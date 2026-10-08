@@ -15,6 +15,7 @@ public final class DistributedCommand {
     private final List<KeyPredicate> predicates;
     private final long acknowledgedThrough;
     private final long minimumSessionEpoch;
+    private final RangeSessionControl sessionControl;
 
     public DistributedCommand(UUID groupId, long rangeEpoch, byte[] schemaDigest,
                               OperationId operationId, List<Mutation> mutations) {
@@ -38,6 +39,13 @@ public final class DistributedCommand {
         return new DistributedCommand(4, groupId, rangeEpoch, schemaDigest, operationId, List.of(), List.of(), -1, minimumEpoch);
     }
 
+    /** Control issuer is a separate maintenance identity; it need not be a live user grant. */
+    public static DistributedCommand sessionControl(UUID groupId, long rangeEpoch, byte[] schemaDigest,
+                                                     OperationId operationId, RangeSessionControl control, long acknowledgedThrough) {
+        return new DistributedCommand(5,groupId,rangeEpoch,schemaDigest,operationId,List.of(),List.of(),acknowledgedThrough,
+                Objects.requireNonNull(control).authority().minimumEpoch(),control);
+    }
+
     // Decoding retains the original version, including legacy payload/receipt identity.
     DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
                        OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates) {
@@ -53,7 +61,13 @@ public final class DistributedCommand {
     DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
                        OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates,
                        long acknowledgedThrough, long minimumSessionEpoch) {
-        if (formatVersion < 1 || formatVersion > 4) throw new IllegalArgumentException("Unsupported command version");
+        this(formatVersion,groupId,rangeEpoch,schemaDigest,operationId,mutations,predicates,acknowledgedThrough,minimumSessionEpoch,null);
+    }
+
+    DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
+                       OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates,
+                       long acknowledgedThrough, long minimumSessionEpoch, RangeSessionControl sessionControl) {
+        if (formatVersion < 1 || formatVersion > 5) throw new IllegalArgumentException("Unsupported command version");
         this.formatVersion = formatVersion;
         this.groupId = Objects.requireNonNull(groupId, "groupId");
         if (rangeEpoch < 0) throw new IllegalArgumentException("Range epoch must be nonnegative");
@@ -63,19 +77,22 @@ public final class DistributedCommand {
         this.operationId = Objects.requireNonNull(operationId, "operationId");
         Objects.requireNonNull(mutations, "mutations");
         Objects.requireNonNull(predicates, "predicates");
-        if ((formatVersion == 3 ? acknowledgedThrough < 0 || acknowledgedThrough >= operationId.sequence() : acknowledgedThrough != -1)
-                || (formatVersion == 4 ? minimumSessionEpoch < 0 || operationId.epoch() < minimumSessionEpoch
+        if ((formatVersion == 3 ? acknowledgedThrough < 0 || acknowledgedThrough >= operationId.sequence()
+                        : formatVersion == 5 ? acknowledgedThrough < -1 || acknowledgedThrough >= operationId.sequence() : acknowledgedThrough != -1)
+                || (formatVersion >= 4 ? minimumSessionEpoch < 0 || operationId.epoch() < minimumSessionEpoch
                         || !mutations.isEmpty() || !predicates.isEmpty() : minimumSessionEpoch != -1)
-                || (mutations.isEmpty() && ((formatVersion != 3 && formatVersion != 4) || !predicates.isEmpty()))
+                || (mutations.isEmpty() && ((formatVersion != 3 && formatVersion != 4 && formatVersion != 5) || !predicates.isEmpty()))
                 || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS
-                || (formatVersion == 1 && !predicates.isEmpty())) {
+                || (formatVersion == 1 && !predicates.isEmpty())
+                || (formatVersion == 5 ? sessionControl==null || minimumSessionEpoch!=sessionControl.authority().minimumEpoch() : sessionControl!=null)) {
             throw new IllegalArgumentException("Invalid command items or acknowledgement; v1 has no predicates");
         }
         this.mutations = List.copyOf(mutations);
         this.predicates = List.copyOf(predicates);
         this.acknowledgedThrough = acknowledgedThrough;
         this.minimumSessionEpoch = minimumSessionEpoch;
-        long size = DistributedCommandCodec.headerBytes(formatVersion);
+        this.sessionControl = sessionControl;
+        long size = DistributedCommandCodec.headerBytes(formatVersion) + (sessionControl==null ? 0 : sessionControl.encodedSize());
         for (Mutation mutation : this.mutations) size += mutation.encodedSize();
         for (KeyPredicate predicate : this.predicates) size += predicate.encodedSize();
         if (size > DistributedCommandCodec.MAX_ENCODED_BYTES) {
@@ -94,7 +111,8 @@ public final class DistributedCommand {
     public List<KeyPredicate> predicates() { return predicates; }
     /** -1 for legacy commands without an acknowledgement. */
     public long acknowledgedThrough() { return acknowledgedThrough; }
-    /** -1 unless this is an administrative v4 epoch-floor command. */
+    public RangeSessionControl sessionControl() { return sessionControl; }
+    /** -1 unless this is an administrative epoch-floor/session-authority command. */
     public long minimumSessionEpoch() { return minimumSessionEpoch; }
     /** SHA-256 of the entire canonical encoding, including identity and ordered operands. */
     public byte[] payloadDigest() { return DistributedCommandCodec.digest(this); }

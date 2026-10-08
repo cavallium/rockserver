@@ -76,15 +76,55 @@ public final class RatisSessionEpochs {
     }
     /** Called only for new floor admission. No current-state read is repeated during committed apply. */
     public Consumer<DistributedCommand> floorAdmission(RangeDirectory directory,UUID dataGroup) {
-        if (!directory.clusterId().equals(cluster) || !directory.databaseId().equals(database)) throw new IllegalArgumentException("Wrong authority directory");
-        var descriptor=directory.ranges().stream().filter(range -> range.groupId().equals(dataGroup)).findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("Authority group is absent from directory"));
-        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Authority group is inactive");
+        var descriptor=authorityRange(directory,dataGroup);
         return command -> {
             if (!command.groupId().equals(dataGroup) || command.rangeEpoch()!=descriptor.rangeEpoch()
                     || !Arrays.equals(command.schemaDigest(),directory.schemaDigest())) throw new IllegalArgumentException("Wrong epoch authority group/schema");
             admitFloor(command);
         };
+    }
+    /** Freeze one verified catalogue image into a range control; retries must retain the returned command. */
+    public DistributedCommand prepareSessionBinding(RangeDirectory directory,UUID dataGroup,OperationId issuer,
+            SessionEpochLedger.Grant grant,int outstandingWindow,long acknowledgedThrough) throws IOException {
+        var descriptor=authorityRange(directory,dataGroup);
+        var ledger=read();
+        if (ledger==null) throw new IOException("Epoch catalogue is not initialized");
+        return DistributedCommand.sessionControl(dataGroup,descriptor.rangeEpoch(),directory.schemaDigest(),issuer,
+                RangeSessionControl.bind(ledger,grant,outstandingWindow),acknowledgedThrough);
+    }
+    public DistributedCommand prepareAuthorityAdvance(RangeDirectory directory,UUID dataGroup,OperationId issuer,
+            long acknowledgedThrough) throws IOException {
+        var descriptor=authorityRange(directory,dataGroup);
+        var ledger=read();
+        if (ledger==null) throw new IOException("Epoch catalogue is not initialized");
+        return DistributedCommand.sessionControl(dataGroup,descriptor.rangeEpoch(),directory.schemaDigest(),issuer,
+                RangeSessionControl.advance(ledger),acknowledgedThrough);
+    }
+    /** Validates controls only. Maintenance issuer authority does not depend on a live user grant. */
+    public Consumer<DistributedCommand> sessionControlAdmission(RangeDirectory directory,UUID dataGroup) {
+        var descriptor=authorityRange(directory,dataGroup);
+        return command -> {
+            var control=command.sessionControl();
+            if (control==null || !command.groupId().equals(dataGroup) || command.rangeEpoch()!=descriptor.rangeEpoch()
+                    || !Arrays.equals(command.schemaDigest(),directory.schemaDigest())) throw new IllegalArgumentException("Wrong session control binding");
+            try {
+                var ledger=read();
+                if (ledger==null) throw new IllegalStateException("Absent session authority cut");
+                var current=SessionAuthority.from(ledger);
+                if (control.binding()) {
+                    current.requireAtLeast(control.authority());
+                    try { RangeSessionControl.bind(ledger,control.grant(),control.outstandingWindow()); }
+                    catch (IllegalArgumentException expired) { throw new IllegalStateException("Catalogue no longer authorizes this binding",expired); }
+                } else if (!control.authority().equals(current)) throw new IllegalStateException("Stale authority advance");
+            } catch (IOException unavailable) { throw new IllegalStateException("Catalogue session authority unavailable",unavailable); }
+        };
+    }
+    private RangeDescriptor authorityRange(RangeDirectory directory,UUID dataGroup) {
+        if (!directory.clusterId().equals(cluster) || !directory.databaseId().equals(database)) throw new IllegalArgumentException("Wrong authority directory");
+        var descriptor=directory.ranges().stream().filter(range -> range.groupId().equals(dataGroup)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Authority group is absent from directory"));
+        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Authority group is inactive");
+        return descriptor;
     }
     private void admitFloor(DistributedCommand command) {
         if (command.minimumSessionEpoch()<0) throw new IllegalArgumentException("Not an epoch-floor command");

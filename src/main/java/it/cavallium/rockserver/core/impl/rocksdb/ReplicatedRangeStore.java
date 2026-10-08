@@ -209,6 +209,7 @@ public final class ReplicatedRangeStore {
     }
 
     public void validate(DistributedCommand command) {
+        if (command.sessionControl()!=null) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
         requireActive();
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()

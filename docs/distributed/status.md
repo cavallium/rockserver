@@ -917,3 +917,39 @@ clock/floor updates and bounded session metadata. The catalogue and data groups
 must define the ordered expiry boundary, rather than adding a hidden per-write
 cross-group read or relying on wall-clock rollback-prone leases. Wider resource
 budgets, bootstrap and the other previously listed architecture work remain open.
+
+## Canonical range-session controls and catalogue proofs (execution inactive)
+
+The v5 control envelope now carries a typed `RangeSessionControl`: bind an exact
+immutable issued grant plus a declared window (1..4096), or advance a
+`SessionAuthority` cut (cluster/database/generation/logical time/minimum epoch).
+It is control-only and may ACK the maintenance issuer's earlier sequences. The
+issuer need not hold a live user grant, so an authority update remains representable
+when every user grant has expired. Its epoch must still be at or above the control
+floor. Legacy v1-v4 encodings/hashes retain their existing paths.
+
+`SessionAuthority.requireAtLeast` rejects identity changes, generation/time/floor
+regression and conflicting same-generation cuts; jumps over unrelated catalogue
+transitions are allowed. Binding factories require the exact live grant from the
+source ledger. The canonical bounded control codec checks exact kind/length/version
+and the enclosing command forbids user mutations or predicates. Ratis catalogue
+helpers freeze one fresh ledger image into either control. Control admission
+requires the current exact catalogue cut for clock advances. Bindings may retain an
+older monotonic cut across unrelated issuance, but the exact grant must still be
+live in the fresh ledger; missing, expired or unavailable authority rejects admission. No catalogue read is
+introduced on ordinary data writes.
+
+Native validation explicitly rejects v5 controls before any effects, receipt or A
+advance. This prevents a partial wire implementation from silently applying them
+as empty user mutations. Activation remains inactive until the native group cut,
+bindings/window enforcement, snapshot validation/GC, replay behavior and maintenance
+integration are implemented. The wire format alone proves no expiry enforcement,
+propagation completion or rolling-version interoperability.
+
+Focused ordinary gate passes 19 core and 14 adapter cases (33 total), exit zero:
+`/tmp/rockserver-session-control-wire-gate.log`. Coverage includes truncation and
+noncanonical controls, ACK bounds, exact sizing/round-trip/hash identity, immutable
+live bindings, monotonic cuts, a stale catalogue proof, authority progress with no
+live user issuer, unavailable catalogue and rejection before native apply. Previous
+session-client/retention tests also pass. No excluded workflow, density fixture,
+network/server process, publication/deployment or main-checkout change occurred.

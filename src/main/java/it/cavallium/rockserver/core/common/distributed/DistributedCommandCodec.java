@@ -7,7 +7,7 @@ import java.util.ArrayList;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Canonical big-endian v1/v2/v3/v4 encoding; decoded legacy commands retain their original bytes/hash. */
+/** Canonical big-endian v1/v2/v3/v4/v5 encoding; decoded legacy commands retain their original bytes/hash. */
 public final class DistributedCommandCodec {
     public static final int FORMAT_VERSION = 2;
     public static final int MAX_ITEMS = 256;
@@ -17,12 +17,12 @@ public final class DistributedCommandCodec {
     static final int HEADER_BYTES = 4 + 16 + 8 + 32 + 16 + 8 + 8 + 4;
 
     private DistributedCommandCodec() {}
-    static int headerBytes(int version) { return HEADER_BYTES + (version >= 2 ? 4 : 0) + (version >= 3 ? 8 : 0); }
+    static int headerBytes(int version) { return HEADER_BYTES + (version >= 2 ? 4 : 0) + (version >= 3 ? 8 : 0) + (version == 5 ? 4 : 0); }
 
     /** Exact canonical size without allocating or copying command operands. */
     public static int encodedSize(DistributedCommand command) {
         Objects.requireNonNull(command, "command");
-        int size = headerBytes(command.formatVersion());
+        int size = headerBytes(command.formatVersion()) + (command.sessionControl()==null ? 0 : command.sessionControl().encodedSize());
         for (Mutation mutation : command.mutations()) size += mutation.encodedSize();
         for (KeyPredicate predicate : command.predicates()) size += predicate.encodedSize();
         return size;
@@ -39,6 +39,9 @@ public final class DistributedCommandCodec {
         if (command.formatVersion() >= 2) output.putInt(command.predicates().size());
         if (command.formatVersion() == 3) output.putLong(command.acknowledgedThrough());
         if (command.formatVersion() == 4) output.putLong(command.minimumSessionEpoch());
+        if (command.formatVersion() == 5) {
+            output.putLong(command.acknowledgedThrough()).putInt(command.sessionControl().encodedSize()).put(command.sessionControl().encode());
+        }
         for (Mutation mutation : command.mutations()) {
             output.put((byte) switch (mutation.kind()) {
                 case PUT -> 1; case DELETE -> 2; case MERGE -> 3; case DELETE_RANGE -> 4;
@@ -71,7 +74,7 @@ public final class DistributedCommandCodec {
         }
         ByteBuffer input = ByteBuffer.wrap(encoded);
         int version = input.getInt();
-        if (version < 1 || version > 4) throw new IllegalArgumentException("Unsupported command version");
+        if (version < 1 || version > 5) throw new IllegalArgumentException("Unsupported command version");
         if (encoded.length < headerBytes(version)) throw new IllegalArgumentException("Truncated command header");
         UUID group = getUuid(input);
         long rangeEpoch = input.getLong();
@@ -80,8 +83,15 @@ public final class DistributedCommandCodec {
         OperationId operation = new OperationId(getUuid(input), input.getLong(), input.getLong());
         int count = input.getInt();
         int predicateCount = version >= 2 ? input.getInt() : 0;
-        long acknowledgedThrough = version == 3 ? input.getLong() : -1;
+        long acknowledgedThrough = version == 3 || version == 5 ? input.getLong() : -1;
         long minimumEpoch = version == 4 ? input.getLong() : -1;
+        RangeSessionControl control=null;
+        if (version == 5) {
+            int length=input.getInt();
+            if ((length!=RangeSessionControl.ADVANCE_BYTES && length!=RangeSessionControl.BIND_BYTES) || length!=input.remaining() || count!=0 || predicateCount!=0) throw new IllegalArgumentException("Invalid session control envelope");
+            byte[] bytes=new byte[length]; input.get(bytes); control=RangeSessionControl.decode(bytes);
+            minimumEpoch=control.authority().minimumEpoch();
+        }
         if (count < 0 || predicateCount < 0 || (long) count + predicateCount > MAX_ITEMS
                 || 26L * count + 25L * predicateCount > input.remaining()) {
             throw new IllegalArgumentException("Invalid command item counts");
@@ -138,7 +148,7 @@ public final class DistributedCommandCodec {
             predicates.add(new KeyPredicate(column, key, expected));
         }
         if (input.hasRemaining()) throw new IllegalArgumentException("Trailing command bytes");
-        return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates, acknowledgedThrough, minimumEpoch);
+        return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates, acknowledgedThrough, minimumEpoch, control);
     }
 
     static byte[] digest(DistributedCommand command) {

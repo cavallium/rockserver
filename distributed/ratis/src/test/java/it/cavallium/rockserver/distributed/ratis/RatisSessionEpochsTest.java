@@ -158,6 +158,39 @@ class RatisSessionEpochsTest {
         }
     }
 
+    @Test void typedBindingAuthorityIsFreshAndMaintenanceSurvivesExpiryOfEveryUserGrant() throws Exception {
+        try (var f=new Fixture(root)) {
+            var dir=directory(cluster);
+            assertThrows(IOException.class,() -> f.epochs.prepareAuthorityAdvance(dir,dataGroup,operation(0),-1));
+            var initial=SessionEpochLedger.initial(cluster,database,10);
+            f.epochs.execute(f.epochs.prepare(operation(0),null,initial));
+            var live=initial.issue(a,100); f.epochs.execute(f.epochs.prepare(operation(1),initial,live));
+            int reads=f.reads.get();
+            var binding=f.epochs.prepareSessionBinding(dir,dataGroup,operation(10),live.grants().getFirst(),32,9);
+            assertEquals(reads+1,f.reads.get());
+            var admission=f.epochs.sessionControlAdmission(dir,dataGroup);
+            admission.accept(binding); assertEquals(reads+2,f.reads.get());
+            var fake=new RangeSessionControl(SessionAuthority.from(live),new SessionEpochLedger.Grant(1,a,10,99),32);
+            assertThrows(IllegalStateException.class,() -> admission.accept(DistributedCommand.sessionControl(dataGroup,1,new byte[32],operation(11),fake,-1)));
+            var unrelated=live.issue(b,200); f.epochs.execute(f.epochs.prepare(operation(2),live,unrelated));
+            assertDoesNotThrow(() -> admission.accept(binding),"Unrelated issuance must not starve an immutable live binding");
+            var dataStore=f.pool.openRange(new RangeOwnership.Owner(dataGroup,1),new RangeOwnership.Interval(dataGroup,Set.of(data),null,null),
+                    new byte[32],Map.of(data,"data"),Set.of());
+            assertThrows(UnsupportedOperationException.class,() -> dataStore.apply(new ApplyPosition(1,0),binding));
+            assertNull(dataStore.applied(),"Unsupported controls cannot silently become no-op receipts");
+            var expired=unrelated.advanceTime(200); f.epochs.execute(f.epochs.prepare(operation(3),unrelated,expired));
+            assertThrows(IllegalStateException.class,() -> admission.accept(binding));
+            var advance=f.epochs.prepareAuthorityAdvance(dir,dataGroup,new OperationId(maintenance,expired.minimumEpoch(),12),11);
+            assertFalse(advance.sessionControl().binding()); assertEquals(SessionAuthority.from(expired),advance.sessionControl().authority());
+            assertFalse(expired.isLive(advance.operationId()));
+            assertDoesNotThrow(() -> admission.accept(advance));
+            assertThrows(IllegalArgumentException.class,() -> f.epochs.sessionControlAdmission(directory(UUID.randomUUID()),dataGroup));
+            byte[] frozen=DistributedCommandCodec.encode(advance); f.unavailable=true;
+            assertThrows(IllegalStateException.class,() -> admission.accept(advance));
+            assertArrayEquals(frozen,DistributedCommandCodec.encode(advance));
+        }
+    }
+
     final class Fixture implements AutoCloseable {
         final DistributedStoragePool pool;
         final ReplicatedRangeStore store;
