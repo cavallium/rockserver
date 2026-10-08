@@ -26,19 +26,13 @@ class RatisDurableSnapshotTest {
         journal.queueHome(f.home.homes.prepare(control(sequence),journal.snapshot().observedHome(),next));
         assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status());
     }
-    RatisSnapshotCoordinator coordinator(RatisDurableSnapshot journal,RatisSnapshotCaptureRpcTest.Fixture f,java.util.concurrent.atomic.AtomicInteger authorizations) throws Exception {
+    RatisSnapshotCoordinator coordinator(RatisDurableSnapshot journal,RatisSnapshotCaptureRpcTest.Fixture f) throws Exception {
         return new RatisSnapshotCoordinator(journal,f.home.homes,f.client,
-                last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),request -> {
-                    authorizations.incrementAndGet();
-                    try {
-                        var proposal=request.isRelease() ? f.data.f.machine.prepareSnapshotRelease(f.home.homes,request.fence()) : f.data.f.machine.prepareSnapshotInstall(f.home.homes,request.fence());
-                        return new RatisSnapshotCoordinator.Authorization(proposal.request(),proposal::valid,proposal::drained,proposal);
-                    } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
-                },(fence,group) -> false,UUID::randomUUID,Duration.ofSeconds(10));
+                last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10));
     }
     @Test void coordinatorCompletesForcedWorkflowWithOneRaftWritePerStep() throws Exception {
         try (var f=fixture("driver"); var journal=create(root.resolve("driver.journal"),f);
-                var driver=coordinator(journal,f,new java.util.concurrent.atomic.AtomicInteger())) {
+                var driver=coordinator(journal,f)) {
             boolean complete=false;
             for (int n=0;n<20 && !complete;n++) {
                 long before=f.data.wire.index+f.home.wire.index; var step=driver.step(); complete=step.complete();
@@ -56,29 +50,85 @@ class RatisDurableSnapshotTest {
             try (var release=f.data.f.machine.prepareSnapshotRelease(f.home.homes,f.fence)) { helper.helper.append(f.data,release); }
             var fence=helper.helper.fence(f.home,f.data,19,helper.helper.scope(f.data,1,4)); var initial=SnapshotFenceStatus.begin(fence);
             var old=f.data.f.propose(f.data.f.put(3)); assertNull(old.getException());
-            var authorizations=new java.util.concurrent.atomic.AtomicInteger();
             try (var journal=RatisDurableSnapshot.create(root.resolve("waiting.journal"),f.home.homes,f.client,initial,f.home.homes.prepare(control(0),null,initial),f.data.directory.ranges());
-                    var driver=coordinator(journal,f,authorizations)) {
+                    var driver=coordinator(journal,f)) {
                 driver.step();
                 assertEquals(RatisSnapshotCoordinator.Action.WAITING,driver.step().action());
                 assertEquals(RatisSnapshotCoordinator.Action.WAITING,driver.step().action());
-                assertEquals(1,authorizations.get()); assertEquals(1,f.data.f.machine.proposalGateStats().gates());
+                assertEquals(1,f.data.f.machine.snapshotPreparationSlots()); assertEquals(1,f.data.f.machine.proposalGateStats().gates());
                 assertNotNull(f.data.f.propose(f.data.f.put(1)).getException());
                 f.data.f.machine.notifyNotLeader(List.of());
                 f.data.f.leadership.set(new RatisRangeStateMachine.Leadership(2,true));
                 f.data.f.machine.notifyTermIndexUpdated(2,++f.data.wire.index);
                 assertEquals(RatisSnapshotCoordinator.Action.INSTALLED,driver.step().action());
-                assertEquals(2,authorizations.get()); assertNotNull(f.data.f.store.snapshotGate(fence.fenceId()).installed());
+                assertNotNull(f.data.f.store.snapshotGate(fence.fenceId()).installed());
             }
         }
     }
     @Test void coordinatorRetriesLostInstallReplyInsteadOfWaitingOnRetiredAuthority() throws Exception {
-        var authorizations=new java.util.concurrent.atomic.AtomicInteger();
-        try (var f=fixture("install-retry"); var journal=create(root.resolve("install-retry.journal"),f);
-                var driver=coordinator(journal,f,authorizations)) {
-            f.data.wire.lose=true; assertThrows(IOException.class,driver::step);
-            assertEquals(RatisSnapshotCoordinator.Action.INSTALLED,driver.step().action()); assertEquals(2,authorizations.get());
-            assertNotNull(journal.snapshot().participant(f.data.f.groupId).installReceipt());
+        Path path=root.resolve("install-retry.journal");
+        try (var f=fixture("install-retry")) {
+            f.home.transition(f.initial,f.initial.abort());
+            try (var release=f.data.f.machine.prepareSnapshotRelease(f.home.homes,f.fence)) { helper.helper.append(f.data,release); }
+            var fence=helper.helper.fence(f.home,f.data,20,helper.helper.scope(f.data,1,4)); var initial=SnapshotFenceStatus.begin(fence);
+            try (var journal=RatisDurableSnapshot.create(path,f.home.homes,f.client,initial,f.home.homes.prepare(control(0),null,initial),f.data.directory.ranges()); var driver=coordinator(journal,f)) {
+                driver.step(); f.data.wire.lose=true; assertThrows(IOException.class,driver::step);
+                assertNull(journal.snapshot().participant(f.data.f.groupId).installReceipt());
+            }
+            long applied=f.data.wire.index;
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f)) {
+                assertEquals(RatisSnapshotCoordinator.Action.INSTALLED,driver.step().action()); assertEquals(applied,f.data.wire.index);
+                assertNotNull(journal.snapshot().participant(f.data.f.groupId).installReceipt());
+            }
+        }
+    }
+    @Test void closeCancelsOnlyUndispatchedFrozenInstallAndReopenRetainsExactRequest() throws Exception {
+        Path path=root.resolve("cancel-wait.journal");
+        try (var f=fixture("cancel-wait")) {
+            f.home.transition(f.initial,f.initial.abort());
+            try (var release=f.data.f.machine.prepareSnapshotRelease(f.home.homes,f.fence)) { helper.helper.append(f.data,release); }
+            var fence=helper.helper.fence(f.home,f.data,21,helper.helper.scope(f.data,1,4)); var initial=SnapshotFenceStatus.begin(fence);
+            var old=f.data.f.propose(f.data.f.put(3)); assertNull(old.getException());
+            try (var journal=RatisDurableSnapshot.create(path,f.home.homes,f.client,initial,f.home.homes.prepare(control(0),null,initial),f.data.directory.ranges())) {
+                var driver=coordinator(journal,f); driver.step(); assertEquals(RatisSnapshotCoordinator.Action.WAITING,driver.step().action());
+                assertEquals(1,f.data.f.machine.proposalGateStats().gates()); driver.close(); assertEquals(0,f.data.f.machine.proposalGateStats().gates());
+                assertTrue(journal.snapshot().participant(f.data.f.groupId).installFrozen()); assertNull(journal.snapshot().participant(f.data.f.groupId).installReceipt()); assertThrows(IOException.class,driver::step);
+                f.data.f.machine.cancelTransaction(old);
+            }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f)) { assertEquals(RatisSnapshotCoordinator.Action.INSTALLED,driver.step().action()); }
+        }
+    }
+    @Test void cancelledCloseViewKeepsJournalLockedUntilActualInstallCancellationReturns() throws Exception {
+        Path path=root.resolve("cancel-owned.journal");
+        try (var f=fixture("cancel-owned"); var executor=java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            f.home.transition(f.initial,f.initial.abort());
+            try (var release=f.data.f.machine.prepareSnapshotRelease(f.home.homes,f.fence)) { helper.helper.append(f.data,release); }
+            var fence=helper.helper.fence(f.home,f.data,22,helper.helper.scope(f.data,1,4)); var initial=SnapshotFenceStatus.begin(fence);
+            var old=f.data.f.propose(f.data.f.put(3)); assertNull(old.getException());
+            var entered=new java.util.concurrent.CountDownLatch(1); var release=new java.util.concurrent.CountDownLatch(1); var done=new java.util.concurrent.CountDownLatch(1);
+            var transport=new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
+                public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
+                public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return f.data.wire.participant(route,bytes); }
+                public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
+                    if (ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL) {
+                        entered.countDown(); try { if (!release.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); } catch (InterruptedException failure) { throw new IOException(failure); }
+                    }
+                    return f.data.wire.transaction(route,bytes,fresh);
+                }
+            };
+            try (var client=new RatisRoutedClient(f.data.directory,transport); var journal=RatisDurableSnapshot.create(path,f.home.homes,client,initial,f.home.homes.prepare(control(0),null,initial),f.data.directory.ranges());
+                    var driver=new RatisSnapshotCoordinator(journal,f.home.homes,client,last -> control(last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))) {
+                driver.step(); assertEquals(RatisSnapshotCoordinator.Action.WAITING,driver.step().action());
+                var view=executor.submit(() -> { try { driver.close(); return null; } finally { done.countDown(); } });
+                try {
+                    assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertTrue(view.cancel(false)); assertThrows(IOException.class,journal::close); assertThrows(IOException.class,driver::close);
+                    assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,client));
+                } finally { release.countDown(); }
+                assertTrue(done.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertEquals(0,f.data.f.machine.proposalGateStats().gates());
+                f.data.f.machine.cancelTransaction(old); journal.close();
+                try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,client)) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).installFrozen()); assertNull(reopened.snapshot().participant(f.data.f.groupId).installReceipt()); }
+            } finally { release.countDown(); }
         }
     }
     @Test void observedForeignCaptureIsDurablyLostBeforeTheNextPolicyStep() throws Exception {
@@ -90,14 +140,14 @@ class RatisDurableSnapshotTest {
                 f.home.transition(f.initial,ready); var token=f.client.executeSnapshotCapture(f.operation()); f.home.transition(ready,ready.capture(group,token));
                 journal.refreshHome(); assertTrue(journal.snapshot().participant(group).captureLost());
             }
-            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f,new java.util.concurrent.atomic.AtomicInteger())) {
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f)) {
                 assertTrue(journal.snapshot().participant(group).captureLost()); assertEquals(RatisSnapshotCoordinator.Action.ABORTED,driver.step().action());
                 assertTrue(driver.step().complete()); assertFalse(f.data.f.store.snapshotGate(f.fence.fenceId()).active());
             }
         }
     }
     RatisSnapshotCoordinator proofOnlyDriver(RatisDurableSnapshot journal,RatisSnapshotCaptureRpcTest.Fixture f) throws Exception {
-        return new RatisSnapshotCoordinator(journal,f.home.homes,f.client,last -> control(last.sequence()+1),request -> { throw new AssertionError("Saved receipt proof must not need write authority"); },(fence,group) -> false,UUID::randomUUID,Duration.ofSeconds(10));
+        return new RatisSnapshotCoordinator(journal,f.home.homes,f.client,last -> control(last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10));
     }
     @Test void forcedReceiptsReopenAndResolveProofWithoutWriteAuthority() throws Exception {
         Path path=root.resolve("receipt-proof.journal");

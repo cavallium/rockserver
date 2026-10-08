@@ -113,6 +113,7 @@ class RatisRetentionAdmissionTest {
         final RaftGroup group=RaftGroup.valueOf(RaftGroupId.valueOf(groupId),peer);
         final AtomicReference<RatisRangeStateMachine.Leadership> leadership=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         final DistributedStoragePool pool; final RaftStorage storage; final ReplicatedRangeStore store; final RatisRangeStateMachine machine;
+        final RatisProofQueryService proofQueries=new RatisProofQueryService();
         Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits) throws Exception {
             this(root,limits,command -> {});
         }
@@ -127,19 +128,29 @@ class RatisRetentionAdmissionTest {
         }
         Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator,java.util.function.LongSupplier nanos,RangeOwnership.Interval interval,java.util.function.Consumer<RatisRangeStateMachine> configure) throws Exception {
             column=interval==null ? UUID.randomUUID() : interval.columns().iterator().next();
-            pool=DistributedStoragePool.open(root.resolve("native"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
-            storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT)
-                    .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
-                    .setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build(); storage.initialize();
-            store=pool.openRange(new RangeOwnership.Owner(groupId,1),interval==null ? new RangeOwnership.Interval(groupId,Set.of(column),null,null) : interval,new byte[32],Map.of(column,"data"),Set.of());
-            var identity=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> {
-                if (method.getName().equals("getId")) return peer.getId();
-                if (method.getName().equals("toString")) return "identity-fixture";
-                throw new AssertionError("Unexpected server access "+method);
-            });
-            machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),validator,command -> {},limits,leadership::get);
-            machine.transactionClock(nanos); configure.accept(machine);
-            machine.initialize(identity,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
+            DistributedStoragePool openedPool=null; RaftStorage openedStorage=null; RatisRangeStateMachine openedMachine=null;
+            try {
+                openedPool=DistributedStoragePool.open(root.resolve("native"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
+                openedStorage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT)
+                        .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
+                        .setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build(); openedStorage.initialize();
+                var openedStore=openedPool.openRange(new RangeOwnership.Owner(groupId,1),interval==null ? new RangeOwnership.Interval(groupId,Set.of(column),null,null) : interval,new byte[32],Map.of(column,"data"),Set.of());
+                var identity=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> {
+                    if (method.getName().equals("getId")) return peer.getId();
+                    if (method.getName().equals("toString")) return "identity-fixture";
+                    throw new AssertionError("Unexpected server access "+method);
+                });
+                openedMachine=new RatisRangeStateMachine(openedStore,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),validator,command -> {},limits,leadership::get);
+                openedMachine.proofQueries(proofQueries); openedMachine.transactionClock(nanos); configure.accept(openedMachine);
+                openedMachine.initialize(identity,group.getGroupId(),openedStorage); openedMachine.notifyTermIndexUpdated(1,0);
+                pool=openedPool; storage=openedStorage; store=openedStore; machine=openedMachine;
+            } catch (Exception | Error failure) {
+                try { proofQueries.stop().get(5,TimeUnit.SECONDS); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+                if (openedMachine!=null) try { openedMachine.close(); openedMachine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+                if (openedStorage!=null) try { openedStorage.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+                if (openedPool!=null) try { openedPool.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
         }
         DistributedCommand put(long sequence) { return new DistributedCommand(groupId,1,new byte[32],new OperationId(session,1,sequence),
                 List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{(byte)sequence},new byte[]{7}))); }
@@ -160,6 +171,6 @@ class RatisRetentionAdmissionTest {
             assertEquals(0,counter("dataAdmissions")); assertEquals(0,counter("protectedAdmissions")); assertEquals(0,counter("admittedBytes"));
             var field=RatisRangeStateMachine.class.getDeclaredField("maintenanceReservation"); field.setAccessible(true); assertNull(field.get(machine));
         }
-        public void close() throws Exception { machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); storage.close(); pool.close(); }
+        public void close() throws Exception { proofQueries.stop().get(5,TimeUnit.SECONDS); machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); storage.close(); pool.close(); }
     }
 }

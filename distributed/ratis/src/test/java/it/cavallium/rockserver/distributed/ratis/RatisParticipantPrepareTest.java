@@ -20,18 +20,26 @@ class RatisParticipantPrepareTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final UUID cluster=new UUID(0,1),database=new UUID(0,2),controlSession=new UUID(0,3);
     RatisTransactionStatuses transactionHomes;
+    RatisSnapshotReadinessHelper.Recovery snapshotRecovery;
     final Map<UUID,Node> nodes=new ConcurrentHashMap<>();
     OperationId control(long n) { return new OperationId(controlSession,1,n); }
     final class Node implements AutoCloseable {
+        final it.cavallium.rockserver.core.impl.RWScheduler scheduler;
+        final RatisSnapshotHelpService snapshotHelp;
         final RatisRetentionAdmissionTest.Fixture f; final Wire wire; final RangeDirectory directory; final RatisRoutedClient routed; final RatisTransactionStatuses statuses;
         Node(String name,boolean home) throws Exception { this(name,home,null); }
         Node(String name,boolean home,RangeOwnership.Interval interval) throws Exception { this(name,home,interval,null,System::nanoTime); }
         Node(String name,boolean home,RangeOwnership.Interval interval,RatisSnapshotFences snapshotHomes,java.util.function.LongSupplier nanos) throws Exception {
+            var recoveryProvider=home ? null : snapshotRecovery;
+            scheduler=recoveryProvider==null ? null : it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,1,1,4,1,"snapshot-help-fixture");
+            snapshotHelp=scheduler==null ? null : new RatisSnapshotHelpService(scheduler);
             var validator=new java.util.concurrent.atomic.AtomicReference<Consumer<DistributedCommand>>(command -> {});
             var ownedInterval=home && interval==null ? new RangeOwnership.Interval(UUID.randomUUID(),Set.of(UUID.randomUUID()),null,null) : interval;
+            try {
             f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validator.get().accept(command),nanos,ownedInterval,machine -> {
                 if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes);
                 if (!home && transactionHomes!=null) machine.transactionHomes(transactionHomes);
+                if (!home && recoveryProvider!=null) machine.snapshotRecovery(recoveryProvider,snapshotHelp);
                 if (home) {
                     machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(cluster,database,key,value));
                     machine.homeRecoveryReservations(cluster,database,ownedInterval.columns().iterator().next());
@@ -42,13 +50,18 @@ class RatisParticipantPrepareTest {
                     });
                 }
             });
+            } catch (Exception | Error failure) {
+                if (snapshotHelp!=null) try { snapshotHelp.stop().get(5,TimeUnit.SECONDS); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+                if (scheduler!=null) try { scheduler.disposeGracefully().block(java.time.Duration.ofSeconds(5)); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
             var replica=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"fixture","127.0.0.1:12345",ReplicaDescriptor.Role.VOTER);
             var range=new RangeDescriptor(f.groupId,f.groupId,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
             directory=new RangeDirectory(cluster,database,f.store.ownership().interval().domainId(),1,new byte[32],0,Set.of(f.column),0,List.of(range));
             nodes.put(f.groupId,this); wire=new Wire(f); routed=new RatisRoutedClient(directory,wire); statuses=new RatisTransactionStatuses(routed,f.column);
             if (home) { transactionHomes=statuses; validator.set(RatisTransactionStatuses.validator(cluster,database,f.groupId,1,new byte[32],f.column)); }
         }
-        @Override public void close() throws Exception { nodes.remove(f.groupId,this); routed.close(); f.close(); }
+        @Override public void close() throws Exception { if (snapshotHelp!=null) snapshotHelp.stop().get(5,TimeUnit.SECONDS); nodes.remove(f.groupId,this); routed.close(); f.close(); if (scheduler!=null) scheduler.disposeGracefully().block(java.time.Duration.ofSeconds(5)); }
     }
     static final class Wire implements RatisRoutedClient.Transport {
         final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Runnable afterRead,beforeFinalization; IOException readFailure;

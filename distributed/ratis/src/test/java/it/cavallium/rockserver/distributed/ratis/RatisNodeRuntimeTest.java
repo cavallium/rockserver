@@ -40,6 +40,24 @@ class RatisNodeRuntimeTest {
             assertEquals(0,homes.closes);
         }
     }
+    @Test void nodeCloseRetainsActualHelpOwnershipAfterCancelledReplyView() throws Exception {
+        try (var env=new Env(root); var homes=new TransactionHomeReader(env,env.outer.cluster)) {
+            var settings=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofSeconds(1),1); var fake=new FakeServer();
+            var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,null,null,settings);
+            var entered=new java.util.concurrent.CountDownLatch(1); var release=new java.util.concurrent.CountDownLatch(1);
+            try {
+                node.start(); var field=RatisNodeRuntime.class.getDeclaredField("snapshotHelp"); field.setAccessible(true); var help=(RatisSnapshotHelpService)field.get(node);
+                var directory=env.plan.directory(); var route=directory.ranges().getFirst();
+                var fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),directory.domainId(),new UUID(13,1),new UUID(13,2),1,directory.generation(),directory.schemaEpoch(),directory.schemaDigest(),List.of(
+                        new SnapshotFence.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),new OperationId(new UUID(13,3),0,0),new OperationId(new UUID(13,3),0,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
+                var view=help.submit(route.groupId(),ScopedTransactionRpc.SnapshotBinding.of(fence),() -> { entered.countDown(); if (!release.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); return true; });
+                assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertTrue(view.cancel(false));
+                assertThrows(IOException.class,node::close); assertEquals(1,help.activeJobs()); assertEquals(0,fake.closes);
+                release.countDown(); help.stop().get(5,java.util.concurrent.TimeUnit.SECONDS); node.close(); assertEquals(1,fake.closes); assertEquals(0,help.activeJobs()); assertEquals(0,homes.closes);
+            } finally { release.countDown(); node.close(); }
+        }
+    }
+
     @Test void foreignRecoveryHomesAreRejectedBeforeBootstrapWrites() throws Exception {
         try (var env=new Env(root); var homes=new TransactionHomeReader(env,UUID.randomUUID())) {
             var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);

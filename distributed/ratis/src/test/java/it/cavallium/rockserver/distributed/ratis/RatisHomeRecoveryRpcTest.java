@@ -141,6 +141,16 @@ class RatisHomeRecoveryRpcTest {
             helper.released(f.nativeHome); helper.released(data);
         }
     }
+    @Test void stalePreparationCannotJoinAnIdenticalBlockedFreshHomeRequest() throws Exception {
+        try (var f=new Fixture("fresh-coalesce")) {
+            f.homes.executeRecovery(f.abort(0)); var operation=f.ack(1); f.proof.block=true;
+            var message=Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.HOME_RECOVERY_PREPARE,operation.bytes())));
+            var fresh=f.nativeHome.machine.queryLinearizable(message);
+            try { assertTrue(f.proof.entered.await(5,TimeUnit.SECONDS)); assertThrows(ExecutionException.class,() -> f.nativeHome.machine.query(message).get(100,TimeUnit.MILLISECONDS)); }
+            finally { f.proof.release.countDown(); }
+            fresh.get(5,TimeUnit.SECONDS); f.homes.cancelRecovery(operation); helper.released(f.nativeHome);
+        }
+    }
     @Test void routedCloseWaitsThroughBlockedAuthorizationAndFollowingAppend() throws Exception {
         try (var f=new Fixture("close"); var executor=Executors.newVirtualThreadPerTaskExecutor()) {
             f.homes.executeRecovery(f.abort(0)); var operation=f.ack(1); f.proof.block=true;

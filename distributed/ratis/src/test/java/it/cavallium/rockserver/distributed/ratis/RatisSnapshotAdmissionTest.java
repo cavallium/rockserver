@@ -92,7 +92,7 @@ class RatisSnapshotAdmissionTest {
     }
     @Test void lostInstallReplyRetriesExactBytesAndCompleteReleaseLeavesCapturedCutReadable() throws Exception {
         helper.root=root;
-        try (var home=new Home("capture-home"); var data=helper.new Node("capture-data",false)) {
+        try (var home=new Home("capture-home"); var data=helper.new Node("capture-data",false,null,home.homes,System::nanoTime)) {
             var fence=fence(home,data,2,scope(data,1,4)); var initial=home.register(fence);
             RatisRoutedClient.PreparedSnapshotOperation operation;
             try (var install=data.f.machine.prepareSnapshotInstall(home.homes,fence)) {

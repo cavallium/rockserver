@@ -49,13 +49,13 @@ class RatisSnapshotRecordTest {
             assertThrows(IllegalArgumentException.class,() -> new RatisSnapshotRecord.Result(new ApplyPosition(1,0)));
         }
     }
-    @Test void committedGatesDispatchAndExactLostRepliesRetryWithoutNewHomeAuthority() throws Exception {
+    @Test void committedGatesDispatchAndExactRetriesNeedNoHomeAuthorityOrAppend() throws Exception {
         helper.root=root;
         try (var data=helper.new Node("committed",false)) {
             var fence=fence(data); var install=RatisSnapshotRecord.install(fence,data.f.groupId); var operation=data.routed.prepareSnapshotGate(install);
             assertNotNull(data.wire.propose(operation.bytes()).getException(),"An encoding alone cannot authorize a new gate");
             assertEquals(new ApplyPosition(1,1),apply(data,1,install).position());
-            data.wire.lose=true; assertThrows(IOException.class,() -> data.routed.executeSnapshotGate(operation));
+            long index=data.wire.index; assertEquals(new ApplyPosition(1,1),data.routed.executeSnapshotGate(operation).position()); assertEquals(index,data.wire.index,"Retained proof must not append again");
             assertEquals(new ApplyPosition(1,1),data.routed.executeSnapshotGate(operation).position());
             assertTrue(data.routed.snapshotGate(fence,data.f.groupId).active()); assertNotNull(data.f.propose(data.f.put(2)).getException());
             var body=ByteBuffer.allocate(16).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
@@ -68,13 +68,13 @@ class RatisSnapshotRecordTest {
             }
             var release=RatisSnapshotRecord.release(complete,data.f.groupId); var releaseOperation=data.routed.prepareSnapshotGate(release);
             assertNotNull(data.wire.propose(releaseOperation.bytes()).getException(),"A new release still requires fresh home authority");
-            assertEquals(new ApplyPosition(1,4),apply(data,4,release).position());
-            assertEquals(new ApplyPosition(1,4),data.routed.executeSnapshotGate(releaseOperation).position());
+            assertEquals(new ApplyPosition(1,2),apply(data,2,release).position());
+            assertEquals(new ApplyPosition(1,2),data.routed.executeSnapshotGate(releaseOperation).position());
             assertFalse(data.routed.snapshotGate(fence,data.f.groupId).active());
             var floor=DistributedCommand.advanceSessionEpochFloor(data.f.groupId,1,new byte[32],new OperationId(data.f.admin,2,0),2);
             data.wire.command(operation.descriptor(),floor);
             assertEquals(new ApplyPosition(1,1),data.routed.executeSnapshotGate(operation).position());
-            assertEquals(new ApplyPosition(1,4),data.routed.snapshotGate(fence,data.f.groupId).released()); data.f.assertReleased();
+            assertEquals(new ApplyPosition(1,2),data.routed.snapshotGate(fence,data.f.groupId).released()); data.f.assertReleased();
         }
     }
     @Test void releaseFirstSuppressionAndOriginalRoutesRemainStableAcrossRefresh() throws Exception {

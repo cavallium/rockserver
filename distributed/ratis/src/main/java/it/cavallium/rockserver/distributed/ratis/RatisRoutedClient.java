@@ -173,19 +173,60 @@ public final class RatisRoutedClient implements AutoCloseable {
                 || !Arrays.equals(directory.schemaDigest(),participant.schemaDigest()) || !Arrays.equals(directory.schemaDigest(),fence.schemaDigest()) || directory.schemaEpoch()!=fence.schemaEpoch()
                 || !directory.clusterId().equals(fence.clusterId()) || !directory.databaseId().equals(fence.databaseId()) || !directory.domainId().equals(fence.domainId())) throw new IllegalArgumentException("Snapshot route differs from frozen participant");
     }
+    public record SnapshotGatePreparation(boolean drained,RatisSnapshotRecord.Result receipt) {
+        public SnapshotGatePreparation { if (!drained && receipt!=null) throw new IllegalArgumentException("Retained snapshot proof cannot be waiting"); }
+    }
+    public SnapshotGatePreparation authorizeSnapshotGate(PreparedSnapshotOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try { return authorizeSnapshotGateCall(operation); } finally { endCall(); }
+    }
+    private SnapshotGatePreparation authorizeSnapshotGateCall(PreparedSnapshotOperation operation) throws IOException {
+        try {
+            var input=ByteBuffer.wrap(transactionReply(operation.descriptor,ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE,operation.bytes,true));
+            byte[] digest=ScopedTransactionRpc.blob(input,32,false);
+            if (input.remaining()<5) throw new IllegalArgumentException("Truncated snapshot preparation reply");
+            int state=input.get()&255; byte[] bytes=ScopedTransactionRpc.blob(input,RatisSnapshotRecord.Result.MAX_BYTES,true);
+            if (!Arrays.equals(digest,operation.request.digest()) || input.hasRemaining() || state>2 || (state==2)!=(bytes!=null)) throw new IllegalArgumentException("Snapshot authority changed its frozen request");
+            var receipt=bytes==null ? null : RatisSnapshotRecord.Result.decode(bytes); if (receipt!=null) requireSnapshotResult(operation,receipt);
+            return new SnapshotGatePreparation(state!=0,receipt);
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot gate authority reply",malformed); }
+    }
     public RatisSnapshotRecord.Result executeSnapshotGate(PreparedSnapshotOperation operation) throws IOException {
         Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
         try {
-            var result=RatisSnapshotRecord.Result.decode(transport.participant(operation.descriptor,operation.bytes));
-            if (operation.request.isRelease()) {
-                if (result.suppressed()) throw new IllegalArgumentException("Snapshot RELEASE requires an applied receipt");
-                var progress=operation.request.terminal().progress(operation.request.participantGroup());
-                var before=progress.capture()==null ? progress.ready() : progress.capture().position();
-                if (before!=null && (result.position().term()<before.term() || result.position().index()<=before.index())) throw new IllegalArgumentException("Snapshot RELEASE reply precedes frozen proof");
-            }
-            return result;
+            var preparation=authorizeSnapshotGateCall(operation);
+            if (!preparation.drained()) throw new RatisSnapshotWaitingException();
+            var result=preparation.receipt()==null ? RatisSnapshotRecord.Result.decode(transport.participant(operation.descriptor,operation.bytes)) : preparation.receipt();
+            requireSnapshotResult(operation,result); return result;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot gate applied reply",malformed); }
         finally { endCall(); }
+    }
+    private static void requireSnapshotResult(PreparedSnapshotOperation operation,RatisSnapshotRecord.Result result) {
+        if (operation.request.isRelease()) {
+            if (result.suppressed()) throw new IllegalArgumentException("Snapshot RELEASE requires an applied receipt");
+            var progress=operation.request.terminal().progress(operation.request.participantGroup());
+            var before=progress.capture()==null ? progress.ready() : progress.capture().position();
+            if (before!=null && (result.position().term()<before.term() || result.position().index()<=before.index())) throw new IllegalArgumentException("Snapshot RELEASE reply precedes frozen proof");
+        }
+    }
+    public void cancelSnapshotGate(PreparedSnapshotOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            byte[] reply=transactionReply(operation.descriptor,ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL,operation.bytes,true);
+            if (!Arrays.equals(reply,operation.request.digest())) throw new IOException("Snapshot cancellation identity changed");
+        } finally { endCall(); }
+    }
+    /** One bounded server-side recovery quantum; false or an empty blocker page never proves READY. */
+    public boolean helpSnapshotFence(SnapshotFence fence,UUID group) throws IOException {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot helper route absent"));
+        requireSnapshotRoute(observed,descriptor,fence,group);
+        try {
+            var binding=ScopedTransactionRpc.SnapshotBinding.of(fence); var body=ByteBuffer.allocate(48); ScopedTransactionRpc.snapshotBinding(body,binding);
+            var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.SNAPSHOT_HELP,body.array(),true));
+            var actual=ScopedTransactionRpc.snapshotBinding(input); var actualGroup=ScopedTransactionRpc.uuid(input);
+            if (!binding.equals(actual) || !group.equals(actualGroup) || input.remaining()!=1) throw new IllegalArgumentException("Snapshot helper reply binding changed");
+            int helped=input.get()&255; if (helped>1) throw new IllegalArgumentException("Invalid snapshot helper progress"); return helped==1;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot helper reply",malformed); }
     }
     /** Fresh retained gate/terminal state remains queryable independently of control grants. */
     public SnapshotGate snapshotGate(SnapshotFence fence,UUID group) throws IOException {

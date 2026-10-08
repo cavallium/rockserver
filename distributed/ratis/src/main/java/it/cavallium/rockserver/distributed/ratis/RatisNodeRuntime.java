@@ -58,6 +58,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisParticipantRecoveryRegistry participantRecoveries;
     private RatisTransactionRecoveryService participantRecoveryService;
     private RatisNativeParticipantDiscovery nativeParticipantDiscovery;
+    private RatisSnapshotHelpService snapshotHelp;
+    private RatisProofQueryService proofQueries;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
 
@@ -169,6 +171,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (snapshotPlan!=null) {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
+        proofQueries=new RatisProofQueryService();
+        if (transactionHomes!=null) snapshotHelp=new RatisSnapshotHelpService(scheduler);
         pool=DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class));
         try {
             for (var group:plan.localGroups()) {
@@ -195,8 +199,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.homeRecoveryData(routed); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
                     }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
-                    else { machine.role(role); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) machine.transactionHomes(transactionHomes); }
+                    else { machine.role(role); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
                 }
+                machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
             }
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
@@ -282,7 +287,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public RatisSnapshotReadinessHelper.Recovery participantRecovery() { if (participantRecoveries==null) throw new IllegalStateException("Participant recovery is not configured"); return this::recoverParticipant; }
     private boolean recoverParticipant(UUID group,it.cavallium.rockserver.core.common.distributed.PreparedParticipant prepared) throws IOException {
         synchronized (this) { if (closeRequested || closed) throw new IOException("Node participant recovery is stopping"); }
-        return participantRecoveries.step(group,prepared);
+        var registry=participantRecoveries; if (registry==null) throw new IOException("Node participant recovery is not initialized");
+        return registry.step(group,prepared);
     }
     public RatisParticipantRecoveryRegistry.Snapshot participantRecoveryStatus() { if (participantRecoveries==null) throw new IllegalStateException("Participant recovery is not configured"); return participantRecoveries.stats(); }
     public Throwable transactionExpiryFailure() { return transactionExpiry==null ? null : transactionExpiry.lastFailure(); }
@@ -307,6 +313,16 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 try { participantRecoveryService.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Participant recovery drain interrupted",interrupted); }
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Participant recovery did not drain",failure); }
+            }
+            if (snapshotHelp!=null) {
+                try { snapshotHelp.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Snapshot HELP drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Snapshot HELP did not drain",failure); }
+            }
+            if (proofQueries!=null) {
+                try { proofQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Proof query drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Proof queries did not drain",failure); }
             }
             if (participantRecoveries!=null) participantRecoveries.close();
             if (transactionExpiry!=null) {

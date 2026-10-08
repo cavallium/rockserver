@@ -29,8 +29,11 @@ class RatisSnapshotCoordinatorTest {
         final AtomicLong clock=new AtomicLong();
         final AtomicInteger captures=new AtomicInteger(),helped=new AtomicInteger();
         boolean loseCapture;
+        RatisParticipantRecoveryRegistry registry;
+        RatisSnapshotReadinessHelper.Recovery recovery;
         Fixture(String name) throws Exception {
             helper.root=root; helper.helper.root=root; home=helper.new Home(name+"-snap-home"); transactions=helper.helper.new Node(name+"-tx-home",true);
+            helper.helper.snapshotRecovery=(group,prepared) -> recovery.step(group,prepared);
             byte[] split={(byte)128};
             left=helper.helper.new Node(name+"-left",false,new RangeOwnership.Interval(domain,Set.of(column),null,split),home.homes,clock::get);
             right=helper.helper.new Node(name+"-right",false,new RangeOwnership.Interval(domain,Set.of(column),split,null),home.homes,clock::get);
@@ -58,6 +61,8 @@ class RatisSnapshotCoordinatorTest {
                     } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
                 }
             });
+            registry=new RatisParticipantRecoveryRegistry(java.nio.file.Files.createDirectory(root.resolve(name+"-recoveries")),transactions.statuses,data,false,Set.of(left.f.groupId,right.f.groupId),RatisParticipantRecoveryRegistry.Limits.defaults());
+            recovery=(group,prepared) -> { assertEquals(0,captures.get()); boolean progress=registry.step(group,prepared); if (progress) helped.incrementAndGet(); return progress; };
         }
         RangeDescriptor route(RatisParticipantPrepareTest.Node node,byte[] lower,byte[] upper) {
             var original=node.directory.ranges().getFirst(); return new RangeDescriptor(original.rangeId(),original.groupId(),1,0,lower,upper,RangeDescriptor.TopologyState.ACTIVE,original.replicas());
@@ -105,17 +110,13 @@ class RatisSnapshotCoordinatorTest {
             }
         }
         RatisSnapshotCoordinator driver(RatisDurableSnapshot journal) throws Exception {
-            return new RatisSnapshotCoordinator(journal,home.homes,data,last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),request -> {
-                try { var node=node(request.participantGroup()); var proposal=request.isRelease() ? node.f.machine.prepareSnapshotRelease(home.homes,fence) : node.f.machine.prepareSnapshotInstall(home.homes,fence);
-                    return new RatisSnapshotCoordinator.Authorization(proposal.request(),proposal::valid,proposal::drained,proposal);
-                } catch (Exception failure) { throw new IOException(failure); }
-            },new RatisSnapshotReadinessHelper(fence,data,(g,participant) -> {
-                assertEquals(0,captures.get()); assertEquals(tx,participant.preparation().transactionId());
-                try { finalize(node(g),control(7)); helped.incrementAndGet(); return true; } catch (Exception failure) { throw new IOException(failure); }
-            }),UUID::randomUUID,Duration.ofSeconds(10));
+            return new RatisSnapshotCoordinator(journal,home.homes,data,last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10));
         }
         long writes() { return home.wire.index+transactions.wire.index+left.wire.index+right.wire.index; }
-        @Override public void close() throws Exception { data.close(); right.close(); left.close(); transactions.close(); home.close(); }
+        @Override public void close() throws Exception { registry.close(); data.close(); right.close(); left.close(); transactions.close(); home.close(); }
+    }
+    RatisSnapshotReadinessHelper readiness(SnapshotFence fence,RatisRoutedClient data,UUID group,RatisSnapshotReadinessHelper.Recovery recovery) {
+        return new RatisSnapshotReadinessHelper(fence,group,(after,limit) -> data.snapshotBlockers(fence,group,after,limit),transaction -> data.preparedParticipant(group,transaction),recovery);
     }
     @Test void compactBlockerCodecOwnsDigestsAndRejectsMalformedCutsOrderingAndCursors() throws Exception {
         try (var f=new Fixture("codec")) {
@@ -148,7 +149,7 @@ class RatisSnapshotCoordinatorTest {
             byte[] request=ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_BLOCKERS,new RatisSnapshotBlockers.Request(f.fence,null,1).encode());
             assertThrows(ExecutionException.class,() -> f.right.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS));
             f.finalize(f.right,control(7)); assertTrue(f.data.snapshotBlockers(f.fence,f.right.f.groupId,null,1).records().isEmpty());
-            assertFalse(new RatisSnapshotReadinessHelper(f.fence,f.data,(group,participant) -> { throw new AssertionError("Empty enumeration performs no recovery"); }).help(f.fence,f.right.f.groupId));
+            assertFalse(readiness(f.fence,f.data,f.right.f.groupId,(group,participant) -> { throw new AssertionError("Empty enumeration performs no recovery"); }).help());
             var home=f.home.homes.read(f.fence.fenceId()); f.home.transition(home,home.abort());
             try (var release=f.right.f.machine.prepareSnapshotRelease(f.home.homes,f.fence)) { helper.append(f.right,release); }
             assertThrows(IOException.class,() -> f.data.snapshotBlockers(f.fence,f.right.f.groupId,null,1));
@@ -160,10 +161,10 @@ class RatisSnapshotCoordinatorTest {
             try (var install=f.right.f.machine.prepareSnapshotInstall(f.home.homes,f.fence)) { helper.append(f.right,install); }
             var first=f.data.snapshotBlockers(f.fence,f.right.f.groupId,null,1); assertTrue(first.more()); assertEquals(tx,first.records().getFirst().transaction());
             var visited=new ArrayList<UUID>();
-            var recovery=new RatisSnapshotReadinessHelper(f.fence,f.data,(group,participant) -> {
+            var recovery=readiness(f.fence,f.data,f.right.f.groupId,(group,participant) -> {
                 UUID selected=participant.preparation().transactionId(); visited.add(selected); if (selected.equals(tx)) throw new IOException("Unavailable recovery authority"); return false;
             });
-            for (int n=0;n<2;n++) { assertThrows(IOException.class,() -> recovery.help(f.fence,f.right.f.groupId)); assertFalse(recovery.help(f.fence,f.right.f.groupId)); }
+            for (int n=0;n<2;n++) { assertThrows(IOException.class,() -> recovery.help()); assertFalse(recovery.help()); }
             assertEquals(List.of(tx,other,tx,other),visited); assertFalse(f.data.snapshotReadiness(f.fence,f.right.f.groupId).ready()); assertEquals(0,f.captures.get());
         }
     }
@@ -184,8 +185,8 @@ class RatisSnapshotCoordinatorTest {
                     }
                 };
                 try (var client=new RatisRoutedClient(f.directory,transport)) {
-                    var readiness=new RatisSnapshotReadinessHelper(f.fence,client,(group,participant) -> { throw new AssertionError("Invalid proof must not reach recovery"); });
-                    assertThrows(IOException.class,() -> readiness.help(f.fence,f.right.f.groupId));
+                    var readiness=readiness(f.fence,client,f.right.f.groupId,(group,participant) -> { throw new AssertionError("Invalid proof must not reach recovery"); });
+                    assertThrows(IOException.class,() -> readiness.help());
                 }
             }
         }

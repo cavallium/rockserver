@@ -140,15 +140,10 @@ class RatisParticipantRecoveryTest {
         try (var f=fixture("durable-snapshot-helper")) {
             f.committedTransactionWithRightStillPrepared();
             try (var local=create(root.resolve("helper-local.journal"),f,helper.tx); var recovery=recovery(local,f,false)) {
+                f.recovery=(group,prepared) -> { assertEquals(local.snapshot().prepared(),prepared); return recovery.step().action()!=RatisParticipantRecovery.Action.WAITING; };
                 var initial=SnapshotFenceStatus.begin(f.fence);
                 try (var snapshots=RatisDurableSnapshot.create(root.resolve("helper-snapshot.journal"),f.home.homes,f.data,initial,f.home.homes.prepare(helper.control(50),null,initial),f.directory.ranges());
-                        var coordinator=new RatisSnapshotCoordinator(snapshots,f.home.homes,f.data,last -> helper.control(last.sequence()+1),request -> {
-                            try { var node=f.node(request.participantGroup()); var proposal=request.isRelease() ? node.f.machine.prepareSnapshotRelease(f.home.homes,f.fence) : node.f.machine.prepareSnapshotInstall(f.home.homes,f.fence);
-                                return new RatisSnapshotCoordinator.Authorization(proposal.request(),proposal::valid,proposal::drained,proposal);
-                            } catch (Exception failure) { throw new IOException(failure); }
-                        },new RatisSnapshotReadinessHelper(f.fence,f.data,(group,prepared) -> {
-                            assertEquals(local.snapshot().prepared(),prepared); return recovery.step().action()!=RatisParticipantRecovery.Action.WAITING;
-                        }),UUID::randomUUID,java.time.Duration.ofSeconds(10))) {
+                        var coordinator=new RatisSnapshotCoordinator(snapshots,f.home.homes,f.data,last -> helper.control(last.sequence()+1),UUID::randomUUID,java.time.Duration.ofSeconds(10))) {
                     boolean complete=false;
                     for (int n=0;n<32 && !complete;n++) { long before=f.writes(); complete=coordinator.step().complete(); assertTrue(f.writes()-before<=1); }
                     assertTrue(complete); assertNotNull(local.snapshot().outcome()); assertEquals(SnapshotFenceStatus.Phase.COMPLETE,snapshots.snapshot().observedHome().phase());

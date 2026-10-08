@@ -43,6 +43,7 @@ public record RatisSnapshotRecord(SnapshotFence fence,UUID participantGroup,Snap
         return new Result(gate.released());
     }
     public record Result(ApplyPosition position) {
+        public static final int MAX_BYTES=28;
         public Result { if (position!=null && (position.term()<=0 || position.index()<=0)) throw new IllegalArgumentException("Invalid snapshot gate receipt position"); }
         public boolean suppressed() { return position==null; }
         public byte[] encode() {

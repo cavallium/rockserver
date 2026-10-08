@@ -128,6 +128,17 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         if (observed==null || observed.terminal()) throw new IllegalStateException("INSTALL requires observed INSTALLING home");
         data.restoreSnapshotGate(RatisSnapshotRecord.install(initial.fence(),group),entry.route); entry.installFrozen=true; persist();
     }
+    /** Abandon only unreceipted INSTALL authority; frozen bytes remain available for a later exact retry. */
+    void cancelInstall(UUID group) throws IOException {
+        Entry entry;
+        synchronized (this) {
+            idle(); entry=entry(group);
+            if (!entry.installFrozen || entry.installReceipt!=null || entry.releaseReceipt!=null || entry.gate!=null && entry.gate.released()!=null) return;
+            active=true;
+        }
+        try { data.cancelSnapshotGate(data.restoreSnapshotGate(RatisSnapshotRecord.install(initial.fence(),group),entry.route)); }
+        finally { end(); }
+    }
     public RatisSnapshotRecord.Result executeInstall(UUID group) throws IOException {
         Entry entry;
         synchronized (this) { idle(); entry=entry(group); if (!entry.installFrozen) throw new IllegalStateException("INSTALL is not frozen"); active=true; }

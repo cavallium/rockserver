@@ -79,6 +79,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final LeadershipSource leadershipSource;
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
+    @FunctionalInterface interface SnapshotHelpAction { boolean run() throws Exception; }
+    @FunctionalInterface interface SnapshotHelpExecutor { CompletableFuture<Boolean> submit(UUID group,ScopedTransactionRpc.SnapshotBinding binding,SnapshotHelpAction action); }
+    @FunctionalInterface interface ProofQueryAction { Message run(byte[] ownedRequest) throws Exception; }
+    @FunctionalInterface interface ProofQueryExecutor { CompletableFuture<Message> submit(UUID group,byte[] encoded,boolean coalesce,ProofQueryAction action); }
+    private SnapshotHelpExecutor snapshotHelpExecutor;
+    private ProofQueryExecutor proofQueries;
+    private RatisSnapshotReadinessHelper.Recovery snapshotRecovery;
+    private final HashMap<UUID,RatisSnapshotReadinessHelper> snapshotHelpers=new HashMap<>();
     private RatisSnapshotFences snapshotHomes;
     private RatisTransactionStatuses transactionHomes;
     @FunctionalInterface interface HomeRecoveryProofReader { it.cavallium.rockserver.core.common.distributed.ParticipantOutcome read(HomeRecovery recovery) throws IOException; }
@@ -95,7 +103,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (getLifeCycleState()!=LifeCycle.State.NEW || roleConfigured) throw new IllegalStateException("Range role is fixed before initialization");
         java.util.Objects.requireNonNull(role);
         boolean home=role==RatisNodePlan.Role.TRANSACTION_HOME || role==RatisNodePlan.Role.SNAPSHOT_HOME;
-        if (home!=(values!=null) || role!=RatisNodePlan.Role.DATA && (snapshotHomes!=null || transactionHomes!=null)) throw new IllegalArgumentException("Invalid range role capabilities");
+        if (home!=(values!=null) || role!=RatisNodePlan.Role.DATA && (snapshotHomes!=null || transactionHomes!=null || snapshotRecovery!=null)) throw new IllegalArgumentException("Invalid range role capabilities");
         this.role=role; homeValues=values; roleConfigured=true;
     }
     private void requireDataRole() { if (role!=RatisNodePlan.Role.DATA) throw new IllegalStateException("Range role does not support DATA transaction/snapshot operations"); }
@@ -128,6 +136,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void validateRoleNativeState() throws IOException {
         if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.homeRecoveryCapacity().effectiveCount()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
         if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
+    }
+    void proofQueries(ProofQueryExecutor executor) {
+        if (getLifeCycleState()!=LifeCycle.State.NEW || proofQueries!=null) throw new IllegalStateException("Proof query dispatcher is fixed before initialization");
+        proofQueries=java.util.Objects.requireNonNull(executor);
+    }
+    void snapshotRecovery(RatisSnapshotReadinessHelper.Recovery recovery,SnapshotHelpExecutor executor) {
+        requireDataRole();
+        if (getLifeCycleState()!=LifeCycle.State.NEW || snapshotRecovery!=null) throw new IllegalStateException("Snapshot recovery is fixed before initialization");
+        snapshotRecovery=java.util.Objects.requireNonNull(recovery); snapshotHelpExecutor=java.util.Objects.requireNonNull(executor);
     }
     void transactionHomes(RatisTransactionStatuses homes) {
         requireDataRole();
@@ -1018,6 +1035,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
     private void retireSnapshotOwners(SnapshotGate record) {
+        if (record.released()!=null) snapshotHelpers.remove(record.fence().fenceId());
         materializeSnapshotCharge(record.fence());
         for (var plan:List.copyOf(preparedSnapshots.values())) {
             try { if (plan.request.receipt(record)!=null) plan.close(); } catch (IllegalArgumentException different) { /* Another speculative definition is not proof. */ }
@@ -1322,6 +1340,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private record NativeAdmissionProof(List<Admission> settled,List<Admission> terminalScopes) {}
     private void invalidateProposalCandidates() { synchronized (admissions) { invalidateUnsubmitted(); } }
     private void invalidateUnsubmitted() {
+        snapshotHelpers.clear();
         proposalFootprints.invalidateCandidates();
         for (var plan:preparedCommits.values()) { plan.closed=true; preparedCommitBytes-=plan.bytes; }
         preparedCommits.clear();
@@ -2031,17 +2050,116 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             byte[] encoded = request.getContent().toByteArray();
             int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
             if (!ScopedTransactionRpc.ownerSnapshot(kind)) requireHealthy();
+            if (kind==ScopedTransactionRpc.SNAPSHOT_HELP) return snapshotHelpQuery(encoded,freshBarrier);
+            if (kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
+                // Reject before coalescing: a stale request must never borrow a fresh request's authority.
+                if (!freshBarrier) throw new IOException("Proof preparation requires a fresh linearizable barrier");
+                if (kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE) {
+                    if (role!=RatisNodePlan.Role.TRANSACTION_HOME) throw new IOException("Only transaction HOME prepares protected recovery");
+                } else requireDataRole();
+            }
+            if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) requireDataRole();
+            if (kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
+                var executor=proofQueries; if (executor==null) throw new IOException("Bounded proof query dispatcher is not configured");
+                long generation=admissionGeneration.get();
+                return executor.submit(store.ownership().owner().groupId(),encoded,kind!=ScopedTransactionRpc.SNAPSHOT_CAPTURE,ownedRequest -> {
+                    // Owner-specific retained captures deliberately survive leader changes.
+                    if (kind!=ScopedTransactionRpc.SNAPSHOT_CAPTURE && generation!=admissionGeneration.get()) throw new IOException("Proof query lost its read-barrier owner");
+                    return framedQuery(ownedRequest,freshBarrier);
+                });
+            }
             return CompletableFuture.completedFuture(framedQuery(encoded,freshBarrier));
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
         }
     }
 
+    private CompletableFuture<Message> snapshotHelpQuery(byte[] encoded,boolean freshBarrier) throws Exception {
+        if (!freshBarrier) throw new IOException("Snapshot helping requires a fresh linearizable barrier"); requireDataRole();
+        var input=ByteBuffer.wrap(ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES).body());
+        var binding=ScopedTransactionRpc.snapshotBinding(input); end(input); var group=store.ownership().owner().groupId();
+        var executor=snapshotHelpExecutor; if (executor==null || snapshotRecovery==null) throw new IOException("Bounded snapshot recovery is not configured");
+        long generation=admissionGeneration.get();
+        return executor.submit(group,binding,() -> {
+            checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot helper lost its read-barrier owner");
+            var record=store.snapshotGate(binding.fenceId()); boolean helped=false;
+            if (record!=null) {
+                var fence=record.fence();
+                if (!binding.equals(ScopedTransactionRpc.SnapshotBinding.of(fence)) || !group.equals(record.participantGroup())) throw new IOException("Snapshot helper native binding changed");
+                if (record.active()) {
+                    final RatisSnapshotReadinessHelper helper;
+                    synchronized (admissions) {
+                        if (generation!=admissionGeneration.get()) throw new IOException("Snapshot helper owner changed");
+                        var known=snapshotHelpers.get(fence.fenceId());
+                        if (known==null) {
+                            if (snapshotHelpers.size()>=ReplicatedRangeStore.MAX_SNAPSHOT_GATES) throw new IOException("Snapshot helper context budget exhausted");
+                            known=new RatisSnapshotReadinessHelper(fence,group,(after,limit) -> snapshotBlockerPage(fence,after,limit),store::preparedParticipant,snapshotRecovery);
+                            snapshotHelpers.put(fence.fenceId(),known);
+                        }
+                        helper=known;
+                    }
+                    try { helped=helper.help(); }
+                    finally {
+                        boolean remove=generation!=admissionGeneration.get();
+                        if (!remove) {
+                            try { var current=store.recoveredSnapshotGate(fence); remove=current==null || !current.active(); }
+                            catch (RuntimeException | org.rocksdb.RocksDBException unavailable) { remove=true; }
+                        }
+                        // Context cleanup never settles the actual recovery task owned by the dispatcher.
+                        if (remove) synchronized (admissions) { snapshotHelpers.remove(fence.fenceId(),helper); }
+                    }
+                }
+            }
+            checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot helper reply lost its owner");
+            if (record!=null && record.active()) {
+                var after=store.recoveredSnapshotGate(record.fence());
+                if (after==null || !after.active()) throw new IOException("Snapshot gate retired while helping");
+            }
+            return helped;
+        }).thenApply(helped -> {
+            var body=ByteBuffer.allocate(65); ScopedTransactionRpc.snapshotBinding(body,binding); ScopedTransactionRpc.uuid(body,group); body.put((byte)(helped ? 1 : 0));
+            return Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_HELP,body.array())));
+        });
+    }
+    private RatisSnapshotBlockers snapshotBlockerPage(SnapshotFence fence,UUID after,int limit) throws IOException {
+        checkTransactionOwner(); var page=store.snapshotBlockers(fence,after,limit); checkTransactionOwner();
+        var records=page.records().stream().map(p -> new RatisSnapshotBlockers.Reference(p.preparation().transactionId(),p.preparation().digest(),p.position())).toList();
+        return new RatisSnapshotBlockers(ScopedTransactionRpc.SnapshotBinding.of(fence),page.gate().participantGroup(),page.gate().installed(),page.position(),records,page.more());
+    }
+    public void cancelSnapshotGate(RatisSnapshotRecord request) throws IOException {
+        checkTransactionOwner(); requireSnapshotParticipant(request);
+        synchronized (admissions) {
+            var ready=preparedSnapshots.get(request.operation());
+            if (ready!=null) { if (!ready.request.equals(request)) throw new IllegalArgumentException("Snapshot cancellation request changed"); ready.close(); }
+            if (preparingSnapshots.containsKey(request.operation())) throw new IOException("Snapshot HOME read is still active");
+            var admitted=admissions.get(request.operation());
+            if (admitted!=null && (admitted.snapshot==null || !admitted.snapshot.equals(request))) throw new IllegalArgumentException("Snapshot cancellation identity changed");
+        }
+    }
     private Message framedQuery(byte[] encoded,boolean freshBarrier) throws Exception {
         var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
         if (role!=RatisNodePlan.Role.DATA && packet.kind()!=ScopedTransactionRpc.POINT && packet.kind()!=ScopedTransactionRpc.STATE && !(role==RatisNodePlan.Role.TRANSACTION_HOME && ScopedTransactionRpc.homeRecovery(packet.kind()))) throw new IOException("Range role rejects transaction/snapshot queries");
         var input=ByteBuffer.wrap(packet.body()); byte[] reply;
         switch (packet.kind()) {
+            case ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE, ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL -> {
+                if (!freshBarrier) throw new IOException("Snapshot gate authority requires a fresh linearizable barrier");
+                long generation=admissionGeneration.get(); checkTransactionOwner();
+                var request=RatisSnapshotRecord.decode(packet.body()); requireSnapshotParticipant(request);
+                if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL) { cancelSnapshotGate(request); reply=request.digest(); }
+                else {
+                    var receipt=request.receipt(store.recoveredSnapshotGate(request.fence())); boolean drained=true;
+                    if (receipt==null) {
+                        if (snapshotHomes==null) throw new IOException("Qualified snapshot HOME reader is not configured");
+                        var proposal=request.isRelease() ? prepareSnapshotRelease(snapshotHomes,request.fence()) : prepareSnapshotInstall(snapshotHomes,request.fence());
+                        if (!proposal.request().equals(request)) { proposal.close(); throw new IOException("Fresh snapshot HOME authority differs from frozen request"); }
+                        receipt=request.receipt(store.recoveredSnapshotGate(request.fence()));
+                        if (receipt!=null) proposal.close(); else drained=proposal.drained();
+                    }
+                    byte[] retained=receipt==null ? null : receipt.encode(); var output=ByteBuffer.allocate(41+(retained==null ? 0 : retained.length));
+                    ScopedTransactionRpc.putBlob(output,request.digest()); output.put((byte)(receipt!=null ? 2 : drained ? 1 : 0)); ScopedTransactionRpc.putBlob(output,retained); reply=output.array();
+                }
+                checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot authority query lost its owner");
+            }
             case ScopedTransactionRpc.FINALIZATION_PREPARE, ScopedTransactionRpc.FINALIZATION_CANCEL -> {
                 if (!freshBarrier) throw new IOException("Participant finalization requires a fresh linearizable barrier");
                 long generation=admissionGeneration.get(); checkTransactionOwner();

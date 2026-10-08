@@ -104,6 +104,17 @@ class RatisFinalizationRpcTest {
             assertThrows(ExecutionException.class,() -> preparing.get(5,TimeUnit.SECONDS)); f.released();
         }
     }
+    @Test void stalePreparationCannotJoinAnIdenticalBlockedFreshFinalizationRequest() throws Exception {
+        try (var f=new Fixture("fresh-coalesce",false)) {
+            var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
+            f.home.wire.afterRead=() -> { entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new AssertionError("HOME read timed out"); } catch (InterruptedException e) { throw new AssertionError(e); } };
+            var message=Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.FINALIZATION_PREPARE,f.operation.bytes())));
+            var fresh=f.data.f.machine.queryLinearizable(message);
+            try { assertTrue(entered.await(5,TimeUnit.SECONDS)); assertThrows(ExecutionException.class,() -> f.data.f.machine.query(message).get(100,TimeUnit.MILLISECONDS)); }
+            finally { release.countDown(); }
+            fresh.get(5,TimeUnit.SECONDS); f.data.routed.cancelFinalization(f.operation); f.released();
+        }
+    }
     @Test void retainedProofAtCompletedIndexMustHaveTheExactNativeTerm() throws Exception {
         try (var f=new Fixture("corrupt-cut",false)) {
             f.data.f.leadership.set(new RatisRangeStateMachine.Leadership(2,true)); f.data.f.machine.notifyTermIndexUpdated(2,1); f.data.wire.index=1;
