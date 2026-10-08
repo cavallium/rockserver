@@ -147,7 +147,9 @@ public final class RatisRoutedClient implements AutoCloseable {
             }
         }
         for (KeyPredicate predicate : predicates) target = sameRange(target, observed.route(predicate.columnId(), predicate.key()));
-        var command = acknowledgedThrough < 0
+        boolean bucket=mutations.stream().anyMatch(Mutation::bucket) || predicates.stream().anyMatch(KeyPredicate::bucket);
+        var command = bucket ? DistributedCommand.bucketData(target.groupId(),target.rangeEpoch(),observed.schemaDigest(),operation,mutations,predicates,acknowledgedThrough)
+                : acknowledgedThrough < 0
                 ? new DistributedCommand(target.groupId(), target.rangeEpoch(), observed.schemaDigest(), operation, mutations, predicates)
                 : new DistributedCommand(target.groupId(), target.rangeEpoch(), observed.schemaDigest(), operation, mutations, predicates, acknowledgedThrough);
         return new PreparedCommand(observed, target, command);
@@ -193,7 +195,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     /** Restore an immutable user retry route without rebasing it onto the current topology. */
     PreparedCommand restoreSessionCommand(DistributedCommand command,RangeDescriptor descriptor) {
         Objects.requireNonNull(command); Objects.requireNonNull(descriptor); var observed=current();
-        if (command.formatVersion()!=2 && command.formatVersion()!=3 || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
+        if (command.formatVersion()!=2 && command.formatVersion()!=3 && command.formatVersion()!=6 || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
                 || command.mutations().isEmpty() && (command.acknowledgedThrough()<0 || !command.predicates().isEmpty())) {

@@ -11,7 +11,7 @@ import java.util.*;
  * Cached-schema logical point operations for one domain. Borrows the routed client and owns one
  * newly issued session sequence window. Prepared identities survive uncertain replies in this
  * instance; use RatisDurableLogicalSession for recovery across restart.
- * Bucket operations, operators, scans and transactions require their own distributed protocols.
+ * Operators, scans and transactions require their own distributed protocols.
  */
 public final class RatisLogicalClient {
     /** Ordered PUT/DELETE input. Logical keys and values are copied at construction. */
@@ -69,10 +69,14 @@ public final class RatisLogicalClient {
         for (var column:schema.columns()) definitions.put(column.name(),column.schema());
         return Collections.unmodifiableMap(definitions);
     }
-    /** Linearizable point read with exactly the standalone fixed-key encoding. */
+    /** Linearizable point read with the existing physical key codec and complete collision-member lookup. */
     public Buf get(long column,Keys keys) throws IOException {
-        var binding=supported(schema,column); byte[] physical=schema.encodeFixedKey(binding.columnId(),keys);
+        var binding=supported(schema,column); var encoded=schema.encodeLogicalKey(binding.columnId(),keys); byte[] physical=encoded.physicalKey();
         byte[] value=routed.read(binding.columnId(),physical);
+        if (binding.schema().variableLengthKeysCount()!=0) {
+            try { value=schema.decodeBucket(binding.columnId(),physical,value).get(encoded.variableKeys()); }
+            catch (IllegalArgumentException malformed) { throw new IOException("Stored bucket cannot be served completely",malformed); }
+        }
         if (value!=null && !binding.schema().hasValue() && value.length!=0) throw new IOException("Nonempty value in key-only column");
         return value==null ? null : Buf.wrap(value);
     }
@@ -95,17 +99,20 @@ public final class RatisLogicalClient {
         var mutations=new ArrayList<Mutation>(changes.size()); var predicates=new ArrayList<KeyPredicate>(conditions.size());
         long bytes=0;
         for (var change:changes) {
-            var column=supported(schema,change.column); var key=schema.encodeFixedKey(column.columnId(),change.keys);
+            var column=supported(schema,change.column); var encoded=schema.encodeLogicalKey(column.columnId(),change.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
             byte[] value=change.kind==Mutation.Kind.DELETE ? null : storedValue(column,change.value);
-            bytes+=26L+key.length+(value==null ? 0 : value.length); requireBudget(bytes);
-            mutations.add(new Mutation(change.kind,column.columnId(),key,value,change.returns));
+            bytes+=26L+key.length+(value==null ? 0 : value.length)+memberBytes(members); requireBudget(bytes);
+            if (column.schema().variableLengthKeysCount()!=0) mutations.add(change.kind==Mutation.Kind.PUT
+                    ? Mutation.bucketPut(column.columnId(),key,members,value,change.returns)
+                    : Mutation.bucketDelete(column.columnId(),key,members,change.returns));
+            else mutations.add(new Mutation(change.kind,column.columnId(),key,value,change.returns));
         }
         for (var condition:conditions) {
-            var column=supported(schema,condition.column); var key=schema.encodeFixedKey(column.columnId(),condition.keys);
+            var column=supported(schema,condition.column); var encoded=schema.encodeLogicalKey(column.columnId(),condition.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
             // Null is an absence predicate even for value-bearing columns.
             byte[] expected=condition.expected==null ? null : storedValue(column,condition.expected);
-            bytes+=25L+key.length+(expected==null ? 0 : expected.length); requireBudget(bytes);
-            predicates.add(new KeyPredicate(column.columnId(),key,expected));
+            bytes+=25L+key.length+(expected==null ? 0 : expected.length)+memberBytes(members); requireBudget(bytes);
+            predicates.add(column.schema().variableLengthKeysCount()!=0 ? KeyPredicate.bucketMember(column.columnId(),key,members,expected) : new KeyPredicate(column.columnId(),key,expected));
         }
         return new Plan(List.copyOf(mutations),List.copyOf(predicates));
     }
@@ -117,7 +124,7 @@ public final class RatisLogicalClient {
     public long acknowledgedThrough() { return session.acknowledgedThrough(); }
     public Pending prepareAcknowledgement(long column,Keys routingKey) {
         var binding=supported(schema,column);
-        return new Pending(this,session.prepareAcknowledgement(binding.columnId(),schema.encodeFixedKey(binding.columnId(),routingKey)));
+        return new Pending(this,session.prepareAcknowledgement(binding.columnId(),schema.encodeLogicalKey(binding.columnId(),routingKey).physicalKey()));
     }
     /** Separate maintenance owner must retain/retry the returned binding identity before data submission. */
     public RatisRoutedClient.PreparedCommand prepareBinding(RatisSessionEpochs epochs,OperationId issuer,Pending pending,long acknowledgedThrough) throws IOException {
@@ -129,7 +136,6 @@ public final class RatisLogicalClient {
     }
     static DistributedSchema.Column supported(DistributedSchema schema,long column) {
         var binding=schema.column(column);
-        if (binding.schema().variableLengthKeysCount()!=0) throw new UnsupportedOperationException("Logical bucket operations require the distributed bucket protocol");
         if (binding.operator()!=null) throw new UnsupportedOperationException("Logical operator operations require verified distributed operator activation");
         return binding;
     }
@@ -140,6 +146,9 @@ public final class RatisLogicalClient {
         }
         if (value!=null && value.length!=0) throw new IllegalArgumentException("Key-only column requires an empty value");
         return new byte[0];
+    }
+    private static long memberBytes(List<byte[]> members) {
+        if (members.isEmpty()) return 0; long bytes=4; for (var key:members) bytes+=2L+key.length; return bytes;
     }
     private static void requireBudget(long bytes) {
         if (bytes>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Logical command exceeds byte budget");

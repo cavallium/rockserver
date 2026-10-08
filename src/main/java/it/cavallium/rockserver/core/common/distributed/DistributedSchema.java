@@ -103,6 +103,10 @@ public final class DistributedSchema {
         for (Buf key:keys.keys()) { byte[] bytes=key.toByteArray(); System.arraycopy(bytes,0,encoded,offset,bytes.length); offset+=bytes.length; }
         return encoded;
     }
+    public void requireFixedKey(UUID columnId,byte[] encoded) {
+        var shape=fixed(columnId); Objects.requireNonNull(encoded); int bytes=0; for (int width:shape.keys()) bytes+=width;
+        if (encoded.length!=bytes) throw new IllegalArgumentException("Physical fixed key width differs from schema");
+    }
     public Keys decodeFixedKey(UUID columnId,byte[] encoded) {
         var schema=fixed(columnId); Objects.requireNonNull(encoded); int size=0;
         for (int width:schema.keys()) size+=width;
@@ -164,6 +168,13 @@ public final class DistributedSchema {
             for (int b=0;b<digest.length;b++) if (physicalKey[offset+b]!=digest[b]) throw new IllegalArgumentException("Bucket member hash differs from physical key");
             offset+=digest.length;
         }
+    }
+    /** Strict complete-row decoding, including placement of every stored collision member. */
+    public DistributedBucket decodeBucket(UUID columnId,byte[] physicalKey,byte[] raw) {
+        var shape=column(columnId).schema; Objects.requireNonNull(physicalKey); int bytes=0; for (int width:shape.keys()) bytes+=width;
+        if (shape.variableLengthKeysCount()==0 || physicalKey.length!=bytes) throw new IllegalArgumentException("Stored bucket row differs from qualified schema");
+        var bucket=DistributedBucket.decode(shape,raw);
+        for (var member:bucket.members()) requireBucketKey(columnId,physicalKey,member.tails()); return bucket;
     }
     private static byte[] hash(ColumnHashType hash,byte[] key) {
         var result=Buf.createZeroes(hash.bytesSize());

@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.config.DatabaseConfig;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
 import java.io.IOException;
@@ -37,7 +38,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     || shutdownTimeout.compareTo(Duration.ofMinutes(1))>0) throw new IllegalArgumentException("Invalid node resource/lifecycle settings");
         }
     }
-    private final RatisNodePlan plan; private final Path root; private final Settings settings;
+    private final RatisNodePlan plan; private final DistributedSchema logicalSchema; private final Path root; private final Settings settings;
     private final RatisSessionEpochs epochs; private final RatisRoutedClient routed;
     private final RWScheduler scheduler; private final Scheduler timer; private final LongSupplier time;
     private final Map<RaftGroupId,RatisRangeStateMachine> machines=new LinkedHashMap<>();
@@ -53,7 +54,15 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory) throws IOException {
-        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings);
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,null);
+    }
+    public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,schema);
+    }
+    static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema) throws IOException {
+        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema);
         try { node.initialize(config,startup,factory); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
@@ -61,10 +70,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
     }
     private RatisNodeRuntime(RatisNodePlan plan,Path root,RatisSessionEpochs epochs,RatisRoutedClient routed,
-            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings) {
+            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema) {
         this.plan=Objects.requireNonNull(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
         this.routed=Objects.requireNonNull(routed); this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
-        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings);
+        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); logicalSchema=schema;
+        if (schema!=null) schema.requireMatches(plan.directory());
         if (plan.localGroups().stream().anyMatch(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId()))
                 && plan.directory().ranges().size()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
         var catalogue=plan.catalogue(); epochs.requireCatalogueBinding(plan.directory().clusterId(),plan.directory().databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
@@ -117,6 +127,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     var descriptor=plan.directory().ranges().stream().filter(range -> range.groupId().equals(id)).findFirst().orElseThrow();
                     var store=pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(plan.directory().domainId(),plan.directory().columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
                             plan.directory().schemaDigest(),plan.columns(),plan.merges());
+                    if (logicalSchema!=null) store.enableLogicalSchema(logicalSchema);
                     machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),command -> {},epochs,plan.directory(),settings.retention());
                 }
                 machines.put(group.getGroupId(),machine);

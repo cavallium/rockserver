@@ -1758,3 +1758,63 @@ policy limits; exact byte/unsigned-short bounds; full maximum-member decode;
 all existing physical hash codecs, forced collisions and defensive ownership.
 No native bucket mutation, server-process, network/quorum, power-loss or measured
 performance acceptance is claimed. The excluded density fixture remains untouched.
+
+## V6 logical bucket point commands and ordered native atomic RMW
+
+The explicit v6 data envelope now carries BUCKET_PUT/BUCKET_DELETE member keys and
+bucket-member equality/absence predicates, with an optional own-session ACK. It
+can mix those operations with fixed-column point effects in the same range. Old
+constructors still emit v2/v3; v1–v5 bytes, digest branches and replay behavior are
+preserved. V6 point plans reject DELETE_RANGE before sequence allocation. Catalogue
+metadata validators reject bucket data envelopes. Durable routing/window recovery
+preserves the complete v6 payload and frozen original route.
+
+`ReplicatedRangeStore.enableLogicalSchema` installs exact immutable decoding
+material matching native schema digest, domain, columns and projection bounds.
+V6 cannot apply without it. Qualified bucket columns accept member mutations and
+predicates; fixed columns accept existing point operations, including already
+admitted native merge operands. Every incoming and stored member must hash to its
+physical bucket. The schema-bound node service supplies this material before Ratis
+replay. This does not grant schema activation or operator qualification authority.
+Legacy raw physical commands retain their separate existing contract.
+
+Native evaluation checks predicates against the original image, loads each
+original bucket once and stages all member changes in log order, including NONE
+returns. Saved PREVIOUS/CURRENT values refer to logical members. One final row
+replacement per touched bucket is appended to the same WAL-enabled batch as fixed
+column effects, receipt, session metadata and apply marker. Empty buckets preserve
+the standalone empty-row representation. Duplicate identities return the saved
+result without bucket reevaluation, even after later colliding updates.
+
+The fixed v6 apply budget caps original bucket bytes plus retained final staged
+bucket replacements at 16 MiB; per-bucket/member limits and result limits also
+apply. Policy overflow saves the existing canonical RESULT_TOO_LARGE outcome and
+no business effects. Structural corruption or a misplaced stored member fails
+before the marker advances. Precomputed external v6 results are rejected because
+they would bypass ordered RMW. These consensus limits are not replica-local runtime
+settings. Native fixed-key validation avoids materializing decoded key objects.
+
+Both logical clients now encode variable keys with their original collision
+identity, prepare v6 point plans, perform complete bounded bucket reads, distinguish
+key-only empty presence from absence, and preserve explicit consumption/ACK across
+restart. Member bytes count toward aggregate command admission before RPC or
+sequence allocation. No client read/CAS replacement protocol was introduced.
+
+Validation: the established selected `test-compile surefire:test@default-test`
+gate passed 110 core, 19 patched-server and 137 adapter cases (266 total, zero
+failures/errors/skips), exit zero: `/tmp/rockserver-v6-bucket-full-gate.log`.
+Five v6 wire cases preserve old fixtures and exercise canonical mixed plans,
+optional ACKs, copies, truncation and malformed components. Seven native cases
+cover ordered collisions/original predicates, mixed columns, key-only deletion,
+per-bucket/aggregate/result no-effects overload, qualification, malformed and
+misplaced stored data, exact retries after later changes, reopen and snapshot
+install. Three adapter cases cover durable v6 reply loss/recovery and later
+colliding updates, key-only semantics and aggregate member admission. Existing
+session, catalogue, bootstrap, runtime and image consumers still pass.
+
+This establishes local disk/native/interface behavior. All replicas must support
+v6 before it is used; feature-epoch negotiation, mixed-version rollout, real quorum,
+power-loss and measured resource/performance acceptance remain unverified. Scoped
+transactions, range/cursor parity, topology and the other architecture workflows
+remain unfinished. No server process/network probe was run; the excluded density
+fixture was neither staged nor selected. Standalone operation is unchanged.

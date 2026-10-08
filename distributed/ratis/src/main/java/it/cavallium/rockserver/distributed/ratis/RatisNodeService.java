@@ -78,8 +78,8 @@ public final class RatisNodeService implements AutoCloseable {
             var plan=manifest.plan(); var c=plan.catalogue();
             var epochs=new RatisSessionEpochs(resources.catalogue,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
             var node=factory==null
-                    ? RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER)
-                    : RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,factory);
+                    ? RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,manifest.schema())
+                    : RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,factory,manifest.schema());
             return new RatisNodeService(manifest,resources,node);
         } catch (IOException | RuntimeException | Error failure) {
             resources.abort(failure); throw failure;

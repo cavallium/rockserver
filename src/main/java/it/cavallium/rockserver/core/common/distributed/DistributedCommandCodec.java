@@ -5,9 +5,10 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Objects;
+import java.util.List;
 import java.util.UUID;
 
-/** Canonical big-endian v1/v2/v3/v4/v5 encoding; decoded legacy commands retain their original bytes/hash. */
+/** Canonical big-endian v1/v2/v3/v4/v5/v6 encoding; decoded legacy commands retain their original bytes/hash. */
 public final class DistributedCommandCodec {
     public static final int FORMAT_VERSION = 2;
     public static final int MAX_ITEMS = 256;
@@ -37,14 +38,14 @@ public final class DistributedCommandCodec {
         output.putLong(command.operationId().epoch()).putLong(command.operationId().sequence());
         output.putInt(command.mutations().size());
         if (command.formatVersion() >= 2) output.putInt(command.predicates().size());
-        if (command.formatVersion() == 3) output.putLong(command.acknowledgedThrough());
+        if (command.formatVersion() == 3 || command.formatVersion() == 6) output.putLong(command.acknowledgedThrough());
         if (command.formatVersion() == 4) output.putLong(command.minimumSessionEpoch());
         if (command.formatVersion() == 5) {
             output.putLong(command.acknowledgedThrough()).putInt(command.sessionControl().encodedSize()).put(command.sessionControl().encode());
         }
         for (Mutation mutation : command.mutations()) {
             output.put((byte) switch (mutation.kind()) {
-                case PUT -> 1; case DELETE -> 2; case MERGE -> 3; case DELETE_RANGE -> 4;
+                case PUT -> 1; case DELETE -> 2; case MERGE -> 3; case DELETE_RANGE -> 4; case BUCKET_PUT -> 5; case BUCKET_DELETE -> 6;
             });
             output.put((byte) switch (mutation.returnMode()) {
                 case NONE -> 0; case PREVIOUS -> 1; case CURRENT -> 2;
@@ -55,14 +56,16 @@ public final class DistributedCommandCodec {
             output.putInt(key.length).put(key);
             output.putInt(value == null ? -1 : value.length);
             if (value != null) output.put(value);
+            if (mutation.bucket()) putMembers(output,mutation.memberKeys());
         }
         for (KeyPredicate predicate : command.predicates()) {
-            output.put((byte) 1); // v2 key equality/absence
+            output.put((byte) (predicate.bucket() ? 2 : 1)); // v2 physical/v6 member equality or absence
             putUuid(output, predicate.columnId());
             byte[] key = predicate.key();
             byte[] expected = predicate.expectedValue();
             output.putInt(key.length).put(key).putInt(expected == null ? -1 : expected.length);
             if (expected != null) output.put(expected);
+            if (predicate.bucket()) putMembers(output,predicate.memberKeys());
         }
         return output.array();
     }
@@ -74,7 +77,7 @@ public final class DistributedCommandCodec {
         }
         ByteBuffer input = ByteBuffer.wrap(encoded);
         int version = input.getInt();
-        if (version < 1 || version > 5) throw new IllegalArgumentException("Unsupported command version");
+        if (version < 1 || version > 6) throw new IllegalArgumentException("Unsupported command version");
         if (encoded.length < headerBytes(version)) throw new IllegalArgumentException("Truncated command header");
         UUID group = getUuid(input);
         long rangeEpoch = input.getLong();
@@ -83,7 +86,7 @@ public final class DistributedCommandCodec {
         OperationId operation = new OperationId(getUuid(input), input.getLong(), input.getLong());
         int count = input.getInt();
         int predicateCount = version >= 2 ? input.getInt() : 0;
-        long acknowledgedThrough = version == 3 || version == 5 ? input.getLong() : -1;
+        long acknowledgedThrough = version == 3 || version == 5 || version == 6 ? input.getLong() : -1;
         long minimumEpoch = version == 4 ? input.getLong() : -1;
         RangeSessionControl control=null;
         if (version == 5) {
@@ -102,6 +105,8 @@ public final class DistributedCommandCodec {
             Mutation.Kind kind = switch (input.get()) {
                 case 1 -> Mutation.Kind.PUT; case 2 -> Mutation.Kind.DELETE;
                 case 3 -> Mutation.Kind.MERGE; case 4 -> Mutation.Kind.DELETE_RANGE;
+                case 5 -> { if (version!=6) throw new IllegalArgumentException("Bucket mutation requires v6"); yield Mutation.Kind.BUCKET_PUT; }
+                case 6 -> { if (version!=6) throw new IllegalArgumentException("Bucket mutation requires v6"); yield Mutation.Kind.BUCKET_DELETE; }
                 default -> throw new IllegalArgumentException("Unknown mutation kind");
             };
             Mutation.ReturnMode mode = switch (input.get()) {
@@ -117,20 +122,29 @@ public final class DistributedCommandCodec {
             // Check both lengths and the operation shape before allocating either array.
             int valueLength = input.getInt(input.position() + keyLength);
             int available = input.remaining() - keyLength - 4;
-            if (kind == Mutation.Kind.DELETE ? valueLength != -1 : valueLength < 0 || valueLength > available) {
+            if (kind == Mutation.Kind.DELETE || kind == Mutation.Kind.BUCKET_DELETE ? valueLength != -1 : valueLength < 0 || valueLength > available) {
                 throw new IllegalArgumentException("Invalid value length");
+            }
+            boolean bucket=kind==Mutation.Kind.BUCKET_PUT || kind==Mutation.Kind.BUCKET_DELETE;
+            ByteBuffer memberInput=null; List<byte[]> members=List.of();
+            if (bucket) {
+                memberInput=input.duplicate(); memberInput.position(input.position()+keyLength+4+Math.max(0,valueLength)); members=getMembers(memberInput);
             }
             byte[] key = new byte[keyLength];
             input.get(key);
             input.getInt();
             byte[] value = valueLength == -1 ? null : new byte[valueLength];
             if (value != null) input.get(value);
-            mutations.add(new Mutation(kind, column, key, value, mode));
+            if (bucket) {
+                input.position(memberInput.position());
+                mutations.add(kind==Mutation.Kind.BUCKET_PUT ? Mutation.bucketPut(column,key,members,value,mode) : Mutation.bucketDelete(column,key,members,mode));
+            } else mutations.add(new Mutation(kind, column, key, value, mode));
         }
         var predicates = new ArrayList<KeyPredicate>(predicateCount);
         for (int i = 0; i < predicateCount; i++) {
             require(input, 25);
-            if (input.get() != 1) throw new IllegalArgumentException("Unknown predicate kind");
+            int predicateKind=input.get() & 255;
+            if (predicateKind!=1 && (predicateKind!=2 || version!=6)) throw new IllegalArgumentException("Unknown predicate kind");
             UUID column = getUuid(input);
             int keyLength = input.getInt();
             if (keyLength < 0 || keyLength > input.remaining() - 4) {
@@ -140,12 +154,18 @@ public final class DistributedCommandCodec {
             if (expectedLength < -1 || expectedLength > input.remaining() - keyLength - 4) {
                 throw new IllegalArgumentException("Invalid predicate value length");
             }
+            ByteBuffer memberInput=null; List<byte[]> members=List.of();
+            if (predicateKind==2) {
+                memberInput=input.duplicate(); memberInput.position(input.position()+keyLength+4+Math.max(0,expectedLength)); members=getMembers(memberInput);
+            }
             byte[] key = new byte[keyLength];
             input.get(key);
             input.getInt();
             byte[] expected = expectedLength == -1 ? null : new byte[expectedLength];
             if (expected != null) input.get(expected);
-            predicates.add(new KeyPredicate(column, key, expected));
+            if (predicateKind==2) {
+                input.position(memberInput.position()); predicates.add(KeyPredicate.bucketMember(column,key,members,expected));
+            } else predicates.add(new KeyPredicate(column, key, expected));
         }
         if (input.hasRemaining()) throw new IllegalArgumentException("Trailing command bytes");
         return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates, acknowledgedThrough, minimumEpoch, control);
@@ -157,6 +177,21 @@ public final class DistributedCommandCodec {
         } catch (NoSuchAlgorithmException impossible) {
             throw new AssertionError("SHA-256 unavailable", impossible);
         }
+    }
+
+    private static void putMembers(ByteBuffer output,List<byte[]> members) {
+        output.putInt(members.size()); for (byte[] key:members) output.putChar((char)key.length).put(key);
+    }
+    private static List<byte[]> getMembers(ByteBuffer input) {
+        require(input,4); int count=input.getInt();
+        if (count<1 || count>DistributedSchemaCodec.MAX_KEY_COMPONENTS || 2L*count>input.remaining()) throw new IllegalArgumentException("Invalid bucket member component count");
+        int start=input.position();
+        for (int i=0;i<count;i++) {
+            require(input,2); int length=input.getChar(); require(input,length); input.position(input.position()+length);
+        }
+        int end=input.position(); var copy=input.duplicate(); copy.position(start); var keys=new ArrayList<byte[]>(count);
+        for (int i=0;i<count;i++) { int length=copy.getChar(); byte[] key=new byte[length]; copy.get(key); keys.add(key); }
+        input.position(end); return List.copyOf(keys);
     }
 
     private static void require(ByteBuffer input, int count) {

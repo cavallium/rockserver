@@ -46,6 +46,12 @@ public final class DistributedCommand {
                 Objects.requireNonNull(control).authority().minimumEpoch(),control);
     }
 
+    /** v6 raw/bucket data command; an optional ACK belongs to the same issuing session/epoch. */
+    public static DistributedCommand bucketData(UUID groupId,long rangeEpoch,byte[] schemaDigest,OperationId operationId,
+            List<Mutation> mutations,List<KeyPredicate> predicates,long acknowledgedThrough) {
+        return new DistributedCommand(6,groupId,rangeEpoch,schemaDigest,operationId,mutations,predicates,acknowledgedThrough);
+    }
+
     // Decoding retains the original version, including legacy payload/receipt identity.
     DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
                        OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates) {
@@ -67,7 +73,7 @@ public final class DistributedCommand {
     DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
                        OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates,
                        long acknowledgedThrough, long minimumSessionEpoch, RangeSessionControl sessionControl) {
-        if (formatVersion < 1 || formatVersion > 5) throw new IllegalArgumentException("Unsupported command version");
+        if (formatVersion < 1 || formatVersion > 6) throw new IllegalArgumentException("Unsupported command version");
         this.formatVersion = formatVersion;
         this.groupId = Objects.requireNonNull(groupId, "groupId");
         if (rangeEpoch < 0) throw new IllegalArgumentException("Range epoch must be nonnegative");
@@ -78,15 +84,18 @@ public final class DistributedCommand {
         Objects.requireNonNull(mutations, "mutations");
         Objects.requireNonNull(predicates, "predicates");
         if ((formatVersion == 3 ? acknowledgedThrough < 0 || acknowledgedThrough >= operationId.sequence()
-                        : formatVersion == 5 ? acknowledgedThrough < -1 || acknowledgedThrough >= operationId.sequence() : acknowledgedThrough != -1)
-                || (formatVersion >= 4 ? minimumSessionEpoch < 0 || operationId.epoch() < minimumSessionEpoch
+                        : formatVersion == 5 || formatVersion == 6 ? acknowledgedThrough < -1 || acknowledgedThrough >= operationId.sequence() : acknowledgedThrough != -1)
+                || (formatVersion == 4 || formatVersion == 5 ? minimumSessionEpoch < 0 || operationId.epoch() < minimumSessionEpoch
                         || !mutations.isEmpty() || !predicates.isEmpty() : minimumSessionEpoch != -1)
                 || (mutations.isEmpty() && ((formatVersion != 3 && formatVersion != 4 && formatVersion != 5) || !predicates.isEmpty()))
                 || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS
                 || (formatVersion == 1 && !predicates.isEmpty())
+                || (formatVersion == 6 ? mutations.stream().noneMatch(Mutation::bucket) && predicates.stream().noneMatch(KeyPredicate::bucket)
+                        : mutations.stream().anyMatch(Mutation::bucket) || predicates.stream().anyMatch(KeyPredicate::bucket))
                 || (formatVersion == 5 ? sessionControl==null || minimumSessionEpoch!=sessionControl.authority().minimumEpoch() : sessionControl!=null)) {
             throw new IllegalArgumentException("Invalid command items or acknowledgement; v1 has no predicates");
         }
+        if (formatVersion==6 && mutations.stream().anyMatch(mutation -> mutation.kind()==Mutation.Kind.DELETE_RANGE)) throw new IllegalArgumentException("V6 bucket point commands do not support range deletion");
         this.mutations = List.copyOf(mutations);
         this.predicates = List.copyOf(predicates);
         this.acknowledgedThrough = acknowledgedThrough;

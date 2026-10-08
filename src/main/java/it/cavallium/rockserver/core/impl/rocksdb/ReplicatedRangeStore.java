@@ -1,6 +1,11 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
+import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
+import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
 import it.cavallium.rockserver.core.common.distributed.SessionAuthority;
 import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
@@ -49,6 +54,9 @@ import org.rocksdb.TransactionDB;
 public final class ReplicatedRangeStore {
     private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
+    /** V6 consensus bound for original bucket bytes plus retained staged bucket replacements. */
+    public static final long MAX_BUCKET_PLAN_BYTES=16L*1024*1024;
+    private volatile DistributedSchema logicalSchema;
     private final RocksDB db;
     // getBaseDB() is borrowed and does not retain its original Java/native owner.
     private final RocksDB databaseOwner;
@@ -221,6 +229,38 @@ public final class ReplicatedRangeStore {
         finally { applyLane.unlock(); leaveNative(); }
     }
 
+    /** Install exact immutable decoding material before accepting/replaying v6. This grants no schema activation authority. */
+    public void enableLogicalSchema(DistributedSchema schema) {
+        Objects.requireNonNull(schema); enterNative(); applyLane.lock();
+        try {
+            var current=ownership.get(owner).state();
+            if (current!=RangeOwnership.State.ACTIVE && current!=RangeOwnership.State.FENCED) throw new IllegalStateException("Range cannot install decoding schema");
+            int prefix=schema.routingPrefixBytes();
+            if (!Arrays.equals(schemaDigest,schema.digest()) || !interval.domainId().equals(schema.domainId()) || !interval.columns().equals(schema.columnIds())
+                    || logicalSchema!=null && !Arrays.equals(logicalSchema.digest(),schema.digest())
+                    || prefix>0 && (interval.lowerInclusive()!=null && interval.lowerInclusive().length!=prefix
+                            || interval.upperExclusive()!=null && interval.upperExclusive().length!=prefix)) throw new IllegalArgumentException("Logical schema differs from native ownership");
+            logicalSchema=schema;
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    private void validateLogical(DistributedCommand command) {
+        var schema=logicalSchema; if (schema==null) throw new UnsupportedOperationException("V6 bucket decoding schema is not installed");
+        for (var mutation:command.mutations()) {
+            if (mutation.kind()==Mutation.Kind.DELETE_RANGE) throw new IllegalArgumentException("V6 bucket point plans do not contain range deletion");
+            var shape=schema.column(mutation.columnId()).schema(); boolean bucket=shape.variableLengthKeysCount()!=0;
+            if (bucket!=mutation.bucket()) throw new IllegalArgumentException("V6 mutation differs from qualified column kind");
+            if (bucket) schema.requireBucketKey(mutation.columnId(),mutation.key(),mutation.memberKeys());
+            else schema.requireFixedKey(mutation.columnId(),mutation.key());
+            if (!shape.hasValue() && mutation.value()!=null && mutation.value().length!=0) throw new IllegalArgumentException("Key-only mutation has value bytes");
+        }
+        for (var predicate:command.predicates()) {
+            var shape=schema.column(predicate.columnId()).schema(); boolean bucket=shape.variableLengthKeysCount()!=0;
+            if (bucket!=predicate.bucket()) throw new IllegalArgumentException("V6 predicate differs from qualified column kind");
+            if (bucket) schema.requireBucketKey(predicate.columnId(),predicate.key(),predicate.memberKeys());
+            else schema.requireFixedKey(predicate.columnId(),predicate.key());
+            if (!shape.hasValue() && predicate.expectedValue()!=null && predicate.expectedValue().length!=0) throw new IllegalArgumentException("Key-only predicate has value bytes");
+        }
+    }
     public void validate(DistributedCommand command) {
         if (command.sessionControl()!=null && !sessionControlsEnabled) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
@@ -247,6 +287,7 @@ public final class ReplicatedRangeStore {
                 throw new IllegalArgumentException("Predicate outside owned column/interval");
             }
         }
+        if (command.formatVersion()==6) validateLogical(command);
         if (command.mutations().stream().anyMatch(m -> m.returnMode() != Mutation.ReturnMode.NONE)
                 && command.mutations().stream().anyMatch(m -> m.kind() == Mutation.Kind.DELETE_RANGE)) {
             throw new IllegalArgumentException("Point results with range deletion require a range-aware overlay");
@@ -279,7 +320,7 @@ public final class ReplicatedRangeStore {
             throws RocksDBException {
         Objects.requireNonNull(position);
         validate(command);
-        if (result!=null && command.sessionControl()!=null) throw new IllegalArgumentException("Session controls require ordered native evaluation");
+        if (result!=null && (command.sessionControl()!=null || command.formatVersion()==6)) throw new IllegalArgumentException("Session controls require ordered native evaluation");
         if (result != null && !command.predicates().isEmpty()) {
             throw new IllegalArgumentException("Precomputed results require a fully evaluated plan without live predicates");
         }
@@ -322,15 +363,16 @@ public final class ReplicatedRangeStore {
             if (saved==null && sessionStatus!=CommandResult.Status.SUCCESS) {
                 stableResult=new CommandResult(sessionStatus,List.of()).encode(); installUserEffects=false;
             }
+            List<Mutation> effects=command.mutations(); Map<BucketKey,DistributedBucket> bucketEffects=Map.of();
             if (saved == null && stableResult == null) {
                 var evaluated = evaluate(command);
-                stableResult = evaluated.encode();
-                installUserEffects = evaluated.status() == CommandResult.Status.SUCCESS;
+                stableResult = evaluated.result().encode(); effects=evaluated.effects(); bucketEffects=evaluated.buckets();
+                installUserEffects = evaluated.result().status() == CommandResult.Status.SUCCESS;
             }
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                 if (saved == null) {
-                    if (installUserEffects) for (var mutation : command.mutations()) {
+                    if (installUserEffects) for (var mutation : effects) {
                         var cf = columns.get(mutation.columnId());
                         if (cf == null) throw new IllegalArgumentException("Unknown logical column");
                         switch (mutation.kind()) {
@@ -338,8 +380,10 @@ public final class ReplicatedRangeStore {
                             case DELETE -> batch.delete(cf, mutation.key());
                             case MERGE -> batch.merge(cf, mutation.key(), mutation.value());
                             case DELETE_RANGE -> batch.deleteRange(cf, mutation.key(), mutation.value());
+                            case BUCKET_PUT, BUCKET_DELETE -> throw new IllegalStateException("Bucket effect was not lowered into a physical batch");
                         }
                     }
+                    if (installUserEffects) for (var entry:bucketEffects.entrySet()) batch.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
                     if (acceptMaintenance && command.sessionControl()!=null) installSessionControl(batch,command.sessionControl());
                     if (effectiveMinimum > currentEpochFloor) {
                         batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(effectiveMinimum).array());
@@ -444,7 +488,71 @@ public final class ReplicatedRangeStore {
         if (control.binding()) batch.put(state,bindingKey(control.grant().epoch()),control.encode());
     }
 
-    private CommandResult evaluate(DistributedCommand command) throws RocksDBException {
+    private record Evaluation(CommandResult result,List<Mutation> effects,Map<BucketKey,DistributedBucket> buckets) {
+        Evaluation(CommandResult result,List<Mutation> effects) { this(result,effects,Map.of()); }
+    }
+    private Evaluation evaluate(DistributedCommand command) throws RocksDBException {
+        if (command.formatVersion()!=6) return new Evaluation(evaluateLegacy(command),command.mutations());
+        try { return evaluateBuckets(command); }
+        catch (DistributedBucket.LimitExceededException limit) { return new Evaluation(new CommandResult(CommandResult.Status.RESULT_TOO_LARGE,List.of()),List.of()); }
+    }
+    private static final class BucketKey {
+        final UUID column; final byte[] key; final int hash;
+        BucketKey(UUID column,byte[] key) { this.column=column; this.key=key.clone(); hash=31*column.hashCode()+Arrays.hashCode(key); }
+        @Override public int hashCode() { return hash; }
+        @Override public boolean equals(Object other) { return other instanceof BucketKey bucket && column.equals(bucket.column) && Arrays.equals(key,bucket.key); }
+    }
+    private static final class BucketBudget {
+        long bytes;
+        void replace(long previous,long next) {
+            long total=bytes-previous+next;
+            if (total>MAX_BUCKET_PLAN_BYTES) throw new DistributedBucket.LimitExceededException("V6 bucket apply plan exceeds protocol byte budget"); bytes=total;
+        }
+    }
+    private DistributedBucket originalBucket(BucketKey key,Map<BucketKey,DistributedBucket> originals,BucketBudget budget) throws RocksDBException {
+        var bucket=originals.get(key); if (bucket!=null) return bucket;
+        byte[] raw=db.get(columns.get(key.column),key.key); budget.replace(0,raw==null ? 0 : raw.length);
+        bucket=logicalSchema.decodeBucket(key.column,key.key,raw);
+        originals.put(key,bucket); return bucket;
+    }
+    private Evaluation evaluateBuckets(DistributedCommand command) throws RocksDBException {
+        var budget=new BucketBudget(); var originals=new HashMap<BucketKey,DistributedBucket>();
+        for (var predicate:command.predicates()) {
+            byte[] current=predicate.bucket() ? originalBucket(new BucketKey(predicate.columnId(),predicate.key()),originals,budget).get(predicate.memberKeys())
+                    : db.get(columns.get(predicate.columnId()),predicate.key());
+            if (!Arrays.equals(current,predicate.expectedValue())) return new Evaluation(new CommandResult(CommandResult.Status.CONFLICT,List.of()),List.of());
+        }
+        var staged=new LinkedHashMap<BucketKey,DistributedBucket>(); var effects=new ArrayList<Mutation>(); var values=new ArrayList<byte[]>(); long resultBytes=8;
+        try (var overlay=new WriteBatchWithIndex(true); var options=new ReadOptions()) {
+            for (var mutation:command.mutations()) {
+                byte[] value=null;
+                if (mutation.bucket()) {
+                    var key=new BucketKey(mutation.columnId(),mutation.key()); var prior=staged.get(key);
+                    var bucket=prior==null ? originalBucket(key,originals,budget) : prior;
+                    if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=bucket.get(mutation.memberKeys());
+                    var next=mutation.kind()==Mutation.Kind.BUCKET_PUT ? bucket.put(mutation.memberKeys(),mutation.value()) : bucket.remove(mutation.memberKeys());
+                    budget.replace(prior==null ? 0 : prior.encodedSize(),next.encodedSize()); staged.put(key,next);
+                    if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=next.get(mutation.memberKeys());
+                } else {
+                    var cf=columns.get(mutation.columnId()); byte[] key=mutation.key();
+                    if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=overlay.getFromBatchAndDB(db,cf,options,key);
+                    switch (mutation.kind()) {
+                        case PUT -> overlay.put(cf,key,mutation.value()); case DELETE -> overlay.delete(cf,key); case MERGE -> overlay.merge(cf,key,mutation.value());
+                        default -> throw new IllegalStateException("Non-point effect escaped V6 validation");
+                    }
+                    effects.add(mutation);
+                    if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=overlay.getFromBatchAndDB(db,cf,options,key);
+                }
+                if (mutation.returnMode()!=Mutation.ReturnMode.NONE) {
+                    resultBytes+=4L+(value==null ? 0 : value.length);
+                    if (resultBytes>MAX_RESULT_BYTES) return new Evaluation(new CommandResult(CommandResult.Status.RESULT_TOO_LARGE,List.of()),List.of());
+                    values.add(value);
+                }
+            }
+        }
+        return new Evaluation(new CommandResult(CommandResult.Status.SUCCESS,values),List.copyOf(effects),staged);
+    }
+    private CommandResult evaluateLegacy(DistributedCommand command) throws RocksDBException {
         for (var predicate : command.predicates()) {
             byte[] current = db.get(columns.get(predicate.columnId()), predicate.key());
             if (!Arrays.equals(current, predicate.expectedValue())) {
@@ -469,6 +577,7 @@ public final class ReplicatedRangeStore {
                     case DELETE -> overlay.delete(cf, key);
                     case MERGE -> overlay.merge(cf, key, mutation.value());
                     case DELETE_RANGE -> throw new IllegalStateException("Range result plan escaped validation");
+                    case BUCKET_PUT, BUCKET_DELETE -> throw new IllegalStateException("Bucket command escaped V6 evaluation");
                 }
                 if (mutation.returnMode() == Mutation.ReturnMode.CURRENT) {
                     value = overlay.getFromBatchAndDB(db, cf, options, key);

@@ -89,6 +89,7 @@ public final class RatisCatalogue {
         if (rangeEpoch < 0 || schemaDigest.length != 32) throw new IllegalArgumentException("Invalid catalogue validator schema");
         byte[] digest = schemaDigest.clone();
         return command -> {
+            if (command.formatVersion()==6) throw new IllegalArgumentException("Catalogue does not accept bucket data commands");
             if (!command.groupId().equals(groupId) || command.rangeEpoch() != rangeEpoch
                     || !Arrays.equals(command.schemaDigest(), digest)) {
                 throw new IllegalArgumentException("Wrong catalogue identity/schema");

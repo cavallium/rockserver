@@ -60,7 +60,7 @@ class RatisLogicalClientTest {
     @Test void unsupportedSchemasInvalidInputsAndCrossRangeAtomicPlansNeverSubmitOrConsumeIdentity() throws Exception {
         try (var f=new Fixture(root)) {
             int sent=f.sent.size(),reads=f.reads;
-            assertThrows(UnsupportedOperationException.class,() -> f.logical.get(101,key(1)));
+            assertThrows(IllegalArgumentException.class,() -> f.logical.get(101,new Keys(Buf.wrap(new byte[8]))));
             assertThrows(UnsupportedOperationException.class,() -> f.logical.preparePut(111,key(1),Buf.wrap(new byte[]{1}),Mutation.ReturnMode.NONE));
             assertThrows(IllegalArgumentException.class,() -> f.logical.get(999,key(1)));
             assertThrows(IllegalArgumentException.class,() -> f.logical.get(71,new Keys(Buf.wrap(new byte[8]))));
@@ -110,7 +110,7 @@ class RatisLogicalClientTest {
             for (var range:directory.ranges()) {
                 var store=catalogue.pool.openRange(new RangeOwnership.Owner(range.groupId(),1),new RangeOwnership.Interval(domain,schema.columnIds(),range.lowerInclusive(),range.upperExclusive()),
                         schema.digest(),Map.of(outer.data,"data",keyOnly,"keys",bucket,"buckets",operated,"sum"),Set.of());
-                store.enableSessionControls(); stores.put(range.groupId(),store); positions.put(range.groupId(),0L);
+                store.enableSessionControls(); store.enableLogicalSchema(schema); stores.put(range.groupId(),store); positions.put(range.groupId(),0L);
             }
             transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor range,UUID column,byte[] key) throws IOException {

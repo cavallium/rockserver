@@ -69,6 +69,7 @@ public final class DistributedBucket {
         if (input.hasRemaining()) throw new IllegalArgumentException("Trailing stored bucket bytes");
         return count==0 ? empty : new DistributedBucket(empty.tailCount,empty.hasValue,members);
     }
+    public int encodedSize() { return encodedBytes; }
     public byte[] encode() {
         if (members.isEmpty()) return new byte[0];
         var output=ByteBuffer.allocate(encodedBytes).putInt(members.size());

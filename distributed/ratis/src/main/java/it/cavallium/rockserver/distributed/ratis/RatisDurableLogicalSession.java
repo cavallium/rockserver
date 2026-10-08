@@ -117,7 +117,11 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
     public long acknowledgedThrough() throws IOException { return run(() -> window.acknowledgedThrough()); }
     public Buf get(long column,Keys keys) throws IOException {
         return run(() -> {
-            var binding=RatisLogicalClient.supported(schema,column); byte[] value=routed.read(binding.columnId(),schema.encodeFixedKey(binding.columnId(),keys));
+            var binding=RatisLogicalClient.supported(schema,column); var encoded=schema.encodeLogicalKey(binding.columnId(),keys); byte[] value=routed.read(binding.columnId(),encoded.physicalKey());
+            if (binding.schema().variableLengthKeysCount()!=0) {
+                try { value=schema.decodeBucket(binding.columnId(),encoded.physicalKey(),value).get(encoded.variableKeys()); }
+                catch (IllegalArgumentException malformed) { throw new IOException("Stored bucket cannot be served completely",malformed); }
+            }
             if (value!=null && !binding.schema().hasValue() && value.length!=0) throw new IOException("Nonempty key-only value"); return value==null ? null : Buf.wrap(value);
         });
     }
@@ -129,7 +133,7 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
     public CommandResult execute(Pending pending) throws IOException { return run(() -> window.execute(owned(pending))); }
     public void acknowledge(Pending pending) throws IOException { run(() -> { window.acknowledge(owned(pending)); return null; }); }
     public Pending prepareAcknowledgement(long column,Keys keys) throws IOException {
-        return run(() -> { var binding=RatisLogicalClient.supported(schema,column); return new Pending(this,window.prepareAcknowledgement(binding.columnId(),schema.encodeFixedKey(binding.columnId(),keys))); });
+        return run(() -> { var binding=RatisLogicalClient.supported(schema,column); return new Pending(this,window.prepareAcknowledgement(binding.columnId(),schema.encodeLogicalKey(binding.columnId(),keys).physicalKey())); });
     }
     /** Explicit durable first-use binding; ordinary execution performs no catalogue lookup. */
     public CommandResult ensureBinding(Pending pending) throws IOException {

@@ -148,7 +148,8 @@ class RatisSessionPropagationTest {
         final RatisRoutedClient routed; final byte[] dataSchemaDigest; int submissions,metadataReads,customerReads; CountDownLatch started,release;
         Fixture(Path root) throws Exception { this(root,true); }
         Fixture(Path root,boolean initialized) throws Exception { this(root,initialized,new byte[32]); }
-        Fixture(Path root,boolean initialized,byte[] dataSchemaDigest) throws Exception {
+        Fixture(Path root,boolean initialized,byte[] dataSchemaDigest) throws Exception { this(root,initialized,dataSchemaDigest,null); }
+        Fixture(Path root,boolean initialized,byte[] dataSchemaDigest,DistributedSchema schema) throws Exception {
             this.dataSchemaDigest=dataSchemaDigest.clone();
             catalogue=outer.new Fixture(root.resolve("catalogue"));
             var initial=SessionEpochLedger.initial(outer.cluster,outer.database,10);
@@ -160,7 +161,7 @@ class RatisSessionPropagationTest {
                 var group=descriptor.groupId(); var peer=RaftPeer.newBuilder().setId(descriptor.replicas().getFirst().peerId()).build();
                 var raft=RaftGroup.valueOf(RaftGroupId.valueOf(group),peer); raftGroups.put(group,raft);
                 var store=catalogue.pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(directory.domainId(),Set.of(outer.data),descriptor.lowerInclusive(),descriptor.upperExclusive()),
-                        this.dataSchemaDigest,Map.of(outer.data,"data"),Set.of()); stores.put(group,store);
+                        this.dataSchemaDigest,Map.of(outer.data,"data"),Set.of()); if (schema!=null) store.enableLogicalSchema(schema); stores.put(group,store);
                 var machine=RatisRangeStateMachine.withSessions(store,raft,RatisSessionBindingTest.Fixture.LIMITS,command -> {},catalogue.epochs,directory,
                         RatisRangeStateMachine.RetentionLimits.defaults(),() -> new RatisRangeStateMachine.Leadership(1,true)); machines.put(group,machine);
                 var nativeStorage=RaftStorage.newBuilder().setDirectory(root.resolve(group.toString()).toFile()).setOption(RaftStorage.StartupOption.FORMAT)
