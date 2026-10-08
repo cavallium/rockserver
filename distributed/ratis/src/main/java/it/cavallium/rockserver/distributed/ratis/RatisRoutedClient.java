@@ -72,6 +72,15 @@ public final class RatisRoutedClient implements AutoCloseable {
             if (!proof.group().equals(group) || !proof.binding().equals(ScopedTransactionRpc.SnapshotBinding.of(fence))) throw new IllegalArgumentException("Snapshot readiness binding changed"); return proof;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot readiness reply",malformed); }
     }
+    public RatisSnapshotBlockers snapshotBlockers(SnapshotFence fence,UUID group,UUID after,int limit) throws IOException {
+        var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+        requireSnapshotRoute(observed,route,fence,group); var request=new RatisSnapshotBlockers.Request(fence,after,limit);
+        try {
+            var page=RatisSnapshotBlockers.decode(transaction(route,ScopedTransactionRpc.SNAPSHOT_BLOCKERS,request.encode(),true));
+            if (!page.binding().equals(ScopedTransactionRpc.SnapshotBinding.of(fence)) || !page.group().equals(group) || page.records().size()>limit
+                    || after!=null && page.records().stream().anyMatch(r -> r.transaction().compareTo(after)<=0)) throw new IllegalArgumentException("Snapshot blocker page binding/cursor changed"); return page;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot blocker page",malformed); }
+    }
     public SnapshotTarget snapshotTarget(SnapshotFence fence,UUID group) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group);

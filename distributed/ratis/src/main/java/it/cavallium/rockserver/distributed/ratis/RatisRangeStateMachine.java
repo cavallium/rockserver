@@ -1791,6 +1791,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var binding=ScopedTransactionRpc.SnapshotBinding.of(fence);
                 reply=new RatisSnapshotReadiness(binding,store.ownership().owner().groupId(),record==null ? null : record.installed(),ready).encode();
             }
+            case ScopedTransactionRpc.SNAPSHOT_BLOCKERS -> {
+                if (!freshBarrier) throw new IOException("Snapshot blockers require a fresh linearizable barrier");
+                var request=RatisSnapshotBlockers.Request.decode(packet.body()); checkTransactionOwner();
+                var page=store.snapshotBlockers(request.fence(),request.after(),request.limit()); checkTransactionOwner();
+                var records=page.records().stream().map(p -> new RatisSnapshotBlockers.Reference(p.preparation().transactionId(),p.preparation().digest(),p.position())).toList();
+                reply=new RatisSnapshotBlockers(ScopedTransactionRpc.SnapshotBinding.of(request.fence()),page.gate().participantGroup(),page.gate().installed(),page.position(),records,page.more()).encode();
+            }
             case ScopedTransactionRpc.SNAPSHOT_CAPTURE -> {
                 var capture=RatisSnapshotCaptureRequest.decode(packet.body()); SnapshotFenceStatus.Capture token=null;
                 if (capture.owner().equals(transactionIncarnation)) {

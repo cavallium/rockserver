@@ -656,6 +656,21 @@ public final class ReplicatedRangeStore {
         try { requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); return preparedIndex.records().stream().filter(p -> !isFinalized(p.preparation().transactionId()) && p.preparation().scope().intersects(scope)).toList(); }
         finally { applyLane.unlock(); leaveNative(); }
     }
+    public record SnapshotBlockerPage(SnapshotGate gate,ApplyPosition position,List<PreparedParticipant> records,boolean more) {
+        public SnapshotBlockerPage { records=List.copyOf(records); }
+    }
+    /** Exclusive transaction-ID pagination at one native cut; an active gate prevents new positive blockers. */
+    public SnapshotBlockerPage snapshotBlockers(SnapshotFence fence,UUID after,int limit) {
+        Objects.requireNonNull(fence); if (limit<1 || limit>16) throw new IllegalArgumentException("Invalid snapshot blocker page limit");
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope();
+            var records=preparedIndex.records().stream().filter(p -> !isFinalized(p.preparation().transactionId()) && p.preparation().scope().intersects(scope)
+                    && (after==null || p.preparation().transactionId().compareTo(after)>0)).sorted(java.util.Comparator.comparing(p -> p.preparation().transactionId())).limit(limit+1L).toList();
+            boolean more=records.size()>limit;
+            return new SnapshotBlockerPage(snapshotGates.get(fence.fenceId()),applied,more ? records.subList(0,limit) : records,more);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     public ScopedSnapshot captureGate(SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(fence); enterNative(); applyLane.lock();
         try { requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
