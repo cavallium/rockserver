@@ -12,6 +12,7 @@ import org.rocksdb.RateLimiter;
 
 /** Owns the only policy thread. Close joins it before any sampled native object may close. */
 final class CompactionIoController implements AutoCloseable {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(CompactionIoController.class);
     private final java.util.concurrent.ScheduledExecutorService executor;
     private final List<Meter> meters;
     private final MeterRegistry registry;
@@ -42,7 +43,9 @@ final class CompactionIoController implements AutoCloseable {
                 } catch (VirtualMachineError fatal) {
                     throw fatal;
                 } catch (Throwable failure) {
-                    failures.incrementAndGet();
+                    if (failures.getAndIncrement() == 0) {
+                        LOG.warn("Compaction I/O sampling or adjustment failed for database '{}'", name, failure);
+                    }
                     long restored = budget.sample(new CompactionIoBudget.Sample(System.nanoTime(), 0, 0, 0,
                             false, false, false, false));
                     try {

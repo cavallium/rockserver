@@ -3094,9 +3094,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					long limit = column.effectiveSoftPendingCompactionBytesLimit();
 					pressure |= limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
 					recoveryClear &= !(limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit - limit / 5) >= 0);
-					long levelZeroFiles = nativeDb.getLongProperty(column.handle(), "rocksdb.num-files-at-level0");
-					pressure |= levelZeroFiles >= 20;
-					recoveryClear &= levelZeroFiles < 16;
+					long levelZeroFiles = Long.parseUnsignedLong(nativeDb.getProperty(column.handle(), "rocksdb.num-files-at-level0"));
+					pressure |= Long.compareUnsigned(levelZeroFiles, 20) >= 0;
+					recoveryClear &= Long.compareUnsigned(levelZeroFiles, 16) < 0;
 				} finally { if (registered != null) registered.endUse(); }
 			}
 			try (var statistics = dbOptions.statistics()) {

@@ -54,6 +54,109 @@ class CompactionIoIntegrationTest {
             assertEquals(value, api.get(0, api.getColumnId("data"), key, RequestType.current()));
         }
     }
+    @Test void healthyNativeSamplerReadsL0FilesAndPollsWithoutFailures(@TempDir Path root) throws Exception {
+        var cfg = config(root, "database.metrics.jmx.enabled=false\n"
+                + "database.metrics.influx.enabled=false\n");
+        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        try (var connection = new EmbeddedConnection(root.resolve("db"), "healthy-native-sampler", cfg)) {
+            var internal = connection.getInternalDB();
+            ((io.micrometer.core.instrument.composite.CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
+            var api = connection.getSyncApi(RequestContext.batch());
+            var column = api.createColumn("sampler-data", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+            var controllerField = internal.getClass().getDeclaredField("compactionIoController");
+            controllerField.setAccessible(true);
+            var controller = controllerField.get(internal);
+            var limiterField = controller.getClass().getDeclaredField("limiter");
+            limiterField.setAccessible(true);
+            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
+            var sampleMethod = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            sampleMethod.setAccessible(true);
+            var empty = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+            assertTrue(empty.valid());
+            assertFalse(empty.pressure());
+            assertTrue(empty.recoveryClear());
+
+            api.put(0, column, new Keys(Buf.wrap(new byte[]{1})), Buf.wrap(new byte[]{2}), RequestType.none());
+            api.flush();
+            var dbField = internal.getClass().getDeclaredField("db");
+            dbField.setAccessible(true);
+            var nativeDb = ((it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB) dbField.get(internal)).get();
+            var columnsField = internal.getClass().getDeclaredField("columns");
+            columnsField.setAccessible(true);
+            var handle = ((it.cavallium.rockserver.core.impl.ColumnInstance)
+                    ((java.util.Map<?, ?>) columnsField.get(internal)).get(column)).cfh();
+            assertTrue(Long.parseUnsignedLong(nativeDb.getProperty(handle, "rocksdb.num-files-at-level0")) > 0,
+                    "the regression must sample a real flushed L0 SST");
+            assertThrows(org.rocksdb.RocksDBException.class,
+                    () -> nativeDb.getLongProperty(handle, "rocksdb.num-files-at-level0"),
+                    "the native registry exposes this count only through the string-property API");
+            var flushed = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+            assertTrue(flushed.valid());
+            assertFalse(flushed.pressure());
+            assertTrue(flushed.recoveryClear());
+            var polls = new CountDownLatch(2);
+            internal.setCompactionIoSampleObserverForTesting(polls::countDown);
+            assertTrue(polls.await(5, TimeUnit.SECONDS));
+            assertTimeoutPreemptively(java.time.Duration.ofSeconds(2), () -> {
+                while (internal.getPendingOpsCount() != 0) Thread.sleep(10);
+            });
+            assertEquals(0, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
+            var collectorField = internal.getClass().getDeclaredField("rocksDBStatistics");
+            collectorField.setAccessible(true);
+            var collector = collectorField.get(internal);
+            var executorField = collector.getClass().getDeclaredField("executor");
+            executorField.setAccessible(true);
+            var collectorThread = (Thread) executorField.get(collector);
+            var optionsField = internal.getClass().getDeclaredField("dbOptions");
+            optionsField.setAccessible(true);
+            var readCounter = registry.get("rocksdb.statistics").tag("ticker_name", "NUMBER_KEYS_READ").counter();
+            var writeCounter = registry.get("rocksdb.statistics").tag("ticker_name", "NUMBER_KEYS_WRITTEN").counter();
+            double initialReadExport = readCounter.count();
+            double initialWriteExport = writeCounter.count();
+            api.put(0, column, new Keys(Buf.wrap(new byte[]{1})), Buf.wrap(new byte[]{2}), RequestType.none());
+            assertNotNull(api.get(0, column, new Keys(Buf.wrap(new byte[]{1})), RequestType.current()));
+            collectorThread.interrupt();
+            assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                while (readCounter.count() <= initialReadExport || writeCounter.count() <= initialWriteExport) Thread.sleep(10);
+            });
+            try (var nativeStatistics = ((org.rocksdb.DBOptions) optionsField.get(internal)).statistics()) {
+                long previousReads = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ);
+                long previousWrites = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN);
+                double previousReadExport = readCounter.count();
+                double previousWriteExport = writeCounter.count();
+                long previousCompletions = ((it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                        sampleMethod.invoke(internal, limiter)).foregroundCompletions();
+                for (int cycle = 0; cycle < 5; cycle++) {
+                    if (cycle == 3) nativeStatistics.reset();
+                    api.put(0, column, new Keys(Buf.wrap(new byte[]{1})), Buf.wrap(new byte[]{2}), RequestType.none());
+                    assertNotNull(api.get(0, column, new Keys(Buf.wrap(new byte[]{1})), RequestType.current()));
+                    long reads = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ);
+                    long writes = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN);
+                    double expectedReadExport = previousReadExport + (cycle == 3 ? reads : reads - previousReads);
+                    double expectedWriteExport = previousWriteExport + (cycle == 3 ? writes : writes - previousWrites);
+                    collectorThread.interrupt();
+                    assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                        while (readCounter.count() < expectedReadExport || writeCounter.count() < expectedWriteExport) Thread.sleep(10);
+                    });
+                    assertEquals(expectedReadExport, readCounter.count(), "each native read must be exported once");
+                    assertEquals(expectedWriteExport, writeCounter.count(), "each native write must be exported once");
+                    assertEquals(reads, nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ));
+                    assertEquals(writes, nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN));
+                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+                    assertTrue(sample.valid());
+                    assertEquals(reads + writes, sample.foregroundCompletions());
+                    if (cycle != 3) assertTrue(sample.foregroundCompletions() > previousCompletions);
+                    else assertTrue(sample.foregroundCompletions() < previousCompletions, "a genuine native reset starts a new epoch");
+                    previousReads = reads;
+                    previousWrites = writes;
+                    previousReadExport = expectedReadExport;
+                    previousWriteExport = expectedWriteExport;
+                    previousCompletions = sample.foregroundCompletions();
+                }
+            }
+            assertEquals(0, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
+        } finally { registry.close(); }
+    }
     @Test void closeJoinsSamplerBeforeClosingNativeResources(@TempDir Path root) throws Exception {
         var connection = new EmbeddedConnection(root.resolve("db"), "adaptive-close", config(root, ""));
         var entered = new CountDownLatch(1);

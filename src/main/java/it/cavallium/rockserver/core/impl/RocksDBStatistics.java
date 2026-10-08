@@ -318,12 +318,25 @@ public class RocksDBStatistics {
 		}
 
 		this.executor = new Thread(() -> {
+			long lastKeysRead = 0;
+			long lastKeysWritten = 0;
 			while (!stopRequested) {
 				var taskStartTime = System.nanoTime();
 
 				try {
 					for (TickerType tickerType : tickerMap.keySet()) {
-						var tickerCount = statistics.getAndResetTickerCount(tickerType);
+						double tickerCount;
+						if (tickerType == TickerType.NUMBER_KEYS_READ || tickerType == TickerType.NUMBER_KEYS_WRITTEN) {
+							// The compaction controller samples these native counters cumulatively.
+							long current = statistics.getTickerCount(tickerType);
+							long previous = tickerType == TickerType.NUMBER_KEYS_READ ? lastKeysRead : lastKeysWritten;
+							long delta = Long.compareUnsigned(current, previous) >= 0 ? current - previous : current;
+							tickerCount = delta >= 0 ? delta : 0x1.0p63 + (delta & Long.MAX_VALUE);
+							if (tickerType == TickerType.NUMBER_KEYS_READ) lastKeysRead = current;
+							else lastKeysWritten = current;
+						} else {
+							tickerCount = statistics.getAndResetTickerCount(tickerType);
+						}
 						tickerMap.get(tickerType).increment(tickerCount);
 					}
 
