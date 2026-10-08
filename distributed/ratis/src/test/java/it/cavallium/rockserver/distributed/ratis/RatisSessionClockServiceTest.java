@@ -9,6 +9,8 @@ import java.nio.file.*;
 import java.time.Duration;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import reactor.core.Disposable;
 import reactor.core.scheduler.Scheduler;
 import static org.junit.jupiter.api.Assertions.*;
@@ -112,14 +114,31 @@ class RatisSessionClockServiceTest {
             } finally { release.countDown(); returnCallback.countDown(); }
         }
     }
+    @Test void queuedClockLosesEligibilityBeforeDispatchWithoutTouchingJournals() throws Exception {
+        var eligible=new AtomicBoolean(true);
+        try (var f=new RatisSessionPropagationTest.Fixture(root); var env=new Env(root,f,new AtomicLong(20),eligible::get)) {
+            var started=new CountDownLatch(1); var release=new CountDownLatch(1);
+            env.scheduler.executor(RequestContext.ingest(),OperationFamily.MUTATION).execute(() -> {
+                started.countDown(); try { release.await(); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            });
+            try {
+                assertTrue(started.await(5,TimeUnit.SECONDS)); var queued=env.service.tick();
+                assertEquals(1,env.scheduler.queuedTasks(WorkloadProfile.BATCH)); eligible.set(false); release.countDown();
+                assertInstanceOf(CancellationException.class,assertThrows(ExecutionException.class,() -> queued.get(5,TimeUnit.SECONDS)).getCause());
+                env.service.stop().get(5,TimeUnit.SECONDS);
+                assertEquals(0,f.submissions); assertNull(env.clock.pendingCommand()); assertNull(env.clock.observed()); assertNull(env.driver.progress().target());
+            } finally { release.countDown(); }
+        }
+    }
     static final class Env implements AutoCloseable {
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"session-clock-test");
         final RatisCatalogueClock clock; final RatisSessionPropagation driver; final RatisSessionClockService service;
-        Env(Path root,RatisSessionPropagationTest.Fixture f,AtomicLong time) throws Exception {
+        Env(Path root,RatisSessionPropagationTest.Fixture f,AtomicLong time) throws Exception { this(root,f,time,() -> true); }
+        Env(Path root,RatisSessionPropagationTest.Fixture f,AtomicLong time,BooleanSupplier eligible) throws Exception {
             Path directory=root.resolve("propagation"); Files.createDirectories(directory);
             clock=new RatisCatalogueClock(root.resolve("catalogue-clock.bin"),f.catalogue.epochs);
             driver=new RatisSessionPropagation(directory,f.catalogue.epochs,f.routed,2);
-            service=new RatisSessionClockService(scheduler,clock,driver,time::get,1);
+            service=new RatisSessionClockService(scheduler,clock,driver,time::get,1,eligible);
         }
         public void close() throws Exception {
             service.stop().get(5,TimeUnit.SECONDS); driver.close(); clock.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5));
@@ -129,7 +148,7 @@ class RatisSessionClockServiceTest {
         Runnable periodic; volatile boolean cancelled,disposed;
         void fire() { if (!cancelled && !disposed) periodic.run(); }
         public Disposable schedulePeriodically(Runnable task,long initial,long period,TimeUnit unit) {
-            periodic=task;
+            periodic=task; cancelled=false;
             return new Disposable() { public void dispose() { cancelled=true; } public boolean isDisposed() { return cancelled; } };
         }
         public Disposable schedule(Runnable task) { throw new UnsupportedOperationException(); }

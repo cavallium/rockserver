@@ -1234,3 +1234,63 @@ when explicitly started. Public service/Main/bootstrap wiring, public
 API parity, topology reconciliation, cross-domain scheduling, full node/pool/tenant
 budgets, transactions/2PC and the other architecture requirements remain open.
 Standalone runtime behavior is unchanged and does not start this service.
+
+## Static-placement node runtime and protected recovery ownership
+
+`RatisNodePlan` validates the catalogue/data namespaces and global Ratis server
+identity: the same node incarnation has one peer ID/endpoint across groups, and
+peer IDs/endpoints cannot identify conflicting nodes. Local groups preserve voter/
+listener roles and share one bounded node pool. Catalogue logical/physical columns
+are distinct from user columns; only active static placements are accepted.
+
+`RatisNodeRuntime.open/start` now assembles that pool, all local state machines,
+one multiplexed Ratis server registry and per-group durable snapshot barrier.
+The production builder explicitly uses RECOVER, bounded transport workers and the
+existing durability settings; additional local divisions use the pinned local
+administrative add API. Startup verifies exact group coverage, explicit peer-ID/
+endpoint tuples in authoritative current voter/listener sets, no previous/joint
+configuration, and exact state-machine ownership. Ratis equality helpers alone are
+insufficient. RUNNING denotes those static divisions, not quorum/API readiness.
+
+Persisted node identity binds cluster/database/schema/column bindings and every
+immutable local group tuple: group/range ID, epoch, interval and local replica ID.
+Recovery checks identity before native/server construction, requires existing
+native CURRENT and planned Raft metadata, rejects unknown or noncanonical UUID
+recovery directories and refuses missing identity or wiped-voter adoption. A
+trusted bootstrap caller must explicitly assert authorized initial placement on
+an empty root; the directory object itself provides no creation authority. An
+interrupted initial creation is not silently reformatted/resumed by this stage.
+Local ownership/topology changes require a future durable handoff protocol; merely
+editing the directory cannot relabel already-applied native data.
+
+Data-only nodes allocate no clock journals/timer. Catalogue members dispatch clock
+work only while the local division is leader-ready with a completed native current-
+term prefix. Eligibility is a short memory check at admission and dispatch; loss
+before dispatch returns cancellation without journal work. Established groups can
+recover without a fresh catalogue quorum. Maintenance failure is exposed separately
+from RUNNING/static membership status; no public readiness is inferred from it.
+
+Shutdown stops/drains native/journal service work, closes journals, fences ALL state
+machines before server close, then waits for all native readers before closing the
+shared pool and node lock. A timeout retains STOPPING ownership for retry; held
+readers remain usable and another node owner cannot open the root. Borrowed clients,
+scheduler and timer remain caller-owned. Cleanup never removes groups or formats/
+deletes recovery state.
+
+The ordinary full gate passes 77 core/native, 16 read-round and 75 adapter cases
+(168 total), exit zero: `/tmp/rockserver-node-runtime-full-gate.log`. After the
+nonempty applied-prefix guard and queued eligibility-loss regression, the final
+focused gate passes 13 adapter cases, exit zero:
+`/tmp/rockserver-node-runtime-final-gate.log`. Controlled native tests cover static
+voter/listener multiplexing, data-only recovery, missing/wiped/unknown state,
+endpoint/joint/add failures, immutable placement changes without snapshots,
+catalogue outage, leader/readiness/term eligibility, queued role loss and pin-held
+shutdown/retry. Production Ratis factory code is compiled against pinned APIs but
+not started; actual transport, quorum readiness, independent nodes, physical power
+loss and performance acceptance remain unverified. No excluded workflow, density
+execution, push/deploy or main-checkout modification occurred.
+
+The optional module now has an explicit node lifecycle entry path. New-cluster/
+placement authorization and resumable initialization, CLI/public API adapters,
+topology transitions, full resource envelopes, transactions/2PC and the other
+architecture requirements remain open. Standalone Main/configuration is unchanged.

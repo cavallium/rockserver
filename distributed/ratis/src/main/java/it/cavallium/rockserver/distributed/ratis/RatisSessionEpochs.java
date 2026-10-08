@@ -27,6 +27,10 @@ public final class RatisSessionEpochs {
         if (rangeEpoch < 0 || schema.length!=32 || !client.getGroupId().getUuid().equals(group)) throw new IllegalArgumentException("Invalid epoch catalogue binding");
         this.rangeEpoch=rangeEpoch; this.schema=schema.clone(); this.validator=validator(cluster,database,group,rangeEpoch,schema,column);
     }
+    void requireCatalogueBinding(UUID expectedCluster,UUID expectedDatabase,UUID expectedGroup,long expectedEpoch,byte[] expectedSchema,UUID expectedColumn) {
+        if (!cluster.equals(expectedCluster) || !database.equals(expectedDatabase) || !group.equals(expectedGroup)
+                || rangeEpoch!=expectedEpoch || !Arrays.equals(schema,expectedSchema) || !column.equals(expectedColumn)) throw new IllegalArgumentException("Wrong node catalogue authority binding");
+    }
     void validatePrepared(DistributedCommand command) { validator.accept(command); }
     byte[] identityDigest() {
         byte[] bytes=ByteBuffer.allocate(104).put(uuid(cluster)).put(uuid(database)).put(uuid(group)).put(uuid(column)).putLong(rangeEpoch).put(schema).array();

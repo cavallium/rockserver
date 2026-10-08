@@ -12,6 +12,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
 import reactor.core.Disposable;
 import reactor.core.scheduler.Scheduler;
 
@@ -23,6 +24,7 @@ public final class RatisSessionClockService {
     private final RatisCatalogueClock clock;
     private final RatisSessionPropagation propagation;
     private final LongSupplier timeMillis;
+    private final BooleanSupplier eligible;
     private final int visits;
     private final long estimatedBytes;
     private Task active;
@@ -34,6 +36,12 @@ public final class RatisSessionClockService {
     /** All supplied resources remain caller-owned; stop and await its drain before closing journals/clients/scheduler. */
     public RatisSessionClockService(RWScheduler scheduler,RatisCatalogueClock clock,RatisSessionPropagation propagation,
             LongSupplier timeMillis,int visits) {
+        this(scheduler,clock,propagation,timeMillis,visits,() -> true);
+    }
+    /** Eligibility must be a short memory-only ownership/readiness check; rechecked when queued work dispatches. */
+    public RatisSessionClockService(RWScheduler scheduler,RatisCatalogueClock clock,RatisSessionPropagation propagation,
+            LongSupplier timeMillis,int visits,BooleanSupplier eligible) {
+        this.eligible=Objects.requireNonNull(eligible);
         this.scheduler=Objects.requireNonNull(scheduler);
         this.executor=scheduler.executor(RequestContext.batch(),OperationFamily.MUTATION);
         this.clock=Objects.requireNonNull(clock); this.propagation=Objects.requireNonNull(propagation); this.timeMillis=Objects.requireNonNull(timeMillis);
@@ -55,10 +63,12 @@ public final class RatisSessionClockService {
     /** Coalesces callers into one submission. Cancelling a returned view never releases actual work early. */
     public CompletableFuture<Snapshot> tick() {
         var task=request();
-        return task==null ? CompletableFuture.failedFuture(new RejectedExecutionException("Clock service stopped")) : task.result.copy();
+        return task==null ? CompletableFuture.failedFuture(new RejectedExecutionException("Clock service stopped or inactive")) : task.result.copy();
     }
     // Timer requests create no discarded dependent futures while an existing quantum is stalled.
     private Task request() {
+        synchronized (this) { if (stopping) return null; if (active!=null) return active; }
+        if (!eligible.getAsBoolean()) return null;
         final Task task;
         synchronized (this) {
             if (stopping) return null;
@@ -110,7 +120,7 @@ public final class RatisSessionClockService {
             Snapshot snapshot=null; Throwable failure=null;
             try {
                 boolean stopped; synchronized (RatisSessionClockService.this) { stopped=stopping; }
-                if (stopped) throw new CancellationException("Clock quantum stopped before execution");
+                if (stopped || !eligible.getAsBoolean()) throw new CancellationException("Clock quantum stopped or inactive before execution");
                 snapshot=cycle();
             } catch (Throwable problem) { failure=problem; }
             finally {
