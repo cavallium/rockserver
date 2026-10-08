@@ -163,6 +163,28 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
                 return value==null ? null : Buf.wrap(value);
             });
         }
+        /** Bounded logical page at this transaction's cut, including current staged writes. */
+        public synchronized RangePage<KV> getRangePage(long column,Keys lower,Keys upper,boolean reverse,Keys resumeAfter,RangeBudget budget) throws IOException {
+            requireMutable(); return run(() -> RatisLogicalRangePages.read(scoped,scope,schema,column,lower,upper,reverse,resumeAfter,budget));
+        }
+        /** Borrows this transaction; closing a cursor releases only its local continuation. */
+        public synchronized Cursor openCursor(long column,Keys lower,Keys upper,boolean reverse) throws IOException {
+            requireMutable();
+            return run(() -> { var cursor=new Cursor(column,lower,upper,reverse); RatisLogicalRangePages.validateBounds(scoped,scope,schema,column,cursor.lower,cursor.upper); return cursor; });
+        }
+        public final class Cursor implements AutoCloseable {
+            private final long column; private final Keys lower,upper; private final boolean reverse;
+            private Keys resume; private boolean closed,exhausted;
+            private Cursor(long column,Keys lower,Keys upper,boolean reverse) {
+                this.column=column; this.lower=RatisLogicalRangePages.copy(lower); this.upper=RatisLogicalRangePages.copy(upper); this.reverse=reverse;
+            }
+            public synchronized RangePage<KV> nextPage(RangeBudget budget) throws IOException {
+                if (closed || exhausted) return RangePage.empty();
+                var page=getRangePage(column,lower,upper,reverse,resume,budget);
+                resume=RatisLogicalRangePages.copy(page.resumeAfter()); exhausted=!page.hasMore(); return page;
+            }
+            @Override public synchronized void close() { closed=true; resume=null; }
+        }
         private void validatePlan(RatisLogicalClient.Plan plan) {
             for (var mutation:plan.mutations()) if (!scope.contains(mutation.columnId(),mutation.key())) throw new IllegalArgumentException("Mutation outside declared logical transaction scope");
             for (var predicate:plan.predicates()) if (!scope.contains(predicate.columnId(),predicate.key())) throw new IllegalArgumentException("Predicate outside declared logical transaction scope");

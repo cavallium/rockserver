@@ -74,6 +74,15 @@ does not establish complete distributed API parity or production acceptance.
   acknowledged; accepted entries retain ordinary exact retry after session reopen.
   Handles must close before the owning session releases its root lock. Read-only
   handles allocate no durable operation identity.
+- Durable logical transactions expose bounded logical pages and borrowed cursors.
+  Physical-key order is followed by unsigned original-member component order inside
+  each collision bucket, in either direction. Full logical `resumeAfter` is exclusive,
+  including absent/intermediate member keys. Physical rows are decoded completely;
+  logical pages may end within a bucket and continue at its exact member key.
+  Cursors copy bounds/continuations, borrow the same transaction cut/staging view and
+  fail after owner loss or parent close. Cursor close owns no independent native pin.
+  Logical null bounds cannot silently clip at a shard boundary: requests crossing
+  the one participant are rejected pending the multi-group snapshot-fence path.
 - Bounded mutation history detects ABA, same-value writes, absence deletes and range
   phantoms. Physical collision-bucket members share one stamp. Range deletion
   conservatively invalidates tracked observations. Exact native snapshots retain
@@ -140,6 +149,14 @@ bounds, not measured heap/native allocator limits or global node/pool envelopes.
 Rejected receipts reserve their actual bounded no-effects growth, preserving
 own-ACK progress at the retention cap.
 
+Logical output pages enforce 4,096 items and 8 MiB of original logical key/value
+bytes, matching standalone accounting. Translation fetches at most 128 complete
+physical rows/8 MiB per subrequest, with a total work quantum of 4,096 physical rows
+and 16 MiB of physical pages per logical request. If that quantum cannot establish
+an actual logical continuation, it fails explicitly instead of emitting an empty
+continuing page or claiming end-of-data. This is a bounded one-group page adapter,
+not the final retained cooperative stream/export implementation.
+
 The handle registry defaults to 128 handles, 16 MiB scope accounting, 16 MiB retained
 plans and a maximum 60-second TTL. A durable logical session additionally bounds its
 open handles by `min(128, outstandingWindow)` (32 by default); opening calls and
@@ -155,12 +172,13 @@ Verification uses ordinary `test-compile surefire:test@default-test` selections,
 not root `mvn test` (which binds fuzzing). Native fixtures use the XFS test-directory
 factories. The excluded density fixture remains untouched and unselected.
 
-The current range-staging regression gate passed 57 core and 69 adapter cases
-(126 total, zero failures/errors/skips), exit zero:
-`/tmp/rockserver-range-staging-regression.log`. After removing a duplicate predicate
-read and strengthening lower-bound resurrection coverage, the final native/scoped
-RPC selection passed 19 core and 5 adapter cases (24 total), exit zero:
-`/tmp/rockserver-range-staging-final.log`.
+The logical page/cursor regression gate passed 16 core and 89 adapter cases
+(105 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-logical-pages-regression.log`. After explicitly rejecting unbounded
+logical requests that cross the participant boundary, the final logical/session/
+staging selection passed 19 adapter cases, exit zero:
+`/tmp/rockserver-logical-pages-final.log`. Native range/apply source is unchanged from
+the preceding 126-case range-staging gate and its final 24-case selection.
 
 The exercised native/controlled-dispatch workflows include OPEN/read/STAGE/PLAN,
 forced acceptance before submission, applied native outcomes, lost PLAN/commit
@@ -169,7 +187,15 @@ point/range deletes and native merges, overlapping tombstones, collision buckets
 key-only presence, forward/reverse continuation and inclusive-lower resurrection,
 skipping erased oversized rows, result-overflow atomicity, immutable scope/prefix
 checks, footprint ownership, history conflicts, strict images/install recovery and
-session journal phases. Unaccepted intents can be reopened and explicitly abandoned;
+session journal phases. Logical page fixtures additionally cover byte/item limits,
+collision-member insertion order versus comparator order, continuation within a
+bucket in both directions, empty physical rows, absent member continuations, key-only
+presence, copied cursor buffers/bounds, fixed-cut reads after concurrent writes,
+parent close and leader loss. The empty-row scan-quantum fixture uses synthetic
+physical replies to isolate client work accounting; ordinary page fixtures use
+native stores and controlled Ratis dispatch. A two-shard fixture verifies that an
+unbounded request cannot report the first shard as the complete result.
+Unaccepted intents can be reopened and explicitly abandoned;
 missing accepted authority resolves through internal rejection. Logical-root/handle
 and in-flight staging retirement fixtures verify that active ownership stays charged
 until actual work returns. Native fixtures reported io_uring allocation warnings on
@@ -191,8 +217,9 @@ server process, network/quorum probe, power-loss run or deployment was performed
 
 ## Required remaining work
 
-- Remaining logical/frontend transaction adapters; complete public RocksDB API
-  transaction, range and cursor parity, including logical/unbounded range handling.
+- Complete public RocksDB API and transport frontend transaction/range/cursor parity,
+  including consistent cross-group/unbounded pages, typed pin-loss errors and retained
+  cooperative streams. The current logical page adapter is one-group and transaction-bound.
 - Durable prepared locks, transaction-status groups, 2PC decision/finalization and
   consistent multi-group scoped snapshot fences.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,
