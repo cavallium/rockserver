@@ -17,7 +17,7 @@ class RatisScopedTransactionsTest {
     final AtomicLong nanos=new AtomicLong(100);
     TransactionScope scope(RatisRetentionAdmissionTest.Fixture f,int key) { return new TransactionScope(List.of(TransactionScope.Span.point(f.column,new byte[]{(byte)key}))); }
     ReentrantLock lane(RatisRetentionAdmissionTest.Fixture f) throws Exception { var field=f.store.getClass().getDeclaredField("applyLane"); field.setAccessible(true); return (ReentrantLock)field.get(f.store); }
-    RatisRetentionAdmissionTest.Fixture fixture(String name) throws Exception { return new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> {},true,nanos::get); }
+    RatisRetentionAdmissionTest.Fixture fixture(String name) throws Exception { return new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> {},nanos::get); }
     RatisScopedTransactions registry(RatisRetentionAdmissionTest.Fixture f) { return new RatisScopedTransactions(f.machine,new RatisScopedTransactions.Limits(1,4096,2L*1024*1024,Duration.ofSeconds(1)),nanos::get); }
     @Test void expiredOpeningRetainsItsCountAndScopeAdmissionUntilNativeCaptureReturns() throws Exception {
         try (var f=fixture("opening"); var registry=registry(f); var executor=Executors.newVirtualThreadPerTaskExecutor()) {
@@ -54,8 +54,8 @@ class RatisScopedTransactionsTest {
     @Test void expiryDoesNotMistakeSuccessfulPlanningPinCloseForHandleLoss() throws Exception {
         try (var f=fixture("plan-publication"); var executor=Executors.newVirtualThreadPerTaskExecutor()) {
             var frozen=new CountDownLatch(1); var publish=new CountDownLatch(1);
-            try (var registry=new RatisScopedTransactions(f.machine,new RatisScopedTransactions.Limits(1,4096,2L*1024*1024,Duration.ofSeconds(1)),nanos::get,(pin,command) -> {
-                var accepted=f.machine.prepareScopedCommit(pin,command); frozen.countDown();
+            try (var registry=new RatisScopedTransactions(f.machine,new RatisScopedTransactions.Limits(1,4096,2L*1024*1024,Duration.ofSeconds(1)),nanos::get,(pin,command,deadline) -> {
+                var accepted=f.machine.prepareScopedCommit(pin,command,deadline); frozen.countDown();
                 if (!publish.await(5,TimeUnit.SECONDS)) { accepted.close(); throw new IOException("Fixture publication timed out"); }
                 return accepted;
             })) {

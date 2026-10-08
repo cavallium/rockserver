@@ -76,8 +76,7 @@ class RatisSnapshotLifecycleTest {
                             var reply = client.io().send(message(command));
                             assertTrue(reply.isSuccess());
                             byte[] original = reply.getMessage().getContent().toByteArray();
-                            var pointRead = Message.valueOf(ByteString.copyFrom(java.nio.ByteBuffer.allocate(19)
-                                    .putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).put(bytes("key")).array()));
+                            var pointRead = Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.pointRequest(column,bytes("key"))));
                             assertTrue(client.io().sendStaleRead(pointRead, reply.getLogIndex(), peer.getId()).isSuccess());
                             assertTrue(client.getSnapshotManagementApi().create(true, 10_000).isSuccess());
                             var d = store.applied();

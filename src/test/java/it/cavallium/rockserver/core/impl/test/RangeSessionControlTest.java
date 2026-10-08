@@ -14,7 +14,7 @@ class RangeSessionControlTest {
             assertEquals(control,RangeSessionControl.decode(control.encode()));
             var command=DistributedCommand.sessionControl(group,1,new byte[32],new OperationId(new UUID(9,9),2,8),control,7);
             var bytes=DistributedCommandCodec.encode(command); var copy=DistributedCommandCodec.decode(bytes);
-            assertEquals(5,copy.formatVersion()); assertEquals(7,copy.acknowledgedThrough()); assertEquals(1,copy.minimumSessionEpoch());
+            assertEquals(DistributedCommand.Kind.SESSION_CONTROL,copy.kind()); assertEquals(7,copy.acknowledgedThrough()); assertEquals(1,copy.minimumSessionEpoch());
             assertEquals(control,copy.sessionControl()); assertEquals(bytes.length,DistributedCommandCodec.encodedSize(command));
             assertArrayEquals(bytes,DistributedCommandCodec.encode(copy)); assertArrayEquals(command.payloadDigest(),copy.payloadDigest());
             for (int i=0;i<bytes.length;i++) {

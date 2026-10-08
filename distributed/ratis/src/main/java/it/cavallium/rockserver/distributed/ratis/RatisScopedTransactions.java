@@ -9,7 +9,7 @@ import java.util.function.LongSupplier;
 
 /** Bounded ephemeral handle ownership. No native work or close runs under the registry monitor. */
 final class RatisScopedTransactions implements AutoCloseable {
-    @FunctionalInterface interface PlanFactory { RatisRangeStateMachine.ScopedCommit prepare(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command) throws Exception; }
+    @FunctionalInterface interface PlanFactory { RatisRangeStateMachine.ScopedCommit prepare(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command,RatisRangeStateMachine.ProposalDeadline deadline) throws Exception; }
     record Limits(int handles,long scopeBytes,long planBytes,Duration maximumTtl) {
         Limits {
             if (handles<1 || handles>4096 || scopeBytes<1 || scopeBytes>256L*1024*1024 || planBytes<DistributedCommandCodec.MAX_ENCODED_BYTES
@@ -95,7 +95,7 @@ final class RatisScopedTransactions implements AutoCloseable {
                 entry.planBytes=DistributedCommandCodec.MAX_ENCODED_BYTES; planBytes+=entry.planBytes;
                 entry.planning=true;
             }
-            entry.plan=planner.prepare(entry.pin,command); entry.baseDigest=command.payloadDigest();
+            entry.plan=planner.prepare(entry.pin,command,new RatisRangeStateMachine.ProposalDeadline(nanos,entry.opened,entry.ttl)); entry.baseDigest=command.payloadDigest();
             int actual=DistributedCommandCodec.encodedSize(entry.plan.command());
             synchronized (this) { planBytes+=actual-entry.planBytes; entry.planBytes=actual; ensureLive(entry); }
             success=true; return entry.plan.command();

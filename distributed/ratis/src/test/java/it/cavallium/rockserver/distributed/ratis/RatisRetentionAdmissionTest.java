@@ -116,9 +116,9 @@ class RatisRetentionAdmissionTest {
             this(root,limits,command -> {});
         }
         Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator) throws Exception {
-            this(root,limits,validator,false,System::nanoTime);
+            this(root,limits,validator,System::nanoTime);
         }
-        Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator,boolean framed,java.util.function.LongSupplier nanos) throws Exception {
+        Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator,java.util.function.LongSupplier nanos) throws Exception {
             pool=DistributedStoragePool.open(root.resolve("native"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
             storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT)
                     .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
@@ -130,7 +130,7 @@ class RatisRetentionAdmissionTest {
                 throw new AssertionError("Unexpected server access "+method);
             });
             machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),validator,command -> {},limits,leadership::get);
-            if (framed) machine.enableScopedTransactions(nanos);
+            machine.transactionClock(nanos);
             machine.initialize(identity,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
         }
         DistributedCommand put(long sequence) { return new DistributedCommand(groupId,1,new byte[32],new OperationId(session,1,sequence),

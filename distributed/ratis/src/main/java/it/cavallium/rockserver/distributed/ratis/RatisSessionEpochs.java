@@ -41,13 +41,11 @@ public final class RatisSessionEpochs {
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
     public SessionEpochLedger read() throws IOException {
-        var query=ByteBuffer.allocate(32).put(uuid(column)).put(uuid(database)).array();
-        byte[] encoded=content(RatisRoutedClient.rpc(() -> client.io().sendReadOnly(message(query))),SessionEpochLedger.MAX_BYTES+4);
-        if (encoded.length<4) throw new IOException("Truncated epoch ledger reply");
-        var input=ByteBuffer.wrap(encoded); int count=input.getInt();
-        if (count==-1 && !input.hasRemaining()) return null;
-        if (count<0 || count!=input.remaining()) throw new IOException("Invalid epoch ledger reply length");
-        byte[] bytes=new byte[count]; input.get(bytes);
+        var query=ScopedTransactionRpc.pointRequest(column,uuid(database));
+        byte[] bytes;
+        try { bytes=ScopedTransactionRpc.pointValue(content(RatisRoutedClient.rpc(() -> client.io().sendReadOnly(message(query))),SessionEpochLedger.MAX_BYTES+20),SessionEpochLedger.MAX_BYTES); }
+        catch (IllegalArgumentException malformed) { throw new IOException("Invalid epoch ledger reply",malformed); }
+        if (bytes==null) return null;
         try {
             var ledger=SessionEpochLedger.decode(bytes); identity(ledger,cluster,database); return ledger;
         } catch (IllegalArgumentException bad) { throw new IOException("Invalid epoch catalogue state",bad); }
@@ -153,7 +151,7 @@ public final class RatisSessionEpochs {
         if (epoch<0 || schema.length!=32) throw new IllegalArgumentException("Invalid epoch validator binding");
         byte[] digest=schema.clone();
         return command -> {
-            if (command.formatVersion()==6 || command.acceptance()!=null) throw new IllegalArgumentException("Session catalogue does not accept bucket or transaction data commands");
+            if (command.hasBucketData() || command.acceptance()!=null || command.transactionRejection()) throw new IllegalArgumentException("Session catalogue does not accept bucket or transaction data commands");
             if (!command.groupId().equals(group) || command.rangeEpoch()!=epoch || !Arrays.equals(command.schemaDigest(),digest)
                     || command.minimumSessionEpoch()!=-1) {
                 throw new IllegalArgumentException("Wrong epoch catalogue identity/schema");

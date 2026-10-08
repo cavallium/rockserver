@@ -58,7 +58,7 @@ import org.rocksdb.TransactionDB;
 public final class ReplicatedRangeStore {
     private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
-    /** V6 consensus bound for original bucket bytes plus retained staged bucket replacements. */
+    /** Consensus bound for original bucket bytes plus retained staged bucket replacements. */
     public static final long MAX_BUCKET_PLAN_BYTES=16L*1024*1024;
     private volatile DistributedSchema logicalSchema;
     private RangeMutationHistory scopedHistory;
@@ -81,7 +81,6 @@ public final class ReplicatedRangeStore {
     private final byte[] configurationKey;
     private final byte[] usageKey;
     private final byte[] usageBucketsPrefix;
-    private final byte[] usageRebuildKey;
     private final RangeOwnership ownership;
     private final RangeOwnership.Owner owner;
     private final RangeOwnership.Interval interval;
@@ -132,7 +131,6 @@ public final class ReplicatedRangeStore {
         configurationKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 1).array();
         usageKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x10).array();
         usageBucketsPrefix = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x11).array();
-        usageRebuildKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x12).array();
         byte[] recovered = this.db.get(state, markerKey);
         applied = recovered == null ? null : decodePosition(recovered);
         pendingInstallation = this.db.get(state, installingKey);
@@ -143,6 +141,7 @@ public final class ReplicatedRangeStore {
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
         } else {
             ensureReceiptUsage();
+            validateReceiptUsage(applied);
         }
     }
 
@@ -300,7 +299,7 @@ public final class ReplicatedRangeStore {
             resetScopedUnderLane();
         }
     }
-    /** Install exact immutable decoding material before accepting/replaying v6. This grants no schema activation authority. */
+    /** Install exact immutable decoding material before accepting/replaying bucket operations. This grants no schema activation authority. */
     public void enableLogicalSchema(DistributedSchema schema) {
         Objects.requireNonNull(schema); enterNative(); applyLane.lock();
         try {
@@ -315,18 +314,18 @@ public final class ReplicatedRangeStore {
         } finally { applyLane.unlock(); leaveNative(); }
     }
     private void validateLogical(DistributedCommand command) {
-        var schema=logicalSchema; if (schema==null) throw new UnsupportedOperationException("V6 bucket decoding schema is not installed");
+        var schema=logicalSchema; if (schema==null) throw new UnsupportedOperationException("Bucket decoding schema is not installed");
         for (var mutation:command.mutations()) {
-            if (mutation.kind()==Mutation.Kind.DELETE_RANGE) throw new IllegalArgumentException("V6 bucket point plans do not contain range deletion");
+            if (mutation.kind()==Mutation.Kind.DELETE_RANGE) throw new IllegalArgumentException("Bucket point plans do not contain range deletion");
             var shape=schema.column(mutation.columnId()).schema(); boolean bucket=shape.variableLengthKeysCount()!=0;
-            if (bucket!=mutation.bucket()) throw new IllegalArgumentException("V6 mutation differs from qualified column kind");
+            if (bucket!=mutation.bucket()) throw new IllegalArgumentException("Bucket mutation differs from qualified column kind");
             if (bucket) schema.requireBucketKey(mutation.columnId(),mutation.key(),mutation.memberKeys());
             else schema.requireFixedKey(mutation.columnId(),mutation.key());
             if (!shape.hasValue() && mutation.value()!=null && mutation.value().length!=0) throw new IllegalArgumentException("Key-only mutation has value bytes");
         }
         for (var predicate:command.predicates()) {
             var shape=schema.column(predicate.columnId()).schema(); boolean bucket=shape.variableLengthKeysCount()!=0;
-            if (bucket!=predicate.bucket()) throw new IllegalArgumentException("V6 predicate differs from qualified column kind");
+            if (bucket!=predicate.bucket()) throw new IllegalArgumentException("Bucket predicate differs from qualified column kind");
             if (bucket) schema.requireBucketKey(predicate.columnId(),predicate.key(),predicate.memberKeys());
             else schema.requireFixedKey(predicate.columnId(),predicate.key());
             if (!shape.hasValue() && predicate.expectedValue()!=null && predicate.expectedValue().length!=0) throw new IllegalArgumentException("Key-only predicate has value bytes");
@@ -391,13 +390,13 @@ public final class ReplicatedRangeStore {
             throws RocksDBException {
         Objects.requireNonNull(position);
         validate(command);
-        if (result!=null && (command.sessionControl()!=null || command.formatVersion()==6 || command.acceptance()!=null)) throw new IllegalArgumentException("Controls, buckets and accepted plans require ordered native evaluation");
+        if (result!=null && (command.sessionControl()!=null || command.hasBucketData() || command.acceptance()!=null || command.transactionRejection())) throw new IllegalArgumentException("Controls, buckets and transaction plans require ordered native evaluation");
         if (result != null && !command.predicates().isEmpty()) {
             throw new IllegalArgumentException("Precomputed results require a fully evaluated plan without live predicates");
         }
         if (result != null && result.length > MAX_RESULT_BYTES) throw new IllegalArgumentException("Result exceeds receipt budget");
         byte[] stableResult = result == null ? null : result.clone();
-        byte[] digest = command.payloadDigest();
+        byte[] digest = command.receiptDigest();
         byte[] receiptKey = receiptKey(command.operationId());
         applyLane.lock();
         try {
@@ -438,6 +437,9 @@ public final class ReplicatedRangeStore {
                 stableResult=new CommandResult(sessionStatus,List.of()).encode(); installUserEffects=false;
             }
             List<Mutation> effects=command.mutations(); Map<BucketKey,DistributedBucket> bucketEffects=Map.of();
+            if (saved==null && stableResult==null && command.transactionRejection()) {
+                stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode(); installUserEffects=false;
+            }
             if (saved == null && stableResult == null) {
                 var evaluated = evaluate(command);
                 stableResult = evaluated.result().encode(); effects=evaluated.effects(); bucketEffects=evaluated.buckets();
@@ -543,7 +545,7 @@ public final class ReplicatedRangeStore {
         if (authority==null || command.minimumSessionEpoch()>=0) return CommandResult.Status.SUCCESS;
         var id=command.operationId(); var binding=sessionBinding(id.epoch());
         if (binding==null || !binding.grant().sessionId().equals(id.sessionId())) return CommandResult.Status.SESSION_EXPIRED;
-        boolean acknowledgementOnly=command.acknowledgedThrough()>=0 && command.mutations().isEmpty() && command.predicates().isEmpty();
+        boolean acknowledgementOnly=!command.transactionRejection() && command.acknowledgedThrough()>=0 && command.mutations().isEmpty() && command.predicates().isEmpty();
         if (!acknowledgementOnly && !authority.permits(binding.grant())) return CommandResult.Status.SESSION_EXPIRED;
         return withinSessionWindow(command,acknowledged,binding.outstandingWindow()) ? CommandResult.Status.SUCCESS : CommandResult.Status.CONFLICT;
     }
@@ -569,7 +571,7 @@ public final class ReplicatedRangeStore {
         Evaluation(CommandResult result,List<Mutation> effects) { this(result,effects,Map.of()); }
     }
     private Evaluation evaluate(DistributedCommand command) throws RocksDBException {
-        if (!command.hasBucketData()) return new Evaluation(evaluateLegacy(command),command.mutations());
+        if (!command.hasBucketData()) return new Evaluation(evaluateRaw(command),command.mutations());
         try { return evaluateBuckets(command); }
         catch (DistributedBucket.LimitExceededException limit) { return new Evaluation(new CommandResult(CommandResult.Status.RESULT_TOO_LARGE,List.of()),List.of()); }
     }
@@ -583,7 +585,7 @@ public final class ReplicatedRangeStore {
         long bytes;
         void replace(long previous,long next) {
             long total=bytes-previous+next;
-            if (total>MAX_BUCKET_PLAN_BYTES) throw new DistributedBucket.LimitExceededException("V6 bucket apply plan exceeds protocol byte budget"); bytes=total;
+            if (total>MAX_BUCKET_PLAN_BYTES) throw new DistributedBucket.LimitExceededException("Bucket apply plan exceeds protocol byte budget"); bytes=total;
         }
     }
     private DistributedBucket originalBucket(BucketKey key,Map<BucketKey,DistributedBucket> originals,BucketBudget budget) throws RocksDBException {
@@ -615,7 +617,7 @@ public final class ReplicatedRangeStore {
                     if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=overlay.getFromBatchAndDB(db,cf,options,key);
                     switch (mutation.kind()) {
                         case PUT -> overlay.put(cf,key,mutation.value()); case DELETE -> overlay.delete(cf,key); case MERGE -> overlay.merge(cf,key,mutation.value());
-                        default -> throw new IllegalStateException("Non-point effect escaped V6 validation");
+                        default -> throw new IllegalStateException("Non-point effect escaped bucket validation");
                     }
                     effects.add(mutation);
                     if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=overlay.getFromBatchAndDB(db,cf,options,key);
@@ -629,7 +631,7 @@ public final class ReplicatedRangeStore {
         }
         return new Evaluation(new CommandResult(CommandResult.Status.SUCCESS,values),List.copyOf(effects),staged);
     }
-    private CommandResult evaluateLegacy(DistributedCommand command) throws RocksDBException {
+    private CommandResult evaluateRaw(DistributedCommand command) throws RocksDBException {
         if (command.acceptance()==null) for (var predicate : command.predicates()) {
             byte[] current = db.get(columns.get(predicate.columnId()), predicate.key());
             if (!Arrays.equals(current, predicate.expectedValue())) {
@@ -654,7 +656,7 @@ public final class ReplicatedRangeStore {
                     case DELETE -> overlay.delete(cf, key);
                     case MERGE -> overlay.merge(cf, key, mutation.value());
                     case DELETE_RANGE -> throw new IllegalStateException("Range result plan escaped validation");
-                    case BUCKET_PUT, BUCKET_DELETE -> throw new IllegalStateException("Bucket command escaped V6 evaluation");
+                    case BUCKET_PUT, BUCKET_DELETE -> throw new IllegalStateException("Bucket command escaped bucket evaluation");
                 }
                 if (mutation.returnMode() == Mutation.ReturnMode.CURRENT) {
                     value = overlay.getFromBatchAndDB(db, cf, options, key);
@@ -780,13 +782,12 @@ public final class ReplicatedRangeStore {
                     });
                     if (!Arrays.equals(expected.sha256(), actual.sha256())) throw new IOException("Snapshot changed during installation");
                     writer.flush();
-                    // Validate/rebuild imported counters while the installation remains fenced.
-                    rebuildReceiptUsage();
+                    // The current image supplies counters bound to its completed position; never normalize imported state.
+                    validateReceiptUsage(expected.position());
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
                         batch.put(state, markerKey, encodePosition(expected.position()));
-                        batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), expected.position()));
                         batch.delete(state, installingKey);
                         db.write(options, batch);
                     }
@@ -1488,7 +1489,7 @@ public final class ReplicatedRangeStore {
             }
             byte[] saved = db.get(receipts, receiptKey(id));
             if (saved != null) {
-                decodeReceipt(saved, command.payloadDigest());
+                decodeReceipt(saved, command.receiptDigest());
                 return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
             }
             var authority=sessionAuthority();
@@ -1533,7 +1534,7 @@ public final class ReplicatedRangeStore {
         return new Usage(ByteBuffer.wrap(value, 4, 16).getLong(), ByteBuffer.wrap(value, 12, 8).getLong());
     }
 
-    // Total: v1/count/bytes/term/index (36 bytes); buckets retain v1/count/bytes (20 bytes).
+    // Current distinct records: total/count/bytes/term/index (36 bytes), epoch bucket/count/bytes (20 bytes).
     private static byte[] encodeTotalUsage(Usage usage, ApplyPosition position) {
         return ByteBuffer.allocate(36).put(usage.encode()).putLong(position == null ? 0 : position.term())
                 .putLong(position == null ? -1 : position.index()).array();
@@ -1541,8 +1542,7 @@ public final class ReplicatedRangeStore {
 
     private Usage readUsage(byte[] key) throws RocksDBException {
         byte[] value = db.get(state, key);
-        if (Arrays.equals(key, usageKey) && value != null && value.length == 36) value = Arrays.copyOf(value, 20);
-        return decodeUsage(value);
+        return Arrays.equals(key, usageKey) ? decodeTotalUsage(value,applied) : decodeUsage(value);
     }
 
     // Epoch comes first so a coarse fence deletes all obsolete buckets in one range tombstone.
@@ -1601,60 +1601,89 @@ public final class ReplicatedRangeStore {
         }
     }
 
-    private void ensureReceiptUsage() throws RocksDBException {
-        byte[] marker = db.get(state, markerKey);
-        var observed=marker==null ? null : decodePosition(marker);
-        if (!Objects.equals(applied,observed)) resetScopedUnderLane(); applied=observed;
-        byte[] total = db.get(state, usageKey);
-        if (total == null || total.length != 36 || db.get(state, usageRebuildKey) != null
-                || ByteBuffer.wrap(total, 20, 16).getLong() != (applied == null ? 0 : applied.term())
-                || ByteBuffer.wrap(total, 28, 8).getLong() != (applied == null ? -1 : applied.index())) {
-            rebuildReceiptUsage();
-        } else decodeUsage(Arrays.copyOf(total, 20));
+    private static Usage decodeTotalUsage(byte[] value,ApplyPosition position) {
+        if (value==null || value.length!=36) throw new IllegalStateException("Missing or malformed total receipt usage");
+        var usage=decodeUsage(Arrays.copyOf(value,20));
+        var input=ByteBuffer.wrap(value,20,16);
+        if (input.getLong()!=(position==null ? 0 : position.term()) || input.getLong()!=(position==null ? -1 : position.index())) {
+            throw new IllegalStateException("Receipt usage differs from completed apply position");
+        }
+        return usage;
     }
 
-    /** Restartable recovery with one session/epoch accumulator and one receipt row in memory. */
-    private void rebuildReceiptUsage() throws RocksDBException {
-        try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
-            batch.put(state, usageRebuildKey, new byte[] {1});
-            batch.delete(state, usageKey);
-            batch.deleteRange(state, usageBucketsPrefix, prefixEnd(usageBucketsPrefix));
-            db.write(options, batch);
+    private void ensureReceiptUsage() throws RocksDBException {
+        byte[] marker=db.get(state,markerKey);
+        var observed=marker==null ? null : decodePosition(marker);
+        if (!Objects.equals(applied,observed)) throw new IllegalStateException("Completed apply marker changed outside ordered apply");
+        if (db.get(state,ByteBuffer.allocate(17).put(markerKey).put((byte)0x12).array())!=null) {
+            throw new IllegalStateException("Unsupported receipt accounting metadata");
         }
-        long minimum = minimumSessionEpoch(null);
-        Usage total = new Usage(0, 0), bucket = new Usage(0, 0);
-        byte[] previousBucket = null;
-        long floor = -1;
-        try (var options = new ReadOptions().setFillCache(false); var iterator = db.newIterator(receipts, options);
-                var write = new WriteOptions().setDisableWAL(false).setSync(false)) {
-            byte[] end = prefixEnd(markerKey);
-            for (iterator.seek(markerKey); iterator.isValid(); iterator.next()) {
-                byte[] key = iterator.key();
-                if (end != null && Arrays.compareUnsigned(key, end) >= 0) break;
-                byte[] value = iterator.value();
-                validateReceiptRow(key, value);
-                var input = ByteBuffer.wrap(key, 16, 32);
-                var id = new OperationId(new UUID(input.getLong(), input.getLong()), input.getLong(), input.getLong());
-                if (id.epoch() < minimum) continue;
-                byte[] currentBucket = usageBucketKey(id);
-                if (!Arrays.equals(previousBucket, currentBucket)) {
-                    if (previousBucket != null && bucket.count != 0) db.put(state, write, previousBucket, bucket.encode());
-                    previousBucket = currentBucket;
-                    bucket = new Usage(0, 0);
-                    floor = acknowledgedThrough(id, null);
+        byte[] total=db.get(state,usageKey);
+        if (total==null) {
+            if (applied!=null || hasRows(receipts,markerKey) || hasRows(state,usageBucketsPrefix)) {
+                throw new IllegalStateException("Established range has no total receipt usage");
+            }
+            // Only a genuinely fresh owned range can create the current empty accounting record.
+            total=encodeTotalUsage(new Usage(0,0),null);
+            try (var write=new WriteOptions().setDisableWAL(false).setSync(true)) { db.put(state,write,usageKey,total); }
+        }
+        decodeTotalUsage(total,applied);
+    }
+
+    private boolean hasRows(ColumnFamilyHandle cf,byte[] prefix) throws RocksDBException {
+        try (var options=new ReadOptions().setFillCache(false); var iterator=db.newIterator(cf,options)) {
+            iterator.seek(prefix);
+            byte[] key=iterator.isValid() ? iterator.key() : null;
+            boolean present=key!=null && key.length>=prefix.length && Arrays.equals(key,0,prefix.length,prefix,0,prefix.length);
+            iterator.status(); return present;
+        }
+    }
+
+    /** Read-only validation at open/import, with one receipt and one session/epoch accumulator in memory. */
+    private void validateReceiptUsage(ApplyPosition position) throws RocksDBException {
+        Usage expected=decodeTotalUsage(db.get(state,usageKey),position), total=new Usage(0,0), bucket=new Usage(0,0);
+        long minimum=minimumSessionEpoch(null), floor=-1, validatedBuckets=0;
+        byte[] previousBucket=null;
+        try (var options=new ReadOptions().setFillCache(false); var iterator=db.newIterator(receipts,options)) {
+            byte[] end=prefixEnd(markerKey);
+            for (iterator.seek(markerKey);iterator.isValid();iterator.next()) {
+                byte[] key=iterator.key();
+                if (end!=null && Arrays.compareUnsigned(key,end)>=0) break;
+                byte[] value=iterator.value(); validateReceiptRow(key,value);
+                var input=ByteBuffer.wrap(key,16,32);
+                var id=new OperationId(new UUID(input.getLong(),input.getLong()),input.getLong(),input.getLong());
+                if (id.epoch()<minimum) continue;
+                byte[] currentBucket=usageBucketKey(id);
+                if (!Arrays.equals(previousBucket,currentBucket)) {
+                    if (previousBucket!=null && bucket.count!=0) { requireUsageBucket(previousBucket,bucket); validatedBuckets++; }
+                    previousBucket=currentBucket; bucket=new Usage(0,0); floor=acknowledgedThrough(id,null);
                 }
-                if (id.sequence() <= floor) continue;
-                Usage row = new Usage(1, (long) key.length + value.length);
-                bucket = bucket.plus(row);
-                total = total.plus(row);
+                if (id.sequence()<=floor) continue;
+                Usage row=new Usage(1,(long)key.length+value.length); bucket=bucket.plus(row); total=total.plus(row);
             }
             iterator.status();
-            if (previousBucket != null && bucket.count != 0) db.put(state, write, previousBucket, bucket.encode());
         }
-        try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
-            batch.put(state, usageKey, encodeTotalUsage(total, applied));
-            batch.delete(state, usageRebuildKey);
-            db.write(options, batch);
+        if (previousBucket!=null && bucket.count!=0) { requireUsageBucket(previousBucket,bucket); validatedBuckets++; }
+        Usage bucketTotal=new Usage(0,0); long buckets=0;
+        try (var options=new ReadOptions().setFillCache(false); var iterator=db.newIterator(state,options)) {
+            byte[] end=prefixEnd(usageBucketsPrefix);
+            for (iterator.seek(usageBucketsPrefix);iterator.isValid();iterator.next()) {
+                byte[] key=iterator.key(); if (end!=null && Arrays.compareUnsigned(key,end)>=0) break;
+                if (key.length!=41 || ByteBuffer.wrap(key,17,8).getLong()<minimum) throw new IllegalStateException("Invalid receipt usage bucket identity");
+                Usage usage=decodeUsage(iterator.value());
+                if (usage.count==0) throw new IllegalStateException("Empty receipt usage bucket");
+                bucketTotal=bucketTotal.plus(usage); buckets++;
+            }
+            iterator.status();
+        }
+        if (!expected.equals(total) || !expected.equals(bucketTotal) || buckets!=validatedBuckets) {
+            throw new IllegalStateException("Receipt usage differs from retained receipts/buckets");
+        }
+    }
+
+    private void requireUsageBucket(byte[] key,Usage expected) throws RocksDBException {
+        if (expected.count==0 || !expected.equals(decodeUsage(db.get(state,key)))) {
+            throw new IllegalStateException("Receipt usage bucket differs from retained receipts");
         }
     }
 

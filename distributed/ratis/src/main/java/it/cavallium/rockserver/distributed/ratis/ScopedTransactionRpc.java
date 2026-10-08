@@ -10,9 +10,9 @@ import java.util.Comparator;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Bounded versioned read protocol. Callers explicitly select this protocol instead of probing legacy payloads. */
+/** The current bounded query protocol for data and catalogue groups. */
 public final class ScopedTransactionRpc {
-    public static final int MAGIC = 0x52535458, VERSION = 2, HEADER_BYTES = 16, HANDLE_BYTES = 56;
+    public static final int MAGIC = 0x52535458, VERSION = 1, HEADER_BYTES = 16, HANDLE_BYTES = 56;
     public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14;
     // A legal physical page continuation can exceed an atomic command's 2 MiB bound.
     public static final int MAX_REQUEST_BYTES = PhysicalRangePage.MAX_BYTES + 128;
@@ -24,6 +24,16 @@ public final class ScopedTransactionRpc {
             .thenComparing(TransactionScope.Span::upperExclusive, ScopedTransactionRpc::compareBounds);
 
     private ScopedTransactionRpc() {}
+
+    public static byte[] pointRequest(UUID column,byte[] key) {
+        Objects.requireNonNull(key); if (key.length>2*1024*1024-16) throw invalid("Point key exceeds budget");
+        var body=ByteBuffer.allocate(20+key.length); uuid(body,column); putBlob(body,key); return frame(POINT,body.array());
+    }
+    public static byte[] pointValue(byte[] encoded,int maximum) {
+        var packet=parse(encoded,MAX_REPLY_BYTES); if (packet.kind()!=POINT) throw invalid("Expected point reply");
+        var input=ByteBuffer.wrap(packet.body()); var value=blob(input,maximum,true);
+        if (input.hasRemaining()) throw invalid("Trailing point reply"); return value;
+    }
 
     public record Packet(int kind, byte[] body) {
         public Packet {

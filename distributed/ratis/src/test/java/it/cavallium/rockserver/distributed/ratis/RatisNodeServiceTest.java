@@ -79,14 +79,14 @@ class RatisNodeServiceTest {
             assertEquals(1,env.catalogue.closes.get()); assertEquals(1,env.transportCloses); assertTrue(env.timer.isDisposed()); assertFalse(fake.created);
         }
     }
-    @Test void ownedLauncherRejectsAClientProtocolDifferentFromItsManifest() throws Exception {
+    @Test void ownedLauncherRejectsPersistedIdentityBindingAndRetiresResources() throws Exception {
         var schema=schema();
         try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
             try (var initialized=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new RatisNodeRuntimeTest.FakeServer())) { initialized.start(); }
-            var legacy=manifest(env,schema); var settings=legacy.settings();
-            var framed=new RatisNodeManifest(schema,env.plan,new RatisNodeRuntime.Settings(settings.images(),settings.retention(),settings.clockPeriod(),settings.propagationVisits(),settings.maxPropagationRanges(),settings.shutdownTimeout(),true),3,3);
+            Path identity=env.nodeRoot.resolve("node.identity"); byte[] changed=SessionJournalFiles.read(identity,128); changed[5]^=1;
+            SessionJournalFiles.write(identity,changed,128);
             var fake=new RatisNodeRuntimeTest.FakeServer();
-            assertThrows(IOException.class,() -> RatisNodeService.recover(framed,env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create));
+            assertThrows(IOException.class,() -> RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create));
             assertFalse(fake.created); assertEquals(1,env.catalogue.closes.get()); assertEquals(1,env.transportCloses); assertTrue(env.timer.isDisposed());
         }
     }

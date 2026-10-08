@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisTransactionRpcTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final AtomicLong nanos=new AtomicLong(100);
-    RatisRetentionAdmissionTest.Fixture fixture(String name) throws Exception { return new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> {},true,nanos::get); }
+    RatisRetentionAdmissionTest.Fixture fixture(String name) throws Exception { return new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> {},nanos::get); }
     TransactionScope scope(RatisRetentionAdmissionTest.Fixture f,int key) { return new TransactionScope(List.of(TransactionScope.Span.point(f.column,new byte[]{(byte)key}))); }
     RangeDirectory directory(RatisRetentionAdmissionTest.Fixture f) {
         var peer=new ReplicaDescriptor(new UUID(0,11),new UUID(0,12),new UUID(0,13),"fixture","127.0.0.1:12345",ReplicaDescriptor.Role.VOTER);
@@ -52,7 +52,7 @@ class RatisTransactionRpcTest {
         try (var f=fixture("workflow")) {
             var transport=new Controlled(f); var directory=directory(f); Path journal=root.resolve("window.bin"); transport.journal=journal;
             var ledger=SessionEpochLedger.initial(directory.clusterId(),directory.databaseId(),10).issue(f.session,100); var grant=ledger.grants().getFirst();
-            try (var routed=new RatisRoutedClient(directory,transport,true)) {
+            try (var routed=new RatisRoutedClient(directory,transport)) {
                 byte[] frozen;
                 try (var client=RatisDurableSessionClient.create(journal,routed,ledger,grant,RatisSessionClient.Limits.defaults()); var tx=routed.openTransaction(scope(f,0),Duration.ofSeconds(30))) {
                     assertNull(tx.get(f.column,new byte[]{0}));
@@ -77,7 +77,7 @@ class RatisTransactionRpcTest {
     @Test void openNeedsFreshHookRetryNonceIsIdempotentAndStaleDispatchCannotOpen() throws Exception {
         try (var f=fixture("barrier")) {
             var transport=new Controlled(f);
-            try (var routed=new RatisRoutedClient(directory(f),transport,true); var tx=routed.openTransaction(scope(f,0),Duration.ofSeconds(1))) {
+            try (var routed=new RatisRoutedClient(directory(f),transport); var tx=routed.openTransaction(scope(f,0),Duration.ofSeconds(1))) {
                 byte[] request=transport.openRequest;
                 assertThrows(ExecutionException.class,() -> f.machine.query(Message.valueOf(ByteString.copyFrom(request))).get(5,TimeUnit.SECONDS));
                 assertThrows(ExecutionException.class,() -> f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS));
@@ -91,7 +91,7 @@ class RatisTransactionRpcTest {
     @Test void snapshotReadsStayAtTheirCutConflictRetiresAndAbsoluteTtlDoesNotRenew() throws Exception {
         try (var f=fixture("expiry")) {
             var transport=new Controlled(f);
-            try (var routed=new RatisRoutedClient(directory(f),transport,true)) {
+            try (var routed=new RatisRoutedClient(directory(f),transport)) {
                 try (var tx=routed.openTransaction(scope(f,0),Duration.ofMillis(1))) {
                     assertNull(tx.get(f.column,new byte[]{0})); f.apply(f.propose(f.put(0)),1); transport.index=1;
                     var changed=new DistributedCommand(f.groupId,1,new byte[32],new OperationId(f.session,1,1),List.of(new Mutation(Mutation.Kind.PUT,f.column,new byte[]{0},new byte[]{9})));
@@ -109,7 +109,7 @@ class RatisTransactionRpcTest {
         try (var f=fixture("pages")) {
             f.apply(f.propose(f.put(1)),1); f.apply(f.propose(f.put(2)),2);
             var range=new TransactionScope(List.of(TransactionScope.Span.range(f.column,new byte[]{0},new byte[]{4})));
-            try (var routed=new RatisRoutedClient(directory(f),new Controlled(f),true); var tx=routed.openTransaction(range,Duration.ofSeconds(1))) {
+            try (var routed=new RatisRoutedClient(directory(f),new Controlled(f)); var tx=routed.openTransaction(range,Duration.ofSeconds(1))) {
                 var first=tx.page(f.column,new byte[]{0},new byte[]{4},false,null,1,1024); assertTrue(first.hasMore()); assertArrayEquals(new byte[]{1},first.rows().getFirst().key());
                 f.apply(f.propose(f.put(3)),3);
                 var second=tx.page(f.column,new byte[]{0},new byte[]{4},false,first.resumeAfter(),2,1024); assertFalse(second.hasMore()); assertEquals(1,second.rows().size()); assertArrayEquals(new byte[]{2},second.rows().getFirst().key());
@@ -121,7 +121,7 @@ class RatisTransactionRpcTest {
         try (var f=fixture("abandon")) {
             var transport=new Controlled(f); var directory=directory(f); var ledger=SessionEpochLedger.initial(directory.clusterId(),directory.databaseId(),10).issue(f.session,100);
             Path journal=root.resolve("abandoned-window.bin"); transport.journal=journal;
-            try (var routed=new RatisRoutedClient(directory,transport,true)) {
+            try (var routed=new RatisRoutedClient(directory,transport)) {
                 try (var client=RatisDurableSessionClient.create(journal,routed,ledger,ledger.grants().getFirst(),RatisSessionClient.Limits.defaults())) {
                     var mutation=new Mutation(Mutation.Kind.PUT,f.column,new byte[]{0},new byte[]{9},Mutation.ReturnMode.PREVIOUS);
                     var intent=client.prepareTransactionIntent(List.of(mutation));
@@ -160,28 +160,56 @@ class RatisTransactionRpcTest {
                 }
             };
             var scope=new TransactionScope(List.of(TransactionScope.Span.range(f.column,null,null)));
-            try (var routed=new RatisRoutedClient(directory(f),transport,true); var tx=routed.openTransaction(scope,Duration.ofSeconds(1))) {
+            try (var routed=new RatisRoutedClient(directory(f),transport); var tx=routed.openTransaction(scope,Duration.ofSeconds(1))) {
                 var first=tx.page(f.column,null,null,false,null,1,PhysicalRangePage.MAX_BYTES); assertTrue(first.hasMore());
                 var second=tx.page(f.column,null,null,false,first.resumeAfter(),1,PhysicalRangePage.MAX_BYTES); assertFalse(second.hasMore()); assertTrue(second.rows().isEmpty());
             }
         }
     }
-    @Test void framedPointStateAndLegacyQueriesUseTheirSelectedParser() throws Exception {
-        try (var f=fixture("framed-reads")) {
-            f.apply(f.propose(f.put(0)),1); var body=ByteBuffer.allocate(21); ScopedTransactionRpc.uuid(body,f.column); ScopedTransactionRpc.putBlob(body,new byte[]{0});
-            var request=Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,body.array())));
-            var point=ScopedTransactionRpc.parse(f.machine.queryLinearizable(request).get(5,TimeUnit.SECONDS).getContent().toByteArray(),ScopedTransactionRpc.MAX_REPLY_BYTES);
-            assertArrayEquals(new byte[]{7},ScopedTransactionRpc.blob(ByteBuffer.wrap(point.body()),DistributedCommandCodec.MAX_ENCODED_BYTES,true));
+    @Test void pointAndStateQueriesUseTheCurrentFraming() throws Exception {
+        try (var f=fixture("current-reads")) {
+            f.apply(f.propose(f.put(0)),1);
+            var request=Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.pointRequest(f.column,new byte[]{0})));
+            assertArrayEquals(new byte[]{7},ScopedTransactionRpc.pointValue(f.machine.queryLinearizable(request).get(5,TimeUnit.SECONDS).getContent().toByteArray(),2*1024*1024));
             var stateRequest=Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0])));
             var state=ScopedTransactionRpc.parse(f.machine.queryLinearizable(stateRequest).get(5,TimeUnit.SECONDS).getContent().toByteArray(),ScopedTransactionRpc.MAX_REPLY_BYTES);
             assertEquals(new ApplyPosition(1,1),RangeStateView.decode(state.body()).applied());
-            var old=Message.valueOf(ByteString.copyFrom(ByteBuffer.allocate(17).putLong(f.column.getMostSignificantBits()).putLong(f.column.getLeastSignificantBits()).put((byte)0).array()));
-            assertThrows(ExecutionException.class,() -> f.machine.queryLinearizable(old).get(5,TimeUnit.SECONDS));
+            assertThrows(IllegalStateException.class,() -> f.machine.transactionClock(nanos::get));
         }
-        try (var f=new RatisRetentionAdmissionTest.Fixture(root.resolve("legacy-reads"),RatisRangeStateMachine.RetentionLimits.defaults())) {
-            f.apply(f.propose(f.put(0)),1); assertThrows(IllegalStateException.class,() -> f.machine.enableScopedTransactions(nanos::get));
-            var request=Message.valueOf(ByteString.copyFrom(ByteBuffer.allocate(17).putLong(f.column.getMostSignificantBits()).putLong(f.column.getLeastSignificantBits()).put((byte)0).array()));
-            var response=ByteBuffer.wrap(f.machine.query(request).get(5,TimeUnit.SECONDS).getContent().toByteArray()); assertEquals(1,response.getInt()); assertEquals(7,response.get());
+    }
+    @Test void expiredAcceptedAuthorityResolvesDurablyAfterLostReplyAndReopen() throws Exception {
+        try (var f=fixture("expired-accepted")) {
+            var transport=new Controlled(f); var directory=directory(f); Path journal=root.resolve("expired-accepted.bin"); transport.journal=journal;
+            var ledger=SessionEpochLedger.initial(directory.clusterId(),directory.databaseId(),10).issue(f.session,100); byte[] original;
+            try (var routed=new RatisRoutedClient(directory,transport)) {
+                try (var client=RatisDurableSessionClient.create(journal,routed,ledger,ledger.grants().getFirst(),RatisSessionClient.Limits.defaults()); var tx=routed.openTransaction(scope(f,0),Duration.ofMillis(1))) {
+                    var pending=client.prepareTransactionIntent(List.of(new Mutation(Mutation.Kind.PUT,f.column,new byte[]{0},new byte[]{7},Mutation.ReturnMode.PREVIOUS)));
+                    client.acceptTransaction(pending,tx.plan(pending.command())); original=DistributedCommandCodec.encode(pending.command());
+                    nanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(2)); f.machine.expireTransactions(); assertEquals(0,f.machine.proposalFootprintStats().candidates());
+                    assertThrows(IllegalStateException.class,() -> client.abandonTransactionIntent(pending));
+                    transport.lose=true; assertThrows(IOException.class,() -> client.execute(pending)); assertNull(pending.savedResult());
+                }
+                try (var client=RatisDurableSessionClient.reopen(journal,routed)) {
+                    var pending=client.pending().getFirst(); assertArrayEquals(original,DistributedCommandCodec.encode(pending.command()));
+                    assertEquals(CommandResult.Status.CONFLICT,client.execute(pending).status());
+                    assertEquals(CommandResult.Status.CONFLICT,CommandResult.decode(f.store.operationResult(pending.command().operationId(),pending.command().payloadDigest())).status());
+                    try (var pin=f.store.capture()) { assertNull(pin.get(f.column,new byte[]{0})); }
+                    client.acknowledge(pending); assertEquals(0,client.acknowledgedThrough()); f.assertReleased();
+                }
+            }
+        }
+    }
+    @Test void delayedExpiryCleanupCannotAuthorizeALateFirstSubmission() throws Exception {
+        try (var f=fixture("late-submission"); var routed=new RatisRoutedClient(directory(f),new Controlled(f)); var tx=routed.openTransaction(scope(f,0),Duration.ofMillis(1))) {
+            var accepted=tx.plan(f.put(0)); nanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(2));
+            assertEquals(1,f.machine.proposalFootprintStats().candidates(),"No cleanup quantum has run");
+            var transaction=f.propose(accepted);
+            try {
+                assertNull(transaction.getException());
+                assertTrue(DistributedCommandCodec.decode(transaction.getStateMachineLogEntry().getLogData().toByteArray()).transactionRejection());
+                assertEquals(CommandResult.Status.CONFLICT,f.apply(transaction,1)); try (var pin=f.store.capture()) { assertNull(pin.get(f.column,new byte[]{0})); }
+            } finally { f.machine.cancelTransaction(transaction); }
+            f.assertReleased();
         }
     }
 }

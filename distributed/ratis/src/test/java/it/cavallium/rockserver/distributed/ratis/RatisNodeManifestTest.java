@@ -46,6 +46,7 @@ class RatisNodeManifestTest {
 
     @Test void canonicalRoundTripRetainsSchemaPlanSettingsAndImmutableBindings() {
         var original=manifest(false); byte[] encoded=RatisNodeManifest.encode(original); var copy=RatisNodeManifest.decode(encoded);
+        assertEquals(1,ByteBuffer.wrap(encoded).getInt(4));
         assertArrayEquals(encoded,RatisNodeManifest.encode(copy)); assertArrayEquals(original.schema().digest(),copy.schema().digest());
         assertArrayEquals(original.plan().identityDigest(),copy.plan().identityDigest()); assertEquals(original.plan().directory().generation(),copy.plan().directory().generation());
         assertEquals(original.settings(),copy.settings()); assertEquals(3,copy.readThreads()); assertEquals(5,copy.writeThreads());
@@ -91,23 +92,13 @@ class RatisNodeManifestTest {
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(plain.schema(),plain.plan(),tooLong,3,3));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(plain.schema(),plan(plain.schema(),Map.of(A,"a".repeat(4097),B,"b"),Set.of()),settings(),3,3));
     }
-    @Test void framedReadModeHasAnExplicitCanonicalManifestVersionAndLegacyStaysLegacy() {
-        var legacy=manifest(false); var settings=legacy.settings(); byte[] old=RatisNodeManifest.encode(legacy);
-        assertEquals(1,ByteBuffer.wrap(old).getInt(4)); assertFalse(RatisNodeManifest.decode(old).settings().scopedTransactions());
-        var framedSettings=new RatisNodeRuntime.Settings(settings.images(),settings.retention(),settings.clockPeriod(),settings.propagationVisits(),settings.maxPropagationRanges(),settings.shutdownTimeout(),true);
-        var framed=new RatisNodeManifest(legacy.schema(),legacy.plan(),framedSettings,legacy.readThreads(),legacy.writeThreads());
-        byte[] encoded=RatisNodeManifest.encode(framed); assertEquals(2,ByteBuffer.wrap(encoded).getInt(4)); assertEquals(old.length+4,encoded.length);
-        assertTrue(RatisNodeManifest.decode(encoded).settings().scopedTransactions()); assertArrayEquals(encoded,RatisNodeManifest.encode(RatisNodeManifest.decode(encoded)));
-        for (int mode:new int[]{0,1,3}) { byte[] wrong=encoded.clone(); ByteBuffer.wrap(wrong).putInt(wrong.length-4,mode); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(wrong)); }
-        assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(Arrays.copyOf(encoded,encoded.length-1)));
-    }
-
     @Test void decoderRejectsUnknownFormatEveryTruncationLengthsCountsOrderNamesAndSettings() {
         byte[] valid=RatisNodeManifest.encode(manifest(false));
         for (int length=0;length<valid.length;length++) { byte[] truncated=Arrays.copyOf(valid,length); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(truncated)); }
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(Arrays.copyOf(valid,valid.length+1)));
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(new byte[RatisNodeManifest.MAX_BYTES+1]));
         for (int offset:new int[] {0,4,8}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,Integer.MAX_VALUE); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
+        for (int version:new int[]{0,2,3}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(4,version); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
         var input=ByteBuffer.wrap(valid); skipBlobs(input); int tail=input.position(), bindings=tail+72;
         for (int offset:new int[] {tail+64,tail+68,bindings+16}) {
             byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,Integer.MAX_VALUE); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad));

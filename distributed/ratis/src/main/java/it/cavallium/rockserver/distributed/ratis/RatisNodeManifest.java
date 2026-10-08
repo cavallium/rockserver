@@ -51,11 +51,10 @@ public final class RatisNodeManifest {
         Objects.requireNonNull(manifest);
         byte[] schema=DistributedSchemaCodec.encode(manifest.schema), directory=RangeDirectoryCodec.encode(manifest.plan.directory());
         byte[] catalogue=RangeDirectoryCodec.encode(synthetic(manifest.plan));
-        int version=manifest.settings.scopedTransactions() ? 2 : 1;
-        long size=8L+12+schema.length+directory.length+catalogue.length+72+SETTINGS_BYTES+(version==2 ? 4 : 0);
+        long size=8L+12+schema.length+directory.length+catalogue.length+72+SETTINGS_BYTES;
         for (var name:manifest.plan.columns().values()) size+=20L+text(name).length;
         if (size>MAX_BYTES-32) throw new IllegalArgumentException("Node manifest exceeds byte budget");
-        var output=ByteBuffer.allocate((int)size).putInt(MAGIC).putInt(version);
+        var output=ByteBuffer.allocate((int)size).putInt(MAGIC).putInt(1);
         blob(output,schema); blob(output,directory); blob(output,catalogue);
         var c=manifest.plan.catalogue(); uuid(output,c.directoryColumn()); uuid(output,c.sessionsColumn());
         uuid(output,manifest.plan.nodeId()); uuid(output,manifest.plan.nodeIncarnation());
@@ -68,7 +67,6 @@ public final class RatisNodeManifest {
         output.putLong(retention.dataCount()).putLong(retention.dataBytes()).putLong(retention.maintenanceCount()).putLong(retention.maintenanceBytes());
         output.putLong(nanos(settings.clockPeriod())).putInt(settings.propagationVisits()).putInt(settings.maxPropagationRanges())
                 .putLong(nanos(settings.shutdownTimeout())).putInt(manifest.readThreads).putInt(manifest.writeThreads);
-        if (version==2) output.putInt(2);
         return output.array();
     }
     public static RatisNodeManifest decode(byte[] bytes) {
@@ -76,32 +74,30 @@ public final class RatisNodeManifest {
         if (bytes.length<172 || bytes.length>MAX_BYTES-32) throw new IllegalArgumentException("Invalid node manifest size");
         var input=ByteBuffer.wrap(bytes);
         if (input.getInt()!=MAGIC) throw new IllegalArgumentException("Unsupported node manifest header");
-        int version=input.getInt(); if (version!=1 && version!=2) throw new IllegalArgumentException("Unsupported node manifest version");
-        int settingsBytes=SETTINGS_BYTES+(version==2 ? 4 : 0);
+        if (input.getInt()!=1) throw new IllegalArgumentException("Unsupported node manifest version");
         var schema=DistributedSchemaCodec.decode(blob(input,DistributedSchemaCodec.MAX_BYTES));
         var directory=RangeDirectoryCodec.decode(blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES));
         var catalogue=RangeDirectoryCodec.decode(blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES));
-        require(input,72+settingsBytes);
+        require(input,72+SETTINGS_BYTES);
         UUID directoryColumn=uuid(input), sessionsColumn=uuid(input), node=uuid(input), incarnation=uuid(input);
         int groups=input.getInt(), count=input.getInt();
         if (groups<1 || groups>RangeDirectoryCodec.MAX_RANGES+1 || count<1 || count>RangeDirectoryCodec.MAX_COLUMNS
-                || (long)count*21>input.remaining()-settingsBytes) throw new IllegalArgumentException("Invalid node manifest group/column counts");
+                || (long)count*21>input.remaining()-SETTINGS_BYTES) throw new IllegalArgumentException("Invalid node manifest group/column counts");
         var columns=new HashMap<UUID,String>(); UUID previous=null;
         for (int i=0;i<count;i++) {
             require(input,16); UUID column=uuid(input);
             if (previous!=null && UUID_ORDER.compare(previous,column)>=0) throw new IllegalArgumentException("Noncanonical manifest physical column order");
             previous=column; String name=text(input); columns.put(column,name);
         }
-        require(input,settingsBytes);
+        require(input,SETTINGS_BYTES);
         var images=new NativeRangeImage.Limits(input.getInt(),input.getLong(),input.getInt());
         final RatisRangeStateMachine.RetentionLimits retention;
         try { retention=new RatisRangeStateMachine.RetentionLimits(input.getLong(),input.getLong(),input.getLong(),input.getLong()); }
         catch (ArithmeticException overflow) { throw new IllegalArgumentException("Manifest retention limits overflow",overflow); }
         long clock=input.getLong(); int visits=input.getInt(), ranges=input.getInt(); long shutdown=input.getLong();
         int reads=input.getInt(), writes=input.getInt();
-        if (version==2 && input.getInt()!=2) throw new IllegalArgumentException("Unsupported framed read protocol version");
         if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
-        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),version==2);
+        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown));
         var recovered=catalogue(catalogue,directory,directoryColumn,sessionsColumn);
         var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,Set.of(),groups);
         if (plan.localGroups().size()!=groups) throw new IllegalArgumentException("Manifest group budget is not canonical");

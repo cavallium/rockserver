@@ -7,7 +7,7 @@ import java.util.*;
 public record RangeStateView(UUID groupId,long rangeEpoch,UUID domainId,byte[] schemaDigest,Set<UUID> columns,
                              byte[] lowerInclusive,byte[] upperExclusive,ApplyPosition applied,SessionAuthority sessionAuthority) {
     public static final int MAX_BYTES=2*1024*1024;
-    private static final int MAGIC=0x52535657, REQUEST_MAGIC=0x52535651, VERSION=1, MIN_BYTES=110;
+    private static final int MAGIC=0x52535657, VERSION=1, MIN_BYTES=110;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
@@ -64,10 +64,6 @@ public record RangeStateView(UUID groupId,long rangeEpoch,UUID domainId,byte[] s
         }
         if (input.hasRemaining()) throw new IllegalArgumentException("Trailing range state view bytes");
         return new RangeStateView(group,epoch,domain,schema,columns,lower,upper,applied,authority);
-    }
-    public static byte[] request() { return ByteBuffer.allocate(8).putInt(REQUEST_MAGIC).putInt(VERSION).array(); }
-    public static boolean isRequest(byte[] bytes) {
-        return bytes!=null && bytes.length==8 && ByteBuffer.wrap(bytes).getInt()==REQUEST_MAGIC && ByteBuffer.wrap(bytes).getInt(4)==VERSION;
     }
     public void requireMatches(RangeDirectory directory,RangeDescriptor range) {
         Objects.requireNonNull(directory); Objects.requireNonNull(range);

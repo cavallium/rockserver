@@ -137,7 +137,7 @@ public final class RatisSessionClient {
     public synchronized void acceptTransaction(Pending entry,DistributedCommand accepted) {
         requireOwner(entry); Objects.requireNonNull(accepted);
         if (!entry.awaitingAcceptance || entry.executing || entry.result!=null || entry.consumed) throw new IllegalStateException("Operation is not an unresolved transaction intent");
-        if (accepted.formatVersion()!=7 || accepted.acceptance()==null) throw new IllegalArgumentException("Transaction acceptance requires v7");
+        if (accepted.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || accepted.acceptance()==null) throw new IllegalArgumentException("Transaction acceptance requires an accepted commit");
         var exact=DistributedCommand.acceptedTransaction(entry.command(),accepted.acceptance());
         if (!Arrays.equals(DistributedCommandCodec.encode(exact),DistributedCommandCodec.encode(accepted))) throw new IllegalArgumentException("Accepted transaction changed original identity or ordered plan");
         var prepared=routed.restoreSessionCommand(accepted,entry.descriptor());

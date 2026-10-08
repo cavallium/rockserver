@@ -25,10 +25,10 @@ class RatisNodeRuntimeTest {
             var first=new FakeServer();
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first)) {
                 assertFalse(node.started()); node.start(); assertTrue(node.started()); assertEquals(2,first.storages.size());
-                assertFalse(env.timer.cancelled); assertNull(node.maintenanceStatus());
+                assertEquals(1,env.timer.activePeriods()); assertNull(node.maintenanceStatus());
                 assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
             }
-            assertEquals(1,first.closes); assertTrue(first.allFencedAtClose); assertFalse(env.timer.cancelled); assertNull(env.timer.periodic);
+            assertEquals(1,first.closes); assertTrue(first.allFencedAtClose); assertEquals(0,env.timer.activePeriods());
             assertEquals(0,env.catalogue.closes.get()); assertEquals(0,env.transportCloses);
             try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); assertTrue(recovered.started()); }
             assertNotNull(env.catalogue.epochs.read()); assertFalse(env.timer.isDisposed());
@@ -106,7 +106,7 @@ class RatisNodeRuntimeTest {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
             env.catalogue.unavailable=true;
             try (var node=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) {
-                node.start(); assertTrue(node.started()); env.timer.fire();
+                node.start(); assertTrue(node.started()); assertEquals(2,env.timer.activePeriods()); env.timer.fire();
                 var settled=new java.util.concurrent.CompletableFuture<Void>();
                 env.scheduler.executor(it.cavallium.rockserver.core.common.RequestContext.batch(),it.cavallium.rockserver.core.common.OperationFamily.MUTATION).execute(() -> settled.complete(null));
                 settled.get(5,java.util.concurrent.TimeUnit.SECONDS);
@@ -137,7 +137,8 @@ class RatisNodeRuntimeTest {
             var failed=new FakeServer(); failed.failCreate=true;
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed));
             assertEquals(0,failed.starts);
-            byte[] identity=SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128); assertEquals(0,identity[4]);
+            byte[] identity=SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128);
+            assertEquals(37,identity.length); assertEquals(1,java.nio.ByteBuffer.wrap(identity).getInt()); assertEquals(0,identity[4]);
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
             var resumed=new FakeServer();
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,resumed)) {
@@ -164,35 +165,35 @@ class RatisNodeRuntimeTest {
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
         }
     }
-    @Test void legacyIdentityRemainsExposedAndInvalidPhaseCannotRelaxRecovery() throws Exception {
+    @Test void currentIdentityIsCanonicalAndRejectsMalformedPhaseShapeVersionAndBinding() throws Exception {
         try (var env=new Env(root)) {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
             Path identity=env.nodeRoot.resolve("node.identity");
-            SessionJournalFiles.write(identity,java.nio.ByteBuffer.allocate(36).putInt(1).put(env.plan.identityDigest()).array(),128);
-            try (var node=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { node.start(); }
-            var bytes=SessionJournalFiles.read(identity,128); assertEquals(2,java.nio.ByteBuffer.wrap(bytes).getInt()); assertEquals(1,bytes[4]);
-            bytes[4]=2; SessionJournalFiles.write(identity,bytes,128);
-            assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
+            byte[] canonical=SessionJournalFiles.read(identity,128);
+            assertEquals(37,canonical.length); assertEquals(1,java.nio.ByteBuffer.wrap(canonical).getInt()); assertEquals(1,canonical[4]);
+            assertArrayEquals(env.plan.identityDigest(),Arrays.copyOfRange(canonical,5,37));
+            for (int length=0;length<canonical.length;length++) assertIdentityRejected(env,Arrays.copyOf(canonical,length));
+            assertIdentityRejected(env,Arrays.copyOf(canonical,canonical.length+1));
+            for (int version:new int[]{0,2,3}) {
+                byte[] malformed=canonical.clone(); java.nio.ByteBuffer.wrap(malformed).putInt(version); assertIdentityRejected(env,malformed);
+            }
+            byte[] phase=canonical.clone(); phase[4]=2; assertIdentityRejected(env,phase);
+            byte[] binding=canonical.clone(); binding[5]^=1; assertIdentityRejected(env,binding);
+            SessionJournalFiles.write(identity,canonical,128);
+            try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
+            assertArrayEquals(canonical,SessionJournalFiles.read(identity,128));
         }
     }
-    @Test void establishedReadProtocolCannotFlipByChangingRecoveryConfiguration() throws Exception {
-        try (var legacy=new Env(root.resolve("legacy"))) {
-            try (var node=legacy.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
-            assertThrows(IOException.class,() -> legacy.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer(),true));
-            try (var node=legacy.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { node.start(); }
-        }
-        try (var framed=new Env(root.resolve("framed"))) {
-            try (var node=framed.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer(),true)) { node.start(); }
-            var identity=SessionJournalFiles.read(framed.nodeRoot.resolve("node.identity"),128);
-            assertEquals(3,java.nio.ByteBuffer.wrap(identity).getInt()); assertEquals(2,java.nio.ByteBuffer.wrap(identity).getInt(5));
-            assertThrows(IOException.class,() -> framed.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
-            try (var node=framed.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer(),true)) { node.start(); }
-        }
+    private static void assertIdentityRejected(Env env,byte[] identity) throws Exception {
+        SessionJournalFiles.write(env.nodeRoot.resolve("node.identity"),identity,128);
+        var fake=new FakeServer();
+        assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,fake)); assertFalse(fake.created);
+        assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
     }
     static final class Env implements AutoCloseable {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest(); final RatisSessionEpochsTest.Fixture catalogue;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"node-runtime-test");
-        final RatisSessionClockServiceTest.ManualTimer timer=new RatisSessionClockServiceTest.ManualTimer();
+        final ManualTimer timer=new ManualTimer();
         final Path nodeRoot; final RatisNodePlan plan; final RatisRoutedClient routed; int transportCloses; boolean resourcesTransferred;
         Env(Path root) throws Exception { this(root,false); }
         Env(Path root,boolean localCatalogue) throws Exception { this(root,localCatalogue,new byte[32]); }
@@ -218,17 +219,35 @@ class RatisNodeRuntimeTest {
             nodeRoot=Files.createDirectory(root.resolve("node"));
         }
         RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake) throws IOException {
-            return open(startup,fake,false);
-        }
-        RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake,boolean framed) throws IOException {
             var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),
-                    Duration.ofSeconds(1),1,2,Duration.ofMillis(100),framed);
+                    Duration.ofSeconds(1),1,2,Duration.ofMillis(100));
             return RatisNodeRuntime.open(plan,nodeRoot,ConfigParser.parseDefault(),catalogue.epochs,routed,scheduler,timer,() -> 20L,settings,startup,fake::create);
         }
         public void close() throws Exception {
             if (resourcesTransferred) catalogue.pool.close();
             else { routed.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close(); }
         }
+    }
+    /** One borrowed node timer can register both catalogue maintenance and transaction expiry. */
+    static final class ManualTimer implements reactor.core.scheduler.Scheduler {
+        private final List<Scheduled> tasks=new java.util.concurrent.CopyOnWriteArrayList<>();
+        private volatile boolean disposed;
+        private static final class Scheduled implements reactor.core.Disposable {
+            final Runnable task; volatile boolean cancelled;
+            Scheduled(Runnable task) { this.task=task; }
+            public void dispose() { cancelled=true; }
+            public boolean isDisposed() { return cancelled; }
+        }
+        long activePeriods() { return disposed ? 0 : tasks.stream().filter(task -> !task.cancelled).count(); }
+        void fire() { for (var scheduled:tasks) if (!disposed && !scheduled.cancelled) scheduled.task.run(); }
+        public reactor.core.Disposable schedulePeriodically(Runnable task,long initial,long period,java.util.concurrent.TimeUnit unit) {
+            if (disposed) throw new java.util.concurrent.RejectedExecutionException("Timer disposed");
+            var scheduled=new Scheduled(task); tasks.add(scheduled); return scheduled;
+        }
+        public reactor.core.Disposable schedule(Runnable task) { throw new UnsupportedOperationException(); }
+        public Worker createWorker() { throw new UnsupportedOperationException(); }
+        public void dispose() { disposed=true; }
+        public boolean isDisposed() { return disposed; }
     }
     static final class FakeServer {
         boolean created,wrongEndpoint,joint,rejectAdd,allFencedAtClose,failCreate,failStart,exposedBeforeStart; int closes,starts;
@@ -241,7 +260,7 @@ class RatisNodeRuntimeTest {
                 case "getId" -> RaftPeerId.valueOf(plan.peerId()); case "toString" -> "controlled-node-server";
                 case "start" -> {
                     starts++; byte[] identity=SessionJournalFiles.read(logs.getParent().resolve("node.identity"),128);
-                    exposedBeforeStart=identity.length==37 && identity[4]==1;
+                    exposedBeforeStart=identity.length==37 && java.nio.ByteBuffer.wrap(identity).getInt()==1 && identity[4]==1;
                     if (failStart) throw new IOException("fixture start failure");
                     initialize(plan.localGroups().getFirst()); yield null;
                 }

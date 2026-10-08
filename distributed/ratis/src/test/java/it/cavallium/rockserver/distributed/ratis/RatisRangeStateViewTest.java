@@ -16,9 +16,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Metadata/native query composition; actual read-index quorum/transport acceptance remains a separate gate. */
 class RatisRangeStateViewTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
-    Message request() { return Message.valueOf(ByteString.copyFrom(RangeStateView.request())); }
+    Message request() { return Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]))); }
     RangeStateView view(RatisSessionBindingTest.Fixture f) throws Exception {
-        return RangeStateView.decode(f.machine.query(request()).get(5,TimeUnit.SECONDS).getContent().toByteArray());
+        return RangeStateView.decode(ScopedTransactionRpc.parse(f.machine.query(request()).get(5,TimeUnit.SECONDS).getContent().toByteArray(),ScopedTransactionRpc.MAX_REPLY_BYTES).body());
     }
     @Test void metadataUsesNoCustomerKeyAndSharesPauseReloadAndStaleIndexGuards() throws Exception {
         try (var f=new RatisSessionBindingTest.Fixture(root)) {
@@ -30,11 +30,11 @@ class RatisRangeStateViewTest {
             var bound=view(f); assertEquals(new ApplyPosition(1,1),bound.applied()); assertEquals(target,bound.sessionAuthority());
             bound.requireMatches(f.directory,f.directory.ranges().getFirst()); bound.requireServing(target);
             var usage=f.store.receiptUsage();
-            byte[] invalid=RangeStateView.request(); invalid[0]^=1;
+            byte[] invalid=ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]); invalid[0]^=1;
             assertTrue(f.machine.query(Message.valueOf(ByteString.copyFrom(invalid))).isCompletedExceptionally());
             assertTrue(f.machine.queryStale(request(),2).isCompletedExceptionally());
-            byte[] legacy=ByteBuffer.allocate(17).putLong(f.outer.data.getMostSignificantBits()).putLong(f.outer.data.getLeastSignificantBits()).put((byte)1).array();
-            assertArrayEquals(ByteBuffer.allocate(4).putInt(-1).array(),f.machine.query(Message.valueOf(ByteString.copyFrom(legacy))).get(5,TimeUnit.SECONDS).getContent().toByteArray());
+            byte[] point=ScopedTransactionRpc.pointRequest(f.outer.data,new byte[]{1});
+            assertNull(ScopedTransactionRpc.pointValue(f.machine.query(Message.valueOf(ByteString.copyFrom(point))).get(5,TimeUnit.SECONDS).getContent().toByteArray(),2*1024*1024));
             assertEquals(usage,f.store.receiptUsage()); assertEquals(0,f.store.activeSnapshotPins());
             f.machine.takeSnapshot(); f.machine.pause(); assertTrue(f.machine.query(request()).isCompletedExceptionally());
             f.machine.reinitialize(); assertEquals(bound,view(f)); assertEquals(0,f.store.activeSnapshotPins());

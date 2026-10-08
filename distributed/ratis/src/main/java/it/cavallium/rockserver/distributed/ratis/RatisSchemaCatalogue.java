@@ -24,13 +24,11 @@ public final class RatisSchemaCatalogue {
         this.epoch=epoch; this.catalogueSchema=catalogueSchema.clone(); validator=validator(cluster,database,group,epoch,catalogueSchema,column);
     }
     public DistributedSchema read(byte[] digest) throws IOException {
-        byte[] key=key(digest), query=ByteBuffer.allocate(49).put(uuid(column)).put(key).array();
-        byte[] reply=content(RatisRoutedClient.rpc(() -> client.io().sendReadOnly(message(query))),MAX_SCHEMA_BYTES+4);
-        if (reply.length<4) throw new IOException("Truncated schema catalogue reply");
-        var input=ByteBuffer.wrap(reply); int size=input.getInt();
-        if (size== -1 && !input.hasRemaining()) return null;
-        if (size<0 || size!=input.remaining()) throw new IOException("Invalid schema catalogue reply length");
-        byte[] encoded=new byte[size]; input.get(encoded);
+        byte[] key=key(digest), query=ScopedTransactionRpc.pointRequest(column,key);
+        byte[] encoded;
+        try { encoded=ScopedTransactionRpc.pointValue(content(RatisRoutedClient.rpc(() -> client.io().sendReadOnly(message(query))),MAX_SCHEMA_BYTES+20),MAX_SCHEMA_BYTES); }
+        catch (IllegalArgumentException malformed) { throw new IOException("Invalid schema catalogue reply",malformed); }
+        if (encoded==null) return null;
         try { return decode(encoded,cluster,database,key); }
         catch (IllegalArgumentException malformed) { throw new IOException("Invalid schema catalogue content",malformed); }
     }
@@ -66,9 +64,9 @@ public final class RatisSchemaCatalogue {
         if (epoch<0 || catalogueSchema.length!=32) throw new IllegalArgumentException("Invalid schema catalogue validator binding");
         byte[] expected=catalogueSchema.clone();
         return command -> {
-            if (command.formatVersion()!=2 || !command.groupId().equals(group) || command.rangeEpoch()!=epoch
+            if (command.kind()!=DistributedCommand.Kind.DATA || !command.groupId().equals(group) || command.rangeEpoch()!=epoch
                     || !Arrays.equals(command.schemaDigest(),expected) || command.mutations().size()!=1 || command.predicates().size()!=1) {
-                throw new IllegalArgumentException("Schema publication requires one v2 conditional content-addressed PUT");
+                throw new IllegalArgumentException("Schema publication requires one conditional content-addressed data PUT");
             }
             var mutation=command.mutations().getFirst(); var predicate=command.predicates().getFirst(); byte[] key=mutation.key();
             if (mutation.kind()!=Mutation.Kind.PUT || mutation.returnMode()!=Mutation.ReturnMode.NONE

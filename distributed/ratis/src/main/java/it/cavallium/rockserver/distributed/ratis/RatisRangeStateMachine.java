@@ -71,10 +71,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final LeadershipSource leadershipSource;
     private RatisScopedTransactions scopedTransactions;
 
-    /** Explicit new-group protocol activation; legacy query bytes are never sniffed as framed requests. */
-    void enableScopedTransactions(java.util.function.LongSupplier nanos) {
-        if (getLifeCycleState()!=LifeCycle.State.NEW || scopedTransactions!=null) throw new IllegalStateException("Read protocol is fixed before initialization");
-        store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+    /** Test clock configuration is fixed before this state-machine owner is initialized. */
+    void transactionClock(java.util.function.LongSupplier nanos) {
+        if (getLifeCycleState()!=LifeCycle.State.NEW) throw new IllegalStateException("Transaction clock is fixed before initialization");
         scopedTransactions=new RatisScopedTransactions(this,RatisScopedTransactions.Limits.defaults(),nanos);
     }
     long transactionGeneration() { return admissionGeneration.get(); }
@@ -96,7 +95,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             retained=true; return pin;
         } finally { if (!retained) pin.close(); }
     }
-    void expireTransactions() throws Exception { if (scopedTransactions!=null) scopedTransactions.expire(); }
+    void expireTransactions() throws Exception { scopedTransactions.expire(); }
 
     private static final class Admission {
         final OperationId id;
@@ -106,11 +105,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         final boolean maintenance, protectedControl;
         final ProposalFootprints.OrdinaryLease footprint;
         final ProposalFootprints.CandidateLease acceptedScope;
+        final ByteString rejectionLogData;
         boolean retentionReleased,maybeAppended,settled;
         int owners = 1;
         Admission(OperationId id, byte[] digest, int bytes, long term, long generation,
-                long receiptCount, long receiptBytes, boolean maintenance, boolean protectedControl,ProposalFootprints.OrdinaryLease footprint,ProposalFootprints.CandidateLease acceptedScope) {
-            this.acceptedScope=acceptedScope; this.footprint=footprint; this.id = id;
+                long receiptCount, long receiptBytes, boolean maintenance, boolean protectedControl,ProposalFootprints.OrdinaryLease footprint,ProposalFootprints.CandidateLease acceptedScope,ByteString rejectionLogData) {
+            this.rejectionLogData=rejectionLogData; this.acceptedScope=acceptedScope; this.footprint=footprint; this.id = id;
             this.digest = digest;
             this.bytes = bytes; this.term = term; this.generation = generation;
             this.receiptCount=receiptCount; this.receiptBytes=receiptBytes;
@@ -213,6 +213,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         this.store = java.util.Objects.requireNonNull(store);
         this.initialGroup = java.util.Objects.requireNonNull(initialGroup);
         this.limits = java.util.Objects.requireNonNull(limits);
+        scopedTransactions=new RatisScopedTransactions(this,RatisScopedTransactions.Limits.defaults(),System::nanoTime);
     }
 
     @Override public SimpleStateMachineStorage getStateMachineStorage() { return snapshots; }
@@ -233,6 +234,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             snapshots.init(storage);
             recover(false);
             store.activate();
+            store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
             if (enableSessionControls) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
         } catch (Exception failure) { throw failRecovery(failure); }
@@ -368,7 +370,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     /** Must run before RaftServer.close(), whose updater waits for outstanding apply futures. */
     public void beginShutdown() {
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
-        if (scopedTransactions!=null) try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
+        try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
         IOException failure = new IOException("Range is shutting down");
         synchronized (gate) { storageFailure = failure; store.fence(); }
         failDeferred(failure);
@@ -522,7 +524,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         throw new IOException("Deferred term conflicts with installed image");
                     }
                     var command = DistributedCommandCodec.decode(pending.encoded());
-                    byte[] result = store.operationResult(command.operationId(), command.payloadDigest());
+                    byte[] result = store.operationResult(command.operationId(), command.receiptDigest());
                     if (result == null) throw new IOException("Installed image omitted deferred receipt");
                     completions.add(new Completion(pending.future(), Message.valueOf(ByteString.copyFrom(result))));
                     coveredOperations.add(command.operationId());
@@ -537,6 +539,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear();
                 store.activate();
+            store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
                 if (enableSessionControls) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
@@ -589,9 +592,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray();
             var command = DistributedCommandCodec.decode(encoded);
+            if (command.transactionRejection()) throw new IllegalArgumentException("Internal rejection records cannot be submitted by clients");
             commandValidator.accept(command);
             store.validate(command);
             byte[] digest = command.payloadDigest();
+            var rejection=command.acceptance()==null ? null : DistributedCommand.rejectAcceptedTransaction(command);
+            var rejectionData=rejection==null ? null : ByteString.copyFrom(DistributedCommandCodec.encode(rejection));
             var spans=new ArrayList<TransactionScope.Span>(command.mutations().size());
             for (var mutation:command.mutations()) spans.add(mutation.kind()==Mutation.Kind.DELETE_RANGE
                     ? TransactionScope.Span.range(mutation.columnId(),mutation.key(),mutation.value()) : TransactionScope.Span.point(mutation.columnId(),mutation.key()));
@@ -599,14 +605,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             // Native receipt reads stay outside the short admission lock. If apply
             // advanced while reading, retry validation before acquiring ownership.
             for (int attempt = 0; attempt < 3; attempt++) {
-                var estimate = store.estimateReceiptRetention(command,enableSessionControls);
-                var observed = estimate.usage().appliedPosition();
+                var originalEstimate = store.estimateReceiptRetention(command,enableSessionControls);
+                var rejectionEstimate=rejection==null ? originalEstimate : store.estimateReceiptRetention(rejection,enableSessionControls);
+                var observed = originalEstimate.usage().appliedPosition();
+                if (!java.util.Objects.equals(observed,rejectionEstimate.usage().appliedPosition()) || originalEstimate.newReceipt()!=rejectionEstimate.newReceipt()) continue;
                 if (observed == null || observed.term() != leadership.term()) {
                     throw new IllegalStateException("Current-term startup prefix has not completed native apply");
                 }
                 // Previously committed outcomes and expired identities cannot advance the fence.
-                if (estimate.newReceipt() && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
+                if (originalEstimate.newReceipt() && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
                 synchronized (admissions) {
+                    var estimate=originalEstimate;
                     requireHealthy();
                     if (generation != admissionGeneration.get()) throw new IllegalStateException("Admission leadership generation changed");
                     if (!store.admissionOpen()) throw new IllegalStateException("Native range admission is closed");
@@ -626,9 +635,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     } else {
                         if (command.acceptance()==null && (preparingCommits.containsKey(command.operationId()) || preparedCommits.containsKey(command.operationId()))) throw new IllegalStateException("Operation identity is reserved by transaction preparation");
                         var accepted=command.acceptance()==null || !estimate.newReceipt() ? null : preparedCommits.get(command.operationId());
-                        if (command.acceptance()!=null && estimate.newReceipt() && (accepted==null || accepted.closed || accepted.claimed
-                                || !Arrays.equals(accepted.digest,digest) || !accepted.reservation.active())) throw new IllegalStateException("Accepted plan has no live leader authorization");
-                        if (estimate.newReceipt() && command.acceptance()==null && estimate.maintenance() && proposalFootprints.stats().candidates()>0) throw new IllegalStateException("Transaction reservations hold session metadata stable");
+                        boolean reject=false;
+                        if (command.acceptance()!=null && estimate.newReceipt()) {
+                            if (preparingCommits.containsKey(command.operationId())) throw new IllegalStateException("Operation identity is still being prepared");
+                            if (accepted!=null && !Arrays.equals(accepted.digest,digest)) throw new IllegalArgumentException("Operation identity reused with different prepared payload");
+                            if (accepted!=null && !accepted.authorized()) { accepted.close(); accepted=null; }
+                            reject=accepted==null;
+                            if (reject) {
+                                estimate=rejectionEstimate;
+                            }
+                        }
+                        if (estimate.newReceipt() && (command.acceptance()==null || reject) && estimate.maintenance() && proposalFootprints.stats().candidates()>0) throw new IllegalStateException("Transaction reservations hold session metadata stable");
                         boolean maintenance = estimate.newReceipt() && estimate.maintenance();
                         boolean protectedControl = estimate.maintenance() && command.mutations().isEmpty() && command.predicates().isEmpty();
                         if (protectedControl ? protectedAdmissions >= 16
@@ -642,11 +659,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                                 || !retentionFits(estimate.usage().retainedBytes(),reservedReceiptBytes,estimate.additionalBytes(),byteLimit)) {
                             throw new IllegalStateException("Retained receipt budget exhausted; acknowledge outcomes or expire epochs");
                         }
-                        var lease=accepted==null && estimate.newReceipt() && !footprint.isEmpty() ? proposalFootprints.registerOrdinary(footprint,leadership.term(),generation) : null;
-                        if (accepted==null && estimate.newReceipt() && !footprint.isEmpty() && lease==null) throw new IllegalStateException("Proposal overlaps a reserved transaction scope");
+                        var lease=!reject && accepted==null && estimate.newReceipt() && !footprint.isEmpty() ? proposalFootprints.registerOrdinary(footprint,leadership.term(),generation) : null;
+                        if (!reject && accepted==null && estimate.newReceipt() && !footprint.isEmpty() && lease==null) throw new IllegalStateException("Proposal overlaps a reserved transaction scope");
                         try {
                             admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation,
-                                    estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl,lease,accepted==null ? null : accepted.reservation.lease);
+                                    estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl,lease,accepted==null ? null : accepted.reservation.lease,reject ? rejectionData : null);
                             admissions.put(admission.id, admission);
                         } catch (RuntimeException | Error failure) {
                             if (admission!=null) admissions.remove(admission.id,admission);
@@ -658,7 +675,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         reservedReceiptCount+=admission.receiptCount; reservedReceiptBytes+=admission.receiptBytes;
                         if (maintenance) maintenanceReservation=admission;
                     }
-                    return transaction.setStateMachineContext(admission);
+                    transaction.setStateMachineContext(admission);
+                    if (admission.rejectionLogData==null) return transaction;
+                    try {
+                        return TransactionContext.newBuilder().setStateMachine(this).setClientRequest(request).setLogData(admission.rejectionLogData).setStateMachineContext(admission).build();
+                    } catch (RuntimeException | Error failure) { releaseAdmission(transaction); throw failure; }
                 }
             }
             throw new IllegalStateException("Range changed during admission; retry with same identity");
@@ -831,15 +852,22 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         @Override public void close() { synchronized (admissions) { proposalFootprints.release(lease); } }
     }
     /** Frozen bytes must be retained by the caller before its first Ratis RPC. Closing abandons only unsubmitted work. */
+    record ProposalDeadline(java.util.function.LongSupplier nanos,long opened,long ttl) {
+        ProposalDeadline { java.util.Objects.requireNonNull(nanos); if (ttl<=0) throw new IllegalArgumentException("Invalid proposal deadline"); }
+        boolean active() { return nanos.getAsLong()-opened<ttl; }
+    }
     public final class ScopedCommit implements AutoCloseable {
         private final ProposalReservation reservation;
         private final DistributedCommand command;
         private final byte[] digest;
         private final int bytes;
+        private final ProposalDeadline deadline;
         private boolean claimed,closed;
-        private ScopedCommit(ProposalReservation reservation,DistributedCommand command) {
+        private ScopedCommit(ProposalReservation reservation,DistributedCommand command,ProposalDeadline deadline) {
             this.reservation=reservation; this.command=command; this.digest=command.payloadDigest(); this.bytes=DistributedCommandCodec.encodedSize(command);
+            this.deadline=deadline;
         }
+        private boolean authorized() { return !closed && !claimed && reservation.active() && (deadline==null || deadline.active()); }
         public DistributedCommand command() { return command; }
         public boolean submitted() { synchronized (admissions) { return claimed; } }
         @Override public void close() {
@@ -852,6 +880,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     /** Caller supplies a leader-bound tracked cut obtained after its read barrier; no network work occurs here. */
     public ScopedCommit prepareScopedCommit(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command) throws Exception {
+        return prepareScopedCommit(pin,command,null);
+    }
+    ScopedCommit prepareScopedCommit(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command,ProposalDeadline deadline) throws Exception {
         java.util.Objects.requireNonNull(pin); java.util.Objects.requireNonNull(command); commandValidator.accept(command);
         ProposalReservation reservation;
         synchronized (admissions) {
@@ -864,7 +895,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         boolean retained=false;
         try {
             synchronized (admissions) {
-                if (!reservation.active() || pin.position().term()!=reservation.term()) throw new IllegalStateException("Transaction snapshot changed leadership");
+                if (!reservation.active() || deadline!=null && !deadline.active() || pin.position().term()!=reservation.term()) throw new IllegalStateException("Transaction snapshot changed leadership or expired");
                 if (admissions.containsKey(command.operationId()) || preparedCommits.containsKey(command.operationId()) || preparingCommits.containsKey(command.operationId())) throw new IllegalStateException("Operation identity already owns a proposal");
                 if (preparingCommits.size()+preparedCommits.size()>=64 || preparing.bytes>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Preparing command byte/count budget exhausted");
                 if (command.acknowledgedThrough()>=0) {
@@ -876,10 +907,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (!store.estimateReceiptRetention(command,enableSessionControls).newReceipt()) throw new IllegalStateException("Transaction identity already has a terminal outcome");
             var accepted=store.planScopedCommit(pin,command,reservation.generation(),transactionIncarnation);
             commandValidator.accept(accepted);
-            var plan=new ScopedCommit(reservation,accepted);
+            var plan=new ScopedCommit(reservation,accepted,deadline);
             synchronized (admissions) {
                 requireHealthy();
-                if (!reservation.active() || preparingCommits.get(command.operationId())!=preparing) throw new IllegalStateException("Transaction lost its reservation before acceptance");
+                if (!plan.authorized() || preparingCommits.get(command.operationId())!=preparing) throw new IllegalStateException("Transaction lost its reservation before acceptance");
                 if (preparedCommits.size()>=64 || plan.bytes>16L*1024*1024-(preparedCommitBytes-preparing.bytes)) throw new IllegalStateException("Prepared command byte/count budget exhausted");
                 preparedCommitBytes+=plan.bytes-preparing.bytes; preparing.bytes=plan.bytes;
             }
@@ -887,7 +918,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             pin.close();
             synchronized (admissions) {
                 requireHealthy();
-                if (!reservation.active() || preparingCommits.get(command.operationId())!=preparing) throw new IllegalStateException("Transaction lost its reservation before publication");
+                if (!plan.authorized() || preparingCommits.get(command.operationId())!=preparing) throw new IllegalStateException("Transaction lost its reservation before publication");
                 if (admissions.containsKey(command.operationId()) || preparedCommits.containsKey(command.operationId())) throw new IllegalStateException("Operation identity already owns a proposal");
                 preparedCommits.put(command.operationId(),plan); preparingCommits.remove(command.operationId(),preparing);
             }
@@ -911,7 +942,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     private static boolean retentionFits(long retained,long reserved,long additional,long ceiling) {
-        // No-growth GC/retries remain possible when a legacy database or conservative in-flight accounting exceeds the ceiling.
+        // No-growth GC/retries remain possible when conservative in-flight accounting exceeds the ceiling.
         return additional == 0 || retained <= ceiling && reserved <= ceiling-retained && additional <= ceiling-retained-reserved;
     }
     // Caller holds admissions. Applied outcomes no longer consume speculative capacity, even with duplicate RPC waiters.
@@ -970,7 +1001,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
-            if (scopedTransactions!=null && ScopedTransactionRpc.parse(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
+            if (ScopedTransactionRpc.parse(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
                 if (minIndex > getLastAppliedTermIndex().getIndex()) throw new IllegalStateException("Requested read index has not completed");
@@ -987,27 +1018,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try {
             requireHealthy();
             byte[] encoded = request.getContent().toByteArray();
-            if (scopedTransactions!=null) return CompletableFuture.completedFuture(framedQuery(encoded,freshBarrier));
-            if (encoded.length==8) {
-                if (!RangeStateView.isRequest(encoded)) throw new IllegalArgumentException("Invalid range-state request");
-                try (var pin=snapshotPin()) {
-                    return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(pin.stateView().encode())));
-                }
-            }
-            if (encoded.length < 16 || encoded.length > DistributedCommandCodec.MAX_ENCODED_BYTES) {
-                throw new IllegalArgumentException("Invalid point read size");
-            }
-            var input = ByteBuffer.wrap(encoded);
-            var column = new UUID(input.getLong(), input.getLong());
-            var key = new byte[input.remaining()];
-            input.get(key);
-            try (var pin = snapshotPin()) {
-                byte[] value = pin.get(column, key);
-                var result = ByteBuffer.allocate(4 + (value == null ? 0 : value.length));
-                result.putInt(value == null ? -1 : value.length);
-                if (value != null) result.put(value);
-                return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(result.array())));
-            }
+            return CompletableFuture.completedFuture(framedQuery(encoded,freshBarrier));
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
         }

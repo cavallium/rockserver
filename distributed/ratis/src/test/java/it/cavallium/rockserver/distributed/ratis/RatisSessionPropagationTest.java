@@ -177,15 +177,14 @@ class RatisSessionPropagationTest {
                 public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) throws IOException {
                     customerReads++;
                     try {
-                        byte[] request=java.nio.ByteBuffer.allocate(16+key.length).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).put(key).array();
+                        byte[] request=ScopedTransactionRpc.pointRequest(column,key);
                         byte[] response=machines.get(descriptor.groupId()).query(Message.valueOf(ByteString.copyFrom(request))).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-                        var input=java.nio.ByteBuffer.wrap(response); int length=input.getInt(); if (length== -1) return null;
-                        byte[] value=new byte[length]; input.get(value); return value;
+                        return ScopedTransactionRpc.pointValue(response,2*1024*1024);
                     } catch (Exception failure) { throw new IOException(failure); }
                 }
                 public RangeStateView stateView(RangeDescriptor descriptor) throws IOException {
                     metadataReads++; if (failed.contains(descriptor.groupId())) throw new IOException("range unavailable");
-                    try { return RangeStateView.decode(machines.get(descriptor.groupId()).query(Message.valueOf(ByteString.copyFrom(RangeStateView.request()))).get(5,TimeUnit.SECONDS).getContent().toByteArray()); }
+                    try { return RangeStateView.decode(ScopedTransactionRpc.parse(machines.get(descriptor.groupId()).query(Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0])))).get(5,TimeUnit.SECONDS).getContent().toByteArray(),ScopedTransactionRpc.MAX_REPLY_BYTES).body()); }
                     catch (Exception failure) { throw new IOException(failure); }
                 }
                 public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException {

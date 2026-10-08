@@ -216,8 +216,8 @@ class RatisSessionEpochsTest {
                     if (writeOverride!=null) reply=writeOverride;
                 } else if (method.getName().equals("sendReadOnly")) {
                     reads.incrementAndGet(); byte[] query=((Message)args[0]).getContent().toByteArray();
-                    assertTrue(query.length==32 || query.length==49); var input=ByteBuffer.wrap(query);
-                    UUID column=new UUID(input.getLong(),input.getLong()); byte[] key=new byte[input.remaining()]; input.get(key);
+                    var packet=ScopedTransactionRpc.parse(query,ScopedTransactionRpc.MAX_REQUEST_BYTES); assertEquals(ScopedTransactionRpc.POINT,packet.kind()); var input=ByteBuffer.wrap(packet.body());
+                    UUID column=ScopedTransactionRpc.uuid(input); byte[] key=ScopedTransactionRpc.blob(input,2*1024*1024,false); assertFalse(input.hasRemaining());
                     assertTrue(column.equals(sessions) || column.equals(directoryColumn));
                     if (column.equals(sessions)) assertArrayEquals(bytes(database),key);
                     if (key.length==33) { assertEquals(directoryColumn,column); assertEquals(0x53,key[0]); if (schemaUnavailable) throw new IOException("schema unavailable"); }
@@ -226,6 +226,7 @@ class RatisSessionEpochsTest {
                         reply=value==null ? ByteBuffer.allocate(4).putInt(-1).array() : ByteBuffer.allocate(4+value.length).putInt(value.length).put(value).array();
                     }
                     if (readOverride!=null) reply=readOverride;
+                    reply=ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,reply);
                 } else throw new AssertionError("Unexpected RPC "+method);
                 return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("fixture"))
                         .setGroupId(RaftGroupId.valueOf(catalogue)).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(reply))).build();

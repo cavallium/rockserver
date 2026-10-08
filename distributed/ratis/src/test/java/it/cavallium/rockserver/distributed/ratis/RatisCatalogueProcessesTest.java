@@ -140,8 +140,7 @@ class RatisCatalogueProcessesTest {
     private static void bootstrap(UUID gid, int[] ports) throws Exception {
         try (var client = client(group(gid, ports), 100)) {
             UUID col = gid.equals(CATALOGUE) ? META : DATA;
-            var query = Message.valueOf(ByteString.copyFrom(ByteBuffer.allocate(17).putLong(col.getMostSignificantBits())
-                    .putLong(col.getLeastSignificantBits()).put((byte)(gid.equals(RIGHT) ? 'z' : 'a')).array()));
+            var query = Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.pointRequest(col,new byte[]{(byte)(gid.equals(RIGHT) ? 'z' : 'a')})));
             for (var peer : group(gid, ports).getPeers()) {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
                 boolean ready = false;

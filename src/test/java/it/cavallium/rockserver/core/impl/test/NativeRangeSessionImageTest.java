@@ -23,7 +23,7 @@ class NativeRangeSessionImageTest {
     @TempDir(factory = DiskTestDirectory.class) Path root;
     private record Row(byte[] key, byte[] value) {}
 
-    @Test void legacyAuthorityOnlyAndLogicallyExpiredBindingsRemainValidAboveCoarseFloor() throws Exception {
+    @Test void authorityOnlyAndLogicallyExpiredBindingsRemainValidAboveCoarseFloor() throws Exception {
         assertValid(0, List.of());
         assertValid(1, List.of(authority(CURRENT)));
         var expired = binding(1);
@@ -95,6 +95,7 @@ class NativeRangeSessionImageTest {
         output.writeInt(1); uuid(output, COLUMN); output.writeInt(-1); output.writeInt(-1); output.writeInt(0);
         var rows = new ArrayList<Row>();
         rows.add(new Row(ByteBuffer.allocate(16).putLong(0).putLong(1).array(), ByteBuffer.allocate(20).putInt(1).putLong(1).putLong(0).array()));
+        rows.add(new Row(key((byte)0x10,null),ByteBuffer.allocate(36).putInt(1).putLong(0).putLong(0).putLong(1).putLong(0).array()));
         if (floor != 0) rows.add(new Row(key((byte) 3, null), ByteBuffer.allocate(12).putInt(1).putLong(floor).array()));
         rows.addAll(controls); rows.sort((a, b) -> Arrays.compareUnsigned(a.key(), b.key()));
         for (Row row : rows) {

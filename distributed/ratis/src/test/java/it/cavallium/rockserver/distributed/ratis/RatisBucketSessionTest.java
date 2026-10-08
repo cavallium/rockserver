@@ -29,7 +29,7 @@ class RatisBucketSessionTest {
                         RatisLogicalClient.Change.put(71,key(1),Buf.wrap(new byte[]{1}),Mutation.ReturnMode.PREVIOUS),
                         RatisLogicalClient.Change.put(71,key(2),Buf.wrap(new byte[]{2}),Mutation.ReturnMode.CURRENT)),
                         List.of(new RatisLogicalClient.Condition(71,key(1),null)));
-                assertEquals(6,pending.command().formatVersion()); assertTrue(pending.command().predicates().getFirst().bucket());
+                assertTrue(pending.command().hasBucketData()); assertTrue(pending.command().predicates().getFirst().bucket());
                 frozen=DistributedCommandCodec.encode(pending.command()); session.ensureBinding(pending);
                 f.lost.add(pending.descriptor().groupId()); assertThrows(IOException.class,() -> session.execute(pending));
             }
@@ -51,7 +51,7 @@ class RatisBucketSessionTest {
         var schema=schema(false);
         try (var f=new RatisSessionPropagationTest.Fixture(root,true,schema.digest(),schema)) {
             var client=new RatisLogicalClient(schema,f.routed,f.ledger,f.ledger.grants().getFirst(),RatisSessionClient.Limits.defaults());
-            var pending=client.preparePut(71,key(1),null,Mutation.ReturnMode.CURRENT); assertEquals(6,pending.command().formatVersion());
+            var pending=client.preparePut(71,key(1),null,Mutation.ReturnMode.CURRENT); assertTrue(pending.command().hasBucketData());
             f.routed.execute(client.prepareBinding(f.catalogue.epochs,new OperationId(f.outer.maintenance,1,100),pending,-1));
             assertArrayEquals(new byte[0],client.execute(pending).value(0)); client.acknowledge(pending);
             assertTrue(client.get(71,key(1)).isEmpty()); assertNull(client.get(71,key(2)));

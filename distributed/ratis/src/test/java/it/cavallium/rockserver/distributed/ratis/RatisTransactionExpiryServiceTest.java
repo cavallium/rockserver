@@ -122,7 +122,7 @@ class RatisTransactionExpiryServiceTest {
     }
 
     private RatisRetentionAdmissionTest.Fixture fixture(String name,LongSupplier nanos) throws Exception {
-        return new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> {},true,nanos);
+        return new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> {},nanos);
     }
     private static void open(RatisRetentionAdmissionTest.Fixture fixture) throws Exception {
         byte[] scope=ScopedTransactionRpc.scopeBytes(new TransactionScope(List.of(TransactionScope.Span.point(fixture.column,new byte[]{0}))));

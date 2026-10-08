@@ -83,7 +83,7 @@ class SessionWindowJournalTest {
             }
             byte[] badFlag=body.clone(); badFlag[116]=2; SessionJournalFiles.write(path,badFlag,SessionWindowJournal.MAX_BYTES);
             assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
-            byte[] badConsumed=body.clone(); badConsumed[badConsumed.length-1]=2; SessionJournalFiles.write(path,badConsumed,SessionWindowJournal.MAX_BYTES);
+            byte[] badConsumed=body.clone(); badConsumed[badConsumed.length-2]=2; SessionJournalFiles.write(path,badConsumed,SessionWindowJournal.MAX_BYTES);
             assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
             var route=ByteBuffer.wrap(body); route.position(121); int commandBytes=route.getInt(); route.position(route.position()+commandBytes+48);
             for (int i=0;i<2;i++) { int length=route.getInt(); if (length>=0) route.position(route.position()+length); }

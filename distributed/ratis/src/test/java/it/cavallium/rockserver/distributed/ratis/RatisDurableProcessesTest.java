@@ -239,11 +239,10 @@ public class RatisDurableProcessesTest {
         do {
             try {
                 var keyBytes = bytes(key);
-                var request = ByteBuffer.allocate(16 + keyBytes.length).putLong(column.getMostSignificantBits())
-                        .putLong(column.getLeastSignificantBits()).put(keyBytes).array();
+                var request = ScopedTransactionRpc.pointRequest(column,keyBytes);
                 var reply = client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(request)), minimum, peer);
                 if (reply.isSuccess()) {
-                    var buffer = ByteBuffer.wrap(reply.getMessage().getContent().toByteArray());
+                    var buffer = ByteBuffer.wrap(ScopedTransactionRpc.parse(reply.getMessage().getContent().toByteArray(),ScopedTransactionRpc.MAX_REPLY_BYTES).body());
                     int size = buffer.getInt();
                     if (size == -1 && expected == null && !buffer.hasRemaining()) return;
                     if (expected != null && size == expected.length) {
@@ -308,11 +307,10 @@ public class RatisDurableProcessesTest {
     }
     private static byte[] read(RaftClient client, UUID column, String key) throws Exception {
         byte[] keyBytes = bytes(key);
-        var request = ByteBuffer.allocate(16 + keyBytes.length).putLong(column.getMostSignificantBits())
-                .putLong(column.getLeastSignificantBits()).put(keyBytes).array();
+        var request = ScopedTransactionRpc.pointRequest(column,keyBytes);
         var reply = client.io().sendReadOnly(Message.valueOf(ByteString.copyFrom(request)));
         assertTrue(reply.isSuccess(), () -> String.valueOf(reply.getException()));
-        var value = ByteBuffer.wrap(reply.getMessage().getContent().toByteArray());
+        var value = ByteBuffer.wrap(ScopedTransactionRpc.parse(reply.getMessage().getContent().toByteArray(),ScopedTransactionRpc.MAX_REPLY_BYTES).body());
         int size = value.getInt();
         if (size == -1) return null;
         var result = new byte[size];

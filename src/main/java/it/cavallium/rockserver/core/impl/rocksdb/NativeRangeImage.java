@@ -313,7 +313,6 @@ public final class NativeRangeImage {
         private long count;
         private boolean marker;
         private boolean usagePresent;
-        private boolean usageBound;
         private SessionAuthority sessionAuthority;
         private int sessionBindings;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
@@ -362,11 +361,11 @@ public final class NativeRangeImage {
                     }
                 }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
-                    throw new IOException("Image contains incomplete receipt usage rebuild");
+                    throw new IOException("Image contains unsupported receipt accounting metadata");
                 }
                 if (section == Section.STATE && key.length > 16 && (key[16] == 0x10 || key[16] == 0x11)) {
                     boolean total = key[16] == 0x10;
-                    if (key.length != (total ? 17 : 41) || (total ? value.length != 20 && value.length != 36 : value.length != 20)) {
+                    if (key.length != (total ? 17 : 41) || (total ? value.length != 36 : value.length != 20)) {
                         throw new IOException("Invalid image receipt usage shape");
                     }
                     var usage = ByteBuffer.wrap(value);
@@ -377,15 +376,14 @@ public final class NativeRangeImage {
                     }
                     if (total) {
                         usagePresent = true;
-                        usageBound = value.length == 36;
-                        if (usageBound && (usage.getLong() != header.position().term() || usage.getLong() != header.position().index())) {
+                        if (usage.getLong() != header.position().term() || usage.getLong() != header.position().index()) {
                             throw new IOException("Image receipt usage position differs from header");
                         }
                         usageCount = count;
                         usageBytes = bytes;
                     } else {
                         if (ByteBuffer.wrap(key, 17, 8).getLong() < 0
-                                || (usageBound && ByteBuffer.wrap(key, 17, 8).getLong() < epochFloor) || count == 0) {
+                                || ByteBuffer.wrap(key, 17, 8).getLong() < epochFloor || count == 0) {
                             throw new IOException("Invalid image receipt usage epoch bucket");
                         }
                         bucketCount = addUsage(bucketCount, count);
@@ -448,8 +446,8 @@ public final class NativeRangeImage {
             if (sessionAuthority != null && sessionAuthority.minimumEpoch() > epochFloor) {
                 throw new IOException("Image range session authority exceeds coarse epoch floor");
             }
-            if (usageBound ? usageCount != bucketCount || usageBytes != bucketBytes
-                    || usageCount != receiptCount || usageBytes != receiptBytes : !usagePresent && (bucketCount != 0 || bucketBytes != 0)) {
+            if (!usagePresent || usageCount != bucketCount || usageBytes != bucketBytes
+                    || usageCount != receiptCount || usageBytes != receiptBytes) {
                 throw new IOException("Image receipt usage differs from retained receipts/buckets");
             }
         }

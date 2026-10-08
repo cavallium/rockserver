@@ -42,16 +42,11 @@ public final class RatisCatalogue {
     /** Linearizable catalogue read; established data operations need no catalogue access. */
     public RangeDirectory read(UUID domainId) throws IOException {
         byte[] key = key(domainId);
-        var request = ByteBuffer.allocate(32).putLong(columnId.getMostSignificantBits())
-                .putLong(columnId.getLeastSignificantBits()).put(key).array();
-        byte[] reply = content(client.io().sendReadOnly(message(request)));
-        if (reply.length < 4 || reply.length > MAX_DIRECTORY_BYTES + 4) throw new IOException("Invalid catalogue read size");
-        var input = ByteBuffer.wrap(reply);
-        int length = input.getInt();
-        if (length == -1 && !input.hasRemaining()) return null;
-        if (length < 0 || length != input.remaining()) throw new IOException("Invalid catalogue value length");
-        var encoded = new byte[length];
-        input.get(encoded);
+        var request=ScopedTransactionRpc.pointRequest(columnId,key);
+        byte[] encoded;
+        try { encoded=ScopedTransactionRpc.pointValue(content(client.io().sendReadOnly(message(request))),MAX_DIRECTORY_BYTES); }
+        catch (IllegalArgumentException malformed) { throw new IOException("Invalid catalogue read reply",malformed); }
+        if (encoded==null) return null;
         try {
             var directory = RangeDirectoryCodec.decode(encoded);
             requireIdentity(directory, clusterId, databaseId, key);
@@ -89,7 +84,7 @@ public final class RatisCatalogue {
         if (rangeEpoch < 0 || schemaDigest.length != 32) throw new IllegalArgumentException("Invalid catalogue validator schema");
         byte[] digest = schemaDigest.clone();
         return command -> {
-            if (command.formatVersion()==6 || command.acceptance()!=null) throw new IllegalArgumentException("Catalogue does not accept bucket or transaction data commands");
+            if (command.hasBucketData() || command.acceptance()!=null || command.transactionRejection()) throw new IllegalArgumentException("Catalogue does not accept bucket or transaction data commands");
             if (!command.groupId().equals(groupId) || command.rangeEpoch() != rangeEpoch
                     || !Arrays.equals(command.schemaDigest(), digest)) {
                 throw new IllegalArgumentException("Wrong catalogue identity/schema");
@@ -133,7 +128,7 @@ public final class RatisCatalogue {
         var schemas = RatisSchemaCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         return command -> {
             if (command.mutations().size()==2) {
-                if (command.formatVersion()!=2 || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
+                if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
                         || command.predicates().size()!=2 || !command.mutations().get(0).columnId().equals(directoryColumn)
                         || !command.mutations().get(1).columnId().equals(sessionColumn)
                         || command.predicates().stream().anyMatch(predicate -> predicate.expectedValue()!=null)) {

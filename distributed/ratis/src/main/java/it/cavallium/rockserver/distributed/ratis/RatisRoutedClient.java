@@ -55,29 +55,20 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     private final RangeDirectory identity;
     private final Transport transport;
-    private final boolean framedQueries;
     private RangeDirectory directory;
     private int activeCalls;
     private boolean closing;
     private CompletableFuture<Void> closeAttempt;
 
     public RatisRoutedClient(RangeDirectory directory, Transport transport) {
-        this(directory,transport,false);
-    }
-    public RatisRoutedClient(RangeDirectory directory,Transport transport,boolean framedQueries) {
         this.identity = this.directory = Objects.requireNonNull(directory, "directory");
         this.transport = Objects.requireNonNull(transport, "transport");
-        this.framedQueries=framedQueries;
     }
 
     public static RatisRoutedClient connect(RangeDirectory directory) {
-        return new RatisRoutedClient(directory, new RaftTransport(false));
+        return new RatisRoutedClient(directory, new RaftTransport());
     }
-    /** All target groups must already have the framed protocol activated through placement/feature authority. */
-    public static RatisRoutedClient connectFramed(RangeDirectory directory) { return new RatisRoutedClient(directory,new RaftTransport(true),true); }
-
     public ScopedTransaction openTransaction(TransactionScope scope,java.time.Duration ttl) throws IOException {
-        if (!framedQueries) throw new IOException("This client uses the legacy query protocol");
         Objects.requireNonNull(scope); long millis=Objects.requireNonNull(ttl).toMillis();
         if (millis<1 || millis>60000 || !ttl.equals(java.time.Duration.ofMillis(millis))) throw new IllegalArgumentException("Transaction TTL must be 1..60000 whole milliseconds");
         var observed=current(); var participants=scope.participants(observed,1); if (participants.size()!=1) throw new IllegalArgumentException("Transaction requires one complete participant");
@@ -148,7 +139,6 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
 
     public synchronized RangeDirectory directory() { return directory; }
-    boolean usesFramedQueries() { return framedQueries; }
 
     public synchronized void refresh(RangeDirectory next) {
         requireOpen();
@@ -275,7 +265,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     /** Restore an immutable user retry route without rebasing it onto the current topology. */
     PreparedCommand restoreSessionCommand(DistributedCommand command,RangeDescriptor descriptor) {
         Objects.requireNonNull(command); Objects.requireNonNull(descriptor); var observed=current();
-        if (command.formatVersion()!=2 && command.formatVersion()!=3 && command.formatVersion()!=6 && command.formatVersion()!=7 || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
+        if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
                 || command.mutations().isEmpty() && (command.acknowledgedThrough()<0 || !command.predicates().isEmpty())) {
@@ -391,45 +381,19 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     private static final class RaftTransport implements Transport {
         private final RatisClientPool clients = new RatisClientPool(MAX_CONCURRENT_CALLS, RaftTransport::connected);
-        private final boolean framed;
-        RaftTransport(boolean framed) { this.framed=framed; }
 
         @Override public void close() throws IOException { clients.close(); }
         @Override public byte[] read(RangeDescriptor descriptor, UUID column, byte[] key) throws IOException {
-            if (framed) {
-                try {
-                var body=ByteBuffer.allocate(20+key.length); ScopedTransactionRpc.uuid(body,column); ScopedTransactionRpc.putBlob(body,key);
-                var packet=ScopedTransactionRpc.parse(transaction(descriptor,ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,body.array()),true),ScopedTransactionRpc.MAX_REPLY_BYTES);
-                if (packet.kind()!=ScopedTransactionRpc.POINT) throw new IOException("Unexpected framed point reply");
-                var input=ByteBuffer.wrap(packet.body()); var value=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,true);
-                if (input.hasRemaining()) throw new IOException("Trailing point reply"); return value;
-                } catch (IllegalArgumentException malformed) { throw new IOException("Invalid framed point reply",malformed); }
-            }
-            var request = ByteBuffer.allocate(16 + key.length).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).put(key).array();
-            return rpc(() -> { try (var lease = clients.acquire(descriptor)) {
-                RaftClient client = lease.client();
-                byte[] encoded = content(client.io().sendReadOnly(Message.valueOf(ByteString.copyFrom(request))));
-                if (encoded.length < 4) throw new IOException("Truncated point reply");
-                var input = ByteBuffer.wrap(encoded);
-                int size = input.getInt();
-                if (size == -1 && !input.hasRemaining()) return null;
-                if (size < 0 || size != input.remaining()) throw new IOException("Invalid point reply length");
-                byte[] value = new byte[size]; input.get(value); return value;
-            } });
+            byte[] reply=transaction(descriptor,ScopedTransactionRpc.pointRequest(column,key),true);
+            try { return ScopedTransactionRpc.pointValue(reply,DistributedCommandCodec.MAX_ENCODED_BYTES); }
+            catch (IllegalArgumentException malformed) { throw new IOException("Invalid point reply",malformed); }
         }
-
         @Override public RangeStateView stateView(RangeDescriptor descriptor) throws IOException {
-            if (framed) {
-                try {
-                var packet=ScopedTransactionRpc.parse(transaction(descriptor,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true),ScopedTransactionRpc.MAX_REPLY_BYTES);
-                if (packet.kind()!=ScopedTransactionRpc.STATE) throw new IOException("Unexpected framed state reply"); return RangeStateView.decode(packet.body());
-                } catch (IllegalArgumentException malformed) { throw new IOException("Invalid framed state reply",malformed); }
-            }
-            return rpc(() -> { try (var lease=clients.acquire(descriptor)) {
-                byte[] encoded=content(lease.client().io().sendReadOnly(Message.valueOf(ByteString.copyFrom(RangeStateView.request()))));
-                try { return RangeStateView.decode(encoded); }
-                catch (IllegalArgumentException malformed) { throw new IOException("Invalid range-state reply",malformed); }
-            } });
+            byte[] reply=transaction(descriptor,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true);
+            try {
+                var packet=ScopedTransactionRpc.parse(reply,ScopedTransactionRpc.MAX_REPLY_BYTES);
+                if (packet.kind()!=ScopedTransactionRpc.STATE) throw new IOException("Unexpected state reply"); return RangeStateView.decode(packet.body());
+            } catch (IllegalArgumentException malformed) { throw new IOException("Invalid state reply",malformed); }
         }
 
         @Override public CommandResult command(RangeDescriptor descriptor, DistributedCommand command) throws IOException {
@@ -441,7 +405,6 @@ public final class RatisRoutedClient implements AutoCloseable {
             } });
         }
         @Override public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException {
-            if (!framed) throw new IOException("Transport uses legacy query protocol");
             return rpc(() -> { try (var lease=clients.acquire(descriptor)) {
                 var message=Message.valueOf(ByteString.copyFrom(request));
                 return content(freshBarrier ? lease.client().io().sendReadOnly(message) : lease.client().io().sendReadOnlyNonLinearizable(message),ScopedTransactionRpc.MAX_REPLY_BYTES);

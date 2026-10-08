@@ -98,7 +98,7 @@ class RatisSchemaCatalogueTest {
             }
             assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(0),
                     valid.mutations(),List.of(new KeyPredicate(outer.directoryColumn,valid.mutations().getFirst().key(),new byte[0])))));
-            assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(1),valid.mutations(),valid.predicates(),0)));
+            assertDoesNotThrow(() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(1),valid.mutations(),valid.predicates(),0)));
             assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.dataGroup,1,new byte[32],outer.operation(0),valid.mutations(),valid.predicates())));
             var returning=new Mutation(Mutation.Kind.PUT,outer.directoryColumn,valid.mutations().getFirst().key(),valid.mutations().getFirst().value(),Mutation.ReturnMode.PREVIOUS);
             assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(0),List.of(returning),valid.predicates())));

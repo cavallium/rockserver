@@ -37,7 +37,7 @@ class RatisAcceptedSessionClientTest {
             calls.incrementAndGet(); byte[] wire=DistributedCommandCodec.encode(command);
             if (command.acceptance()!=null) {
                 byte[] body=SessionJournalFiles.read(journal,SessionWindowJournal.MAX_BYTES); var input=ByteBuffer.wrap(body);
-                assertEquals(2,input.getInt(4)); int size=input.getInt(121); assertArrayEquals(wire,Arrays.copyOfRange(body,125,125+size),"Accepted bytes must be checkpointed before transport execution");
+                assertEquals(1,input.getInt(4)); int size=input.getInt(121); assertArrayEquals(wire,Arrays.copyOfRange(body,125,125+size),"Accepted bytes must be checkpointed before transport execution");
             }
             byte[] first=received.putIfAbsent(command.operationId(),wire); if (first!=null) assertArrayEquals(first,wire);
             if (lose && command.acceptance()!=null) { lose=false; throw new IOException("Lost applied reply"); }
@@ -46,7 +46,7 @@ class RatisAcceptedSessionClientTest {
         public void close() { closes.incrementAndGet(); }
     }
 
-    @Test void acceptedBytesAreDurableBeforeRpcAndLostReplyReopensExactV7AndOriginalRoute() throws Exception {
+    @Test void acceptedBytesAreDurableBeforeRpcAndLostReplyReopensExactAcceptedCommandAndOriginalRoute() throws Exception {
         Path path=root.resolve("accepted.bin"); var transport=new Controlled(); transport.journal=path; byte[] frozen;
         try (var routed=new RatisRoutedClient(directory(0,"127.0.0.1:9001"),transport)) {
             try (var client=RatisDurableSessionClient.create(path,routed,ISSUANCE,GRANT,LIMITS)) {
@@ -208,16 +208,24 @@ class RatisAcceptedSessionClientTest {
         }
     }
 
-    @Test void legacyV1WindowReadsCanonicallyAndNextCheckpointUpgradesToV2() throws Exception {
-        Path path=root.resolve("legacy.bin"); var transport=new Controlled(); transport.journal=path;
+    @Test void currentWindowRequiresItsVersionAndPerEntryPhaseOnRecovery() throws Exception {
+        Path path=root.resolve("strict.bin"); var transport=new Controlled(); transport.journal=path;
         try (var routed=new RatisRoutedClient(directory(0,"127.0.0.1:9001"),transport)) {
             try (var client=RatisDurableSessionClient.create(path,routed,ISSUANCE,GRANT,LIMITS)) { client.prepare(List.of(put(1))); }
-            byte[] current=SessionJournalFiles.read(path,SessionWindowJournal.MAX_BYTES), old=Arrays.copyOf(current,current.length-1);
-            assertEquals(0,current[current.length-1]); ByteBuffer.wrap(old).putInt(4,1); SessionJournalFiles.write(path,old,SessionWindowJournal.MAX_BYTES);
-            try (var client=RatisDurableSessionClient.reopen(path,routed)) {
-                var ordinary=client.pending().getFirst(); assertFalse(ordinary.awaitingAcceptance()); assertNull(ordinary.command().acceptance());
-                client.execute(ordinary); assertEquals(2,ByteBuffer.wrap(SessionJournalFiles.read(path,SessionWindowJournal.MAX_BYTES)).getInt(4));
+            byte[] valid=SessionJournalFiles.read(path,SessionWindowJournal.MAX_BYTES);
+            assertEquals(1,ByteBuffer.wrap(valid).getInt(4)); assertEquals(0,valid[valid.length-1]);
+            byte[] wrongVersion=valid.clone(); ByteBuffer.wrap(wrongVersion).putInt(4,2);
+            for (byte[] invalid:List.of(wrongVersion,Arrays.copyOf(valid,valid.length-1),Arrays.copyOf(valid,valid.length+1))) {
+                SessionJournalFiles.write(path,invalid,SessionWindowJournal.MAX_BYTES);
+                assertThrows(IOException.class,() -> RatisDurableSessionClient.reopen(path,routed));
+                assertArrayEquals(invalid,SessionJournalFiles.read(path,SessionWindowJournal.MAX_BYTES));
             }
+            SessionJournalFiles.write(path,valid,SessionWindowJournal.MAX_BYTES);
+            try (var client=RatisDurableSessionClient.reopen(path,routed)) {
+                var ordinary=client.pending().getFirst(); assertFalse(ordinary.awaitingAcceptance()); assertFalse(ordinary.abandoned()); assertNull(ordinary.command().acceptance());
+                client.execute(ordinary); client.acknowledge(ordinary); assertEquals(0,client.acknowledgedThrough());
+            }
+            try (var client=RatisDurableSessionClient.reopen(path,routed)) { assertTrue(client.pending().isEmpty()); assertEquals(0,client.acknowledgedThrough()); }
         }
     }
 

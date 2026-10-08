@@ -38,15 +38,6 @@ class RangeStateViewTest {
         assertEquals(minimal(),RangeStateView.decode(minimal().encode()));
     }
 
-    @Test void queryHeaderIsExactlyEightBytesAndRejectsUnrecognizedVersions() {
-        byte[] request=RangeStateView.request(); assertEquals(8,request.length); assertTrue(RangeStateView.isRequest(request));
-        assertFalse(RangeStateView.isRequest(null)); assertFalse(RangeStateView.isRequest(new byte[8]));
-        assertFalse(RangeStateView.isRequest(Arrays.copyOf(request,7))); assertFalse(RangeStateView.isRequest(Arrays.copyOf(request,9)));
-        request[7]=2; assertFalse(RangeStateView.isRequest(request)); assertTrue(RangeStateView.isRequest(RangeStateView.request()));
-        assertFalse(RangeStateView.isRequest(minimal().encode()));
-        assertThrows(IllegalArgumentException.class,() -> RangeStateView.decode(RangeStateView.request()));
-    }
-
     @Test void malformedTruncatedNoncanonicalAndOversizedViewsAreRejected() {
         byte[] valid=view(new ApplyPosition(2,3),AUTHORITY).encode();
         for (int length=0;length<valid.length;length++) {

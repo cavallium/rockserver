@@ -23,7 +23,7 @@ class RatisAcceptedTransactionTest {
         try (var f=fixture("commit"); var pin=f.store.captureTracked(scope(f,0))) {
             var disjoint=f.propose(put(f,2,2,Mutation.ReturnMode.NONE));
             try (var prepared=f.machine.prepareScopedCommit(pin,put(f,0,0,Mutation.ReturnMode.PREVIOUS))) {
-                var command=prepared.command(); assertEquals(7,command.formatVersion()); assertEquals(0,f.store.activeTrackedSnapshotPins());
+                var command=prepared.command(); assertEquals(DistributedCommand.Kind.COMMIT_ACCEPTED,command.kind()); assertEquals(0,f.store.activeTrackedSnapshotPins());
                 assertNotNull(f.propose(put(f,0,9,Mutation.ReturnMode.NONE)).getException(),"Prepared identity also excludes disjoint payload reuse");
                 assertNull(CommandResult.decode(command.acceptance().result()).value(0)); assertFalse(prepared.submitted());
                 assertNotNull(f.propose(put(f,3,0,Mutation.ReturnMode.NONE)).getException());
@@ -79,15 +79,18 @@ class RatisAcceptedTransactionTest {
             assertEquals(0,f.machine.proposalFootprintStats().candidates()); var ack=f.propose(f.ack(2,0)); assertNull(ack.getException()); f.machine.cancelTransaction(ack); f.assertReleased();
         }
     }
-    @Test void abandonedInvalidatedOrForgedPlanCannotBecomeANewProposal() throws Exception {
+    @Test void abandonedInvalidatedOrForgedPlansCannotInstallUserEffects() throws Exception {
         try (var f=fixture("authority"); var pin=f.store.captureTracked(scope(f,0)); var prepared=f.machine.prepareScopedCommit(pin,put(f,0,0,Mutation.ReturnMode.NONE))) {
             var command=prepared.command();
-            var forged=DistributedCommand.acceptedTransaction(put(f,1,0,Mutation.ReturnMode.NONE),command.acceptance()); assertNotNull(f.propose(forged).getException());
-            f.machine.notifyNotLeader(List.of()); assertNotNull(f.propose(command).getException()); assertEquals(0,f.machine.proposalFootprintStats().candidates());
-            prepared.close(); f.assertReleased();
+            var forged=DistributedCommand.acceptedTransaction(put(f,1,0,Mutation.ReturnMode.NONE),command.acceptance());
+            assertEquals(CommandResult.Status.CONFLICT,f.apply(f.propose(forged),1));
+            f.machine.notifyNotLeader(List.of()); assertEquals(CommandResult.Status.CONFLICT,f.apply(f.propose(command),2));
+            assertEquals(0,f.machine.proposalFootprintStats().candidates()); prepared.close(); f.assertReleased();
             try (var again=f.store.captureTracked(scope(f,0)); var plan=f.machine.prepareScopedCommit(again,put(f,2,0,Mutation.ReturnMode.NONE))) {
-                var abandoned=plan.command(); plan.close(); assertNotNull(f.propose(abandoned).getException()); assertEquals(0,f.machine.proposalFootprintStats().candidates());
+                var abandoned=plan.command(); plan.close(); assertEquals(CommandResult.Status.CONFLICT,f.apply(f.propose(abandoned),3));
             }
+            try (var read=f.store.capture()) { assertNull(read.get(f.column,new byte[]{0})); }
+            f.assertReleased();
         }
     }
     @Test void metadataPredecessorsAndAcknowledgingPlansHaveExplicitOwnership() throws Exception {
