@@ -109,6 +109,21 @@ does not establish complete distributed API parity or production acceptance.
   accepted bytes before the first write RPC. Lost replies retry only those bytes.
   Unaccepted intents may be durably abandoned as local no-effects CONFLICTs, then
   explicitly consumed/ACKed; accepted entries cannot use that path.
+- The transaction-home kernel adds a canonical immutable status record and routed
+  expected-image CAS over a dedicated data-plane status column/directory. It freezes
+  cluster/database/domain/schema, transaction ID, original business operation and
+  global/participant plan hashes. PREPARING records monotonically collect reports
+  of applied prepare positions; COMMIT requires every registered report. COMMIT or
+  ABORT is immutable, and finalization ACKs and explicit client consumption advance
+  separately. No deletion/automatic GC is admitted, even when a record is eligible.
+  Every changed image advances one generation and one vote/decision/ACK/consumption
+  step. Replica validators reject accepted-command predicate bypass, extra effects,
+  altered definitions and noncanonical bytes. Receipt ACK/GC is independent of
+  transaction-record consumption. Recovery CAS operations have their own identity
+  and epoch; they do not replace the frozen business identity.
+  This is a home-record kernel, not complete 2PC: reports are not self-verifying
+  participant proofs. Protected status-role activation, durable participant staged
+  plans/locks, late-PREPARE fencing, finalization and recovery scheduling remain.
 - Durable grant issuance, logical-session handoff, bounded user/maintenance windows,
   catalogue clocks/propagation, immutable schema publication and static node plans
   have local recovery fixtures. The owned node launcher checks established storage,
@@ -149,6 +164,11 @@ bounds, not measured heap/native allocator limits or global node/pool envelopes.
 Rejected receipts reserve their actual bounded no-effects growth, preserving
 own-ACK progress at the retention cap.
 
+A transaction-home record has at most 64 frozen participants and 7,930 encoded bytes.
+Both expected and replacement images fit comfortably within the 2 MiB atomic command
+bound. This is a per-record bound; global active-decision retention/admission and
+protected status-pool execution envelopes still need implementation.
+
 Logical output pages enforce 4,096 items and 8 MiB of original logical key/value
 bytes, matching standalone accounting. Translation fetches at most 128 complete
 physical rows/8 MiB per subrequest, with a total work quantum of 4,096 physical rows
@@ -172,13 +192,17 @@ Verification uses ordinary `test-compile surefire:test@default-test` selections,
 not root `mvn test` (which binds fuzzing). Native fixtures use the XFS test-directory
 factories. The excluded density fixture remains untouched and unselected.
 
-The logical page/cursor regression gate passed 16 core and 89 adapter cases
-(105 total, zero failures/errors/skips), exit zero:
-`/tmp/rockserver-logical-pages-regression.log`. After explicitly rejecting unbounded
-logical requests that cross the participant boundary, the final logical/session/
-staging selection passed 19 adapter cases, exit zero:
-`/tmp/rockserver-logical-pages-final.log`. Native range/apply source is unchanged from
-the preceding 126-case range-staging gate and its final 24-case selection.
+The home-kernel regression gate passed 15 core and 44 adapter cases (59 total,
+zero failures/errors/skips), exit zero: `/tmp/rockserver-status-kernel-regression.log`.
+The final core/home selection, after adding fenced-business-epoch recovery coverage,
+passed 4 core and 2 adapter cases, exit zero: `/tmp/rockserver-status-kernel-final.log`.
+It covers canonical encoding/bounds, immutable definitions/decisions, both orders of
+concurrently admitted COMMIT/ABORT CAS, competing votes with fresh-identity progress,
+lost reply replay, stable conflict receipts, snapshot reinitialization, ACK/consumption
+separation and recovery through a new CAS epoch. An independent read-only review found
+no actionable kernel correctness issue; it did not claim participant or quorum proof.
+The preceding logical page/cursor gates passed 105 and 19 selected cases; their source
+is unchanged by this home-record work.
 
 The exercised native/controlled-dispatch workflows include OPEN/read/STAGE/PLAN,
 forced acceptance before submission, applied native outcomes, lost PLAN/commit
@@ -220,8 +244,9 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Durable prepared locks, transaction-status groups, 2PC decision/finalization and
-  consistent multi-group scoped snapshot fences.
+- Durable participant staged plans/locks and late-PREPARE fencing; protected status-
+  group node/pool activation, full 2PC finalization/recovery and consistent multi-group
+  scoped snapshot fences. The home-record kernel alone does not establish these.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,
   placement authority and real operator-artifact activation.
 - Complete bounded bulk/import, CDC, export/backup/restore and operational repair
