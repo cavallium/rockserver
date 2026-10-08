@@ -58,14 +58,19 @@ public final class RatisRoutedClient implements AutoCloseable {
     /** Frozen original replica and process incarnation; reads never reselect the current leader. */
     public static final class SnapshotTarget {
         private final RangeDirectory source; private final SnapshotFence fence; private final RangeDescriptor descriptor; private final ReplicaDescriptor replica; private final UUID incarnation; private final ScopedTransactionRpc.SnapshotBinding binding;
-        private SnapshotTarget(RangeDirectory source,SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation) { this.source=source; this.fence=fence; this.descriptor=descriptor; this.replica=replica; this.incarnation=incarnation; binding=new ScopedTransactionRpc.SnapshotBinding(fence.fenceId(),snapshotDigest(fence)); }
+        private SnapshotTarget(RangeDirectory source,SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation) { this.source=source; this.fence=fence; this.descriptor=descriptor; this.replica=replica; this.incarnation=incarnation; binding=ScopedTransactionRpc.SnapshotBinding.of(fence); }
         public SnapshotFence fence() { return fence; }
         public RangeDescriptor descriptor() { return descriptor; }
         public ReplicaDescriptor replica() { return replica; }
         public UUID incarnation() { return incarnation; }
     }
-    private static byte[] snapshotDigest(SnapshotFence fence) {
-        try { return java.security.MessageDigest.getInstance("SHA-256").digest(fence.encode()); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    public RatisSnapshotReadiness snapshotReadiness(SnapshotFence fence,UUID group) throws IOException {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+        requireSnapshotRoute(observed,descriptor,fence,group);
+        try {
+            var proof=RatisSnapshotReadiness.decode(transaction(descriptor,ScopedTransactionRpc.SNAPSHOT_READY,fence.encode(),true));
+            if (!proof.group().equals(group) || !proof.binding().equals(ScopedTransactionRpc.SnapshotBinding.of(fence))) throw new IllegalArgumentException("Snapshot readiness binding changed"); return proof;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot readiness reply",malformed); }
     }
     public SnapshotTarget snapshotTarget(SnapshotFence fence,UUID group) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));

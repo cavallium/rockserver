@@ -2,7 +2,6 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.nio.ByteBuffer;
-import java.security.*;
 import java.time.Duration;
 import java.util.*;
 
@@ -15,8 +14,7 @@ public record RatisSnapshotCaptureRequest(SnapshotFence fence,UUID owner,UUID sn
         long millis=ttl.toMillis(); if (millis<1 || millis>60000 || !ttl.equals(Duration.ofMillis(millis))) throw new IllegalArgumentException("Snapshot capture TTL must be 1..60000 whole milliseconds");
     }
     public ScopedTransactionRpc.SnapshotBinding binding() {
-        try { return new ScopedTransactionRpc.SnapshotBinding(fence.fenceId(),MessageDigest.getInstance("SHA-256").digest(fence.encode())); }
-        catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        return ScopedTransactionRpc.SnapshotBinding.of(fence);
     }
     public byte[] encode() {
         byte[] definition=fence.encode(); var output=ByteBuffer.allocate(HEADER_BYTES+definition.length);

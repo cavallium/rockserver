@@ -802,6 +802,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         public RatisSnapshotRecord request() { return request; }
         public byte[] bytes() { return bytes.clone(); }
         private boolean authorized() { var a=store.applied(); return !closed && !claimed && !hold.invalidated && !hold.released && hold.generation==admissionGeneration.get() && a!=null && a.term()==hold.term && store.admissionOpen(); }
+        public boolean valid() {
+            final Leadership leader;
+            try { leader=leadership(); } catch (IOException unavailable) { return false; }
+            synchronized (admissions) {
+                if (closed || !leader.ready() || !store.admissionOpen()) return false;
+                return hold==null || !hold.invalidated && !hold.released && hold.generation==admissionGeneration.get() && leader.term()==hold.term;
+            }
+        }
         public boolean drained() { synchronized (admissions) { if (hold==null) return true; return hold.lease==null || !hold.lease.active() ? !hold.invalidated && !hold.released : proposalFootprints.drained(hold.lease); } }
         @Override public void close() {
             synchronized (admissions) { if (closed || claimed) return; closed=true; if (preparedSnapshots.remove(hold.operation,this)) releaseSnapshotHold(hold); }
@@ -1775,6 +1783,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 end(input); checkTransactionOwner(); var server=getServer().getNow(null);
                 if (server==null) throw new IOException("Snapshot peer is not initialized");
                 try (var pin=store.capture()) { reply=new RatisSnapshotOwner(pin.groupId(),pin.rangeEpoch(),pin.schemaDigest(),snapshotCaptureOwner(),server.getId().toString()).encode(); }
+            }
+            case ScopedTransactionRpc.SNAPSHOT_READY -> {
+                if (!freshBarrier) throw new IOException("Snapshot readiness requires a fresh linearizable barrier");
+                byte[] definition=new byte[input.remaining()]; input.get(definition); var fence=SnapshotFence.decode(definition); checkTransactionOwner();
+                var record=store.recoveredSnapshotGate(fence); boolean ready=record!=null && record.active() && snapshotGateReady(fence);
+                var binding=ScopedTransactionRpc.SnapshotBinding.of(fence);
+                reply=new RatisSnapshotReadiness(binding,store.ownership().owner().groupId(),record==null ? null : record.installed(),ready).encode();
             }
             case ScopedTransactionRpc.SNAPSHOT_CAPTURE -> {
                 var capture=RatisSnapshotCaptureRequest.decode(packet.body()); SnapshotFenceStatus.Capture token=null;

@@ -16,6 +16,13 @@ public final class RatisSnapshotFences {
         if (!directory.columns().equals(Set.of(column))) throw new IllegalArgumentException("Snapshot fence directory must have its dedicated column");
         cluster=directory.clusterId(); database=directory.databaseId(); schemaDigest=directory.schemaDigest();
     }
+    byte[] identityDigest() {
+        var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+    RatisRoutedClient.PreparedCommand restore(DistributedCommand command,RangeDescriptor descriptor) {
+        var restored=routed.restoreSessionCommand(command,descriptor); validate(restored); return restored;
+    }
     void requireDatabaseBinding(UUID cluster,UUID database) {
         if (!this.cluster.equals(cluster) || !this.database.equals(database)) throw new IllegalArgumentException("Snapshot home reader belongs to another cluster/database");
     }

@@ -13,7 +13,7 @@ import java.util.UUID;
 /** The current bounded query protocol for data and catalogue groups. */
 public final class ScopedTransactionRpc {
     public static final int MAGIC = 0x52535458, HEADER_BYTES = 12, HANDLE_BYTES = 56;
-    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22, SNAPSHOT_OWNER = 30, SNAPSHOT_GET = 31, SNAPSHOT_PAGE = 32, SNAPSHOT_RELEASE = 33, SNAPSHOT_CAPTURE = 34;
+    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22, SNAPSHOT_OWNER = 30, SNAPSHOT_GET = 31, SNAPSHOT_PAGE = 32, SNAPSHOT_RELEASE = 33, SNAPSHOT_CAPTURE = 34, SNAPSHOT_READY = 35;
     // A legal physical page continuation can exceed an atomic command's 2 MiB bound.
     public static final int MAX_REQUEST_BYTES = PhysicalRangePage.MAX_BYTES + 128;
     public static final int MAX_REPLY_BYTES = PhysicalRangePage.MAX_BYTES + 128;
@@ -90,6 +90,10 @@ public final class ScopedTransactionRpc {
 
     public record SnapshotBinding(java.util.UUID fenceId,byte[] digest) {
         public SnapshotBinding { Objects.requireNonNull(fenceId); Objects.requireNonNull(digest); if (digest.length!=32) throw invalid("Invalid snapshot binding digest"); digest=digest.clone(); }
+        public static SnapshotBinding of(it.cavallium.rockserver.core.common.distributed.SnapshotFence fence) {
+            try { return new SnapshotBinding(fence.fenceId(),java.security.MessageDigest.getInstance("SHA-256").digest(fence.encode())); }
+            catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        }
         @Override public byte[] digest() { return digest.clone(); }
         @Override public boolean equals(Object other) { return other instanceof SnapshotBinding binding && fenceId.equals(binding.fenceId) && Arrays.equals(digest,binding.digest); }
         @Override public int hashCode() { return Objects.hash(fenceId,Arrays.hashCode(digest)); }
@@ -246,7 +250,7 @@ public final class ScopedTransactionRpc {
         return Arrays.compareUnsigned(left, right);
     }
     private static void requireKind(int kind) {
-        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_OWNER && !ownerSnapshot(kind)) {
+        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && !ownerSnapshot(kind)) {
             throw invalid("Unknown read frame kind");
         }
     }

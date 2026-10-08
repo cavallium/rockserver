@@ -25,7 +25,7 @@ class RatisSnapshotCaptureRpcTest {
         final SnapshotFence fence;
         final SnapshotFenceStatus initial;
         final AtomicLong clock=new AtomicLong(); final AtomicInteger homes=new AtomicInteger(),owners=new AtomicInteger();
-        boolean lose;
+        boolean lose,loseGateProof;
         Fixture(String name,boolean configured,boolean ready) throws Exception {
             helper.root=root; helper.helper.root=root; home=helper.new Home(name+"-home");
             data=helper.helper.new Node(name+"-data",false,null,configured ? home.homes : null,clock::get);
@@ -36,7 +36,9 @@ class RatisSnapshotCaptureRpcTest {
             client=new RatisRoutedClient(data.directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError("No latest fallback"); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError("No write fallback"); }
-                public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException { assertTrue(fresh); owners.incrementAndGet(); return data.wire.transaction(route,request,true); }
+                public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return data.wire.participant(route,record); }
+                public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException { assertTrue(fresh); owners.incrementAndGet(); byte[] reply=data.wire.transaction(route,request,true);
+                    if (loseGateProof && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.SNAPSHOT_GATE_STATE) { loseGateProof=false; throw new IOException("Lost native gate proof reply"); } return reply; }
                 public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
                     assertEquals(data.directory.ranges().getFirst(),route); assertEquals(route.replicas().getFirst(),owner);
                     try {
@@ -48,6 +50,35 @@ class RatisSnapshotCaptureRpcTest {
         }
         RatisRoutedClient.PreparedSnapshotCapture operation() throws Exception { return client.prepareSnapshotCapture(client.snapshotTarget(fence,data.f.groupId),UUID.randomUUID(),Duration.ofSeconds(10)); }
         @Override public void close() throws Exception { client.close(); data.close(); home.close(); }
+    }
+    @Test void readinessRequiresFreshLeaderAndRetainsTheExactInstalledCut() throws Exception {
+        try (var f=new Fixture("readiness",true,false)) {
+            var retry=f.data.wire.propose(RatisSnapshotRecord.install(f.fence,f.data.f.groupId).encode()); assertNull(retry.getException());
+            try (var borrowed=f.data.f.machine.prepareSnapshotInstall(f.home.homes,f.fence)) { assertTrue(borrowed.valid()); assertTrue(borrowed.drained()); }
+            finally { f.data.f.machine.cancelTransaction(retry); }
+            var proof=f.client.snapshotReadiness(f.fence,f.data.f.groupId);
+            assertTrue(proof.ready()); assertEquals(f.data.f.store.snapshotGate(f.fence.fenceId()).installed(),proof.installed());
+            assertEquals(ScopedTransactionRpc.SnapshotBinding.of(f.fence),proof.binding());
+            assertEquals(proof,RatisSnapshotReadiness.decode(proof.encode()));
+            byte[] request=ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_READY,f.fence.encode());
+            assertThrows(ExecutionException.class,() -> f.data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS));
+            f.home.transition(f.initial,f.initial.abort());
+            try (var release=f.data.f.machine.prepareSnapshotRelease(f.home.homes,f.fence)) { helper.append(f.data,release); }
+            var released=f.client.snapshotReadiness(f.fence,f.data.f.groupId);
+            assertFalse(released.ready()); assertEquals(proof.installed(),released.installed());
+            f.data.f.machine.notifyNotLeader(List.of()); f.data.f.leadership.set(new RatisRangeStateMachine.Leadership(2,false));
+            assertThrows(IOException.class,() -> f.client.snapshotReadiness(f.fence,f.data.f.groupId));
+        }
+    }
+    @Test void readinessCodecRejectsTruncationInvalidFlagsAndImpossiblePositions() {
+        var binding=new ScopedTransactionRpc.SnapshotBinding(UUID.randomUUID(),new byte[32]); var group=UUID.randomUUID();
+        for (var proof:List.of(new RatisSnapshotReadiness(binding,group,null,false),new RatisSnapshotReadiness(binding,group,new ApplyPosition(1,2),false),new RatisSnapshotReadiness(binding,group,new ApplyPosition(1,2),true))) {
+            assertEquals(proof,RatisSnapshotReadiness.decode(proof.encode()));
+            for (int n=0;n<proof.encode().length;n++) { byte[] truncated=Arrays.copyOf(proof.encode(),n); assertThrows(IllegalArgumentException.class,() -> RatisSnapshotReadiness.decode(truncated)); }
+            byte[] changed=proof.encode(); changed[64]=4; assertThrows(IllegalArgumentException.class,() -> RatisSnapshotReadiness.decode(changed));
+        }
+        assertThrows(IllegalArgumentException.class,() -> new RatisSnapshotReadiness(binding,group,null,true));
+        assertThrows(IllegalArgumentException.class,() -> new RatisSnapshotReadiness(binding,group,new ApplyPosition(0,2),true));
     }
     @Test void lostReplyReopenAndLeaderLossRepeatTheOriginalPinWithoutAnotherHomeRead() throws Exception {
         try (var f=new Fixture("retry",true,true)) {
