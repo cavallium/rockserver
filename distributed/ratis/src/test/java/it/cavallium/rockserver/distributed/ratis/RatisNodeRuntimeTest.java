@@ -175,6 +175,20 @@ class RatisNodeRuntimeTest {
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
         }
     }
+    @Test void establishedReadProtocolCannotFlipByChangingRecoveryConfiguration() throws Exception {
+        try (var legacy=new Env(root.resolve("legacy"))) {
+            try (var node=legacy.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
+            assertThrows(IOException.class,() -> legacy.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer(),true));
+            try (var node=legacy.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { node.start(); }
+        }
+        try (var framed=new Env(root.resolve("framed"))) {
+            try (var node=framed.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer(),true)) { node.start(); }
+            var identity=SessionJournalFiles.read(framed.nodeRoot.resolve("node.identity"),128);
+            assertEquals(3,java.nio.ByteBuffer.wrap(identity).getInt()); assertEquals(2,java.nio.ByteBuffer.wrap(identity).getInt(5));
+            assertThrows(IOException.class,() -> framed.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
+            try (var node=framed.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer(),true)) { node.start(); }
+        }
+    }
     static final class Env implements AutoCloseable {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest(); final RatisSessionEpochsTest.Fixture catalogue;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"node-runtime-test");
@@ -204,8 +218,11 @@ class RatisNodeRuntimeTest {
             nodeRoot=Files.createDirectory(root.resolve("node"));
         }
         RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake) throws IOException {
+            return open(startup,fake,false);
+        }
+        RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake,boolean framed) throws IOException {
             var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),
-                    Duration.ofSeconds(1),1,2,Duration.ofMillis(100));
+                    Duration.ofSeconds(1),1,2,Duration.ofMillis(100),framed);
             return RatisNodeRuntime.open(plan,nodeRoot,ConfigParser.parseDefault(),catalogue.epochs,routed,scheduler,timer,() -> 20L,settings,startup,fake::create);
         }
         public void close() throws Exception {

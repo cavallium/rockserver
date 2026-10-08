@@ -61,7 +61,7 @@ public final class RatisNodeService implements AutoCloseable {
             var properties=new RaftProperties(); RaftConfigKeys.Rpc.setType(properties,SupportedRpcType.GRPC);
             RaftClientConfigKeys.Rpc.setRequestTimeout(properties,TimeDuration.valueOf(3,TimeUnit.SECONDS)); GrpcConfigKeys.Client.setWorkerGroupSize(properties,1);
             client=RaftClient.newBuilder().setRaftGroup(manifest.plan().catalogueGroup()).setProperties(properties).setRetryPolicy(RetryPolicies.noRetry()).build();
-            routed=RatisRoutedClient.connect(manifest.plan().directory());
+            routed=manifest.settings().scopedTransactions() ? RatisRoutedClient.connectFramed(manifest.plan().directory()) : RatisRoutedClient.connect(manifest.plan().directory());
             scheduler=new RWScheduler(workload,"distributed-node",null,manifest.schema().databaseId().toString()); timer=Schedulers.newSingle("distributed-node-clock",true);
         } catch (RuntimeException | Error failure) {
             try { if (routed!=null) routed.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
@@ -75,6 +75,7 @@ public final class RatisNodeService implements AutoCloseable {
     static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory) throws IOException {
         try {
             preflight(root,manifest.plan()); manifest.schema().requireMatches(resources.routed.directory());
+            if (resources.routed.usesFramedQueries()!=manifest.settings().scopedTransactions()) throw new IOException("Node routed client query protocol differs from manifest");
             var plan=manifest.plan(); var c=plan.catalogue();
             var epochs=new RatisSessionEpochs(resources.catalogue,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
             var node=factory==null

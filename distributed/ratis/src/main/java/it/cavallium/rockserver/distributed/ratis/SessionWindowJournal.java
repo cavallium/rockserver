@@ -12,7 +12,7 @@ import java.util.*;
 final class SessionWindowJournal implements AutoCloseable {
     static final int MAX_BYTES=64*1024*1024;
     static final long MAX_WINDOW_BYTES=16L*1024*1024;
-    private static final int MAGIC=0x53574a4c, VERSION=1, HEADER_BYTES=121;
+    private static final int MAGIC=0x53574a4c, VERSION=2, HEADER_BYTES=121;
     record Saved(SessionEpochLedger.Grant grant,RatisSessionClient.Limits limits,RatisSessionClient.WindowState state) {}
     private final Path path;
     private final RatisRoutedClient routed;
@@ -56,7 +56,7 @@ final class SessionWindowJournal implements AutoCloseable {
             var restored=RatisSessionClient.restore(routed,grant,limits,state).snapshot();
             var canonical=new Saved(grant,limits,restored);
             if (encodedSize(canonical)!=size) throw new IOException("Session window changed during canonical restoration");
-            byte[] body=encode(canonical,size);
+            byte[] body=encode(canonical,size,VERSION);
             SessionJournalFiles.write(path,body,MAX_BYTES); saved=canonical;
         } catch (IOException failure) { fenced=true; throw failure; }
         catch (RuntimeException invalid) {
@@ -77,7 +77,8 @@ final class SessionWindowJournal implements AutoCloseable {
         try {
             if (body.length<HEADER_BYTES) throw new IOException("Truncated session window journal");
             var input=ByteBuffer.wrap(body);
-            if (input.getInt()!=MAGIC || input.getInt()!=VERSION) throw new IOException("Unsupported session window journal");
+            if (input.getInt()!=MAGIC) throw new IOException("Unsupported session window journal");
+            int version=input.getInt(); if (version!=1 && version!=VERSION) throw new IOException("Unsupported session window journal version");
             byte[] bound=new byte[32]; input.get(bound); if (!Arrays.equals(bound,identity)) throw new IOException("Wrong session window journal identity");
             var grant=new SessionEpochLedger.Grant(input.getLong(),uuid(input),input.getLong(),input.getLong());
             var limits=new RatisSessionClient.Limits(input.getInt(),input.getLong(),input.getLong()); validateLimits(limits);
@@ -92,17 +93,20 @@ final class SessionWindowJournal implements AutoCloseable {
                 byte[] resultBytes=blob(input,CommandResult.MAX_BYTES,true);
                 var result=resultBytes==null ? null : CommandResult.decode(resultBytes);
                 if (result!=null && !Arrays.equals(resultBytes,result.encode())) throw new IOException("Noncanonical session window result");
-                entries.add(new RatisSessionClient.WindowEntry(prepared,result,flag(input)));
+                boolean consumed=flag(input); int phase=0;
+                if (version>=2) { require(input,1); phase=input.get() & 255; if (phase>2) throw new IOException("Invalid session window intent phase"); }
+                entries.add(new RatisSessionClient.WindowEntry(prepared,result,consumed,phase==1,phase==2));
             }
             if (input.hasRemaining()) throw new IOException("Trailing session window journal data");
             var state=new RatisSessionClient.WindowState(sequence,acknowledged,exhausted,List.copyOf(entries));
             var canonical=new Saved(grant,limits,RatisSessionClient.restore(routed,grant,limits,state).snapshot());
-            int size=encodedSize(canonical);
-            if (!Arrays.equals(body,encode(canonical,size))) throw new IOException("Noncanonical session window journal");
+            int size=encodedSize(canonical,version);
+            if (!Arrays.equals(body,encode(canonical,size,version))) throw new IOException("Noncanonical session window journal");
             return canonical;
         } catch (RuntimeException invalid) { throw new IOException("Invalid session window journal",invalid); }
     }
-    private static int encodedSize(Saved saved) throws IOException {
+    private static int encodedSize(Saved saved) throws IOException { return encodedSize(saved,VERSION); }
+    private static int encodedSize(Saved saved,int version) throws IOException {
         validateLimits(saved.limits()); var entries=saved.state().entries();
         if (entries.size()>saved.limits().outstanding()) throw new IOException("Session window entry count exceeds bound");
         long size=HEADER_BYTES;
@@ -110,7 +114,7 @@ final class SessionWindowJournal implements AutoCloseable {
             int command=DistributedCommandCodec.encodedSize(entry.prepared().command());
             if (command<1 || command>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Session command blob exceeds bound");
             long result=entry.result()==null ? 0 : resultSize(entry.result());
-            size+=4L+command+routeSize(entry.prepared().descriptor())+4+result+1;
+            size+=4L+command+routeSize(entry.prepared().descriptor())+4+result+(version>=2 ? 2 : 1);
             if (size>MAX_BYTES-32) throw new IOException("Session window journal exceeds aggregate byte bound");
         }
         return (int)size;
@@ -131,14 +135,15 @@ final class SessionWindowJournal implements AutoCloseable {
         for (var replica:route.replicas()) size+=57L+ascii(replica.peerId(),128).length+ascii(replica.address(),256).length;
         return size;
     }
-    private byte[] encode(Saved saved,int size) {
-        var output=ByteBuffer.allocate(size).putInt(MAGIC).putInt(VERSION).put(identity); var grant=saved.grant(); var limits=saved.limits(); var state=saved.state();
+    private byte[] encode(Saved saved,int size,int version) {
+        var output=ByteBuffer.allocate(size).putInt(MAGIC).putInt(version).put(identity); var grant=saved.grant(); var limits=saved.limits(); var state=saved.state();
         output.putLong(grant.epoch()); uuid(output,grant.sessionId()); output.putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis());
         output.putInt(limits.outstanding()).putLong(limits.commandBytes()).putLong(limits.resultBytes());
         output.putLong(state.nextSequence()).putLong(state.acknowledgedThrough()).put((byte)(state.exhausted() ? 1 : 0)).putInt(state.entries().size());
         for (var entry:state.entries()) {
             blob(output,DistributedCommandCodec.encode(entry.prepared().command())); route(output,entry.prepared().descriptor());
             blob(output,entry.result()==null ? null : entry.result().encode()); output.put((byte)(entry.consumed() ? 1 : 0));
+            if (version>=2) output.put((byte)(entry.intent() ? 1 : entry.abandoned() ? 2 : 0));
         }
         return output.array();
     }

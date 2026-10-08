@@ -10,11 +10,14 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class RatisDurableSessionClient implements AutoCloseable {
     public static final class Pending {
         private final RatisDurableSessionClient owner; private final RatisSessionClient.Pending pending;
-        private CommandResult result; private boolean consumed,executing;
+        private CommandResult result; private DistributedCommand command; private boolean consumed,executing,awaitingAcceptance,abandoned;
         private Pending(RatisDurableSessionClient owner,RatisSessionClient.Pending pending,CommandResult result,boolean consumed) {
             this.owner=owner; this.pending=pending; this.result=result; this.consumed=consumed;
+            this.command=pending.command(); this.awaitingAcceptance=pending.awaitingAcceptance(); this.abandoned=pending.abandoned();
         }
-        public DistributedCommand command() { return pending.command(); }
+        public DistributedCommand command() { owner.lane.lock(); try { return command; } finally { owner.lane.unlock(); } }
+        public boolean awaitingAcceptance() { owner.lane.lock(); try { return awaitingAcceptance; } finally { owner.lane.unlock(); } }
+        public boolean abandoned() { owner.lane.lock(); try { return abandoned; } finally { owner.lane.unlock(); } }
         public RangeDescriptor descriptor() { return pending.descriptor(); }
         public boolean consumed() { owner.lane.lock(); try { return consumed; } finally { owner.lane.unlock(); } }
         /** Only durably saved results are exposed. Consumed holes remain marked until their contiguous prefix drains. */
@@ -53,6 +56,30 @@ public final class RatisDurableSessionClient implements AutoCloseable {
         lane.lock(); try { requireOpen(); var pending=client.prepare(mutations,predicates); checkpoint(); return retain(pending); } finally { lane.unlock(); }
     }
     public Pending prepare(List<Mutation> mutations) throws IOException { return prepare(mutations,List.of()); }
+    public Pending prepareTransactionIntent(List<Mutation> mutations,List<KeyPredicate> predicates) throws IOException {
+        lane.lock(); try { requireOpen(); var pending=client.prepareTransactionIntent(mutations,predicates); checkpoint(); return retain(pending); } finally { lane.unlock(); }
+    }
+    public Pending prepareTransactionIntent(List<Mutation> mutations) throws IOException { return prepareTransactionIntent(mutations,List.of()); }
+    /** Accepted bytes are forced before the durable phase permits any execution. */
+    public void acceptTransaction(Pending pending,DistributedCommand accepted) throws IOException {
+        lane.lock();
+        try {
+            requireOpen(); owned(pending);
+            if (!pending.awaitingAcceptance || pending.executing || pending.result!=null || pending.consumed) throw new IllegalStateException("Operation is not an unresolved durable transaction intent");
+            client.acceptTransaction(pending.pending,accepted); checkpoint();
+            pending.command=pending.pending.command(); pending.awaitingAcceptance=false;
+        } finally { lane.unlock(); }
+    }
+    /** Persist a definitive local CONFLICT before exposure; application consumption and ACK remain explicit. */
+    public CommandResult abandonTransactionIntent(Pending pending) throws IOException {
+        lane.lock();
+        try {
+            requireOpen(); owned(pending);
+            if (!pending.awaitingAcceptance || pending.executing || pending.result!=null || pending.consumed) throw new IllegalStateException("Operation is not an unresolved durable transaction intent");
+            var result=client.abandonTransactionIntent(pending.pending); checkpoint();
+            pending.result=result; pending.abandoned=true; pending.awaitingAcceptance=false; return result;
+        } finally { lane.unlock(); }
+    }
     public Pending prepareAcknowledgement(UUID column,byte[] routingKey) throws IOException {
         lane.lock(); try { requireOpen(); var pending=client.prepareAcknowledgement(column,routingKey); checkpoint(); return retain(pending); } finally { lane.unlock(); }
     }
@@ -62,7 +89,9 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     public CommandResult execute(Pending pending) throws IOException {
         lane.lock();
         try {
-            requireOpen(); owned(pending); if (pending.result!=null) return pending.result;
+            requireOpen(); owned(pending);
+            if (pending.awaitingAcceptance) throw new IllegalStateException("Durable transaction intent has not been accepted");
+            if (pending.result!=null) return pending.result;
             if (pending.executing) throw new IOException("This durable operation is already executing"); pending.executing=true; active++;
         } finally { lane.unlock(); }
         try {
@@ -74,7 +103,9 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     public void acknowledge(Pending pending) throws IOException {
         lane.lock();
         try {
-            requireOpen(); owned(pending); if (pending.result==null) throw new IllegalStateException("No durably resolved outcome to consume");
+            requireOpen(); owned(pending);
+            if (pending.awaitingAcceptance) throw new IllegalStateException("Durable transaction intent has not been accepted");
+            if (pending.result==null) throw new IllegalStateException("No durably resolved outcome to consume");
             if (pending.consumed) return; client.acknowledge(pending.pending); checkpoint(); pending.consumed=true;
             retained.headMap(client.acknowledgedThrough(),true).clear();
         } finally { lane.unlock(); }

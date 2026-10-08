@@ -91,6 +91,16 @@ class RatisNodeManifestTest {
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(plain.schema(),plain.plan(),tooLong,3,3));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(plain.schema(),plan(plain.schema(),Map.of(A,"a".repeat(4097),B,"b"),Set.of()),settings(),3,3));
     }
+    @Test void framedReadModeHasAnExplicitCanonicalManifestVersionAndLegacyStaysLegacy() {
+        var legacy=manifest(false); var settings=legacy.settings(); byte[] old=RatisNodeManifest.encode(legacy);
+        assertEquals(1,ByteBuffer.wrap(old).getInt(4)); assertFalse(RatisNodeManifest.decode(old).settings().scopedTransactions());
+        var framedSettings=new RatisNodeRuntime.Settings(settings.images(),settings.retention(),settings.clockPeriod(),settings.propagationVisits(),settings.maxPropagationRanges(),settings.shutdownTimeout(),true);
+        var framed=new RatisNodeManifest(legacy.schema(),legacy.plan(),framedSettings,legacy.readThreads(),legacy.writeThreads());
+        byte[] encoded=RatisNodeManifest.encode(framed); assertEquals(2,ByteBuffer.wrap(encoded).getInt(4)); assertEquals(old.length+4,encoded.length);
+        assertTrue(RatisNodeManifest.decode(encoded).settings().scopedTransactions()); assertArrayEquals(encoded,RatisNodeManifest.encode(RatisNodeManifest.decode(encoded)));
+        for (int mode:new int[]{0,1,3}) { byte[] wrong=encoded.clone(); ByteBuffer.wrap(wrong).putInt(wrong.length-4,mode); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(wrong)); }
+        assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(Arrays.copyOf(encoded,encoded.length-1)));
+    }
 
     @Test void decoderRejectsUnknownFormatEveryTruncationLengthsCountsOrderNamesAndSettings() {
         byte[] valid=RatisNodeManifest.encode(manifest(false));

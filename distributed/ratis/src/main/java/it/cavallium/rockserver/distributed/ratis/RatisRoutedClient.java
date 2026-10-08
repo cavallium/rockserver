@@ -35,6 +35,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         byte[] read(RangeDescriptor descriptor, UUID columnId, byte[] physicalKey) throws IOException;
         CommandResult command(RangeDescriptor descriptor, DistributedCommand command) throws IOException;
         default RangeStateView stateView(RangeDescriptor descriptor) throws IOException { throw new IOException("Range-state reads unsupported by this transport"); }
+        default byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException { throw new IOException("Scoped transactions unsupported by this transport"); }
         @Override default void close() throws IOException {}
     }
 
@@ -54,21 +55,100 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     private final RangeDirectory identity;
     private final Transport transport;
+    private final boolean framedQueries;
     private RangeDirectory directory;
     private int activeCalls;
     private boolean closing;
     private CompletableFuture<Void> closeAttempt;
 
     public RatisRoutedClient(RangeDirectory directory, Transport transport) {
+        this(directory,transport,false);
+    }
+    public RatisRoutedClient(RangeDirectory directory,Transport transport,boolean framedQueries) {
         this.identity = this.directory = Objects.requireNonNull(directory, "directory");
         this.transport = Objects.requireNonNull(transport, "transport");
+        this.framedQueries=framedQueries;
     }
 
     public static RatisRoutedClient connect(RangeDirectory directory) {
-        return new RatisRoutedClient(directory, new RaftTransport());
+        return new RatisRoutedClient(directory, new RaftTransport(false));
+    }
+    /** All target groups must already have the framed protocol activated through placement/feature authority. */
+    public static RatisRoutedClient connectFramed(RangeDirectory directory) { return new RatisRoutedClient(directory,new RaftTransport(true),true); }
+
+    public ScopedTransaction openTransaction(TransactionScope scope,java.time.Duration ttl) throws IOException {
+        if (!framedQueries) throw new IOException("This client uses the legacy query protocol");
+        Objects.requireNonNull(scope); long millis=Objects.requireNonNull(ttl).toMillis();
+        if (millis<1 || millis>60000 || !ttl.equals(java.time.Duration.ofMillis(millis))) throw new IllegalArgumentException("Transaction TTL must be 1..60000 whole milliseconds");
+        var observed=current(); var participants=scope.participants(observed,1); if (participants.size()!=1) throw new IllegalArgumentException("Transaction requires one complete participant");
+        var descriptor=participants.getFirst(); var nonce=UUID.randomUUID(); byte[] encodedScope=ScopedTransactionRpc.scopeBytes(scope);
+        var input=ByteBuffer.allocate(24+encodedScope.length); ScopedTransactionRpc.uuid(input,nonce); input.putLong(millis).put(encodedScope);
+        byte[] reply=transaction(descriptor,ScopedTransactionRpc.OPEN,input.array(),true);
+        try {
+            var output=ByteBuffer.wrap(reply); var echoed=ScopedTransactionRpc.uuid(output); var handle=ScopedTransactionRpc.readHandle(output);
+            if (output.hasRemaining() || !echoed.equals(nonce)) throw new IOException("Transaction open reply differs from request identity");
+            return new ScopedTransaction(descriptor,handle,scope);
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction open reply",malformed); }
+    }
+    public final class ScopedTransaction implements AutoCloseable {
+        private final RangeDescriptor descriptor; private final ScopedTransactionRpc.Handle handle;
+        private final TransactionScope scope;
+        private boolean closed;
+        private ScopedTransaction(RangeDescriptor descriptor,ScopedTransactionRpc.Handle handle,TransactionScope scope) { this.descriptor=descriptor; this.handle=handle; this.scope=scope; }
+        public ApplyPosition snapshot() { return handle.position(); }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public byte[] get(UUID column,byte[] key) throws IOException {
+            Objects.requireNonNull(key); if (key.length>DistributedCommandCodec.MAX_ENCODED_BYTES-16) throw new IllegalArgumentException("Transaction key exceeds budget");
+            var body=ByteBuffer.allocate(76+key.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.uuid(body,column); ScopedTransactionRpc.putBlob(body,key);
+            var reply=ByteBuffer.wrap(call(ScopedTransactionRpc.GET,body.array()));
+            try {
+                var value=ScopedTransactionRpc.blob(reply,DistributedCommandCodec.MAX_ENCODED_BYTES,true);
+                if (reply.hasRemaining()) throw new IOException("Trailing transaction point reply"); return value;
+            } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction point reply",malformed); }
+        }
+        public PhysicalRangePage page(UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws IOException {
+            long size=93L+(lower==null ? 0 : lower.length)+(upper==null ? 0 : upper.length)+(resume==null ? 0 : resume.length);
+            if (size>ScopedTransactionRpc.MAX_REQUEST_BYTES-ScopedTransactionRpc.HEADER_BYTES) throw new IllegalArgumentException("Transaction page request exceeds budget");
+            var body=ByteBuffer.allocate((int)size); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.uuid(body,column);
+            ScopedTransactionRpc.putBlob(body,lower); ScopedTransactionRpc.putBlob(body,upper); body.put((byte)(reverse ? 1 : 0)); ScopedTransactionRpc.putBlob(body,resume); body.putInt(items).putInt(bytes);
+            byte[] reply=call(ScopedTransactionRpc.PAGE,body.array());
+            try { return ScopedTransactionRpc.decodePage(reply); } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction page reply",malformed); }
+        }
+        public DistributedCommand plan(DistributedCommand intent) throws IOException {
+            byte[] encoded=DistributedCommandCodec.encode(intent); var body=ByteBuffer.allocate(60+encoded.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.putBlob(body,encoded);
+            byte[] reply=call(ScopedTransactionRpc.PLAN,body.array());
+            try {
+                var accepted=DistributedCommandCodec.decode(reply);
+                if (accepted.acceptance()==null || !Arrays.equals(DistributedCommandCodec.encode(accepted),DistributedCommandCodec.encode(DistributedCommand.acceptedTransaction(intent,accepted.acceptance())))) throw new IOException("Accepted reply differs from original transaction intent");
+                var audit=accepted.acceptance();
+                if (!audit.snapshot().equals(handle.position()) || audit.leaderGeneration()!=handle.generation() || !audit.ownerIncarnation().equals(handle.owner())
+                        || !Arrays.equals(ScopedTransactionRpc.scopeBytes(scope),ScopedTransactionRpc.scopeBytes(audit.scope()))) throw new IOException("Accepted reply changed transaction capture identity/scope");
+                return accepted;
+            } catch (IllegalArgumentException malformed) { throw new IOException("Invalid accepted transaction reply",malformed); }
+        }
+        private byte[] call(int kind,byte[] body) throws IOException {
+            synchronized (this) { if (closed) throw new IOException("Transaction handle is closed"); }
+            return transaction(descriptor,kind,body,false);
+        }
+        @Override public void close() throws IOException {
+            synchronized (this) { if (closed) return; }
+            var body=ByteBuffer.allocate(ScopedTransactionRpc.HANDLE_BYTES); ScopedTransactionRpc.writeHandle(body,handle);
+            if (transaction(descriptor,ScopedTransactionRpc.CLOSE,body.array(),false).length!=0) throw new IOException("Invalid transaction close reply");
+            synchronized (this) { closed=true; }
+        }
+    }
+    private byte[] transaction(RangeDescriptor descriptor,int kind,byte[] body,boolean freshBarrier) throws IOException {
+        byte[] request=ScopedTransactionRpc.frame(kind,body); if (request.length>ScopedTransactionRpc.MAX_REQUEST_BYTES) throw new IllegalArgumentException("Transaction request exceeds byte budget");
+        beginCall();
+        try {
+            var packet=ScopedTransactionRpc.parse(transport.transaction(descriptor,request,freshBarrier),ScopedTransactionRpc.MAX_REPLY_BYTES);
+            if (packet.kind()!=kind) throw new IOException("Transaction reply opcode differs from request"); return packet.body();
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid scoped transaction reply",malformed); }
+        finally { endCall(); }
     }
 
     public synchronized RangeDirectory directory() { return directory; }
+    boolean usesFramedQueries() { return framedQueries; }
 
     public synchronized void refresh(RangeDirectory next) {
         requireOpen();
@@ -195,7 +275,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     /** Restore an immutable user retry route without rebasing it onto the current topology. */
     PreparedCommand restoreSessionCommand(DistributedCommand command,RangeDescriptor descriptor) {
         Objects.requireNonNull(command); Objects.requireNonNull(descriptor); var observed=current();
-        if (command.formatVersion()!=2 && command.formatVersion()!=3 && command.formatVersion()!=6 || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
+        if (command.formatVersion()!=2 && command.formatVersion()!=3 && command.formatVersion()!=6 && command.formatVersion()!=7 || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
                 || command.mutations().isEmpty() && (command.acknowledgedThrough()<0 || !command.predicates().isEmpty())) {
@@ -214,6 +294,16 @@ public final class RatisRoutedClient implements AutoCloseable {
             }
         }
         for (var predicate:command.predicates()) recoveredKey(observed,descriptor,predicate.columnId(),predicate.key());
+        if (command.acceptance()!=null) for (var span:command.acceptance().scope().spans()) {
+            if (span.isPoint()) { recoveredKey(observed,descriptor,span.columnId(),span.lowerInclusive()); continue; }
+            if (!observed.columns().contains(span.columnId())) throw new IllegalArgumentException("Recovered transaction scope belongs to another column");
+            byte[] lower=span.lowerInclusive(), upper=span.upperExclusive(), routeLower=descriptor.lowerInclusive(), routeUpper=descriptor.upperExclusive();
+            if (routeLower!=null && (lower==null || Arrays.compareUnsigned(projectRecovered(observed,lower),routeLower)<0)
+                    || routeUpper!=null && (upper==null || Arrays.compareUnsigned(projectRecovered(observed,upper),routeUpper)>0
+                    || Arrays.equals(projectRecovered(observed,upper),routeUpper) && observed.routingPrefixBytes()>0 && upper.length>observed.routingPrefixBytes())) {
+                throw new IllegalArgumentException("Recovered transaction scope crosses frozen route");
+            }
+        }
         return new PreparedCommand(identity,descriptor,command);
     }
     private static byte[] projectRecovered(RangeDirectory directory,byte[] key) {
@@ -301,9 +391,20 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     private static final class RaftTransport implements Transport {
         private final RatisClientPool clients = new RatisClientPool(MAX_CONCURRENT_CALLS, RaftTransport::connected);
+        private final boolean framed;
+        RaftTransport(boolean framed) { this.framed=framed; }
 
         @Override public void close() throws IOException { clients.close(); }
         @Override public byte[] read(RangeDescriptor descriptor, UUID column, byte[] key) throws IOException {
+            if (framed) {
+                try {
+                var body=ByteBuffer.allocate(20+key.length); ScopedTransactionRpc.uuid(body,column); ScopedTransactionRpc.putBlob(body,key);
+                var packet=ScopedTransactionRpc.parse(transaction(descriptor,ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,body.array()),true),ScopedTransactionRpc.MAX_REPLY_BYTES);
+                if (packet.kind()!=ScopedTransactionRpc.POINT) throw new IOException("Unexpected framed point reply");
+                var input=ByteBuffer.wrap(packet.body()); var value=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,true);
+                if (input.hasRemaining()) throw new IOException("Trailing point reply"); return value;
+                } catch (IllegalArgumentException malformed) { throw new IOException("Invalid framed point reply",malformed); }
+            }
             var request = ByteBuffer.allocate(16 + key.length).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).put(key).array();
             return rpc(() -> { try (var lease = clients.acquire(descriptor)) {
                 RaftClient client = lease.client();
@@ -318,6 +419,12 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
 
         @Override public RangeStateView stateView(RangeDescriptor descriptor) throws IOException {
+            if (framed) {
+                try {
+                var packet=ScopedTransactionRpc.parse(transaction(descriptor,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true),ScopedTransactionRpc.MAX_REPLY_BYTES);
+                if (packet.kind()!=ScopedTransactionRpc.STATE) throw new IOException("Unexpected framed state reply"); return RangeStateView.decode(packet.body());
+                } catch (IllegalArgumentException malformed) { throw new IOException("Invalid framed state reply",malformed); }
+            }
             return rpc(() -> { try (var lease=clients.acquire(descriptor)) {
                 byte[] encoded=content(lease.client().io().sendReadOnly(Message.valueOf(ByteString.copyFrom(RangeStateView.request()))));
                 try { return RangeStateView.decode(encoded); }
@@ -331,6 +438,13 @@ public final class RatisRoutedClient implements AutoCloseable {
                 byte[] encoded = content(client.io().send(Message.valueOf(ByteString.copyFrom(DistributedCommandCodec.encode(command)))));
                 try { return CommandResult.decode(encoded); }
                 catch (IllegalArgumentException invalid) { throw new IOException("Invalid command reply", invalid); }
+            } });
+        }
+        @Override public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException {
+            if (!framed) throw new IOException("Transport uses legacy query protocol");
+            return rpc(() -> { try (var lease=clients.acquire(descriptor)) {
+                var message=Message.valueOf(ByteString.copyFrom(request));
+                return content(freshBarrier ? lease.client().io().sendReadOnly(message) : lease.client().io().sendReadOnlyNonLinearizable(message),ScopedTransactionRpc.MAX_REPLY_BYTES);
             } });
         }
 
@@ -369,11 +483,14 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
 
         private static byte[] content(RaftClientReply reply) throws IOException {
+            return content(reply,DistributedCommandCodec.MAX_ENCODED_BYTES);
+        }
+        private static byte[] content(RaftClientReply reply,int maximum) throws IOException {
             if (reply == null || !reply.isSuccess() || reply.getMessage() == null) {
                 throw new IOException("Raft operation did not return a successful application reply", reply == null ? null : reply.getException());
             }
             var content = reply.getMessage().getContent();
-            if (content == null || content.size() > DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Application reply exceeds budget");
+            if (content == null || content.size() > maximum) throw new IOException("Application reply exceeds budget");
             return content.toByteArray();
         }
     }

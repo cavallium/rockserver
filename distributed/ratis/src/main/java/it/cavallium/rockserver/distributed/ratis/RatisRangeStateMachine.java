@@ -46,7 +46,7 @@ import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Initial synchronous apply adapter; the pool owner drains Ratis before closing native handles. */
-public final class RatisRangeStateMachine extends BaseStateMachine {
+public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.impl.LinearizableQueryStateMachine {
     private final ReplicatedRangeStore store;
     private final Consumer<DistributedCommand> commandValidator;
     private final Consumer<DistributedCommand> epochFloorAdmission;
@@ -69,6 +69,34 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     record Leadership(long term, boolean ready) {}
     @FunctionalInterface interface LeadershipSource { Leadership get() throws IOException; }
     private final LeadershipSource leadershipSource;
+    private RatisScopedTransactions scopedTransactions;
+
+    /** Explicit new-group protocol activation; legacy query bytes are never sniffed as framed requests. */
+    void enableScopedTransactions(java.util.function.LongSupplier nanos) {
+        if (getLifeCycleState()!=LifeCycle.State.NEW || scopedTransactions!=null) throw new IllegalStateException("Read protocol is fixed before initialization");
+        store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+        scopedTransactions=new RatisScopedTransactions(this,RatisScopedTransactions.Limits.defaults(),nanos);
+    }
+    long transactionGeneration() { return admissionGeneration.get(); }
+    long transactionTerm() { var a=store.applied(); return a==null ? -1 : a.term(); }
+    UUID transactionOwnerIncarnation() { return transactionIncarnation; }
+    void checkTransactionOwner() throws IOException {
+        requireHealthy(); var current=leadership(); var a=store.applied();
+        if (!current.ready() || a==null || a.term()!=current.term() || !store.admissionOpen()) throw new IOException("Transaction leader changed or is not ready");
+    }
+    ReplicatedRangeStore.ScopedHistoryPin captureTransaction(TransactionScope scope) throws Exception {
+        checkTransactionOwner(); long generation=admissionGeneration.get(); var pin=store.captureTracked(scope); boolean retained=false;
+        try {
+            checkTransactionOwner();
+            synchronized (admissions) {
+                var a=store.applied();
+                if (generation!=admissionGeneration.get() || !store.admissionOpen() || a==null || pin.position().term()!=a.term()
+                        || pin.status()!=it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Status.ACTIVE) throw new IOException("Transaction capture lost leadership");
+            }
+            retained=true; return pin;
+        } finally { if (!retained) pin.close(); }
+    }
+    void expireTransactions() throws Exception { if (scopedTransactions!=null) scopedTransactions.expire(); }
 
     private static final class Admission {
         final OperationId id;
@@ -340,6 +368,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     /** Must run before RaftServer.close(), whose updater waits for outstanding apply futures. */
     public void beginShutdown() {
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
+        if (scopedTransactions!=null) try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
         IOException failure = new IOException("Range is shutting down");
         synchronized (gate) { storageFailure = failure; store.fence(); }
         failDeferred(failure);
@@ -941,6 +970,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
 
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
+            if (scopedTransactions!=null && ScopedTransactionRpc.parse(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
                 if (minIndex > getLastAppliedTermIndex().getIndex()) throw new IllegalStateException("Requested read index has not completed");
@@ -950,9 +980,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     }
 
     @Override public CompletableFuture<Message> query(Message request) {
+        return query(request,false);
+    }
+    @Override public CompletableFuture<Message> queryLinearizable(Message request) { return query(request,true); }
+    private CompletableFuture<Message> query(Message request,boolean freshBarrier) {
         try {
             requireHealthy();
             byte[] encoded = request.getContent().toByteArray();
+            if (scopedTransactions!=null) return CompletableFuture.completedFuture(framedQuery(encoded,freshBarrier));
             if (encoded.length==8) {
                 if (!RangeStateView.isRequest(encoded)) throw new IllegalArgumentException("Invalid range-state request");
                 try (var pin=snapshotPin()) {
@@ -976,6 +1011,49 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
         }
+    }
+
+    private Message framedQuery(byte[] encoded,boolean freshBarrier) throws Exception {
+        var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+        var input=ByteBuffer.wrap(packet.body()); byte[] reply;
+        switch (packet.kind()) {
+            case ScopedTransactionRpc.POINT -> {
+                var column=ScopedTransactionRpc.uuid(input); var key=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES-16,false); end(input);
+                try (var pin=snapshotPin()) { var value=pin.get(column,key); reply=valueBlob(value); }
+            }
+            case ScopedTransactionRpc.STATE -> { end(input); try (var pin=snapshotPin()) { reply=pin.stateView().encode(); } }
+            case ScopedTransactionRpc.OPEN -> {
+                if (!freshBarrier) throw new IOException("Transaction open requires a fresh linearizable read barrier");
+                var id=ScopedTransactionRpc.uuid(input); long ttl=input.getLong();
+                var handle=scopedTransactions.open(id,ScopedTransactionRpc.decodeScope(input),java.time.Duration.ofMillis(ttl));
+                var output=ByteBuffer.allocate(16+ScopedTransactionRpc.HANDLE_BYTES); ScopedTransactionRpc.uuid(output,id); ScopedTransactionRpc.writeHandle(output,handle); reply=output.array();
+            }
+            case ScopedTransactionRpc.GET -> {
+                var handle=ScopedTransactionRpc.readHandle(input); var column=ScopedTransactionRpc.uuid(input);
+                var key=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES-16,false); end(input);
+                reply=valueBlob(scopedTransactions.get(handle,column,key));
+            }
+            case ScopedTransactionRpc.PAGE -> {
+                var handle=ScopedTransactionRpc.readHandle(input); var column=ScopedTransactionRpc.uuid(input);
+                var lower=ScopedTransactionRpc.blob(input,TransactionScope.MAX_BOUND_BYTES,true); var upper=ScopedTransactionRpc.blob(input,TransactionScope.MAX_BOUND_BYTES,true);
+                int direction=input.get()&255; if (direction>1) throw new IllegalArgumentException("Invalid transaction page direction");
+                var resume=ScopedTransactionRpc.blob(input,it.cavallium.rockserver.core.common.distributed.PhysicalRangePage.MAX_BYTES,true);
+                int items=input.getInt(), bytes=input.getInt(); end(input);
+                reply=ScopedTransactionRpc.pageBytes(scopedTransactions.page(handle,column,lower,upper,direction==1,resume,items,bytes));
+            }
+            case ScopedTransactionRpc.PLAN -> {
+                var handle=ScopedTransactionRpc.readHandle(input); var command=DistributedCommandCodec.decode(ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); end(input);
+                reply=DistributedCommandCodec.encode(scopedTransactions.plan(handle,command));
+            }
+            case ScopedTransactionRpc.CLOSE -> { var handle=ScopedTransactionRpc.readHandle(input); end(input); scopedTransactions.release(handle); reply=new byte[0]; }
+            default -> throw new IllegalArgumentException("Unsupported framed query");
+        }
+        return Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(packet.kind(),reply)));
+    }
+    private static void end(ByteBuffer input) { if (input.hasRemaining()) throw new IllegalArgumentException("Trailing query bytes"); }
+    private static byte[] valueBlob(byte[] value) {
+        if (value!=null && value.length>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Point value exceeds reply budget");
+        var output=ByteBuffer.allocate(4+(value==null ? 0 : value.length)); ScopedTransactionRpc.putBlob(output,value); return output.array();
     }
 
     private void requireHealthy() {

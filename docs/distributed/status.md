@@ -2009,3 +2009,120 @@ planner's payload charge before the retention fix:
 `/tmp/rockserver-accepted-planner-retention-red.log`. The final broad gate includes
 its corrected ordering. All adapter append contexts remain controlled fixtures,
 not real quorum acceptance.
+
+## Fresh scoped snapshot RPCs and durable accepted-client phases
+
+The patched Ratis producer now distinguishes a completed LINEARIZABLE read-index /
+wait-applied path from generic query dispatch. Released `query(Message)` alone is
+insufficient evidence: explicitly non-linearizable reads also reach it. The new
+`LinearizableQueryStateMachine` hook runs only after both barriers succeed; dummy,
+generic and stale behavior remain separate. `RaftServerImpl` is vendored from the
+exact Apache `ratis-3.3.1` source alongside the existing leader patch; its upstream
+source SHA-256 is `a1b8cb4b41c8366985a94a2973f2b8926ffc0646556bdce9d135bf5f7a904b78`.
+Producer unpack excludes both replaced class families, retaining one server jar.
+
+Query protocol v2 is mode-exclusive, never a magic-prefix guess over arbitrary
+legacy UUID/key bytes. Legacy is still the default. `Settings.scopedTransactions`
+activates framed queries for new data groups; manifest v2 and node identity v3 bind
+that choice. Existing roots reject a configuration-only mode flip. The owned node
+launcher selects/matches its routed client's mode. `connectFramed` requires every
+target data group to have that protocol activated. This is an explicit new-placement
+boundary; rolling activation/feature-epoch negotiation remains unimplemented, and
+legacy clients cannot send legacy query bytes to an activated framed group.
+Catalogue query formats remain separate.
+
+OPEN requires the proven-fresh hook, a ready local leader and a completed native
+current-term cut. A retry nonce returns the same active opening; each new opening
+receives a separate server lease ID plus incarnation/generation/cut identity for the entire
+declared scope. Reusing an expired nonce cannot let stale CLOSE/read requests
+access a replacement. GET and PAGE read that one native snapshot;
+reads do not renew its absolute monotonic TTL (default maximum 60 seconds). PLAN
+reserves/certifies the complete scope and returns the frozen v7 command; repeating
+the same base command returns the same plan. A mismatched retry rejects without
+destroying the original plan. Successful planning deliberately closes the snapshot;
+its explicit planning phase prevents expiry from misclassifying that close before
+publication. CLOSE/expiry abandon only unsubmitted authority. Submitted ambiguous
+ownership remains with the existing admission/recovery machinery.
+
+Owned GET/PAGE/PLAN/CLOSE use non-linearizable transport requests because they
+operate on the already captured cut, not a newly linearizable current read. They
+still check exact handle identity, lifecycle, captured native term and leadership
+generation; unknown/expired handles never reopen or rebase automatically. Ordinary point/state
+reads still request fresh barriers. Stale-read dispatch rejects transaction handle
+operations. Typed framing separately bounds scope/command fields and pages; a legal
+physical-page continuation can exceed an atomic command's 2 MiB limit, so framed
+query envelopes permit the existing 8 MiB page bound plus identity framing.
+
+The registry separately bounds 128 default handles, 16 MiB accounted scope and
+16 MiB retained plan payloads. Opening/planning work stays charged after logical
+expiry while native work is still running. Plans reserve the maximum command size
+before result construction. Native pins retain their independent physical ledger.
+One node-shared expiry service visits at most 32 groups per 100 ms quantum through
+the existing reserved CONTROL lane; timer callbacks only admit work. Quanta coalesce,
+queued stop removes work, and running cleanup drains before machine/pool shutdown.
+There is no executor/thread per handle or group. Cleanup scheduling can lag under
+failures/queue pressure; expired handles still reject access and retained capacity
+is not donated early. These fixed accounting bounds are not measured heap/SST or
+end-to-end transport-buffer residency bounds.
+
+Session windows now distinguish unaccepted intent, accepted v7 and abandoned
+unaccepted intent. A base intent cannot execute or ACK, including after recovery.
+`acceptTransaction` requires exact original identity/route/ACK/ordered operands,
+then the durable client forces the full accepted command before allowing its first
+write RPC. A lost reply reopens/retries only those bytes and frozen route. A definitive
+pre-submission conflict can use `abandonTransactionIntent`: it durably records a
+local empty CONFLICT without an RPC, then permits explicit consumption/ACK progress.
+Only never-executable intents can use this path; ordinary or accepted entries reject
+it. This prevents repeated whole-transaction retries from leaving permanent sequence
+holes. Journal v2 records these phases and still reads canonical v1 windows. Failed
+persistence fences execution/phase publication until recovery.
+
+The representative workflow now covers native OPEN/read/PLAN, durable acceptance,
+controlled append/native apply, lost reply, close/reopen, exact retry and ACK. This
+is still a physical one-group interface: read-your-writes staging, logical transaction
+adapters and complete public frontend parity remain unfinished. An accepted v7
+whose local authorization disappears before submission currently remains pending
+in its durable window; it cannot use the unaccepted-intent abandonment path. A
+replicated no-effects rejection/status mechanism remains necessary to resolve such
+identities without rebasing or unsafe abandonment. Durable locks/2PC,
+topology, full bulk/CDC/backup, feature negotiation, global resource envelopes and
+representative performance/quorum/power-loss acceptance remain open. No server
+process/network probe was run; the excluded density fixture remains untouched.
+
+Validation: the final selected `test-compile surefire:test@default-test` gate passed
+142 core, 24 patched-server and 194 adapter cases (360 total, zero failures/errors/
+skips), exit zero: `/tmp/rockserver-transaction-handles-final-gate.log`. Five producer
+cases cover dispatch and pending/failed barriers. Nine codec cases cover strict
+framing/scope/page/handle bounds and immutable copies. Six RPC cases include the
+full native/durable lost-reply workflow, fresh-OPEN enforcement, fixed-cut pages,
+TTL, native PLAN conflict followed by durable abandonment/ACK progress, and a
+large physical continuation transport fixture. Five registry cases force blocked
+opening/planning ownership, successful plan publication during expiry, stale-close
+replacement protection and cached-plan term invalidation. Five expiry cases cover
+node-shared visits, reserved CONTROL admission, coalescing, rejection, stop and
+actual drain. Eleven durable-client cases include v1 recovery, phase validation,
+force failure fencing, abandoned consumed holes and frozen accepted retries. New
+manifest/runtime/launcher cases establish mode binding and mismatch rejection.
+
+The intentional pin-close publication race and destructive mismatched retry failed
+before their fixes in `/tmp/rockserver-transaction-plan-publication-red.log` and
+`/tmp/rockserver-transaction-plan-retry-red.log`. Expired nonce reuse and cached
+plan term checks also reproduced failures before correction:
+`/tmp/rockserver-transaction-open-replacement-red.log` and
+`/tmp/rockserver-transaction-cached-term-red.log`. The final gate includes all four
+corrected boundaries. Controlled barrier/query/append fixtures establish the paths
+they exercise, not actual network/quorum or production acceptance.
+
+Producer packaging also passed, exit zero:
+`/tmp/rockserver-transaction-ratis-package.log`. The 534,238-byte
+`distributed/ratis-server/target/rockserver-ratis-server-3.3.1-rockserver.1.jar` has
+SHA-256 `b7226ca8e54c05b157325f5c47b0fb0a4943d9389cbd8a1544941b2a6b21ad36`.
+All 159 released classes outside the three replaced families are byte-identical to
+the checksum-pinned original jar; the artifact has no duplicate ZIP entries and
+contains the new fresh-query hook/dispatch. This is packaged local evidence only;
+no publication, server launch or deployment occurred.
+A final added native query-compatibility case also passed, exit zero:
+`/tmp/rockserver-transaction-query-compatibility-gate.log`. It verifies framed
+point/state replies, rejection of legacy bytes in framed mode, preservation of the
+legacy parser and refusal to activate a new query mode after initialization. This
+adds one case beyond the 360-case broad gate without changing production source.

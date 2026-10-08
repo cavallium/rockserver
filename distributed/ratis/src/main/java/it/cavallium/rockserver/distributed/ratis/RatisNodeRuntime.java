@@ -30,7 +30,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException;
     }
     public record Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,
-                           Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout) {
+                           Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout,boolean scopedTransactions) {
+        public Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout) {
+            this(images,retention,clockPeriod,propagationVisits,maxPropagationRanges,shutdownTimeout,false);
+        }
         public Settings {
             Objects.requireNonNull(images); Objects.requireNonNull(retention); Objects.requireNonNull(clockPeriod); Objects.requireNonNull(shutdownTimeout);
             if (clockPeriod.isNegative() || clockPeriod.isZero() || propagationVisits<1 || propagationVisits>32
@@ -44,6 +47,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final Map<RaftGroupId,RatisRangeStateMachine> machines=new LinkedHashMap<>();
     private DistributedStoragePool pool; private RaftServer server; private RatisCatalogueClock clock;
     private RatisSessionPropagation propagation; private RatisSessionClockService service;
+    private RatisTransactionExpiryService transactionExpiry;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
 
@@ -129,11 +133,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             plan.directory().schemaDigest(),plan.columns(),plan.merges());
                     if (logicalSchema!=null) store.enableLogicalSchema(logicalSchema);
                     machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),command -> {},epochs,plan.directory(),settings.retention());
+                    if (settings.scopedTransactions()) machine.enableScopedTransactions(System::nanoTime);
                 }
                 machines.put(group.getGroupId(),machine);
             }
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
         server=factory.create(plan,logs,Collections.unmodifiableMap(machines));
+        if (settings.scopedTransactions()) transactionExpiry=new RatisTransactionExpiryService(scheduler,List.copyOf(machines.values()),32);
         if (!machines.containsKey(RaftGroupId.valueOf(plan.catalogue().groupId()))) return;
         clock=new RatisCatalogueClock(root.resolve("sessions/catalogue-clock.bin"),epochs);
         propagation=new RatisSessionPropagation(root.resolve("sessions"),epochs,routed,settings.maxPropagationRanges());
@@ -157,23 +163,29 @@ public final class RatisNodeRuntime implements AutoCloseable {
             var actualIds=new HashSet<RaftGroupId>(); server.getGroupIds().forEach(actualIds::add);
             if (!actualIds.equals(machines.keySet())) throw new IOException("Server division coverage differs from placement");
             for (var group:plan.localGroups()) verify(group);
-            if (service!=null) service.start(timer,settings.clockPeriod()); synchronized (this) { started=true; }
+            if (service!=null) service.start(timer,settings.clockPeriod());
+            if (transactionExpiry!=null) transactionExpiry.start(timer,Duration.ofMillis(100));
+            synchronized (this) { started=true; }
         } catch (IOException | RuntimeException | Error failure) {
             synchronized (this) { closeRequested=true; }
             for (var machine:machines.values()) machine.beginShutdown(); throw failure;
         } finally { synchronized (this) { starting=false; } }
     }
     private byte[] identity(boolean exposed) {
+        if (settings.scopedTransactions()) return ByteBuffer.allocate(41).putInt(3).put((byte)(exposed ? 1 : 0)).putInt(2).put(plan.identityDigest()).array();
         return ByteBuffer.allocate(37).putInt(2).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
     }
     private boolean identityExposed(byte[] bytes) throws IOException {
         if (bytes.length<4) throw new IOException("Truncated node identity");
-        var input=ByteBuffer.wrap(bytes); int version=input.getInt(); boolean exposed;
+        var input=ByteBuffer.wrap(bytes); int version=input.getInt(); boolean exposed; boolean framed=false;
         if (version==1 && bytes.length==36) exposed=true; // Older writers did not prove a pre-exposure boundary.
         else if (version==2 && bytes.length==37) {
             int phase=input.get() & 255;
             if (phase>1) throw new IOException("Invalid node exposure phase"); exposed=phase==1;
+        } else if (version==3 && bytes.length==41) {
+            int phase=input.get()&255; if (phase>1 || input.getInt()!=2) throw new IOException("Invalid node read-protocol identity"); exposed=phase==1; framed=true;
         } else throw new IOException("Invalid node identity version/shape");
+        if (framed!=settings.scopedTransactions()) throw new IOException("Established node read protocol changed; requires authoritative feature activation");
         byte[] digest=new byte[32]; input.get(digest);
         if (!Arrays.equals(digest,plan.identityDigest())) throw new IOException("Node identity/schema/placement binding changed");
         return exposed;
@@ -195,6 +207,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public synchronized boolean started() { return state()==State.RUNNING; }
     public RatisSessionClockService.Snapshot maintenanceStatus() { return service==null ? null : service.latest(); }
     public Throwable maintenanceFailure() { return service==null ? null : service.lastFailure(); }
+    public Throwable transactionExpiryFailure() { return transactionExpiry==null ? null : transactionExpiry.lastFailure(); }
     private void verify(RaftGroup group) throws IOException {
         var division=server.getDivision(group.getGroupId()); var configuration=division.getRaftConf();
         for (var role:List.of(RaftPeerRole.FOLLOWER,RaftPeerRole.LISTENER)) {
@@ -212,6 +225,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            if (transactionExpiry!=null) {
+                try { transactionExpiry.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Transaction expiry drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Transaction expiry did not drain",failure); }
+            }
             if (service!=null) {
                 try { service.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Node service drain interrupted",interrupted); }

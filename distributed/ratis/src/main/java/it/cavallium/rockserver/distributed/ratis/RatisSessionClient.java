@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.distributed.*;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Arrays;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -20,8 +21,9 @@ public final class RatisSessionClient {
     }
     public static final class Pending {
         private final RatisSessionClient owner;
-        private final RatisRoutedClient.PreparedCommand prepared;
-        private final int commandBytes, resultBytes;
+        private volatile RatisRoutedClient.PreparedCommand prepared;
+        private int commandBytes, resultBytes;
+        private volatile boolean awaitingAcceptance,abandoned;
         private CommandResult result;
         private boolean executing, consumed;
         private Pending(RatisSessionClient owner,RatisRoutedClient.PreparedCommand prepared,int commandBytes,int resultBytes) {
@@ -29,8 +31,13 @@ public final class RatisSessionClient {
         }
         public DistributedCommand command() { return prepared.command(); }
         public RangeDescriptor descriptor() { return prepared.descriptor(); }
+        public boolean awaitingAcceptance() { return awaitingAcceptance; }
+        public boolean abandoned() { return abandoned; }
     }
-    record WindowEntry(RatisRoutedClient.PreparedCommand prepared,CommandResult result,boolean consumed) {}
+    record WindowEntry(RatisRoutedClient.PreparedCommand prepared,CommandResult result,boolean consumed,boolean intent,boolean abandoned) {
+        WindowEntry(RatisRoutedClient.PreparedCommand prepared,CommandResult result,boolean consumed,boolean intent) { this(prepared,result,consumed,intent,false); }
+        WindowEntry(RatisRoutedClient.PreparedCommand prepared,CommandResult result,boolean consumed) { this(prepared,result,consumed,false,false); }
+    }
     record WindowState(long nextSequence,long acknowledgedThrough,boolean exhausted,List<WindowEntry> entries) {
         WindowState { entries=List.copyOf(entries); }
     }
@@ -60,7 +67,7 @@ public final class RatisSessionClient {
     }
     synchronized WindowState snapshot() {
         return new WindowState(nextSequence,acknowledgedThrough,exhausted,pending.values().stream()
-                .map(entry -> new WindowEntry(entry.prepared,entry.result,entry.consumed)).toList());
+                .map(entry -> new WindowEntry(entry.prepared,entry.result,entry.consumed,entry.awaitingAcceptance,entry.abandoned)).toList());
     }
     /** Journal recovery is separate from fresh issuance; an expired grant may still have saved outcomes to resolve. */
     static RatisSessionClient restore(RatisRoutedClient routed,SessionEpochLedger.Grant grant,Limits limits,WindowState state) {
@@ -79,11 +86,14 @@ public final class RatisSessionClient {
             var prepared=routed.restoreSessionCommand(saved.prepared().command(),saved.prepared().descriptor()); var command=prepared.command(); var id=command.operationId();
             if (!id.sessionId().equals(grant.sessionId()) || id.epoch()!=grant.epoch() || id.sequence()!=sequence
                     || command.acknowledgedThrough()>ack || saved.consumed() && saved.result()==null
-                    || client.pending.isEmpty() && saved.consumed()) throw new IllegalArgumentException("Invalid recovered command/outcome ownership");
+                    || client.pending.isEmpty() && saved.consumed()
+                    || saved.intent() && (command.acceptance()!=null || command.mutations().isEmpty() || saved.result()!=null || saved.consumed() || saved.abandoned())
+                    || saved.abandoned() && (command.acceptance()!=null || command.mutations().isEmpty() || saved.result()==null
+                            || saved.result().status()!=CommandResult.Status.CONFLICT || saved.result().valueCount()!=0)) throw new IllegalArgumentException("Invalid recovered command/outcome ownership");
             int bytes=DistributedCommandCodec.encodedSize(command), result=maximumResult(command);
             if (bytes>limits.commandBytes()-client.commandBytes || result>limits.resultBytes()-client.resultBytes) throw new IllegalArgumentException("Recovered byte window exceeds limits");
             if (saved.result()!=null) validateResult(command,saved.result());
-            var entry=new Pending(client,prepared,bytes,result); entry.result=saved.result(); entry.consumed=saved.consumed();
+            var entry=new Pending(client,prepared,bytes,result); entry.result=saved.result(); entry.consumed=saved.consumed(); entry.awaitingAcceptance=saved.intent(); entry.abandoned=saved.abandoned();
             client.pending.put(sequence,entry); client.commandBytes+=bytes; client.resultBytes+=result;
             if (sequence!=Long.MAX_VALUE) sequence++;
         }
@@ -98,6 +108,9 @@ public final class RatisSessionClient {
     private static void validateResult(DistributedCommand command,CommandResult result) {
         long count=command.mutations().stream().filter(m -> m.returnMode()!=Mutation.ReturnMode.NONE).count();
         if (result.status()==CommandResult.Status.SUCCESS && result.valueCount()!=count) throw new IllegalArgumentException("Outcome differs from command result plan");
+        if (command.acceptance()!=null && result.status()==CommandResult.Status.SUCCESS && !Arrays.equals(result.encode(),command.acceptance().result())) {
+            throw new IllegalArgumentException("Outcome differs from frozen accepted result");
+        }
     }
     public SessionEpochLedger.Grant grant() { return grant; }
     public synchronized int outstanding() { return pending.size(); }
@@ -112,6 +125,39 @@ public final class RatisSessionClient {
     }
     public Pending prepare(List<Mutation> mutations) { return prepare(mutations,List.of()); }
 
+    /** Allocates an identity/route whose base command can never execute before explicit acceptance. */
+    public synchronized Pending prepareTransactionIntent(List<Mutation> mutations,List<KeyPredicate> predicates) {
+        if (mutations.isEmpty()) throw new IllegalArgumentException("Transaction intent requires business mutations");
+        requireCapacity(); var id=new OperationId(grant.sessionId(),grant.epoch(),nextSequence);
+        var prepared=acknowledgedThrough<0 ? routed.prepare(id,mutations,predicates) : routed.prepare(id,mutations,predicates,acknowledgedThrough);
+        return retain(prepared,true);
+    }
+    public Pending prepareTransactionIntent(List<Mutation> mutations) { return prepareTransactionIntent(mutations,List.of()); }
+    /** Installs only the exact accepted form of this unresolved intent, retaining its original frozen route. */
+    public synchronized void acceptTransaction(Pending entry,DistributedCommand accepted) {
+        requireOwner(entry); Objects.requireNonNull(accepted);
+        if (!entry.awaitingAcceptance || entry.executing || entry.result!=null || entry.consumed) throw new IllegalStateException("Operation is not an unresolved transaction intent");
+        if (accepted.formatVersion()!=7 || accepted.acceptance()==null) throw new IllegalArgumentException("Transaction acceptance requires v7");
+        var exact=DistributedCommand.acceptedTransaction(entry.command(),accepted.acceptance());
+        if (!Arrays.equals(DistributedCommandCodec.encode(exact),DistributedCommandCodec.encode(accepted))) throw new IllegalArgumentException("Accepted transaction changed original identity or ordered plan");
+        var prepared=routed.restoreSessionCommand(accepted,entry.descriptor());
+        int bytes=DistributedCommandCodec.encodedSize(accepted), result=maximumResult(accepted);
+        if (bytes>limits.commandBytes()-(commandBytes-entry.commandBytes) || result>limits.resultBytes()-(resultBytes-entry.resultBytes)) {
+            throw new IllegalStateException("Accepted transaction exceeds session byte window");
+        }
+        commandBytes=commandBytes-entry.commandBytes+bytes; resultBytes=resultBytes-entry.resultBytes+result;
+        entry.commandBytes=bytes; entry.resultBytes=result; entry.prepared=prepared; entry.awaitingAcceptance=false;
+    }
+
+    /** Definitive local no-effects outcome: an awaiting intent has never been eligible for a write RPC. */
+    public synchronized CommandResult abandonTransactionIntent(Pending entry) {
+        requireOwner(entry);
+        if (!entry.awaitingAcceptance || entry.command().acceptance()!=null || entry.command().mutations().isEmpty()
+                || entry.executing || entry.result!=null || entry.consumed) throw new IllegalStateException("Operation is not an unresolved transaction intent");
+        entry.result=new CommandResult(CommandResult.Status.CONFLICT,List.of()); entry.abandoned=true; entry.awaitingAcceptance=false;
+        return entry.result;
+    }
+
     /** Explicitly drains receipts on a selected range even when no further data command is needed there. */
     public synchronized Pending prepareAcknowledgement(UUID column,byte[] routingKey) {
         requireCapacity();
@@ -122,13 +168,14 @@ public final class RatisSessionClient {
         if (exhausted) throw new IllegalStateException("Session sequence space exhausted");
         if (pending.size() >= limits.outstanding()) throw new IllegalStateException("Session outstanding window exhausted");
     }
-    private Pending retain(RatisRoutedClient.PreparedCommand prepared) {
+    private Pending retain(RatisRoutedClient.PreparedCommand prepared) { return retain(prepared,false); }
+    private Pending retain(RatisRoutedClient.PreparedCommand prepared,boolean intent) {
         int encoded=DistributedCommandCodec.encodedSize(prepared.command());
         int maximumResult=maximumResult(prepared.command());
         if (encoded > limits.commandBytes()-commandBytes || maximumResult > limits.resultBytes()-resultBytes) {
             throw new IllegalStateException("Session command/result byte window exhausted");
         }
-        var entry=new Pending(this,prepared,encoded,maximumResult);
+        var entry=new Pending(this,prepared,encoded,maximumResult); entry.awaitingAcceptance=intent;
         pending.put(nextSequence,entry); commandBytes+=encoded; resultBytes+=maximumResult;
         if (nextSequence==Long.MAX_VALUE) exhausted=true; else nextSequence++;
         return entry;
@@ -146,6 +193,7 @@ public final class RatisSessionClient {
     public CommandResult execute(Pending entry) throws IOException {
         synchronized (this) {
             requireOwner(entry);
+            if (entry.awaitingAcceptance) throw new IllegalStateException("Transaction intent has not been accepted");
             if (entry.result != null) return entry.result;
             if (entry.executing) throw new IOException("This session operation is already executing");
             entry.executing=true;
@@ -162,6 +210,7 @@ public final class RatisSessionClient {
     /** Call only after the application has durably consumed the returned outcome, including conflicts. */
     public synchronized void acknowledge(Pending entry) {
         requireOwner(entry);
+        if (entry.awaitingAcceptance) throw new IllegalStateException("Transaction intent has not been accepted");
         if (entry.result==null) throw new IllegalStateException("Unresolved operation cannot be acknowledged");
         entry.consumed=true;
         while (!pending.isEmpty() && pending.firstEntry().getValue().consumed) {
