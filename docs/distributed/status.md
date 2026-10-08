@@ -1075,3 +1075,59 @@ returning mutation, persisted retry/hash identity, no user effects, explicit
 consumption, rejected identity swapping/out-of-window requests and continued ACK
 cleanup. This closes the reviewed individual-expiry client-progress gap for bound
 sessions; remaining bootstrap/propagation/public-runtime work is unchanged.
+
+## Durable bounded session-maintenance streams
+
+`RatisSessionMaintenance` adds one journaled pending control per stream/range
+incarnation, borrowing the catalogue and routed clients. It durably creates a
+stable maintenance UUID, keeps its issuer epoch until the coarse floor crosses
+it, and ACKs the previous completed sequence on the next control. Epoch rotation
+resets the sequence only under a higher committed coarse floor, whose control
+also removes the old epoch's receipts. Repeated updates/reopen retain one receipt
+per stream rather than abandoning identities at restart. Native range quotas
+still govern all streams; a node-wide stream/job budget is not implemented yet.
+
+The bounded checksummed journal stores the exact canonical command and original
+peer route before sending. A stable file lock excludes another owner of the same
+journal. A single bounded .pending file is forced, atomically renamed, then the
+parent directory is forced; recovery seals the surviving version before use.
+Terminal completion, consumed sequence/ACK prefix and proven propagated cut are
+persisted before another identity is allocated. Lost replies retain the original
+pending command. Journal write failures fence the owner until reopen, including
+uncertain completion writes after native success. Idle close invalidates the owner
+before releasing ownership; active execution prevents close/reacquisition until
+actual completion. Clients remain caller-owned; no executor is created.
+
+Frozen ADVANCE controls can now succeed when a newer catalogue/native cut already
+dominates them. The effective native authority remains the maximum cut, while the
+control's own ACK applies normally. Contradictory identities/generations/time/floors
+still reject. This lets an old clock retry complete under catalogue churn without
+rewriting its payload or claiming the latest catalogue time. `propagated()` records
+a durable lower bound for this exact range incarnation only after SUCCESS; a
+SESSION_EXPIRED/CONFLICT result consumes the identity without claiming propagation.
+
+A binding whose grant expires before admission can still require coarse fencing
+to resolve. A separate dedicated clock stream can install that floor while the
+binding stream retains its frozen identity; its retry then receives canonical
+SESSION_EXPIRED and can move on. Automatic jobs must keep this clock driver
+independent of unresolved first-use binding work. The native maintenance lane
+continues serializing actual in-flight ACK/bind/clock proposals and deletion credit.
+
+The ordinary full gate passes 77 core/native, 16 read-round and 45 adapter cases
+(138 total), exit zero: `/tmp/rockserver-session-maintenance-full-gate.log`.
+After ownership-cleanup refinements and two added journal cases, the final focused
+gate passes 3 core and 26 adapter cases, exit zero:
+`/tmp/rockserver-session-maintenance-final-gate.log`. Seven maintenance cases cover
+repeated receipt conservation, epoch rotation, ownership exclusion, restart and
+lost native reply, original route across refresh, failed completion persistence,
+corrupt/foreign journals, active RPC drain, lost lock-channel ownership and separate
+clock unblocking of an expired binding. Native tests also prove a new identity
+remains expired after a dominated clock retry. These use real native stores/local
+file operations and controlled interfaces, not physical-power-loss, transport,
+independent-node or measured performance acceptance. No excluded workflow, density
+execution, push/deployment or main-checkout change occurred.
+
+Automatic multi-range clock/floor scheduling and aggregate completion, bounded
+node/pool/tenant budgets, public runtime integration and the other previously
+listed architecture work remain open. The journal supplies a per-range durable
+control owner; it does not establish catalogue-wide instantaneous expiry.

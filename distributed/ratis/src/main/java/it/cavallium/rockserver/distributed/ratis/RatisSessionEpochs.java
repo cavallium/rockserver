@@ -111,11 +111,11 @@ public final class RatisSessionEpochs {
                 var ledger=read();
                 if (ledger==null) throw new IllegalStateException("Absent session authority cut");
                 var current=SessionAuthority.from(ledger);
+                current.requireAtLeast(control.authority());
                 if (control.binding()) {
-                    current.requireAtLeast(control.authority());
                     try { RangeSessionControl.bind(ledger,control.grant(),control.outstandingWindow()); }
                     catch (IllegalArgumentException expired) { throw new IllegalStateException("Catalogue no longer authorizes this binding",expired); }
-                } else if (!control.authority().equals(current)) throw new IllegalStateException("Stale authority advance");
+                }
             } catch (IOException unavailable) { throw new IllegalStateException("Catalogue session authority unavailable",unavailable); }
         };
     }

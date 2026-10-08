@@ -164,6 +164,27 @@ public final class RatisRoutedClient implements AutoCloseable {
         return new PreparedCommand(observed,descriptor,command);
     }
 
+    // Journal recovery preserves the exact original peer route even after a directory refresh.
+    PreparedCommand restoreSessionControl(DistributedCommand command,RangeDescriptor descriptor) {
+        var observed=current(); var control=command.sessionControl();
+        if (control==null || !control.authority().clusterId().equals(observed.clusterId())
+                || !control.authority().databaseId().equals(observed.databaseId())
+                || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
+                || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
+                || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Invalid recovered control route");
+        return new PreparedCommand(identity,descriptor,command);
+    }
+    byte[] sessionIdentityDigest() {
+        var output=ByteBuffer.allocate(96+16*identity.columns().size());
+        output.putLong(identity.clusterId().getMostSignificantBits()).putLong(identity.clusterId().getLeastSignificantBits());
+        output.putLong(identity.databaseId().getMostSignificantBits()).putLong(identity.databaseId().getLeastSignificantBits());
+        output.putLong(identity.domainId().getMostSignificantBits()).putLong(identity.domainId().getLeastSignificantBits());
+        output.putLong(identity.schemaEpoch()).put(identity.schemaDigest()).putInt(identity.routingPrefixBytes()).putInt(identity.columns().size());
+        for (var id:identity.columns().stream().sorted().toList()) output.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(output.array()); }
+        catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+
     public CommandResult execute(PreparedCommand prepared) throws IOException {
         Objects.requireNonNull(prepared, "prepared");
         requireIdentity(prepared.source);

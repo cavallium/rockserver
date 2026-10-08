@@ -387,7 +387,6 @@ public final class ReplicatedRangeStore {
         if (current==null) return control.authority();
         try { control.authority().requireAtLeast(current); return control.authority(); }
         catch (IllegalArgumentException older) {
-            if (!control.binding()) throw older;
             current.requireAtLeast(control.authority()); return current;
         }
     }

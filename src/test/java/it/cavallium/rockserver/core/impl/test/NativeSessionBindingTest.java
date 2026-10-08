@@ -72,7 +72,9 @@ class NativeSessionBindingTest {
             var staleBind=control(new OperationId(ADMIN,3,3),RangeSessionControl.bind(ledger,ledger.grants().getLast(),2));
             assertEquals(CommandResult.Status.SESSION_EXPIRED,f.apply(staleBind));
             var rollback=control(new OperationId(ADMIN,3,4),RangeSessionControl.advance(ledger));
-            assertEquals(CommandResult.Status.CONFLICT,f.apply(rollback));
+            assertEquals(CommandResult.Status.SUCCESS,f.apply(rollback),"Dominated clock retry succeeds without lowering authority");
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,f.apply(put(OTHER,2,3,1)),"A new identity remains expired after a dominated clock retry");
+            assertNull(f.db.get(f.handles.get(1),new byte[]{3}));
             assertEquals(CommandResult.Status.SUCCESS,f.apply(put(USER,1,0,-1)));
             var closed=expiredHole.advanceTime(100);
             assertEquals(CommandResult.Status.SUCCESS,f.apply(control(new OperationId(ADMIN,3,5),RangeSessionControl.advance(closed))));
