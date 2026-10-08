@@ -112,6 +112,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         final ByteString rejectionLogData;
         PreparedParticipant.Preparation participant;
         ParticipantHold participantHold;
+        RatisSnapshotRecord snapshot;
         ParticipantFinalization finalization;
         FinalizationHold finalizationHold;
         boolean retentionReleased,maybeAppended,settled;
@@ -625,6 +626,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray();
+            if (RatisSnapshotRecord.isSnapshot(encoded)) return startSnapshotRetry(transaction,encoded,generation,leadership);
             if (RatisParticipantRecord.isParticipant(encoded)) return RatisParticipantRecord.isFinalization(encoded) ? startFinalization(transaction,encoded,generation,leadership) : startParticipant(transaction,encoded,generation,leadership);
             var command = DistributedCommandCodec.decode(encoded);
             if (command.transactionRejection()) throw new IllegalArgumentException("Internal rejection records cannot be submitted by clients");
@@ -724,6 +726,37 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
 
+    private void requireSnapshotParticipant(RatisSnapshotRecord request) {
+        if (!request.participantGroup().equals(store.ownership().owner().groupId())) throw new IllegalArgumentException("Snapshot gate command addressed to another participant");
+    }
+    /** Exact retained outcomes may retry without fresh home authority; new gate admission is a separate privileged seam. */
+    private TransactionContext startSnapshotRetry(TransactionContext transaction,byte[] encoded,long generation,Leadership leader) throws Exception {
+        var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request); byte[] digest=request.digest();
+        for (int attempt=0;attempt<3;attempt++) {
+            var estimate=request.isRelease() ? store.estimateGateRelease(request.terminal()) : store.estimateGateInstall(request.fence());
+            var observed=estimate.capacity().position(); var receipt=request.receipt(estimate.existing());
+            if (receipt==null) throw new IllegalStateException("Snapshot gate has no verified native outcome or fresh home admission authority");
+            if (observed==null || observed.term()!=leader.term()) throw new IllegalStateException("Snapshot gate native prefix is not ready");
+            synchronized (admissions) {
+                requireHealthy(); if (generation!=admissionGeneration.get() || !store.admissionOpen()) throw new IllegalStateException("Snapshot gate retry owner changed");
+                if (!java.util.Objects.equals(observed,store.applied())) continue; reconcileOlderProposalTerms(leader.term());
+                var known=admissions.get(request.operation());
+                if (known!=null && !Arrays.equals(known.digest,digest)) throw new IllegalArgumentException("Snapshot control identity payload changed");
+                if (known!=null) { settleAdmission(known); known=admissions.get(request.operation()); }
+                if (known!=null) {
+                    if (known.snapshot==null || known.term!=leader.term() || known.generation!=generation) throw new IllegalStateException("Snapshot control is still settling");
+                    known.owners++; transaction.setStateMachineContext(known); return transaction;
+                }
+                if (participantIdentityBusy(request.operation())) throw new IllegalStateException("Snapshot control identity belongs to other work");
+                if (protectedAdmissions+protectedFinalizationSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                var admission=new Admission(request.operation(),digest,encoded.length,leader.term(),generation,0,0,false,true,null,null,null);
+                admission.snapshot=request; admissions.put(admission.id,admission); protectedAdmissions++; admittedBytes+=admission.bytes;
+                transaction.setStateMachineContext(admission); return transaction;
+            }
+        }
+        throw new IllegalStateException("Native snapshot gate cut changed during retry admission");
+    }
+
     private Leadership leadership() throws IOException {
         if (leadershipSource != null) return leadershipSource.get();
         RaftServer server = getServer().getNow(null);
@@ -761,6 +794,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private record AppliedRecord(OperationId operation,byte[] result) {}
     private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
+        if (RatisSnapshotRecord.isSnapshot(encoded)) {
+            var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request);
+            var record=request.isRelease() ? store.applyGateRelease(positionArg,request.terminal()) : store.applyGateInstall(positionArg,request.fence());
+            return new AppliedRecord(request.operation(),java.util.Objects.requireNonNull(request.receipt(record)).encode());
+        }
         if (RatisParticipantRecord.isFinalization(encoded)) {
             var finalization=RatisParticipantRecord.decodeFinalization(encoded);
             var position=finalization.decision().phase()==TransactionStatus.Phase.COMMIT ? store.applyCommit(positionArg,finalization).position() : store.applyAbort(positionArg,finalization).position();
@@ -776,6 +814,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return new AppliedRecord(command.operationId(),store.apply(positionArg,command));
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
+        if (RatisSnapshotRecord.isSnapshot(encoded)) {
+            var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request);
+            var receipt=request.receipt(store.recoveredSnapshotGate(request.fence()));
+            return new AppliedRecord(request.operation(),receipt==null ? null : receipt.encode());
+        }
         if (RatisParticipantRecord.isFinalization(encoded)) {
             var finalization=RatisParticipantRecord.decodeFinalization(encoded); var position=store.recoveredFinalization(finalization);
             return new AppliedRecord(finalization.operation(),position==null ? null : RatisParticipantRecord.result(position));
@@ -902,7 +945,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try (var pin=store.capture()) {
             for (var admission:pending) {
                 try {
-                    if (admission.finalization!=null) { if (pin.finalizationPosition(admission.finalization)!=null) verified.add(admission); }
+                    if (admission.snapshot!=null) { if (admission.snapshot.receipt(pin.snapshotGate(admission.snapshot.fence()))!=null) verified.add(admission); }
+                    else if (admission.finalization!=null) { if (pin.finalizationPosition(admission.finalization)!=null) verified.add(admission); }
                     else if (admission.participant==null) { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
                     else { var vote=pin.preparationVote(admission.participant); if (vote!=null) verified.add(admission); else if (pin.finalizedPreparation(admission.participant)) terminalScopes.add(admission); }
                 }
@@ -1418,6 +1462,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (!freshBarrier) throw new IOException("Participant outcome requires a fresh linearizable barrier");
                 var id=ScopedTransactionRpc.uuid(input); end(input); checkTransactionOwner(); var outcome=store.finalizedParticipant(id);
                 byte[] bytes=outcome==null ? null : outcome.encode(); var output=ByteBuffer.allocate(4+(bytes==null ? 0 : bytes.length)); ScopedTransactionRpc.putBlob(output,bytes); reply=output.array();
+            }
+            case ScopedTransactionRpc.SNAPSHOT_GATE_STATE -> {
+                if (!freshBarrier) throw new IOException("Snapshot gate state requires a fresh linearizable barrier");
+                var id=ScopedTransactionRpc.uuid(input); end(input); checkTransactionOwner(); var record=store.snapshotGate(id);
+                byte[] bytes=record==null ? null : record.encode(); var output=ByteBuffer.allocate(4+(bytes==null ? 0 : bytes.length)); ScopedTransactionRpc.putBlob(output,bytes); reply=output.array();
             }
             case ScopedTransactionRpc.CLOSE -> { var handle=ScopedTransactionRpc.readHandle(input); end(input); scopedTransactions.release(handle); reply=new byte[0]; }
             default -> throw new IllegalArgumentException("Unsupported framed query");

@@ -365,15 +365,31 @@ Release requires a matching completed/aborted home decision; an ABORT release be
 INSTALL suppresses delayed installation. Recovery and native image validation retain
 gates and terminal receipts; restart or expiry never implies release.
 
+`RatisSnapshotFences` persists one monotone home progress/decision step through a
+dedicated-column physical DATA CAS. Every replica validates the frozen home
+identity, transition and separate control identity; reads return the descriptor
+captured with that same status. Initial registration reserves room for the largest
+future expected/next status pair, rejecting a definition that would later exceed
+the command limit. The home value alone does not prove participant gate or pin
+provenance; the coordinator must verify those proofs before reporting them.
+
+Committed snapshot commands dispatch to the native gate kernel through Ratis,
+including verified snapshot-covered replay. Routed operations retain the exact
+body, identity and original route. Fresh gate queries validate the complete frozen
+fence and work independently of expired control grants. Leader retry admission
+requires an exact retained native outcome; a suppressed delayed INSTALL is distinct
+from an applied RELEASE. New INSTALL/RELEASE requests still require the privileged
+admission implementation and are rejected without that authority.
+
 Per range, gates have an independent bound of 16 retained fence records and 16 MiB
 of reserved metadata, including future release growth. Released records retain their
 capacity and operation identities until a future fenced GC implementation. A fence
 contains at most 64 participants and an aggregate definition below 2 MiB minus
 8 KiB, leaving bounded room for progress and envelopes. The ephemeral admission
 index can reserve a gate before earlier proposals drain, with independent protected
-limits. Raft gate admission, volatile predecessor proof, replicated home persistence,
-coordinated capture/recovery and frontend snapshot leases remain unfinished; this
-native kernel alone does not establish a consistent cross-group read cut.
+limits. Privileged new gate admission, volatile predecessor proof, coordinated
+capture/recovery and frontend snapshot leases remain unfinished; this native kernel
+alone does not establish a consistent cross-group read cut.
 
 Each coordinator journal freezes at most 64 participants and 16 MiB of aggregate
 accepted commands (including their result images), plus 16 MiB of frozen routes and

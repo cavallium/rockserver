@@ -428,12 +428,10 @@ public final class NativeRangeImage {
                 }
                 if (section==Section.STATE && key.length>16 && key[16]==0x24) {
                     try {
-                        var gate=SnapshotGate.decode(value); var fence=gate.fence(); var participant=fence.participant(gate.participantGroup());
+                        var gate=SnapshotGate.decode(value); gate.requireCompletedCut(header.position()); var fence=gate.fence(); var participant=fence.participant(gate.participantGroup());
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x24).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !gate.participantGroup().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !fence.domainId().equals(header.interval().domainId())
-                                || gate.installed()!=null && (gate.installed().index()>header.position().index() || gate.installed().term()>header.position().term())
-                                || gate.released()!=null && (gate.released().index()>header.position().index() || gate.released().term()>header.position().term())) throw new IOException("Gate image identity/cut differs");
+                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !fence.domainId().equals(header.interval().domainId())) throw new IOException("Gate image identity/cut differs");
                         for (var span:participant.scope().spans()) {
                             byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
                             if (!header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)

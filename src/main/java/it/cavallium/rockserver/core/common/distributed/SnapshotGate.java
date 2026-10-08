@@ -21,6 +21,13 @@ public record SnapshotGate(SnapshotFence fence,UUID participantGroup,ApplyPositi
         if (terminal.phase()!=SnapshotFenceStatus.Phase.ABORT || terminal.progress(group).ready()!=null) throw SnapshotFence.invalid("Release before install requires unready ABORT");
         return new SnapshotGate(terminal.fence(),group,null,position,terminal.digest());
     }
+    /** The completed prefix has exactly one term at its final index. Earlier receipt indexes may use older terms. */
+    public void requireCompletedCut(ApplyPosition cut) {
+        if (cut==null || outside(installed,cut) || outside(released,cut)) throw SnapshotFence.invalid("Snapshot gate receipt contradicts completed cut");
+    }
+    private static boolean outside(ApplyPosition position,ApplyPosition cut) {
+        return position!=null && (position.index()>cut.index() || position.term()>cut.term() || position.index()==cut.index() && position.term()!=cut.term());
+    }
     public boolean active() { return installed!=null && released==null; }
     public boolean ownsOperation(OperationId operation) { var participant=fence.participant(participantGroup); return participant.installOperation().equals(operation) || participant.releaseOperation().equals(operation); }
     public SnapshotGate release(SnapshotFenceStatus terminal,ApplyPosition position) {

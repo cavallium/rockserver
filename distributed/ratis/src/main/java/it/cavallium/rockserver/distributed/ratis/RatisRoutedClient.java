@@ -54,6 +54,54 @@ public final class RatisRoutedClient implements AutoCloseable {
         public DistributedCommand command() { return command; }
     }
 
+    public static final class PreparedSnapshotOperation {
+        private final RangeDirectory source; private final RangeDescriptor descriptor; private final RatisSnapshotRecord request; private final byte[] bytes;
+        private PreparedSnapshotOperation(RangeDirectory source,RangeDescriptor descriptor,RatisSnapshotRecord request) { this.source=source; this.descriptor=descriptor; this.request=request; bytes=request.encode(); }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public RatisSnapshotRecord request() { return request; }
+        public byte[] bytes() { return bytes.clone(); }
+    }
+    /** Retain this exact command and original route before dispatch; encoding does not grant leader admission authority. */
+    public PreparedSnapshotOperation prepareSnapshotGate(RatisSnapshotRecord request) {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(request.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+        return restoreSnapshotGate(request,descriptor);
+    }
+    public PreparedSnapshotOperation restoreSnapshotGate(RatisSnapshotRecord request,RangeDescriptor descriptor) {
+        var observed=current(); requireSnapshotRoute(observed,descriptor,request.fence(),request.participantGroup());
+        return new PreparedSnapshotOperation(identity,descriptor,request);
+    }
+    private static void requireSnapshotRoute(RangeDirectory directory,RangeDescriptor descriptor,SnapshotFence fence,UUID group) {
+        var participant=fence.participant(group);
+        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || !descriptor.groupId().equals(group) || !descriptor.rangeId().equals(participant.rangeId()) || descriptor.rangeEpoch()!=participant.rangeEpoch()
+                || !Arrays.equals(directory.schemaDigest(),participant.schemaDigest()) || !Arrays.equals(directory.schemaDigest(),fence.schemaDigest()) || directory.schemaEpoch()!=fence.schemaEpoch()
+                || !directory.clusterId().equals(fence.clusterId()) || !directory.databaseId().equals(fence.databaseId()) || !directory.domainId().equals(fence.domainId())) throw new IllegalArgumentException("Snapshot route differs from frozen participant");
+    }
+    public RatisSnapshotRecord.Result executeSnapshotGate(PreparedSnapshotOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            var result=RatisSnapshotRecord.Result.decode(transport.participant(operation.descriptor,operation.bytes));
+            if (operation.request.isRelease()) {
+                if (result.suppressed()) throw new IllegalArgumentException("Snapshot RELEASE requires an applied receipt");
+                var progress=operation.request.terminal().progress(operation.request.participantGroup());
+                var before=progress.capture()==null ? progress.ready() : progress.capture().position();
+                if (before!=null && (result.position().term()<before.term() || result.position().index()<=before.index())) throw new IllegalArgumentException("Snapshot RELEASE reply precedes frozen proof");
+            }
+            return result;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot gate applied reply",malformed); }
+        finally { endCall(); }
+    }
+    /** Fresh retained gate/terminal state remains queryable independently of control grants. */
+    public SnapshotGate snapshotGate(SnapshotFence fence,UUID group) throws IOException {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+        requireSnapshotRoute(observed,descriptor,fence,group); var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,fence.fenceId());
+        try {
+            var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.SNAPSHOT_GATE_STATE,body.array(),true));
+            byte[] bytes=ScopedTransactionRpc.blob(input,SnapshotGate.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing snapshot gate state");
+            if (bytes==null) return null; var record=SnapshotGate.decode(bytes);
+            if (!record.participantGroup().equals(group) || !record.fence().equals(fence)) throw new IllegalArgumentException("Snapshot gate reply binding changed");
+            return record;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot gate state reply",malformed); }
+    }
     public static final class PreparedFinalizationOperation {
         private final RangeDirectory source; private final RangeDescriptor descriptor; private final ParticipantFinalization finalization; private final byte[] bytes;
         private PreparedFinalizationOperation(RangeDirectory source,RangeDescriptor descriptor,ParticipantFinalization finalization) { this.source=source; this.descriptor=descriptor; this.finalization=finalization; bytes=RatisParticipantRecord.encode(finalization); }

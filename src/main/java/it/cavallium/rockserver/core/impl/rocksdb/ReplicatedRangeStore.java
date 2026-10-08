@@ -544,9 +544,8 @@ public final class ReplicatedRangeStore {
             while (iterator.isValid()) {
                 if (records.size()>=MAX_SNAPSHOT_GATES || iterator.key(sizing)!=33 || iterator.value(sizing)>SnapshotGate.MAX_BYTES) throw new IllegalStateException("Snapshot gate recovery bound exceeded");
                 var record=SnapshotGate.decode(iterator.value()); requireSnapshotFence(record.fence());
-                if (!record.participantGroup().equals(groupId) || !Arrays.equals(iterator.key(),snapshotGateKey(record.fence().fenceId())) || applied==null
-                        || record.installed()!=null && (record.installed().index()>applied.index() || record.installed().term()>applied.term())
-                        || record.released()!=null && (record.released().index()>applied.index() || record.released().term()>applied.term())) throw new IllegalStateException("Snapshot gate differs from completed cut");
+                try { record.requireCompletedCut(applied); } catch (IllegalArgumentException invalid) { throw new IllegalStateException("Snapshot gate differs from completed cut",invalid); }
+                if (!record.participantGroup().equals(groupId) || !Arrays.equals(iterator.key(),snapshotGateKey(record.fence().fenceId()))) throw new IllegalStateException("Snapshot gate recovery identity differs");
                 records.put(record.fence().fenceId(),record); iterator.next();
             }
             iterator.status(); long bytes=0; for (var record:records.values()) bytes+=snapshotGateBytes(record.fence());
@@ -585,6 +584,20 @@ public final class ReplicatedRangeStore {
     }
     public GateCapacity gateCapacity() { enterNative(); applyLane.lock(); try { requireActive(); return gateCapacityUnderLane(); } finally { applyLane.unlock(); leaveNative(); } }
     public SnapshotGate snapshotGate(UUID fence) { enterNative(); applyLane.lock(); try { requireActive(); return snapshotGates.get(fence); } finally { applyLane.unlock(); leaveNative(); } }
+    /** Exact native receipt lookup while fenced; it grants no new gate admission authority. */
+    public SnapshotGate recoveredSnapshotGate(SnapshotFence fence) throws RocksDBException {
+        Objects.requireNonNull(fence); enterNative(); applyLane.lock();
+        try { return readSnapshotGate(fence,null,applied); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    private SnapshotGate readSnapshotGate(SnapshotFence fence,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        requireSnapshotFence(fence); byte[] key=snapshotGateKey(fence.fenceId());
+        byte[] bytes=options==null ? db.get(state,key) : db.get(state,options,key); if (bytes==null) return null;
+        var record=SnapshotGate.decode(bytes);
+        record.requireCompletedCut(cut);
+        if (!record.fence().equals(fence) || !record.participantGroup().equals(groupId)) throw new IllegalArgumentException("Recovered snapshot gate binding changed");
+        return record;
+    }
     public GateEstimate estimateGateInstall(SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(fence); enterNative(); applyLane.lock();
         try {
@@ -1953,6 +1966,11 @@ public final class ReplicatedRangeStore {
         public ApplyPosition finalizationPosition(ParticipantFinalization expected) throws RocksDBException {
             Objects.requireNonNull(expected); acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) { return readFinalizationPosition(expected,options,position); }
+            finally { releaseUse(); }
+        }
+        public SnapshotGate snapshotGate(SnapshotFence fence) throws RocksDBException {
+            Objects.requireNonNull(fence); acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) { return readSnapshotGate(fence,options,position); }
             finally { releaseUse(); }
         }
         public boolean finalizedPreparation(PreparedParticipant.Preparation expected) throws RocksDBException {

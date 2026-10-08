@@ -145,6 +145,26 @@ class NativeSnapshotGateTest {
             f.store.fence(); assertThrows(IllegalArgumentException.class,f.store::activate); assertFalse(f.store.admissionOpen());
         }
     }
+    @Test void receiptAtCompletedIndexMustUseTheCompletedTerm() throws Exception {
+        for (boolean released:new boolean[]{false,true}) try (var f=outer.new Fixture(root.resolve("wrong-cut-"+released),true)) {
+            helper.enable(f); var fence=fence(f,1,1); SnapshotGate corrupt;
+            if (released) {
+                var terminal=SnapshotFenceStatus.begin(fence).abort(); f.store.applyGateRelease(new ApplyPosition(2,1),terminal);
+                corrupt=SnapshotGate.released(terminal,outer.group,new ApplyPosition(1,1));
+            } else {
+                f.store.applyGateInstall(new ApplyPosition(2,1),fence); corrupt=SnapshotGate.install(fence,outer.group,new ApplyPosition(1,1));
+            }
+            var dbField=ReplicatedRangeStore.class.getDeclaredField("db"); var stateField=ReplicatedRangeStore.class.getDeclaredField("state"); dbField.setAccessible(true); stateField.setAccessible(true);
+            byte[] recordKey=java.nio.ByteBuffer.allocate(33).putLong(outer.group.getMostSignificantBits()).putLong(outer.group.getLeastSignificantBits()).put((byte)0x24).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
+            ((org.rocksdb.RocksDB)dbField.get(f.store)).put((org.rocksdb.ColumnFamilyHandle)stateField.get(f.store),recordKey,corrupt.encode());
+            assertThrows(IllegalArgumentException.class,() -> f.store.recoveredSnapshotGate(fence));
+            try (var pin=f.store.capture()) {
+                assertThrows(IllegalArgumentException.class,() -> pin.snapshotGate(fence));
+                assertThrows(java.io.IOException.class,() -> NativeRangeImage.write(root.resolve("bad-cut-"+released),pin,f.store.ownership().interval(),limits));
+            }
+            f.store.fence(); assertThrows(IllegalStateException.class,f.store::activate); assertFalse(f.store.admissionOpen());
+        }
+    }
     @Test void gateControlsCannotStealOrDonateDurableOperationIdentities() throws Exception {
         try (var f=outer.new Fixture(root.resolve("gate-identities"),true)) {
             helper.enable(f); var fence=fence(f,1,1); var control=fence.participant(outer.group).installOperation();
