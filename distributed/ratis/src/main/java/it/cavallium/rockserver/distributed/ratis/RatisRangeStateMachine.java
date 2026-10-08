@@ -77,11 +77,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @FunctionalInterface interface LeadershipSource { Leadership get() throws IOException; }
     private final LeadershipSource leadershipSource;
     private RatisScopedTransactions scopedTransactions;
+    private RatisSnapshotPins capturedSnapshots;
 
     /** Test clock configuration is fixed before this state-machine owner is initialized. */
     void transactionClock(java.util.function.LongSupplier nanos) {
         if (getLifeCycleState()!=LifeCycle.State.NEW) throw new IllegalStateException("Transaction clock is fixed before initialization");
         scopedTransactions=new RatisScopedTransactions(this,RatisScopedTransactions.Limits.defaults(),nanos);
+        capturedSnapshots=newSnapshotPins(nanos);
     }
     long transactionGeneration() { return admissionGeneration.get(); }
     long transactionTerm() { var a=store.applied(); return a==null ? -1 : a.term(); }
@@ -102,7 +104,27 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             retained=true; return pin;
         } finally { if (!retained) pin.close(); }
     }
-    void expireTransactions() throws Exception { scopedTransactions.expire(); }
+    void expireTransactions() throws Exception {
+        Exception failure=null;
+        try { scopedTransactions.expire(); } catch (Exception problem) { failure=problem; }
+        try { capturedSnapshots.expire(); } catch (Exception problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
+        if (failure!=null) throw failure;
+    }
+    private RatisSnapshotPins newSnapshotPins(java.util.function.LongSupplier nanos) {
+        return new RatisSnapshotPins(transactionIncarnation,store.ownership().owner().groupId(),RatisSnapshotPins.Limits.defaults(),nanos,this::captureSnapshotGate);
+    }
+    /** Qualified coordinator seam; the caller freezes this incarnation before its first capture request. */
+    public UUID snapshotCaptureOwner() throws IOException { checkTransactionOwner(); return transactionIncarnation; }
+    public SnapshotFenceStatus.Capture captureSnapshotPin(RatisSnapshotFences homes,SnapshotFence fence,UUID owner,UUID snapshot,java.time.Duration ttl) throws Exception {
+        return capturedSnapshots.capture(homes,fence,owner,snapshot,ttl);
+    }
+    /** Immutable pin reads do not acquire new leader authority or substitute a current native cut. */
+    public byte[] snapshotPinGet(SnapshotFenceStatus.Capture token,UUID column,byte[] key) throws Exception { return capturedSnapshots.get(token,column,key); }
+    public it.cavallium.rockserver.core.common.distributed.PhysicalRangePage snapshotPinPage(SnapshotFenceStatus.Capture token,UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws Exception {
+        return capturedSnapshots.page(token,column,lower,upper,reverse,resume,items,bytes);
+    }
+    public void releaseSnapshotPin(SnapshotFenceStatus.Capture token) throws Exception { capturedSnapshots.release(token); }
+    RatisSnapshotPins.Stats snapshotPinStats() { return capturedSnapshots.stats(); }
 
     private static final class Admission {
         final OperationId id;
@@ -279,6 +301,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         this.initialGroup = java.util.Objects.requireNonNull(initialGroup);
         this.limits = java.util.Objects.requireNonNull(limits);
         scopedTransactions=new RatisScopedTransactions(this,RatisScopedTransactions.Limits.defaults(),System::nanoTime);
+        capturedSnapshots=newSnapshotPins(System::nanoTime);
     }
 
     @Override public SimpleStateMachineStorage getStateMachineStorage() { return snapshots; }
@@ -427,6 +450,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 store.fence();
                 getLifeCycle().transition(LifeCycle.State.PAUSED);
             }
+            capturedSnapshots.invalidate();
             awaitNativeReaders(java.time.Duration.ofSeconds(10));
             preserveInstallationImages();
         } catch (Exception failure) {
@@ -440,6 +464,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     public void beginShutdown() {
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
         try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
+        try { capturedSnapshots.close(); } catch (Exception failure) { storageFailure=failure; }
         IOException failure = new IOException("Range is shutting down");
         synchronized (gate) { storageFailure = failure; store.fence(); }
         failDeferred(failure);

@@ -427,6 +427,30 @@ limits. Coordinated multi-group capture/recovery and frontend snapshot leases
 remain unfinished; these participant seams alone do not establish a consistent
 cross-group read cut.
 
+Participant snapshot pins now have bounded local ownership. The coordinator supplies
+an expected owner incarnation and capture ID before invoking capture. An exact
+fence/ID/TTL retry returns the original token and native cut without another home
+read or deadline extension. Changed declarations are rejected. Released, expired
+or storage-invalidated captures retain small tombstones and return SNAPSHOT_LOST;
+they never reopen at the current cut. A new owner rejects an old expected incarnation
+before allocating a native pin.
+
+The pin registry retains at most sixteen capture identities and sixteen MiB of
+accounted frozen definition/scope bytes. Actual native owners keep their complete
+charge through a busy capture/read and successful native close, then compact to a
+128-byte tombstone. Immutable reads and scoped forward/reverse pages survive
+leadership loss on the same live owner. Storage pause invalidates these leases
+before the existing native-reader drain; old tokens stay lost after reload, while
+new fence/capture identities may proceed. Shutdown and expiry use the same deferred
+cleanup rule. Point values remain bounded to two MiB and physical pages to eight
+MiB. These are payload/count bounds, not measured pinned-SST or node memory limits.
+
+This registry is currently exposed through qualified local participant methods.
+Owner-directed replica transport, durable capture orchestration, frontend token
+binding and safe tombstone reclamation remain unfinished. A client must freeze the
+owner/capture identity and must not follow a current-leader fallback to recreate a
+missing pin.
+
 Each coordinator journal freezes at most 64 participants and 16 MiB of aggregate
 accepted commands (including their result images), plus 16 MiB of frozen routes and
 reserved pending-home routing. It reserves future registration/decision/proof metadata
