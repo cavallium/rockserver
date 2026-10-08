@@ -1343,3 +1343,43 @@ Initial preparation is now resumable before exposure. Repair/resumption after
 exposure, actual placement-creation authority and new-cluster catalogue bootstrap,
 CLI/public API parity, topology and the other full architecture requirements
 remain open; the active goal is not complete.
+
+## Durable atomic catalogue genesis intent
+
+`RatisCatalogueGenesis` now freezes an explicit new-database/first-domain creation
+intent: initial directory generation0 and initial empty session ledger generation0,
+under the same catalogue schema/group. Both absence predicates are evaluated and
+both metadata writes, saved outcome and A are installed in one native batch. An
+existing directory OR ledger produces a stable CONFLICT without writing the other
+key; partial old initialization is never silently overwritten/repaired.
+
+The combined catalogue validator accepts only this ordered v2 pair with absent
+matching predicates, correct namespaces, ordinary NONE PUTs and independently valid
+initial images. Existing one-key directory/session CAS paths remain unchanged.
+All catalogue replicas need the combined rule before genesis; mixed-version feature
+negotiation remains part of the broader unfinished rollout contract.
+
+The bounded checksummed intent journal persists exact nonce/payload before RPC and
+completion before publishing the result. Transport/malformed replies retain the
+original pending identity. A retry after later directory/ledger changes resolves
+the saved receipt rather than resetting metadata. Reopen rejects changed creation
+parameters, corrupt/noncanonical state or another owner. Completion persistence
+failure fences until reopen. Active execution retains the lock and close refuses
+premature release; the borrowed Raft client remains caller-owned. A completed
+cached result creates no additional RPC/receipt on reuse.
+
+The full ordinary gate passes 77 core/native, 19 patched-server and 84 adapter cases
+(180 total), exit zero: `/tmp/rockserver-catalogue-genesis-full-gate.log`. Five new
+native cases cover lost applied reply and exact restart after subsequent metadata
+updates, either-key partial conflict, invalid bundle shapes, journal-failure fencing,
+corrupt/changed intent and active RPC ownership/close. Earlier catalogue/node/clock
+consumers pass with the combined rule. No excluded workflow, density execution,
+network/server process, push/deployment or main-checkout change occurred. Actual
+Raft quorum/bootstrap readiness and physical-power-loss acceptance remain unverified.
+
+This explicit intent requires creation authority already held by its caller. It
+publishes metadata only; it does not authorize placements or prove/activate their
+readiness. Coordinated new-cluster/bootstrap workflow, CLI/public API adapters,
+schema/topology transitions, full resource budgets, transactions/2PC and the other
+architecture requirements remain open. Standalone behavior is unchanged and the
+active goal remains incomplete.

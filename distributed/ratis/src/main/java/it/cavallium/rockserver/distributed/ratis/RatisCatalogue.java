@@ -123,14 +123,25 @@ public final class RatisCatalogue {
         };
     }
 
-    /** Optional epoch ledger column; install the combined deterministic rule on every catalogue replica. */
+    /** Combined rule: one ordinary CAS or the atomic initial directory/ledger pair. Install on every catalogue replica. */
     public static Consumer<DistributedCommand> validator(UUID clusterId, UUID databaseId, UUID groupId,
             long rangeEpoch, byte[] schemaDigest, UUID directoryColumn, UUID sessionColumn) {
         if (directoryColumn.equals(sessionColumn)) throw new IllegalArgumentException("Catalogue columns must be distinct");
         var directory = validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         var sessions = RatisSessionEpochs.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,sessionColumn);
         return command -> {
-            if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(sessionColumn)) sessions.accept(command);
+            if (command.mutations().size()==2) {
+                if (command.formatVersion()!=2 || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
+                        || command.predicates().size()!=2 || !command.mutations().get(0).columnId().equals(directoryColumn)
+                        || !command.mutations().get(1).columnId().equals(sessionColumn)
+                        || command.predicates().stream().anyMatch(predicate -> predicate.expectedValue()!=null)) {
+                    throw new IllegalArgumentException("Genesis requires an ordered pair of absent directory/session keys");
+                }
+                directory.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
+                        List.of(command.mutations().get(0)),List.of(command.predicates().get(0))));
+                sessions.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
+                        List.of(command.mutations().get(1)),List.of(command.predicates().get(1))));
+            } else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(sessionColumn)) sessions.accept(command);
             else directory.accept(command);
         };
     }
