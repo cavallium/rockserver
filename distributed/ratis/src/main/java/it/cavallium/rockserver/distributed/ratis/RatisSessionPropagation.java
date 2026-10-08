@@ -52,6 +52,10 @@ public final class RatisSessionPropagation implements AutoCloseable {
         }
     }
     public synchronized Progress progress() { return progress(round,Map.of()); }
+    /** Whether the completed frozen scope also covers the current cached directory and requested cut. */
+    public synchronized boolean covers(SessionAuthority target) {
+        return round.complete() && Arrays.equals(round.directory(),routed.directory().payloadDigest()) && covers(round.target(),target);
+    }
     /** Freeze one catalogue cut and all current active ranges; an unfinished round is never silently replaced. */
     public Progress begin() throws IOException {
         final Round before=enter();

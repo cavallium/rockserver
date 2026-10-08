@@ -1180,3 +1180,57 @@ reconciliation of unfinished rounds, cross-domain coverage, node/pool/tenant
 budgets and public service/Main integration remain to implement. This component's
 completion proves only the requested frozen directory/cut, not instantaneous
 catalogue-wide expiry.
+
+## Durable catalogue clock and shared-scheduler propagation service
+
+`RatisCatalogueClock` journals one exact catalogue clock CAS before RPC, using a
+stable internal issuer UUID/epoch0 and consumed ACK prefix. Lost replies retry
+identical bytes; terminal SUCCESS/CONFLICT/SESSION_EXPIRED outcomes consume their
+identity durably. A conflict never claims the replacement clock was installed.
+Fresh catalogue observations and successful replacements preserve monotonic
+logical time; wall-clock rollback observes the existing cut without new log work.
+An unchanged already-durable observation also avoids a redundant journal force.
+Recovery validates the exact conditional time-advance shape and source identity;
+missing catalogue state is not silently bootstrapped. Journal write failures fence
+until reopen, and ownership remains held throughout active read/execute work.
+The catalogue remains a separate internal authority path, not a recursively
+session-bound data range.
+
+`RatisSessionClockService` connects that clock to propagation rounds through the
+existing database RWScheduler BATCH/MUTATION lane with bounded estimated byte cost.
+A borrowed timer only requests admission. Exactly one owned quantum is queued or
+running; repeated timer requests create no discarded future observers. Incomplete
+frozen rounds finish before another clock advance, so catalogue churn cannot
+silently replace the target. A completed current directory/cut is reused without
+new range controls. The service creates no thread pool and owns none of its
+scheduler, timer, journals or clients.
+
+Public tick futures are views: cancelling one does not cancel durable work.
+Admission stays coalesced through synchronous completion publication, including a
+blocked observer. Stop disposes the service's timer registration, removes queued
+admission through the scheduler's real identity index, and drains running native/
+journal I/O. Dispatched stopped work reports cancellation, never null success.
+A separate drain future marks this resource boundary; user completion callbacks
+may still be publishing on the worker. Borrowers must await that drain before
+closing journals/clients and manage their own callback/scheduler lifetime.
+Scheduler rejection/shutdown settles queued tasks through RejectionAwareTask;
+active native work retains its eventual terminal owner.
+
+The full ordinary gate passes 77 core/native, 16 read-round and 64 adapter cases
+(157 total), exit zero: `/tmp/rockserver-catalogue-clock-service-full-gate.log`.
+Six catalogue-clock cases cover lost applied reply, exact restart retry, real CAS
+conflict, expiry, bounded ACK retention, rollback/no-op, journal write/corruption
+failure, ownership and recovered non-clock rejection. Five service cases use the
+actual shared RWScheduler and two native ranges to verify frozen-round ordering,
+reopen, timer coalescing, constant timer observer retention, cancelled view isolation,
+blocked completion callbacks, indexed queued stop, actual I/O drain and scheduler
+shutdown without starting journal work. Timer firing is controlled in tests; no
+real server/transport/quorum, independent-node, physical-power-loss or representative
+performance acceptance is implied. Excluded workflows/density fixture remain
+inactive; no push/deploy/main-checkout mutation occurred.
+
+Automatic periodic requests now have a bounded, recoverable library implementation
+when explicitly started. Public service/Main/bootstrap wiring, public
+API parity, topology reconciliation, cross-domain scheduling, full node/pool/tenant
+budgets, transactions/2PC and the other architecture requirements remain open.
+Standalone runtime behavior is unchanged and does not start this service.

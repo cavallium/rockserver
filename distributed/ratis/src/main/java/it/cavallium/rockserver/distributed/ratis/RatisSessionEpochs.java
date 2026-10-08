@@ -27,6 +27,12 @@ public final class RatisSessionEpochs {
         if (rangeEpoch < 0 || schema.length!=32 || !client.getGroupId().getUuid().equals(group)) throw new IllegalArgumentException("Invalid epoch catalogue binding");
         this.rangeEpoch=rangeEpoch; this.schema=schema.clone(); this.validator=validator(cluster,database,group,rangeEpoch,schema,column);
     }
+    void validatePrepared(DistributedCommand command) { validator.accept(command); }
+    byte[] identityDigest() {
+        byte[] bytes=ByteBuffer.allocate(104).put(uuid(cluster)).put(uuid(database)).put(uuid(group)).put(uuid(column)).putLong(rangeEpoch).put(schema).array();
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); }
+        catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
     public SessionEpochLedger read() throws IOException {
         var query=ByteBuffer.allocate(32).put(uuid(column)).put(uuid(database)).array();
         byte[] encoded=content(RatisRoutedClient.rpc(() -> client.io().sendReadOnly(message(query))),SessionEpochLedger.MAX_BYTES+4);
