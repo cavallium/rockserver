@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.common.distributed.RangeStateView;
 import it.cavallium.rockserver.core.common.distributed.ReceiptUsage;
 import it.cavallium.rockserver.core.common.distributed.ReceiptRetentionEstimate;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
+import it.cavallium.rockserver.core.common.distributed.DistributedCommandCodec;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import it.cavallium.rockserver.core.common.distributed.CommandResult;
@@ -588,45 +589,48 @@ public final class ReplicatedRangeStore {
             if (total>MAX_BUCKET_PLAN_BYTES) throw new DistributedBucket.LimitExceededException("Bucket apply plan exceeds protocol byte budget"); bytes=total;
         }
     }
-    private DistributedBucket originalBucket(BucketKey key,Map<BucketKey,DistributedBucket> originals,BucketBudget budget) throws RocksDBException {
+    private DistributedBucket originalBucket(BucketKey key,Map<BucketKey,DistributedBucket> originals,BucketBudget budget,ReadOptions options) throws RocksDBException {
         var bucket=originals.get(key); if (bucket!=null) return bucket;
-        byte[] raw=db.get(columns.get(key.column),key.key); budget.replace(0,raw==null ? 0 : raw.length);
+        byte[] raw=db.get(columns.get(key.column),options,key.key); budget.replace(0,raw==null ? 0 : raw.length);
         bucket=logicalSchema.decodeBucket(key.column,key.key,raw);
         originals.put(key,bucket); return bucket;
     }
     private Evaluation evaluateBuckets(DistributedCommand command) throws RocksDBException {
+        try (var overlay=new WriteBatchWithIndex(true); var options=new ReadOptions()) {
+            return evaluatePoints(command,overlay,options);
+        }
+    }
+    private Evaluation evaluatePoints(DistributedCommand command,WriteBatchWithIndex overlay,ReadOptions options) throws RocksDBException {
         var budget=new BucketBudget(); var originals=new HashMap<BucketKey,DistributedBucket>();
         if (command.acceptance()==null) for (var predicate:command.predicates()) {
-            byte[] current=predicate.bucket() ? originalBucket(new BucketKey(predicate.columnId(),predicate.key()),originals,budget).get(predicate.memberKeys())
-                    : db.get(columns.get(predicate.columnId()),predicate.key());
+            byte[] current=predicate.bucket() ? originalBucket(new BucketKey(predicate.columnId(),predicate.key()),originals,budget,options).get(predicate.memberKeys())
+                    : db.get(columns.get(predicate.columnId()),options,predicate.key());
             if (!Arrays.equals(current,predicate.expectedValue())) return new Evaluation(new CommandResult(CommandResult.Status.CONFLICT,List.of()),List.of());
         }
         var staged=new LinkedHashMap<BucketKey,DistributedBucket>(); var effects=new ArrayList<Mutation>(); var values=new ArrayList<byte[]>(); long resultBytes=8;
-        try (var overlay=new WriteBatchWithIndex(true); var options=new ReadOptions()) {
-            for (var mutation:command.mutations()) {
-                byte[] value=null;
-                if (mutation.bucket()) {
-                    var key=new BucketKey(mutation.columnId(),mutation.key()); var prior=staged.get(key);
-                    var bucket=prior==null ? originalBucket(key,originals,budget) : prior;
-                    if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=bucket.get(mutation.memberKeys());
-                    var next=mutation.kind()==Mutation.Kind.BUCKET_PUT ? bucket.put(mutation.memberKeys(),mutation.value()) : bucket.remove(mutation.memberKeys());
-                    budget.replace(prior==null ? 0 : prior.encodedSize(),next.encodedSize()); staged.put(key,next);
-                    if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=next.get(mutation.memberKeys());
-                } else {
-                    var cf=columns.get(mutation.columnId()); byte[] key=mutation.key();
-                    if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=overlay.getFromBatchAndDB(db,cf,options,key);
-                    switch (mutation.kind()) {
-                        case PUT -> overlay.put(cf,key,mutation.value()); case DELETE -> overlay.delete(cf,key); case MERGE -> overlay.merge(cf,key,mutation.value());
-                        default -> throw new IllegalStateException("Non-point effect escaped bucket validation");
-                    }
-                    effects.add(mutation);
-                    if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=overlay.getFromBatchAndDB(db,cf,options,key);
+        for (var mutation:command.mutations()) {
+            byte[] value=null;
+            if (mutation.bucket()) {
+                var key=new BucketKey(mutation.columnId(),mutation.key()); var prior=staged.get(key);
+                var bucket=prior==null ? originalBucket(key,originals,budget,options) : prior;
+                if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=bucket.get(mutation.memberKeys());
+                var next=mutation.kind()==Mutation.Kind.BUCKET_PUT ? bucket.put(mutation.memberKeys(),mutation.value()) : bucket.remove(mutation.memberKeys());
+                budget.replace(prior==null ? 0 : prior.encodedSize(),next.encodedSize()); staged.put(key,next);
+                if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=next.get(mutation.memberKeys());
+            } else {
+                var cf=columns.get(mutation.columnId()); byte[] key=mutation.key();
+                if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=overlay.getFromBatchAndDB(db,cf,options,key);
+                switch (mutation.kind()) {
+                    case PUT -> overlay.put(cf,key,mutation.value()); case DELETE -> overlay.delete(cf,key); case MERGE -> overlay.merge(cf,key,mutation.value());
+                    default -> throw new IllegalStateException("Non-point effect escaped bucket validation");
                 }
-                if (mutation.returnMode()!=Mutation.ReturnMode.NONE) {
-                    resultBytes+=4L+(value==null ? 0 : value.length);
-                    if (resultBytes>MAX_RESULT_BYTES) return new Evaluation(new CommandResult(CommandResult.Status.RESULT_TOO_LARGE,List.of()),List.of());
-                    values.add(value);
-                }
+                effects.add(mutation);
+                if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=overlay.getFromBatchAndDB(db,cf,options,key);
+            }
+            if (mutation.returnMode()!=Mutation.ReturnMode.NONE) {
+                resultBytes+=4L+(value==null ? 0 : value.length);
+                if (resultBytes>MAX_RESULT_BYTES) return new Evaluation(new CommandResult(CommandResult.Status.RESULT_TOO_LARGE,List.of()),List.of());
+                values.add(value);
             }
         }
         return new Evaluation(new CommandResult(CommandResult.Status.SUCCESS,values),List.copyOf(effects),staged);
@@ -938,11 +942,7 @@ public final class ReplicatedRangeStore {
         if (pin.owner()!=this) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
         if (command.acceptance()!=null || command.sessionControl()!=null || command.minimumSessionEpoch()>=0 || command.mutations().isEmpty()) throw new IllegalArgumentException("Expected an unaccepted business command");
         validate(command);
-        for (var mutation:command.mutations()) {
-            if (mutation.kind()==Mutation.Kind.DELETE_RANGE ? !pin.scope().containsRange(mutation.columnId(),mutation.key(),mutation.value())
-                    : !pin.scope().contains(mutation.columnId(),mutation.key())) throw new IllegalArgumentException("Mutation outside transaction scope");
-        }
-        for (var predicate:command.predicates()) if (!pin.scope().contains(predicate.columnId(),predicate.key())) throw new IllegalArgumentException("Predicate outside transaction scope");
+        validateScopedCommand(pin,command);
         enterNative(); applyLane.lock();
         try {
             requireActive();
@@ -958,6 +958,13 @@ public final class ReplicatedRangeStore {
             var accepted=DistributedCommand.acceptedTransaction(command,new it.cavallium.rockserver.core.common.distributed.TransactionAcceptance(pin.position(),generation,incarnation,pin.scope(),evaluation.result().encode()));
             validate(accepted); return accepted;
         } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    private void validateScopedCommand(ScopedHistoryPin pin,DistributedCommand command) {
+        for (var mutation:command.mutations()) {
+            if (mutation.kind()==Mutation.Kind.DELETE_RANGE ? !pin.scope().containsRange(mutation.columnId(),mutation.key(),mutation.value())
+                    : !pin.scope().contains(mutation.columnId(),mutation.key())) throw new IllegalArgumentException("Mutation outside transaction scope");
+        }
+        for (var predicate:command.predicates()) if (!pin.scope().contains(predicate.columnId(),predicate.key())) throw new IllegalArgumentException("Predicate outside transaction scope");
     }
     /** Unprepared physical-scope snapshot. All member accesses in a collision bucket share its one physical stamp. */
     public final class ScopedHistoryPin implements AutoCloseable {
@@ -981,6 +988,15 @@ public final class ReplicatedRangeStore {
         }
         public void visitColumn(UUID column,byte[] lower,byte[] upper,SnapshotVisitor visitor) throws RocksDBException,IOException {
             requireReadable(); snapshot.visitColumn(column,lower,upper,visitor);
+        }
+        /** Builds a bounded read-your-writes view at this exact cut, without applying or accepting anything. */
+        public ScopedStaging stage(DistributedCommand command) throws RocksDBException {
+            requireReadable(); Objects.requireNonNull(command);
+            if (command.kind()!=DistributedCommand.Kind.DATA || command.mutations().isEmpty()) throw new IllegalArgumentException("Expected business DATA for staging");
+            ReplicatedRangeStore.this.validate(command); validateScopedCommand(this,command);
+            if (command.mutations().stream().anyMatch(m -> m.kind()==Mutation.Kind.DELETE_RANGE)) throw new UnsupportedOperationException("Range deletion requires range-aware transaction staging");
+            if (logicalSchema!=null) validateLogical(command);
+            return new ScopedStaging(this,command);
         }
         /** Observes complete declared-scope history under the apply lane; a later proposal still needs reservations/revalidation. */
         public RangeMutationHistory.Status validate() {
@@ -1006,6 +1022,84 @@ public final class ReplicatedRangeStore {
                 applyLane.lock(); try { history.close(registration); scopedPins.remove(registration); }
                 finally { applyLane.unlock(); drainScopedReleases(); }
             }
+        }
+    }
+
+    /** Immutable staged prefix. Owns its indexed batch and a native use until close; its parent owns certification. */
+    public final class ScopedStaging implements AutoCloseable {
+        private final ScopedHistoryPin parent;
+        private final DistributedCommand command;
+        private final WriteBatchWithIndex overlay;
+        private final CommandResult result;
+        private boolean closed;
+        private ScopedStaging(ScopedHistoryPin parent,DistributedCommand command) throws RocksDBException {
+            this.parent=parent; this.command=command;
+            var pin=parent.snapshot.pin; pin.acquireUse();
+            WriteBatchWithIndex building=null; boolean success=false;
+            try {
+                building=new WriteBatchWithIndex(true);
+                building.setMaxBytes(MAX_BUCKET_PLAN_BYTES+DistributedCommandCodec.MAX_ENCODED_BYTES);
+                try (var options=new ReadOptions().setSnapshot(pin.snapshot)) {
+                    var evaluation=evaluatePoints(command,building,options);
+                    if (evaluation.result().status()!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Transaction staging rejected: "+evaluation.result().status());
+                    for (var entry:evaluation.buckets().entrySet()) building.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
+                    result=evaluation.result();
+                }
+                parent.requireReadable(); overlay=building; building=null; success=true;
+            } finally {
+                if (!success) { try { if (building!=null) building.close(); } finally { pin.releaseUse(); } }
+            }
+        }
+        public DistributedCommand command() { return command; }
+        public CommandResult result() { return result; }
+        private void requireReadable() {
+            if (closed) throw new IllegalStateException("Staged transaction view is closed");
+            parent.requireReadable();
+        }
+        public synchronized byte[] get(UUID column,byte[] key) throws RocksDBException {
+            requireReadable(); key=Objects.requireNonNull(key).clone();
+            if (!parent.scope().contains(column,key)) throw new IllegalArgumentException("Read outside declared scope");
+            try (var options=new ReadOptions().setSnapshot(parent.snapshot.pin.snapshot)) {
+                byte[] value=overlay.getFromBatchAndDB(db,columns.get(column),options,key);
+                if (value!=null && value.length>MAX_RESULT_BYTES) throw new IllegalStateException("Staged value exceeds reply budget");
+                return value;
+            }
+        }
+        public synchronized byte[] getMember(UUID column,byte[] key,List<byte[]> members) throws RocksDBException {
+            requireReadable();
+            if (logicalSchema==null) throw new UnsupportedOperationException("Logical schema is not qualified");
+            key=Objects.requireNonNull(key).clone(); members=members.stream().map(byte[]::clone).toList();
+            logicalSchema.requireBucketKey(column,key,members);
+            // Physical bucket bytes have their own budget; only the selected member is a point reply.
+            if (!parent.scope().contains(column,key)) throw new IllegalArgumentException("Read outside declared scope");
+            try (var options=new ReadOptions().setSnapshot(parent.snapshot.pin.snapshot)) {
+                byte[] raw=overlay.getFromBatchAndDB(db,columns.get(column),options,key);
+                if (raw!=null && raw.length>MAX_BUCKET_PLAN_BYTES) throw new IllegalStateException("Staged bucket exceeds byte budget");
+                byte[] value=logicalSchema.decodeBucket(column,key,raw).get(members);
+                if (value!=null && value.length>MAX_RESULT_BYTES) throw new IllegalStateException("Staged member exceeds reply budget");
+                return value;
+            }
+        }
+        public synchronized PhysicalRangePage page(UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws RocksDBException {
+            requireReadable(); validatePageBudget(items,bytes);
+            if ((long)(lower==null ? 0 : lower.length)+(upper==null ? 0 : upper.length)>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Page bounds exceed budget");
+            lower=lower==null ? interval.lowerInclusive() : lower.clone(); upper=upper==null ? interval.upperExclusive() : upper.clone();
+            if (!parent.scope().containsRange(column,lower,upper)) throw new IllegalArgumentException("Page outside declared scope");
+            resume=resume==null ? null : resume.clone();
+            if (resume!=null && (resume.length>PhysicalRangePage.MAX_BYTES || lower!=null && Arrays.compareUnsigned(resume,lower)<0 || upper!=null && Arrays.compareUnsigned(resume,upper)>=0)) throw new IllegalArgumentException("Continuation outside page bounds");
+            try (var low=lower==null ? null : new org.rocksdb.Slice(lower);
+                 var high=upper==null ? null : new org.rocksdb.Slice(upper);
+                 var options=new ReadOptions().setSnapshot(parent.snapshot.pin.snapshot).setFillCache(false)) {
+                if (low!=null) options.setIterateLowerBound(low); if (high!=null) options.setIterateUpperBound(high);
+                try (var base=db.newIterator(columns.get(column),options);
+                     var iterator=overlay.newIteratorWithBase(columns.get(column),base,options)) {
+                    return readPage(iterator,lower,upper,reverse,resume,items,bytes,true);
+                }
+            }
+        }
+        @Override public synchronized void close() {
+            if (closed) return; closed=true;
+            try { overlay.close(); } finally { parent.snapshot.pin.releaseUse(); }
         }
     }
 
@@ -1237,31 +1331,7 @@ public final class ReplicatedRangeStore {
                 if (lowerBound != null) options.setIterateLowerBound(lowerBound);
                 if (upperBound != null) options.setIterateUpperBound(upperBound);
                 try (var iterator = db.newIterator(cf, options)) {
-                    byte[] sizingBuffer = new byte[0];
-                    if (resume != null) {
-                        if (reverse) iterator.seekForPrev(resume); else iterator.seek(resume);
-                        if (iterator.isValid() && iterator.key(sizingBuffer) == resume.length && Arrays.equals(iterator.key(), resume)) {
-                            if (reverse) iterator.prev(); else iterator.next();
-                        }
-                    } else if (reverse) iterator.seekToLast();
-                    else if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
-                    var rows = new ArrayList<PhysicalRangePage.Row>();
-                    int bytes = PhysicalRangePage.HEADER_BYTES, lastKeyBytes = 0;
-                    while (iterator.isValid() && rows.size() < itemLimit) {
-                        int keyBytes = iterator.key(sizingBuffer), valueBytes = iterator.value(sizingBuffer);
-                        if (keyBytes < 0 || valueBytes < 0) throw new IllegalStateException("Invalid native row length");
-                        long required = (long)bytes - lastKeyBytes + 8L + 2L * keyBytes + valueBytes;
-                        if (required > byteLimit) {
-                            iterator.status();
-                            if (rows.isEmpty()) throw new PhysicalRangePage.LimitExceededException(required);
-                            break;
-                        }
-                        rows.add(new PhysicalRangePage.Row(iterator.key(), iterator.value()));
-                        bytes = (int)required; lastKeyBytes = keyBytes;
-                        if (reverse) iterator.prev(); else iterator.next();
-                    }
-                    iterator.status();
-                    return new PhysicalRangePage(rows, iterator.isValid());
+                    return readPage(iterator,lower,upper,reverse,resume,itemLimit,byteLimit,false);
                 }
             } finally { releaseUse(); }
         }
@@ -1341,6 +1411,42 @@ public final class ReplicatedRangeStore {
                 snapshotPins.decrementAndGet();
             }
         }
+    }
+
+    private static boolean withinPageBounds(org.rocksdb.RocksIterator iterator,byte[] lower,byte[] upper) {
+        if (!iterator.isValid()) return false;
+        byte[] key=iterator.key();
+        return (lower==null || Arrays.compareUnsigned(key,lower)>=0) && (upper==null || Arrays.compareUnsigned(key,upper)<0);
+    }
+    private static PhysicalRangePage readPage(org.rocksdb.RocksIterator iterator,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int itemLimit,int byteLimit,boolean checkBounds) throws RocksDBException {
+        byte[] sizingBuffer = new byte[0];
+        if (resume != null) {
+            if (reverse) iterator.seekForPrev(resume); else iterator.seek(resume);
+            if (iterator.isValid() && iterator.key(sizingBuffer) == resume.length && Arrays.equals(iterator.key(), resume)) {
+                if (reverse) iterator.prev(); else iterator.next();
+            }
+        } else if (reverse && upper!=null) {
+            iterator.seekForPrev(upper);
+            if (iterator.isValid() && Arrays.equals(iterator.key(),upper)) iterator.prev();
+        } else if (reverse) iterator.seekToLast();
+        else if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
+        var rows = new ArrayList<PhysicalRangePage.Row>();
+        int bytes = PhysicalRangePage.HEADER_BYTES, lastKeyBytes = 0;
+        while (iterator.isValid() && (!checkBounds || withinPageBounds(iterator,lower,upper)) && rows.size() < itemLimit) {
+            int keyBytes = iterator.key(sizingBuffer), valueBytes = iterator.value(sizingBuffer);
+            if (keyBytes < 0 || valueBytes < 0) throw new IllegalStateException("Invalid native row length");
+            long required = (long)bytes - lastKeyBytes + 8L + 2L * keyBytes + valueBytes;
+            if (required > byteLimit) {
+                iterator.status();
+                if (rows.isEmpty()) throw new PhysicalRangePage.LimitExceededException(required);
+                break;
+            }
+            rows.add(new PhysicalRangePage.Row(iterator.key(), iterator.value()));
+            bytes = (int)required; lastKeyBytes = keyBytes;
+            if (reverse) iterator.prev(); else iterator.next();
+        }
+        iterator.status();
+        return new PhysicalRangePage(rows, iterator.isValid() && (!checkBounds || withinPageBounds(iterator,lower,upper)));
     }
 
     @FunctionalInterface

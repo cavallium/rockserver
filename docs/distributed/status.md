@@ -40,6 +40,14 @@ does not establish complete distributed API parity or production acceptance.
   block only intersecting user proposals. Session ACK/floor/authority metadata is
   conservatively excluded while candidates hold certification; an ACK-bearing
   transaction requires sole metadata ownership.
+- Native scoped staging supplies an immutable read-your-writes prefix for point
+  puts/deletes, ordered native merge operands and collision-bucket member mutations.
+  Point/member reads and forward/reverse physical pages combine its indexed batch
+  with the original native snapshot. It installs no user effects or receipts and
+  does not confer commit authority. Failed predicates/shape/result bounds discard
+  the view. Its native use remains charged until close, even after parent
+  certification invalidation. RPC/client staging and range-delete staging remain
+  incomplete.
 - Bounded mutation history detects ABA, same-value writes, absence deletes and range
   phantoms. Physical collision-bucket members share one stamp. Range deletion
   conservatively invalidates tracked observations. Exact native snapshots retain
@@ -92,6 +100,11 @@ Default history retention bounds 128 pins, 65,536 entries, 16 MiB history and
 and retained command payloads share a separate 16 MiB bound; planners reserve the
 maximum command size before constructing output. Original requests retain normal
 input-slot/byte charges even when their chosen log form is a compact rejection.
+A native staging prefix retains the bounded original command and result plus an
+indexed native batch capped at 18 MiB (16 MiB bucket-plan allowance plus 2 MiB
+command allowance). Construction shares the apply evaluator's bucket working bound.
+These are data-size bounds; staging still needs aggregate RPC/registry admission
+before it is exposed through logical transaction handles.
 Rejected receipts reserve their actual bounded no-effects growth, preserving
 own-ACK progress at the retention cap.
 
@@ -119,6 +132,14 @@ cases (364 total, zero failures/errors/skips), exit zero:
 selection after removing obsolete format labels passed 14 core and 20 adapter
 cases (34 total), exit zero: `/tmp/rockserver-current-format-native-final.log`.
 
+The native staging regression gate passed 39 core and 31 adapter cases (70 total,
+zero failures/errors/skips), exit zero: `/tmp/rockserver-native-staging-regression.log`.
+It covers immutable-prefix replacement, snapshot isolation, staged forward/reverse
+pages and limits, bucket collisions, ordered native merges, original-operand/result
+parity through accepted native apply, rejection cleanup, pin retention, image/install
+and existing scoped transaction RPC behavior. The five new staging cases exercise
+the native primitive, not a completed public transaction adapter.
+
 The end-to-end local workflow includes native OPEN/read/PLAN, forced acceptance,
 controlled append/native apply, lost reply, close/reopen, exact receipt retry and
 ACK. It also covers failed PLAN followed by durable local abandonment, and missing
@@ -142,7 +163,8 @@ server process, network/quorum probe, power-loss run or deployment was performed
 
 ## Required remaining work
 
-- Read-your-writes staging and logical transaction adapters; complete public
+- RPC/client read-your-writes integration, range-delete staging and logical
+  transaction adapters; complete public
   RocksDB API/frontend transaction, range and cursor parity.
 - Durable prepared locks, transaction-status groups, 2PC decision/finalization and
   consistent multi-group scoped snapshot fences.
