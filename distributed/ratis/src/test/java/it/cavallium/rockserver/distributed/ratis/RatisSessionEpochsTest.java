@@ -93,19 +93,21 @@ class RatisSessionEpochsTest {
                     .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
                     .setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build()) {
                 storage.initialize();
-                var machine=new RatisRangeStateMachine(dataStore,group,new NativeRangeImage.Limits(2*1024*1024,16*1024*1024,1),command -> {},authority);
+                var machine=new RatisRangeStateMachine(dataStore,group,new NativeRangeImage.Limits(2*1024*1024,16*1024*1024,1),command -> {},authority,
+                        () -> new RatisRangeStateMachine.Leadership(1,true));
                 try {
                     machine.initialize(identity,group.getGroupId(),storage);
+                    machine.notifyTermIndexUpdated(1,0);
                     var request=RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(peer.getId()).setGroupId(group.getGroupId())
                             .setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(Message.valueOf(ByteString.copyFrom(DistributedCommandCodec.encode(valid)))).build();
                     int count=f.reads.get(); var accepted=machine.startTransaction(request);
-                    assertNull(accepted.getException()); assertEquals(count+1,f.reads.get()); accepted.initLogEntry(1,0);
+                    assertNull(accepted.getException()); assertEquals(count+1,f.reads.get()); accepted.initLogEntry(1,1);
                     f.unavailable=true;
                     assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(machine.applyTransaction(accepted).get(5,java.util.concurrent.TimeUnit.SECONDS).getContent().toByteArray()).status());
                     var old=new DistributedCommand(dataGroup,1,new byte[32],new OperationId(a,1,99),List.of(new Mutation(Mutation.Kind.PUT,data,new byte[]{1},new byte[]{9})));
                     var replay=org.apache.ratis.statemachine.TransactionContext.newBuilder().setStateMachine(machine)
                             .setServerRole(org.apache.ratis.proto.RaftProtos.RaftPeerRole.FOLLOWER).setLogEntry(org.apache.ratis.proto.RaftProtos.LogEntryProto.newBuilder()
-                            .setTerm(1).setIndex(1).setStateMachineLogEntry(org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto.newBuilder()
+                            .setTerm(1).setIndex(2).setStateMachineLogEntry(org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto.newBuilder()
                             .setLogData(ByteString.copyFrom(DistributedCommandCodec.encode(old)))).build()).build();
                     assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(machine.applyTransaction(replay).get(5,java.util.concurrent.TimeUnit.SECONDS).getContent().toByteArray()).status());
                     try (var pin=dataStore.capture()) { assertNull(pin.get(data,new byte[]{1})); }

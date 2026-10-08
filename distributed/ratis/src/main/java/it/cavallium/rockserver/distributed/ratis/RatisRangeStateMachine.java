@@ -46,16 +46,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     private volatile Throwable storageFailure;
     private final HashMap<OperationId, Admission> admissions = new HashMap<>();
     private long admittedBytes;
+    private final java.util.concurrent.atomic.AtomicLong admissionGeneration = new java.util.concurrent.atomic.AtomicLong();
+    record Leadership(long term, boolean ready) {}
+    @FunctionalInterface interface LeadershipSource { Leadership get() throws IOException; }
+    private final LeadershipSource leadershipSource;
 
     private static final class Admission {
         final OperationId id;
         final byte[] digest;
         final int bytes;
+        final long term, generation;
         int owners = 1;
-        Admission(OperationId id, byte[] digest, int bytes) {
+        Admission(OperationId id, byte[] digest, int bytes, long term, long generation) {
             this.id = id;
             this.digest = digest;
-            this.bytes = bytes;
+            this.bytes = bytes; this.term = term; this.generation = generation;
         }
     }
 
@@ -90,6 +95,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     /** Authority is checked only at proposal admission; committed replay remains deterministic. */
     public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
             Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission) {
+        this(store, initialGroup, limits, commandValidator, epochFloorAdmission, null);
+    }
+
+    // Explicit view injection is only for ordinary in-process fixtures without a running Raft division.
+    RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission,
+            LeadershipSource leadershipSource) {
+        this.leadershipSource = leadershipSource;
         this.commandValidator = java.util.Objects.requireNonNull(commandValidator);
         this.epochFloorAdmission = java.util.Objects.requireNonNull(epochFloorAdmission);
         this.store = java.util.Objects.requireNonNull(store);
@@ -230,6 +243,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     }
 
     @Override public void pause() {
+        admissionGeneration.incrementAndGet();
         try {
             synchronized (gate) {
                 getLifeCycle().transition(LifeCycle.State.PAUSING);
@@ -247,6 +261,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
 
     /** Must run before RaftServer.close(), whose updater waits for outstanding apply futures. */
     public void beginShutdown() {
+        admissionGeneration.incrementAndGet();
         IOException failure = new IOException("Range is shutting down");
         synchronized (gate) { storageFailure = failure; store.fence(); }
         failDeferred(failure);
@@ -384,6 +399,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     private record Completion(CompletableFuture<Message> future, Message result) {}
 
     @Override public void reinitialize() throws IOException {
+        admissionGeneration.incrementAndGet();
         var completions = new java.util.ArrayList<Completion>();
         IOException failure = null;
         synchronized (gate) {
@@ -450,6 +466,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         var transaction = super.startTransaction(request);
         try {
             requireHealthy();
+            long generation = admissionGeneration.get();
+            Leadership leadership = leadership();
+            if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray();
             var command = DistributedCommandCodec.decode(encoded);
             commandValidator.accept(command);
@@ -459,22 +478,29 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             // advanced while reading, retry validation before acquiring ownership.
             for (int attempt = 0; attempt < 3; attempt++) {
                 var observed = store.applied();
+                if (observed == null || observed.term() != leadership.term()) {
+                    throw new IllegalStateException("Current-term startup prefix has not completed native apply");
+                }
                 byte[] saved = store.operationResult(command.operationId(), digest);
                 // Previously committed outcomes and expired identities cannot advance the fence.
                 if (saved == null && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
                 synchronized (admissions) {
+                    if (generation != admissionGeneration.get()) throw new IllegalStateException("Admission leadership generation changed");
                     if (!java.util.Objects.equals(observed, store.applied())) continue;
                     var admission = admissions.get(command.operationId());
                     if (admission != null) {
                         if (!Arrays.equals(admission.digest, digest)) {
                             throw new IllegalArgumentException("Operation identity reused with different payload");
                         }
+                        if (admission.term != leadership.term() || admission.generation != generation) {
+                            throw new IllegalStateException("Earlier admission is still settling; retry the same identity");
+                        }
                         admission.owners++;
                     } else {
                         if (admissions.size() >= 1024 || admittedBytes + encoded.length > 16L * 1024 * 1024) {
                             throw new IllegalStateException("Range proposal budget exhausted");
                         }
-                        admission = new Admission(command.operationId(), digest, encoded.length);
+                        admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation);
                         admissions.put(admission.id, admission);
                         admittedBytes += admission.bytes;
                     }
@@ -484,6 +510,40 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             throw new IllegalStateException("Range changed during admission; retry with same identity");
         } catch (Exception rejected) {
             return transaction.setException(rejected);
+        }
+    }
+
+    private Leadership leadership() throws IOException {
+        if (leadershipSource != null) return leadershipSource.get();
+        RaftServer server = getServer().getNow(null);
+        if (server == null) throw new IOException("Raft division is not initialized");
+        var division = server.getDivision(getGroupId());
+        synchronized (division) {
+            var info = division.getInfo();
+            return new Leadership(info.getCurrentTerm(), info.isLeader() && info.isLeaderReady());
+        }
+    }
+
+    /** Ratis invokes this under its append locks; recheck only in-memory ownership and term. */
+    @Override public TransactionContext preAppendTransaction(TransactionContext transaction) throws IOException {
+        try {
+            requireHealthy();
+            Leadership current = leadership();
+            var nativePosition = store.applied();
+            synchronized (admissions) {
+                if (!(transaction.getStateMachineContext() instanceof Admission admission)
+                        || admissions.get(admission.id) != admission || admission.owners <= 0
+                        || !current.ready() || admission.term != current.term()
+                        || admission.generation != admissionGeneration.get()
+                        || nativePosition == null || nativePosition.term() != current.term()) {
+                    throw new IOException("Admission lost its completed current-term owner before append");
+                }
+            }
+            return super.preAppendTransaction(transaction);
+        } catch (Exception stale) {
+            releaseAdmission(transaction);
+            // IOException alone would make Ratis step down the healthy replacement leader.
+            throw new org.apache.ratis.protocol.exceptions.StateMachineException("Stale proposal admission", stale, false);
         }
     }
 
@@ -542,6 +602,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     }
 
     @Override public void notifyNotLeader(Collection<TransactionContext> pendingEntries) {
+        admissionGeneration.incrementAndGet();
         for (var transaction : pendingEntries) releaseAdmission(transaction);
     }
 

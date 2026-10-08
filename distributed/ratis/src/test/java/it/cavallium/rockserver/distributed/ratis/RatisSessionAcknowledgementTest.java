@@ -44,55 +44,58 @@ class RatisSessionAcknowledgementTest {
             storage.initialize();
             var store = pool.openRange(new RangeOwnership.Owner(groupId,1),
                     new RangeOwnership.Interval(groupId,Set.of(column),null,null),new byte[32],Map.of(column,"data"),Set.of());
-            var machine = new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(2*1024*1024,16*1024*1024,1));
+            var machine = new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(2*1024*1024,16*1024*1024,1),command -> {},
+                    command -> { throw new IllegalStateException("catalogue lifetime authority required"); },
+                    () -> new RatisRangeStateMachine.Leadership(1,true));
             try {
                 machine.initialize(identity,group.getGroupId(),storage);
+                machine.notifyTermIndexUpdated(1,0);
                 var fence = DistributedCommand.advanceSessionEpochFloor(groupId,1,new byte[32],new OperationId(admin,4,0),2);
                 assertInstanceOf(IllegalStateException.class,machine.startTransaction(request(group,peer,fence)).getException());
                 var original = new DistributedCommand(groupId,1,new byte[32],new OperationId(session,1,0),
                         List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{1},new byte[]{7})));
                 var ack = new DistributedCommand(groupId,1,new byte[32],new OperationId(session,1,1),List.of(),List.of(),0);
-                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,0,original)).get(5,TimeUnit.SECONDS)));
-                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,1,ack)).get(5,TimeUnit.SECONDS)));
-                assertEquals(1,machine.takeSnapshot());
+                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,1,original)).get(5,TimeUnit.SECONDS)));
+                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,2,ack)).get(5,TimeUnit.SECONDS)));
+                assertEquals(2,machine.takeSnapshot());
                 machine.pause();
-                var covered = machine.applyTransaction(transaction(machine,0,original));
+                var covered = machine.applyTransaction(transaction(machine,1,original));
                 var tail = new DistributedCommand(groupId,1,new byte[32],new OperationId(session,1,2),
                         List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{1},new byte[]{8})));
-                var deferredTail = machine.applyTransaction(transaction(machine,2,tail));
+                var deferredTail = machine.applyTransaction(transaction(machine,3,tail));
                 assertFalse(covered.isDone()); assertFalse(deferredTail.isDone());
                 machine.reinitialize();
                 assertEquals(CommandResult.Status.SESSION_EXPIRED,result(covered.get(5,TimeUnit.SECONDS)));
                 assertFalse(deferredTail.isDone());
-                assertEquals(1,machine.getLastAppliedTermIndex().getIndex());
-                try (var pin = store.capture()) { assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{1})); }
-                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,2,tail)).get(5,TimeUnit.SECONDS)));
-                assertEquals(CommandResult.Status.SUCCESS,result(deferredTail.get(5,TimeUnit.SECONDS)));
                 assertEquals(2,machine.getLastAppliedTermIndex().getIndex());
-                assertEquals(CommandResult.Status.SESSION_EXPIRED,result(machine.applyTransaction(transaction(machine,3,original)).get(5,TimeUnit.SECONDS)));
+                try (var pin = store.capture()) { assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{1})); }
+                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,3,tail)).get(5,TimeUnit.SECONDS)));
+                assertEquals(CommandResult.Status.SUCCESS,result(deferredTail.get(5,TimeUnit.SECONDS)));
+                assertEquals(3,machine.getLastAppliedTermIndex().getIndex());
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,result(machine.applyTransaction(transaction(machine,4,original)).get(5,TimeUnit.SECONDS)));
                 try (var pin = store.capture()) { assertArrayEquals(new byte[]{8},pin.get(column,new byte[]{1})); }
                 // A committed follower entry does not repeat proposer lifetime authority.
-                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,4,fence)).get(5,TimeUnit.SECONDS)));
-                assertEquals(4,machine.takeSnapshot());
+                assertEquals(CommandResult.Status.SUCCESS,result(machine.applyTransaction(transaction(machine,5,fence)).get(5,TimeUnit.SECONDS)));
+                assertEquals(5,machine.takeSnapshot());
             } finally { machine.close(); machine.awaitNativeReaders(Duration.ofSeconds(5)); }
             var allowed = new java.util.concurrent.atomic.AtomicBoolean(true);
             var checks = new java.util.concurrent.atomic.AtomicInteger();
             var authorized = new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(2*1024*1024,16*1024*1024,1),command -> {},command -> {
                 checks.incrementAndGet();
                 if (!allowed.get()) throw new IllegalStateException("lifetime authority changed");
-            });
+            }, () -> new RatisRangeStateMachine.Leadership(1,true));
             try {
                 authorized.initialize(identity,group.getGroupId(),storage);
                 var advance = DistributedCommand.advanceSessionEpochFloor(groupId,1,new byte[32],new OperationId(admin,4,1),3);
                 var accepted = authorized.startTransaction(request(group,peer,advance));
-                assertNull(accepted.getException()); accepted.initLogEntry(1,5);
+                assertNull(accepted.getException()); accepted.initLogEntry(1,6);
                 allowed.set(false);
                 assertEquals(CommandResult.Status.SUCCESS,result(authorized.applyTransaction(accepted).get(5,TimeUnit.SECONDS)));
                 assertEquals(1,checks.get());
-                assertEquals(CommandResult.Status.SUCCESS,result(authorized.applyTransaction(transaction(authorized,5,advance)).get(5,TimeUnit.SECONDS)));
+                assertEquals(CommandResult.Status.SUCCESS,result(authorized.applyTransaction(transaction(authorized,6,advance)).get(5,TimeUnit.SECONDS)));
                 assertEquals(1,checks.get(),"Replay never consults changed admission authority");
                 var duplicate = authorized.startTransaction(request(group,peer,advance));
-                assertNull(duplicate.getException()); duplicate.initLogEntry(1,6);
+                assertNull(duplicate.getException()); duplicate.initLogEntry(1,7);
                 assertEquals(CommandResult.Status.SUCCESS,result(authorized.applyTransaction(duplicate).get(5,TimeUnit.SECONDS)));
                 assertEquals(1,checks.get(),"A known original outcome does not need new authority");
                 var next = DistributedCommand.advanceSessionEpochFloor(groupId,1,new byte[32],new OperationId(admin,4,2),4);

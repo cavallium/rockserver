@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.ReceiptUsage;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
@@ -56,6 +57,9 @@ public final class ReplicatedRangeStore {
     private final byte[] markerKey;
     private final byte[] installingKey;
     private final byte[] configurationKey;
+    private final byte[] usageKey;
+    private final byte[] usageBucketsPrefix;
+    private final byte[] usageRebuildKey;
     private final RangeOwnership ownership;
     private final RangeOwnership.Owner owner;
     private final RangeOwnership.Interval interval;
@@ -102,6 +106,9 @@ public final class ReplicatedRangeStore {
         markerKey = uuidBytes(groupId);
         installingKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x7f).array();
         configurationKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 1).array();
+        usageKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x10).array();
+        usageBucketsPrefix = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x11).array();
+        usageRebuildKey = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x12).array();
         byte[] recovered = this.db.get(state, markerKey);
         applied = recovered == null ? null : decodePosition(recovered);
         pendingInstallation = this.db.get(state, installingKey);
@@ -110,6 +117,8 @@ public final class ReplicatedRangeStore {
                 throw new IllegalStateException("Invalid pending installation marker");
             }
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
+        } else {
+            ensureReceiptUsage();
         }
     }
 
@@ -265,6 +274,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             requireActive();
+            ensureReceiptUsage();
             long currentEpochFloor = minimumSessionEpoch(null);
             long currentFloor = command.operationId().epoch() < currentEpochFloor ? -1 : acknowledgedThrough(command.operationId(), null);
             if (command.operationId().epoch() < currentEpochFloor || command.operationId().sequence() <= currentFloor) {
@@ -272,6 +282,7 @@ public final class ReplicatedRangeStore {
                     requireNext(position);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                         batch.put(state, markerKey, encodePosition(position));
+                        batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                         db.write(options, batch);
                     }
                     applied = position;
@@ -314,9 +325,12 @@ public final class ReplicatedRangeStore {
                         batch.deleteRange(receipts, receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), 0)),
                                 receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), floor + 1)));
                     }
-                    batch.put(receipts, receiptKey, encodeReceipt(digest, stableResult));
+                    byte[] encodedReceipt = encodeReceipt(digest, stableResult);
+                    updateReceiptUsage(batch, command, currentEpochFloor, currentFloor, encodedReceipt.length, position);
+                    batch.put(receipts, receiptKey, encodedReceipt);
                 }
                 batch.put(state, markerKey, encodePosition(position));
+                if (saved != null) batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 db.write(options, batch);
             }
             applied = position;
@@ -383,11 +397,13 @@ public final class ReplicatedRangeStore {
             if (pendingInstallation != null || (current != RangeOwnership.State.ACTIVE && current != RangeOwnership.State.FENCED)) {
                 throw new IllegalStateException("Range cannot complete Raft accounting");
             }
+            ensureReceiptUsage();
             if (applied != null && position.index() <= applied.index()) return;
             requireNext(position);
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                 batch.put(state, markerKey, encodePosition(position));
+                batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 if (configuration != null) {
                     batch.put(state, configurationKey, encodeConfiguration(new Configuration(position.term(), position.index(), configuration)));
                 }
@@ -474,10 +490,13 @@ public final class ReplicatedRangeStore {
                     });
                     if (!Arrays.equals(expected.sha256(), actual.sha256())) throw new IOException("Snapshot changed during installation");
                     writer.flush();
+                    // Validate/rebuild imported counters while the installation remains fenced.
+                    rebuildReceiptUsage();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
                         batch.put(state, markerKey, encodePosition(expected.position()));
+                        batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), expected.position()));
                         batch.delete(state, installingKey);
                         db.write(options, batch);
                     }
@@ -691,6 +710,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             requireActive();
+            ensureReceiptUsage();
             Snapshot snapshot = db.getSnapshot();
             try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
                 byte[] marker = db.get(state, options, markerKey);
@@ -1017,6 +1037,161 @@ public final class ReplicatedRangeStore {
         if (i < 0) return null;
         end[i]++;
         return Arrays.copyOf(end,i+1);
+    }
+
+    /** Totals and completed position from one ordered apply cut. */
+    public ReceiptUsage receiptUsage() throws RocksDBException {
+        enterNative();
+        applyLane.lock();
+        try {
+            if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
+            ensureReceiptUsage();
+            var totals = readUsage(usageKey);
+            return new ReceiptUsage(applied, totals.count, totals.bytes);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+
+    private record Usage(long count, long bytes) {
+        Usage {
+            if (count < 0 || bytes < 0 || (count == 0 ? bytes != 0 : bytes / count < 84)) {
+                throw new IllegalStateException("Invalid receipt usage");
+            }
+        }
+        Usage plus(Usage other) { return new Usage(Math.addExact(count, other.count), Math.addExact(bytes, other.bytes)); }
+        Usage minus(Usage other) { return new Usage(Math.subtractExact(count, other.count), Math.subtractExact(bytes, other.bytes)); }
+        byte[] encode() { return ByteBuffer.allocate(20).putInt(STATE_VERSION).putLong(count).putLong(bytes).array(); }
+    }
+
+    private static Usage decodeUsage(byte[] value) {
+        if (value == null) return new Usage(0, 0);
+        if (value.length != 20 || ByteBuffer.wrap(value).getInt() != STATE_VERSION) {
+            throw new IllegalStateException("Invalid receipt usage metadata");
+        }
+        return new Usage(ByteBuffer.wrap(value, 4, 16).getLong(), ByteBuffer.wrap(value, 12, 8).getLong());
+    }
+
+    // Total: v1/count/bytes/term/index (36 bytes); buckets retain v1/count/bytes (20 bytes).
+    private static byte[] encodeTotalUsage(Usage usage, ApplyPosition position) {
+        return ByteBuffer.allocate(36).put(usage.encode()).putLong(position == null ? 0 : position.term())
+                .putLong(position == null ? -1 : position.index()).array();
+    }
+
+    private Usage readUsage(byte[] key) throws RocksDBException {
+        byte[] value = db.get(state, key);
+        if (Arrays.equals(key, usageKey) && value != null && value.length == 36) value = Arrays.copyOf(value, 20);
+        return decodeUsage(value);
+    }
+
+    // Epoch comes first so a coarse fence deletes all obsolete buckets in one range tombstone.
+    private byte[] usageBucketKey(OperationId id) {
+        return ByteBuffer.allocate(41).put(usageBucketsPrefix).putLong(id.epoch()).put(uuidBytes(id.sessionId())).array();
+    }
+
+    private Usage scanUsage(ColumnFamilyHandle cf, byte[] lower, byte[] upper, boolean receiptRows) throws RocksDBException {
+        Usage total = new Usage(0, 0);
+        try (var options = new ReadOptions().setFillCache(false); var iterator = db.newIterator(cf, options)) {
+            for (iterator.seek(lower); iterator.isValid(); iterator.next()) {
+                byte[] key = iterator.key();
+                if (upper != null && Arrays.compareUnsigned(key, upper) >= 0) break;
+                if (upper == null && (key.length < markerKey.length || !Arrays.equals(key, 0, markerKey.length, markerKey, 0, markerKey.length))) break;
+                if (receiptRows) {
+                    byte[] value = iterator.value();
+                    validateReceiptRow(key, value);
+                    total = total.plus(new Usage(1, (long) key.length + value.length));
+                } else {
+                    if (key.length != 41) throw new IllegalStateException("Invalid usage bucket key");
+                    total = total.plus(decodeUsage(iterator.value()));
+                }
+            }
+            iterator.status();
+        }
+        return total;
+    }
+
+    private void updateReceiptUsage(WriteBatch batch, DistributedCommand command, long epochFloor,
+            long acknowledged, int valueBytes, ApplyPosition position) throws RocksDBException {
+        Usage total = readUsage(usageKey);
+        byte[] bucketKey = usageBucketKey(command.operationId());
+        Usage bucket = readUsage(bucketKey);
+        if (command.minimumSessionEpoch() > epochFloor) {
+            byte[] end = ByteBuffer.allocate(25).put(usageBucketsPrefix).putLong(command.minimumSessionEpoch()).array();
+            total = total.minus(scanUsage(state, usageBucketsPrefix, end, false));
+            batch.deleteRange(state, usageBucketsPrefix, end);
+        }
+        if (command.acknowledgedThrough() > acknowledged) {
+            var id = command.operationId();
+            Usage removed = scanUsage(receipts, receiptKey(new OperationId(id.sessionId(), id.epoch(), 0)),
+                    receiptKey(new OperationId(id.sessionId(), id.epoch(), command.acknowledgedThrough() + 1)), true);
+            total = total.minus(removed);
+            bucket = bucket.minus(removed);
+        }
+        Usage added = new Usage(1, 48L + valueBytes);
+        batch.put(state, bucketKey, bucket.plus(added).encode());
+        batch.put(state, usageKey, encodeTotalUsage(total.plus(added), position));
+    }
+
+    private static void validateReceiptRow(byte[] key, byte[] value) {
+        if (key.length != 48 || ByteBuffer.wrap(key, 32, 8).getLong() < 0
+                || ByteBuffer.wrap(key, 40, 8).getLong() < 0 || value.length < 36
+                || value.length > 36 + MAX_RESULT_BYTES || ByteBuffer.wrap(value).getInt() != STATE_VERSION) {
+            throw new IllegalStateException("Invalid durable receipt row");
+        }
+    }
+
+    private void ensureReceiptUsage() throws RocksDBException {
+        byte[] marker = db.get(state, markerKey);
+        applied = marker == null ? null : decodePosition(marker);
+        byte[] total = db.get(state, usageKey);
+        if (total == null || total.length != 36 || db.get(state, usageRebuildKey) != null
+                || ByteBuffer.wrap(total, 20, 16).getLong() != (applied == null ? 0 : applied.term())
+                || ByteBuffer.wrap(total, 28, 8).getLong() != (applied == null ? -1 : applied.index())) {
+            rebuildReceiptUsage();
+        } else decodeUsage(Arrays.copyOf(total, 20));
+    }
+
+    /** Restartable recovery with one session/epoch accumulator and one receipt row in memory. */
+    private void rebuildReceiptUsage() throws RocksDBException {
+        try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
+            batch.put(state, usageRebuildKey, new byte[] {1});
+            batch.delete(state, usageKey);
+            batch.deleteRange(state, usageBucketsPrefix, prefixEnd(usageBucketsPrefix));
+            db.write(options, batch);
+        }
+        long minimum = minimumSessionEpoch(null);
+        Usage total = new Usage(0, 0), bucket = new Usage(0, 0);
+        byte[] previousBucket = null;
+        long floor = -1;
+        try (var options = new ReadOptions().setFillCache(false); var iterator = db.newIterator(receipts, options);
+                var write = new WriteOptions().setDisableWAL(false).setSync(false)) {
+            byte[] end = prefixEnd(markerKey);
+            for (iterator.seek(markerKey); iterator.isValid(); iterator.next()) {
+                byte[] key = iterator.key();
+                if (end != null && Arrays.compareUnsigned(key, end) >= 0) break;
+                byte[] value = iterator.value();
+                validateReceiptRow(key, value);
+                var input = ByteBuffer.wrap(key, 16, 32);
+                var id = new OperationId(new UUID(input.getLong(), input.getLong()), input.getLong(), input.getLong());
+                if (id.epoch() < minimum) continue;
+                byte[] currentBucket = usageBucketKey(id);
+                if (!Arrays.equals(previousBucket, currentBucket)) {
+                    if (previousBucket != null && bucket.count != 0) db.put(state, write, previousBucket, bucket.encode());
+                    previousBucket = currentBucket;
+                    bucket = new Usage(0, 0);
+                    floor = acknowledgedThrough(id, null);
+                }
+                if (id.sequence() <= floor) continue;
+                Usage row = new Usage(1, (long) key.length + value.length);
+                bucket = bucket.plus(row);
+                total = total.plus(row);
+            }
+            iterator.status();
+            if (previousBucket != null && bucket.count != 0) db.put(state, write, previousBucket, bucket.encode());
+        }
+        try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
+            batch.put(state, usageKey, encodeTotalUsage(total, applied));
+            batch.delete(state, usageRebuildKey);
+            db.write(options, batch);
+        }
     }
 
     private byte[] epochFloorKey() { return ByteBuffer.allocate(17).put(uuidBytes(groupId)).put((byte) 3).array(); }

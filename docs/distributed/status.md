@@ -779,3 +779,62 @@ admission, scheduled reclamation, rolling feature activation and lineage remain
 unfinished. Default floor activation is still disabled. Full architecture,
 frontend parity, transactions/2PC/topology/long workflows and representative
 performance/recovery acceptance remain required.
+
+
+## Durable retained receipt usage and term-bound admission readiness
+
+`ReceiptUsage` exposes an atomic completed-position/count/encoded-byte snapshot.
+Native state now has a total at tag0x10 and epoch-first session buckets at tag0x11.
+Bytes count the 48-byte receipt key plus version/hash/result value. New unique
+results, ACK deletion and coarse epoch removal update usage in the same WAL-enabled
+sync=false batch as data/receipts/floors/A. Duplicates and expired retries add no
+usage; local physical cleanup leaves logical usage unchanged. Ordinary apply is
+constant work; partial ACKs stream covered receipts and coarse fences stream
+metadata buckets rather than user data.
+
+Totals include their exact term/index in a 36-byte value; buckets remain 20 bytes.
+Every marker advance, including duplicate, expired and config/no-op entries,
+updates that binding atomically. This prevents an older writer advancing A and
+receipts while leaving a deceptively valid old total. Missing, legacy20, stale or
+interrupted counters rebuild with bounded memory and a synced restart flag; one
+session/epoch accumulator and one receipt row are retained. Final synced totals
+clear the flag. Installation recomputes bucket allocation while fenced and binds
+it to the final marker. New image totals must match their header position;
+legacy unbound totals are auxiliary input normalized before activation. Image
+checks compare bound aggregate totals, bucket sums and retained receipt rows.
+
+Pinned Ratis bytecode confirms that leader-ready notification precedes the native
+current-term config/no-op marker. Admission therefore requires both current
+leader readiness and completed native apply in that term. It does not require A
+to catch every later commit/log entry or drain disjoint steady proposals.
+Admissions capture term and an invalidation generation. Ratis's pre-append hook
+rechecks term/role/readiness, native term and exact owner without native IO or the
+adapter gate. Rejection releases ownership itself (Ratis does not cancel this
+failure path) and uses StateMachineException with leaderShouldStepDown=false.
+Pause/reload/shutdown/not-leader invalidate prior generations; cancellation and
+release remain idempotent. Earlier-term contexts cannot append merely because a
+replacement leader is now ready.
+
+The final ordinary gate passes 66 core/native, 16 read-round and 25 adapter cases,
+Maven exit zero: `/tmp/rockserver-retention-bound-position-full-gate.log`. New tests
+cover exact bytes/counts, duplicate/expired/ACK/floor paths, cleanup invariance,
+restartable legacy/partial counter recovery, legacy writer stale totals, no-op
+position binding, old/new image metadata and fresh install. Leadership tests use
+the production DivisionInfo lookup through controlled interfaces: ready-before-
+native startup, inherited old term, multiple steady proposals, stale term with a
+natively ready replacement, nonleader/not-ready state, generation invalidation,
+non-stepdown rejection and exact release. Native session fixtures now explicitly
+supply current-term startup accounting before proposal admission.
+
+No excluded security/fuzzing/traffic-isolation/network-probe/server-process/density
+or paused-registry workflow ran. Tests are controlled native/interface fixtures;
+actual Ratis callback concurrency, independent failure domains and physical power
+loss remain unverified. No push, publication, deployment, production or main-
+checkout mutation occurred. The density fixture remains untracked and unexecuted.
+
+This is the accounting/readiness foundation for retention limits, not enforcement:
+proposal count/result-byte reservations and ACK/control progress at full capacity
+remain to integrate. Bootstrap/lifetime/data-session binding, automatic clock/floor
+propagation, scoped transactions/reservations, 2PC, topology, public API parity,
+long workflows and representative equal-durability/resource acceptance are still
+required by the full active goal.

@@ -71,7 +71,7 @@ class NativeRangeImageTest {
                 assertEquals(interval(), written.interval());
                 assertEquals(new ApplyPosition(1, 1), written.position());
                 assertEquals(Set.of(A), written.deterministicMergeColumns());
-                assertEquals(5, written.rows());
+                assertEquals(7, written.rows());
                 assertEquals(Files.size(image), written.bytes());
                 assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(image)), written.sha256());
                 assertArrayEquals(written.sha256(), inspected.sha256());
@@ -84,12 +84,14 @@ class NativeRangeImageTest {
                 assertArrayEquals(bytes("paired"), rows.get(2).value());
                 assertEquals(Section.STATE, rows.get(3).section());
                 assertNull(rows.get(3).column());
-                assertEquals(Section.RECEIPTS, rows.get(4).section());
+                assertEquals(Section.STATE, rows.get(4).section());
+                assertEquals(Section.STATE, rows.get(5).section());
+                assertEquals(Section.RECEIPTS, rows.get(6).section());
                 byte[] receiptKey = ByteBuffer.allocate(48).putLong(GROUP.getMostSignificantBits())
                         .putLong(GROUP.getLeastSignificantBits()).putLong(SESSION.getMostSignificantBits())
                         .putLong(SESSION.getLeastSignificantBits()).putLong(1).putLong(0).array();
-                assertArrayEquals(receiptKey, rows.get(4).key());
-                assertArrayEquals(bytes("original-result"), Arrays.copyOfRange(rows.get(4).value(), 36, rows.get(4).value().length));
+                assertArrayEquals(receiptKey, rows.get(6).key());
+                assertArrayEquals(bytes("original-result"), Arrays.copyOfRange(rows.get(6).value(), 36, rows.get(6).value().length));
                 Path sameCut = directory.resolve("same.image");
                 NativeRangeImage.write(sameCut, pin, interval(), LIMITS);
                 assertArrayEquals(Files.readAllBytes(image), Files.readAllBytes(sameCut));
@@ -233,7 +235,7 @@ class NativeRangeImageTest {
         var delivered = new ArrayList<Section>();
         assertThrows(IOException.class, () -> NativeRangeImage.visit(image, LIMITS,
                 (section, column, key, value) -> delivered.add(section)));
-        assertEquals(List.of(Section.USER, Section.STATE, Section.RECEIPTS), delivered);
+        assertEquals(List.of(Section.USER, Section.STATE, Section.STATE, Section.STATE, Section.RECEIPTS), delivered);
     }
 
     @Test
