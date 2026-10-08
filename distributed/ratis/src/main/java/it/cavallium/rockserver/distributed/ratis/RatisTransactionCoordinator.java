@@ -10,7 +10,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         Authorization authorize(UUID transaction,RatisDurableTransaction.ParticipantProgress participant) throws IOException;
     }
     /** The provider retains ownership of pins and preserves claimed/uncertain proposal ownership on close. */
-    public record Authorization(PreparedParticipant.Preparation value,AutoCloseable owner) implements AutoCloseable {
+    public record Authorization(PreparedParticipant.Preparation value,boolean negative,AutoCloseable owner) implements AutoCloseable {
         public Authorization { Objects.requireNonNull(value); Objects.requireNonNull(owner); }
         @Override public void close() throws Exception { owner.close(); }
     }
@@ -93,7 +93,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         catch (RatisPreparationUnavailableException unavailable) { return decide(journal.snapshot(),TransactionStatus.Phase.ABORT); }
         try (authorization) {
             // Restore validates the original route; freeze additionally checks exact accepted business/control/registration.
-            journal.freezePreparation(data.restoreParticipant(authorization.value(),progress.intent().route()));
+            journal.freezePreparation(data.restoreParticipant(authorization.value(),progress.intent().route(),authorization.negative()));
             var vote=journal.executePreparation(group);
             return result(vote.prepared() ? Action.PREPARED : Action.PREPARATION_REJECTED,group);
         } catch (IOException failure) { throw failure; }

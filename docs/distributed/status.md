@@ -396,15 +396,36 @@ submitted input is bounded to sixteen MiB. Retained INSTALL retries use the same
 sublimits and preserve RELEASE headroom. Ready or blocked RELEASE work does not
 reject an exact native INSTALL retry belonging to that same fence.
 
+Gate conflicts now certify an explicit negative PREPARE request under the same
+admission monitor as both control/business identity claims. This request owns no
+candidate lease, prepared scope or business effects. It uses protected control
+slots and an independent eight-MiB input allowance, so ordinary or candidate quota
+saturation cannot prevent a negative vote. Native rejection admission reserves only
+compact negative/terminal metadata and checks existing positive evidence first.
+
+The chosen request kind, complete original preparation and route are frozen before
+RPC and preserved by the coordinator journal across reopen. A frozen positive
+request is never converted into an explicit negative one, and negative requests
+cannot accept positive replies or recovered proofs. A gate may release or fail
+after certification without changing that negative request into a positive plan.
+An original accepted image can be rejected in a newer term without reopening its
+read cut. Existing positive preparation owners retain their original rights.
+
+Negative payload ownership transfers to submitted input and can be shared with
+FINALIZE; native publication releases storage reservation without donating payload
+still owned by an RPC or finalizer. Fresh negative authority requires the matching
+PREPARING home and a reserved or installed gate at the claimed native cut. Exact
+retained negative outcomes remain retryable independently of expired grants.
+
 Per range, gates have an independent bound of 16 retained fence records and 16 MiB
 of reserved metadata, including future release growth. Released records retain their
 capacity and operation identities until a future fenced GC implementation. A fence
 contains at most 64 participants and an aggregate definition below 2 MiB minus
 8 KiB, leaving bounded room for progress and envelopes. The ephemeral admission
 index can reserve a gate before earlier proposals drain, with independent protected
-limits. Definitive negative PREPARE admission at reserved or installed gates,
-coordinated capture/recovery and frontend snapshot leases remain unfinished; these
-participant seams alone do not establish a consistent cross-group read cut.
+limits. Coordinated multi-group capture/recovery and frontend snapshot leases
+remain unfinished; these participant seams alone do not establish a consistent
+cross-group read cut.
 
 Each coordinator journal freezes at most 64 participants and 16 MiB of aggregate
 accepted commands (including their result images), plus 16 MiB of frozen routes and

@@ -115,6 +115,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         final ByteString rejectionLogData;
         PreparedParticipant.Preparation participant;
         ParticipantHold participantHold;
+        boolean participantNegative;
+        NegativePayload negativePayload;
         RatisSnapshotRecord snapshot;
         SnapshotHold snapshotHold;
         ParticipantFinalization finalization;
@@ -140,10 +142,20 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         PreparingCommit(ProposalReservation reservation,int bytes) { this.reservation=reservation; this.bytes=bytes; }
     }
     private final HashMap<OperationId,PreparingCommit> preparingCommits=new HashMap<>();
+    private static final class NegativePayload {
+        int bytes,references=1;
+        NegativePayload(int bytes) { this.bytes=bytes; }
+    }
+    private int protectedNegativeSlots;
+    private long negativeInputBytes;
     private static final class ParticipantHold {
-        final OperationId control,business; final UUID transaction; final long scopeBytes; long bytes;
-        boolean released,capacityReleased; int finalizers; PreparedParticipant.Preparation preparation;
-        ParticipantHold(UUID transaction,OperationId control,OperationId business,long bytes,long scopeBytes) { this.transaction=transaction; this.control=control; this.business=business; this.bytes=bytes; this.scopeBytes=scopeBytes; }
+        final OperationId control,business; final UUID transaction; final long scopeBytes,term,generation; long bytes;
+        final NegativePayload payload;
+        boolean released,capacityReleased,negativeSlot,transferred,invalidated; int finalizers; PreparedParticipant.Preparation preparation;
+        ParticipantHold(UUID transaction,OperationId control,OperationId business,long bytes,long scopeBytes,long term,long generation,NegativePayload payload,boolean reserved) {
+            this.transaction=transaction; this.control=control; this.business=business; this.bytes=bytes; this.scopeBytes=scopeBytes; this.term=term; this.generation=generation;
+            this.payload=payload; negativeSlot=payload!=null; capacityReleased=!reserved;
+        }
     }
     private record PreparingParticipant(ProposalReservation reservation,ParticipantHold hold) {}
     private final HashMap<OperationId,PreparingParticipant> preparingParticipants=new HashMap<>();
@@ -712,7 +724,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         if (estimate.newReceipt() && (command.acceptance()==null || reject) && estimate.maintenance() && proposalFootprints.stats().candidates()>0) throw new IllegalStateException("Transaction reservations hold session metadata stable");
                         boolean maintenance = estimate.newReceipt() && estimate.maintenance();
                         boolean protectedControl = estimate.maintenance() && command.mutations().isEmpty() && command.predicates().isEmpty();
-                        if (protectedControl ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots >= 16
+                        if (protectedControl ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots >= 16
                                 : dataAdmissions >= 1024 || dataProposalBytes + encoded.length > 16L * 1024 * 1024) {
                             throw new IllegalStateException("Range proposal budget exhausted");
                         }
@@ -788,7 +800,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (known!=null) throw new IllegalStateException("Previous snapshot control is still settling");
                 if (preparingSnapshots.containsKey(operation)) throw new IllegalStateException("Snapshot control is still preparing");
-                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes
                         || install && (snapshotInstallOwners+snapshotAdmittedInstalls>=8 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-snapshotInstallBytes-snapshotInstallAdmittedBytes)) throw new IllegalStateException("Snapshot protected input budget exhausted");
                 var charge=snapshotCharges.get(fence.fenceId());
                 if (charge!=null && !charge.fence.equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed");
@@ -925,7 +937,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (receipt==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Snapshot gate has no fresh home admission authority");
                 if (accepted!=null && !accepted.drained()) throw new IllegalStateException("Snapshot gate predecessors are still settling");
                 if (accepted==null && snapshotRetryIdentityBusy(request.operation(),request.fence())) throw new IllegalStateException("Snapshot control identity belongs to other work");
-                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
                 long transferred=accepted==null ? 0 : accepted.hold.bytes;
                 if (encoded.length>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes+transferred
                         || !request.isRelease() && (snapshotInstallOwners+snapshotAdmittedInstalls-(accepted==null ? 0 : 1)>=8
@@ -995,7 +1007,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         if (RatisParticipantRecord.isParticipant(encoded)) {
             var preparation=RatisParticipantRecord.decode(encoded); commandValidator.accept(preparation.business());
-            var record=store.applyPrepared(positionArg,preparation);
+            var record=RatisParticipantRecord.isNegative(encoded) ? store.applyRejected(positionArg,preparation) : store.applyPrepared(positionArg,preparation);
             return new AppliedRecord(preparation.operation(),RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded); commandValidator.accept(command);
@@ -1013,6 +1025,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         if (RatisParticipantRecord.isParticipant(encoded)) {
             var preparation=RatisParticipantRecord.decode(encoded); var record=store.recoveredPreparationVote(preparation);
+            if (RatisParticipantRecord.isNegative(encoded) && record!=null && record.prepared()) throw new IOException("Negative preparation has contradictory positive native coverage");
             return new AppliedRecord(preparation.operation(),record==null ? null : RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded);
@@ -1094,6 +1107,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (!admissions.remove(admission.id,admission)) return;
         releaseRetention(admission); releaseFootprint(admission);
         admittedBytes-=admission.bytes;
+        if (admission.negativePayload!=null) releaseNegativePayload(admission.negativePayload);
         if (admission.snapshot!=null) { snapshotAdmittedBytes-=admission.bytes; if (!admission.snapshot.isRelease()) { snapshotAdmittedInstalls--; snapshotInstallAdmittedBytes-=admission.bytes; } }
         if (admission.protectedControl) protectedAdmissions--; else { dataAdmissions--; dataProposalBytes-=admission.bytes; }
     }
@@ -1108,7 +1122,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var hold=preparing.hold();
             if (hold.transaction.equals(finalization.transactionId()) && hold.business.equals(finalization.decision().operation())
                     && (hold.preparation==null || matchesFinalization(finalization,hold.preparation))) {
-                proposalFootprints.release(preparing.reservation().lease); finishParticipantHold(hold,true);
+                hold.invalidated=true; if (preparing.reservation()!=null) proposalFootprints.release(preparing.reservation().lease); finishParticipantHold(hold,true);
             }
         }
         for (var admission:admissions.values()) if (admission.participant!=null && matchesFinalization(finalization,admission.participant)) retirePreparationScope(admission);
@@ -1138,7 +1152,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if (admission.snapshot!=null) { if (admission.snapshot.receipt(pin.snapshotGate(admission.snapshot.fence()))!=null) verified.add(admission); }
                     else if (admission.finalization!=null) { if (pin.finalizationPosition(admission.finalization)!=null) verified.add(admission); }
                     else if (admission.participant==null) { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
-                    else { var vote=pin.preparationVote(admission.participant); if (vote!=null) verified.add(admission); else if (pin.finalizedPreparation(admission.participant)) terminalScopes.add(admission); }
+                    else { var vote=pin.preparationVote(admission.participant); if (admission.participantNegative && vote!=null && vote.prepared()) throw new IllegalArgumentException("Negative preparation contradicts positive proof"); if (vote!=null) verified.add(admission); else if (pin.finalizedPreparation(admission.participant)) terminalScopes.add(admission); }
                 }
                 catch (IllegalArgumentException differentPayload) { /* A mismatched speculative request is not verified coverage. */ }
             }
@@ -1151,8 +1165,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         proposalFootprints.invalidateCandidates();
         for (var plan:preparedCommits.values()) { plan.closed=true; preparedCommitBytes-=plan.bytes; }
         preparedCommits.clear();
-        for (var plan:preparedParticipants.values()) { plan.closed=true; preparedCommitBytes-=plan.bytes.length; releaseParticipantHold(plan.hold); }
+        for (var plan:preparedParticipants.values()) { plan.closed=true; if (!plan.negative) preparedCommitBytes-=plan.bytes.length; releaseParticipantHold(plan.hold); }
         preparedParticipants.clear();
+        for (var preparing:preparingParticipants.values()) preparing.hold().invalidated=true;
         for (var plan:List.copyOf(preparedFinalizations.values())) plan.close();
         for (var plan:List.copyOf(preparedSnapshots.values())) plan.close();
         for (var hold:preparingSnapshots.values()) { hold.invalidated=true; if (hold.lease!=null) proposalFootprints.release(hold.lease); }
@@ -1237,7 +1252,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (ready!=null && ready.finalization.transactionId().equals(transaction) && ready.authorized()) return borrowedFinalization(ready.hold,ready.finalization);
             var known=admissions.get(recovery);
             if (known!=null && known.finalization!=null && known.finalization.transactionId().equals(transaction) && known.term==leader.term() && known.generation==generation) return borrowedFinalization(known.finalizationHold,known.finalization);
-            if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+            if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
             if (participantIdentityBusy(recovery) || finalizingTransactions.containsKey(transaction)) throw new IllegalStateException("Finalization identity/transaction is already owned");
             hold=new FinalizationHold(transaction,recovery,leader.term(),generation); preparingFinalizations.put(recovery,hold); finalizingTransactions.put(transaction,hold); finalizationOwners.put(recovery,hold); protectedFinalizationSlots++;
         }
@@ -1260,7 +1275,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         if (shared.preparation!=null) finalization.requirePreparation(shared.preparation);
                     }
                     if (estimate.newFence()) {
-                        if (shared!=null && !shared.capacityReleased) { shared.finalizers++; hold.shared=shared; }
+                        if (shared!=null && !shared.capacityReleased) { shared.finalizers++; if (shared.payload!=null) shared.payload.references++; hold.shared=shared; }
                         else {
                             if (capacity.count()+reservedParticipantCount+reservedFinalizationCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || ReplicatedRangeStore.FINALIZATION_RESERVATION>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes-reservedFinalizationBytes) throw new IllegalStateException("Finalization fence reservation exhausted");
                             hold.capacity=true; reservedFinalizationCount++; reservedFinalizationBytes+=ReplicatedRangeStore.FINALIZATION_RESERVATION;
@@ -1292,7 +1307,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 var accepted=estimate.existing()==null ? preparedFinalizations.get(finalization.operation()) : null;
                 if (estimate.existing()==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Finalization has no fresh home acceptance authority");
-                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
                 var admission=new Admission(finalization.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,true,null,null,null);
                 admission.finalization=finalization; admission.finalizationHold=accepted==null ? null : accepted.hold; admissions.put(admission.id,admission);
                 if (accepted!=null) { accepted.claimed=true; preparedFinalizations.remove(admission.id,accepted); protectedFinalizationSlots--; }
@@ -1306,25 +1321,38 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     public final class ParticipantProposal implements AutoCloseable {
         private final ProposalReservation reservation; private final ParticipantHold hold;
         private final PreparedParticipant.Preparation preparation; private final byte[] bytes,digest; private final ProposalDeadline deadline;
+        private final boolean negative;
         private boolean claimed,closed;
-        private ParticipantProposal(ProposalReservation reservation,ParticipantHold hold,PreparedParticipant.Preparation preparation,ProposalDeadline deadline) {
-            this.reservation=reservation; this.hold=hold; this.preparation=preparation; this.deadline=deadline;
-            bytes=RatisParticipantRecord.encode(preparation); digest=RatisParticipantRecord.digest(preparation);
+        private ParticipantProposal(ProposalReservation reservation,ParticipantHold hold,PreparedParticipant.Preparation preparation,ProposalDeadline deadline,boolean negative) {
+            this.reservation=reservation; this.hold=hold; this.preparation=preparation; this.deadline=deadline; this.negative=negative;
+            bytes=RatisParticipantRecord.encode(preparation,negative); digest=RatisParticipantRecord.digest(preparation,negative);
         }
-        private boolean authorized() { return !closed && !claimed && reservation.active() && (deadline==null || deadline.active()); }
+        private boolean authorized() {
+            var a=store.applied();
+            return !closed && !claimed && hold!=null && !hold.invalidated && !hold.released && (negative ? hold.generation==admissionGeneration.get() && a!=null && a.term()==hold.term && store.admissionOpen() : reservation!=null && reservation.active()) && (deadline==null || deadline.active());
+        }
+        public boolean negative() { return negative; }
         public PreparedParticipant.Preparation preparation() { return preparation; }
         public byte[] bytes() { return bytes.clone(); }
         @Override public void close() {
             synchronized (admissions) {
                 if (closed || claimed) return; closed=true;
-                if (preparedParticipants.remove(preparation.operation(),this)) preparedCommitBytes-=bytes.length;
-                releaseParticipantHold(hold); proposalFootprints.release(reservation.lease);
+                if (preparedParticipants.remove(preparation.operation(),this) && !negative) preparedCommitBytes-=bytes.length;
+                releaseParticipantHold(hold); if (reservation!=null) proposalFootprints.release(reservation.lease);
             }
         }
     }
+    private void releaseNegativePayload(NegativePayload payload) {
+        if (--payload.references==0) negativeInputBytes-=payload.bytes;
+    }
+    public long negativeParticipantInputBytes() { synchronized (admissions) { return negativeInputBytes; } }
+    public int negativeParticipantSlots() { synchronized (admissions) { return protectedNegativeSlots; } }
     private void releaseParticipantHold(ParticipantHold hold) { releaseParticipantHold(hold,false); }
     private void releaseParticipantHold(ParticipantHold hold,boolean covered) {
-        hold.released=true; finishParticipantHold(hold,covered);
+        if (hold.released) return; hold.released=true;
+        if (hold.negativeSlot) { hold.negativeSlot=false; protectedNegativeSlots--; }
+        if (hold.payload!=null && !hold.transferred) releaseNegativePayload(hold.payload);
+        finishParticipantHold(hold,covered);
     }
     private void finishParticipantHold(ParticipantHold hold,boolean covered) {
         if (!hold.capacityReleased && (covered || hold.released && hold.finalizers==0)) {
@@ -1336,7 +1364,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (hold.released) return; hold.released=true;
         finalizationOwners.remove(hold.recovery,hold); if (hold.business!=null) finalizationOwners.remove(hold.business,hold); finalizingTransactions.remove(hold.transaction,hold);
         if (hold.capacity) { reservedFinalizationCount--; reservedFinalizationBytes-=ReplicatedRangeStore.FINALIZATION_RESERVATION; }
-        if (hold.shared!=null) { var shared=hold.shared; hold.shared=null; shared.finalizers--; finishParticipantHold(shared,covered); }
+        if (hold.shared!=null) { var shared=hold.shared; hold.shared=null; shared.finalizers--; if (shared.payload!=null) releaseNegativePayload(shared.payload); finishParticipantHold(shared,covered); }
     }
     private boolean participantIdentityBusy(OperationId id) {
         return snapshotControlCharges.containsKey(id) || finalizationOwners.containsKey(id) || participantOwners.containsKey(id) || admissions.containsKey(id) || preparedCommits.containsKey(id) || preparingCommits.containsKey(id);
@@ -1364,12 +1392,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             reconcileOlderProposalTerms(leader.term()); var ready=preparedParticipants.get(control);
             if (ready!=null && ready.authorized()) {
                 requireParticipantImage(transaction,accepted,ready.preparation);
-                var view=new ParticipantProposal(ready.reservation,ready.hold,ready.preparation,ready.deadline); view.claimed=true; return view;
+                var view=new ParticipantProposal(ready.reservation,ready.hold,ready.preparation,ready.deadline,ready.negative); view.claimed=true; return view;
             }
             var known=admissions.get(control);
             if (known!=null && known.participant!=null && known.term==leader.term() && known.generation==generation) {
                 requireParticipantImage(transaction,accepted,known.participant);
-                var view=new ParticipantProposal(known.acceptedScope==null ? null : new ProposalReservation(known.acceptedScope),known.participantHold,known.participant,null); view.claimed=true; return view;
+                var view=new ParticipantProposal(known.acceptedScope==null ? null : new ProposalReservation(known.acceptedScope),known.participantHold,known.participant,null,known.participantNegative); view.claimed=true; return view;
             }
             throw new RatisPreparationUnavailableException("No live acceptance for the original participant read cut");
         }
@@ -1377,62 +1405,101 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private static void requireParticipantImage(UUID transaction,DistributedCommand accepted,PreparedParticipant.Preparation preparation) {
         if (!transaction.equals(preparation.transactionId()) || !Arrays.equals(DistributedCommandCodec.encode(accepted),DistributedCommandCodec.encode(preparation.business()))) throw new IllegalArgumentException("Participant image differs from frozen acceptance");
     }
-    /** Privileged coordinator seam: verifies the committed home registration, then freezes/reserves one accepted participant plan. */
-    public ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,
-            RatisTransactionStatuses homes,UUID transaction) throws Exception {
+    /** Claims scope/identities at one cut. Gate rejection has protected input and no candidate lease. */
+    private PreparingParticipant reserveParticipant(TransactionScope scope,OperationId business,OperationId control,UUID transaction,boolean rejectionOnly,ProposalDeadline deadline) throws Exception {
+        requireHealthy(); long generation=admissionGeneration.get(); var leader=leadership();
+        if (!leader.ready()) throw new IllegalStateException("Participant leader is not ready");
+        var footprint=proposalFootprints.prepare(scope); long scopeBytes=RangeMutationHistory.accountedScopeBytes(scope);
+        for (int attempt=0;attempt<3;attempt++) {
+            var observed=store.rejectionCapacity(transaction); var capacity=observed.capacity(); var gateCut=store.gateConflict(scope);
+            synchronized (admissions) {
+                requireHealthy(); var a=store.applied();
+                if (generation!=admissionGeneration.get() || a==null || a.term()!=leader.term() || !store.admissionOpen() || deadline!=null && !deadline.active()) throw new IllegalStateException("Participant owner changed");
+                if (!java.util.Objects.equals(a,capacity.position()) || !java.util.Objects.equals(a,gateCut.position())) continue;
+                reconcileOlderProposalTerms(leader.term());
+                if (participantIdentityBusy(control) || participantIdentityBusy(business)) throw new IllegalStateException("Participant operation identity is already owned");
+                boolean negative=gateCut.blocked() || proposalFootprints.gated(footprint);
+                if (rejectionOnly && !negative) throw new RatisPreparationUnavailableException("No gate authorizes this negative preparation");
+                boolean reserve=!negative || observed.newParticipant();
+                long bytes=negative ? ReplicatedRangeStore.FINALIZATION_RESERVATION : 49L+PreparedParticipant.Preparation.MAX_BYTES+ReplicatedRangeStore.FINALIZATION_RESERVATION;
+                long ownedScope=negative ? 0 : scopeBytes;
+                if (reserve && (capacity.count()+reservedParticipantCount+reservedFinalizationCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || bytes>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes-reservedFinalizationBytes)
+                        || ownedScope>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.scopeBytes()-reservedParticipantScopeBytes) throw new IllegalStateException("Participant staged capacity exhausted");
+                if (negative ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-negativeInputBytes
+                        : DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Participant input budget exhausted");
+                ProposalReservation reservation=null;
+                if (!negative) { var lease=proposalFootprints.reserveCandidate(footprint,leader.term(),generation); if (lease==null) throw new IllegalStateException("Participant scope overlaps in-flight work"); reservation=new ProposalReservation(lease); }
+                var payload=negative ? new NegativePayload(DistributedCommandCodec.MAX_ENCODED_BYTES) : null;
+                var hold=new ParticipantHold(transaction,control,business,reserve ? bytes : 0,ownedScope,leader.term(),generation,payload,reserve);
+                var preparing=new PreparingParticipant(reservation,hold); preparingParticipants.put(control,preparing); participantOwners.put(control,hold); participantOwners.put(business,hold);
+                if (reserve) { reservedParticipantCount++; reservedParticipantBytes+=bytes; reservedParticipantScopeBytes+=ownedScope; }
+                if (negative) { protectedNegativeSlots++; negativeInputBytes+=payload.bytes; } else preparedCommitBytes+=DistributedCommandCodec.MAX_ENCODED_BYTES;
+                return preparing;
+            }
+        }
+        throw new IllegalStateException("Native cut kept changing during participant admission");
+    }
+    public ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,RatisTransactionStatuses homes,UUID transaction) throws Exception {
         return prepareParticipant(pin,business,control,homes,transaction,null);
     }
-    ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,
-            RatisTransactionStatuses homes,UUID transaction,ProposalDeadline deadline) throws Exception {
+    ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,RatisTransactionStatuses homes,UUID transaction,ProposalDeadline deadline) throws Exception {
         java.util.Objects.requireNonNull(pin); java.util.Objects.requireNonNull(control); commandValidator.accept(business);
         if (control.equals(business.operationId())) throw new IllegalArgumentException("Prepare control identity must differ from business identity");
-        var reservation=reserveProposalScope(pin.scope()); if (reservation==null) throw new IllegalStateException("Participant scope overlaps in-flight work");
-        PreparingParticipant preparing=null; boolean retained=false;
-        try {
-            for (int attempt=0;attempt<3 && preparing==null;attempt++) {
-                var capacity=store.preparedCapacity();
-                synchronized (admissions) {
-                    requireHealthy(); if (!reservation.active() || deadline!=null && !deadline.active() || pin.position().term()!=reservation.term()) throw new IllegalStateException("Participant owner expired or changed term");
-                    if (!java.util.Objects.equals(capacity.position(),store.applied())) continue;
-                    if (participantIdentityBusy(control) || participantIdentityBusy(business.operationId())) throw new IllegalStateException("Participant operation identity is already owned");
-                    long scope=RangeMutationHistory.accountedScopeBytes(pin.scope()), maximum=49L+PreparedParticipant.Preparation.MAX_BYTES+ReplicatedRangeStore.FINALIZATION_RESERVATION;
-                    if (capacity.count()+reservedParticipantCount+reservedFinalizationCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || maximum>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes-reservedFinalizationBytes
-                            || scope>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.scopeBytes()-reservedParticipantScopeBytes
-                            || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Participant staged capacity exhausted");
-                    var hold=new ParticipantHold(transaction,control,business.operationId(),maximum,scope); preparing=new PreparingParticipant(reservation,hold);
-                    preparingParticipants.put(control,preparing); participantOwners.put(control,hold); participantOwners.put(hold.business,hold);
-                    reservedParticipantCount++; reservedParticipantBytes+=maximum; reservedParticipantScopeBytes+=scope; preparedCommitBytes+=DistributedCommandCodec.MAX_ENCODED_BYTES;
-                }
-            }
-            if (preparing==null) throw new IllegalStateException("Native cut kept changing during participant admission");
+        var preparing=reserveParticipant(pin.scope(),business.operationId(),control,transaction,false,deadline);
+        return finishParticipantPreparation(preparing,homes,transaction,pin,deadline,() -> {
+            if (pin.position().term()!=preparing.hold().term) throw new IllegalStateException("Original participant pin changed term");
+            if (preparing.hold().payload!=null) return participantIntent(pin,business);
             if (!store.estimateReceiptRetention(business,enableSessionControls).newReceipt()) throw new IllegalStateException("Business operation already has an outcome");
-            var homeRead=homes.readRegistration(transaction); var registration=homeRead.status(); if (registration==null || registration.phase()!=TransactionStatus.Phase.PREPARING) throw new IllegalStateException("Home has no active frozen registration");
-            var accepted=store.planScopedCommit(pin,business,reservation.generation(),transactionIncarnation); commandValidator.accept(accepted);
-            var home=homeRead.descriptor();
-            var preparation=new PreparedParticipant.Preparation(home.groupId(),home.rangeEpoch(),control,registration,accepted);
-            store.estimatePreparation(preparation); // Reject an unbound/fenced control owner before closing the caller's read cut.
-            var plan=new ParticipantProposal(reservation,preparing.hold(),preparation,deadline);
-            synchronized (admissions) { preparing.hold().preparation=preparation; }
-            pin.close();
+            return store.planScopedCommit(pin,business,preparing.hold().generation,transactionIncarnation);
+        });
+    }
+    /** Reject a frozen original plan under current gate authority without reopening or rebasing its read cut. */
+    public ParticipantProposal prepareParticipantRejection(DistributedCommand accepted,OperationId control,RatisTransactionStatuses homes,UUID transaction) throws Exception {
+        java.util.Objects.requireNonNull(accepted); java.util.Objects.requireNonNull(control);
+        if (accepted.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || control.equals(accepted.operationId())) throw new IllegalArgumentException("Expected a frozen accepted plan and separate control");
+        commandValidator.accept(accepted); store.validate(accepted);
+        var preparing=reserveParticipant(accepted.acceptance().scope(),accepted.operationId(),control,transaction,true,null);
+        return finishParticipantPreparation(preparing,homes,transaction,null,null,() -> accepted);
+    }
+    private ParticipantProposal finishParticipantPreparation(PreparingParticipant preparing,RatisTransactionStatuses homes,UUID transaction,ReplicatedRangeStore.ScopedHistoryPin pin,ProposalDeadline deadline,java.util.concurrent.Callable<DistributedCommand> plan) throws Exception {
+        var hold=preparing.hold(); boolean negative=hold.payload!=null,retained=false;
+        try {
+            var homeRead=homes.readRegistration(transaction); var registration=homeRead.status();
+            if (registration==null || registration.phase()!=TransactionStatus.Phase.PREPARING) throw new IllegalStateException("Home has no active frozen registration");
+            var accepted=plan.call(); commandValidator.accept(accepted); var home=homeRead.descriptor();
+            var preparation=new PreparedParticipant.Preparation(home.groupId(),home.rangeEpoch(),hold.control,registration,accepted);
+            if (negative) { var estimate=store.estimateRejection(preparation); if (estimate.existing()!=null && estimate.existing().prepared()) throw new IllegalStateException("Positive preparation cannot become a negative vote"); }
+            else store.estimatePreparation(preparation);
+            var proposal=new ParticipantProposal(preparing.reservation(),hold,preparation,deadline,negative);
+            synchronized (admissions) { hold.preparation=preparation; }
+            if (pin!=null) pin.close();
             synchronized (admissions) {
-                requireHealthy(); if (!plan.authorized() || preparingParticipants.get(control)!=preparing) throw new IllegalStateException("Participant lost acceptance ownership");
-                long actual=49L+preparation.encode().length+ReplicatedRangeStore.FINALIZATION_RESERVATION;
-                if (!plan.hold.capacityReleased) reservedParticipantBytes+=actual-plan.hold.bytes; plan.hold.bytes=actual;
-                preparedCommitBytes+=plan.bytes.length-DistributedCommandCodec.MAX_ENCODED_BYTES;
-                preparedParticipants.put(control,plan); preparingParticipants.remove(control,preparing);
+                requireHealthy(); if (!proposal.authorized() || preparingParticipants.get(hold.control)!=preparing) throw new IllegalStateException("Participant lost acceptance ownership");
+                if (negative) { negativeInputBytes+=proposal.bytes.length-hold.payload.bytes; hold.payload.bytes=proposal.bytes.length; }
+                else {
+                    long actual=49L+preparation.encode().length+ReplicatedRangeStore.FINALIZATION_RESERVATION;
+                    if (!hold.capacityReleased) reservedParticipantBytes+=actual-hold.bytes; hold.bytes=actual;
+                    preparedCommitBytes+=proposal.bytes.length-DistributedCommandCodec.MAX_ENCODED_BYTES;
+                }
+                preparedParticipants.put(hold.control,proposal); preparingParticipants.remove(hold.control,preparing); retained=true; return proposal;
             }
-            retained=true; return plan;
         } finally {
             synchronized (admissions) {
-                if (preparing!=null && preparingParticipants.remove(control,preparing)) { preparedCommitBytes-=DistributedCommandCodec.MAX_ENCODED_BYTES; releaseParticipantHold(preparing.hold()); }
+                if (!retained && preparingParticipants.remove(hold.control,preparing)) {
+                    if (!negative) preparedCommitBytes-=DistributedCommandCodec.MAX_ENCODED_BYTES; releaseParticipantHold(hold);
+                }
             }
-            if (!retained) reservation.close();
+            if (!retained && preparing.reservation()!=null) preparing.reservation().close();
         }
     }
     private TransactionContext startParticipant(TransactionContext transaction,byte[] encoded,long generation,Leadership leadership) throws Exception {
-        var preparation=RatisParticipantRecord.decode(encoded); commandValidator.accept(preparation.business()); byte[] digest=RatisParticipantRecord.digest(preparation);
+        var preparation=RatisParticipantRecord.decode(encoded); boolean negative=RatisParticipantRecord.isNegative(encoded); commandValidator.accept(preparation.business()); byte[] digest=RatisParticipantRecord.digest(preparation,negative);
         for (int attempt=0;attempt<3;attempt++) {
-            var estimate=store.estimatePreparation(preparation); var observed=estimate.capacity().position();
+            var estimate=negative ? store.estimateRejection(preparation) : null;
+            var positive=negative ? null : store.estimatePreparation(preparation);
+            var observed=negative ? estimate.capacity().position() : positive.capacity().position();
+            var existing=negative ? estimate.existing() : positive.existing();
+            if (negative && existing!=null && existing.prepared()) throw new IllegalStateException("Positive preparation cannot become a negative vote");
             if (observed==null || observed.term()!=leadership.term()) throw new IllegalStateException("Participant native prefix is not ready");
             synchronized (admissions) {
                 requireHealthy(); if (generation!=admissionGeneration.get() || !store.admissionOpen()) throw new IllegalStateException("Participant owner changed");
@@ -1440,21 +1507,27 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 reconcileOlderProposalTerms(leadership.term());
                 var known=admissions.get(preparation.operation());
                 if (known!=null && !Arrays.equals(known.digest,digest)) throw new IllegalArgumentException("Prepare operation payload changed");
-                if (known!=null && estimate.existing()!=null) { settleAdmission(known); known=admissions.get(preparation.operation()); }
+                if (known!=null && existing!=null) { settleAdmission(known); known=admissions.get(preparation.operation()); }
                 if (known!=null) {
                     if (known.participant==null || known.term!=leadership.term() || known.generation!=generation) throw new IllegalStateException("Previous prepare admission is still settling");
                     known.owners++; transaction.setStateMachineContext(known); return transaction;
                 }
-                var accepted=estimate.existing()==null ? preparedParticipants.get(preparation.operation()) : null;
-                if (estimate.existing()==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Prepare has no current acceptance authority; resolve through its home");
-                if (dataAdmissions>=1024 || encoded.length>16L*1024*1024-dataProposalBytes) throw new IllegalStateException("Participant input budget exhausted");
-                var admission=new Admission(preparation.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,false,null,accepted==null ? null : accepted.reservation.lease,null);
-                admission.participant=preparation; admission.participantHold=accepted==null ? null : accepted.hold;
+                var accepted=existing==null ? preparedParticipants.get(preparation.operation()) : null;
+                if (existing==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Prepare has no current acceptance authority; resolve through its home");
+                if (negative ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots-(accepted==null ? 0 : 1)>=16 || accepted==null && encoded.length>8L*1024*1024-negativeInputBytes
+                        : dataAdmissions>=1024 || encoded.length>16L*1024*1024-dataProposalBytes) throw new IllegalStateException("Participant input budget exhausted");
+                var admission=new Admission(preparation.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,negative,null,accepted==null || accepted.reservation==null ? null : accepted.reservation.lease,null);
+                admission.participant=preparation; admission.participantNegative=negative; admission.participantHold=accepted==null ? null : accepted.hold;
+                if (negative) {
+                    admission.negativePayload=accepted==null ? new NegativePayload(encoded.length) : accepted.hold.payload;
+                    if (accepted==null) negativeInputBytes+=encoded.length;
+                    else { accepted.hold.transferred=true; accepted.hold.negativeSlot=false; protectedNegativeSlots--; }
+                }
                 admissions.put(admission.id,admission);
                 if (accepted!=null) {
-                    proposalFootprints.submit(accepted.reservation.lease); accepted.claimed=true; preparedParticipants.remove(admission.id,accepted); preparedCommitBytes-=accepted.bytes.length;
+                    if (accepted.reservation!=null) proposalFootprints.submit(accepted.reservation.lease); accepted.claimed=true; preparedParticipants.remove(admission.id,accepted); if (!negative) preparedCommitBytes-=accepted.bytes.length;
                 }
-                admittedBytes+=admission.bytes; dataAdmissions++; dataProposalBytes+=admission.bytes;
+                admittedBytes+=admission.bytes; if (negative) protectedAdmissions++; else { dataAdmissions++; dataProposalBytes+=admission.bytes; }
                 transaction.setStateMachineContext(admission); return transaction;
             }
         }

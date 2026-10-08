@@ -131,27 +131,32 @@ public final class RatisRoutedClient implements AutoCloseable {
         finally { endCall(); }
     }
     public static final class PreparedParticipantOperation {
-        private final RangeDirectory source; private final RangeDescriptor descriptor; private final PreparedParticipant.Preparation preparation; private final byte[] bytes;
-        private PreparedParticipantOperation(RangeDirectory source,RangeDescriptor descriptor,PreparedParticipant.Preparation preparation) { this.source=source; this.descriptor=descriptor; this.preparation=preparation; bytes=RatisParticipantRecord.encode(preparation); }
-        public RangeDescriptor descriptor() { return descriptor; } public PreparedParticipant.Preparation preparation() { return preparation; } public byte[] bytes() { return bytes.clone(); }
+        private final RangeDirectory source; private final RangeDescriptor descriptor; private final PreparedParticipant.Preparation preparation; private final boolean negative; private final byte[] bytes;
+        private PreparedParticipantOperation(RangeDirectory source,RangeDescriptor descriptor,PreparedParticipant.Preparation preparation,boolean negative) { this.source=source; this.descriptor=descriptor; this.preparation=preparation; this.negative=negative; bytes=RatisParticipantRecord.encode(preparation,negative); }
+        public RangeDescriptor descriptor() { return descriptor; } public PreparedParticipant.Preparation preparation() { return preparation; } public boolean negative() { return negative; } public byte[] bytes() { return bytes.clone(); }
     }
     /** Freeze and durably retain this operation before the first participant write RPC. No route or identity is regenerated on retry. */
-    public PreparedParticipantOperation prepareParticipant(PreparedParticipant.Preparation preparation) {
+    public PreparedParticipantOperation prepareParticipant(PreparedParticipant.Preparation preparation) { return prepareParticipant(preparation,false); }
+    public PreparedParticipantOperation prepareParticipant(PreparedParticipant.Preparation preparation,boolean negative) {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(preparation.business().groupId())).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route is absent"));
-        return restoreParticipant(preparation,descriptor);
+        return restoreParticipant(preparation,descriptor,negative);
     }
-    public PreparedParticipantOperation restoreParticipant(PreparedParticipant.Preparation preparation,RangeDescriptor descriptor) {
+    public PreparedParticipantOperation restoreParticipant(PreparedParticipant.Preparation preparation,RangeDescriptor descriptor) { return restoreParticipant(preparation,descriptor,false); }
+    public PreparedParticipantOperation restoreParticipant(PreparedParticipant.Preparation preparation,RangeDescriptor descriptor,boolean negative) {
         var observed=current();
         var registered=preparation.registration().participants().stream().filter(p -> p.groupId().equals(descriptor.groupId())).findFirst().orElseThrow();
         if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || descriptor.rangeEpoch()!=preparation.business().rangeEpoch() || !registered.rangeId().equals(descriptor.rangeId())
                 || !Arrays.equals(observed.schemaDigest(),preparation.business().schemaDigest()) || !observed.domainId().equals(preparation.registration().domainId())
                 || !observed.clusterId().equals(preparation.registration().clusterId()) || !observed.databaseId().equals(preparation.registration().databaseId())) throw new IllegalArgumentException("Participant route differs from frozen registration");
         restoreSessionCommand(preparation.business(),descriptor);
-        return new PreparedParticipantOperation(identity,descriptor,preparation);
+        return new PreparedParticipantOperation(identity,descriptor,preparation,negative);
     }
     public ParticipantVote executeParticipant(PreparedParticipantOperation operation) throws IOException {
         java.util.Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
-        try { return RatisParticipantRecord.result(transport.participant(operation.descriptor,operation.bytes)); }
+        try {
+            var vote=RatisParticipantRecord.result(transport.participant(operation.descriptor,operation.bytes));
+            if (operation.negative && vote.prepared()) throw new IllegalArgumentException("Negative PREPARE returned a positive vote"); return vote;
+        }
         catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant vote reply",invalid); }
         finally { endCall(); }
     }

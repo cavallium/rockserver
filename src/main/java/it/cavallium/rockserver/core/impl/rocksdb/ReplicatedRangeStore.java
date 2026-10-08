@@ -661,6 +661,12 @@ public final class ReplicatedRangeStore {
         try { requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
         finally { applyLane.unlock(); leaveNative(); }
     }
+    public record GateConflict(ApplyPosition position,boolean blocked) {}
+    public GateConflict gateConflict(TransactionScope scope) {
+        Objects.requireNonNull(scope); enterNative(); applyLane.lock();
+        try { requireActive(); validateSnapshotScope(scope); return new GateConflict(applied,gated(scope)); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
     private boolean gated(TransactionScope scope) { return snapshotGates.values().stream().anyMatch(gate -> gate.active() && gate.fence().participant(groupId).scope().intersects(scope)); }
     private void requireUngated(TransactionScope scope) { if (gated(scope)) throw new IllegalStateException("Write scope intersects an active snapshot gate"); }
     private void requireGateOperation(OperationId id) { for (var gate:snapshotGates.values()) if (gate.ownsOperation(id)) throw new IllegalArgumentException("Operation identity belongs to snapshot gate"); }
@@ -893,6 +899,37 @@ public final class ReplicatedRangeStore {
         enterNative(); applyLane.lock();
         try { requireActive(); return preparedCapacityUnderLane(); }
         finally { applyLane.unlock(); leaveNative(); }
+    }
+    public record RejectionCapacity(PreparedCapacity capacity,boolean newParticipant) {}
+    public record RejectionEstimate(PreparedCapacity capacity,ParticipantVote existing,boolean newParticipant) {}
+    private boolean newParticipant(UUID transaction) {
+        return !abortedIndex.containsKey(transaction) && !rejectedIndex.containsKey(transaction) && !committedIndex.containsKey(transaction)
+                && preparedIndex.records().stream().noneMatch(p -> p.preparation().transactionId().equals(transaction));
+    }
+    public RejectionCapacity rejectionCapacity(UUID transaction) {
+        Objects.requireNonNull(transaction); enterNative(); applyLane.lock();
+        try { requireActive(); return new RejectionCapacity(preparedCapacityUnderLane(),newParticipant(transaction)); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Negative votes retain compact metadata, never acquire a scope, and cannot replace positive evidence. */
+    public RejectionEstimate estimateRejection(PreparedParticipant.Preparation preparation) throws RocksDBException {
+        Objects.requireNonNull(preparation); enterNative(); applyLane.lock();
+        try {
+            requireActive(); requirePreparation(preparation,true); var capacity=preparedCapacityUnderLane();
+            for (var prepared:preparedIndex.records()) if (prepared.preparation().transactionId().equals(preparation.transactionId())) {
+                if (!prepared.preparation().equals(preparation)) throw new IllegalArgumentException("Prepared transaction payload changed");
+                return new RejectionEstimate(capacity,ParticipantVote.prepared(prepared.position()),false);
+            }
+            var saved=rejectedIndex.get(preparation.transactionId());
+            if (saved!=null) { saved.requirePreparation(preparation); return new RejectionEstimate(capacity,ParticipantVote.negative(),false); }
+            requireNegativeIdentity(preparation); var abort=abortedIndex.get(preparation.transactionId());
+            if (abort!=null) abort.finalization().requirePreparation(preparation);
+            if (applied==null || applied.index()==Long.MAX_VALUE || preparation.business().acceptance().snapshot().index()>applied.index()
+                    || preparation.business().acceptance().snapshot().term()>applied.term()) throw new IllegalStateException("Rejection cannot follow its original cut");
+            boolean additional=newParticipant(preparation.transactionId());
+            if (additional && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("Rejected preparation capacity exhausted");
+            return new RejectionEstimate(capacity,null,additional);
+        } finally { applyLane.unlock(); leaveNative(); }
     }
     /** Native checks and quota observation from one completed cut, before entering the adapter admission monitor. */
     public PreparationEstimate estimatePreparation(PreparedParticipant.Preparation preparation) throws RocksDBException {

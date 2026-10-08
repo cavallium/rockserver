@@ -153,6 +153,10 @@ public final class ProposalFootprints {
         capacity(footprint,true); var lease=new CandidateLease(this,footprint,term,generation);
         candidateIndex.add(footprint); candidates.add(lease); account(footprint,1); return lease;
     }
+    public boolean gated(PreparedFootprint footprint) {
+        if (footprint==null || footprint.owner!=this) throw new IllegalArgumentException("Foreign proposal footprint");
+        return gateIndex.overlaps(footprint);
+    }
     /** Reserve before checking drainage, under the same caller lock as ordinary/candidate admission. */
     public GateLease reserveGate(PreparedFootprint footprint,long term,long generation) {
         require(footprint,term,generation);

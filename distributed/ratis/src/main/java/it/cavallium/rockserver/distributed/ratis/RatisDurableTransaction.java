@@ -114,7 +114,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
         if (!entry.intent.route().equals(operation.descriptor())) throw new IllegalArgumentException("Preparation route differs from frozen intent");
         var expected=preparation(entry.intent,registration);
         if (entry.preparation!=null) { if (!Arrays.equals(entry.preparation.bytes(),operation.bytes())) throw new IllegalArgumentException("Preparation request changed"); return; }
-        entry.registration=registration; entry.preparation=data.restoreParticipant(expected,entry.intent.route()); persist();
+        if (operation.negative() && (entry.vote!=null && entry.vote.prepared() || entry.outcome!=null && entry.outcome.vote()!=null && entry.outcome.vote().prepared())) throw new IllegalArgumentException("Negative PREPARE contradicts positive native proof");
+        entry.registration=registration; entry.preparation=data.restoreParticipant(expected,entry.intent.route(),operation.negative()); persist();
     }
     public ParticipantVote executePreparation(UUID group) throws IOException {
         Entry entry;
@@ -213,6 +214,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         } finally { synchronized (this) { active=false; } }
     }
     private void mergeVote(Entry entry,ParticipantVote vote) throws IOException {
+        if (vote.prepared() && entry.preparation!=null && entry.preparation.negative()) throw new IOException("Positive native proof contradicts frozen negative PREPARE");
         if (entry.vote!=null && !entry.vote.equals(vote)) throw new IOException("Participant vote changed"); entry.vote=vote;
     }
     private void mergeOutcome(Entry entry,ParticipantOutcome outcome) throws IOException {
@@ -343,7 +345,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         for (var entry:entries.values()) {
             var intent=entry.intent;
             SessionWindowJournal.route(output,intent.route()); blob(output,DistributedCommandCodec.encode(intent.acceptedBusiness())); operation(output,intent.prepareControl()); operation(output,intent.finalizeControl());
-            blob(output,entry.registration==null ? null : entry.registration.encode()); output.put((byte)(entry.preparation==null ? 0 : 1)); vote(output,entry.vote); blob(output,entry.finalization==null ? null : entry.finalization.finalization().encode()); position(output,entry.receipt);
+            blob(output,entry.registration==null ? null : entry.registration.encode()); output.put((byte)(entry.preparation==null ? 0 : entry.preparation.negative() ? 2 : 1)); vote(output,entry.vote); blob(output,entry.finalization==null ? null : entry.finalization.finalization().encode()); position(output,entry.receipt);
             output.put((byte)(entry.outcome==null ? 0 : 1));
             if (entry.outcome!=null) { blob(output,entry.outcome.finalization().encode()); output.putLong(entry.outcome.position().term()).putLong(entry.outcome.position().index()); vote(output,entry.outcome.vote()); }
         }
@@ -370,11 +372,12 @@ public final class RatisDurableTransaction implements AutoCloseable {
                 if (entries.putIfAbsent(route.groupId(),entry)!=null) throw new IOException("Duplicate journal participant");
                 byte[] registration=blob(input,TransactionStatus.MAX_BYTES,true); entry.registration=registration==null ? null : TransactionStatus.decode(registration);
                 if (entry.registration!=null) requirePreparation(entry,preparation(intent,entry.registration));
-                if (flag(input)) {
+                int preparationKind=input.get() & 255; if (preparationKind>2) throw new IOException("Invalid frozen PREPARE kind");
+                if (preparationKind!=0) {
                     if (entry.registration==null) throw new IOException("Frozen preparation has no registration");
-                    entry.preparation=data.restoreParticipant(preparation(intent,entry.registration),route);
+                    entry.preparation=data.restoreParticipant(preparation(intent,entry.registration),route,preparationKind==2);
                 }
-                entry.vote=vote(input); byte[] finalization=blob(input,ParticipantFinalization.MAX_BYTES,true);
+                var savedVote=vote(input); if (savedVote!=null) mergeVote(entry,savedVote); byte[] finalization=blob(input,ParticipantFinalization.MAX_BYTES,true);
                 if (finalization!=null) entry.finalization=data.restoreFinalization(ParticipantFinalization.decode(finalization),route);
                 entry.receipt=position(input);
                 if (flag(input)) {

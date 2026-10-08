@@ -22,7 +22,7 @@ class RatisTransactionCoordinatorTest {
                 try { token=f.data.f.machine.prepareParticipant(f.pin,f.data.f.put(2),intent.prepareControl(),f.home.statuses,tx); }
                 catch (IllegalStateException expired) { throw new RatisPreparationUnavailableException("Original read cut unavailable",expired); }
             }
-            return new RatisTransactionCoordinator.Authorization(token.preparation(),token);
+            return new RatisTransactionCoordinator.Authorization(token.preparation(),token.negative(),token);
         } catch (IOException e) { throw e; } catch (Exception e) { throw new IOException(e); }
     }
     RatisTransactionCoordinator coordinator(RatisTransactionRecoveryTest.Fixture f) throws IOException {
@@ -146,7 +146,7 @@ class RatisTransactionCoordinatorTest {
                     try {
                         try { token=node.f.machine.reattachParticipant(tx,p.intent().prepareControl(),p.intent().acceptedBusiness()); }
                         catch (RatisPreparationUnavailableException absent) { if (p.preparation()!=null) throw absent; token=node.f.machine.prepareParticipant(isLeft ? lp : rp,isLeft ? lb : rb,p.intent().prepareControl(),home.statuses,tx); }
-                        return new RatisTransactionCoordinator.Authorization(token.preparation(),token);
+                        return new RatisTransactionCoordinator.Authorization(token.preparation(),token.negative(),token);
                     } catch (IOException e) { throw e; } catch (Exception e) { throw new IOException(e); }
                 },(g,t,c) -> { try { var node=g.equals(l.groupId()) ? left : right; var token=node.f.machine.prepareFinalization(home.statuses,t,c); return new RatisTransactionRecovery.Authorization(token.finalization(),token); } catch (Exception e) { throw new IOException(e); } })) {
                     left.wire.lose=true; int lost=0; boolean partial=false,complete=false;
@@ -185,6 +185,25 @@ class RatisTransactionCoordinatorTest {
                     var step=coordinator.step(); assertEquals(RatisTransactionCoordinator.Action.ACK_ATTEMPTED,step.action()); assertTrue(step.complete()); assertFalse(f.journal.snapshot().observedHome().consumed());
                 }
             }
+        }
+    }
+
+    @Test void snapshotGateAuthorityFreezesANegativePrepareThenAbortsOnTheFollowingStep() throws Exception {
+        fixtures.root=root;
+        try (var f=fixtures.new Fixture("negative-gate"); var coordinator=coordinator(f)) {
+            coordinator.step();
+            var group=f.data.f.groupId;
+            var gate=new SnapshotFence(fixtures.helper.cluster,fixtures.helper.database,f.data.directory.domainId(),new UUID(0,3010),new UUID(0,3011),1,0,1,new byte[32],
+                    List.of(new SnapshotFence.Participant(group,group,1,new byte[32],new OperationId(new UUID(0,3012),1,0),new OperationId(new UUID(0,3012),1,1),fixtures.helper.scope(f.data,1,4))));
+            var install=RatisSnapshotRecord.install(gate,group);
+            f.data.f.machine.applyTransaction(RatisSnapshotRecordTest.committed(f.data.f.machine,1,1,install)).get(5,TimeUnit.SECONDS); f.data.wire.index=1;
+            long before=f.home.wire.index+f.data.wire.index;
+            assertEquals(RatisTransactionCoordinator.Action.PREPARATION_REJECTED,coordinator.step().action()); assertEquals(1,f.home.wire.index+f.data.wire.index-before);
+            var progress=f.journal.snapshot().participant(group); assertTrue(progress.preparation().negative()); assertTrue(RatisParticipantRecord.isNegative(progress.preparation().bytes())); assertEquals(ParticipantVote.negative(),progress.vote());
+            assertEquals(TransactionStatus.Phase.PREPARING,f.journal.snapshot().observedHome().phase());
+            assertEquals(RatisTransactionCoordinator.Action.ABORT_ATTEMPTED,coordinator.step().action()); drain(f,coordinator);
+            var home=f.journal.snapshot().observedHome(); assertEquals(TransactionStatus.Phase.ABORT,home.phase()); assertTrue(home.fullyFinalized()); assertFalse(home.consumed());
+            assertEquals(ParticipantVote.negative(),f.journal.snapshot().participant(group).outcome().vote()); assertEquals(0,f.data.f.store.preparedParticipantCount()); assertNull(f.data.routed.read(f.data.f.column,new byte[]{2})); fixtures.helper.released(f.data);
         }
     }
 
