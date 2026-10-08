@@ -32,12 +32,12 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
     private boolean active,closed;
 
     public RatisTransactionCoordinator(RatisDurableTransaction journal,RatisTransactionStatuses homes,RatisRoutedClient data,
-            RatisTransactionRecovery.ControlIds controls,PreparationAuthority authority,RatisTransactionRecovery.FinalizationAuthority finalizations) throws IOException {
+            RatisTransactionRecovery.ControlIds controls,PreparationAuthority authority) throws IOException {
         this.journal=Objects.requireNonNull(journal); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
         this.controls=Objects.requireNonNull(controls); this.authority=Objects.requireNonNull(authority);
         journal.requireClients(homes,data);
         participants=journal.snapshot().initial().participants().stream().map(TransactionStatus.Participant::groupId).toList();
-        terminal=new RatisTransactionRecovery(journal,homes,data,controls,Objects.requireNonNull(finalizations));
+        terminal=new RatisTransactionRecovery(journal,homes,data,controls);
     }
     /** One active step, at most one transaction write; an unavailable participant does not starve later participants. */
     public Step step() throws IOException {

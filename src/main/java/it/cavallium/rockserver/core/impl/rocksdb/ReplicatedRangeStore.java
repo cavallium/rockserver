@@ -673,7 +673,7 @@ public final class ReplicatedRangeStore {
         if (committed!=null) { var receipt=CommittedParticipant.decode(committed); actual=receipt.finalization(); position=receipt.position(); }
         else { var receipt=AbortedParticipant.decode(aborted); actual=receipt.finalization(); position=receipt.position(); }
         requireFinalization(actual);
-        if (!actual.equals(expected) || cut==null || position.index()>cut.index() || position.term()>cut.term()) throw new IllegalArgumentException("Native finalization proof differs");
+        if (!actual.equals(expected) || cut==null || position.index()>cut.index() || position.term()>cut.term() || position.index()==cut.index() && position.term()!=cut.term()) throw new IllegalArgumentException("Native finalization proof differs");
         return position;
     }
     private boolean isFinalized(UUID transaction) { return abortedIndex.containsKey(transaction) || committedIndex.containsKey(transaction); }

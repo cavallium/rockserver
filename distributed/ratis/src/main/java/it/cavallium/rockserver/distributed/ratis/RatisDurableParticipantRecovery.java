@@ -13,7 +13,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private static final long MAX_ROUTES=16L*1024*1024;
     private static final int MAGIC=0x50524a4c;
     public record Snapshot(PreparedParticipant prepared,RangeDescriptor participantRoute,RangeDescriptor homeRoute,TransactionStatus observedHome,
-            RatisRoutedClient.PreparedCommand pendingHome,CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,OperationId finalizeControl,
+            RatisRoutedClient.PreparedCommand pendingHome,CommandResult homeResult,boolean homeSuperseded,OperationId finalizeControl,
             RatisRoutedClient.PreparedFinalizationOperation finalization,ApplyPosition finalizationReceipt,ParticipantOutcome outcome,
             RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery,HomeRecoveryReceipt recoveryReceipt) {}
     private final Path path;
@@ -28,9 +28,9 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private RatisRoutedClient.PreparedCommand pending;
     private CommandResult homeResult;
     private boolean homeSuperseded,active,closed,fenced;
-    private OperationId lastHome,finalizeControl;
+    private OperationId finalizeControl;
     private UUID recoveryNamespace=UUID.randomUUID();
-    private long recoverySequence;
+    private long recoverySequence=1;
     private RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery;
     private HomeRecoveryReceipt recoveryReceipt;
     private RatisRoutedClient.PreparedFinalizationOperation finalization;
@@ -38,11 +38,11 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private ParticipantOutcome outcome;
 
     public static RatisDurableParticipantRecovery create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,PreparedParticipant nativePrepared,
-            RangeDescriptor participantRoute,OperationId initialHomeControl,OperationId finalizeControl) throws IOException {
+            RangeDescriptor participantRoute) throws IOException {
         var journal=new RatisDurableParticipantRecovery(path,homes,data,true);
         try {
             journal.prepared=Objects.requireNonNull(nativePrepared); journal.participantRoute=Objects.requireNonNull(participantRoute);
-            journal.lastHome=Objects.requireNonNull(initialHomeControl); journal.finalizeControl=Objects.requireNonNull(finalizeControl); journal.definition=definition(nativePrepared.preparation().registration());
+            journal.finalizeControl=new OperationId(journal.recoveryNamespace,0,0); journal.definition=definition(nativePrepared.preparation().registration());
             data.restoreParticipant(nativePrepared.preparation(),participantRoute);
             journal.requireControls();
             var actual=data.preparedParticipant(nativePrepared.preparation().business().groupId(),nativePrepared.preparation().transactionId());
@@ -72,7 +72,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     synchronized void requireClients(RatisTransactionStatuses expectedHomes,RatisRoutedClient expectedData) throws IOException {
         requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,Objects.requireNonNull(expectedData).sessionIdentityDigest())) throw new IllegalArgumentException("Participant recovery clients differ from journal binding");
     }
-    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(prepared,participantRoute,homeRoute,observed,pending,homeResult,homeSuperseded,lastHome,finalizeControl,finalization,receipt,outcome,pendingRecovery,recoveryReceipt); }
+    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(prepared,participantRoute,homeRoute,observed,pending,homeResult,homeSuperseded,finalizeControl,finalization,receipt,outcome,pendingRecovery,recoveryReceipt); }
     public TransactionStatus refreshHome() throws IOException {
         synchronized (this) { idle(); active=true; }
         try {
@@ -192,7 +192,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     }
     private void requireControls() {
         var preparation=prepared.preparation();
-        if (preparation.ownsOperation(finalizeControl) || preparation.ownsOperation(lastHome) || finalizeControl.equals(lastHome)) throw new IllegalArgumentException("Participant recovery controls overlap retained business/prepare identities");
+        if (preparation.ownsOperation(finalizeControl)) throw new IllegalArgumentException("Participant recovery controls overlap retained business/prepare identities");
     }
     private void requireHomeRoute(RangeDescriptor route) {
         if (!homeRoute.rangeId().equals(route.rangeId()) || !homeRoute.groupId().equals(route.groupId()) || homeRoute.rangeEpoch()!=route.rangeEpoch()
@@ -220,8 +220,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     }
     private void capacity() throws IOException {
         requireControls();
-        if (recoverySequence<0 || recoveryNamespace.equals(lastHome.sessionId()) || recoveryNamespace.equals(finalizeControl.sessionId())
-                || recoveryNamespace.equals(prepared.preparation().operation().sessionId()) || recoveryNamespace.equals(prepared.preparation().business().operationId().sessionId())) throw new IOException("Invalid protected recovery namespace");
+        if (recoverySequence<1 || !finalizeControl.equals(new OperationId(recoveryNamespace,0,0)) || recoveryNamespace.equals(prepared.preparation().operation().sessionId()) || recoveryNamespace.equals(prepared.preparation().business().operationId().sessionId())) throw new IOException("Invalid protected recovery namespace");
         data.restoreParticipant(prepared.preparation(),participantRoute);
         if (!homeRoute.groupId().equals(prepared.preparation().homeGroup()) || homeRoute.rangeEpoch()!=prepared.preparation().homeEpoch()) throw new IOException("Participant recovery home binding changed");
         monotone(definition,prepared.preparation().registration());
@@ -233,7 +232,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     /** Preparation/registration/business bytes occur once; later home images and native terminal proofs are compact. */
     private byte[] encode() throws IOException {
         var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(MAGIC); out.write(identity); out.write(homeIdentity); blob(out,prepared.encode());
-        route(out,participantRoute); route(out,homeRoute); operation(out,lastHome); operation(out,finalizeControl); uuid(out,recoveryNamespace); out.writeLong(recoverySequence); status(out,observed);
+        route(out,participantRoute); route(out,homeRoute); uuid(out,recoveryNamespace); out.writeLong(recoverySequence); status(out,observed);
         out.writeByte(pending==null ? 0 : 2);
         if (pending!=null) {
             route(out,pending.descriptor()); var command=pending.command(); uuid(out,command.mutations().getFirst().columnId()); out.write(command.schemaDigest()); operation(out,command.operationId()); out.writeLong(command.acknowledgedThrough());
@@ -252,7 +251,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
             byte[] bound=new byte[32],homeBound=new byte[32]; in.get(bound).get(homeBound);
             if (!Arrays.equals(identity,bound) || !Arrays.equals(homeIdentity,homeBound)) throw new IOException("Participant recovery client identity changed");
             prepared=PreparedParticipant.decode(blob(in,16+PreparedParticipant.Preparation.MAX_BYTES)); definition=definition(prepared.preparation().registration());
-            participantRoute=SessionWindowJournal.route(in); homeRoute=SessionWindowJournal.route(in); lastHome=operation(in); finalizeControl=operation(in); recoveryNamespace=uuid(in); recoverySequence=in.getLong();
+            participantRoute=SessionWindowJournal.route(in); homeRoute=SessionWindowJournal.route(in); recoveryNamespace=uuid(in); finalizeControl=new OperationId(recoveryNamespace,0,0); recoverySequence=in.getLong();
             var home=status(in); if (home==null) throw new IOException("Participant recovery journal lacks existing home"); observe(home);
             int homeKind=in.get() & 255; if (homeKind!=0 && homeKind!=2) throw new IOException("Invalid participant recovery home kind");
             if (homeKind==2) {
@@ -264,7 +263,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
                 if (flag(in)) { UUID participant=uuid(in); var position=positionValue(in); byte[] digest=new byte[32]; in.get(digest); proof=new HomeRecovery.Proof(participant,position,digest); }
                 var command=new DistributedCommand(route.groupId(),route.rangeEpoch(),schema,operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,before.encode())),ack);
                 pendingRecovery=homes.restoreRecovery(new HomeRecovery(proof==null ? HomeRecovery.Action.ABORT : HomeRecovery.Action.ACK,command,proof),route); pending=pendingRecovery.command();
-                if (!operation.sessionId().equals(recoveryNamespace) || operation.epoch()!=0 || recoverySequence<=0 || operation.sequence()!=recoverySequence-1) throw new IOException("Participant protected high-water identity changed"); monotone(before,observed);
+                if (!operation.sessionId().equals(recoveryNamespace) || operation.epoch()!=0 || recoverySequence<=1 || operation.sequence()<1 || operation.sequence()!=recoverySequence-1) throw new IOException("Participant protected high-water identity changed"); monotone(before,observed);
             }
             var recoveryPosition=position(in);
             int result=in.get() & 255; if (result>CommandResult.Status.values().length) throw new IOException("Invalid participant home result kind");

@@ -12,17 +12,13 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisParticipantRecoveryTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final RatisSnapshotCoordinatorTest helper=new RatisSnapshotCoordinatorTest();
-    OperationId nextHome(OperationId last) { return helper.control(Math.max(42,last.sequence()+1)); }
     RatisSnapshotCoordinatorTest.Fixture fixture(String name) throws Exception { helper.root=root; return helper.new Fixture(name); }
     RatisDurableParticipantRecovery create(Path path,RatisSnapshotCoordinatorTest.Fixture f,UUID transaction) throws Exception {
         var prepared=f.data.preparedParticipant(f.right.f.groupId,transaction);
-        return RatisDurableParticipantRecovery.create(path,f.transactions.statuses,f.data,prepared,f.directory.ranges().getLast(),helper.control(40),helper.control(41));
+        return RatisDurableParticipantRecovery.create(path,f.transactions.statuses,f.data,prepared,f.directory.ranges().getLast());
     }
     RatisParticipantRecovery recovery(RatisDurableParticipantRecovery journal,RatisSnapshotCoordinatorTest.Fixture f,boolean takeover) throws Exception {
-        return new RatisParticipantRecovery(journal,f.transactions.statuses,f.data,this::nextHome,(group,tx,control) -> {
-            try { var proposal=f.node(group).f.machine.prepareFinalization(f.transactions.statuses,tx,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
-            catch (Exception failure) { throw new IOException(failure); }
-        },takeover);
+        return new RatisParticipantRecovery(journal,f.transactions.statuses,f.data,takeover);
     }
     void drain(RatisParticipantRecovery recovery,RatisSnapshotCoordinatorTest.Fixture f) throws Exception {
         boolean complete=false;
@@ -50,15 +46,12 @@ class RatisParticipantRecoveryTest {
         Path path=root.resolve("typed-local-ack.journal");
         try (var f=fixture("typed-local-ack")) {
             f.committedTransactionWithRightStillPrepared(); RatisRoutedClient.PreparedHomeRecoveryOperation frozen; HomeRecoveryReceipt nativeReceipt;
-            try (var journal=create(path,f,helper.tx); var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,f.data,last -> { throw new AssertionError("Local recovery must not allocate ordinary HOME controls"); },(group,tx,control) -> {
-                try { var proposal=f.node(group).f.machine.prepareFinalization(f.transactions.statuses,tx,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
-                catch (Exception failure) { throw new IOException(failure); }
-            },false)) {
+            try (var journal=create(path,f,helper.tx); var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,f.data,false)) {
                 assertEquals(RatisParticipantRecovery.Action.FINALIZED,recovery.step().action());
-                var ordinary=journal.snapshot().lastHome();
+                var finalize=journal.snapshot().finalizeControl(); assertEquals(0,finalize.epoch()); assertEquals(0,finalize.sequence());
                 f.transactions.wire.command(f.transactions.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(f.transactions.f.groupId,1,new byte[32],new OperationId(f.transactions.f.admin,2,0),2));
                 f.transactions.wire.lose=true; assertThrows(IOException.class,recovery::step); frozen=journal.snapshot().pendingRecovery();
-                assertEquals(0,frozen.recovery().operation().epoch()); assertEquals(ordinary,journal.snapshot().lastHome()); assertNull(journal.snapshot().recoveryReceipt());
+                assertEquals(0,frozen.recovery().operation().epoch()); assertEquals(finalize.sessionId(),frozen.recovery().operation().sessionId()); assertEquals(1,frozen.recovery().operation().sequence()); assertNull(journal.snapshot().recoveryReceipt());
                 nativeReceipt=f.transactions.statuses.recoveryResult(frozen); assertNotNull(nativeReceipt);
             }
             try (var journal=RatisDurableParticipantRecovery.reopen(path,f.transactions.statuses,f.data)) {
@@ -100,14 +93,12 @@ class RatisParticipantRecoveryTest {
             };
             try (var data=new RatisRoutedClient(f.directory,transport)) {
                 var prepared=data.preparedParticipant(f.right.f.groupId,helper.tx);
-                try (var journal=RatisDurableParticipantRecovery.create(path,f.transactions.statuses,data,prepared,f.directory.ranges().getLast(),helper.control(40),helper.control(41));
-                        var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,data,this::nextHome,(g,t,c) -> {
-                            try { var proposal=f.node(g).f.machine.prepareFinalization(f.transactions.statuses,t,c); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); } catch (Exception failure) { throw new IOException(failure); }
-                        },false)) {
+                try (var journal=RatisDurableParticipantRecovery.create(path,f.transactions.statuses,data,prepared,f.directory.ranges().getLast());
+                        var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,data,false)) {
                     assertThrows(IOException.class,recovery::step); assertNotNull(journal.snapshot().finalizationReceipt()); assertNull(journal.snapshot().outcome());
                 }
                 try (var journal=RatisDurableParticipantRecovery.reopen(path,f.transactions.statuses,data);
-                        var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,data,this::nextHome,(g,t,c) -> { throw new AssertionError("Forced receipt only needs native lookup"); },false)) {
+                        var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,data,false)) {
                     drain(recovery,f); assertNotNull(journal.snapshot().outcome());
                 }
             }
@@ -120,15 +111,22 @@ class RatisParticipantRecoveryTest {
             var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
-                public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return f.node(route.groupId()).wire.transaction(route,bytes,fresh); }
+                public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
+                    var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+                    if (packet.kind()==ScopedTransactionRpc.FINALIZATION_PREPARE) {
+                        var value=RatisParticipantRecord.decodeFinalization(packet.body());
+                        return ScopedTransactionRpc.frame(packet.kind(),java.nio.ByteBuffer.allocate(40).putInt(32).put(RatisParticipantRecord.digest(value)).putInt(-1).array());
+                    }
+                    return f.node(route.groupId()).wire.transaction(route,bytes,fresh);
+                }
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException {
                     try { f.finalize(f.right,helper.control(7)); } catch (Exception failure) { throw new IOException(failure); }
                     var position=f.right.f.store.committedParticipant(helper.tx).position(); return RatisParticipantRecord.result(position);
                 }
             };
             try (var data=new RatisRoutedClient(f.directory,transport)) {
-                try (var journal=RatisDurableParticipantRecovery.create(path,f.transactions.statuses,data,prepared,f.directory.ranges().getLast(),helper.control(40),helper.control(41))) {
-                    var finalization=new ParticipantFinalization(f.transactions.f.groupId,1,f.right.f.groupId,helper.control(41),journal.snapshot().observedHome());
+                try (var journal=RatisDurableParticipantRecovery.create(path,f.transactions.statuses,data,prepared,f.directory.ranges().getLast())) {
+                    var finalization=new ParticipantFinalization(f.transactions.f.groupId,1,f.right.f.groupId,journal.snapshot().finalizeControl(),journal.snapshot().observedHome());
                     journal.freezeFinalization(data.restoreFinalization(finalization,f.directory.ranges().getLast()));
                     assertThrows(IOException.class,journal::executeFinalization); assertNotNull(journal.snapshot().finalizationReceipt()); assertNull(journal.snapshot().outcome());
                 }
@@ -224,7 +222,7 @@ class RatisParticipantRecoveryTest {
             };
             try (var client=new RatisRoutedClient(f.transactions.directory,transport)) {
                 var homes=new RatisTransactionStatuses(client,f.transactions.f.column);
-                assertThrows(IOException.class,() -> RatisDurableParticipantRecovery.create(root.resolve("absent.journal"),homes,f.data,prepared,f.directory.ranges().getLast(),helper.control(40),helper.control(41)));
+                assertThrows(IOException.class,() -> RatisDurableParticipantRecovery.create(root.resolve("absent.journal"),homes,f.data,prepared,f.directory.ranges().getLast()));
                 assertEquals(before,f.writes());
             }
         }
@@ -235,7 +233,7 @@ class RatisParticipantRecoveryTest {
             f.committedTransactionWithRightStillPrepared();
             try (var journal=create(path,f,helper.tx)) { f.finalize(f.right,helper.control(7)); }
             try (var journal=RatisDurableParticipantRecovery.reopen(path,f.transactions.statuses,f.data);
-                    var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,f.data,this::nextHome,(g,t,c) -> { throw new AssertionError("Native terminal proof needs no write authority"); },false)) {
+                    var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,f.data,false)) {
                 drain(recovery,f); assertEquals(helper.control(7),journal.snapshot().outcome().finalization().operation()); assertNull(journal.snapshot().finalization());
             }
         }
@@ -247,7 +245,7 @@ class RatisParticipantRecoveryTest {
             try (var journal=create(path,f,helper.tx)) {
                 var home=journal.snapshot().observedHome(); var prepared=journal.snapshot().prepared();
                 var forged=new PreparedParticipant(prepared.preparation(),new ApplyPosition(prepared.position().term(),prepared.position().index()+1));
-                assertThrows(IOException.class,() -> RatisDurableParticipantRecovery.create(root.resolve("forged.journal"),f.transactions.statuses,f.data,forged,f.directory.ranges().getLast(),helper.control(40),helper.control(41)));
+                assertThrows(IOException.class,() -> RatisDurableParticipantRecovery.create(root.resolve("forged.journal"),f.transactions.statuses,f.data,forged,f.directory.ranges().getLast()));
                 assertThrows(IOException.class,() -> RatisDurableParticipantRecovery.reopen(path,f.transactions.statuses,f.data));
                 assertThrows(IllegalArgumentException.class,() -> journal.queueRecovery(home.finalized(f.right.f.groupId)));
                 f.finalize(f.right,helper.control(7)); assertNotNull(journal.resolveParticipant());

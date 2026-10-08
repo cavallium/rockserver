@@ -3,7 +3,6 @@ package it.cavallium.rockserver.distributed.ratis;
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.io.IOException;
 import java.nio.file.*;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -13,19 +12,9 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisParticipantRecoveryRegistryTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final RatisSnapshotCoordinatorTest helper=new RatisSnapshotCoordinatorTest();
-    final java.util.concurrent.atomic.AtomicInteger allocations=new java.util.concurrent.atomic.AtomicInteger();
     RatisSnapshotCoordinatorTest.Fixture fixture(String name) throws Exception { helper.root=root; return helper.new Fixture(name); }
-    RatisParticipantRecoveryRegistry.ControlIdsFactory controls() {
-        return (group,tx) -> {
-            allocations.incrementAndGet(); UUID session=UUID.nameUUIDFromBytes((group+"/"+tx).getBytes(StandardCharsets.UTF_8));
-            return new RatisParticipantRecoveryRegistry.Controls(new OperationId(session,3,0),new OperationId(session,3,1),last -> new OperationId(last.sessionId(),last.epoch(),Math.max(2,last.sequence()+1)));
-        };
-    }
     RatisParticipantRecoveryRegistry registry(Path path,RatisSnapshotCoordinatorTest.Fixture f,boolean takeover,RatisParticipantRecoveryRegistry.Limits limits) throws Exception {
-        return new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,f.data,controls(),(group,tx,control) -> {
-            try { var proposal=f.node(group).f.machine.prepareFinalization(f.transactions.statuses,tx,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
-            catch (Exception failure) { throw new IOException(failure); }
-        },takeover,Set.of(f.left.f.groupId,f.right.f.groupId),limits);
+        return new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,f.data,takeover,Set.of(f.left.f.groupId,f.right.f.groupId),limits);
     }
     @Test void helperCreatesDurableWorkerAndRestartRetainsCompletedProofWithoutPolling() throws Exception {
         Path path=Files.createDirectory(root.resolve("completed"));
@@ -33,13 +22,13 @@ class RatisParticipantRecoveryRegistryTest {
             f.committedTransactionWithRightStillPrepared(); var prepared=f.data.preparedParticipant(f.right.f.groupId,helper.tx); long bytes;
             try (var registry=registry(path,f,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024))) {
                 long before=f.writes(); assertTrue(registry.step(f.right.f.groupId,prepared)); assertEquals(1,f.writes()-before);
-                assertEquals(1,registry.stats().openWorkers()); assertEquals(1,registry.stats().persistedFiles()); assertEquals(1,allocations.get());
+                assertEquals(1,registry.stats().openWorkers()); assertEquals(1,registry.stats().persistedFiles());
                 assertEquals(1,registry.cycle(1)); assertEquals(0,registry.stats().openWorkers()); bytes=registry.stats().reservedBytes(); assertTrue(bytes>0 && bytes<RatisDurableParticipantRecovery.MAX_BYTES);
                 assertFalse(f.transactions.statuses.read(helper.tx).fullyFinalized());
             }
             try (var registry=registry(path,f,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024))) {
                 registry.discover(); long before=f.writes(); for (int n=0;n<4;n++) registry.cycle(1);
-                assertEquals(0,registry.stats().openWorkers()); assertEquals(1,registry.stats().persistedFiles()); assertEquals(bytes,registry.stats().reservedBytes()); assertEquals(before,f.writes()); assertEquals(1,allocations.get());
+                assertEquals(0,registry.stats().openWorkers()); assertEquals(1,registry.stats().persistedFiles()); assertEquals(bytes,registry.stats().reservedBytes()); assertEquals(before,f.writes());
                 assertArrayEquals(new byte[]{8},f.data.read(helper.column,new byte[]{(byte)130}));
             }
         }
@@ -106,9 +95,11 @@ class RatisParticipantRecoveryRegistryTest {
     @Test void unpublishedAdmissionFailureDoesNotConsumeThePersistentFileBudget() throws Exception {
         Path path=Files.createDirectory(root.resolve("unpublished"));
         try (var f=fixture("unpublished")) {
-            f.committedTransactionWithRightStillPrepared(); UUID other=f.anotherPreparedRight(); var real=controls();
-            try (var registry=new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,f.data,(group,tx) -> { if (tx.equals(helper.tx)) throw new IOException("Temporarily unavailable control allocator"); return real.create(group,tx); },(g,t,c) -> { throw new AssertionError("No terminal decision yet"); },false,Set.of(f.right.f.groupId),new RatisParticipantRecoveryRegistry.Limits(1,1,RatisDurableParticipantRecovery.MAX_BYTES))) {
+            f.committedTransactionWithRightStillPrepared(); UUID other=f.anotherPreparedRight();
+            try (var registry=new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,f.data,false,Set.of(f.right.f.groupId),new RatisParticipantRecoveryRegistry.Limits(1,1,RatisDurableParticipantRecovery.MAX_BYTES))) {
+                f.transactions.wire.readFailure=new IOException("Qualified HOME read unavailable");
                 long before=f.writes(); assertThrows(IOException.class,() -> registry.step(f.right.f.groupId,f.data.preparedParticipant(f.right.f.groupId,helper.tx)));
+                f.transactions.wire.readFailure=null;
                 assertEquals(0,registry.stats().persistedFiles()); assertEquals(0,registry.stats().openWorkers()); assertEquals(0,registry.stats().reservedBytes());
                 assertFalse(registry.step(f.right.f.groupId,f.data.preparedParticipant(f.right.f.groupId,other))); assertEquals(1,registry.stats().persistedFiles()); assertEquals(before,f.writes());
             }

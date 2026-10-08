@@ -180,6 +180,10 @@ class RatisParticipantFinalizeTest {
                     public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { throw new IOException("Unused"); }
                     public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { throw new IOException("Unused"); }
                     public byte[] participant(RangeDescriptor route,byte[] bytes) { return RatisParticipantRecord.result(reply.get()); }
+                    public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
+                        assertTrue(fresh); assertEquals(ScopedTransactionRpc.FINALIZATION_PREPARE,ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind());
+                        return ScopedTransactionRpc.frame(ScopedTransactionRpc.FINALIZATION_PREPARE,java.nio.ByteBuffer.allocate(40).putInt(32).put(RatisParticipantRecord.digest(finalization)).putInt(-1).array());
+                    }
                 };
                 try (var routed=new RatisRoutedClient(data.directory,transport)) {
                     var operation=routed.prepareFinalization(finalization); assertThrows(IOException.class,() -> routed.executeFinalization(operation));

@@ -11,16 +11,14 @@ public final class RatisParticipantRecovery implements AutoCloseable {
     private final RatisDurableParticipantRecovery journal;
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
-    private final RatisTransactionRecovery.ControlIds controls;
-    private final RatisTransactionRecovery.FinalizationAuthority authority;
     private final boolean takeover;
     private boolean active,closed;
 
     /** takeover authorizes new ABORT attempts; previously frozen requests are resolved regardless of this policy. */
     public RatisParticipantRecovery(RatisDurableParticipantRecovery journal,RatisTransactionStatuses homes,RatisRoutedClient data,
-            RatisTransactionRecovery.ControlIds controls,RatisTransactionRecovery.FinalizationAuthority authority,boolean takeover) throws IOException {
+            boolean takeover) throws IOException {
         this.journal=Objects.requireNonNull(journal); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
-        this.controls=Objects.requireNonNull(controls); this.authority=Objects.requireNonNull(authority); this.takeover=takeover; journal.requireClients(homes,data);
+        this.takeover=takeover; journal.requireClients(homes,data);
     }
     /** One synchronous CONTROL quantum, at most one state-changing RPC; clients and journal are borrowed. */
     public Step step() throws IOException {
@@ -41,9 +39,8 @@ public final class RatisParticipantRecovery implements AutoCloseable {
             snapshot=journal.snapshot();
             // A forced append receipt only needs native proof lookup; it must not require new write authority.
             if (snapshot.finalizationReceipt()!=null) { journal.executeFinalization(); return result(Action.VERIFIED); }
-            try (var grant=Objects.requireNonNull(authority.authorize(group,home.transactionId(),snapshot.finalizeControl()))) {
-                journal.freezeFinalization(data.restoreFinalization(grant.value(),snapshot.participantRoute())); journal.executeFinalization();
-            } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Participant finalization authority failed",failure); }
+            var value=new ParticipantFinalization(snapshot.homeRoute().groupId(),snapshot.homeRoute().rangeEpoch(),group,snapshot.finalizeControl(),home);
+            journal.freezeFinalization(data.restoreFinalization(value,snapshot.participantRoute())); journal.executeFinalization();
             return result(Action.FINALIZED);
         }
         if (!home.participants().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow().finalized()) return transition(snapshot,home.finalized(group),Action.ACK_ATTEMPTED);

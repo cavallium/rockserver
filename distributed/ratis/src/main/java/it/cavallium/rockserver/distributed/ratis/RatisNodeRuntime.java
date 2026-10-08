@@ -39,10 +39,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     || shutdownTimeout.compareTo(Duration.ofMinutes(1))>0) throw new IllegalArgumentException("Invalid node resource/lifecycle settings");
         }
     }
-    public record RecoverySettings(RatisTransactionStatuses homes,RatisParticipantRecoveryRegistry.ControlIdsFactory controls,
-                                   boolean takeover,RatisParticipantRecoveryRegistry.Limits limits,Duration period,int visits) {
+    public record RecoverySettings(RatisTransactionStatuses homes,boolean takeover,RatisParticipantRecoveryRegistry.Limits limits,Duration period,int visits) {
         public RecoverySettings {
-            Objects.requireNonNull(homes); Objects.requireNonNull(controls); Objects.requireNonNull(limits); Objects.requireNonNull(period);
+            Objects.requireNonNull(homes); Objects.requireNonNull(limits); Objects.requireNonNull(period);
             if (period.isNegative() || period.isZero() || period.compareTo(Duration.ofMinutes(1))>0 || visits<1 || visits>32) throw new IllegalArgumentException("Invalid participant recovery settings");
         }
     }
@@ -55,7 +54,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final List<RatisSessionPropagation> propagations=new ArrayList<>();
     private final Map<RatisNodePlan.Role,RatisRoutedClient> homeClients=new EnumMap<>(RatisNodePlan.Role.class);
     private RatisTransactionExpiryService transactionExpiry;
-    private final RecoverySettings recoverySettings;
+    private RecoverySettings recoverySettings;
     private RatisParticipantRecoveryRegistry participantRecoveries;
     private RatisTransactionRecoveryService participantRecoveryService;
     private RatisNativeParticipantDiscovery nativeParticipantDiscovery;
@@ -127,6 +126,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory) throws IOException {
         Objects.requireNonNull(startup); Objects.requireNonNull(factory);
         if (!Files.isDirectory(root)) throw new IOException("Node root must already exist on durable storage");
+        for (var home:plan.homes()) {
+            var client=Objects.requireNonNull(homeFactory.connect(home.directory())); homeClients.put(home.role(),client);
+            if (!Arrays.equals(client.directory().payloadDigest(),home.directory().payloadDigest())) throw new IllegalArgumentException("HOME client differs from declared placement");
+        }
+        var transactionPlan=plan.home(RatisNodePlan.Role.TRANSACTION_HOME);
+        if (recoverySettings==null && transactionPlan!=null) recoverySettings=new RecoverySettings(new RatisTransactionStatuses(homeClients.get(transactionPlan.role()),transactionPlan.column()),false,RatisParticipantRecoveryRegistry.Limits.defaults(),Duration.ofSeconds(1),4);
+        RatisTransactionStatuses transactionHomes=recoverySettings==null ? null : recoverySettings.homes();
         lockChannel=FileChannel.open(root.resolve("node.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
         try { lock=lockChannel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Node root already owned",owned); }
         if (lock==null) throw new IOException("Node root already owned");
@@ -158,7 +164,6 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 if (!allowed.contains(group)) throw new IOException("Unplanned persisted Raft group "+group);
             }
         }
-        for (var home:plan.homes()) homeClients.put(home.role(),homeFactory.connect(home.directory()));
         RatisSnapshotFences captureHomes=snapshotHomes;
         var snapshotPlan=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME);
         if (snapshotPlan!=null) {
@@ -190,20 +195,16 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.homeRecoveryData(routed); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
                     }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
-                    else { machine.role(role); if (captureHomes!=null) machine.snapshotHomes(captureHomes); }
+                    else { machine.role(role); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) machine.transactionHomes(transactionHomes); }
                 }
                 machines.put(group.getGroupId(),machine);
             }
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
         server=factory.create(plan,logs,Collections.unmodifiableMap(machines));
         transactionExpiry=new RatisTransactionExpiryService(scheduler,machines.entrySet().stream().filter(entry -> plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA).map(Map.Entry::getValue).toList(),32);
-        if (recoverySettings!=null) {
-            var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (plan.role(id.getUuid())==RatisNodePlan.Role.DATA) local.add(id.getUuid());
-            participantRecoveries=new RatisParticipantRecoveryRegistry(root.resolve("recovery"),recoverySettings.homes(),routed,recoverySettings.controls(),(group,transaction,control) -> {
-                var machine=machines.get(RaftGroupId.valueOf(group)); if (machine==null || !local.contains(group)) throw new IOException("Participant recovery is outside local DATA groups");
-                try { var proposal=machine.prepareFinalization(recoverySettings.homes(),transaction,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
-                catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Local participant recovery authority unavailable",failure); }
-            },recoverySettings.takeover(),local,recoverySettings.limits());
+        var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (plan.role(id.getUuid())==RatisNodePlan.Role.DATA) local.add(id.getUuid());
+        if (recoverySettings!=null && !local.isEmpty()) {
+            participantRecoveries=new RatisParticipantRecoveryRegistry(root.resolve("recovery"),recoverySettings.homes(),routed,recoverySettings.takeover(),local,recoverySettings.limits());
             var sources=new ArrayList<RatisNativeParticipantDiscovery.Source>();
             for (var group:local.stream().sorted().toList()) sources.add(new RatisNativeParticipantDiscovery.Source(group,machines.get(RaftGroupId.valueOf(group))::preparedRecoveries));
             nativeParticipantDiscovery=new RatisNativeParticipantDiscovery(participantRecoveries,sources);

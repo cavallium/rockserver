@@ -48,7 +48,7 @@ class RatisTransactionPlanTest {
                                 var token=f.node(part.route().groupId()).f.machine.prepareParticipant(pins.get(part.route().groupId()),part.command(),progress.intent().prepareControl(),f.transactions.statuses,tx);
                                 return new RatisTransactionCoordinator.Authorization(token.preparation(),token.negative(),token);
                             } catch (Exception failure) { throw new IOException(failure); }
-                        },(group,tx,control) -> { try { var token=f.node(group).f.machine.prepareFinalization(f.transactions.statuses,tx,control); return new RatisTransactionRecovery.Authorization(token.finalization(),token); } catch (Exception failure) { throw new IOException(failure); } })) {
+                        })) {
                     assertThrows(IllegalStateException.class,journal::result); boolean complete=false,locked=false;
                     for (int n=0;n<32 && !complete;n++) {
                         complete=coordinator.step().complete();

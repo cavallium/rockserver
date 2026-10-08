@@ -9,14 +9,6 @@ public final class RatisTransactionRecovery implements AutoCloseable {
     @FunctionalInterface public interface ControlIds {
         OperationId nextAfter(OperationId last) throws IOException;
     }
-    @FunctionalInterface public interface FinalizationAuthority {
-        Authorization authorize(UUID group,UUID transaction,OperationId control) throws IOException;
-    }
-    /** Closing preserves the authority implementation's ownership rules, including claimed/uncertain server tokens. */
-    public record Authorization(ParticipantFinalization value,AutoCloseable owner) implements AutoCloseable {
-        public Authorization { Objects.requireNonNull(value); Objects.requireNonNull(owner); }
-        @Override public void close() throws Exception { owner.close(); }
-    }
     public enum Action { RETRIED_HOME, REGISTRATION_ATTEMPTED, ABORT_ATTEMPTED, FINALIZED, ACK_ATTEMPTED, VERIFIED, COMPLETE }
     /** Action identifies the attempted quantum; home CAS success/conflict remains in the journal's homeResult. */
     public record Step(Action action,UUID participant,boolean complete) {}
@@ -25,15 +17,14 @@ public final class RatisTransactionRecovery implements AutoCloseable {
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
     private final ControlIds controls;
-    private final FinalizationAuthority authority;
     private final List<UUID> participants;
     private int cursor;
     private boolean active,closed;
 
     public RatisTransactionRecovery(RatisDurableTransaction journal,RatisTransactionStatuses homes,RatisRoutedClient data,
-            ControlIds controls,FinalizationAuthority authority) throws IOException {
+            ControlIds controls) throws IOException {
         this.journal=Objects.requireNonNull(journal); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
-        this.controls=Objects.requireNonNull(controls); this.authority=Objects.requireNonNull(authority);
+        this.controls=Objects.requireNonNull(controls);
         journal.requireClients(homes,data);
         participants=journal.snapshot().initial().participants().stream().map(TransactionStatus.Participant::groupId).toList();
     }
@@ -86,14 +77,10 @@ public final class RatisTransactionRecovery implements AutoCloseable {
         var progress=snapshot.participant(group);
         if (progress.outcome()==null) progress=journal.resolveParticipant(group);
         if (progress.outcome()==null) {
-            try (var authorization=Objects.requireNonNull(authority.authorize(group,home.transactionId(),progress.intent().finalizeControl()))) {
-                var value=authorization.value();
-                if (!value.participantGroup().equals(group) || !value.transactionId().equals(home.transactionId())
-                        || !value.operation().equals(progress.intent().finalizeControl()) || !value.decision().equals(home.terminalDecision())) throw new IOException("Finalization authority differs from frozen recovery request/decision");
-                journal.freezeFinalization(data.restoreFinalization(value,progress.intent().route()));
-                journal.executeFinalization(group);
-            } catch (IOException failure) { throw failure; }
-            catch (Exception failure) { throw new IOException("Finalization authority failed",failure); }
+            var route=snapshot.pendingHome().descriptor();
+            var value=new ParticipantFinalization(route.groupId(),route.rangeEpoch(),group,progress.intent().finalizeControl(),home);
+            journal.freezeFinalization(data.restoreFinalization(value,progress.intent().route()));
+            journal.executeFinalization(group);
             return result(Action.FINALIZED,group);
         }
         // A fresh query may accept another coordinator's winning proof without claiming this journal's RPC succeeded.
@@ -114,7 +101,7 @@ public final class RatisTransactionRecovery implements AutoCloseable {
         return snapshot.observedHome()!=null && snapshot.observedHome().fullyFinalized()
                 && snapshot.participants().stream().allMatch(p -> p.outcome()!=null);
     }
-    /** Borrowed clients/journal remain open. Active authority and file ownership must settle before close can succeed. */
+    /** Borrowed clients/journal remain open. Active RPC and file ownership must settle before close can succeed. */
     @Override public synchronized void close() throws IOException {
         if (active) throw new IOException("Recovery step active; ownership retained");
         closed=true;

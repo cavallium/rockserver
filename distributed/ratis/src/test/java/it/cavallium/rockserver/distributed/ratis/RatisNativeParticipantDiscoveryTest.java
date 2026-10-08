@@ -28,9 +28,9 @@ class RatisNativeParticipantDiscoveryTest {
                 assertEquals(2,registry.stats().persistedFiles()); assertEquals(0,registry.stats().openWorkers());
                 var home=f.transactions.statuses.read(helper.tx); assertEquals(TransactionStatus.Phase.COMMIT,home.phase()); assertTrue(home.fullyFinalized()); assertFalse(home.consumed());
                 assertArrayEquals(new byte[]{7},f.data.read(helper.column,new byte[]{1})); assertArrayEquals(new byte[]{8},f.data.read(helper.column,new byte[]{(byte)130}));
-                var reads=new java.util.concurrent.atomic.AtomicInteger(); f.transactions.wire.afterRead=reads::incrementAndGet; int allocations=registries.allocations.get();
+                var reads=new java.util.concurrent.atomic.AtomicInteger(); f.transactions.wire.afterRead=reads::incrementAndGet; int files=registry.stats().persistedFiles();
                 for (int n=0;n<8;n++) assertEquals(0,discovery.cycle(1));
-                assertEquals(0,reads.get()); assertEquals(allocations,registries.allocations.get());
+                assertEquals(0,reads.get()); assertEquals(files,registry.stats().persistedFiles());
             }
         }
     }
@@ -93,12 +93,18 @@ class RatisNativeParticipantDiscoveryTest {
         try (var f=fixture("startup-failure")) {
             f.committedTransactionWithRightStillPrepared(); var limits=new RatisParticipantRecoveryRegistry.Limits(2,4,96L*1024*1024);
             try (var registry=registries.registry(path,f,false,limits)) { registry.register(f.left.f.groupId,f.data.preparedParticipant(f.left.f.groupId,helper.tx)); }
-            var controls=registries.controls();
-            try (var registry=new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,f.data,(group,tx) -> { if (group.equals(f.left.f.groupId)) throw new IOException("Persisted worker grant unavailable"); return controls.create(group,tx); },(group,tx,control) -> {
-                try { var proposal=f.node(group).f.machine.prepareFinalization(f.transactions.statuses,tx,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); } catch (Exception failure) { throw new IOException(failure); }
-            },false,Set.of(f.left.f.groupId,f.right.f.groupId),limits)) {
+            var transport=new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return f.node(route.groupId()).wire.read(route,column,key); }
+                public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return f.node(route.groupId()).wire.command(route,command); }
+                public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return f.node(route.groupId()).wire.participant(route,bytes); }
+                public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
+                    if (route.groupId().equals(f.left.f.groupId)) throw new IOException("Persisted worker DATA unavailable");
+                    return f.node(route.groupId()).wire.transaction(route,bytes,fresh);
+                }
+            };
+            try (var data=new RatisRoutedClient(f.directory,transport); var registry=new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,data,false,Set.of(f.left.f.groupId,f.right.f.groupId),limits)) {
                 var discovery=new RatisNativeParticipantDiscovery(registry,List.of(new RatisNativeParticipantDiscovery.Source(f.right.f.groupId,f.right.f.machine::preparedRecoveries)));
-                for (int n=0;n<12;n++) { long before=f.writes(); try { discovery.cycle(1); } catch (IOException expected) { assertEquals("Persisted worker grant unavailable",expected.getMessage()); } assertTrue(f.writes()-before<=1); }
+                for (int n=0;n<12;n++) { long before=f.writes(); try { discovery.cycle(1); } catch (IOException expected) { assertEquals("Persisted worker DATA unavailable",expected.getMessage()); } assertTrue(f.writes()-before<=1); }
                 var home=f.transactions.statuses.read(helper.tx); assertFalse(home.fullyFinalized()); assertTrue(home.participants().stream().filter(p -> p.groupId().equals(f.right.f.groupId)).findFirst().orElseThrow().finalized());
             }
         }
@@ -125,7 +131,7 @@ class RatisNativeParticipantDiscoveryTest {
             assertThrows(IllegalArgumentException.class,() -> f.right.f.store.preparedRecoveries(null,17));
             var vote=first.records().getFirst(); assertThrows(IllegalArgumentException.class,() -> new ReplicatedRangeStore.PreparedRecoveryPage(new ApplyPosition(0,vote.position().index()),List.of(vote),false));
             try (var registry=registries.registry(path,f,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024))) {
-                long before=f.writes(); assertTrue(registry.register(f.right.f.groupId,vote)); assertEquals(1,registries.allocations.get()); assertEquals(before,f.writes());
+                long before=f.writes(); assertTrue(registry.register(f.right.f.groupId,vote)); assertEquals(1,registry.stats().persistedFiles()); assertEquals(before,f.writes());
                 for (int n=0;n<4;n++) registry.cycle(1);
                 var changed=new PreparedParticipant(vote.preparation(),new ApplyPosition(vote.position().term(),vote.position().index()+1));
                 assertThrows(IOException.class,() -> registry.register(f.right.f.groupId,changed));

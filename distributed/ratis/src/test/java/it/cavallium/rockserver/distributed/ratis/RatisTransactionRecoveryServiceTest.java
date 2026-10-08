@@ -40,19 +40,18 @@ class RatisTransactionRecoveryServiceTest {
             } finally { service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
         }
     }
-    @Test void cancelledViewsAndStopWaitForActualAuthorityAndDoNotCloseBorrowedOwners() throws Exception {
+    @Test void cancelledViewsAndStopWaitForActualRemoteAuthorizationAndDoNotCloseBorrowedOwners() throws Exception {
         var helper=new RatisTransactionRecoveryTest(); helper.root=root;
         try (var f=helper.new Fixture("running"); var later=helper.new Fixture("later")) {
             f.journal.executeHome(); var abort=f.plan.initial().decide(TransactionStatus.Phase.ABORT); f.journal.queueRecovery(abort); f.journal.executeHome();
             var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
-            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(g,t,c) -> {
-                entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); } catch (InterruptedException e) { throw new IOException(e); } return f.authorize(g,t,c);
-            }); var laterRecovery=later.recovery()) {
+            f.data.wire.beforeFinalization=() -> { entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new AssertionError("Fixture timeout"); } catch (InterruptedException failure) { throw new AssertionError(failure); } };
+            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next); var laterRecovery=later.recovery()) {
                 var scheduler=scheduler(); var service=new RatisTransactionRecoveryService(scheduler,List.of(recovery,laterRecovery),2);
                 try {
                     var view=service.tick(); assertTrue(entered.await(5,TimeUnit.SECONDS)); assertTrue(view.cancel(false)); assertThrows(IOException.class,recovery::close);
                     var drain=service.stop(); assertFalse(drain.isDone()); assertTrue(drain.cancel(false)); var actual=service.stop(); assertFalse(actual.isDone());
-                    release.countDown(); actual.get(5,TimeUnit.SECONDS); idle(scheduler); assertNotNull(f.journal.snapshot().participant(f.data.f.groupId).outcome()); assertEquals(0,later.home.wire.index,"Stop must not begin the next transaction in this quantum");
+                    release.countDown(); actual.get(5,TimeUnit.SECONDS); idle(scheduler); f.data.wire.beforeFinalization=null; assertNotNull(f.journal.snapshot().participant(f.data.f.groupId).outcome()); assertEquals(0,later.home.wire.index,"Stop must not begin the next transaction in this quantum");
                     helper.drain(f,recovery); assertFalse(f.journal.snapshot().observedHome().consumed()); assertThrows(ExecutionException.class,() -> service.tick().get(5,TimeUnit.SECONDS));
                 } finally { release.countDown(); service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
             }
@@ -62,7 +61,8 @@ class RatisTransactionRecoveryServiceTest {
         var helper=new RatisTransactionRecoveryTest(); helper.root=root;
         try (var first=helper.new Fixture("first"); var second=helper.new Fixture("second")) {
             first.journal.executeHome(); second.journal.executeHome();
-            try (var failed=new RatisTransactionRecovery(first.journal,first.home.statuses,first.data.routed,RatisTransactionRecoveryTest::next,(group,transaction,control) -> { throw new IOException("Participant finalization authority unavailable"); }); var healthy=second.recovery()) {
+            first.data.wire.beforeFinalization=() -> { throw new IllegalStateException("Qualified finalization RPC unavailable"); };
+            try (var failed=new RatisTransactionRecovery(first.journal,first.home.statuses,first.data.routed,RatisTransactionRecoveryTest::next); var healthy=second.recovery()) {
                 var scheduler=scheduler(); var service=new RatisTransactionRecoveryService(scheduler,List.of(failed,healthy),1);
                 try {
                     for (int n=0;n<16 && service.remaining()>1;n++) { try { service.tick().get(5,TimeUnit.SECONDS); } catch (ExecutionException expected) { assertInstanceOf(IOException.class,expected.getCause()); } idle(scheduler); }

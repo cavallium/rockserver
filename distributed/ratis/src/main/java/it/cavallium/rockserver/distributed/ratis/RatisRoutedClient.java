@@ -286,15 +286,42 @@ public final class RatisRoutedClient implements AutoCloseable {
                 || !Arrays.equals(observed.schemaDigest(),registered.schemaDigest()) || !observed.domainId().equals(decision.domainId()) || !observed.clusterId().equals(decision.clusterId()) || !observed.databaseId().equals(decision.databaseId())) throw new IllegalArgumentException("Finalization route differs from frozen participant");
         return new PreparedFinalizationOperation(identity,descriptor,finalization);
     }
-    public ApplyPosition executeFinalization(PreparedFinalizationOperation operation) throws IOException {
-        java.util.Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+    /** Obtain ready authority from a fixed server-side HOME reader; frozen bytes never choose that reader. */
+    public void authorizeFinalization(PreparedFinalizationOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try { authorizeFinalizationCall(operation); } finally { endCall(); }
+    }
+    private ApplyPosition authorizeFinalizationCall(PreparedFinalizationOperation operation) throws IOException {
         try {
-            var position=RatisParticipantRecord.finalizationResult(transport.participant(operation.descriptor,operation.bytes)); var vote=operation.finalization.participant().prepared();
-            if (vote!=null && (position.term()<vote.term() || position.index()<=vote.index())) throw new IllegalArgumentException("Finalization reply does not follow its prepared vote");
-            return position;
-        }
-        catch (IllegalArgumentException malformed) { throw new IOException("Invalid finalization applied reply",malformed); }
+            var input=ByteBuffer.wrap(transactionReply(operation.descriptor,ScopedTransactionRpc.FINALIZATION_PREPARE,operation.bytes,true));
+            byte[] digest=ScopedTransactionRpc.blob(input,32,false),bytes=ScopedTransactionRpc.blob(input,16,true);
+            if (!Arrays.equals(digest,RatisParticipantRecord.digest(operation.finalization)) || input.hasRemaining()) throw new IllegalArgumentException("Finalization authority changed its frozen request");
+            if (bytes==null) return null;
+            if (bytes.length!=16) throw new IllegalArgumentException("Invalid retained finalization position");
+            var position=ByteBuffer.wrap(bytes); var result=new ApplyPosition(position.getLong(),position.getLong()); requireFinalizationPosition(operation,result); return result;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid participant finalization authority reply",malformed); }
+    }
+    /** Retained proof finishes an exact retry without another append or another HOME read. */
+    public ApplyPosition executeFinalization(PreparedFinalizationOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            var retained=authorizeFinalizationCall(operation);
+            var position=retained==null ? RatisParticipantRecord.finalizationResult(transport.participant(operation.descriptor,operation.bytes)) : retained;
+            requireFinalizationPosition(operation,position); return position;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid finalization applied reply",malformed); }
         finally { endCall(); }
+    }
+    private static void requireFinalizationPosition(PreparedFinalizationOperation operation,ApplyPosition position) {
+        var vote=operation.finalization.participant().prepared();
+        if (position.term()<=0 || position.index()<=0 || vote!=null && (position.term()<vote.term() || position.index()<=vote.index())) throw new IllegalArgumentException("Finalization reply does not follow its prepared vote");
+    }
+    /** Releases ready unsubmitted authority; active preparations and submitted unknown requests retain ownership. */
+    public void cancelFinalization(PreparedFinalizationOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            byte[] reply=transactionReply(operation.descriptor,ScopedTransactionRpc.FINALIZATION_CANCEL,operation.bytes,true);
+            if (!Arrays.equals(reply,RatisParticipantRecord.digest(operation.finalization))) throw new IOException("Finalization cancellation request changed");
+        } finally { endCall(); }
     }
     public static final class PreparedParticipantOperation {
         private final RangeDirectory source; private final RangeDescriptor descriptor; private final PreparedParticipant.Preparation preparation; private final boolean negative; private final byte[] bytes;

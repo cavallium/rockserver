@@ -80,6 +80,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
     private RatisSnapshotFences snapshotHomes;
+    private RatisTransactionStatuses transactionHomes;
     @FunctionalInterface interface HomeRecoveryProofReader { it.cavallium.rockserver.core.common.distributed.ParticipantOutcome read(HomeRecovery recovery) throws IOException; }
     private HomeRecoveryProofReader homeRecoveryProofs;
     private boolean homeReservations;
@@ -94,7 +95,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (getLifeCycleState()!=LifeCycle.State.NEW || roleConfigured) throw new IllegalStateException("Range role is fixed before initialization");
         java.util.Objects.requireNonNull(role);
         boolean home=role==RatisNodePlan.Role.TRANSACTION_HOME || role==RatisNodePlan.Role.SNAPSHOT_HOME;
-        if (home!=(values!=null) || role!=RatisNodePlan.Role.DATA && snapshotHomes!=null) throw new IllegalArgumentException("Invalid range role capabilities");
+        if (home!=(values!=null) || role!=RatisNodePlan.Role.DATA && (snapshotHomes!=null || transactionHomes!=null)) throw new IllegalArgumentException("Invalid range role capabilities");
         this.role=role; homeValues=values; roleConfigured=true;
     }
     private void requireDataRole() { if (role!=RatisNodePlan.Role.DATA) throw new IllegalStateException("Range role does not support DATA transaction/snapshot operations"); }
@@ -127,6 +128,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void validateRoleNativeState() throws IOException {
         if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.homeRecoveryCapacity().effectiveCount()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
         if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
+    }
+    void transactionHomes(RatisTransactionStatuses homes) {
+        requireDataRole();
+        if (getLifeCycleState()!=LifeCycle.State.NEW || transactionHomes!=null) throw new IllegalStateException("Transaction HOME reader is fixed before initialization");
+        transactionHomes=java.util.Objects.requireNonNull(homes);
     }
     void snapshotHomes(RatisSnapshotFences homes) {
         requireDataRole();
@@ -1644,6 +1650,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         throw new IllegalStateException("Native finalization cut changed during append admission");
     }
+    public void cancelFinalization(ParticipantFinalization finalization) throws IOException {
+        checkTransactionOwner();
+        synchronized (admissions) {
+            var ready=preparedFinalizations.get(finalization.operation());
+            if (ready!=null) {
+                if (!ready.finalization.equals(finalization)) throw new IllegalArgumentException("Finalization cancellation payload changed");
+                ready.close();
+            }
+            var preparing=preparingFinalizations.get(finalization.operation());
+            if (preparing!=null) throw new IllegalStateException("Finalization HOME read is still active");
+            var admitted=admissions.get(finalization.operation());
+            if (admitted!=null && (admitted.finalization==null || !admitted.finalization.equals(finalization))) throw new IllegalArgumentException("Finalization cancellation identity changed");
+            // Submitted unknown work retains scope, input and capacity until verified native settlement.
+        }
+    }
     public int protectedFinalizationSlots() { synchronized (admissions) { return protectedFinalizationSlots; } }
     public long reservedFinalizationCount() { synchronized (admissions) { return reservedFinalizationCount; } }
     public final class ParticipantProposal implements AutoCloseable {
@@ -2021,6 +2042,27 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (role!=RatisNodePlan.Role.DATA && packet.kind()!=ScopedTransactionRpc.POINT && packet.kind()!=ScopedTransactionRpc.STATE && !(role==RatisNodePlan.Role.TRANSACTION_HOME && ScopedTransactionRpc.homeRecovery(packet.kind()))) throw new IOException("Range role rejects transaction/snapshot queries");
         var input=ByteBuffer.wrap(packet.body()); byte[] reply;
         switch (packet.kind()) {
+            case ScopedTransactionRpc.FINALIZATION_PREPARE, ScopedTransactionRpc.FINALIZATION_CANCEL -> {
+                if (!freshBarrier) throw new IOException("Participant finalization requires a fresh linearizable barrier");
+                long generation=admissionGeneration.get(); checkTransactionOwner();
+                var finalization=RatisParticipantRecord.decodeFinalization(packet.body());
+                // Native validation binds the participant owner, schema and the exact finalization control.
+                var retained=store.recoveredFinalization(finalization);
+                if (packet.kind()==ScopedTransactionRpc.FINALIZATION_CANCEL) {
+                    cancelFinalization(finalization); reply=RatisParticipantRecord.digest(finalization);
+                } else {
+                    if (retained==null) {
+                        if (transactionHomes==null) throw new IOException("Qualified transaction HOME reader is not configured");
+                        var proposal=prepareFinalization(transactionHomes,finalization.transactionId(),finalization.operation());
+                        if (!proposal.finalization().equals(finalization)) { proposal.close(); throw new IOException("Fresh HOME authority differs from frozen finalization"); }
+                        retained=store.recoveredFinalization(finalization); if (retained!=null) proposal.close();
+                    }
+                    byte[] position=retained==null ? null : ByteBuffer.allocate(16).putLong(retained.term()).putLong(retained.index()).array();
+                    var output=ByteBuffer.allocate(40+(position==null ? 0 : position.length));
+                    ScopedTransactionRpc.putBlob(output,RatisParticipantRecord.digest(finalization)); ScopedTransactionRpc.putBlob(output,position); reply=output.array();
+                }
+                checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Finalization query lost its owner");
+            }
             case ScopedTransactionRpc.HOME_RECOVERY_PREPARE, ScopedTransactionRpc.HOME_RECOVERY_RESULT, ScopedTransactionRpc.HOME_RECOVERY_CANCEL -> {
                 if (!freshBarrier) throw new IOException("HOME recovery requires a fresh linearizable barrier");
                 long generation=admissionGeneration.get();

@@ -26,7 +26,7 @@ class RatisTransactionCoordinatorTest {
         } catch (IOException e) { throw e; } catch (Exception e) { throw new IOException(e); }
     }
     RatisTransactionCoordinator coordinator(RatisTransactionRecoveryTest.Fixture f) throws IOException {
-        return new RatisTransactionCoordinator(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(tx,p) -> authorize(f,tx,p),f::authorize);
+        return new RatisTransactionCoordinator(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(tx,p) -> authorize(f,tx,p));
     }
     int drain(RatisTransactionRecoveryTest.Fixture f,RatisTransactionCoordinator coordinator) throws Exception {
         for (int n=0;n<32;n++) { long before=f.home.wire.index+f.data.wire.index; var step=coordinator.step(); assertTrue(f.home.wire.index+f.data.wire.index-before<=1); if (step.complete()) return n+1; }
@@ -71,7 +71,7 @@ class RatisTransactionCoordinatorTest {
         }
         try (var f=fixtures.new Fixture("io")) {
             f.journal.executeHome();
-            try (var coordinator=new RatisTransactionCoordinator(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(tx,p) -> { throw new IOException("Unknown authorization transport result"); },f::authorize)) { assertThrows(IOException.class,coordinator::step); }
+            try (var coordinator=new RatisTransactionCoordinator(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(tx,p) -> { throw new IOException("Unknown authorization transport result"); })) { assertThrows(IOException.class,coordinator::step); }
             assertEquals(TransactionStatus.Phase.PREPARING,f.home.statuses.read(f.plan.initial().transactionId()).phase()); assertEquals(0,f.data.wire.index);
             try (var coordinator=coordinator(f)) { drain(f,coordinator); } assertEquals(TransactionStatus.Phase.COMMIT,f.journal.snapshot().observedHome().phase());
         }
@@ -98,7 +98,7 @@ class RatisTransactionCoordinatorTest {
             };
             try (var routed=new RatisRoutedClient(f.home.directory,transport)) {
                 var homes=new RatisTransactionStatuses(routed,f.home.f.column); f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,homes,f.data.routed);
-                try (var coordinator=new RatisTransactionCoordinator(f.journal,homes,f.data.routed,RatisTransactionRecoveryTest::next,(tx,p) -> { throw new AssertionError("All prepares already verified"); },f::authorize)) {
+                try (var coordinator=new RatisTransactionCoordinator(f.journal,homes,f.data.routed,RatisTransactionRecoveryTest::next,(tx,p) -> { throw new AssertionError("All prepares already verified"); })) {
                     assertEquals(RatisTransactionCoordinator.Action.COMMIT_ATTEMPTED,coordinator.step().action()); assertEquals(CommandResult.Status.CONFLICT,f.journal.snapshot().homeResult().status()); drain(f,coordinator);
                 }
             }
@@ -119,7 +119,7 @@ class RatisTransactionCoordinatorTest {
             f.journal.executeHome(); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var actualDone=new CountDownLatch(1);
             var coordinator=new RatisTransactionCoordinator(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(tx,p) -> {
                 entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); } catch (InterruptedException e) { throw new IOException(e); } return authorize(f,tx,p);
-            },f::authorize);
+            });
             try {
                 var view=executor.submit(() -> { try { return coordinator.step(); } finally { actualDone.countDown(); } }); assertTrue(entered.await(5,TimeUnit.SECONDS)); assertTrue(view.cancel(false)); assertThrows(IOException.class,coordinator::close); release.countDown(); assertTrue(actualDone.await(5,TimeUnit.SECONDS));
                 assertNotNull(f.journal.snapshot().participant(f.data.f.groupId).vote());
@@ -151,7 +151,7 @@ class RatisTransactionCoordinatorTest {
                         catch (RatisPreparationUnavailableException absent) { if (p.preparation()!=null) throw absent; token=node.f.machine.prepareParticipant(isLeft ? lp : rp,isLeft ? lb : rb,p.intent().prepareControl(),home.statuses,tx); }
                         return new RatisTransactionCoordinator.Authorization(token.preparation(),token.negative(),token);
                     } catch (IOException e) { throw e; } catch (Exception e) { throw new IOException(e); }
-                },(g,t,c) -> { try { var node=g.equals(l.groupId()) ? left : right; var token=node.f.machine.prepareFinalization(home.statuses,t,c); return new RatisTransactionRecovery.Authorization(token.finalization(),token); } catch (Exception e) { throw new IOException(e); } })) {
+                })) {
                     assertArrayEquals(RatisDurableTransaction.planDigest(intents),RatisDurableTransaction.planDigest(List.of(intents.get(1),intents.get(0))));
                     var reorderedResults=List.of(new RatisDurableTransaction.Intent(l,la,intents.get(0).prepareControl(),intents.get(0).finalizeControl(),List.of(0)),new RatisDurableTransaction.Intent(r,ra,intents.get(1).prepareControl(),intents.get(1).finalizeControl(),List.of(1,2)));
                     assertFalse(Arrays.equals(RatisDurableTransaction.planDigest(intents),RatisDurableTransaction.planDigest(reorderedResults)));
@@ -191,7 +191,7 @@ class RatisTransactionCoordinatorTest {
             };
             try (var routed=new RatisRoutedClient(f.data.directory,unavailable)) {
                 f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,f.home.statuses,routed);
-                try (var coordinator=new RatisTransactionCoordinator(f.journal,f.home.statuses,routed,RatisTransactionRecoveryTest::next,(t,p) -> { throw new AssertionError("No prepare needed"); },(g,t,c) -> { throw new AssertionError("No finalize needed"); })) {
+                try (var coordinator=new RatisTransactionCoordinator(f.journal,f.home.statuses,routed,RatisTransactionRecoveryTest::next,(t,p) -> { throw new AssertionError("No prepare needed"); })) {
                     var step=coordinator.step(); assertEquals(RatisTransactionCoordinator.Action.ACK_ATTEMPTED,step.action()); assertTrue(step.complete()); assertFalse(f.journal.snapshot().observedHome().consumed());
                 }
             }

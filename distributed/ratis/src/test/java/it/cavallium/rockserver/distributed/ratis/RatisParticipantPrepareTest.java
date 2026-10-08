@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisParticipantPrepareTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final UUID cluster=new UUID(0,1),database=new UUID(0,2),controlSession=new UUID(0,3);
+    RatisTransactionStatuses transactionHomes;
     final Map<UUID,Node> nodes=new ConcurrentHashMap<>();
     OperationId control(long n) { return new OperationId(controlSession,1,n); }
     final class Node implements AutoCloseable {
@@ -30,6 +31,7 @@ class RatisParticipantPrepareTest {
             var ownedInterval=home && interval==null ? new RangeOwnership.Interval(UUID.randomUUID(),Set.of(UUID.randomUUID()),null,null) : interval;
             f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validator.get().accept(command),nanos,ownedInterval,machine -> {
                 if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes);
+                if (!home && transactionHomes!=null) machine.transactionHomes(transactionHomes);
                 if (home) {
                     machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(cluster,database,key,value));
                     machine.homeRecoveryReservations(cluster,database,ownedInterval.columns().iterator().next());
@@ -44,12 +46,12 @@ class RatisParticipantPrepareTest {
             var range=new RangeDescriptor(f.groupId,f.groupId,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
             directory=new RangeDirectory(cluster,database,f.store.ownership().interval().domainId(),1,new byte[32],0,Set.of(f.column),0,List.of(range));
             nodes.put(f.groupId,this); wire=new Wire(f); routed=new RatisRoutedClient(directory,wire); statuses=new RatisTransactionStatuses(routed,f.column);
-            if (home) validator.set(RatisTransactionStatuses.validator(cluster,database,f.groupId,1,new byte[32],f.column));
+            if (home) { transactionHomes=statuses; validator.set(RatisTransactionStatuses.validator(cluster,database,f.groupId,1,new byte[32],f.column)); }
         }
         @Override public void close() throws Exception { nodes.remove(f.groupId,this); routed.close(); f.close(); }
     }
     static final class Wire implements RatisRoutedClient.Transport {
-        final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Runnable afterRead;
+        final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Runnable afterRead,beforeFinalization; IOException readFailure;
         Wire(RatisRetentionAdmissionTest.Fixture f) { this.f=f; }
         TransactionContext propose(byte[] bytes) throws Exception {
             return f.machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(f.peer.getId()).setGroupId(f.group.getGroupId()).setCallId(1)
@@ -66,10 +68,11 @@ class RatisParticipantPrepareTest {
         public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return CommandResult.decode(append(DistributedCommandCodec.encode(command))); }
         public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return append(record); }
         public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException {
-            try { var message=Message.valueOf(ByteString.copyFrom(request)); return (fresh ? f.machine.queryLinearizable(message) : f.machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
+            try { if (beforeFinalization!=null && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.FINALIZATION_PREPARE) beforeFinalization.run(); var message=Message.valueOf(ByteString.copyFrom(request)); return (fresh ? f.machine.queryLinearizable(message) : f.machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
             catch (Exception failure) { throw new IOException(failure); }
         }
         public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException {
+            if (readFailure!=null) throw readFailure;
             byte[] value=ScopedTransactionRpc.pointValue(transaction(route,ScopedTransactionRpc.pointRequest(column,key),true),2*1024*1024);
             if (afterRead!=null) afterRead.run(); return value;
         }

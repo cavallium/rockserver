@@ -22,8 +22,16 @@ class RatisNodeRuntimeTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     @Test void configuredParticipantRecoveryRunsOnControlAndDrainsBeforeNodeClose() throws Exception {
         try (var env=new Env(root); var homes=new TransactionHomeReader(env,env.outer.cluster)) {
-            var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,(group,tx) -> { throw new AssertionError("No persisted recoveries"); },false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()::create,null,null,recovery)) {
+            var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
+            var fake=new FakeServer();
+            RatisNodeRuntime.ServerFactory bound=(plan,logs,machines) -> {
+                try {
+                    var field=RatisRangeStateMachine.class.getDeclaredField("transactionHomes"); field.setAccessible(true);
+                    for (var entry:machines.entrySet()) if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA) assertSame(homes.homes,field.get(entry.getValue()));
+                } catch (ReflectiveOperationException failure) { throw new IOException(failure); }
+                return fake.create(plan,logs,machines);
+            };
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,bound,null,null,recovery)) {
                 assertEquals(0,node.participantRecoveryStatus().openWorkers()); node.start(); assertEquals(2,env.timer.activePeriods());
                 env.timer.fire(); RatisTransactionRecoveryServiceTest.idle(env.scheduler); assertNull(node.participantRecoveryFailure()); assertEquals(0,node.participantRecoveryStatus().persistedFiles());
             }
@@ -34,7 +42,7 @@ class RatisNodeRuntimeTest {
     }
     @Test void foreignRecoveryHomesAreRejectedBeforeBootstrapWrites() throws Exception {
         try (var env=new Env(root); var homes=new TransactionHomeReader(env,UUID.randomUUID())) {
-            var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,(group,tx) -> { throw new AssertionError(); },false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
+            var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
             var fake=new FakeServer();
             assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,null,null,recovery));
             assertFalse(fake.created); try (var files=Files.list(env.nodeRoot)) { assertTrue(files.findAny().isEmpty()); }

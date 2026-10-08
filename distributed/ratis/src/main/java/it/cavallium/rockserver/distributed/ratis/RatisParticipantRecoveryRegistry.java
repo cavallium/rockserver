@@ -6,13 +6,9 @@ import java.nio.file.*;
 import java.nio.channels.*;
 import java.util.*;
 
-/** Bounded local discovery and synchronous recovery ownership. Journals are retained; clients and authority remain borrowed. */
+/** Bounded local discovery and synchronous recovery ownership. Journals are retained; clients remain borrowed. */
 public final class RatisParticipantRecoveryRegistry implements RatisSnapshotReadinessHelper.Recovery,AutoCloseable {
     public static final int MAX_FILES=4096, MAX_VISITS=32;
-    public record Controls(OperationId initialHomeControl,OperationId finalizeControl,RatisTransactionRecovery.ControlIds next) {
-        public Controls { Objects.requireNonNull(initialHomeControl); Objects.requireNonNull(finalizeControl); Objects.requireNonNull(next); }
-    }
-    @FunctionalInterface public interface ControlIdsFactory { Controls create(UUID group,UUID transaction) throws IOException; }
     public record Limits(int maxWorkers,int maxFiles,long maxBytes) {
         public Limits {
             if (maxWorkers<1 || maxWorkers>MAX_FILES || maxFiles<1 || maxFiles>MAX_FILES || maxBytes<1
@@ -43,8 +39,6 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
     private final Path directory;
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
-    private final ControlIdsFactory controls;
-    private final RatisTransactionRecovery.FinalizationAuthority authority;
     private final boolean takeover;
     private final Set<UUID> allowedGroups;
     private final Limits limits;
@@ -58,9 +52,9 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
     private boolean discovered,active,stopping,closing;
 
     public RatisParticipantRecoveryRegistry(Path existingDirectory,RatisTransactionStatuses homes,RatisRoutedClient data,
-            ControlIdsFactory controls,RatisTransactionRecovery.FinalizationAuthority authority,boolean takeover,Set<UUID> allowedGroups,Limits limits) throws IOException {
+            boolean takeover,Set<UUID> allowedGroups,Limits limits) throws IOException {
         this.directory=Objects.requireNonNull(existingDirectory).toAbsolutePath().normalize(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
-        this.controls=Objects.requireNonNull(controls); this.authority=Objects.requireNonNull(authority); this.takeover=takeover;
+        this.takeover=takeover;
         this.allowedGroups=Set.copyOf(Objects.requireNonNull(allowedGroups)); this.limits=Objects.requireNonNull(limits);
         if (this.allowedGroups.size()>MAX_FILES) throw new IllegalArgumentException("Too many allowed recovery groups");
         homes.requireDatabaseBinding(data.directory().clusterId(),data.directory().databaseId());
@@ -205,14 +199,13 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
         }
         if (file.reserved) releaseReservation(file); // A previous failed size check retained accounting after its journal closed.
         makeRoom(); reserve(file);
-        RatisDurableParticipantRecovery journal=null; Controls ids=null;
+        RatisDurableParticipantRecovery journal=null;
         try {
             if (file.persisted) journal=RatisDurableParticipantRecovery.reopen(file.path,homes,data);
             else {
                 if (selected==null) throw new IOException("Unpublished recovery file has no native preparation input");
-                ids=Objects.requireNonNull(controls.create(file.key.group,file.key.transaction));
                 var route=data.directory().ranges().stream().filter(r -> r.groupId().equals(file.key.group)).findFirst().orElseThrow(() -> new IOException("Allowed participant route is absent"));
-                journal=RatisDurableParticipantRecovery.create(file.path,homes,data,selected,route,ids.initialHomeControl(),ids.finalizeControl());
+                journal=RatisDurableParticipantRecovery.create(file.path,homes,data,selected,route);
                 synchronized (this) { file.persisted=true; persistedFiles++; }
             }
             var snapshot=journal.snapshot();
@@ -220,8 +213,7 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
                     || selected!=null && !selected.equals(snapshot.prepared())) throw new IOException("Recovery filename/selected proof differs from journal identity");
             file.preparedDigest=snapshot.prepared().preparation().digest(); file.preparedPosition=snapshot.prepared().position();
             if (complete(snapshot)) { file.complete=true; journal.close(); journal=null; releaseReservation(file); return null; }
-            if (ids==null) ids=Objects.requireNonNull(controls.create(file.key.group,file.key.transaction));
-            var driver=new RatisParticipantRecovery(journal,homes,data,ids.next(),authority,takeover); var worker=new Worker(file,journal,driver);
+            var driver=new RatisParticipantRecovery(journal,homes,data,takeover); var worker=new Worker(file,journal,driver);
             synchronized (this) { workers.put(file.key,worker); opening--; } return worker;
         } catch (IOException | RuntimeException | Error failure) {
             boolean retained=false;
