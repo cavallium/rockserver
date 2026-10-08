@@ -11,6 +11,14 @@ public final class ProposalFootprints {
         }
         public static Limits defaults() { return new Limits(1024,64,16384,16L*1024*1024); }
     }
+    /** Protected gate capacity is independent of user proposal saturation. */
+    public record GateLimits(int maxGates,int maxSpans,long maxBytes) {
+        public GateLimits {
+            if (maxGates<1 || maxGates>4096 || maxSpans<1 || maxSpans>1_048_576
+                    || maxBytes<1 || maxBytes>256L*1024*1024) throw new IllegalArgumentException("Invalid gate footprint limits");
+        }
+        public static GateLimits defaults() { return new GateLimits(16,4096,4L*1024*1024); }
+    }
     public static final class PreparedFootprint {
         private final ProposalFootprints owner;
         private final List<Piece> pieces;
@@ -52,7 +60,16 @@ public final class ProposalFootprints {
         @Override public PreparedFootprint footprint() { return super.footprint(); }
         @Override public boolean active() { return super.active(); }
     }
+    /** Blocks newcomers while existing conflicting owners retain their submission and retry rights. */
+    public static final class GateLease extends Lease {
+        private GateLease(ProposalFootprints owner,PreparedFootprint footprint,long term,long generation) { super(owner,footprint,term,generation); }
+        @Override public long term() { return super.term(); }
+        @Override public long generation() { return super.generation(); }
+        @Override public PreparedFootprint footprint() { return super.footprint(); }
+        @Override public boolean active() { return super.active(); }
+    }
     public record Stats(int ordinary,int candidates,int spans,long bytes) {}
+    public record GateStats(int gates,int spans,long bytes) {}
     // Accounted weights: 128/lease +64/normalized span +bound bytes. Bounds are owned once and shared by indexes;
     // JVM object overhead varies, while independent lease/span caps also bound index metadata.
     private static final int LEASE_BYTES=128, SPAN_BYTES=64;
@@ -65,13 +82,20 @@ public final class ProposalFootprints {
     private static final Comparator<Bytes> START=(a,b) -> a==null ? b==null ? 0 : -1 : b==null ? 1 : a.compareTo(b);
     private static final Comparator<Bytes> END=(a,b) -> a==null ? b==null ? 0 : 1 : b==null ? -1 : a.compareTo(b);
     private final Limits limits;
-    private final Index ordinaryIndex=new Index(), candidateIndex=new Index();
+    private final GateLimits gateLimits;
+    private final Index ordinaryIndex=new Index(), candidateIndex=new Index(), gateIndex=new Index();
+    private final Set<GateLease> gates=new HashSet<>();
+    private int gateSpans;
+    private long gateBytes;
     private final Set<OrdinaryLease> ordinary=new HashSet<>();
     private final Set<CandidateLease> candidates=new HashSet<>();
     private int spans;
     private long bytes;
 
-    public ProposalFootprints(Limits limits) { this.limits=Objects.requireNonNull(limits); }
+    public ProposalFootprints(Limits limits) { this(limits,GateLimits.defaults()); }
+    public ProposalFootprints(Limits limits,GateLimits gateLimits) {
+        this.limits=Objects.requireNonNull(limits); this.gateLimits=Objects.requireNonNull(gateLimits);
+    }
     public PreparedFootprint prepare(TransactionScope scope) {
         if (scope==null) throw new IllegalArgumentException("Missing proposal scope"); return prepare(scope.spans());
     }
@@ -116,19 +140,40 @@ public final class ProposalFootprints {
         }
         return new PreparedFootprint(this,pieces,size);
     }
-    /** Ordinary proposals may overlap each other; only exclusive candidates can refuse admission. */
+    /** Ordinary proposals may overlap each other; candidates and gates refuse conflicting newcomers. */
     public OrdinaryLease registerOrdinary(PreparedFootprint footprint,long term,long generation) {
         require(footprint,term,generation);
-        if (candidateIndex.overlaps(footprint)) return null;
+        if (candidateIndex.overlaps(footprint) || gateIndex.overlaps(footprint)) return null;
         capacity(footprint,false); var lease=new OrdinaryLease(this,footprint,term,generation);
         ordinaryIndex.add(footprint); ordinary.add(lease); account(footprint,1); return lease;
     }
     public CandidateLease reserveCandidate(PreparedFootprint footprint,long term,long generation) {
         require(footprint,term,generation);
-        if (ordinaryIndex.overlaps(footprint) || candidateIndex.overlaps(footprint)) return null;
+        if (ordinaryIndex.overlaps(footprint) || candidateIndex.overlaps(footprint) || gateIndex.overlaps(footprint)) return null;
         capacity(footprint,true); var lease=new CandidateLease(this,footprint,term,generation);
         candidateIndex.add(footprint); candidates.add(lease); account(footprint,1); return lease;
     }
+    /** Reserve before checking drainage, under the same caller lock as ordinary/candidate admission. */
+    public GateLease reserveGate(PreparedFootprint footprint,long term,long generation) {
+        require(footprint,term,generation);
+        if (gateIndex.overlaps(footprint)) return null;
+        if (gates.size()>=gateLimits.maxGates() || footprint.pieces.size()>gateLimits.maxSpans()-gateSpans
+                || footprint.bytes>gateLimits.maxBytes()-gateBytes) throw new IllegalStateException("Gate footprint quota exhausted");
+        var lease=new GateLease(this,footprint,term,generation);
+        gateIndex.add(footprint); gates.add(lease); gateSpans+=footprint.pieces.size(); gateBytes+=footprint.bytes; return lease;
+    }
+    /** Only proves volatile predecessor drainage; native gate apply and prepared-lock drainage are separate. */
+    public boolean drained(GateLease lease) {
+        requireOwner(lease); if (!lease.active()) throw new IllegalStateException("Gate is no longer active");
+        return !ordinaryIndex.overlaps(lease.footprint()) && !candidateIndex.overlaps(lease.footprint());
+    }
+    /** Caller must establish that abandoning or releasing this gate is safe; generation loss is insufficient. */
+    public void release(GateLease lease) {
+        requireOwner(lease); if (!lease.active()) return;
+        gateIndex.remove(lease.footprint()); gates.remove(lease);
+        gateSpans-=lease.footprint().pieces.size(); gateBytes-=lease.footprint().bytes; ((Lease)lease).active=false;
+    }
+    public GateStats gateStats() { return new GateStats(gates.size(),gateSpans,gateBytes); }
     public void release(OrdinaryLease lease) {
         requireOwner(lease); if (!lease.active()) return;
         ordinaryIndex.remove(lease.footprint()); ordinary.remove(lease); account(lease.footprint(),-1); ((Lease)lease).active=false;

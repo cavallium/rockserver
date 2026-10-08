@@ -112,6 +112,69 @@ class ProposalFootprintsTest {
         index.release(accepted); index.release(accepted); assertEquals(new ProposalFootprints.Stats(0,0,0,0),index.stats());
         assertThrows(IllegalStateException.class,() -> index.submit(accepted)); assertThrows(IllegalArgumentException.class,() -> index().submit(pending));
     }
+    @Test void gatesBlockNewcomersBeforeConflictingOrdinaryAndCandidateOwnersDrain() {
+        var index=index();
+        var first=index.registerOrdinary(fp(index,point(1)),1,0);
+        var second=index.registerOrdinary(fp(index,point(1)),1,0);
+        var candidate=index.reserveCandidate(fp(index,point(2)),1,0);
+        var gate=index.reserveGate(fp(index,range(b(1),b(3))),1,0);
+        assertNotNull(gate); assertFalse(index.drained(gate));
+        assertEquals(1,gate.term()); assertEquals(0,gate.generation());
+        assertNull(index.registerOrdinary(fp(index,point(1)),1,0));
+        assertNull(index.reserveCandidate(fp(index,point(2)),1,0));
+        assertNull(index.reserveGate(fp(index,point(2)),1,0));
+        var disjoint=index.registerOrdinary(fp(index,point(3)),1,0); assertNotNull(disjoint);
+        var otherGate=index.reserveGate(fp(index,TransactionScope.Span.point(OTHER,b(1))),1,0);
+        assertNotNull(otherGate); assertTrue(index.drained(otherGate));
+        index.submit(candidate); // A pre-gate acceptance retains its submission right.
+        index.release(first); assertFalse(index.drained(gate));
+        index.release(second); assertFalse(index.drained(gate));
+        index.invalidateCandidates(); assertTrue(candidate.active()); assertFalse(index.drained(gate));
+        assertTrue(gate.active());
+        index.release(candidate); assertTrue(index.drained(gate));
+        assertNull(index.registerOrdinary(fp(index,point(2)),2,1)); // Drained is not released.
+        index.release(gate); assertNotNull(index.registerOrdinary(fp(index,point(2)),2,1));
+        assertTrue(otherGate.active()); assertTrue(disjoint.active());
+    }
+
+    @Test void protectedGatesAdmitAtUserSaturationAndEnforceIndependentBoundsWithoutLeaks() {
+        var index=new ProposalFootprints(new ProposalFootprints.Limits(1,1,1,193),new ProposalFootprints.GateLimits(2,2,386));
+        var ordinary=index.registerOrdinary(fp(index,point(1)),1,0); var users=index.stats();
+        var gate=index.reserveGate(fp(index,point(1)),1,0); assertNotNull(gate);
+        assertEquals(users,index.stats()); assertEquals(new ProposalFootprints.GateStats(1,1,193),index.gateStats());
+        var second=index.reserveGate(fp(index,point(2)),1,0); var full=index.gateStats();
+        assertThrows(IllegalStateException.class,() -> index.reserveGate(fp(index,point(3)),1,0)); assertEquals(full,index.gateStats());
+        index.release(gate); var replacement=index.reserveGate(fp(index,point(1)),2,1);
+        index.release(gate); assertTrue(replacement.active()); assertFalse(index.drained(replacement));
+        index.release(ordinary); assertTrue(index.drained(replacement));
+        index.release(replacement); index.release(second);
+        assertEquals(new ProposalFootprints.GateStats(0,0,0),index.gateStats());
+        assertEquals(new ProposalFootprints.Stats(0,0,0,0),index.stats());
+        assertThrows(IllegalStateException.class,() -> index.drained(gate));
+        var spanLimited=new ProposalFootprints(ProposalFootprints.Limits.defaults(),new ProposalFootprints.GateLimits(4,1,1024));
+        assertThrows(IllegalStateException.class,() -> spanLimited.reserveGate(fp(spanLimited,point(1),point(2)),1,0));
+        assertEquals(new ProposalFootprints.GateStats(0,0,0),spanLimited.gateStats());
+        var byteLimited=new ProposalFootprints(ProposalFootprints.Limits.defaults(),new ProposalFootprints.GateLimits(4,4,192));
+        assertThrows(IllegalStateException.class,() -> byteLimited.reserveGate(fp(byteLimited,point(1)),1,0));
+        assertEquals(new ProposalFootprints.GateStats(0,0,0),byteLimited.gateStats());
+    }
+
+    @Test void gatesValidateOwnershipAndKeepHalfOpenScopeBoundaries() {
+        var index=index(); var foreign=index(); var gate=index.reserveGate(fp(index,range(b(128),b(200))),1,0);
+        assertNull(index.registerOrdinary(fp(index,point(128)),1,0));
+        assertNull(index.reserveCandidate(fp(index,point(199)),1,0));
+        assertNotNull(index.registerOrdinary(fp(index,point(200)),1,0));
+        assertNotNull(index.reserveCandidate(fp(index,point(127,255)),1,0));
+        assertTrue(index.drained(gate));
+        assertThrows(IllegalArgumentException.class,() -> foreign.release(gate));
+        assertThrows(IllegalArgumentException.class,() -> foreign.drained(gate));
+        assertThrows(IllegalArgumentException.class,() -> foreign.reserveGate(gate.footprint(),1,0));
+        assertThrows(IllegalArgumentException.class,() -> index.reserveGate(fp(index),0,0));
+        assertThrows(IllegalArgumentException.class,() -> index.reserveGate(fp(index),1,-1));
+        assertThrows(IllegalArgumentException.class,() -> new ProposalFootprints.GateLimits(0,1,1));
+        assertThrows(IllegalArgumentException.class,() -> new ProposalFootprints.GateLimits(1,0,1));
+        assertThrows(IllegalArgumentException.class,() -> new ProposalFootprints.GateLimits(1,1,0));
+    }
     private static void assertAccounting(ProposalFootprints index,List<ProposalFootprints.OrdinaryLease> ordinary,List<ProposalFootprints.CandidateLease> candidates) {
         int owners=0, exclusive=0, count=0; long bytes=0;
         for (var lease:ordinary) if (lease.active()) { owners++; count+=lease.footprint().spans().size(); bytes+=accounted(lease.footprint()); }
