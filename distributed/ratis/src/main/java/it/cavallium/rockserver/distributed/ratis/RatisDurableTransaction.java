@@ -187,7 +187,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
             var read=homes.readRegistration(initial.transactionId());
             try { requireHomeRoute(read.descriptor()); } catch (IllegalArgumentException invalid) { throw new IOException("Home read changed frozen range incarnation",invalid); }
             var status=read.status();
-            synchronized (this) { if (status==null) { if (observed!=null) throw new IOException("Home registration disappeared"); return null; } observe(status); persist(); return observed; }
+            synchronized (this) { if (status==null) { if (observed!=null) throw new IOException("Home registration disappeared"); return null; } if (status.equals(observed)) return observed; observe(status); persist(); return observed; }
         } finally { synchronized (this) { active=false; } }
     }
     public ParticipantProgress resolveParticipant(UUID group) throws IOException {
@@ -207,7 +207,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
                     }
                     if (outcome!=null) mergeOutcome(entry,outcome);
                 } catch (IOException invalid) { entry.vote=oldVote; entry.outcome=oldOutcome; entry.registration=oldRegistration; throw invalid; }
-                persist(); return entry.progress();
+                if (!Objects.equals(oldVote,entry.vote) || !Objects.equals(oldOutcome,entry.outcome) || !Objects.equals(oldRegistration,entry.registration)) persist();
+                return entry.progress();
             }
         } finally { synchronized (this) { active=false; } }
     }

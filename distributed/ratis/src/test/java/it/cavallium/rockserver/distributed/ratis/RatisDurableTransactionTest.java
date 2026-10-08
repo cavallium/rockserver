@@ -268,4 +268,18 @@ class RatisDurableTransactionTest {
         }
     }
 
+    @Test void unchangedFreshObservationsDoNotRewriteTheJournalButNewIntentsStillMustForce() throws Exception {
+        helper.root=root;
+        try (var home=helper.new Node("unchanged-home",true); var data=helper.new Node("unchanged-data",false); var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
+            var plan=plan(home,data,pin); Path path=root.resolve("unchanged.bin");
+            try (var journal=create(path,home,data,plan)) {
+                journal.executeHome(); Path blocked=path.resolveSibling(path.getFileName()+".pending"); Files.createDirectory(blocked);
+                assertEquals(plan.initial(),journal.refreshHome()); assertNull(journal.resolveParticipant(data.f.groupId).outcome()); assertTrue(Files.isDirectory(blocked),"Unchanged observations must not enter atomic snapshot replacement");
+                var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); assertThrows(IOException.class,() -> journal.queueHome(home.statuses.prepare(homeOperation(1),plan.initial(),abort))); assertEquals(plan.initial(),home.statuses.read(plan.initial().transactionId()));
+                assertThrows(IOException.class,journal::executeHome); assertEquals(0,data.wire.index);
+            }
+            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); }
+        }
+    }
+
 }

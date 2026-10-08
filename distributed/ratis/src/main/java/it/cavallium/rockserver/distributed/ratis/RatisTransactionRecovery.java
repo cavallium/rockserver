@@ -39,13 +39,21 @@ public final class RatisTransactionRecovery implements AutoCloseable {
     }
 
     /** At most one transaction write. A failed participant advances the cursor so the next step can visit another. */
-    public Step step() throws IOException {
+    public Step step() throws IOException { return perform(false); }
+    /** Terminal decisions are immutable; a healthy coordinator has already refreshed the home for this step. */
+    Step stepTerminal() throws IOException { return perform(true); }
+    private Step perform(boolean terminalOnly) throws IOException {
         synchronized (this) {
             if (closed) throw new IOException("Transaction recovery is closed");
             if (active) throw new IOException("Transaction recovery step already active");
             active=true;
         }
-        try { return advance(); }
+        try {
+            if (!terminalOnly) return advance();
+            var snapshot=journal.snapshot();
+            if (snapshot.observedHome()==null || snapshot.observedHome().phase()==TransactionStatus.Phase.PREPARING || snapshot.homeResult()==null && !snapshot.homeSuperseded()) throw new IOException("Terminal completion requires a verified decision and resolved home request");
+            return finishTerminal(snapshot);
+        }
         finally { synchronized (this) { active=false; } }
     }
 
@@ -68,10 +76,15 @@ public final class RatisTransactionRecovery implements AutoCloseable {
             journal.executeHome();
             return result(Action.ABORT_ATTEMPTED,null);
         }
+        return finishTerminal(snapshot);
+    }
+    private Step finishTerminal(RatisDurableTransaction.Snapshot snapshot) throws IOException {
+        var home=snapshot.observedHome();
         if (complete(snapshot)) return new Step(Action.COMPLETE,null,true);
         UUID group=participants.get(cursor);
         cursor=(cursor+1)%participants.size();
-        var progress=journal.resolveParticipant(group);
+        var progress=snapshot.participant(group);
+        if (progress.outcome()==null) progress=journal.resolveParticipant(group);
         if (progress.outcome()==null) {
             try (var authorization=Objects.requireNonNull(authority.authorize(group,home.transactionId(),progress.intent().finalizeControl()))) {
                 var value=authorization.value();

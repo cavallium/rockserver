@@ -1116,6 +1116,31 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             commandValidator.accept(accepted); return accepted;
         }
     }
+    /** Reattach exact live PREPARE authority after a lost coordinator reply; never recreate a read cut. */
+    public ParticipantProposal reattachParticipant(UUID transaction,OperationId control,DistributedCommand accepted) throws IOException {
+        java.util.Objects.requireNonNull(transaction); java.util.Objects.requireNonNull(control); java.util.Objects.requireNonNull(accepted);
+        if (accepted.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED) throw new IllegalArgumentException("Expected a frozen accepted participant image"); commandValidator.accept(accepted);
+        requireHealthy(); long generation=admissionGeneration.get(); var leader=leadership();
+        if (!leader.ready()) throw new RatisPreparationUnavailableException("Participant leader is not ready for original acceptance");
+        synchronized (admissions) {
+            requireHealthy(); var a=store.applied();
+            if (generation!=admissionGeneration.get() || a==null || a.term()!=leader.term() || !store.admissionOpen()) throw new RatisPreparationUnavailableException("Original participant owner is unavailable");
+            reconcileOlderProposalTerms(leader.term()); var ready=preparedParticipants.get(control);
+            if (ready!=null && ready.authorized()) {
+                requireParticipantImage(transaction,accepted,ready.preparation);
+                var view=new ParticipantProposal(ready.reservation,ready.hold,ready.preparation,ready.deadline); view.claimed=true; return view;
+            }
+            var known=admissions.get(control);
+            if (known!=null && known.participant!=null && known.term==leader.term() && known.generation==generation) {
+                requireParticipantImage(transaction,accepted,known.participant);
+                var view=new ParticipantProposal(known.acceptedScope==null ? null : new ProposalReservation(known.acceptedScope),known.participantHold,known.participant,null); view.claimed=true; return view;
+            }
+            throw new RatisPreparationUnavailableException("No live acceptance for the original participant read cut");
+        }
+    }
+    private static void requireParticipantImage(UUID transaction,DistributedCommand accepted,PreparedParticipant.Preparation preparation) {
+        if (!transaction.equals(preparation.transactionId()) || !Arrays.equals(DistributedCommandCodec.encode(accepted),DistributedCommandCodec.encode(preparation.business()))) throw new IllegalArgumentException("Participant image differs from frozen acceptance");
+    }
     /** Privileged coordinator seam: verifies the committed home registration, then freezes/reserves one accepted participant plan. */
     public ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,
             RatisTransactionStatuses homes,UUID transaction) throws Exception {

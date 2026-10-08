@@ -122,8 +122,8 @@ does not establish complete distributed API parity or production acceptance.
   transaction-record consumption. Recovery CAS operations have their own identity
   and epoch; they do not replace the frozen business identity.
   This is a home-record kernel, not complete 2PC: reports are not self-verifying
-  participant proofs. Protected status-role activation, healthy commit orchestration
-  and daemon recovery discovery/admission remain.
+  participant proofs. Protected status-role activation, public coordinator/frontend
+  integration and daemon recovery discovery/admission remain.
 - Finalization intents capture a fresh terminal home decision and its route together.
   Their canonical binding retains the frozen definition, chosen COMMIT/ABORT and
   prepare vote positions, while excluding later home generations, ACKs and client
@@ -183,8 +183,8 @@ does not establish complete distributed API parity or production acceptance.
   A fresh linearizable participant-state query survives response loss and control-session
   receipt GC. The routed client freezes exact bytes and the original descriptor for
   retry. The caller-driven coordinator journal now retains them durably, and the
-  recovery takeover policy below completes chosen decisions. Healthy forward commit
-  orchestration and daemon discovery/admission remain unfinished.
+  the forward and recovery policies below complete chosen decisions. Public frontend
+  integration and daemon discovery/admission remain unfinished.
 - The current FINALIZE record carries the verified immutable home decision and its
   independent recovery identity in at most 8,010 encoded bytes. A privileged leader
   coordinator reserves a protected input slot before the fresh home read, validates
@@ -231,7 +231,25 @@ does not establish complete distributed API parity or production acceptance.
   One RPC owner operates outside the journal monitor; close during an active RPC
   retains file ownership and rejects, so another owner cannot race it. Clients remain
   borrowed. This durable dispatch/state component feeds the recovery policy below;
-  it does not establish healthy forward orchestration or cross-group snapshot gates.
+  it does not itself establish cross-group snapshot gates or public frontend wiring.
+- `RatisTransactionCoordinator` advances normal commit requests over the frozen
+  journal. Each step performs at most one transaction write: registration, exact
+  PREPARE, a verified vote report, decision, FINALIZE or ACK. COMMIT requires every
+  local durable positive vote to match the complete home vote set. Native negative
+  votes or unavailable original prepare authority permit an ABORT attempt; generic
+  I/O stays uncertain. CAS action labels identify attempts, not a guessed decision.
+  A competing ABORT therefore defeats COMMIT without exposing business effects.
+  PREPARE authority providers retain the original pins and canonical accepted images.
+  Exact live ready/inflight PREPARE acceptance can be borrowed after reply loss or
+  journal reopen without allocating another reservation or recreating the read cut.
+  A closed/conflicting original cut is never rebased. Authority tokens close after
+  dispatch using their original ownership rules, and an active policy cannot close.
+  Terminal completion shares the recovery path after the already-verified home read,
+  avoiding a second home read. Completion requires all saved native outcomes and all
+  home finalization ACKs; consumption remains an explicit client action. Saved terminal
+  proof may authorize ACK while a participant is temporarily unavailable. The driver
+  does not manufacture a consistent cross-group read cut or assemble legacy global
+  result order; scoped snapshot fences and frontend result binding remain unfinished.
 - `RatisTransactionRecovery` implements explicit takeover in bounded steps. It reads
   the home freshly, retries an uncertain frozen home request when still relevant,
   proposes ABORT for otherwise-undecided PREPARING state, and completes a chosen
@@ -334,7 +352,9 @@ reserved pending-home routing. It reserves future registration/decision/proof me
 before the first home RPC; the complete current snapshot is capped at 64 MiB including
 its checksum. Accepted business/result bytes are stored once, with compact request
 and outcome metadata reconstructed against that immutable intent. Snapshots are
-rewritten atomically per durable transition; write amplification and global journal
+rewritten atomically per durable state change; unchanged fresh home/participant
+observations reuse the already-forced state, and saved terminal proofs avoid another
+participant download before ACK. Write amplification and global journal
 storage/tenant envelopes still require performance/resource qualification.
 
 A transaction-home record has at most 64 frozen participants and 7,926 encoded bytes.
@@ -477,6 +497,22 @@ rejects a status read from another incarnation without manufacturing an RPC rece
 These are controlled fixtures; process/quorum/fault-disk and daemon wiring acceptance
 remain separate and unperformed.
 
+The forward-coordinator regression gate passed 55 core and 152 adapter cases (207
+total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-transaction-coordinator-regression.log`. After cached terminal-proof
+reuse, the final focused selection passed 59 adapter cases, zero failures/errors/skips,
+exit zero: `/tmp/rockserver-transaction-coordinator-last.log`. Ten coordinator fixtures
+cover normal completion without consumption or duplicate home reads, lost PREPARE
+reply, ready and unknown submitted reattachment, unavailable versus uncertain authority,
+original-cut conflict without rebasing, competing ABORT, lost final ACK, cancelled
+observer ownership, two-group commit with a lost reply and partial-finalization locks,
+and ACK from forced proof while the participant transport is unavailable. A journal
+fixture blocks atomic replacement to prove unchanged observations do not write, while
+new intents still force and fence before dispatch. Independent read-only review found
+no concrete issue in the examined forward/cached-proof boundary. This does not prove
+cross-group snapshot consistency, public API parity, runtime role wiring or real quorum
+acceptance.
+
 The exercised native preparation cases cover unchanged user values, complete read/
 absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
 planning/admission rejection, stable duplicate prepare positions, separate ordinary
@@ -489,7 +525,7 @@ actual controlled applied votes to a home, choose COMMIT, apply both Raft FINALI
 ACK each participant and consume the home record. While only one group is finalized,
 the other's lock prevents stale user reads. Both values become readable after local
 finalization. This establishes the exercised protocol path, not participant quorum
-behavior, an automatic durable coordinator or the public transaction frontend.
+behavior, scoped cross-group snapshot consistency or the public transaction frontend.
 
 The exercised native/controlled-dispatch workflows include OPEN/read/STAGE/PLAN,
 forced acceptance before submission, applied native outcomes, lost PLAN/commit
@@ -532,7 +568,7 @@ server process, network/quorum probe, power-loss run or deployment was performed
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
 - Protected status-group node/pool activation, daemon journal discovery/admission
-  and healthy commit orchestration, and consistent
+  and public commit orchestration/frontend wiring, and consistent
   multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
   establish these.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,
