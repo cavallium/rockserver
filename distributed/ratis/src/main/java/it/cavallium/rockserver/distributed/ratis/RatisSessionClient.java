@@ -86,6 +86,14 @@ public final class RatisSessionClient {
         return entry;
     }
 
+    /** Prepare first-use binding for a pending route. A separate maintenance sequencer owns the issuer identity and retry. */
+    public RatisRoutedClient.PreparedCommand prepareBinding(RatisSessionEpochs epochs,OperationId issuer,Pending target,long acknowledgedThrough) throws IOException {
+        synchronized (this) { requireOwner(target); }
+        var command=epochs.prepareSessionBinding(routed.directory(),target.descriptor().groupId(),issuer,grant,limits.outstanding(),acknowledgedThrough);
+        if (command.rangeEpoch()!=target.command().rangeEpoch()) throw new IllegalStateException("Pending route changed incarnation before binding");
+        return routed.prepareSessionControl(command);
+    }
+
     /** Failure leaves the immutable command in the window for explicit same-identity retry. */
     public CommandResult execute(Pending entry) throws IOException {
         synchronized (this) {

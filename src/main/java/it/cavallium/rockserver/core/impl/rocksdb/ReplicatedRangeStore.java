@@ -311,12 +311,14 @@ public final class ReplicatedRangeStore {
                 return original;
             }
             requireNext(position);
-            var sessionStatus = saved==null ? sessionDecision(command,currentFloor) : CommandResult.Status.SUCCESS;
-            boolean acceptMaintenance = sessionStatus==CommandResult.Status.SUCCESS;
+            var authority=saved==null ? sessionAuthority() : null;
+            var sessionStatus = saved==null ? sessionDecision(command,currentFloor,authority) : CommandResult.Status.SUCCESS;
+            boolean terminalExpiry = sessionStatus==CommandResult.Status.SESSION_EXPIRED && expiredBoundOutcome(command,currentFloor,authority);
+            boolean acceptMaintenance = sessionStatus==CommandResult.Status.SUCCESS || terminalExpiry;
             long effectiveMinimum = acceptMaintenance ? command.minimumSessionEpoch() : -1;
             long effectiveAcknowledgement = acceptMaintenance ? command.acknowledgedThrough() : -1;
             boolean installUserEffects = true;
-            if (saved==null && !acceptMaintenance) {
+            if (saved==null && sessionStatus!=CommandResult.Status.SUCCESS) {
                 stableResult=new CommandResult(sessionStatus,List.of()).encode(); installUserEffects=false;
             }
             if (saved == null && stableResult == null) {
@@ -389,8 +391,8 @@ public final class ReplicatedRangeStore {
             current.requireAtLeast(control.authority()); return current;
         }
     }
-    private CommandResult.Status sessionDecision(DistributedCommand command,long acknowledged) throws RocksDBException {
-        var authority=sessionAuthority(); var control=command.sessionControl();
+    private CommandResult.Status sessionDecision(DistributedCommand command,long acknowledged,SessionAuthority authority) throws RocksDBException {
+        var control=command.sessionControl();
         if (control!=null) {
             final SessionAuthority effective;
             try { effective=effectiveAuthority(control,authority); }
@@ -421,9 +423,19 @@ public final class ReplicatedRangeStore {
         if (binding==null || !binding.grant().sessionId().equals(id.sessionId())) return CommandResult.Status.SESSION_EXPIRED;
         boolean acknowledgementOnly=command.acknowledgedThrough()>=0 && command.mutations().isEmpty() && command.predicates().isEmpty();
         if (!acknowledgementOnly && !authority.permits(binding.grant())) return CommandResult.Status.SESSION_EXPIRED;
+        return withinSessionWindow(command,acknowledged,binding.outstandingWindow()) ? CommandResult.Status.SUCCESS : CommandResult.Status.CONFLICT;
+    }
+    private static boolean withinSessionWindow(DistributedCommand command,long acknowledged,int window) {
         long floor=Math.max(acknowledged,command.acknowledgedThrough());
-        int window=binding.outstandingWindow();
-        return floor>Long.MAX_VALUE-window || id.sequence()<=floor+window ? CommandResult.Status.SUCCESS : CommandResult.Status.CONFLICT;
+        return floor>Long.MAX_VALUE-window || command.operationId().sequence()<=floor+window;
+    }
+    // Only an installed immutable grant proves individual expiry. Unbound requests remain retryable until binding.
+    private boolean expiredBoundOutcome(DistributedCommand command,long acknowledged,SessionAuthority authority) throws RocksDBException {
+        if (authority==null || command.minimumSessionEpoch()>=0) return false;
+        var id=command.operationId(); var binding=sessionBinding(id.epoch());
+        return binding!=null && binding.grant().sessionId().equals(id.sessionId())
+                && binding.grant().expiresAtMillis()<=authority.logicalTimeMillis()
+                && withinSessionWindow(command,acknowledged,binding.outstandingWindow());
     }
     private void installSessionControl(WriteBatch batch,RangeSessionControl control) throws RocksDBException {
         var effective=effectiveAuthority(control,sessionAuthority());
@@ -1147,6 +1159,11 @@ public final class ReplicatedRangeStore {
      * Callers must serialize outstanding maintenance proposals to avoid spending overlapping ACK/floor removal twice.
      */
     public ReceiptRetentionEstimate estimateReceiptRetention(DistributedCommand command) throws RocksDBException {
+        return estimateReceiptRetention(command,false);
+    }
+
+    /** Session-enabled adapters stop new data admission until their first replicated authority cut is installed. */
+    public ReceiptRetentionEstimate estimateReceiptRetention(DistributedCommand command,boolean requireSessionAuthority) throws RocksDBException {
         Objects.requireNonNull(command);
         enterNative();
         applyLane.lock();
@@ -1167,8 +1184,13 @@ public final class ReplicatedRangeStore {
                 decodeReceipt(saved, command.payloadDigest());
                 return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
             }
-            var sessionStatus=sessionDecision(command,floor);
-            if (sessionStatus!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Session admission rejected: " + sessionStatus);
+            var authority=sessionAuthority();
+            if (requireSessionAuthority && command.sessionControl()==null && command.minimumSessionEpoch()<0 && authority==null) {
+                throw new IllegalStateException("Replicated session authority has not been initialized");
+            }
+            var sessionStatus=sessionDecision(command,floor,authority);
+            boolean terminalExpiry=sessionStatus==CommandResult.Status.SESSION_EXPIRED && expiredBoundOutcome(command,floor,authority);
+            if (sessionStatus!=CommandResult.Status.SUCCESS && !terminalExpiry) throw new IllegalStateException("Session admission rejected: " + sessionStatus);
             Usage removed = new Usage(0, 0);
             if (command.minimumSessionEpoch() > minimum) {
                 byte[] end = ByteBuffer.allocate(25).put(usageBucketsPrefix).putLong(command.minimumSessionEpoch()).array();
@@ -1178,7 +1200,7 @@ public final class ReplicatedRangeStore {
                 removed = removed.plus(scanUsage(receipts, receiptKey(new OperationId(id.sessionId(), id.epoch(), 0)),
                         receiptKey(new OperationId(id.sessionId(), id.epoch(), command.acknowledgedThrough() + 1)), true));
             }
-            long maximumBytes = 84L + (command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)
+            long maximumBytes = 84L + (terminalExpiry || command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)
                     ? 8 : CommandResult.MAX_BYTES);
             return new ReceiptRetentionEstimate(usage, true, Math.max(0, 1 - removed.count),
                     Math.max(0, maximumBytes - removed.bytes), maintenance);

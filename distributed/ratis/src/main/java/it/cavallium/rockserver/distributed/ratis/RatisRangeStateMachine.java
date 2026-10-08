@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
 import java.util.function.Consumer;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommandCodec;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
+import it.cavallium.rockserver.core.common.distributed.RangeDirectory;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
 import java.nio.channels.FileChannel;
@@ -50,6 +51,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     private long reservedReceiptCount, reservedReceiptBytes;
     private Admission maintenanceReservation;
     private final RetentionLimits retentionLimits;
+    private final boolean enableSessionControls;
     public record RetentionLimits(long dataCount, long dataBytes, long maintenanceCount, long maintenanceBytes) {
         public RetentionLimits {
             if (dataCount < 1 || dataBytes < 92 || maintenanceCount < 1 || maintenanceBytes < 92) throw new IllegalArgumentException("Invalid retention limits");
@@ -119,6 +121,28 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         this(store,initialGroup,limits,commandValidator,epochFloorAdmission,retentionLimits,null);
     }
 
+    /** Explicit bootstrap seam: catalogue checks run only for controls, never on ordinary data replay. */
+    public static RatisRangeStateMachine withSessions(ReplicatedRangeStore store,RaftGroup group,NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> validator,RatisSessionEpochs epochs,RangeDirectory directory,RetentionLimits retentionLimits) {
+        return withSessions(store,group,limits,validator,epochs,directory,retentionLimits,null);
+    }
+    static RatisRangeStateMachine withSessions(ReplicatedRangeStore store,RaftGroup group,NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> validator,RatisSessionEpochs epochs,RangeDirectory directory,RetentionLimits retentionLimits,
+            LeadershipSource leadershipSource) {
+        var id=group.getGroupId().getUuid();
+        var floor=epochs.floorAdmission(directory,id); var control=epochs.sessionControlAdmission(directory,id);
+        var descriptor=directory.ranges().stream().filter(range -> range.groupId().equals(id)).findFirst().orElseThrow();
+        var ownership=store.ownership(); var interval=ownership.interval();
+        if (!ownership.owner().groupId().equals(id) || ownership.owner().epoch()!=descriptor.rangeEpoch()
+                || !interval.domainId().equals(directory.domainId()) || !interval.columns().equals(directory.columns())
+                || !Arrays.equals(store.schemaDigest(),directory.schemaDigest())
+                || !Arrays.equals(interval.lowerInclusive(),descriptor.lowerInclusive())
+                || !Arrays.equals(interval.upperExclusive(),descriptor.upperExclusive())) throw new IllegalArgumentException("Session directory differs from native range");
+        return new RatisRangeStateMachine(store,group,limits,validator,
+                command -> { if (command.sessionControl()!=null) control.accept(command); else floor.accept(command); },
+                retentionLimits,leadershipSource,true);
+    }
+
     // Explicit view injection is only for ordinary in-process fixtures without a running Raft division.
     RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
             Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission,
@@ -129,6 +153,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
             Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission,
             RetentionLimits retentionLimits, LeadershipSource leadershipSource) {
+        this(store,initialGroup,limits,commandValidator,epochFloorAdmission,retentionLimits,leadershipSource,false);
+    }
+    private RatisRangeStateMachine(ReplicatedRangeStore store,RaftGroup initialGroup,NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> commandValidator,Consumer<DistributedCommand> epochFloorAdmission,
+            RetentionLimits retentionLimits,LeadershipSource leadershipSource,boolean enableSessionControls) {
+        this.enableSessionControls=enableSessionControls;
         this.retentionLimits = java.util.Objects.requireNonNull(retentionLimits);
         this.leadershipSource = leadershipSource;
         this.commandValidator = java.util.Objects.requireNonNull(commandValidator);
@@ -156,6 +186,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             snapshots.init(storage);
             recover(false);
             store.activate();
+            if (enableSessionControls) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
         } catch (Exception failure) { throw failRecovery(failure); }
     }
@@ -458,6 +489,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear();
                 store.activate();
+                if (enableSessionControls) store.enableSessionControls();
                 synchronized (admissions) {
                     for (var id : coveredOperations) {
                         var admission = admissions.get(id);
@@ -513,7 +545,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             // Native receipt reads stay outside the short admission lock. If apply
             // advanced while reading, retry validation before acquiring ownership.
             for (int attempt = 0; attempt < 3; attempt++) {
-                var estimate = store.estimateReceiptRetention(command);
+                var estimate = store.estimateReceiptRetention(command,enableSessionControls);
                 var observed = estimate.usage().appliedPosition();
                 if (observed == null || observed.term() != leadership.term()) {
                     throw new IllegalStateException("Current-term startup prefix has not completed native apply");

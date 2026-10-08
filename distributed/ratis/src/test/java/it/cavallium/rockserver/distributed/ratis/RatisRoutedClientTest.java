@@ -222,6 +222,22 @@ class RatisRoutedClientTest {
         }
     }
 
+    @Test void preparedSessionControlKeepsItsOriginalIncarnationAcrossDirectoryRefresh() throws Exception {
+        var transport=new RecordingTransport();
+        try (var client=new RatisRoutedClient(directory(1,1),transport)) {
+            var control=RangeSessionControl.advance(SessionEpochLedger.initial(CLUSTER,DB,10));
+            var command=DistributedCommand.sessionControl(new UUID(8,1),9,new byte[32],OPERATION,control,-1);
+            var prepared=client.prepareSessionControl(command); byte[] original=DistributedCommandCodec.encode(command);
+            assertThrows(IllegalArgumentException.class,() -> client.prepareSessionControl(
+                    DistributedCommand.sessionControl(command.groupId(),8,new byte[32],OPERATION,control,-1)));
+            client.refresh(directory(2,3));
+            assertThrows(IllegalArgumentException.class,() -> client.prepareSessionControl(command));
+            client.execute(prepared); client.execute(prepared);
+            assertEquals(new UUID(8,1),transport.lastDescriptor.groupId()); assertEquals(2,transport.commands.size());
+            for (var submitted:transport.commands) assertArrayEquals(original,DistributedCommandCodec.encode(submitted));
+        }
+    }
+
     private class RecordingTransport implements RatisRoutedClient.Transport {
         final List<DistributedCommand> commands = new ArrayList<>();
         final AtomicInteger closes = new AtomicInteger();

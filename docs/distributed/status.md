@@ -1004,3 +1004,74 @@ Next work includes Ratis/bootstrap control wiring, automatic logical-clock/floor
 propagation with explicit completion, range session binding from the client,
 node/pool/tenant budgets and the other remaining architecture workflows. Activation
 remains explicit; no catalogue-wide instantaneous expiry guarantee is claimed.
+
+## Explicit Ratis session bootstrap and routed first-use binding
+
+`RatisRangeStateMachine.withSessions` now composes typed-control and legacy-floor
+catalogue proposal checks and verifies the directory's group/range epoch, immutable
+schema, domain, columns and interval against native ownership. It enables native
+controls only after initialization/reinitialization has recovered and activated the
+store. Existing constructors remain opt-in-free. The session-enabled admission
+path stops new ordinary data until the first replicated authority cut exists;
+known receipts and permanently expired identities still resolve, and committed
+legacy replay remains unchanged. This startup guard uses the same completed cut
+as retention estimation. Native authority lookup is shared within the estimate.
+
+Bindings, clock advances, ACK-only commands and piggyback ACKs all retain the single
+maintenance reservation owner. Controls therefore cannot invalidate receipt
+removal credit held by another maintenance proposal. Catalogue availability is
+checked at proposal admission only: apply/replay and ordinary bound data never
+repeat it. Recovery retains this configuration and native enforcement.
+
+The routed client can now prepare a catalogue-frozen control against its exact
+active group/incarnation and cluster/database/schema. The prepared route/payload
+remain immutable through directory refresh and explicit retry. Session clients can
+prepare first-use binding for a pending data route using their declared window;
+a separate maintenance sequencer supplies the control identity and contiguous ACK.
+A pending incarnation change rejects binding rather than silently rebasing data.
+Binding execution is explicit; no background scheduler or per-write catalogue read
+is added.
+
+The full ordinary Maven gate passes 77 core/native, 16 read-round and 39 adapter
+cases (132 total), exit zero:
+`/tmp/rockserver-ratis-session-wiring-full-gate.log`. New composition tests cover
+startup rejection before authority, binding/duplicate owners, bound data and ACKs
+while catalogue unavailable, ACK-vs-expiry exclusion in both orders, cancellation,
+clock propagation with all user grants expired, snapshot reload/control reuse,
+identity rejection before effects and original control route/bytes across refresh.
+Fixtures use real native catalogue/data stores with controlled Ratis interfaces;
+they do not prove replica-membership agreement, actual transport/quorum ordering,
+independent failure domains, power-loss recovery or performance. No excluded
+workflow/density execution, main-checkout change, push or deployment occurred.
+
+This is an explicit bootstrap seam and one complete native/interface workflow.
+Automatic clock/floor propagation and its completion record, bounded maintenance
+sequencing, automatic per-range client binding, public service/Main integration,
+node/pool/tenant budgets and the previously listed architecture workflows remain
+required. Session-enabled mode is not activated in the standalone/public runtime.
+
+### Individual expiry outcome resolution before coarse fencing
+
+The session wiring now resolves individual expiry even when an earlier live grant
+keeps the coarse floor unchanged. For an installed exact grant already expired at
+the replicated logical time, a new command within its effective ACK/window may
+append a saved canonical SESSION_EXPIRED receipt. Its worst retained size is 92
+bytes even for returning mutations. Native apply independently forbids user effects
+while honoring the matching session's frozen piggyback ACK, so consumed receipts
+can be replaced by the terminal outcome at capacity. Unknown/unbound requests and
+out-of-window identities remain admission failures, not definitive expiry results.
+
+The receipt preserves the original payload digest: an expired write cannot be
+replaced with an ACK-only command under the same identity. Client execute now
+receives a definitive result for the expiry hole and explicit application
+consumption can advance its prefix. Later ACK/coarse fencing retains its existing
+permanent rejection behavior. No generic IOException clears an unresolved identity.
+
+The final ordinary gate passes 77 core/native, 16 read-round and 40 adapter cases
+(133 total), exit zero: `/tmp/rockserver-individual-session-expiry-full-gate.log`.
+The new composition case has a live earlier grant and expired later grant, fills
+the 184-byte soft retention limit, then proves zero-growth terminal expiry for a
+returning mutation, persisted retry/hash identity, no user effects, explicit
+consumption, rejected identity swapping/out-of-window requests and continued ACK
+cleanup. This closes the reviewed individual-expiry client-progress gap for bound
+sessions; remaining bootstrap/propagation/public-runtime work is unchanged.

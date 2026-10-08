@@ -149,6 +149,21 @@ public final class RatisRoutedClient implements AutoCloseable {
         return new PreparedCommand(observed, descriptor, command);
     }
 
+    /** Keep a catalogue-prepared control immutable and route it to its exact active range incarnation. */
+    public PreparedCommand prepareSessionControl(DistributedCommand command) {
+        Objects.requireNonNull(command);
+        var observed=current(); var control=command.sessionControl();
+        if (control==null || !control.authority().clusterId().equals(observed.clusterId())
+                || !control.authority().databaseId().equals(observed.databaseId())
+                || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())) throw new IllegalArgumentException("Wrong session control identity/schema");
+        var descriptor=observed.ranges().stream().filter(range -> range.groupId().equals(command.groupId())).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Control range is absent from directory"));
+        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || descriptor.rangeEpoch()!=command.rangeEpoch()) {
+            throw new IllegalArgumentException("Control range is inactive or changed incarnation");
+        }
+        return new PreparedCommand(observed,descriptor,command);
+    }
+
     public CommandResult execute(PreparedCommand prepared) throws IOException {
         Objects.requireNonNull(prepared, "prepared");
         requireIdentity(prepared.source);
