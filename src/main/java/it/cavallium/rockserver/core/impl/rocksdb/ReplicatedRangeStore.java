@@ -90,7 +90,55 @@ public final class ReplicatedRangeStore {
     public static final int MAX_HOME_RECOVERIES=1024;
     public static final long MAX_HOME_RECOVERY_BYTES=16L*1024*1024;
     private volatile Map<OperationId,HomeRecoveryReceipt> homeRecoveries=Map.of();
-    private long retainedHomeRecoveryBytes;
+    private long retainedHomeRecoveryBytes,reservedHomeRecoveryBytes;
+    private int reservedHomeRecoveryCount;
+    private volatile Map<UUID,HomeRecoveryCredit> homeRecoveryCredits=Map.of();
+    private volatile HomeRecoveryContext homeRecoveryContext;
+    private record HomeRecoveryContext(UUID cluster,UUID database,UUID column) {}
+    public record HomeRecoveryCredit(UUID group,long rangeEpoch,byte[] schema,UUID cluster,UUID database,UUID column,TransactionStatus initial,TransactionStatus current,ApplyPosition position) {
+        public static final int MAX_BYTES=128+2*TransactionStatus.MAX_BYTES;
+        public static final long TRANSITION_BYTES=49L+HomeRecoveryReceipt.MAX_BYTES;
+        public HomeRecoveryCredit {
+            Objects.requireNonNull(group); Objects.requireNonNull(schema); Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(column); Objects.requireNonNull(initial); Objects.requireNonNull(current); Objects.requireNonNull(position);
+            initial.requireInitial();
+            if (rangeEpoch<0 || schema.length!=32 || position.term()<=0 || !cluster.equals(initial.clusterId()) || !database.equals(initial.databaseId()) || !initial.sameDefinition(current) || remaining(current)==0) throw new IllegalArgumentException("Invalid HOME recovery promise");
+            var rebuilt=initial;
+            for (var p:current.participants()) if (p.prepared()!=null) rebuilt=rebuilt.prepared(p.groupId(),p.planDigest(),p.prepared());
+            if (current.phase()!=TransactionStatus.Phase.PREPARING) rebuilt=rebuilt.decide(current.phase());
+            for (var p:current.participants()) if (p.finalized()) rebuilt=rebuilt.finalized(p.groupId());
+            if (current.consumed()) rebuilt=rebuilt.consume();
+            if (!rebuilt.equals(current)) throw new IllegalArgumentException("HOME promise progress/generation changed"); schema=schema.clone();
+        }
+        @Override public byte[] schema() { return schema.clone(); }
+        public static int remaining(TransactionStatus status) { return (status.phase()==TransactionStatus.Phase.PREPARING ? 1 : 0)+(int)status.participants().stream().filter(p -> !p.finalized()).count(); }
+        public int reservedCount() { return remaining(current); }
+        public long reservedBytes() { return reservedCount()*TRANSITION_BYTES+33L+encode().length; }
+        public byte[] userKey() { return uuidBytes(current.transactionId()); }
+        public void requireCut(ApplyPosition cut) { if (cut==null || position.index()>cut.index() || position.term()>cut.term() || position.index()==cut.index() && position.term()!=cut.term()) throw new IllegalArgumentException("HOME promise differs from completed cut"); }
+        public void requireOwner(RangeOwnership.Owner owner,RangeOwnership.Interval interval,byte[] digest) {
+            var key=userKey(); if (!group.equals(owner.groupId()) || rangeEpoch!=owner.epoch() || !Arrays.equals(schema,digest) || !interval.columns().equals(Set.of(column))
+                    || interval.lowerInclusive()!=null && Arrays.compareUnsigned(key,interval.lowerInclusive())<0 || interval.upperExclusive()!=null && Arrays.compareUnsigned(key,interval.upperExclusive())>=0) throw new IllegalArgumentException("HOME promise owner/schema/column differs");
+        }
+        public byte[] encode() {
+            byte[] first=initial.encode(),next=current.encode(); var b=ByteBuffer.allocate(128+first.length+next.length);
+            b.putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).putLong(rangeEpoch).put(schema);
+            for (var id:List.of(cluster,database,column)) b.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());
+            return b.putLong(position.term()).putLong(position.index()).putInt(first.length).put(first).putInt(next.length).put(next).array();
+        }
+        @Override public boolean equals(Object other) { return other instanceof HomeRecoveryCredit credit && Arrays.equals(encode(),credit.encode()); }
+        @Override public int hashCode() { return Arrays.hashCode(encode()); }
+        public static HomeRecoveryCredit decode(byte[] bytes) {
+            if (bytes.length<128 || bytes.length>MAX_BYTES) throw new IllegalArgumentException("Invalid HOME promise length");
+            try {
+                var b=ByteBuffer.wrap(bytes); UUID group=new UUID(b.getLong(),b.getLong()); long epoch=b.getLong(); byte[] schema=new byte[32]; b.get(schema);
+                UUID cluster=new UUID(b.getLong(),b.getLong()),database=new UUID(b.getLong(),b.getLong()),column=new UUID(b.getLong(),b.getLong()); var position=new ApplyPosition(b.getLong(),b.getLong());
+                int first=b.getInt(); if (first<0 || first>TransactionStatus.MAX_BYTES || first>b.remaining()-4) throw new IllegalArgumentException("Invalid HOME promise definition"); byte[] initial=new byte[first]; b.get(initial);
+                int next=b.getInt(); if (next<0 || next>TransactionStatus.MAX_BYTES || next!=b.remaining()) throw new IllegalArgumentException("Invalid HOME promise progress"); byte[] current=new byte[next]; b.get(current);
+                var result=new HomeRecoveryCredit(group,epoch,schema,cluster,database,column,TransactionStatus.decode(initial),TransactionStatus.decode(current),position);
+                if (!Arrays.equals(bytes,result.encode())) throw new IllegalArgumentException("Noncanonical HOME promise"); return result;
+            } catch (RuntimeException invalid) { throw new IllegalArgumentException("Invalid HOME promise",invalid); }
+        }
+    }
     private volatile Map<UUID,SnapshotGate> snapshotGates=Map.of();
     private long retainedGateBytes;
     private volatile DistributedSchema logicalSchema;
@@ -175,7 +223,7 @@ public final class ReplicatedRangeStore {
         } else {
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            homeRecoveries=loadHomeRecoveries(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
         }
     }
 
@@ -250,7 +298,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
-            homeRecoveries=loadHomeRecoveries(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -399,8 +447,62 @@ public final class ReplicatedRangeStore {
         if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command);
     }
 
-    public record HomeRecoveryCapacity(ApplyPosition position,int count,long bytes) {}
-    public record HomeRecoveryEstimate(HomeRecoveryCapacity capacity,boolean newReceipt,HomeRecoveryReceipt existing) {}
+    public record HomeRecoveryCapacity(ApplyPosition position,int count,long bytes,int reservedCount,long reservedBytes) {
+        public int effectiveCount() { return count+reservedCount; }
+        public long effectiveBytes() { return bytes+reservedBytes; }
+    }
+    public record HomeRecoveryEstimate(HomeRecoveryCapacity capacity,boolean newReceipt,HomeRecoveryReceipt existing,boolean creditCovered,int additionalCount,long additionalBytes) {}
+    public record HomeCreditEstimate(HomeRecoveryCapacity capacity,int additionalCount,long additionalBytes) {}
+    private record HomeCreditChange(Map<UUID,HomeRecoveryCredit> published,UUID transaction,HomeRecoveryCredit credit,int count,long bytes) {}
+    public void configureHomeRecoveryReservations(UUID cluster,UUID database,UUID column) {
+        Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(column); enterNative(); applyLane.lock();
+        try {
+            var context=new HomeRecoveryContext(cluster,database,column);
+            if (!columns.keySet().equals(Set.of(column)) || homeRecoveryContext!=null && !homeRecoveryContext.equals(context)) throw new IllegalArgumentException("HOME reservation context changed or column is not dedicated");
+            for (var credit:homeRecoveryCredits.values()) if (!credit.cluster().equals(cluster) || !credit.database().equals(database) || !credit.column().equals(column)) throw new IllegalArgumentException("HOME reservation context differs from stored promises");
+            var recovered=loadHomeCredits(applied,context); homeRecoveryCredits=recovered; validateHomeCreditCapacity(); homeRecoveryContext=context;
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    private byte[] homeCreditKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x26).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
+    private HomeRecoveryContext creditContext() {
+        if (homeRecoveryContext!=null) return homeRecoveryContext;
+        var credit=homeRecoveryCredits.values().stream().findFirst().orElse(null); return credit==null ? null : new HomeRecoveryContext(credit.cluster(),credit.database(),credit.column());
+    }
+    private HomeCreditChange homeCreditChange(DistributedCommand command,ApplyPosition position,boolean successful) { return homeCreditChange(command,position,successful,false); }
+    private HomeCreditChange homeCreditChange(DistributedCommand command,ApplyPosition position,boolean successful,boolean protectedRecovery) {
+        if (!successful || command.mutations().isEmpty()) return null;
+        if (!protectedRecovery && homeRecoveryContext==null && !homeRecoveryCredits.isEmpty()) throw new IllegalStateException("HOME reservations must be configured before ordinary changes");
+        var context=creditContext(); if (context==null) return null;
+        if (command.kind()!=DistributedCommand.Kind.DATA || command.hasBucketData() || command.mutations().size()!=1 || command.predicates().size()!=1) throw new IllegalArgumentException("Promised HOME changes require one physical CAS");
+        var mutation=command.mutations().getFirst(); var predicate=command.predicates().getFirst();
+        if (mutation.kind()!=Mutation.Kind.PUT || mutation.returnMode()!=Mutation.ReturnMode.NONE || !mutation.columnId().equals(context.column()) || !predicate.columnId().equals(context.column()) || mutation.key().length!=16 || !Arrays.equals(mutation.key(),predicate.key())) throw new IllegalArgumentException("Invalid promised HOME CAS envelope");
+        var next=TransactionStatus.decode(mutation.value());
+        if (!next.clusterId().equals(context.cluster()) || !next.databaseId().equals(context.database()) || !Arrays.equals(mutation.key(),uuidBytes(next.transactionId()))) throw new IllegalArgumentException("Promised HOME identity changed");
+        var old=homeRecoveryCredits.get(next.transactionId()); TransactionStatus initial;
+        if (predicate.expectedValue()==null) { next.requireInitial(); if (old!=null) throw new IllegalStateException("HOME registration replaced a promise"); initial=next; }
+        else {
+            var before=TransactionStatus.decode(predicate.expectedValue()); next.requireSuccessorOf(before);
+            if (old==null && HomeRecoveryCredit.remaining(before)!=0) throw new IllegalStateException("Existing HOME has no future recovery promise");
+            if (old!=null && !old.current().equals(before)) throw new IllegalStateException("HOME row and promise differ"); initial=old==null ? before : old.initial();
+        }
+        var credit=HomeRecoveryCredit.remaining(next)==0 ? null : new HomeRecoveryCredit(groupId,rangeEpoch,schemaDigest,context.cluster(),context.database(),context.column(),initial,next,position);
+        int count=(credit==null ? 0 : credit.reservedCount())-(old==null ? 0 : old.reservedCount()); long bytes=(credit==null ? 0 : credit.reservedBytes())-(old==null ? 0 : old.reservedBytes());
+        var published=new HashMap<>(homeRecoveryCredits); if (credit==null) published.remove(next.transactionId()); else published.put(next.transactionId(),credit);
+        return new HomeCreditChange(Map.copyOf(published),next.transactionId(),credit,count,bytes);
+    }
+    private void checkHomeCapacity(int count,long bytes) { var capacity=homeRecoveryCapacityUnderLane(); if (count>MAX_HOME_RECOVERIES-capacity.effectiveCount() || bytes>MAX_HOME_RECOVERY_BYTES-capacity.effectiveBytes()) throw new IllegalStateException("HOME receipt/future promise capacity exhausted"); }
+    private void writeHomeCredit(WriteBatch batch,HomeCreditChange change) throws RocksDBException { if (change!=null) { if (change.credit()==null) batch.delete(state,homeCreditKey(change.transaction())); else batch.put(state,homeCreditKey(change.transaction()),change.credit().encode()); } }
+    private void publishHomeCredit(HomeCreditChange change) { if (change!=null) { homeRecoveryCredits=change.published(); reservedHomeRecoveryCount+=change.count(); reservedHomeRecoveryBytes+=change.bytes(); } }
+    public HomeCreditEstimate estimateHomeRegistration(DistributedCommand command) throws RocksDBException {
+        Objects.requireNonNull(command); enterNative(); applyLane.lock();
+        try {
+            requireActive(); if (homeRecoveryContext==null) throw new IllegalStateException("HOME registration reservations are not configured"); validate(command);
+            var capacity=homeRecoveryCapacityUnderLane(); if (db.get(receipts,receiptKey(command.operationId()))!=null) return new HomeCreditEstimate(capacity,0,0);
+            boolean successful=evaluate(command).result().status()==CommandResult.Status.SUCCESS;
+            var change=homeCreditChange(command,new ApplyPosition(Math.max(1,applied==null ? 1 : applied.term()),applied==null ? 0 : applied.index()+1),successful);
+            int count=change==null ? 0 : Math.max(0,change.count()); long bytes=change==null ? 0 : Math.max(0,change.bytes()); checkHomeCapacity(count,bytes); return new HomeCreditEstimate(capacity,count,bytes);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     private byte[] homeRecoveryKey(OperationId id) { return ByteBuffer.allocate(49).put(markerKey).put((byte)0x25).putLong(id.sessionId().getMostSignificantBits()).putLong(id.sessionId().getLeastSignificantBits()).putLong(id.epoch()).putLong(id.sequence()).array(); }
     public static long homeRecoveryBytes(HomeRecovery recovery) { return 49L+28+recovery.encode().length; }
     private void requireHomeRecovery(HomeRecovery recovery) {
@@ -418,7 +520,7 @@ public final class ReplicatedRangeStore {
         for (var r:snapshotGates.values()) if (r.ownsOperation(id)) throw new IllegalArgumentException("HOME recovery identity belongs to snapshot gate");
         if (db.get(receipts,receiptKey(id))!=null) throw new IllegalArgumentException("HOME recovery identity has an ordinary receipt");
     }
-    private HomeRecoveryCapacity homeRecoveryCapacityUnderLane() { return new HomeRecoveryCapacity(applied,homeRecoveries.size(),retainedHomeRecoveryBytes); }
+    private HomeRecoveryCapacity homeRecoveryCapacityUnderLane() { return new HomeRecoveryCapacity(applied,homeRecoveries.size(),retainedHomeRecoveryBytes,reservedHomeRecoveryCount,reservedHomeRecoveryBytes); }
     public HomeRecoveryCapacity homeRecoveryCapacity() {
         enterNative(); applyLane.lock(); try { requireActive(); return homeRecoveryCapacityUnderLane(); } finally { applyLane.unlock(); leaveNative(); }
     }
@@ -426,11 +528,12 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(recovery); enterNative(); applyLane.lock();
         try {
             requireActive(); requireHomeRecovery(recovery); var existing=homeRecoveries.get(recovery.operation());
-            if (existing!=null) { requireSameHomeRecovery(existing,recovery,applied); return new HomeRecoveryEstimate(homeRecoveryCapacityUnderLane(),false,existing); }
+            if (existing!=null) { requireSameHomeRecovery(existing,recovery,applied); return new HomeRecoveryEstimate(homeRecoveryCapacityUnderLane(),false,existing,false,0,0); }
             requireHomeRecoveryIdentity(recovery); var command=recovery.command(); requireUnlocked(command); requireUngated(commandScope(command));
             var capacity=homeRecoveryCapacityUnderLane();
-            if (capacity.count()>=MAX_HOME_RECOVERIES || homeRecoveryBytes(recovery)>MAX_HOME_RECOVERY_BYTES-capacity.bytes()) throw new IllegalStateException("Protected HOME recovery capacity exhausted");
-            return new HomeRecoveryEstimate(capacity,true,null);
+            var credit=homeRecoveryCredits.get(recovery.before().transactionId()); boolean covered=credit!=null && credit.current().equals(recovery.before()) && evaluate(command).result().status()==CommandResult.Status.SUCCESS;
+            int count=covered ? 0 : 1; long bytes=covered ? 0 : homeRecoveryBytes(recovery); checkHomeCapacity(count,bytes);
+            return new HomeRecoveryEstimate(capacity,true,null,covered,count,bytes);
         } finally { applyLane.unlock(); leaveNative(); }
     }
     public HomeRecoveryReceipt applyHomeRecovery(ApplyPosition position,HomeRecovery recovery) throws RocksDBException {
@@ -444,13 +547,15 @@ public final class ReplicatedRangeStore {
             var published=homeRecoveries; long bytes=retainedHomeRecoveryBytes;
             if (saved==null) { var next=new HashMap<>(homeRecoveries); next.put(recovery.operation(),receipt); published=Map.copyOf(next); bytes+=homeRecoveryBytes(recovery); }
             boolean effects=saved==null && result.status()==CommandResult.Status.SUCCESS;
+            var creditChange=homeCreditChange(command,position,effects,true);
+            if (saved==null) checkHomeCapacity(1+(creditChange==null ? 0 : creditChange.count()),homeRecoveryBytes(recovery)+(creditChange==null ? 0 : creditChange.bytes()));
             var writes=prepareScopedWrites(effects,command.mutations(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
                 if (effects) { var mutation=command.mutations().getFirst(); batch.put(columns.get(mutation.columnId()),mutation.key(),mutation.value()); }
-                if (saved==null) batch.put(state,homeRecoveryKey(recovery.operation()),receipt.encode());
+                if (saved==null) batch.put(state,homeRecoveryKey(recovery.operation()),receipt.encode()); writeHomeCredit(batch,creditChange);
                 batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
-            homeRecoveries=published; retainedHomeRecoveryBytes=bytes; publishScoped(position,writes,false); applied=position; return receipt;
+            homeRecoveries=published; retainedHomeRecoveryBytes=bytes; publishHomeCredit(creditChange); publishScoped(position,writes,false); applied=position; return receipt;
         } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
         finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
@@ -466,7 +571,8 @@ public final class ReplicatedRangeStore {
         try { if (pendingInstallation!=null) throw new IllegalStateException("HOME recovery metadata is being installed"); return readHomeRecovery(recovery,null,applied); }
         finally { applyLane.unlock(); leaveNative(); }
     }
-    private Map<OperationId,HomeRecoveryReceipt> loadHomeRecoveries() {
+    private Map<OperationId,HomeRecoveryReceipt> loadHomeRecoveries() { return loadHomeRecoveries(applied); }
+    private Map<OperationId,HomeRecoveryReceipt> loadHomeRecoveries(ApplyPosition cut) {
         var records=new HashMap<OperationId,HomeRecoveryReceipt>(); long bytes=0;
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array());
              var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array());
@@ -474,13 +580,53 @@ public final class ReplicatedRangeStore {
             iterator.seekToFirst(); var sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_HOME_RECOVERIES || iterator.key(sizing)!=49 || iterator.value(sizing)>HomeRecoveryReceipt.MAX_BYTES) throw new IllegalStateException("HOME recovery receipt bound exceeded");
-                var receipt=HomeRecoveryReceipt.decode(iterator.value()); requireHomeRecovery(receipt.recovery()); receipt.requireCut(applied);
+                var receipt=HomeRecoveryReceipt.decode(iterator.value()); requireHomeRecovery(receipt.recovery()); receipt.requireCut(cut);
                 if (!Arrays.equals(iterator.key(),homeRecoveryKey(receipt.recovery().operation()))) throw new IllegalArgumentException("HOME recovery receipt key changed");
                 bytes+=49L+iterator.value(sizing); if (bytes>MAX_HOME_RECOVERY_BYTES || records.putIfAbsent(receipt.recovery().operation(),receipt)!=null) throw new IllegalStateException("HOME recovery receipt capacity/identity exceeded"); iterator.next();
             }
             iterator.status(); retainedHomeRecoveryBytes=bytes; return Map.copyOf(records);
         } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover protected HOME receipts",failure); }
     }
+    private Map<UUID,HomeRecoveryCredit> loadHomeCredits(ApplyPosition cut) { return loadHomeCredits(cut,homeRecoveryContext); }
+    private Map<UUID,HomeRecoveryCredit> loadHomeCredits(ApplyPosition cut,HomeRecoveryContext required) {
+        var records=new HashMap<UUID,HomeRecoveryCredit>(); int count=0; long bytes=0; HomeRecoveryContext context=null;
+        try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array()); var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x27).array());
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+            iterator.seekToFirst(); var sizing=new byte[0];
+            while (iterator.isValid()) {
+                if (records.size()>=MAX_HOME_RECOVERIES || iterator.key(sizing)!=33 || iterator.value(sizing)>HomeRecoveryCredit.MAX_BYTES) throw new IllegalStateException("HOME promise recovery bound exceeded");
+                var credit=HomeRecoveryCredit.decode(iterator.value()); credit.requireCut(cut); credit.requireOwner(owner,interval,schemaDigest);
+                if (!Arrays.equals(iterator.key(),homeCreditKey(credit.current().transactionId())) || !Arrays.equals(db.get(columns.get(credit.column()),credit.userKey()),credit.current().encode())) throw new IllegalStateException("HOME promise differs from user row");
+                var nextContext=new HomeRecoveryContext(credit.cluster(),credit.database(),credit.column()); if (context!=null && !context.equals(nextContext) || required!=null && !required.equals(nextContext)) throw new IllegalStateException("HOME promise database context differs"); context=nextContext;
+                count+=credit.reservedCount(); bytes+=credit.reservedBytes(); if (count>MAX_HOME_RECOVERIES || bytes>MAX_HOME_RECOVERY_BYTES) throw new IllegalStateException("HOME future promise capacity exceeded"); records.put(credit.current().transactionId(),credit); iterator.next();
+            }
+            iterator.status(); validateHomeUserCredits(records,required==null ? context : required); reservedHomeRecoveryCount=count; reservedHomeRecoveryBytes=bytes; return Map.copyOf(records);
+        } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover HOME promises",failure); }
+    }
+    /** Streaming reverse proof, including the empty-credit case when the role supplies its context. */
+    private void validateHomeUserCredits(Map<UUID,HomeRecoveryCredit> credits,HomeRecoveryContext context) throws RocksDBException { validateHomeUserCredits(credits,context,null); }
+    private void validateHomeUserCredits(Map<UUID,HomeRecoveryCredit> credits,HomeRecoveryContext context,Snapshot snapshot) throws RocksDBException {
+        if (context==null) return;
+        if (!columns.keySet().equals(Set.of(context.column()))) throw new IllegalStateException("HOME promise context column differs from ownership");
+        try (var low=interval.lowerInclusive()==null ? null : new org.rocksdb.Slice(interval.lowerInclusive());
+             var high=interval.upperExclusive()==null ? null : new org.rocksdb.Slice(interval.upperExclusive()); var options=new ReadOptions().setFillCache(false)) {
+            if (snapshot!=null) options.setSnapshot(snapshot);
+            if (low!=null) options.setIterateLowerBound(low); if (high!=null) options.setIterateUpperBound(high);
+            try (var iterator=db.newIterator(columns.get(context.column()),options)) {
+                iterator.seekToFirst(); var sizing=new byte[0];
+                while (iterator.isValid()) {
+                    if (iterator.key(sizing)!=16 || iterator.value(sizing)>TransactionStatus.MAX_BYTES) throw new IllegalStateException("Invalid HOME user row shape");
+                    var status=TransactionStatus.decode(iterator.value());
+                    if (!status.clusterId().equals(context.cluster()) || !status.databaseId().equals(context.database()) || !Arrays.equals(iterator.key(),uuidBytes(status.transactionId()))) throw new IllegalStateException("HOME user row database/key differs");
+                    var credit=credits.get(status.transactionId());
+                    if (HomeRecoveryCredit.remaining(status)>0 && (credit==null || !credit.current().equals(status)) || HomeRecoveryCredit.remaining(status)==0 && credit!=null) throw new IllegalStateException("Unfinished HOME user row has no exact future recovery promise");
+                    iterator.next();
+                }
+                iterator.status();
+            }
+        }
+    }
+    private void validateHomeCreditCapacity() { if (homeRecoveryCapacityUnderLane().effectiveCount()>MAX_HOME_RECOVERIES || homeRecoveryCapacityUnderLane().effectiveBytes()>MAX_HOME_RECOVERY_BYTES) throw new IllegalStateException("Combined HOME receipt/promise capacity exceeded"); }
     private void validateHomeRecoveries() {
         try { for (var receipt:homeRecoveries.values()) requireHomeRecoveryIdentity(receipt.recovery()); }
         catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate HOME recovery identities",failure); }
@@ -1252,6 +1398,8 @@ public final class ReplicatedRangeStore {
                 }
                 installUserEffects = evaluated.result().status() == CommandResult.Status.SUCCESS;
             }
+            var creditChange=homeCreditChange(command,position,saved==null && installUserEffects);
+            if (creditChange!=null) checkHomeCapacity(creditChange.count(),creditChange.bytes());
             var writes=prepareScopedWrites(saved==null && installUserEffects,effects,bucketEffects);
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
@@ -1284,11 +1432,11 @@ public final class ReplicatedRangeStore {
                     updateReceiptUsage(batch, command, effectiveMinimum, effectiveAcknowledgement, currentEpochFloor, currentFloor, encodedReceipt.length, position);
                     batch.put(receipts, receiptKey, encodedReceipt);
                 }
-                batch.put(state, markerKey, encodePosition(position));
+                writeHomeCredit(batch,creditChange); batch.put(state, markerKey, encodePosition(position));
                 if (saved != null) batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 db.write(options, batch);
             }
-            publishScoped(position,writes,false); applied = position;
+            publishHomeCredit(creditChange); publishScoped(position,writes,false); applied = position;
             return saved == null ? stableResult : original;
         } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
         finally { applyLane.unlock(); }
@@ -1566,7 +1714,8 @@ public final class ReplicatedRangeStore {
 
     private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
             InstallationObserver observer) throws IOException, RocksDBException {
-        var expected = NativeRangeImage.inspect(image, limits);
+        var context=homeRecoveryContext;
+        var expected = context==null ? NativeRangeImage.inspect(image, limits) : NativeRangeImage.inspectHomeRecoveryReservations(image,limits,context.cluster(),context.database(),context.column());
         if (!expected.owner().equals(owner) || !expected.interval().equals(interval)
                 || !Arrays.equals(expected.schemaDigest(), schemaDigest)
                 || !expected.deterministicMergeColumns().equals(deterministicMergeColumns)) {
@@ -1623,6 +1772,7 @@ public final class ReplicatedRangeStore {
                     writer.flush();
                     // The current image supplies counters bound to its completed position; never normalize imported state.
                     validateReceiptUsage(expected.position());
+                    homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
@@ -1633,7 +1783,6 @@ public final class ReplicatedRangeStore {
                     publishScoped(expected.position(),prepareScopedWrites(false,List.of(),Map.of()),false); applied = expected.position();
                     installationGeneration++;
                     pendingInstallation = null;
-                    homeRecoveries=loadHomeRecoveries();
                     return actual;
                 }
             }
@@ -2142,6 +2291,11 @@ public final class ReplicatedRangeStore {
             Objects.requireNonNull(expected); acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) { return readFinalizationPosition(expected,options,position); }
             finally { releaseUse(); }
+        }
+        void validateHomeCreditImage(Map<UUID,HomeRecoveryCredit> credits) throws RocksDBException {
+            var context=homeRecoveryContext;
+            if (context==null && !credits.isEmpty()) { var credit=credits.values().iterator().next(); context=new HomeRecoveryContext(credit.cluster(),credit.database(),credit.column()); }
+            acquireUse(); try { validateHomeUserCredits(credits,context,snapshot); } finally { releaseUse(); }
         }
         public HomeRecoveryReceipt homeRecoveryResult(HomeRecovery recovery) throws RocksDBException {
             Objects.requireNonNull(recovery); acquireUse();

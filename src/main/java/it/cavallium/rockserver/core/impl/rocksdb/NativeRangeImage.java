@@ -75,6 +75,7 @@ public final class NativeRangeImage {
         void accept(Section section, UUID columnId, byte[] key, byte[] value) throws IOException;
     }
 
+    private record HomeContext(UUID cluster,UUID database,UUID column) {}
     private record Header(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
                           byte[] schema, ApplyPosition position, Set<UUID> mergeColumns) {}
 
@@ -132,6 +133,8 @@ public final class NativeRangeImage {
                 pin.visitState((key, value) -> append.accept(Section.STATE, null, key, value));
                 pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
                 tracker.finish();
+                try { pin.validateHomeCreditImage(tracker.homeCredits); }
+                catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("HOME image user/promise reverse proof differs",invalid); }
                 output.writeByte(0);
                 output.writeLong(tracker.count);
                 bodyOutput.on(false);
@@ -156,12 +159,21 @@ public final class NativeRangeImage {
         return visit(image, limits, (section, column, key, value) -> {});
     }
 
+    /** Qualified TX HOME reverse proof, including an image with no credit rows. Does not activate native admission. */
+    public static Manifest inspectHomeRecoveryReservations(Path image,Limits limits,UUID cluster,UUID database,UUID column) throws IOException {
+        return visitHomeRecoveryReservations(image,limits,cluster,database,column,(section,id,key,value) -> {});
+    }
+    public static Manifest visitHomeRecoveryReservations(Path image,Limits limits,UUID cluster,UUID database,UUID column,RowVisitor visitor) throws IOException {
+        return visit(image,limits,visitor,true,new HomeContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column)));
+    }
+
     /**
      * Verifies all bytes, row order, ownership and marker identity. Rows are delivered before the final
      * checksum is verified: an installer must remain inactive until this method returns successfully.
      * Use inspect first for validation before effects, and still require visit success afterward.
      */
-    public static Manifest visit(Path image, Limits limits, RowVisitor visitor) throws IOException {
+    public static Manifest visit(Path image, Limits limits, RowVisitor visitor) throws IOException { return visit(image,limits,visitor,true,null); }
+    private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required) throws IOException {
         Objects.requireNonNull(limits, "limits");
         Objects.requireNonNull(visitor, "visitor");
         long size = Files.size(image);
@@ -202,7 +214,14 @@ public final class NativeRangeImage {
             input.readFully(embedded);
             if (!MessageDigest.isEqual(embedded, body.digest())) throw new IOException("Image body checksum mismatch");
             if (input.read() != -1 || counted.count != size) throw new IOException("Trailing or changing image bytes");
-            return manifest(header, tracker.count, size, whole.digest());
+            var manifest=manifest(header, tracker.count, size, whole.digest());
+            var homeContext=tracker.homeContext(required);
+            if (verifyCreditUsers && homeContext!=null) {
+                var matched=new HashSet<UUID>();
+                var checked=visit(image,limits,(section,column,key,value) -> { if (section==Section.USER) tracker.requireHomeUser(homeContext,column,key,value,matched); },false,null);
+                if (matched.size()!=tracker.homeCredits.size() || !Arrays.equals(manifest.sha256(),checked.sha256())) throw new IOException("HOME image promises have missing user rows or image changed between passes");
+            }
+            return manifest;
         } catch (IllegalArgumentException malformed) {
             throw new IOException("Invalid image metadata", malformed);
         }
@@ -328,7 +347,9 @@ public final class NativeRangeImage {
         private final Map<UUID,AbortedParticipant> aborted=new HashMap<>();
         private final Map<UUID,RejectedParticipant> rejected=new HashMap<>();
         private final Map<UUID,SnapshotGate> gates=new HashMap<>();
-        private long gateBytes,homeRecoveryBytes;
+        private long gateBytes,homeRecoveryBytes,homeCreditBytes;
+        private int homeCreditCount;
+        private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
         private final Map<OperationId,HomeRecoveryReceipt> homeRecoveries=new HashMap<>();
         private final Map<UUID,CommittedParticipant> committed=new HashMap<>();
         private long preparedBytes,preparedScopeBytes;
@@ -456,6 +477,16 @@ public final class NativeRangeImage {
                         if (homeRecoveries.size()>=ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeRecoveryBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES || homeRecoveries.putIfAbsent(id,receipt)!=null) throw new IOException("HOME recovery image capacity/identity exceeded");
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid HOME recovery image receipt",invalid); }
                 }
+                if (section==Section.STATE && key.length>16 && key[16]==0x26) {
+                    try {
+                        var credit=ReplicatedRangeStore.HomeRecoveryCredit.decode(value); credit.requireCut(header.position()); credit.requireOwner(header.owner(),header.interval(),header.schema());
+                        byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x26).putLong(credit.current().transactionId().getMostSignificantBits()).putLong(credit.current().transactionId().getLeastSignificantBits()).array();
+                        if (!Arrays.equals(key,expected)) throw new IOException("HOME promise image key differs");
+                        if (!homeCredits.isEmpty()) { var previous=homeCredits.values().iterator().next(); if (!previous.cluster().equals(credit.cluster()) || !previous.database().equals(credit.database()) || !previous.column().equals(credit.column())) throw new IOException("HOME promise image context differs"); }
+                        homeCreditCount+=credit.reservedCount(); homeCreditBytes+=credit.reservedBytes();
+                        if (homeCreditCount>ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeCreditBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES || homeCredits.putIfAbsent(credit.current().transactionId(),credit)!=null) throw new IOException("HOME promise image bound exceeded");
+                    } catch (IllegalArgumentException invalid) { throw new IOException("Invalid HOME image promise",invalid); }
+                }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
                     throw new IOException("Image contains unsupported receipt accounting metadata");
                 }
@@ -538,6 +569,24 @@ public final class NativeRangeImage {
             count++;
         }
 
+        HomeContext homeContext(HomeContext required) throws IOException {
+            HomeContext context=required;
+            for (var credit:homeCredits.values()) {
+                var actual=new HomeContext(credit.cluster(),credit.database(),credit.column());
+                if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
+            }
+            if (context!=null && !header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership"); return context;
+        }
+        void requireHomeUser(HomeContext context,UUID column,byte[] key,byte[] value,Set<UUID> matched) throws IOException {
+            if (!context.column().equals(column) || key.length!=16 || value.length>it.cavallium.rockserver.core.common.distributed.TransactionStatus.MAX_BYTES) throw new IOException("Invalid qualified HOME image user row");
+            var status=it.cavallium.rockserver.core.common.distributed.TransactionStatus.decode(value); var id=status.transactionId();
+            byte[] expected=ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
+            if (!status.clusterId().equals(context.cluster()) || !status.databaseId().equals(context.database()) || !Arrays.equals(key,expected)) throw new IOException("Qualified HOME image user identity differs");
+            var credit=homeCredits.get(id);
+            if (ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)>0 && (credit==null || !credit.current().equals(status)) || ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)==0 && credit!=null) throw new IOException("Unfinished HOME image user row lacks exact promise");
+            if (credit!=null) matched.add(id);
+        }
+
         private static long addUsage(long a, long b) throws IOException {
             try { return Math.addExact(a, b); }
             catch (ArithmeticException overflow) { throw new IOException("Image receipt usage overflow", overflow); }
@@ -545,6 +594,7 @@ public final class NativeRangeImage {
 
         void finish() throws IOException {
             if (!marker) throw new IOException("Image has no applied marker");
+            if (homeRecoveries.size()+homeCreditCount>ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeRecoveryBytes+homeCreditBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES) throw new IOException("HOME image actual/future capacity exceeded");
             long terminalOnly=0;
             for (var record:prepared) {
                 var abort=aborted.get(record.preparation().transactionId());

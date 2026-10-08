@@ -185,7 +185,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     if (role==RatisNodePlan.Role.DATA && logicalSchema!=null) store.enableLogicalSchema(logicalSchema);
                     machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),validator,epochs,directory,settings.retention());
-                    if (role==RatisNodePlan.Role.TRANSACTION_HOME) machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
+                    if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
+                        machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
+                        machine.homeRecoveryData(routed); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
+                    }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
                     else { machine.role(role); if (captureHomes!=null) machine.snapshotHomes(captureHomes); }
                 }
