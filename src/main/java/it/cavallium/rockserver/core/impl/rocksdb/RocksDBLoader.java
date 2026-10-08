@@ -130,7 +130,18 @@ public class RocksDBLoader {
                            RocksDBObjects refs, @Nullable Cache cache,
                            Map<String, Cache> caches,
                            Map<String, Long> cacheCapacities,
-                           Map<String, String> definitiveColumnCacheNames, @Nullable RateLimiter compactionIoLimiter) {}
+                           Map<String, Cache> metadataCaches,
+                           Map<String, Long> metadataCacheCapacities,
+                           Map<String, String> definitiveColumnCacheNames, @Nullable RateLimiter compactionIoLimiter) {
+        public LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
+                        DBOptions dbOptions, Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap,
+                        Map<String, @Nullable FFMAbstractMergeOperator> mergeOperators,
+                        RocksDBObjects refs, @Nullable Cache cache, Map<String, Cache> caches,
+                        Map<String, Long> cacheCapacities, Map<String, String> definitiveColumnCacheNames) {
+            this(db, path, definitiveDbPath, dbOptions, definitiveColumnFamilyOptionsMap, mergeOperators,
+                    refs, cache, caches, cacheCapacities, Map.of(), Map.of(), definitiveColumnCacheNames, null);
+        }
+    }
 
     private static final class OpenedDbGuard implements AutoCloseable {
 
@@ -248,6 +259,19 @@ public class RocksDBLoader {
         RocksDBObjects refs,
         boolean inMemory,
         Map<String, Cache> caches) {
+        return getColumnOptions(name, path, definitiveDbPath, globalDatabaseConfig, logger, refs, inMemory,
+                caches, Map.of());
+    }
+
+    public static ColumnOptionsWithMerge getColumnOptions(String name,
+        @Nullable Path path,
+        @NotNull Path definitiveDbPath,
+        GlobalDatabaseConfig globalDatabaseConfig,
+        Logger logger,
+        RocksDBObjects refs,
+        boolean inMemory,
+        Map<String, Cache> caches,
+        Map<String, Cache> metadataCaches) {
         try {
             FallbackColumnConfig columnOptions = null;
             for (NamedColumnConfig namedColumnConfig : globalDatabaseConfig.columnOptions()) {
@@ -492,6 +516,7 @@ public class RocksDBLoader {
                 }
             }
             boolean pinIndexAndFilterBlocks = Optional.ofNullable(columnOptions.pinIndexAndFilterBlocks()).orElse(true);
+            Cache metadataCache = metadataCaches.get(resolveBlockCacheName(columnOptions));
             boolean cacheIndexAndFilterBlocks = !inMemory && Optional.ofNullable(columnOptions.cacheIndexAndFilterBlocks())
                     // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
                     .orElse(true);
@@ -514,7 +539,7 @@ public class RocksDBLoader {
                         .setPinL0FilterAndIndexBlocksInCache(!inMemory && pinIndexAndFilterBlocks)
                         // https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
                         // RocksDB applies this priority to index, filter, and compression-dictionary
-                        // blocks. The LRU cache's configured high-priority pool provides the reserve.
+                        // blocks. An unsplit LRU cache can additionally use its high-priority pool.
                         .setCacheIndexAndFilterBlocksWithHighPriority(true)
                         .setCacheIndexAndFilterBlocks(cacheIndexAndFilterBlocks)
                         .setOptimizeFiltersForMemory(true)
@@ -531,6 +556,7 @@ public class RocksDBLoader {
                                 .map(DataSize::longValue)
                                 .orElse((globalDatabaseConfig.spinning() ? 128 : 16) * SizeUnit.KB))
                         .setBlockCache(cache)
+                        .setMetadataBlockCache(metadataCache)
                         .setNoBlockCache(cache == null);
             }
             if (inMemory) {
@@ -659,7 +685,9 @@ public class RocksDBLoader {
     record OptionsWithCache(DBOptions options,
                             @Nullable Cache standardCache,
                             Map<String, Cache> caches,
-                            Map<String, Long> cacheCapacities, @Nullable RateLimiter compactionIoLimiter) {}
+                            Map<String, Long> cacheCapacities,
+                            Map<String, Cache> metadataCaches,
+                            Map<String, Long> metadataCacheCapacities, @Nullable RateLimiter compactionIoLimiter) {}
 
     private static DBOptions newCompatibleDBOptions() {
         // DBOptions.getDBOptionsFromProps(), unlike the public constructor, does not bootstrap JNI itself.
@@ -691,6 +719,9 @@ public class RocksDBLoader {
         RocksDBObjects refs,
         Logger logger) {
         try {
+            // Resolve all cache budgets before allocating native resources.
+            var cacheBudgets = resolveCacheBudgets(databaseOptions.global());
+            double highPriorityPoolRatio = resolveBlockCacheHighPriorityRatio(databaseOptions.global());
             // the Options class contains a set of configurable DB options
             // that determines the behaviour of the database.
             var options = newCompatibleDBOptions();
@@ -715,15 +746,6 @@ public class RocksDBLoader {
                     throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
                             "adaptive-compaction-io requires background jobs");
                 }
-                long buffer = Optional.ofNullable(databaseOptions.global().writeBufferManager())
-                        .map(DataSize::longValue).orElse(DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET);
-                if (buffer <= 0) buffer = DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
-                long seed = Math.max(CompactionIoBudget.MIN_BYTES_PER_SECOND,
-                        Math.min(CompactionIoBudget.MAX_BYTES_PER_SECOND, buffer / 5));
-                compactionIoLimiter = new RateLimiter(seed, 100_000, RateLimiter.DEFAULT_FAIRNESS,
-                        RateLimiterMode.ALL_IO, false);
-                refs.add(compactionIoLimiter);
-                options.setRateLimiter(compactionIoLimiter);
             }
 
             if (!databaseOptions.global().unorderedWrite()) {
@@ -806,6 +828,8 @@ public class RocksDBLoader {
             Cache blockCache;
             Map<String, Cache> blockCaches = new LinkedHashMap<>();
             Map<String, Long> blockCacheCapacities = new LinkedHashMap<>();
+            Map<String, Cache> metadataCaches = new LinkedHashMap<>();
+            Map<String, Long> metadataCacheCapacities = new LinkedHashMap<>();
             final boolean useDirectIO = path != null && databaseOptions.global().useDirectIo();
             final boolean allowMmapReads = (path == null) || (!useDirectIO && databaseOptions.global().allowRocksdbMemoryMapping());
             final boolean allowMmapWrites = (path != null) && (!useDirectIO && (databaseOptions.global().allowRocksdbMemoryMapping()
@@ -831,50 +855,25 @@ public class RocksDBLoader {
             ;
             long blockCacheSize;
             if (path != null) {
-                blockCacheSize = writeBufferManagerSize + Optional.ofNullable(databaseOptions.global().blockCache()).map(DataSize::longValue).orElse( 512 * SizeUnit.MB);
-                double highPriorityPoolRatio = resolveBlockCacheHighPriorityRatio(databaseOptions.global());
-                blockCache = newBlockCache(databaseOptions.global(), blockCacheSize, highPriorityPoolRatio,
-                        "default", logger);
-                refs.add(blockCache);
-                blockCaches.put("default", blockCache);
-                blockCacheCapacities.put("default", blockCacheSize);
-
-                for (BlockCacheConfig cacheConfig : Objects.requireNonNullElse(
-                        databaseOptions.global().blockCaches(), new BlockCacheConfig[0])) {
-                    String cacheName = cacheConfig.name();
-                    if (cacheName == null || cacheName.isBlank()) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "database.global.block-caches contains a blank name");
+                blockCacheSize = cacheBudgets.get("default").totalSize();
+                for (var entry : cacheBudgets.entrySet()) {
+                    String cacheName = entry.getKey();
+                    var budget = entry.getValue();
+                    double ratio = budget.metadataSize() > 0 ? 0.0d : highPriorityPoolRatio;
+                    Cache dataCache = newBlockCache(databaseOptions.global(), budget.dataSize(), ratio,
+                            cacheName, logger);
+                    refs.add(dataCache);
+                    blockCaches.put(cacheName, dataCache);
+                    blockCacheCapacities.put(cacheName, budget.dataSize());
+                    if (budget.metadataSize() > 0) {
+                        Cache metadataCache = newBlockCache(databaseOptions.global(), budget.metadataSize(),
+                                0.0d, cacheName + " metadata", logger);
+                        refs.add(metadataCache);
+                        metadataCaches.put(cacheName, metadataCache);
+                        metadataCacheCapacities.put(cacheName, budget.metadataSize());
                     }
-                    if ("default".equals(cacheName)) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "database.global.block-caches name 'default' is reserved");
-                    }
-                    DataSize configuredSize = cacheConfig.size();
-                    if (configuredSize == null) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "Named block cache '" + cacheName + "' size is required");
-                    }
-                    long cacheSize = configuredSize.longValue();
-                    if (cacheSize <= 0L) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "Named block cache '" + cacheName + "' size must be greater than zero");
-                    }
-                    Cache namedCache = newBlockCache(databaseOptions.global(), cacheSize,
-                            highPriorityPoolRatio, cacheName, logger);
-                    if (blockCaches.putIfAbsent(cacheName, namedCache) != null) {
-                        namedCache.close();
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "Duplicate named block cache: " + cacheName);
-                    }
-                    refs.add(namedCache);
-                    blockCacheCapacities.put(cacheName, cacheSize);
                 }
+                blockCache = blockCaches.get("default");
             } else {
                 blockCacheSize = 0;
                 blockCache = null;
@@ -918,13 +917,16 @@ public class RocksDBLoader {
                 }
             }
 
+            if (databaseOptions.global().adaptiveCompactionIo() && options.maxBackgroundJobs() <= 0) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "adaptive-compaction-io requires background jobs");
+            }
+
+            long effectiveWbmSize = writeBufferManagerSize > 0L ? writeBufferManagerSize : blockCacheSize / 2;
             if (path != null) {
                 // If writeBufferManagerSize is not explicitly configured, default to 50% of block cache size.
                 // Without a WriteBufferManager, memtable memory is unbounded and not tracked by the block cache,
                 // which can cause real RAM usage to grow far beyond the configured block cache size.
-                long effectiveWbmSize = writeBufferManagerSize > 0L
-                        ? writeBufferManagerSize
-                        : blockCacheSize / 2;
                 if (effectiveWbmSize > 0) {
                     var writeBufferManager = new WriteBufferManager(effectiveWbmSize, blockCache, false) {
                       {
@@ -934,6 +936,16 @@ public class RocksDBLoader {
                     refs.add(writeBufferManager);
                     options.setWriteBufferManager(writeBufferManager);
                 }
+            }
+
+            if (databaseOptions.global().adaptiveCompactionIo()) {
+                long buffer = effectiveWbmSize > 0 ? effectiveWbmSize : DEFAULT_COMPACTION_MEMTABLE_MEMORY_BUDGET;
+                long seed = Math.max(CompactionIoBudget.MIN_BYTES_PER_SECOND,
+                        Math.min(CompactionIoBudget.MAX_BYTES_PER_SECOND, buffer / 5));
+                compactionIoLimiter = new RateLimiter(seed, 100_000, RateLimiter.DEFAULT_FAIRNESS,
+                        RateLimiterMode.ALL_IO, false);
+                refs.add(compactionIoLimiter);
+                options.setRateLimiter(compactionIoLimiter);
             }
 
             if (useDirectIO) {
@@ -959,9 +971,73 @@ public class RocksDBLoader {
             return new OptionsWithCache(options,
                     blockCache,
                     Collections.unmodifiableMap(new LinkedHashMap<>(blockCaches)),
-                    Collections.unmodifiableMap(new LinkedHashMap<>(blockCacheCapacities)), compactionIoLimiter);
+                    Collections.unmodifiableMap(new LinkedHashMap<>(blockCacheCapacities)),
+                    Collections.unmodifiableMap(new LinkedHashMap<>(metadataCaches)),
+                    Collections.unmodifiableMap(new LinkedHashMap<>(metadataCacheCapacities)), compactionIoLimiter);
         } catch (GestaltException e) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);
+        }
+    }
+
+    private record CacheBudget(long dataSize, long metadataSize) {
+        long totalSize() { return Math.addExact(dataSize, metadataSize); }
+    }
+
+    private static Map<String, CacheBudget> resolveCacheBudgets(GlobalDatabaseConfig global) throws GestaltException {
+        Map<String, CacheBudget> budgets = new LinkedHashMap<>();
+        long defaultSize = Optional.ofNullable(global.blockCache()).map(DataSize::longValue)
+                .orElse(512 * SizeUnit.MB);
+        long wbmSize = Optional.ofNullable(global.writeBufferManager()).map(DataSize::longValue).orElse(0L);
+        budgets.put("default", cacheBudget("default", defaultSize, global.blockCacheMetadataSize(), wbmSize));
+        for (var cache : Objects.requireNonNullElse(global.blockCaches(), new BlockCacheConfig[0])) {
+            String name = cache.name();
+            if (name == null || name.isBlank() || "default".equals(name)) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Named block cache must have a nonblank name other than 'default'");
+            }
+            if (budgets.containsKey(name)) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Duplicate named block cache: " + name);
+            }
+            DataSize size = cache.size();
+            if (size == null) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Named block cache '" + name + "' size is required");
+            }
+            budgets.put(name, cacheBudget(name, size.longValue(), cache.metadataSize(), 0L));
+        }
+        // Every configured split family must cache index/filter blocks, including dynamically created families.
+        validateMetadataCaching(global.fallbackColumnOptions(), budgets);
+        for (var column : Objects.requireNonNullElse(global.columnOptions(), new NamedColumnConfig[0])) {
+            validateMetadataCaching(column, budgets);
+        }
+        return budgets;
+    }
+
+    private static void validateMetadataCaching(FallbackColumnConfig column, Map<String, CacheBudget> budgets)
+            throws GestaltException {
+        CacheBudget budget = budgets.get(resolveBlockCacheName(column));
+        if (budget != null && budget.metadataSize() > 0 && Boolean.FALSE.equals(column.cacheIndexAndFilterBlocks())) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Split block cache '" + resolveBlockCacheName(column)
+                            + "' requires cache-index-and-filter-blocks=true");
+        }
+    }
+
+    private static CacheBudget cacheBudget(String name, long size, @Nullable DataSize metadata, long wbmSize) {
+        long metadataSize = metadata == null ? 0L : metadata.longValue();
+        if (size < 0L || (size == 0L && !"default".equals(name)) || metadataSize < 0L
+                || (metadataSize > 0L && metadataSize >= size) || wbmSize < 0L) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Block cache '" + name + "' requires a nonnegative size (positive for named caches), and metadata-size=0 or 0 < metadata-size < size; "
+                            + "write-buffer-manager must be nonnegative");
+        }
+        try {
+            Math.addExact(size, wbmSize);
+            return new CacheBudget(Math.addExact(size - metadataSize, wbmSize), metadataSize);
+        } catch (ArithmeticException overflow) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Block cache '" + name + "' size plus write-buffer-manager overflows", overflow);
         }
     }
 
@@ -1137,7 +1213,7 @@ public class RocksDBLoader {
                         && (name.equals("_column_schemas_") || name.equals("_merge_operators_") || name.equals("_cdc_meta_"))
                         ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs, path, definitiveDbPath, databaseOptions), null)
                         : getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
-                                logger, refs, path == null, optionsWithCache.caches());
+                                logger, refs, path == null, optionsWithCache.caches(), optionsWithCache.metadataCaches());
 
                 // Create base directories
                 List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, entry.getValue());
@@ -1247,6 +1323,8 @@ public class RocksDBLoader {
                         optionsWithCache.standardCache(),
                         optionsWithCache.caches(),
                         optionsWithCache.cacheCapacities(),
+                        optionsWithCache.metadataCaches(),
+                        optionsWithCache.metadataCacheCapacities(),
                         Collections.unmodifiableMap(new HashMap<>(definitiveColumnCacheNames)), optionsWithCache.compactionIoLimiter());
                 openedDbGuard.release();
                 envRegistered = false;

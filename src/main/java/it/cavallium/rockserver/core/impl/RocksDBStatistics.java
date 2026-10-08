@@ -42,6 +42,7 @@ public class RocksDBStatistics {
 	private final Thread executor;
 	private final MultiGauge cacheStats;
 	private final MultiGauge namedCacheStats;
+	private final MultiGauge metadataCacheStats;
 	private final @Nullable RocksDBWalMetrics walMetrics;
 	private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -110,8 +111,32 @@ public class RocksDBStatistics {
 			Function<String, Map<String, Long>> perCfLongPropertyGetter,
 			MemoryUpperBoundConfig memoryUpperBoundConfig,
 			@Nullable WalMetricsConfig walMetricsConfig) {
+		this(name, statistics, metrics, caches, cacheCapacities, Map.of(), Map.of(),
+				longPropertyGetter, perCfLongPropertyGetter, memoryUpperBoundConfig, walMetricsConfig);
+	}
+
+	public RocksDBStatistics(String name, Statistics statistics, MetricsManager metrics,
+			Map<String, Cache> caches, Map<String, Long> cacheCapacities,
+			Map<String, Cache> metadataCaches, Map<String, Long> metadataCacheCapacities,
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
+			Function<String, Map<String, Long>> perCfLongPropertyGetter,
+			MemoryUpperBoundConfig memoryUpperBoundConfig) {
+		this(name, statistics, metrics, caches, cacheCapacities, metadataCaches, metadataCacheCapacities,
+				longPropertyGetter, perCfLongPropertyGetter, memoryUpperBoundConfig, null);
+	}
+
+	RocksDBStatistics(String name, Statistics statistics, MetricsManager metrics,
+			Map<String, Cache> caches, Map<String, Long> cacheCapacities,
+			Map<String, Cache> metadataCaches, Map<String, Long> metadataCacheCapacities,
+			BiFunction<String, AggregationMode, BigInteger> longPropertyGetter,
+			Function<String, Map<String, Long>> perCfLongPropertyGetter,
+			MemoryUpperBoundConfig memoryUpperBoundConfig, @Nullable WalMetricsConfig walMetricsConfig) {
 		Map<String, Cache> effectiveCaches = Map.copyOf(caches);
-		Map<String, Long> effectiveCacheCapacities = Map.copyOf(cacheCapacities);
+		Map<String, Cache> effectiveMetadataCaches = Map.copyOf(metadataCaches);
+		Map<String, Long> effectiveMetadataCapacities = Map.copyOf(metadataCacheCapacities);
+		Map<String, Long> effectiveCacheCapacities = new java.util.LinkedHashMap<>(cacheCapacities);
+		metadataCacheCapacities.forEach((cacheName, capacity) ->
+				effectiveCacheCapacities.merge(cacheName, capacity, Math::addExact));
 		this.statistics = statistics;
 		this.metrics = metrics;
 		this.walMetrics = walMetricsConfig == null ? null : new RocksDBWalMetrics(
@@ -172,6 +197,9 @@ public class RocksDBStatistics {
 				.tag("database", name)
 				.register(metrics.getRegistry());
 
+		this.metadataCacheStats = MultiGauge.builder("rocksdb.cache.metadata")
+				.tag("database", name).register(metrics.getRegistry());
+
 		// Realistic total memory gauge: block cache + table readers (index/filter outside cache) + memtables
 		// Note: block-cache-pinned-usage is a subset of block-cache-usage, so it's not added separately
 		Gauge.builder("rocksdb.memory.total", () -> {
@@ -179,7 +207,8 @@ public class RocksDBStatistics {
 				return Double.NaN;
 			}
 			try {
-				long blockCacheUsage = effectiveCaches.values().stream().mapToLong(Cache::getUsage).sum();
+				long blockCacheUsage = effectiveCaches.values().stream().mapToLong(Cache::getUsage).sum()
+						+ effectiveMetadataCaches.values().stream().mapToLong(Cache::getUsage).sum();
 				long tableReadersMem = longPropertyGetter.apply(
 						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getName(),
 						RocksDBLongProperty.ESTIMATE_TABLE_READERS_MEM.getAggregationMode()
@@ -239,7 +268,9 @@ public class RocksDBStatistics {
 
 		EnumMap<HistogramType, HistogramData> histogramDataRef = new EnumMap<>(HistogramType.class);
 		AtomicReference<Map<String, CacheStats>> cacheStatsRef = new AtomicReference<>(getCacheStats(
-				effectiveCaches, effectiveCacheCapacities));
+				effectiveCaches, effectiveCacheCapacities, effectiveMetadataCaches));
+		AtomicReference<Map<String, CacheStats>> metadataStatsRef = new AtomicReference<>(getCacheStats(
+				effectiveMetadataCaches, effectiveMetadataCapacities, Map.of()));
 		// Per-CF property snapshots: property -> (column_name -> value)
 		ConcurrentHashMap<RocksDBLongProperty, Map<String, Long>> perCfSnapshots = new ConcurrentHashMap<>();
 
@@ -260,6 +291,15 @@ public class RocksDBStatistics {
 			), true);
 		});
 
+		metadataCacheStats.register(effectiveMetadataCaches.keySet().stream().flatMap(cacheName ->
+				java.util.stream.Stream.of(
+						Row.of(Tags.of("cache", cacheName, "field", "usage"),
+								() -> metadataStatsRef.get().get(cacheName).usage()),
+						Row.of(Tags.of("cache", cacheName, "field", "pinned_usage"),
+								() -> metadataStatsRef.get().get(cacheName).pinnedUsage()),
+						Row.of(Tags.of("cache", cacheName, "field", "capacity"),
+								() -> metadataStatsRef.get().get(cacheName).capacity())
+				)).toList(), true);
 		if (!effectiveCaches.isEmpty()) {
 			cacheStats.register(List.of(
 					Row.of(Tags.of("field", "usage"), () -> cacheStatsRef.get().values().stream()
@@ -292,7 +332,8 @@ public class RocksDBStatistics {
 					}
 
 					if (!effectiveCaches.isEmpty()) {
-						cacheStatsRef.set(getCacheStats(effectiveCaches, effectiveCacheCapacities));
+						cacheStatsRef.set(getCacheStats(effectiveCaches, effectiveCacheCapacities, effectiveMetadataCaches));
+						metadataStatsRef.set(getCacheStats(effectiveMetadataCaches, effectiveMetadataCapacities, Map.of()));
 					}
 
 					if (walMetrics != null) {
@@ -341,10 +382,14 @@ public class RocksDBStatistics {
 	}
 
 	private Map<String, CacheStats> getCacheStats(Map<String, Cache> caches,
-			Map<String, Long> cacheCapacities) {
+			Map<String, Long> cacheCapacities, Map<String, Cache> metadataCaches) {
 		Map<String, CacheStats> result = new java.util.LinkedHashMap<>();
-		caches.forEach((name, cache) -> result.put(name,
-				new CacheStats(cache.getUsage(), cache.getPinnedUsage(), cacheCapacities.getOrDefault(name, 0L))));
+		caches.forEach((name, cache) -> {
+			Cache metadata = metadataCaches.get(name);
+			result.put(name, new CacheStats(cache.getUsage() + (metadata == null ? 0L : metadata.getUsage()),
+					cache.getPinnedUsage() + (metadata == null ? 0L : metadata.getPinnedUsage()),
+					cacheCapacities.getOrDefault(name, 0L)));
+		});
 		return Map.copyOf(result);
 	}
 

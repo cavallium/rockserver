@@ -89,6 +89,59 @@ class RocksDBStatisticsShutdownTest {
 	}
 
 	@Test
+	void metadataMetricsPreserveLogicalTotalsWithoutNameCollisions() throws Exception {
+		var config = ConfigParser.parse(Files.writeString(tempDir.resolve("metadata-metrics.conf"), """
+				database.metrics.jmx.enabled = false
+				database.metrics.influx.enabled = false
+				"""));
+		try (var nativeStatistics = new Statistics();
+				var data = org.mockito.Mockito.mock(org.rocksdb.Cache.class);
+				var metadata = org.mockito.Mockito.mock(org.rocksdb.Cache.class);
+				var named = org.mockito.Mockito.mock(org.rocksdb.Cache.class)) {
+			org.mockito.Mockito.when(data.getUsage()).thenReturn(200L);
+			org.mockito.Mockito.when(data.getPinnedUsage()).thenReturn(100L);
+			org.mockito.Mockito.when(metadata.getUsage()).thenReturn(50L);
+			org.mockito.Mockito.when(metadata.getPinnedUsage()).thenReturn(20L);
+			org.mockito.Mockito.when(named.getUsage()).thenReturn(100L);
+			org.mockito.Mockito.when(named.getPinnedUsage()).thenReturn(40L);
+			var metrics = new MetricsManager(config);
+			var registry = new SimpleMeterRegistry();
+			((CompositeMeterRegistry) metrics.getRegistry()).add(registry);
+			var statistics = new RocksDBStatistics("metadata-test", nativeStatistics, metrics,
+					Map.of("default", data, "default:metadata", named),
+					Map.of("default", 2L << 20, "default:metadata", 1L << 20),
+					Map.of("default", metadata), Map.of("default", 1L << 20),
+					(_, _) -> BigInteger.ONE, _ -> Map.of("default", 1L),
+					new RocksDBStatistics.MemoryUpperBoundConfig(1, 0, 0));
+			try {
+				assertEquals(3L << 20, registry.get("rocksdb.cache.named").tag("cache", "default")
+						.tag("field", "capacity").gauge().value());
+				assertEquals(1L << 20, registry.get("rocksdb.cache.named").tag("cache", "default:metadata")
+						.tag("field", "capacity").gauge().value());
+				assertEquals(1L << 20, registry.get("rocksdb.cache.metadata").tag("cache", "default")
+						.tag("field", "capacity").gauge().value());
+				assertEquals((4L << 20) + 2L, registry.get("rocksdb.memory.max-estimate").gauge().value());
+				assertEquals(250L, registry.get("rocksdb.cache.named").tag("cache", "default")
+						.tag("field", "usage").gauge().value());
+				assertEquals(120L, registry.get("rocksdb.cache.named").tag("cache", "default")
+						.tag("field", "pinned_usage").gauge().value());
+				assertEquals(350L, registry.get("rocksdb.cache").tag("field", "usage").gauge().value());
+				assertEquals(160L, registry.get("rocksdb.cache").tag("field", "pinned_usage").gauge().value());
+				assertEquals(352L, registry.get("rocksdb.memory.total").gauge().value());
+				statistics.close();
+				org.mockito.Mockito.clearInvocations(data, metadata, named);
+				registry.find("rocksdb.cache.metadata").gauges().forEach(gauge -> gauge.value());
+				registry.find("rocksdb.cache.named").gauges().forEach(gauge -> gauge.value());
+				assertTrue(Double.isNaN(registry.get("rocksdb.memory.total").gauge().value()));
+				org.mockito.Mockito.verifyNoInteractions(data, metadata, named);
+			} finally {
+				statistics.close();
+				metrics.close();
+			}
+		}
+	}
+
+	@Test
 	void reportsNamedCachesAndUsesTheirCombinedCapacity(@TempDir Path cacheTempDir) throws Exception {
 		var configPath = Files.writeString(cacheTempDir.resolve("named-cache-metrics.conf"), """
 				database.metrics.jmx.enabled = false

@@ -23,9 +23,10 @@ public class ConfigPrinter {
 		return """
 				{
 				        "name": %s,
-				        "size": %s
+				        "size": %s,
+				        "metadata-size": %s
 				      }\
-				""".formatted(quote(o.name()), quote(o.size()));
+				""".formatted(quote(o.name()), quote(o.size()), quote(o.metadataSize()));
 	}
 
 	public static String stringify(DatabaseConfig config) {
@@ -87,6 +88,7 @@ public class ConfigPrinter {
 				    "max-file-opening-threads": %s,
 				    "optimistic": %b,
 				    "block-cache": %s,
+				    "block-cache-metadata-size": %s,
 				    "block-caches": %s,
 				    "block-cache-high-priority-ratio": %s,
 				    "write-buffer-manager": %s,
@@ -123,6 +125,7 @@ public class ConfigPrinter {
 				o.maxFileOpeningThreads(),
 				o.optimistic(),
 				quote(o.blockCache()),
+				quote(o.blockCacheMetadataSize()),
 				blockCaches.toString(),
 				o.blockCacheHighPriorityRatio(),
 				quote(o.writeBufferManager()),

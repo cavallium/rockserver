@@ -550,6 +550,15 @@ class RocksDBLoaderComplexConfigTest {
     }
 
     @Test
+    void adaptiveIoRejectsEffectiveZeroBackgroundJobs(@TempDir Path tempDir) throws Exception {
+        System.setProperty("it.cavallium.dbengine.jobs.background.num", "0");
+        var config = parse(tempDir, "adaptive-no-background-jobs", "database.global.adaptive-compaction-io=true");
+        var failure = assertThrows(RocksDBException.class, () -> RocksDBLoader.load(
+                tempDir.resolve("adaptive-no-background-jobs"), config, LoggerFactory.getLogger(getClass())));
+        assertEquals(RocksDBErrorType.CONFIG_ERROR, failure.getErrorUniqueId());
+    }
+
+    @Test
     void disableSlowdownKeepsAllWriteStallThresholdsDisabled(@TempDir Path tempDir) throws Exception {
         var config = parse(tempDir, "no-compactions", """
                 database.global.disable-auto-compactions = true
@@ -578,6 +587,8 @@ class RocksDBLoaderComplexConfigTest {
         var config = parse(tempDir, "invalid-merge", """
                 database: {
                   global: {
+                    block-cache-metadata-size: 1MiB
+                    block-caches: [{name: sender, size: 4MiB, metadata-size: 1MiB}]
                     fallback-column-options: {
                       merge-operator-class: "java.lang.String"
                     }
@@ -604,6 +615,8 @@ class RocksDBLoaderComplexConfigTest {
             assertEquals(RocksDBErrorType.CONFIG_ERROR, failure.getErrorUniqueId());
         }
         assertTrue(nativeReferences.size() >= 5, "the failure must occur after native loader setup starts");
+        assertEquals(4, nativeReferences.stream().filter(org.rocksdb.Cache.class::isInstance).count(),
+                "both pools of default and named caches must be allocated before the failure");
         nativeReferences.forEach(reference -> assertFalse(reference.isOwningHandle(),
                 () -> "partially constructed reference was not closed: " + reference.getClass().getName()));
     }

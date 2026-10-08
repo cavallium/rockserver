@@ -27,7 +27,9 @@ class CompactionIoIntegrationTest {
         return path;
     }
     @Test void putFlushReadCloseAndReopenWithActiveController(@TempDir Path root) throws Exception {
-        var cfg = config(root, "database.global.fallback-column-options.compaction-ttl=PT24H\n");
+        var cfg = config(root, "database.global.fallback-column-options.compaction-ttl=PT24H\n"
+                + "database.global.block-cache=4MiB\n"
+                + "database.global.block-cache-metadata-size=1MiB\n");
         var dbPath = root.resolve("db");
         var key = new Keys(new Buf[]{Buf.wrap(new byte[]{1})});
         var value = Buf.wrap(new byte[]{2, 3});
@@ -118,12 +120,59 @@ class CompactionIoIntegrationTest {
             }
         } finally { registry.close(); }
     }
+    @Test void closeRestoresUsefulRateBeforeJoinAndAfterLateSamplerAdjustment() throws Exception {
+        RocksDBLoader.loadLibrary();
+        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var restored = new CountDownLatch(1);
+        var lateThrottle = new CountDownLatch(1);
+        var restoreSeen = new java.util.concurrent.atomic.AtomicBoolean();
+        try (var limiter = new org.rocksdb.RateLimiter(1_000_000, 100_000,
+                org.rocksdb.RateLimiter.DEFAULT_FAIRNESS, org.rocksdb.RateLimiterMode.ALL_IO, false) {
+            @Override public void setBytesPerSecond(long bytes) {
+                super.setBytesPerSecond(bytes);
+                if (bytes == 1_000_000) { restoreSeen.set(true); restored.countDown(); }
+                else if (restoreSeen.get() && bytes == 750_000) lateThrottle.countDown();
+            }
+        }; var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var calls = new java.util.concurrent.atomic.AtomicInteger();
+            java.util.function.Supplier<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sample = () -> {
+                int call = calls.incrementAndGet();
+                if (call == 7) {
+                    entered.countDown();
+                    try { assertTrue(release.await(10, TimeUnit.SECONDS)); }
+                    catch (InterruptedException failure) { throw new AssertionError(failure); }
+                }
+                return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(call * 1_000_000_000L,
+                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true);
+            };
+            var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
+                    .getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
+                            java.util.function.Supplier.class, io.micrometer.core.instrument.MeterRegistry.class);
+            constructor.setAccessible(true);
+            try (var controller = (AutoCloseable) constructor.newInstance("shutdown-restore", limiter, sample, registry)) {
+                assertTrue(entered.await(12, TimeUnit.SECONDS));
+                assertEquals(750_000, limiter.getBytesPerSecond());
+                var close = executor.submit(() -> { controller.close(); return null; });
+                try {
+                    assertTrue(restored.await(5, TimeUnit.SECONDS));
+                    assertEquals(1_000_000, limiter.getBytesPerSecond());
+                    assertThrows(TimeoutException.class, () -> close.get(100, TimeUnit.MILLISECONDS));
+                } finally { release.countDown(); }
+                close.get(5, TimeUnit.SECONDS);
+                assertTrue(lateThrottle.await(1, TimeUnit.SECONDS));
+                assertEquals(1_000_000, limiter.getBytesPerSecond());
+                limiter.close();
+                controller.close(); // Repeat close must not touch the now-disposed limiter.
+            }
+        } finally { release.countDown(); registry.close(); }
+    }
     @Test void zeroConfiguredWriteBufferStillBootstrapsAboveAlignmentFloor(@TempDir Path root) throws Exception {
-        var cfg = config(root, "database.global.write-buffer-manager=0\n");
+        var cfg = config(root, "database.global.write-buffer-manager=0\ndatabase.global.block-cache=8MiB\n");
         var loaded = RocksDBLoader.load(root.resolve("zero-wbm"), ConfigParser.parse(cfg), LoggerFactory.getLogger(getClass()));
         try {
-            assertTrue(loaded.compactionIoLimiter().getBytesPerSecond()
-                    > it.cavallium.rockserver.core.impl.CompactionIoBudget.MIN_BYTES_PER_SECOND);
+            assertEquals((8L << 20) / 2 / 5, loaded.compactionIoLimiter().getBytesPerSecond());
         } finally { loaded.db().close(); loaded.refs().close(); }
     }
     @Test void invalidTtlAndDisabledNativeProtectionsAreRejected(@TempDir Path root) throws Exception {

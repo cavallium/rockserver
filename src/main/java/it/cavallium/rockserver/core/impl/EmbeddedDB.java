@@ -381,6 +381,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final WorkloadSettings workloadSettings;
 	private final RocksDBObjects refs;
 	private final Map<String, Cache> caches;
+	private final Map<String, Cache> metadataCaches;
 	private final MetricsManager metrics;
 	private final ExistsMultiPerfSampler existsMultiPerfSampler;
 	private final String name;
@@ -649,6 +650,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
 		this.caches = loadedDb.caches();
+		this.metadataCaches = loadedDb.metadataCaches();
 		this.definitiveDbPath = loadedDb.definitiveDbPath();
 		// Compute upper-bound memory config from database options
 		RocksDBStatistics.MemoryUpperBoundConfig memoryUpperBoundConfig;
@@ -687,7 +689,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var walMetricsConfig = new RocksDBStatistics.WalMetricsConfig(
 				db.get(), walDirectory, dbOptions.maxTotalWalSize());
 		this.rocksDBStatistics = new RocksDBStatistics(name, dbOptions.statistics(), metrics,
-				caches, loadedDb.cacheCapacities(),
+				caches, loadedDb.cacheCapacities(), metadataCaches, loadedDb.metadataCacheCapacities(),
 				this::getLongProperty, this::getPerCfLongProperty, memoryUpperBoundConfig, walMetricsConfig);
 		this.scheduler = schedulerOverride != null
 				? schedulerOverride
@@ -2746,7 +2748,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								logger,
 								refs,
 								this.path == null,
-								caches
+								caches, metadataCaches
 						);
 						// Force use of configured merge operator if available, or resolve from new schema
 						var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
@@ -2771,7 +2773,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 									logger,
 									this.refs,
 									path == null,
-									caches
+									caches, metadataCaches
 							);
 							var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
 							if (mergeOp != null && !(mergeOp instanceof DelegatingMergeOperator)) {
@@ -2800,7 +2802,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								logger,
 								this.refs,
 								path == null,
-								caches
+								caches, metadataCaches
 						);
 						var mergeOp = resolveMergeOperator(schema, options.mergeOperator());
 						if (mergeOp != null && !(mergeOp instanceof DelegatingMergeOperator)) {
@@ -4505,7 +4507,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							logger,
 							refs,
 							false,
-							caches
+							caches, metadataCaches
 					);
 				} else {
 					try {
@@ -4516,7 +4518,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								logger,
 								refs,
 								false,
-								caches
+								caches, metadataCaches
 						);
 					} catch (GestaltException e) {
 						throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, e);

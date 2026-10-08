@@ -34,6 +34,8 @@ public interface GlobalDatabaseConfig {
 
 	@Nullable DataSize blockCache() throws GestaltException;
 
+	@Nullable DataSize blockCacheMetadataSize() throws GestaltException;
+
 	BlockCacheConfig[] blockCaches() throws GestaltException;
 
 	@Nullable Double blockCacheHighPriorityRatio() throws GestaltException;

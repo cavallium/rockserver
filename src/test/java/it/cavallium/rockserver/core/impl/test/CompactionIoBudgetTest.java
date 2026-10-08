@@ -24,6 +24,7 @@ class CompactionIoBudgetTest {
         t.window(10, 100, SEED);
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
         assertEquals(750_000, t.policy.budget());
+        assertEquals(SEED, t.policy.shutdownBudget());
         t.window(10, 80, 750_000); t.window(10, 80, 750_000);
         assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
         assertEquals(750_000, t.policy.budget());

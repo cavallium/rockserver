@@ -15,6 +15,7 @@ public final class CompactionIoBudget {
     }
     private final long seed;
     private volatile long budget;
+    private volatile long shutdownBudget;
     private volatile State state = State.BOOTSTRAP;
     private Sample previous;
     private long windowNanos, reads, micros, bytes;
@@ -27,9 +28,10 @@ public final class CompactionIoBudget {
 
     public CompactionIoBudget(long seed) {
         this.seed = bound(seed);
-        budget = this.seed;
+        budget = shutdownBudget = this.seed;
     }
     public long budget() { return budget; }
+    public long shutdownBudget() { return shutdownBudget; }
     public State state() { return state; }
     private static long bound(double value) {
         return (long) Math.max(MIN_BYTES_PER_SECOND, Math.min(MAX_BYTES_PER_SECOND, value));
@@ -58,7 +60,7 @@ public final class CompactionIoBudget {
                 || sample.foregroundCompletions < old.foregroundCompletions) {
             if (state == State.PROBE) finishProbe(false, 0);
             clearWindow();
-            return budget;
+            return publishBudget();
         }
         long elapsed = sample.nanos - old.nanos;
         long completed = sample.readCount - old.readCount;
@@ -73,7 +75,7 @@ public final class CompactionIoBudget {
         micros += sample.readMicros - old.readMicros;
         bytes += transferred;
         background |= sample.background || old.background || transferred > 0;
-        if (windowNanos < 5_000_000_000L) return budget;
+        if (windowNanos < 5_000_000_000L) return publishBudget();
         double achieved = bytes * (1_000_000_000d / windowNanos);
         double latency = reads >= 32 ? (double) micros / reads : Double.NaN;
         boolean active = background && bytes > 0;
@@ -87,22 +89,22 @@ public final class CompactionIoBudget {
             if (pressureInWindow) {
                 healthyRecovery = 0;
                 if (achieved >= budget * .8) budget = bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
-                return budget;
+                return publishBudget();
             }
             if (++healthyRecovery >= 2) { state = State.BOOTSTRAP; baseline = 0; }
-            return budget;
+            return publishBudget();
         }
         lastAchieved = active ? achieved : 0;
         if (state == State.PROBE) {
-            if (--settle > 0) return budget;
+            if (--settle > 0) return publishBudget();
             finishProbe(active && Double.isFinite(latency) && latency > 0 && latency <= probeLatency * .9, latency);
-            return budget;
+            return publishBudget();
         }
         if (!active) {
             if (Double.isFinite(latency) && latency > 0) {
                 baseline = baseline == 0 ? latency : baseline * .8 + latency * .2;
             }
-            return budget;
+            return publishBudget();
         }
         recentAchieved = recentAchieved == 0 ? achieved : recentAchieved * .5 + achieved * .5;
         if (state == State.BOOTSTRAP) {
@@ -114,7 +116,7 @@ public final class CompactionIoBudget {
                 baseline = latency;
                 beginProbe(latency);
             }
-            return budget;
+            return publishBudget();
         }
         // Cache hits/mutations or proven foreground idleness can establish progress without block misses.
         if (!Double.isFinite(latency) || latency <= 0) {
@@ -124,7 +126,7 @@ public final class CompactionIoBudget {
                 noProgressProbeUsed = true;
                 beginProbe(baseline);
             }
-            return budget;
+            return publishBudget();
         }
         if (baseline == 0) baseline = latency;
         if (latency > baseline * 1.5) {
@@ -142,6 +144,11 @@ public final class CompactionIoBudget {
                 }
             }
         }
+        return publishBudget();
+    }
+    private long publishBudget() {
+        shutdownBudget = bound(Math.max(Math.max(seed, budget),
+                Math.max(Math.max(preThrottle, probeBudget), recentAchieved)));
         return budget;
     }
     private void finishProbe(boolean improved, double latency) {

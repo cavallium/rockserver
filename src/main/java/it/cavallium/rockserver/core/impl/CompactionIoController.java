@@ -16,11 +16,15 @@ final class CompactionIoController implements AutoCloseable {
     private final List<Meter> meters;
     private final MeterRegistry registry;
     private final AtomicLong failures = new AtomicLong();
+    private final RateLimiter limiter;
+    private final CompactionIoBudget budget;
+    private boolean closed;
 
     CompactionIoController(String name, RateLimiter limiter, Supplier<CompactionIoBudget.Sample> sample,
                            MeterRegistry registry) {
         this.registry = registry;
-        var budget = new CompactionIoBudget(limiter.getBytesPerSecond());
+        this.limiter = limiter;
+        budget = new CompactionIoBudget(limiter.getBytesPerSecond());
         meters = List.of(
                 Gauge.builder("rockserver.compaction.io.budget", budget, CompactionIoBudget::budget)
                         .tag("db", name).baseUnit("bytes/second").register(registry),
@@ -52,15 +56,25 @@ final class CompactionIoController implements AutoCloseable {
         }
     }
 
-    @Override public void close() {
+    @Override public synchronized void close() {
+        if (closed) return;
         executor.shutdown();
+        restoreShutdownBudget();
         boolean interrupted = false;
         for (;;) {
             try {
                 if (executor.awaitTermination(1, TimeUnit.DAYS)) break;
             } catch (InterruptedException ignored) { interrupted = true; }
         }
+        // An in-flight sample may have overwritten the first restore before it exited.
+        restoreShutdownBudget();
+        closed = true;
         meters.forEach(registry::remove);
         if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private void restoreShutdownBudget() {
+        try { limiter.setBytesPerSecond(budget.shutdownBudget()); }
+        catch (RuntimeException failure) { failures.incrementAndGet(); }
     }
 }
