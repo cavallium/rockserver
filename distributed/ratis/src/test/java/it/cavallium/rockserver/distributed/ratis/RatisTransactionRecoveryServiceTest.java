@@ -16,6 +16,17 @@ class RatisTransactionRecoveryServiceTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     RWScheduler scheduler() { return RWScheduler.forTesting(1,1,1,4,1,"transaction-recovery-test"); }
     static void idle(RWScheduler scheduler) throws Exception { var done=new CompletableFuture<Void>(); scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,RequestContext.NO_TIMEOUT).execute(() -> done.complete(null)); done.get(5,TimeUnit.SECONDS); }
+    @Test void dynamicQuantumCoalescesCancellationAndDrainsActualWork() throws Exception {
+        var scheduler=scheduler(); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var calls=new java.util.concurrent.atomic.AtomicInteger();
+        var service=new RatisTransactionRecoveryService(scheduler,() -> { calls.incrementAndGet(); entered.countDown(); if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); });
+        try {
+            assertThrows(IllegalStateException.class,service::remaining);
+            var first=service.tick(); assertTrue(entered.await(5,TimeUnit.SECONDS)); var second=service.tick(); assertTrue(first.cancel(false));
+            var stopped=service.stop(); assertFalse(stopped.isDone()); assertTrue(stopped.cancel(false)); var actual=service.stop(); assertFalse(actual.isDone());
+            release.countDown(); actual.get(5,TimeUnit.SECONDS); second.get(5,TimeUnit.SECONDS); idle(scheduler); assertEquals(1,calls.get());
+            assertThrows(ExecutionException.class,() -> service.tick().get(5,TimeUnit.SECONDS));
+        } finally { release.countDown(); service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
+    }
     @Test void timerQuantaFinishRecoveryWithoutConsumingAndRetireCompletedPolling() throws Exception {
         var helper=new RatisTransactionRecoveryTest(); helper.root=root;
         try (var f=helper.new Fixture("timer"); var recovery=f.recovery()) {

@@ -17,6 +17,8 @@ import reactor.core.scheduler.Scheduler;
 /** Node-shared bounded recovery quanta through the existing reserved CONTROL lane. Supplied resources remain caller-owned. */
 public final class RatisTransactionRecoveryService {
     public static final int MAX_RECOVERIES=4096;
+    @FunctionalInterface public interface Quantum { void run() throws Exception; }
+    private final Quantum quantum;
     private final RWScheduler scheduler;
     private final RWScheduler.WorkloadExecutor executor;
     private final int visits;
@@ -34,7 +36,14 @@ public final class RatisTransactionRecoveryService {
         if (recoveries.size()>MAX_RECOVERIES) throw new IllegalArgumentException("Too many transaction recoveries");
         var supplied=List.copyOf(recoveries); pending.addAll(supplied); remaining=supplied.size();
         if (visits<1 || visits>32) throw new IllegalArgumentException("Invalid recovery quantum");
-        this.visits=visits;
+        this.visits=visits; quantum=this::cycle;
+    }
+
+    /** Dynamic discovery/recovery uses the same coalesced CONTROL admission and actual-task drain ownership. */
+    public RatisTransactionRecoveryService(RWScheduler scheduler,Quantum quantum) {
+        this.scheduler=Objects.requireNonNull(scheduler);
+        executor=scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,RequestContext.NO_TIMEOUT);
+        this.quantum=Objects.requireNonNull(quantum); visits=0;
     }
 
     /** Timer callbacks only admit work; recovery runs on the shared workload executor. */
@@ -84,7 +93,7 @@ public final class RatisTransactionRecoveryService {
         return pending==null ? CompletableFuture.completedFuture(null) : pending.drained.copy();
     }
 
-    public synchronized int remaining() { return remaining; }
+    public synchronized int remaining() { if (visits==0) throw new IllegalStateException("Dynamic recovery status belongs to its registry"); return remaining; }
     private void cycle() throws Exception {
         final int count; synchronized (this) { count=Math.min(visits,pending.size()); }
         for (int i=0;i<count;i++) {
@@ -120,7 +129,7 @@ public final class RatisTransactionRecoveryService {
             try {
                 boolean stopped; synchronized (RatisTransactionRecoveryService.this) { stopped=stopping; }
                 if (stopped) throw new CancellationException("Recovery stopped before execution");
-                cycle();
+                quantum.run();
             } catch (Throwable problem) { failure=problem; }
             finally {
                 phase.set(2); if (failure==null) failure=rejection.get(); finish(this,failure);

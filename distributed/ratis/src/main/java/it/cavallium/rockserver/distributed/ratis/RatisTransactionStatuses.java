@@ -16,6 +16,9 @@ public final class RatisTransactionStatuses {
         if (!directory.columns().equals(Set.of(column))) throw new IllegalArgumentException("Status directory must have its dedicated status column");
         cluster=directory.clusterId(); database=directory.databaseId(); schemaDigest=directory.schemaDigest();
     }
+    void requireDatabaseBinding(UUID cluster,UUID database) {
+        if (!this.cluster.equals(cluster) || !this.database.equals(database)) throw new IllegalArgumentException("Transaction home reader belongs to another cluster/database");
+    }
     byte[] identityDigest() {
         var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }

@@ -20,6 +20,40 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Native node lifecycle with controlled Ratis interfaces. Production server factory is compiled, never executed here. */
 class RatisNodeRuntimeTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    @Test void configuredParticipantRecoveryRunsOnControlAndDrainsBeforeNodeClose() throws Exception {
+        try (var env=new Env(root); var homes=new TransactionHomeReader(env,env.outer.cluster)) {
+            var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,(group,tx) -> { throw new AssertionError("No persisted recoveries"); },false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()::create,null,null,recovery)) {
+                assertEquals(0,node.participantRecoveryStatus().openWorkers()); node.start(); assertEquals(2,env.timer.activePeriods());
+                env.timer.fire(); RatisTransactionRecoveryServiceTest.idle(env.scheduler); assertNull(node.participantRecoveryFailure()); assertEquals(0,node.participantRecoveryStatus().persistedFiles());
+            }
+            assertEquals(0,env.timer.activePeriods()); assertEquals(0,homes.closes);
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.RECOVER,new FakeServer()::create,null,null,recovery)) { node.start(); env.timer.fire(); RatisTransactionRecoveryServiceTest.idle(env.scheduler); assertNull(node.participantRecoveryFailure()); }
+            assertEquals(0,homes.closes);
+        }
+    }
+    @Test void foreignRecoveryHomesAreRejectedBeforeBootstrapWrites() throws Exception {
+        try (var env=new Env(root); var homes=new TransactionHomeReader(env,UUID.randomUUID())) {
+            var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,(group,tx) -> { throw new AssertionError(); },false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
+            var fake=new FakeServer();
+            assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,null,null,recovery));
+            assertFalse(fake.created); try (var files=Files.list(env.nodeRoot)) { assertTrue(files.findAny().isEmpty()); }
+        }
+    }
+    static final class TransactionHomeReader implements AutoCloseable {
+        final RatisRoutedClient routed; final RatisTransactionStatuses homes; int closes;
+        TransactionHomeReader(Env env,UUID cluster) {
+            UUID column=new UUID(12,1),group=new UUID(12,2); var peer=env.plan.directory().ranges().getFirst().replicas().getFirst();
+            var route=new RangeDescriptor(group,group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+            var directory=new RangeDirectory(cluster,env.outer.database,new UUID(12,3),1,new byte[32],0,Set.of(column),0,List.of(route));
+            routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError("No recovery journals"); }
+                public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError("No recovery journals"); }
+                public void close() { closes++; }
+            }); homes=new RatisTransactionStatuses(routed,column);
+        }
+        @Override public void close() throws Exception { routed.close(); }
+    }
     @Test void explicitPlacementStartsAllLocalGroupsAndRecoveryKeepsBorrowedResourcesOpen() throws Exception {
         try (var env=new Env(root)) {
             var first=new FakeServer();
@@ -138,13 +172,13 @@ class RatisNodeRuntimeTest {
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed));
             assertEquals(0,failed.starts);
             byte[] identity=SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128);
-            assertEquals(37,identity.length); assertEquals(1,java.nio.ByteBuffer.wrap(identity).getInt()); assertEquals(0,identity[4]);
+            assertEquals(33,identity.length); assertEquals(0,identity[0]);
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
             var resumed=new FakeServer();
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,resumed)) {
                 node.start(); assertTrue(resumed.exposedBeforeStart); assertTrue(node.started());
             }
-            assertEquals(1,SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128)[4]);
+            assertEquals(1,SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128)[0]);
             try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
         }
     }
@@ -160,25 +194,22 @@ class RatisNodeRuntimeTest {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed)) {
                 assertThrows(IOException.class,node::start); assertTrue(failed.exposedBeforeStart);
             }
-            assertEquals(1,SessionJournalFiles.read(identity,128)[4]);
+            assertEquals(1,SessionJournalFiles.read(identity,128)[0]);
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
         }
     }
-    @Test void currentIdentityIsCanonicalAndRejectsMalformedPhaseShapeVersionAndBinding() throws Exception {
+    @Test void currentIdentityIsCanonicalAndRejectsMalformedPhaseShapeAndBinding() throws Exception {
         try (var env=new Env(root)) {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
             Path identity=env.nodeRoot.resolve("node.identity");
             byte[] canonical=SessionJournalFiles.read(identity,128);
-            assertEquals(37,canonical.length); assertEquals(1,java.nio.ByteBuffer.wrap(canonical).getInt()); assertEquals(1,canonical[4]);
-            assertArrayEquals(env.plan.identityDigest(),Arrays.copyOfRange(canonical,5,37));
+            assertEquals(33,canonical.length); assertEquals(1,canonical[0]);
+            assertArrayEquals(env.plan.identityDigest(),Arrays.copyOfRange(canonical,1,33));
             for (int length=0;length<canonical.length;length++) assertIdentityRejected(env,Arrays.copyOf(canonical,length));
             assertIdentityRejected(env,Arrays.copyOf(canonical,canonical.length+1));
-            for (int version:new int[]{0,2,3}) {
-                byte[] malformed=canonical.clone(); java.nio.ByteBuffer.wrap(malformed).putInt(version); assertIdentityRejected(env,malformed);
-            }
-            byte[] phase=canonical.clone(); phase[4]=2; assertIdentityRejected(env,phase);
-            byte[] binding=canonical.clone(); binding[5]^=1; assertIdentityRejected(env,binding);
+            byte[] phase=canonical.clone(); phase[0]=2; assertIdentityRejected(env,phase);
+            byte[] binding=canonical.clone(); binding[1]^=1; assertIdentityRejected(env,binding);
             SessionJournalFiles.write(identity,canonical,128);
             try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
             assertArrayEquals(canonical,SessionJournalFiles.read(identity,128));
@@ -325,7 +356,7 @@ class RatisNodeRuntimeTest {
                 case "getId" -> RaftPeerId.valueOf(plan.peerId()); case "toString" -> "controlled-node-server";
                 case "start" -> {
                     starts++; byte[] identity=SessionJournalFiles.read(logs.getParent().resolve("node.identity"),128);
-                    exposedBeforeStart=identity.length==37 && java.nio.ByteBuffer.wrap(identity).getInt()==1 && identity[4]==1;
+                    exposedBeforeStart=identity.length==33 && identity[0]==1;
                     if (failStart) throw new IOException("fixture start failure");
                     initialize(plan.localGroups().getFirst()); yield null;
                 }

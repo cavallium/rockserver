@@ -38,6 +38,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     || shutdownTimeout.compareTo(Duration.ofMinutes(1))>0) throw new IllegalArgumentException("Invalid node resource/lifecycle settings");
         }
     }
+    public record RecoverySettings(RatisTransactionStatuses homes,RatisParticipantRecoveryRegistry.ControlIdsFactory controls,
+                                   boolean takeover,RatisParticipantRecoveryRegistry.Limits limits,Duration period,int visits) {
+        public RecoverySettings {
+            Objects.requireNonNull(homes); Objects.requireNonNull(controls); Objects.requireNonNull(limits); Objects.requireNonNull(period);
+            if (period.isNegative() || period.isZero() || period.compareTo(Duration.ofMinutes(1))>0 || visits<1 || visits>32) throw new IllegalArgumentException("Invalid participant recovery settings");
+        }
+    }
     private final RatisNodePlan plan; private final DistributedSchema logicalSchema; private final Path root; private final Settings settings;
     private final RatisSessionEpochs epochs; private final RatisRoutedClient routed; private final RatisSnapshotFences snapshotHomes;
     private final RWScheduler scheduler; private final Scheduler timer; private final LongSupplier time;
@@ -45,6 +52,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private DistributedStoragePool pool; private RaftServer server; private RatisCatalogueClock clock;
     private RatisSessionPropagation propagation; private RatisSessionClockService service;
     private RatisTransactionExpiryService transactionExpiry;
+    private final RecoverySettings recoverySettings;
+    private RatisParticipantRecoveryRegistry participantRecoveries;
+    private RatisTransactionRecoveryService participantRecoveryService;
+    private boolean recoveriesDiscovered;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
 
@@ -72,7 +83,15 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes) throws IOException {
-        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes);
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,null);
+    }
+    public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,schema,snapshotHomes,recoveries);
+    }
+    static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
+        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes,recoveries);
         try { node.initialize(config,startup,factory); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
@@ -80,10 +99,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
     }
     private RatisNodeRuntime(RatisNodePlan plan,Path root,RatisSessionEpochs epochs,RatisRoutedClient routed,
-            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema,RatisSnapshotFences snapshotHomes) {
+            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) {
         this.plan=Objects.requireNonNull(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
         this.routed=Objects.requireNonNull(routed); this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
-        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); logicalSchema=schema; this.snapshotHomes=snapshotHomes;
+        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); logicalSchema=schema; this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
+        if (recoveries!=null) recoveries.homes().requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
         if (snapshotHomes!=null) snapshotHomes.requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
         if (schema!=null) schema.requireMatches(plan.directory());
         if (plan.localGroups().stream().anyMatch(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId()))
@@ -109,13 +129,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }
         } else {
             if (startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Node identity is absent; explicit placement initialization is required");
-            for (String directory:List.of("native","raft","sessions")) {
+            for (String directory:List.of("native","raft","sessions","recovery")) {
                 Path path=root.resolve(directory);
                 if (Files.exists(path)) try (var entries=Files.list(path)) { if (entries.findAny().isPresent()) throw new IOException("Unidentified node data must not be adopted"); }
             }
             SessionJournalFiles.write(identity,identity(false),128);
         }
-        for (String directory:List.of("native","raft","sessions")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
+        for (String directory:List.of("native","raft","sessions","recovery")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
         SessionJournalFiles.force(root);
         var allowed=new HashSet<UUID>(); for (var group:plan.localGroups()) allowed.add(group.getGroupId().getUuid());
         try (var entries=Files.list(logs)) {
@@ -147,6 +167,18 @@ public final class RatisNodeRuntime implements AutoCloseable {
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
         server=factory.create(plan,logs,Collections.unmodifiableMap(machines));
         transactionExpiry=new RatisTransactionExpiryService(scheduler,List.copyOf(machines.values()),32);
+        if (recoverySettings!=null) {
+            var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (!id.getUuid().equals(plan.catalogue().groupId())) local.add(id.getUuid());
+            participantRecoveries=new RatisParticipantRecoveryRegistry(root.resolve("recovery"),recoverySettings.homes(),routed,recoverySettings.controls(),(group,transaction,control) -> {
+                var machine=machines.get(RaftGroupId.valueOf(group)); if (machine==null || !local.contains(group)) throw new IOException("Participant recovery is outside local DATA groups");
+                try { var proposal=machine.prepareFinalization(recoverySettings.homes(),transaction,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
+                catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Local participant recovery authority unavailable",failure); }
+            },recoverySettings.takeover(),local,recoverySettings.limits());
+            participantRecoveryService=new RatisTransactionRecoveryService(scheduler,() -> {
+                if (!recoveriesDiscovered) { participantRecoveries.discover(); recoveriesDiscovered=true; }
+                participantRecoveries.cycle(recoverySettings.visits());
+            });
+        }
         if (!machines.containsKey(RaftGroupId.valueOf(plan.catalogue().groupId()))) return;
         clock=new RatisCatalogueClock(root.resolve("sessions/catalogue-clock.bin"),epochs);
         propagation=new RatisSessionPropagation(root.resolve("sessions"),epochs,routed,settings.maxPropagationRanges());
@@ -172,6 +204,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for (var group:plan.localGroups()) verify(group);
             if (service!=null) service.start(timer,settings.clockPeriod());
             transactionExpiry.start(timer,Duration.ofMillis(100));
+            if (participantRecoveryService!=null) participantRecoveryService.start(timer,recoverySettings.period());
             synchronized (this) { started=true; }
         } catch (IOException | RuntimeException | Error failure) {
             synchronized (this) { closeRequested=true; }
@@ -179,12 +212,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
         } finally { synchronized (this) { starting=false; } }
     }
     private byte[] identity(boolean exposed) {
-        return ByteBuffer.allocate(37).putInt(1).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
+        return ByteBuffer.allocate(33).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
     }
     private boolean identityExposed(byte[] bytes) throws IOException {
-        if (bytes.length!=37) throw new IOException("Invalid node identity shape");
+        if (bytes.length!=33) throw new IOException("Invalid node identity shape");
         var input=ByteBuffer.wrap(bytes);
-        if (input.getInt()!=1) throw new IOException("Invalid node identity version");
         int phase=input.get()&255;
         if (phase>1) throw new IOException("Invalid node exposure phase");
         byte[] digest=new byte[32]; input.get(digest);
@@ -208,6 +240,14 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public synchronized boolean started() { return state()==State.RUNNING; }
     public RatisSessionClockService.Snapshot maintenanceStatus() { return service==null ? null : service.latest(); }
     public Throwable maintenanceFailure() { return service==null ? null : service.lastFailure(); }
+    public Throwable participantRecoveryFailure() { return participantRecoveryService==null ? null : participantRecoveryService.lastFailure(); }
+    /** Borrowed synchronous helper; callers invoke it within their existing CONTROL quantum. */
+    public RatisSnapshotReadinessHelper.Recovery participantRecovery() { if (participantRecoveries==null) throw new IllegalStateException("Participant recovery is not configured"); return this::recoverParticipant; }
+    private boolean recoverParticipant(UUID group,it.cavallium.rockserver.core.common.distributed.PreparedParticipant prepared) throws IOException {
+        synchronized (this) { if (closeRequested || closed) throw new IOException("Node participant recovery is stopping"); }
+        return participantRecoveries.step(group,prepared);
+    }
+    public RatisParticipantRecoveryRegistry.Snapshot participantRecoveryStatus() { if (participantRecoveries==null) throw new IllegalStateException("Participant recovery is not configured"); return participantRecoveries.stats(); }
     public Throwable transactionExpiryFailure() { return transactionExpiry==null ? null : transactionExpiry.lastFailure(); }
     private void verify(RaftGroup group) throws IOException {
         var division=server.getDivision(group.getGroupId()); var configuration=division.getRaftConf();
@@ -226,6 +266,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            if (participantRecoveryService!=null) {
+                try { participantRecoveryService.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Participant recovery drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Participant recovery did not drain",failure); }
+            }
+            if (participantRecoveries!=null) participantRecoveries.close();
             if (transactionExpiry!=null) {
                 try { transactionExpiry.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Transaction expiry drain interrupted",interrupted); }
