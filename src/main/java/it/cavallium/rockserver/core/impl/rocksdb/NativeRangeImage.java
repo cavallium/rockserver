@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt;
+import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RejectedParticipant;
@@ -326,7 +328,8 @@ public final class NativeRangeImage {
         private final Map<UUID,AbortedParticipant> aborted=new HashMap<>();
         private final Map<UUID,RejectedParticipant> rejected=new HashMap<>();
         private final Map<UUID,SnapshotGate> gates=new HashMap<>();
-        private long gateBytes;
+        private long gateBytes,homeRecoveryBytes;
+        private final Map<OperationId,HomeRecoveryReceipt> homeRecoveries=new HashMap<>();
         private final Map<UUID,CommittedParticipant> committed=new HashMap<>();
         private long preparedBytes,preparedScopeBytes;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
@@ -442,6 +445,17 @@ public final class NativeRangeImage {
                         gates.put(fence.fenceId(),gate);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid gate image record",invalid); }
                 }
+                if (section==Section.STATE && key.length>16 && key[16]==0x25) {
+                    try {
+                        var receipt=HomeRecoveryReceipt.decode(value); receipt.requireCut(header.position()); var recovery=receipt.recovery(); var command=recovery.command(); var mutation=command.mutations().getFirst(); var id=recovery.operation();
+                        byte[] expected=ByteBuffer.allocate(49).put(groupPrefix).put((byte)0x25).putLong(id.sessionId().getMostSignificantBits()).putLong(id.sessionId().getLeastSignificantBits()).putLong(id.epoch()).putLong(id.sequence()).array();
+                        if (!Arrays.equals(key,expected) || !Arrays.equals(value,receipt.encode()) || !command.groupId().equals(header.owner().groupId()) || command.rangeEpoch()!=header.owner().epoch()
+                                || !Arrays.equals(command.schemaDigest(),header.schema()) || header.interval().columns().size()!=1 || !header.interval().columns().contains(mutation.columnId())
+                                || lower!=null && Arrays.compareUnsigned(mutation.key(),lower)<0 || upper!=null && Arrays.compareUnsigned(mutation.key(),upper)>=0) throw new IOException("HOME recovery image ownership/key/schema differs");
+                        homeRecoveryBytes+=key.length+(long)value.length;
+                        if (homeRecoveries.size()>=ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeRecoveryBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES || homeRecoveries.putIfAbsent(id,receipt)!=null) throw new IOException("HOME recovery image capacity/identity exceeded");
+                    } catch (IllegalArgumentException invalid) { throw new IOException("Invalid HOME recovery image receipt",invalid); }
+                }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
                     throw new IOException("Image contains unsupported receipt accounting metadata");
                 }
@@ -483,6 +497,7 @@ public final class NativeRangeImage {
                     for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("ABORT image identity also has ordinary receipt");
                     for (var record:rejected.values()) if (record.ownsOperation(id)) throw new IOException("Rejected image identity also has ordinary receipt");
                     for (var gate:gates.values()) if (gate.ownsOperation(id)) throw new IOException("Gate image identity also has ordinary receipt");
+                    if (homeRecoveries.containsKey(id)) throw new IOException("HOME recovery image identity also has ordinary receipt");
                     receiptCount = addUsage(receiptCount, 1);
                     receiptBytes = addUsage(receiptBytes, (long) key.length + value.length);
                 }
@@ -574,6 +589,15 @@ public final class NativeRangeImage {
                     for (var other:gates.values()) if (other!=gate && other.ownsOperation(id)) throw new IOException("Gate image identity reused");
                 }
                 if (gate.active()) for (var other:gates.values()) if (other!=gate && other.active() && participant.scope().intersects(other.fence().participant(other.participantGroup()).scope())) throw new IOException("Active gate image scopes overlap");
+            }
+
+            for (var recovery:homeRecoveries.values()) {
+                var id=recovery.recovery().operation();
+                for (var p:prepared) if (p.preparation().ownsOperation(id)) throw new IOException("HOME recovery/preparation image identity reused");
+                for (var r:rejected.values()) if (r.ownsOperation(id)) throw new IOException("HOME recovery/rejection image identity reused");
+                for (var r:aborted.values()) if (r.ownsOperation(id)) throw new IOException("HOME recovery/ABORT image identity reused");
+                for (var r:committed.values()) if (r.ownsOperation(id)) throw new IOException("HOME recovery/COMMIT image identity reused");
+                for (var r:gates.values()) if (r.ownsOperation(id)) throw new IOException("HOME recovery/gate image identity reused");
             }
 
             if (sessionAuthority != null && sessionAuthority.minimumEpoch() > epochFloor) {

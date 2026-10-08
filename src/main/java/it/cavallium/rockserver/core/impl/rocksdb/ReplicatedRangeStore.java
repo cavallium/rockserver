@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.HomeRecovery;
+import it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
 import it.cavallium.rockserver.core.common.distributed.ParticipantFinalization;
 import it.cavallium.rockserver.core.common.distributed.ParticipantVote;
@@ -85,6 +87,10 @@ public final class ReplicatedRangeStore {
     public static final long FINALIZATION_RESERVATION=66L+AbortedParticipant.MAX_BYTES+RejectedParticipant.MAX_BYTES;
     public static final int MAX_SNAPSHOT_GATES=16;
     public static final long MAX_SNAPSHOT_GATE_BYTES=16L*1024*1024;
+    public static final int MAX_HOME_RECOVERIES=1024;
+    public static final long MAX_HOME_RECOVERY_BYTES=16L*1024*1024;
+    private volatile Map<OperationId,HomeRecoveryReceipt> homeRecoveries=Map.of();
+    private long retainedHomeRecoveryBytes;
     private volatile Map<UUID,SnapshotGate> snapshotGates=Map.of();
     private long retainedGateBytes;
     private volatile DistributedSchema logicalSchema;
@@ -169,7 +175,7 @@ public final class ReplicatedRangeStore {
         } else {
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates();
+            homeRecoveries=loadHomeRecoveries(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
         }
     }
 
@@ -244,7 +250,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
-            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates();
+            homeRecoveries=loadHomeRecoveries(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -364,6 +370,7 @@ public final class ReplicatedRangeStore {
     public void validate(DistributedCommand command) { validateCommand(command,true); }
     private void validateCommand(DistributedCommand command,boolean active) { validateCommand(command,active,true); }
     private void validateCommand(DistributedCommand command,boolean active,boolean logical) {
+        requireHomeRecoveryFree(command.operationId());
         if (command.sessionControl()!=null && !sessionControlsEnabled) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
         if (active) requireActive();
@@ -390,6 +397,93 @@ public final class ReplicatedRangeStore {
             }
         }
         if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command);
+    }
+
+    public record HomeRecoveryCapacity(ApplyPosition position,int count,long bytes) {}
+    public record HomeRecoveryEstimate(HomeRecoveryCapacity capacity,boolean newReceipt,HomeRecoveryReceipt existing) {}
+    private byte[] homeRecoveryKey(OperationId id) { return ByteBuffer.allocate(49).put(markerKey).put((byte)0x25).putLong(id.sessionId().getMostSignificantBits()).putLong(id.sessionId().getLeastSignificantBits()).putLong(id.epoch()).putLong(id.sequence()).array(); }
+    public static long homeRecoveryBytes(HomeRecovery recovery) { return 49L+28+recovery.encode().length; }
+    private void requireHomeRecovery(HomeRecovery recovery) {
+        var command=recovery.command(); var mutation=command.mutations().getFirst();
+        if (!command.groupId().equals(groupId) || command.rangeEpoch()!=rangeEpoch || !Arrays.equals(command.schemaDigest(),schemaDigest)
+                || columns.size()!=1 || !columns.containsKey(mutation.columnId()) || !contains(mutation.key())) throw new IllegalArgumentException("HOME recovery differs from native home ownership/schema");
+    }
+    private void requireHomeRecoveryFree(OperationId id) { if (homeRecoveries.containsKey(id)) throw new IllegalArgumentException("Operation identity belongs to protected HOME recovery"); }
+    private void requireHomeRecoveryIdentity(HomeRecovery recovery) throws RocksDBException {
+        var id=recovery.operation();
+        for (var p:preparedIndex.records()) if (p.preparation().ownsOperation(id)) throw new IllegalArgumentException("HOME recovery identity belongs to preparation");
+        for (var r:rejectedIndex.values()) if (r.ownsOperation(id)) throw new IllegalArgumentException("HOME recovery identity belongs to rejection");
+        for (var r:abortedIndex.values()) if (r.ownsOperation(id)) throw new IllegalArgumentException("HOME recovery identity belongs to ABORT");
+        for (var r:committedIndex.values()) if (r.ownsOperation(id)) throw new IllegalArgumentException("HOME recovery identity belongs to COMMIT");
+        for (var r:snapshotGates.values()) if (r.ownsOperation(id)) throw new IllegalArgumentException("HOME recovery identity belongs to snapshot gate");
+        if (db.get(receipts,receiptKey(id))!=null) throw new IllegalArgumentException("HOME recovery identity has an ordinary receipt");
+    }
+    private HomeRecoveryCapacity homeRecoveryCapacityUnderLane() { return new HomeRecoveryCapacity(applied,homeRecoveries.size(),retainedHomeRecoveryBytes); }
+    public HomeRecoveryCapacity homeRecoveryCapacity() {
+        enterNative(); applyLane.lock(); try { requireActive(); return homeRecoveryCapacityUnderLane(); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public HomeRecoveryEstimate estimateHomeRecovery(HomeRecovery recovery) throws RocksDBException {
+        Objects.requireNonNull(recovery); enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireHomeRecovery(recovery); var existing=homeRecoveries.get(recovery.operation());
+            if (existing!=null) { requireSameHomeRecovery(existing,recovery,applied); return new HomeRecoveryEstimate(homeRecoveryCapacityUnderLane(),false,existing); }
+            requireHomeRecoveryIdentity(recovery); var command=recovery.command(); requireUnlocked(command); requireUngated(commandScope(command));
+            var capacity=homeRecoveryCapacityUnderLane();
+            if (capacity.count()>=MAX_HOME_RECOVERIES || homeRecoveryBytes(recovery)>MAX_HOME_RECOVERY_BYTES-capacity.bytes()) throw new IllegalStateException("Protected HOME recovery capacity exhausted");
+            return new HomeRecoveryEstimate(capacity,true,null);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public HomeRecoveryReceipt applyHomeRecovery(ApplyPosition position,HomeRecovery recovery) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(recovery); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage(); var estimate=estimateHomeRecovery(recovery); var saved=estimate.existing();
+            if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Completed HOME recovery has no retained receipt"); return saved; }
+            requireNext(position); var command=recovery.command();
+            var result=saved==null ? evaluate(command).result() : saved.result();
+            var receipt=saved==null ? new HomeRecoveryReceipt(recovery,position,result) : saved;
+            var published=homeRecoveries; long bytes=retainedHomeRecoveryBytes;
+            if (saved==null) { var next=new HashMap<>(homeRecoveries); next.put(recovery.operation(),receipt); published=Map.copyOf(next); bytes+=homeRecoveryBytes(recovery); }
+            boolean effects=saved==null && result.status()==CommandResult.Status.SUCCESS;
+            var writes=prepareScopedWrites(effects,command.mutations(),Map.of());
+            try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if (effects) { var mutation=command.mutations().getFirst(); batch.put(columns.get(mutation.columnId()),mutation.key(),mutation.value()); }
+                if (saved==null) batch.put(state,homeRecoveryKey(recovery.operation()),receipt.encode());
+                batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            homeRecoveries=published; retainedHomeRecoveryBytes=bytes; publishScoped(position,writes,false); applied=position; return receipt;
+        } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
+        finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    private void requireSameHomeRecovery(HomeRecoveryReceipt receipt,HomeRecovery expected,ApplyPosition cut) {
+        receipt.requireCut(cut); if (!Arrays.equals(receipt.recovery().digest(),expected.digest())) throw new IllegalArgumentException("Protected HOME recovery identity payload changed");
+    }
+    private HomeRecoveryReceipt readHomeRecovery(HomeRecovery recovery,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        requireHomeRecovery(recovery); byte[] bytes=options==null ? db.get(state,homeRecoveryKey(recovery.operation())) : db.get(state,options,homeRecoveryKey(recovery.operation()));
+        if (bytes==null) return null; var receipt=HomeRecoveryReceipt.decode(bytes); requireSameHomeRecovery(receipt,recovery,cut); return receipt;
+    }
+    public HomeRecoveryReceipt homeRecoveryResult(HomeRecovery recovery) throws RocksDBException {
+        Objects.requireNonNull(recovery); enterNative(); applyLane.lock();
+        try { if (pendingInstallation!=null) throw new IllegalStateException("HOME recovery metadata is being installed"); return readHomeRecovery(recovery,null,applied); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    private Map<OperationId,HomeRecoveryReceipt> loadHomeRecoveries() {
+        var records=new HashMap<OperationId,HomeRecoveryReceipt>(); long bytes=0;
+        try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array());
+             var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array());
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+            iterator.seekToFirst(); var sizing=new byte[0];
+            while (iterator.isValid()) {
+                if (records.size()>=MAX_HOME_RECOVERIES || iterator.key(sizing)!=49 || iterator.value(sizing)>HomeRecoveryReceipt.MAX_BYTES) throw new IllegalStateException("HOME recovery receipt bound exceeded");
+                var receipt=HomeRecoveryReceipt.decode(iterator.value()); requireHomeRecovery(receipt.recovery()); receipt.requireCut(applied);
+                if (!Arrays.equals(iterator.key(),homeRecoveryKey(receipt.recovery().operation()))) throw new IllegalArgumentException("HOME recovery receipt key changed");
+                bytes+=49L+iterator.value(sizing); if (bytes>MAX_HOME_RECOVERY_BYTES || records.putIfAbsent(receipt.recovery().operation(),receipt)!=null) throw new IllegalStateException("HOME recovery receipt capacity/identity exceeded"); iterator.next();
+            }
+            iterator.status(); retainedHomeRecoveryBytes=bytes; return Map.copyOf(records);
+        } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover protected HOME receipts",failure); }
+    }
+    private void validateHomeRecoveries() {
+        try { for (var receipt:homeRecoveries.values()) requireHomeRecoveryIdentity(receipt.recovery()); }
+        catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate HOME recovery identities",failure); }
     }
 
     public record FinalizationEstimate(PreparedCapacity capacity,boolean newFence,ApplyPosition existing) {}
@@ -563,6 +657,7 @@ public final class ReplicatedRangeStore {
     private void requireGateIdentity(SnapshotFence fence) throws RocksDBException {
         var participant=fence.participant(groupId);
         for (var id:List.of(participant.installOperation(),participant.releaseOperation())) {
+            requireHomeRecoveryFree(id);
             for (var prepared:preparedIndex.records()) if (prepared.preparation().ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to preparation");
             for (var rejected:rejectedIndex.values()) if (rejected.ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to rejection");
             for (var abort:abortedIndex.values()) if (abort.ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to ABORT");
@@ -714,6 +809,7 @@ public final class ReplicatedRangeStore {
         for (var record:index.records()) ids.remove(record.preparation().transactionId()); return ids;
     }
     private void requireRejected(RejectedParticipant record) {
+        requireHomeRecoveryFree(record.operation()); requireHomeRecoveryFree(record.registration().operation());
         var participant=record.registration().participants().stream().filter(p -> p.groupId().equals(record.participantGroup())).findFirst().orElseThrow();
         if (!record.participantGroup().equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),schemaDigest)
                 || !record.registration().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Rejected preparation differs from range");
@@ -794,6 +890,7 @@ public final class ReplicatedRangeStore {
     private byte[] abortedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x21).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
     private void requireAbort(AbortedParticipant record) { requireFinalization(record.finalization()); }
     private void requireFinalization(ParticipantFinalization decision) {
+        requireHomeRecoveryFree(decision.operation()); requireHomeRecoveryFree(decision.decision().operation());
         var participant=decision.participant();
         if (!decision.participantGroup().equals(owner.groupId()) || participant.rangeEpoch()!=owner.epoch() || !Arrays.equals(participant.schemaDigest(),schemaDigest)
                 || !decision.decision().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Finalization differs from range");
@@ -878,6 +975,7 @@ public final class ReplicatedRangeStore {
     public AbortedParticipant abortedParticipant(UUID transaction) { enterNative(); applyLane.lock(); try { requireActive(); return abortedIndex.get(transaction); } finally { applyLane.unlock(); leaveNative(); } }
     private byte[] preparedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x20).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
     private void requirePreparation(PreparedParticipant.Preparation preparation,boolean material) {
+        requireHomeRecoveryFree(preparation.operation()); requireHomeRecoveryFree(preparation.business().operationId());
         var business=preparation.business(); validateCommand(business,false,material || logicalSchema!=null); validateSnapshotScope(preparation.scope());
         if (!preparation.registration().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Prepared domain differs from range");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(preparation.registration().clusterId()) || !logicalSchema.databaseId().equals(preparation.registration().databaseId()))) throw new IllegalArgumentException("Prepared database differs from schema");
@@ -1102,7 +1200,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             requireActive();
-            ensureReceiptUsage();
+            ensureReceiptUsage(); requireHomeRecoveryFree(command.operationId());
             long currentEpochFloor = minimumSessionEpoch(null);
             long currentFloor = command.operationId().epoch() < currentEpochFloor ? -1 : acknowledgedThrough(command.operationId(), null);
             if (command.operationId().epoch() < currentEpochFloor || command.operationId().sequence() <= currentFloor) {
@@ -1535,6 +1633,7 @@ public final class ReplicatedRangeStore {
                     publishScoped(expected.position(),prepareScopedWrites(false,List.of(),Map.of()),false); applied = expected.position();
                     installationGeneration++;
                     pendingInstallation = null;
+                    homeRecoveries=loadHomeRecoveries();
                     return actual;
                 }
             }
@@ -1604,6 +1703,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
+            requireHomeRecoveryFree(id);
             if (id.epoch() < minimumSessionEpoch(null) || id.sequence() <= acknowledgedThrough(id, null)) return expiredResult();
             byte[] saved = db.get(receipts, receiptKey(id));
             return saved == null ? null : decodeReceipt(saved, payloadDigest);
@@ -2043,6 +2143,10 @@ public final class ReplicatedRangeStore {
             try (var options=new ReadOptions().setSnapshot(snapshot)) { return readFinalizationPosition(expected,options,position); }
             finally { releaseUse(); }
         }
+        public HomeRecoveryReceipt homeRecoveryResult(HomeRecovery recovery) throws RocksDBException {
+            Objects.requireNonNull(recovery); acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) { return readHomeRecovery(recovery,options,position); } finally { releaseUse(); }
+        }
         public SnapshotGate snapshotGate(SnapshotFence fence) throws RocksDBException {
             Objects.requireNonNull(fence); acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) { return readSnapshotGate(fence,options,position); }
@@ -2084,6 +2188,7 @@ public final class ReplicatedRangeStore {
             try {
                 try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
                     if (payloadDigest.length != 32) throw new IllegalArgumentException("Invalid payload digest");
+                    if (db.get(state,options,homeRecoveryKey(id))!=null) throw new IllegalArgumentException("Operation identity belongs to protected HOME recovery");
                     if (id.epoch() < minimumSessionEpoch(options) || id.sequence() <= acknowledgedThrough(id, options)) return expiredResult();
                     byte[] saved = db.get(receipts, options, receiptKey(id));
                     return saved == null ? null : decodeReceipt(saved, payloadDigest);

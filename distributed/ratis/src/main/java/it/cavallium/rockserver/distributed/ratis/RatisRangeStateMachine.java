@@ -100,6 +100,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.SESSION_FLOOR && command.kind()!=DistributedCommand.Kind.SESSION_CONTROL) throw new IllegalArgumentException("Range role rejects transaction business records");
     }
     private void validateRoleNativeState() throws IOException {
+        if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.homeRecoveryCapacity().count()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
         if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
     }
     void snapshotHomes(RatisSnapshotFences homes) {
@@ -427,6 +428,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         var manifest = NativeRangeImage.visit(image, limits, (section, column, key, value) -> {
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x20 && (key[16]&255)<=0x24) throw new IllegalArgumentException("Non-DATA image contains participant/snapshot state");
+            if (role!=RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)==0x25) throw new IllegalArgumentException("Image role rejects protected HOME recovery receipts");
+            if (role==RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)==0x25) {
+                var receipt=it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt.decode(value); var recovery=receipt.recovery(); var homeKey=recovery.command().mutations().getFirst().key();
+                homeValues.validate(homeKey,recovery.before().encode()); homeValues.validate(homeKey,recovery.next().encode());
+            }
             if (homeValues!=null && section==NativeRangeImage.Section.USER) homeValues.validate(key,value);
             if (section == NativeRangeImage.Section.STATE && key.length == 17 && key[16] == 1) {
                 try { cutConfiguration[0] = ReplicatedRangeStore.Configuration.decode(value); }
