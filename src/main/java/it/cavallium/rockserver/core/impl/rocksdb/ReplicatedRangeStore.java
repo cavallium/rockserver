@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
 import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
@@ -61,6 +62,12 @@ public final class ReplicatedRangeStore {
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
     /** Consensus bound for original bucket bytes plus retained staged bucket replacements. */
     public static final long MAX_BUCKET_PLAN_BYTES=16L*1024*1024;
+    public static final int MAX_PREPARED_PARTICIPANTS=64;
+    public static final long MAX_PREPARED_BYTES=16L*1024*1024;
+    private record PreparedIndex(List<PreparedParticipant> records,long bytes,long scopeBytes) {
+        static PreparedIndex empty() { return new PreparedIndex(List.of(),0,0); }
+    }
+    private volatile PreparedIndex preparedIndex=PreparedIndex.empty();
     private volatile DistributedSchema logicalSchema;
     private RangeMutationHistory scopedHistory;
     private RangeMutationHistory.Limits scopedLimits;
@@ -143,6 +150,7 @@ public final class ReplicatedRangeStore {
         } else {
             ensureReceiptUsage();
             validateReceiptUsage(applied);
+            preparedIndex=loadPreparedIndex();
         }
     }
 
@@ -217,6 +225,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
+            preparedIndex=loadPreparedIndex();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -312,6 +321,7 @@ public final class ReplicatedRangeStore {
                     || prefix>0 && (interval.lowerInclusive()!=null && interval.lowerInclusive().length!=prefix
                             || interval.upperExclusive()!=null && interval.upperExclusive().length!=prefix)) throw new IllegalArgumentException("Logical schema differs from native ownership");
             logicalSchema=schema;
+            for (var prepared:preparedIndex.records()) requirePreparation(prepared.preparation(),true);
         } finally { applyLane.unlock(); leaveNative(); }
     }
     private void validateLogical(DistributedCommand command) {
@@ -332,10 +342,12 @@ public final class ReplicatedRangeStore {
             if (!shape.hasValue() && predicate.expectedValue()!=null && predicate.expectedValue().length!=0) throw new IllegalArgumentException("Key-only predicate has value bytes");
         }
     }
-    public void validate(DistributedCommand command) {
+    public void validate(DistributedCommand command) { validateCommand(command,true); }
+    private void validateCommand(DistributedCommand command,boolean active) { validateCommand(command,active,true); }
+    private void validateCommand(DistributedCommand command,boolean active,boolean logical) {
         if (command.sessionControl()!=null && !sessionControlsEnabled) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
-        requireActive();
+        if (active) requireActive();
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
                 || !Arrays.equals(schemaDigest, command.schemaDigest())) {
             throw new IllegalArgumentException("Wrong group, epoch or schema");
@@ -358,7 +370,95 @@ public final class ReplicatedRangeStore {
                 throw new IllegalArgumentException("Predicate outside owned column/interval");
             }
         }
-        if (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null) validateLogical(command);
+        if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command);
+    }
+
+    private byte[] preparedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x20).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
+    private void requirePreparation(PreparedParticipant.Preparation preparation,boolean material) {
+        var business=preparation.business(); validateCommand(business,false,material || logicalSchema!=null); validateSnapshotScope(preparation.scope());
+        if (!preparation.registration().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Prepared domain differs from range");
+        if (logicalSchema!=null && (!logicalSchema.clusterId().equals(preparation.registration().clusterId()) || !logicalSchema.databaseId().equals(preparation.registration().databaseId()))) throw new IllegalArgumentException("Prepared database differs from schema");
+    }
+    private PreparedIndex addPrepared(PreparedIndex index,PreparedParticipant value) {
+        var preparation=value.preparation();
+        for (var old:index.records()) {
+            if (old.preparation().transactionId().equals(preparation.transactionId()) || old.preparation().sharesOperation(preparation)) throw new IllegalArgumentException("Prepared transaction or operation identity reused");
+            if (old.preparation().scope().intersects(preparation.scope())) throw new IllegalStateException("Transaction overlaps durable prepared scope");
+        }
+        long bytes=index.bytes()+33L+value.encode().length, scope=index.scopeBytes()+RangeMutationHistory.accountedScopeBytes(preparation.scope());
+        if (index.records().size()>=MAX_PREPARED_PARTICIPANTS || bytes>MAX_PREPARED_BYTES || scope>MAX_PREPARED_BYTES) throw new IllegalStateException("Durable prepared capacity exhausted");
+        var records=new ArrayList<>(index.records()); records.add(value); return new PreparedIndex(List.copyOf(records),bytes,scope);
+    }
+    private PreparedIndex loadPreparedIndex() {
+        var index=PreparedIndex.empty();
+        try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x20).array());
+             var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x21).array());
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high);
+             var iterator=db.newIterator(state,options)) {
+            iterator.seekToFirst(); var sizing=new byte[0];
+            while (iterator.isValid()) {
+                if (iterator.key(sizing)!=33 || iterator.value(sizing)>16+PreparedParticipant.Preparation.MAX_BYTES) throw new IllegalStateException("Prepared record exceeds native recovery bounds");
+                byte[] key=iterator.key(); var value=PreparedParticipant.decode(iterator.value()); requirePreparation(value.preparation(),false);
+                if (!Arrays.equals(key,preparedKey(value.preparation().transactionId())) || applied==null || value.position().index()>applied.index() || value.position().term()>applied.term()) throw new IllegalStateException("Prepared record differs from completed cut");
+                index=addPrepared(index,value); iterator.next();
+            }
+            iterator.status(); return index;
+        } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover durable prepared scopes",failure); }
+    }
+    private void requireUnlocked(TransactionScope scope) {
+        for (var record:preparedIndex.records()) if (record.preparation().scope().intersects(scope)) throw new IllegalStateException("Access overlaps durable prepared transaction");
+    }
+    private void requireUnlocked(DistributedCommand command) {
+        for (var record:preparedIndex.records()) if (record.preparation().ownsOperation(command.operationId())) throw new IllegalArgumentException("Operation identity is owned by durable preparation");
+        if (command.acceptance()!=null) { requireUnlocked(command.acceptance().scope()); return; }
+        var spans=new ArrayList<TransactionScope.Span>();
+        for (var m:command.mutations()) spans.add(m.kind()==Mutation.Kind.DELETE_RANGE ? TransactionScope.Span.range(m.columnId(),m.key(),m.value()) : TransactionScope.Span.point(m.columnId(),m.key()));
+        for (var p:command.predicates()) spans.add(TransactionScope.Span.point(p.columnId(),p.key()));
+        if (!spans.isEmpty()) requireUnlocked(new TransactionScope(spans));
+    }
+    /** Only committed accepted preparations may enter. The adapter must retain its complete proposal reservation through this return. */
+    public PreparedParticipant applyPrepared(ApplyPosition position,PreparedParticipant.Preparation preparation) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(preparation); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage(); requirePreparation(preparation,true);
+            PreparedParticipant saved=null;
+            for (var old:preparedIndex.records()) if (old.preparation().transactionId().equals(preparation.transactionId())) {
+                if (!Arrays.equals(old.preparation().digest(),preparation.digest())) throw new IllegalArgumentException("Prepared transaction payload changed"); saved=old;
+            }
+            if (applied!=null && position.index()<=applied.index()) {
+                if (saved==null) throw new IllegalStateException("Completed prepare has no durable receipt"); return saved;
+            }
+            requireNext(position);
+            if (saved==null) {
+                var business=preparation.business(); var id=business.operationId(); long minimum=minimumSessionEpoch(null); long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
+                if (id.epoch()<minimum || id.sequence()<=floor || db.get(receipts,receiptKey(id))!=null || db.get(receipts,receiptKey(preparation.operation()))!=null
+                        || sessionDecision(business,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepared business/control identity is no longer eligible");
+            }
+            var value=saved==null ? new PreparedParticipant(preparation,position) : saved;
+            var next=saved==null ? addPrepared(preparedIndex,value) : preparedIndex;
+            if (saved==null && !Arrays.equals(evaluate(preparation.business()).result().encode(),preparation.business().acceptance().result())) throw new IllegalStateException("Prepared result disagrees with ordered native state");
+            // Canonical acceptance was certified before append; replicas do not consult volatile history or expose effects.
+            var history=prepareScopedWrites(false,List.of(),Map.of());
+            try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if (saved==null) batch.put(state,preparedKey(preparation.transactionId()),value.encode());
+                batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            preparedIndex=next; publishScoped(position,history,false); applied=position; return value;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    /** Barrier/query ownership is supplied by the adapter; this record survives prepare-receipt/session GC. */
+    public PreparedParticipant preparedParticipant(UUID transaction) {
+        enterNative(); applyLane.lock();
+        try { requireActive(); return preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(transaction)).findFirst().orElse(null); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    public int preparedParticipantCount() { return preparedIndex.records().size(); }
+    public long preparedParticipantBytes() { return preparedIndex.bytes(); }
+    /** Fresh user reads must reject unresolved prepared scopes; administrative capture remains available for export/recovery. */
+    public ScopedSnapshot captureReadable(TransactionScope scope) throws RocksDBException {
+        Objects.requireNonNull(scope); enterNative(); applyLane.lock();
+        try { requireActive(); validateSnapshotScope(scope); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
+        finally { applyLane.unlock(); leaveNative(); }
     }
 
     /** Evaluates autocommit return values in committed order, preserving native merge operands. */
@@ -421,6 +521,7 @@ public final class ReplicatedRangeStore {
                 return original;
             }
             requireNext(position);
+            if (saved==null) requireUnlocked(command);
             if (saved==null && command.acceptance()!=null && (command.acceptance().snapshot().index()>=position.index()
                     || command.acceptance().snapshot().term()!=position.term())) throw new IllegalArgumentException("Accepted transaction does not follow its audited leadership cut");
             var authority=saved==null ? sessionAuthority() : null;
@@ -945,7 +1046,7 @@ public final class ReplicatedRangeStore {
     public ScopedHistoryPin captureTracked(TransactionScope scope) throws RocksDBException {
         Objects.requireNonNull(scope); enterNative(); applyLane.lock(); ScopedSnapshot snapshot=null; RangeMutationHistory.Pin registration=null;
         try {
-            requireActive(); validateSnapshotScope(scope); ensureReceiptUsage();
+            requireActive(); validateSnapshotScope(scope); ensureReceiptUsage(); requireUnlocked(scope);
             if (scopedHistory==null) throw new UnsupportedOperationException("Scoped mutation history is not enabled");
             if (applied==null || applied.term()==0) throw new IllegalStateException("Tracked snapshot requires a positive completed term");
             scopedHistory.checkOpenCapacity(scope); long scopeBytes=RangeMutationHistory.accountedScopeBytes(scope);
@@ -974,6 +1075,7 @@ public final class ReplicatedRangeStore {
         enterNative(); applyLane.lock();
         try {
             requireActive();
+            requireUnlocked(pin.scope());
             if (pin.validateUnderLane()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot failed serializable validation: "+pin.status());
             var id=command.operationId(); long minimum=minimumSessionEpoch(null);
             long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
@@ -1634,6 +1736,7 @@ public final class ReplicatedRangeStore {
                 decodeReceipt(saved, command.receiptDigest());
                 return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
             }
+            requireUnlocked(command);
             var authority=sessionAuthority();
             if (requireSessionAuthority && command.sessionControl()==null && command.minimumSessionEpoch()<0 && authority==null) {
                 throw new IllegalStateException("Replicated session authority has not been initialized");

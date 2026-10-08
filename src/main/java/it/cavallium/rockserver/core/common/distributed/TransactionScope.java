@@ -85,6 +85,17 @@ public final class TransactionScope {
         return covered && upperExclusive != null && cursor != null && Arrays.compareUnsigned(cursor, upperExclusive) >= 0;
     }
 
+    /** Complete physical lock overlap, including absence points and half-open intervals. */
+    public boolean intersects(TransactionScope other) {
+        Objects.requireNonNull(other);
+        for (var a:spans) for (var b:other.spans) {
+            if (!a.columnId.equals(b.columnId)) continue;
+            if (a.point ? b.contains(a.lower) : b.point ? a.contains(b.lower)
+                    : (a.upper==null || b.lower==null || Arrays.compareUnsigned(b.lower,a.upper)<0)
+                    && (b.upper==null || a.lower==null || Arrays.compareUnsigned(a.lower,b.upper)<0)) return true;
+        }
+        return false;
+    }
     /** Validate the entire declaration and participant budget before any native snapshot acquisition. */
     public List<RangeDescriptor> participants(RangeDirectory directory, int maximumParticipants) {
         Objects.requireNonNull(directory);

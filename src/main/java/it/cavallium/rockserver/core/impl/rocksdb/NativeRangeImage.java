@@ -1,6 +1,9 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
+import it.cavallium.rockserver.core.common.distributed.RangeMutationHistory;
+import it.cavallium.rockserver.core.common.distributed.Mutation;
 import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
 import it.cavallium.rockserver.core.common.distributed.SessionAuthority;
 import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
@@ -315,6 +318,8 @@ public final class NativeRangeImage {
         private boolean usagePresent;
         private SessionAuthority sessionAuthority;
         private int sessionBindings;
+        private final List<PreparedParticipant> prepared=new ArrayList<>();
+        private long preparedBytes,preparedScopeBytes;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
 
         Rows(Header header, Limits limits) {
@@ -359,6 +364,25 @@ public final class NativeRangeImage {
                     } catch (IllegalArgumentException invalid) {
                         throw new IOException("Invalid image range session control", invalid);
                     }
+                }
+                if (section==Section.STATE && key.length>16 && key[16]==0x20) {
+                    try {
+                        var record=PreparedParticipant.decode(value); var preparation=record.preparation(); var plan=preparation.business(); var scope=preparation.scope();
+                        byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x20).putLong(preparation.transactionId().getMostSignificantBits()).putLong(preparation.transactionId().getLeastSignificantBits()).array();
+                        if (!Arrays.equals(key,expected) || !plan.groupId().equals(header.owner().groupId()) || plan.rangeEpoch()!=header.owner().epoch()
+                                || !Arrays.equals(plan.schemaDigest(),header.schema()) || !preparation.registration().domainId().equals(header.interval().domainId())
+                                || record.position().index()>header.position().index() || record.position().term()>header.position().term()) throw new IOException("Prepared image identity/cut differs");
+                        for (var span:scope.spans()) {
+                            byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
+                            if (!header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)
+                                    || upper!=null && (span.isPoint() ? Arrays.compareUnsigned(lo,upper)>=0 : hi==null || Arrays.compareUnsigned(hi,upper)>0)) throw new IOException("Prepared image scope crosses ownership");
+                        }
+                        for (var mutation:plan.mutations()) if (mutation.kind()==Mutation.Kind.MERGE && !header.mergeColumns().contains(mutation.columnId())) throw new IOException("Prepared image merge operator is unavailable");
+                        for (var old:prepared) if (old.preparation().sharesOperation(preparation) || old.preparation().scope().intersects(scope)) throw new IOException("Prepared image identities/scopes overlap");
+                        preparedBytes+=key.length+(long)value.length; preparedScopeBytes+=RangeMutationHistory.accountedScopeBytes(scope);
+                        if (prepared.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES || preparedScopeBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Prepared image capacity exceeded");
+                        prepared.add(record);
+                    } catch (IllegalArgumentException invalid) { throw new IOException("Invalid prepared image record",invalid); }
                 }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
                     throw new IOException("Image contains unsupported receipt accounting metadata");
