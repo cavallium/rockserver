@@ -15,12 +15,12 @@ class ScopedTransactionRpcTest {
 
     @Test void framedKindsAreExplicitAndBodiesAreOwned() {
         for (int kind : new int[]{ScopedTransactionRpc.POINT, ScopedTransactionRpc.STATE, ScopedTransactionRpc.OPEN,
-                ScopedTransactionRpc.GET, ScopedTransactionRpc.PAGE, ScopedTransactionRpc.PLAN, ScopedTransactionRpc.CLOSE, ScopedTransactionRpc.STAGE}) {
+                ScopedTransactionRpc.GET, ScopedTransactionRpc.PAGE, ScopedTransactionRpc.PLAN, ScopedTransactionRpc.CLOSE, ScopedTransactionRpc.STAGE, ScopedTransactionRpc.PARTICIPANT_STATE, ScopedTransactionRpc.PARTICIPANT_OUTCOME}) {
             byte[] body = {1, 2, 3};
             var packet = new ScopedTransactionRpc.Packet(kind, body); body[0] = 9;
             assertArrayEquals(new byte[]{1, 2, 3}, packet.body()); packet.body()[0] = 9;
             byte[] frame = ScopedTransactionRpc.frame(kind, packet.body());
-            var decoded = ScopedTransactionRpc.parse(frame, ScopedTransactionRpc.MAX_REQUEST_BYTES); frame[16] = 9;
+            var decoded = ScopedTransactionRpc.parse(frame, ScopedTransactionRpc.MAX_REQUEST_BYTES); frame[ScopedTransactionRpc.HEADER_BYTES] = 9;
             assertEquals(kind, decoded.kind()); assertArrayEquals(new byte[]{1, 2, 3}, decoded.body());
             decoded.body()[0] = 9; assertEquals(1, decoded.body()[0]);
         }
@@ -32,7 +32,7 @@ class ScopedTransactionRpcTest {
             byte[] truncated = Arrays.copyOf(valid, length);
             assertThrows(IllegalArgumentException.class, () -> ScopedTransactionRpc.parse(truncated, ScopedTransactionRpc.MAX_REQUEST_BYTES));
         }
-        for (int offset : new int[]{0, 4, 8, 12}) {
+        for (int offset : new int[]{0, 4, 8}) {
             byte[] bad = valid.clone(); ByteBuffer.wrap(bad).putInt(offset, -1);
             assertThrows(IllegalArgumentException.class, () -> ScopedTransactionRpc.parse(bad, ScopedTransactionRpc.MAX_REQUEST_BYTES));
         }

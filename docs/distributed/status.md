@@ -169,7 +169,7 @@ does not establish complete distributed API parity or production acceptance.
   coexist; recovery/image validation require the retained matching plan and disjoint
   operation identities. Finalized plans may overlap new active scopes regardless of
   UUID order. This seam still requires a Raft FINALIZE envelope/admission path and
-  frontend outcome queries; it is not complete distributed transaction acceptance.
+  coordinator integration; it is not complete distributed transaction acceptance.
 - Transaction-home and preparation records use one current encoding without format
   release markers or compatibility readers.
 - The Raft participant PREPARE path reserves both control/business identities, durable
@@ -183,8 +183,18 @@ does not establish complete distributed API parity or production acceptance.
   A fresh linearizable participant-state query survives response loss and control-session
   receipt GC. The routed client freezes exact bytes and the original descriptor for
   retry, but callers must durably retain them; a multi-group coordinator journal is
-  still missing. Raft FINALIZE admission and a public independently
-  queryable aborted-state response remain unfinished.
+  still missing. Raft FINALIZE admission and coordinator integration remain unfinished.
+- Fresh terminal-outcome queries return one native cut containing the immutable
+  COMMIT/ABORT binding, first finalization position, optional original prepare vote,
+  and COMMIT-only retained business result. ABORT-before-PREPARE initially has no
+  vote; after a late rejected PREPARE it reports the durable negative vote. Prepared
+  evidence remains positive after PREPARE-first ABORT. Both business and recovery
+  grants may expire without disabling this lookup. Non-linearizable and stale query
+  paths reject it. Routed replies are checked against the captured transaction,
+  range/group/epoch, schema, cluster/database and domain; malformed and trailing data
+  fail. Outcome bytes are bounded by one 2 MiB result plus at most 8,043 bytes of
+  decision/vote/framing data. The current generic query frame is twelve bytes:
+  magic, operation kind and body length, with no format release marker or legacy reader.
 - Durable grant issuance, logical-session handoff, bounded user/maintenance windows,
   catalogue clocks/propagation, immutable schema publication and static node plans
   have local recovery fixtures. The owned node launcher checks established storage,
@@ -311,6 +321,17 @@ rejected by export and activation. Independent read-only review found no concret
 issue at this native boundary. This gate does not establish Raft FINALIZE admission,
 coordinator recovery, a complete multi-group transaction or quorum behavior.
 
+The terminal-outcome/current-query-frame regression gate passed 55 core and 89
+adapter cases (144 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-participant-outcome-regression.log`. The preceding focused gate
+passed 17 core and 23 adapter cases (40 total): `/tmp/rockserver-participant-outcome.log`.
+New checks cover terminal/vote/result shape and codec bounds, COMMIT and both ABORT
+orders, lost negative replies, fresh-only lookup, business/control/recovery grant
+expiry, snapshot/reinitialize, captured route/transaction checks and malformed replies.
+Independent read-only review found no concrete issue at this query boundary. Finalize
+writes still enter through trusted native seams in these fixtures; this gate does not
+establish Raft FINALIZE admission or a complete coordinator workflow.
+
 The exercised native preparation cases cover unchanged user values, complete read/
 absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
 planning/admission rejection, stable duplicate prepare positions, separate ordinary
@@ -363,8 +384,7 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Raft FINALIZE envelope/admission and public durable abort/final
-  outcome queries; protected status-group
+- Raft FINALIZE envelope/admission; protected status-group
   node/pool activation, durable coordinator journaling, full 2PC recovery and consistent
   multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
   establish these.

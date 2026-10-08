@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.common.distributed.ParticipantFinalization;
 import it.cavallium.rockserver.core.common.distributed.ParticipantVote;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.CommittedParticipant;
+import it.cavallium.rockserver.core.common.distributed.ParticipantOutcome;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
 import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
@@ -448,6 +449,18 @@ public final class ReplicatedRangeStore {
         finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
     public CommittedParticipant committedParticipant(UUID transaction) { enterNative(); applyLane.lock(); try { requireActive(); return committedIndex.get(transaction); } finally { applyLane.unlock(); leaveNative(); } }
+    /** One completed native cut; the adapter supplies a fresh linearizable barrier and owner check. */
+    public ParticipantOutcome finalizedParticipant(UUID transaction) {
+        Objects.requireNonNull(transaction); enterNative(); applyLane.lock();
+        try {
+            requireActive(); var commit=committedIndex.get(transaction); var abort=abortedIndex.get(transaction);
+            if (commit==null && abort==null) return null;
+            var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(transaction)).findFirst().orElse(null);
+            if (commit!=null) return new ParticipantOutcome(commit.finalization(),commit.position(),ParticipantVote.prepared(Objects.requireNonNull(prepared,"COMMIT preparation missing").position()),commit.result(prepared));
+            var vote=prepared!=null ? ParticipantVote.prepared(prepared.position()) : abort.negative()!=null ? ParticipantVote.negative() : null;
+            return new ParticipantOutcome(abort.finalization(),abort.position(),vote,null);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     /** Retained business result is independent of ordinary receipt/session GC. */
     public byte[] committedResult(UUID transaction,byte[] acceptedPlanDigest) {
         enterNative(); applyLane.lock();

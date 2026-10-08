@@ -12,8 +12,8 @@ import java.util.UUID;
 
 /** The current bounded query protocol for data and catalogue groups. */
 public final class ScopedTransactionRpc {
-    public static final int MAGIC = 0x52535458, VERSION = 1, HEADER_BYTES = 16, HANDLE_BYTES = 56;
-    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20;
+    public static final int MAGIC = 0x52535458, HEADER_BYTES = 12, HANDLE_BYTES = 56;
+    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21;
     // A legal physical page continuation can exceed an atomic command's 2 MiB bound.
     public static final int MAX_REQUEST_BYTES = PhysicalRangePage.MAX_BYTES + 128;
     public static final int MAX_REPLY_BYTES = PhysicalRangePage.MAX_BYTES + 128;
@@ -55,7 +55,7 @@ public final class ScopedTransactionRpc {
     public static byte[] frame(int kind, byte[] body) {
         requireKind(kind); Objects.requireNonNull(body);
         if (body.length > MAX_REPLY_BYTES - HEADER_BYTES) throw invalid("Frame body exceeds budget");
-        return ByteBuffer.allocate(HEADER_BYTES + body.length).putInt(MAGIC).putInt(VERSION)
+        return ByteBuffer.allocate(HEADER_BYTES + body.length).putInt(MAGIC)
                 .putInt(kind).putInt(body.length).put(body).array();
     }
 
@@ -66,7 +66,7 @@ public final class ScopedTransactionRpc {
         }
         var input = ByteBuffer.wrap(encoded);
         require(input, HEADER_BYTES);
-        if (input.getInt() != MAGIC || input.getInt() != VERSION) throw invalid("Unsupported read frame");
+        if (input.getInt() != MAGIC) throw invalid("Unsupported read frame");
         int kind = input.getInt(), length = input.getInt();
         requireKind(kind);
         if (length < 0 || length != input.remaining()) throw invalid("Invalid frame body length");
@@ -218,7 +218,7 @@ public final class ScopedTransactionRpc {
         return Arrays.compareUnsigned(left, right);
     }
     private static void requireKind(int kind) {
-        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE) {
+        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME) {
             throw invalid("Unknown read frame kind");
         }
     }

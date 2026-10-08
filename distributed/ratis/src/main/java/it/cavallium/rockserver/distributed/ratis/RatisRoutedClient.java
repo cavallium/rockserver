@@ -91,6 +91,19 @@ public final class RatisRoutedClient implements AutoCloseable {
             prepareParticipant(record.preparation()); return record;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid prepared state reply",malformed); }
     }
+    /** Fresh terminal result lookup does not depend on either business or recovery grant eligibility. */
+    public ParticipantOutcome finalizedParticipant(UUID group,UUID transactionId) throws IOException {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
+        var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,transactionId);
+        try {
+            var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.PARTICIPANT_OUTCOME,body.array(),true));
+            byte[] bytes=ScopedTransactionRpc.blob(input,ParticipantOutcome.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing participant outcome");
+            if (bytes==null) return null; var outcome=ParticipantOutcome.decode(bytes); var decision=outcome.finalization().decision(); var participant=outcome.finalization().participant();
+            if (!decision.transactionId().equals(transactionId) || !participant.groupId().equals(group) || !participant.rangeId().equals(descriptor.rangeId()) || participant.rangeEpoch()!=descriptor.rangeEpoch()
+                    || !Arrays.equals(participant.schemaDigest(),observed.schemaDigest()) || !decision.clusterId().equals(observed.clusterId()) || !decision.databaseId().equals(observed.databaseId()) || !decision.domainId().equals(observed.domainId())) throw new IllegalArgumentException("Participant outcome route/identity changed");
+            return outcome;
+        } catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant outcome reply",invalid); }
+    }
     private final RangeDirectory identity;
     private final Transport transport;
     private RangeDirectory directory;

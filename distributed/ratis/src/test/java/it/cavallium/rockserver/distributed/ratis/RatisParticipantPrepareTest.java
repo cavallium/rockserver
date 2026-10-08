@@ -143,6 +143,57 @@ class RatisParticipantPrepareTest {
             assertThrows(ExecutionException.class,() -> pending.get(5,TimeUnit.SECONDS)); released(data);
         }
     }
+    @Test void freshTerminalQueriesRecoverCommitAndBothAbortOrdersAfterAllOriginalGrantsExpire() throws Exception {
+        for (int mode=0;mode<3;mode++) try (var home=new Node("outcome-home-"+mode,true); var data=new Node("outcome-data-"+mode,false); var pin=data.f.store.captureTracked(scope(data,1,4))) {
+            var business=data.f.put(2); var registration=register(home,data,pin,business,0);
+            assertNull(data.routed.finalizedParticipant(data.f.groupId,registration.transactionId()));
+            try (var plan=data.f.machine.prepareParticipant(pin,business,control(0),home.statuses,registration.transactionId())) {
+                var operation=data.routed.prepareParticipant(plan.preparation()); var status=registration;
+                if (mode!=2) {
+                    var vote=data.routed.executeParticipant(operation); assertTrue(vote.prepared());
+                    if (mode==0) { status=registration.prepared(data.f.groupId,plan.preparation().business().payloadDigest(),vote.position()); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,1),registration,status)); }
+                }
+                var decision=status.decide(mode==0 ? TransactionStatus.Phase.COMMIT : TransactionStatus.Phase.ABORT);
+                home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,2),status,decision));
+                var finalization=home.statuses.readFinalization(registration.transactionId(),data.f.groupId,new OperationId(new UUID(0,778),3,0));
+                var finalPosition=new ApplyPosition(1,++data.wire.index);
+                if (mode==0) data.f.store.applyCommit(finalPosition,finalization); else data.f.store.applyAbort(finalPosition,finalization);
+                var outcome=data.routed.finalizedParticipant(data.f.groupId,registration.transactionId()); assertEquals(finalization,outcome.finalization()); assertEquals(finalPosition,outcome.position());
+                if (mode==0) { assertArrayEquals(plan.preparation().business().acceptance().result(),outcome.result()); assertArrayEquals(new byte[]{7},data.routed.read(data.f.column,new byte[]{2})); }
+                else { assertNull(outcome.result()); assertNull(data.routed.read(data.f.column,new byte[]{2})); }
+                if (mode==2) {
+                    assertNull(outcome.vote()); data.wire.lose=true; assertThrows(IOException.class,() -> data.routed.executeParticipant(operation));
+                    assertEquals(ParticipantVote.negative(),data.routed.executeParticipant(operation)); outcome=data.routed.finalizedParticipant(data.f.groupId,registration.transactionId()); assertEquals(ParticipantVote.negative(),outcome.vote());
+                } else assertTrue(outcome.vote().prepared());
+                var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,registration.transactionId()); var query=ScopedTransactionRpc.frame(ScopedTransactionRpc.PARTICIPANT_OUTCOME,body.array());
+                assertThrows(IOException.class,() -> data.wire.transaction(operation.descriptor(),query,false));
+                assertThrows(ExecutionException.class,() -> data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(query)),0).get(5,TimeUnit.SECONDS));
+                var floor=DistributedCommand.advanceSessionEpochFloor(data.f.groupId,1,new byte[32],new OperationId(data.f.admin,4,0),4); data.wire.command(operation.descriptor(),floor);
+                assertThrows(IOException.class,() -> data.routed.executeParticipant(operation)); assertEquals(outcome,data.routed.finalizedParticipant(data.f.groupId,registration.transactionId()));
+                data.f.machine.takeSnapshot(); data.f.machine.pause(); data.f.machine.reinitialize(); assertEquals(outcome,data.routed.finalizedParticipant(data.f.groupId,registration.transactionId())); released(data);
+            }
+        }
+    }
+    @Test void routedTerminalQueriesRejectWrongTransactionAndTrailingReplyData() throws Exception {
+        try (var home=new Node("invalid-home",true); var data=new Node("invalid-data",false); var pin=data.f.store.captureTracked(scope(data,1,4))) {
+            var business=data.f.put(2); var registration=register(home,data,pin,business,0); var decision=registration.decide(TransactionStatus.Phase.ABORT);
+            home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,1),registration,decision));
+            var finalization=home.statuses.readFinalization(registration.transactionId(),data.f.groupId,new OperationId(new UUID(0,779),2,0)); data.f.store.applyAbort(new ApplyPosition(1,1),finalization); data.wire.index=1;
+            var outcome=data.f.store.finalizedParticipant(registration.transactionId()); var trailing=new java.util.concurrent.atomic.AtomicBoolean();
+            var transport=new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return data.wire.read(route,column,key); }
+                public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return data.wire.command(route,command); }
+                public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) {
+                    byte[] bytes=outcome.encode(); var output=ByteBuffer.allocate(4+bytes.length+(trailing.get() ? 1 : 0)); ScopedTransactionRpc.putBlob(output,bytes);
+                    return ScopedTransactionRpc.frame(ScopedTransactionRpc.PARTICIPANT_OUTCOME,output.array());
+                }
+            };
+            try (var routed=new RatisRoutedClient(data.directory,transport)) {
+                assertThrows(IOException.class,() -> routed.finalizedParticipant(data.f.groupId,new UUID(0,999))); trailing.set(true);
+                assertThrows(IOException.class,() -> routed.finalizedParticipant(data.f.groupId,registration.transactionId()));
+            }
+        }
+    }
     @Test void prepareVoteCodecDistinguishesNegativeVotesFromMalformedOrTransientOutcomes() {
         assertEquals(ParticipantVote.negative(),RatisParticipantRecord.result(RatisParticipantRecord.result(ParticipantVote.negative())));
         assertEquals(ParticipantVote.prepared(new ApplyPosition(1,1)),RatisParticipantRecord.result(RatisParticipantRecord.result(new ApplyPosition(1,1))));

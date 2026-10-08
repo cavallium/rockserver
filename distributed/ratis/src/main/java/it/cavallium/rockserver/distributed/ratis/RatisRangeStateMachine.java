@@ -1229,6 +1229,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var id=ScopedTransactionRpc.uuid(input); end(input); checkTransactionOwner(); var record=store.preparedParticipant(id);
                 byte[] bytes=record==null ? null : record.encode(); var output=ByteBuffer.allocate(4+(bytes==null ? 0 : bytes.length)); ScopedTransactionRpc.putBlob(output,bytes); reply=output.array();
             }
+            case ScopedTransactionRpc.PARTICIPANT_OUTCOME -> {
+                if (!freshBarrier) throw new IOException("Participant outcome requires a fresh linearizable barrier");
+                var id=ScopedTransactionRpc.uuid(input); end(input); checkTransactionOwner(); var outcome=store.finalizedParticipant(id);
+                byte[] bytes=outcome==null ? null : outcome.encode(); var output=ByteBuffer.allocate(4+(bytes==null ? 0 : bytes.length)); ScopedTransactionRpc.putBlob(output,bytes); reply=output.array();
+            }
             case ScopedTransactionRpc.CLOSE -> { var handle=ScopedTransactionRpc.readHandle(input); end(input); scopedTransactions.release(handle); reply=new byte[0]; }
             default -> throw new IllegalArgumentException("Unsupported framed query");
         }
