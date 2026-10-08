@@ -111,11 +111,13 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
     private Step decide(RatisDurableTransaction.Snapshot snapshot,TransactionStatus.Phase decision) throws IOException {
         var home=snapshot.observedHome();
         if (home==null || home.phase()!=TransactionStatus.Phase.PREPARING) throw new IOException("Home changed before decision");
-        journal.queueHome(homes.prepare(nextControl(snapshot),home,home.decide(decision))); journal.executeHome();
+        if (decision==TransactionStatus.Phase.ABORT) journal.queueRecovery(home.decide(decision));
+        else journal.queueHome(homes.prepare(nextControl(snapshot),home,home.decide(decision)));
+        journal.executeHome();
         return result(decision==TransactionStatus.Phase.COMMIT ? Action.COMMIT_ATTEMPTED : Action.ABORT_ATTEMPTED,null);
     }
     private OperationId nextControl(RatisDurableTransaction.Snapshot snapshot) throws IOException {
-        return Objects.requireNonNull(controls.nextAfter(snapshot.pendingHome().command().operationId()),"Missing coordinator operation identity");
+        return Objects.requireNonNull(controls.nextAfter(snapshot.lastHome()),"Missing coordinator operation identity");
     }
     private Step result(Action action,UUID group) throws IOException {
         var snapshot=journal.snapshot();

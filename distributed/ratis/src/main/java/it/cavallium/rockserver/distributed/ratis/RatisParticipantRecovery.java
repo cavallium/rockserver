@@ -50,7 +50,7 @@ public final class RatisParticipantRecovery implements AutoCloseable {
         return result(Action.COMPLETE);
     }
     private Step transition(RatisDurableParticipantRecovery.Snapshot snapshot,TransactionStatus next,Action action) throws IOException {
-        journal.queueHome(homes.prepare(Objects.requireNonNull(controls.nextAfter(snapshot.lastHome())),snapshot.observedHome(),next)); journal.executeHome(); return result(action);
+        journal.queueRecovery(next); journal.executeHome(); return result(action);
     }
     private Step result(Action action) throws IOException {
         var snapshot=journal.snapshot(); var home=snapshot.observedHome(); UUID group=snapshot.participantRoute().groupId();

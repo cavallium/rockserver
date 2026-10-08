@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class RatisParticipantPrepareTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final UUID cluster=new UUID(0,1),database=new UUID(0,2),controlSession=new UUID(0,3);
+    final Map<UUID,Node> nodes=new ConcurrentHashMap<>();
     OperationId control(long n) { return new OperationId(controlSession,1,n); }
     final class Node implements AutoCloseable {
         final RatisRetentionAdmissionTest.Fixture f; final Wire wire; final RangeDirectory directory; final RatisRoutedClient routed; final RatisTransactionStatuses statuses;
@@ -26,14 +27,26 @@ class RatisParticipantPrepareTest {
         Node(String name,boolean home,RangeOwnership.Interval interval) throws Exception { this(name,home,interval,null,System::nanoTime); }
         Node(String name,boolean home,RangeOwnership.Interval interval,RatisSnapshotFences snapshotHomes,java.util.function.LongSupplier nanos) throws Exception {
             var validator=new java.util.concurrent.atomic.AtomicReference<Consumer<DistributedCommand>>(command -> {});
-            f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validator.get().accept(command),nanos,interval,machine -> { if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes); });
+            var ownedInterval=home && interval==null ? new RangeOwnership.Interval(UUID.randomUUID(),Set.of(UUID.randomUUID()),null,null) : interval;
+            f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validator.get().accept(command),nanos,ownedInterval,machine -> {
+                if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes);
+                if (home) {
+                    machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(cluster,database,key,value));
+                    machine.homeRecoveryReservations(cluster,database,ownedInterval.columns().iterator().next());
+                    machine.homeRecoveryProofs(recovery -> {
+                        var node=nodes.get(recovery.proof().participant());
+                        if (node==null) throw new IOException("Unconfigured controlled DATA proof group");
+                        return node.routed.finalizedParticipant(recovery.proof().participant(),recovery.before().transactionId());
+                    });
+                }
+            });
             var replica=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"fixture","127.0.0.1:12345",ReplicaDescriptor.Role.VOTER);
             var range=new RangeDescriptor(f.groupId,f.groupId,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
             directory=new RangeDirectory(cluster,database,f.store.ownership().interval().domainId(),1,new byte[32],0,Set.of(f.column),0,List.of(range));
-            wire=new Wire(f); routed=new RatisRoutedClient(directory,wire); statuses=new RatisTransactionStatuses(routed,f.column);
+            nodes.put(f.groupId,this); wire=new Wire(f); routed=new RatisRoutedClient(directory,wire); statuses=new RatisTransactionStatuses(routed,f.column);
             if (home) validator.set(RatisTransactionStatuses.validator(cluster,database,f.groupId,1,new byte[32],f.column));
         }
-        @Override public void close() throws Exception { routed.close(); f.close(); }
+        @Override public void close() throws Exception { nodes.remove(f.groupId,this); routed.close(); f.close(); }
     }
     static final class Wire implements RatisRoutedClient.Transport {
         final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Runnable afterRead;

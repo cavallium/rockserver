@@ -46,6 +46,32 @@ class RatisParticipantRecoveryTest {
             }
         }
     }
+    @Test void protectedLocalAckRetainsExactReceiptAcrossReopenWithoutOrdinaryGrant() throws Exception {
+        Path path=root.resolve("typed-local-ack.journal");
+        try (var f=fixture("typed-local-ack")) {
+            f.committedTransactionWithRightStillPrepared(); RatisRoutedClient.PreparedHomeRecoveryOperation frozen; HomeRecoveryReceipt nativeReceipt;
+            try (var journal=create(path,f,helper.tx); var recovery=new RatisParticipantRecovery(journal,f.transactions.statuses,f.data,last -> { throw new AssertionError("Local recovery must not allocate ordinary HOME controls"); },(group,tx,control) -> {
+                try { var proposal=f.node(group).f.machine.prepareFinalization(f.transactions.statuses,tx,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
+                catch (Exception failure) { throw new IOException(failure); }
+            },false)) {
+                assertEquals(RatisParticipantRecovery.Action.FINALIZED,recovery.step().action());
+                var ordinary=journal.snapshot().lastHome();
+                f.transactions.wire.command(f.transactions.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(f.transactions.f.groupId,1,new byte[32],new OperationId(f.transactions.f.admin,2,0),2));
+                f.transactions.wire.lose=true; assertThrows(IOException.class,recovery::step); frozen=journal.snapshot().pendingRecovery();
+                assertEquals(0,frozen.recovery().operation().epoch()); assertEquals(ordinary,journal.snapshot().lastHome()); assertNull(journal.snapshot().recoveryReceipt());
+                nativeReceipt=f.transactions.statuses.recoveryResult(frozen); assertNotNull(nativeReceipt);
+            }
+            try (var journal=RatisDurableParticipantRecovery.reopen(path,f.transactions.statuses,f.data)) {
+                assertArrayEquals(frozen.bytes(),journal.snapshot().pendingRecovery().bytes()); assertEquals(frozen.descriptor(),journal.snapshot().pendingRecovery().descriptor());
+                assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status()); assertEquals(nativeReceipt,journal.snapshot().recoveryReceipt());
+                long writes=f.writes(); journal.executeHome(); assertEquals(writes,f.writes());
+            }
+            try (var journal=RatisDurableParticipantRecovery.reopen(path,f.transactions.statuses,f.data); var recovery=recovery(journal,f,false)) {
+                assertEquals(nativeReceipt,journal.snapshot().recoveryReceipt()); assertTrue(recovery.step().complete()); assertFalse(journal.snapshot().observedHome().consumed());
+            }
+        }
+    }
+
     @Test void lostLocalAckReplyReopensAndCompletesFromFreshHomeEvidence() throws Exception {
         Path path=root.resolve("ack.journal");
         try (var f=fixture("local-ack")) {
@@ -223,10 +249,9 @@ class RatisParticipantRecoveryTest {
                 var forged=new PreparedParticipant(prepared.preparation(),new ApplyPosition(prepared.position().term(),prepared.position().index()+1));
                 assertThrows(IOException.class,() -> RatisDurableParticipantRecovery.create(root.resolve("forged.journal"),f.transactions.statuses,f.data,forged,f.directory.ranges().getLast(),helper.control(40),helper.control(41)));
                 assertThrows(IOException.class,() -> RatisDurableParticipantRecovery.reopen(path,f.transactions.statuses,f.data));
-                assertThrows(IllegalArgumentException.class,() -> journal.queueHome(f.transactions.statuses.prepare(helper.control(42),home,home.finalized(f.right.f.groupId))));
+                assertThrows(IllegalArgumentException.class,() -> journal.queueRecovery(home.finalized(f.right.f.groupId)));
                 f.finalize(f.right,helper.control(7)); assertNotNull(journal.resolveParticipant());
-                assertThrows(IllegalArgumentException.class,() -> journal.queueHome(f.transactions.statuses.prepare(helper.control(42),home,home.finalized(f.left.f.groupId))));
-                assertThrows(IllegalArgumentException.class,() -> journal.queueHome(f.transactions.statuses.prepare(helper.control(41),home,home.finalized(f.right.f.groupId))));
+                assertThrows(IllegalArgumentException.class,() -> journal.queueRecovery(home.finalized(f.left.f.groupId)));
             }
         }
     }

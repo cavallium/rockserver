@@ -199,6 +199,75 @@ public final class RatisRoutedClient implements AutoCloseable {
             return record;
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot gate state reply",malformed); }
     }
+    public static final class PreparedHomeRecoveryOperation {
+        private final RangeDirectory source;
+        private final RangeDescriptor descriptor;
+        private final HomeRecovery recovery;
+        private final byte[] bytes;
+        private PreparedHomeRecoveryOperation(RangeDirectory source,RangeDescriptor descriptor,HomeRecovery recovery) {
+            this.source=source; this.descriptor=descriptor; this.recovery=recovery; bytes=recovery.encode();
+        }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public HomeRecovery recovery() { return recovery; }
+        PreparedCommand command() { return new PreparedCommand(source,descriptor,recovery.command()); }
+        public byte[] bytes() { return bytes.clone(); }
+    }
+    /** Freeze this request and its original HOME route durably before preparation or append RPCs. */
+    public PreparedHomeRecoveryOperation prepareHomeRecovery(HomeRecovery recovery) {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(recovery.command().groupId())).findFirst().orElseThrow(() -> new IllegalArgumentException("HOME recovery route absent"));
+        return restoreHomeRecovery(recovery,descriptor);
+    }
+    public PreparedHomeRecoveryOperation restoreHomeRecovery(HomeRecovery recovery,RangeDescriptor descriptor) {
+        Objects.requireNonNull(recovery); var observed=current();
+        if (!observed.clusterId().equals(recovery.before().clusterId()) || !observed.databaseId().equals(recovery.before().databaseId())) throw new IllegalArgumentException("HOME recovery database changed");
+        restoreSessionCommand(recovery.command(),descriptor);
+        return new PreparedHomeRecoveryOperation(identity,descriptor,recovery);
+    }
+    public void authorizeHomeRecovery(PreparedHomeRecoveryOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try { authorizeHomeRecoveryCall(operation); } finally { endCall(); }
+    }
+    private HomeRecoveryReceipt authorizeHomeRecoveryCall(PreparedHomeRecoveryOperation operation) throws IOException {
+        try {
+            var input=ByteBuffer.wrap(transactionReply(operation.descriptor,ScopedTransactionRpc.HOME_RECOVERY_PREPARE,operation.bytes,true));
+            byte[] digest=ScopedTransactionRpc.blob(input,32,false),receipt=ScopedTransactionRpc.blob(input,HomeRecoveryReceipt.MAX_BYTES,true);
+            if (!Arrays.equals(digest,operation.recovery.digest()) || input.hasRemaining()) throw new IllegalArgumentException("HOME recovery preparation changed its frozen request");
+            return receipt==null ? null : homeReceipt(operation,receipt);
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid HOME recovery preparation reply",malformed); }
+    }
+    public HomeRecoveryReceipt executeHomeRecovery(PreparedHomeRecoveryOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            var retained=authorizeHomeRecoveryCall(operation);
+            return retained==null ? homeReceipt(operation,transport.participant(operation.descriptor,operation.bytes)) : retained;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid HOME recovery applied receipt",malformed); }
+        finally { endCall(); }
+    }
+    public HomeRecoveryReceipt homeRecoveryResult(PreparedHomeRecoveryOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            var input=ByteBuffer.wrap(transactionReply(operation.descriptor,ScopedTransactionRpc.HOME_RECOVERY_RESULT,operation.bytes,true));
+            var bytes=ScopedTransactionRpc.blob(input,HomeRecoveryReceipt.MAX_BYTES,true);
+            if (input.hasRemaining()) throw new IllegalArgumentException("Trailing HOME recovery receipt");
+            return bytes==null ? null : homeReceipt(operation,bytes);
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid retained HOME recovery receipt",malformed); }
+        finally { endCall(); }
+    }
+    /** Abandon only unsubmitted authority; a submitted unknown request retains its original owner. */
+    public void cancelHomeRecovery(PreparedHomeRecoveryOperation operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            byte[] reply=transactionReply(operation.descriptor,ScopedTransactionRpc.HOME_RECOVERY_CANCEL,operation.bytes,true);
+            if (!Arrays.equals(reply,operation.recovery.digest())) throw new IOException("HOME recovery cancellation identity changed");
+        } finally { endCall(); }
+    }
+    private static HomeRecoveryReceipt homeReceipt(PreparedHomeRecoveryOperation operation,byte[] bytes) {
+        if (bytes==null) throw new IllegalArgumentException("Missing HOME recovery receipt");
+        var receipt=HomeRecoveryReceipt.decode(bytes);
+        if (!receipt.recovery().equals(operation.recovery)) throw new IllegalArgumentException("HOME recovery receipt belongs to another frozen request");
+        return receipt;
+    }
+
     public static final class PreparedFinalizationOperation {
         private final RangeDirectory source; private final RangeDescriptor descriptor; private final ParticipantFinalization finalization; private final byte[] bytes;
         private PreparedFinalizationOperation(RangeDirectory source,RangeDescriptor descriptor,ParticipantFinalization finalization) { this.source=source; this.descriptor=descriptor; this.finalization=finalization; bytes=RatisParticipantRecord.encode(finalization); }
@@ -381,13 +450,15 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
     }
     private byte[] transaction(RangeDescriptor descriptor,int kind,byte[] body,boolean freshBarrier) throws IOException {
-        byte[] request=ScopedTransactionRpc.frame(kind,body); if (request.length>ScopedTransactionRpc.MAX_REQUEST_BYTES) throw new IllegalArgumentException("Transaction request exceeds byte budget");
         beginCall();
+        try { return transactionReply(descriptor,kind,body,freshBarrier); } finally { endCall(); }
+    }
+    private byte[] transactionReply(RangeDescriptor descriptor,int kind,byte[] body,boolean freshBarrier) throws IOException {
+        byte[] request=ScopedTransactionRpc.frame(kind,body); if (request.length>ScopedTransactionRpc.MAX_REQUEST_BYTES) throw new IllegalArgumentException("Transaction request exceeds byte budget");
         try {
             var packet=ScopedTransactionRpc.parse(transport.transaction(descriptor,request,freshBarrier),ScopedTransactionRpc.MAX_REPLY_BYTES);
             if (packet.kind()!=kind) throw new IOException("Transaction reply opcode differs from request"); return packet.body();
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid scoped transaction reply",malformed); }
-        finally { endCall(); }
     }
 
     public synchronized RangeDirectory directory() { return directory; }

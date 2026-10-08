@@ -93,10 +93,12 @@ class RatisTransactionRecoveryTest {
             var raced=new java.util.concurrent.atomic.AtomicBoolean();
             var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return f.home.wire.read(route,column,key); }
-                public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException {
-                    if (TransactionStatus.decode(command.mutations().getFirst().value()).phase()==TransactionStatus.Phase.ABORT && !raced.getAndSet(true)) f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(0,1903),2,0),ready,ready.decide(TransactionStatus.Phase.COMMIT)));
-                    return f.home.wire.command(route,command);
+                public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return f.home.wire.command(route,command); }
+                public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
+                    if (ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.HOME_RECOVERY_PREPARE && !raced.getAndSet(true)) f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(0,1903),2,0),ready,ready.decide(TransactionStatus.Phase.COMMIT)));
+                    return f.home.wire.transaction(route,bytes,fresh);
                 }
+                public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return f.home.wire.participant(route,bytes); }
             };
             try (var routed=new RatisRoutedClient(f.home.directory,transport)) {
                 var racedHomes=new RatisTransactionStatuses(routed,f.home.f.column); f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,racedHomes,f.data.routed);
@@ -107,12 +109,12 @@ class RatisTransactionRecoveryTest {
             assertArrayEquals(new byte[]{7},f.data.routed.read(f.data.f.column,new byte[]{2})); assertEquals(TransactionStatus.Phase.COMMIT,f.journal.snapshot().observedHome().phase());
         }
     }
-    @Test void invalidAuthorityAndControlAllocationFailureCannotDispatchNewRequests() throws Exception {
+    @Test void recoveryAbortDoesNotNeedOrdinaryControlGrantAndInvalidFinalizationAuthorityCannotDispatch() throws Exception {
         try (var f=new Fixture("failures")) {
             f.journal.executeHome();
-            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,last -> { throw new IOException("No current control grant"); },f::authorize)) { assertThrows(IOException.class,recovery::step); }
-            assertEquals(TransactionStatus.Phase.PREPARING,f.home.statuses.read(f.plan.initial().transactionId()).phase()); assertEquals(0,f.data.wire.index);
-            try (var recovery=f.recovery()) { recovery.step(); }
+            try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,last -> { throw new AssertionError("Protected ABORT must not allocate ordinary control"); },f::authorize)) { assertEquals(RatisTransactionRecovery.Action.ABORT_ATTEMPTED,recovery.step().action()); }
+            assertEquals(TransactionStatus.Phase.ABORT,f.home.statuses.read(f.plan.initial().transactionId()).phase()); assertEquals(0,f.data.wire.index);
+            assertEquals(0,f.journal.snapshot().pendingRecovery().recovery().operation().epoch()); assertNotNull(f.journal.snapshot().recoveryReceipt());
             try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(g,t,c) -> f.authorize(g,t,new OperationId(new UUID(0,1904),3,0)))) { assertThrows(IOException.class,recovery::step); }
             assertEquals(0,f.data.wire.index); assertEquals(0,f.data.f.machine.protectedFinalizationSlots()); assertEquals(0,f.data.f.machine.reservedFinalizationCount());
             try (var recovery=f.recovery()) { drain(f,recovery); }

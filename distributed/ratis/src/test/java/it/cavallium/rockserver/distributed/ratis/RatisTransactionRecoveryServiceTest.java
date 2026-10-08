@@ -43,7 +43,7 @@ class RatisTransactionRecoveryServiceTest {
     @Test void cancelledViewsAndStopWaitForActualAuthorityAndDoNotCloseBorrowedOwners() throws Exception {
         var helper=new RatisTransactionRecoveryTest(); helper.root=root;
         try (var f=helper.new Fixture("running"); var later=helper.new Fixture("later")) {
-            f.journal.executeHome(); var abort=f.plan.initial().decide(TransactionStatus.Phase.ABORT); f.journal.queueHome(f.home.statuses.prepare(helper.journals.homeOperation(1),f.plan.initial(),abort)); f.journal.executeHome();
+            f.journal.executeHome(); var abort=f.plan.initial().decide(TransactionStatus.Phase.ABORT); f.journal.queueRecovery(abort); f.journal.executeHome();
             var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
             try (var recovery=new RatisTransactionRecovery(f.journal,f.home.statuses,f.data.routed,RatisTransactionRecoveryTest::next,(g,t,c) -> {
                 entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); } catch (InterruptedException e) { throw new IOException(e); } return f.authorize(g,t,c);
@@ -62,11 +62,11 @@ class RatisTransactionRecoveryServiceTest {
         var helper=new RatisTransactionRecoveryTest(); helper.root=root;
         try (var first=helper.new Fixture("first"); var second=helper.new Fixture("second")) {
             first.journal.executeHome(); second.journal.executeHome();
-            try (var failed=new RatisTransactionRecovery(first.journal,first.home.statuses,first.data.routed,last -> { throw new IOException("Unavailable control grant"); },first::authorize); var healthy=second.recovery()) {
+            try (var failed=new RatisTransactionRecovery(first.journal,first.home.statuses,first.data.routed,RatisTransactionRecoveryTest::next,(group,transaction,control) -> { throw new IOException("Participant finalization authority unavailable"); }); var healthy=second.recovery()) {
                 var scheduler=scheduler(); var service=new RatisTransactionRecoveryService(scheduler,List.of(failed,healthy),1);
                 try {
                     for (int n=0;n<16 && service.remaining()>1;n++) { try { service.tick().get(5,TimeUnit.SECONDS); } catch (ExecutionException expected) { assertInstanceOf(IOException.class,expected.getCause()); } idle(scheduler); }
-                    assertEquals(1,service.remaining()); assertTrue(second.journal.snapshot().observedHome().fullyFinalized()); assertFalse(second.journal.snapshot().observedHome().consumed()); assertEquals(TransactionStatus.Phase.PREPARING,first.journal.snapshot().observedHome().phase());
+                    assertEquals(1,service.remaining()); assertTrue(second.journal.snapshot().observedHome().fullyFinalized()); assertFalse(second.journal.snapshot().observedHome().consumed()); assertEquals(TransactionStatus.Phase.ABORT,first.journal.snapshot().observedHome().phase());
                 } finally { service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
             }
         }

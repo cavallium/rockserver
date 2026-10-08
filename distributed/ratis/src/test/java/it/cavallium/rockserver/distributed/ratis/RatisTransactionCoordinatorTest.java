@@ -93,6 +93,8 @@ class RatisTransactionCoordinatorTest {
             var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return f.home.wire.read(route,column,key); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { if (TransactionStatus.decode(command.mutations().getFirst().value()).phase()==TransactionStatus.Phase.COMMIT && !raced.getAndSet(true)) f.home.statuses.execute(f.home.statuses.prepare(new OperationId(new UUID(0,2001),2,0),ready,ready.decide(TransactionStatus.Phase.ABORT))); return f.home.wire.command(route,command); }
+                public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return f.home.wire.transaction(route,bytes,fresh); }
+                public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return f.home.wire.participant(route,bytes); }
             };
             try (var routed=new RatisRoutedClient(f.home.directory,transport)) {
                 var homes=new RatisTransactionStatuses(routed,f.home.f.column); f.journal.close(); f.journal=RatisDurableTransaction.reopen(f.path,homes,f.data.routed);

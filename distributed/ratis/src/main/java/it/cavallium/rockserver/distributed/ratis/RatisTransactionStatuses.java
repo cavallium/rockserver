@@ -50,6 +50,20 @@ public final class RatisTransactionStatuses {
         var prepared=routed.prepare(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,expected==null ? null : expected.encode())));
         validate(prepared); return prepared;
     }
+    public RatisRoutedClient.PreparedHomeRecoveryOperation prepareRecovery(OperationId operation,TransactionStatus expected,TransactionStatus next,ParticipantOutcome proof) {
+        var command=prepare(operation,expected,next);
+        var recovery=new HomeRecovery(proof==null ? HomeRecovery.Action.ABORT : HomeRecovery.Action.ACK,command.command(),proof==null ? null : HomeRecovery.Proof.from(proof));
+        if (proof!=null) recovery.requireOutcome(proof);
+        return routed.restoreHomeRecovery(recovery,command.descriptor());
+    }
+    public RatisRoutedClient.PreparedHomeRecoveryOperation restoreRecovery(HomeRecovery recovery,RangeDescriptor descriptor) {
+        var operation=routed.restoreHomeRecovery(recovery,descriptor); validate(routed.restoreSessionCommand(recovery.command(),descriptor)); return operation;
+    }
+    public void authorizeRecovery(RatisRoutedClient.PreparedHomeRecoveryOperation operation) throws IOException { validateRecovery(operation); routed.authorizeHomeRecovery(operation); }
+    public HomeRecoveryReceipt executeRecovery(RatisRoutedClient.PreparedHomeRecoveryOperation operation) throws IOException { validateRecovery(operation); return routed.executeHomeRecovery(operation); }
+    public HomeRecoveryReceipt recoveryResult(RatisRoutedClient.PreparedHomeRecoveryOperation operation) throws IOException { validateRecovery(operation); return routed.homeRecoveryResult(operation); }
+    public void cancelRecovery(RatisRoutedClient.PreparedHomeRecoveryOperation operation) throws IOException { validateRecovery(operation); routed.cancelHomeRecovery(operation); }
+    private void validateRecovery(RatisRoutedClient.PreparedHomeRecoveryOperation operation) { restoreRecovery(operation.recovery(),operation.descriptor()); }
     /** Success means this CAS applied; it does not mean the complete distributed transaction finalized. */
     public CommandResult execute(RatisRoutedClient.PreparedCommand prepared) throws IOException { validate(prepared); return routed.execute(prepared); }
     private void validate(RatisRoutedClient.PreparedCommand prepared) {

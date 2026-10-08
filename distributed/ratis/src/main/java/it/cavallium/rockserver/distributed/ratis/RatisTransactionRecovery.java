@@ -72,7 +72,7 @@ public final class RatisTransactionRecovery implements AutoCloseable {
             return result(Action.REGISTRATION_ATTEMPTED,null);
         }
         if (home.phase()==TransactionStatus.Phase.PREPARING) {
-            journal.queueHome(homes.prepare(nextControl(snapshot),home,home.decide(TransactionStatus.Phase.ABORT)));
+            journal.queueRecovery(home.decide(TransactionStatus.Phase.ABORT));
             journal.executeHome();
             return result(Action.ABORT_ATTEMPTED,null);
         }
@@ -100,14 +100,14 @@ public final class RatisTransactionRecovery implements AutoCloseable {
         snapshot=journal.snapshot(); home=snapshot.observedHome();
         var participant=home.participants().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow();
         if (!participant.finalized()) {
-            journal.queueHome(homes.prepare(nextControl(snapshot),home,home.finalized(group)));
+            journal.queueRecovery(home.finalized(group));
             journal.executeHome();
             return result(Action.ACK_ATTEMPTED,group);
         }
         return result(Action.VERIFIED,group);
     }
     private OperationId nextControl(RatisDurableTransaction.Snapshot snapshot) throws IOException {
-        return Objects.requireNonNull(controls.nextAfter(snapshot.pendingHome().command().operationId()),"Missing recovery operation identity");
+        return Objects.requireNonNull(controls.nextAfter(snapshot.lastHome()),"Missing recovery operation identity");
     }
     private Step result(Action action,UUID participant) throws IOException { return new Step(action,participant,complete(journal.snapshot())); }
     private static boolean complete(RatisDurableTransaction.Snapshot snapshot) {

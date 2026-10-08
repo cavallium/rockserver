@@ -14,7 +14,8 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private static final int MAGIC=0x50524a4c;
     public record Snapshot(PreparedParticipant prepared,RangeDescriptor participantRoute,RangeDescriptor homeRoute,TransactionStatus observedHome,
             RatisRoutedClient.PreparedCommand pendingHome,CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,OperationId finalizeControl,
-            RatisRoutedClient.PreparedFinalizationOperation finalization,ApplyPosition finalizationReceipt,ParticipantOutcome outcome) {}
+            RatisRoutedClient.PreparedFinalizationOperation finalization,ApplyPosition finalizationReceipt,ParticipantOutcome outcome,
+            RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery,HomeRecoveryReceipt recoveryReceipt) {}
     private final Path path;
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
@@ -28,6 +29,10 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private CommandResult homeResult;
     private boolean homeSuperseded,active,closed,fenced;
     private OperationId lastHome,finalizeControl;
+    private UUID recoveryNamespace=UUID.randomUUID();
+    private long recoverySequence;
+    private RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery;
+    private HomeRecoveryReceipt recoveryReceipt;
     private RatisRoutedClient.PreparedFinalizationOperation finalization;
     private ApplyPosition receipt;
     private ParticipantOutcome outcome;
@@ -67,7 +72,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     synchronized void requireClients(RatisTransactionStatuses expectedHomes,RatisRoutedClient expectedData) throws IOException {
         requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,Objects.requireNonNull(expectedData).sessionIdentityDigest())) throw new IllegalArgumentException("Participant recovery clients differ from journal binding");
     }
-    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(prepared,participantRoute,homeRoute,observed,pending,homeResult,homeSuperseded,lastHome,finalizeControl,finalization,receipt,outcome); }
+    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(prepared,participantRoute,homeRoute,observed,pending,homeResult,homeSuperseded,lastHome,finalizeControl,finalization,receipt,outcome,pendingRecovery,recoveryReceipt); }
     public TransactionStatus refreshHome() throws IOException {
         synchronized (this) { idle(); active=true; }
         try {
@@ -81,25 +86,31 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         idle(); if (homeSuperseded) return true; if (homeResult!=null || !supersedes()) return false; homeSuperseded=true; persist(); return true;
     }
     private boolean supersedes() { return pending!=null && observed!=null && observed.generation()>expected(pending).generation(); }
-    public synchronized void queueHome(RatisRoutedClient.PreparedCommand request) throws IOException {
-        idle(); homes.restore(request.command(),request.descriptor()); requireHomeRoute(request.descriptor());
-        if (pending!=null && homeResult==null && !homeSuperseded) { if (sameCommand(pending,request)) return; throw new IllegalStateException("Unknown home CAS must retain its exact request/route/identity"); }
-        var before=expected(request); var next=next(request);
-        if (before==null || !before.equals(observed)) throw new IllegalArgumentException("Participant recovery requires the existing observed home image");
-        requireTransition(before,next);
-        var operation=request.command().operationId(); requireHomeControl(operation);
-        if (operation.epoch()<lastHome.epoch() || operation.epoch()==lastHome.epoch() && (!operation.sessionId().equals(lastHome.sessionId()) || operation.sequence()<=lastHome.sequence())) throw new IllegalArgumentException("Participant recovery home identity did not advance");
-        lastHome=operation; pending=request; homeResult=null; homeSuperseded=false; persist();
+    /** Journal-owned epoch-zero identity, independent from ordinary caller control grants. */
+    public synchronized void queueRecovery(TransactionStatus next) throws IOException {
+        idle(); Objects.requireNonNull(next);
+        if (pending!=null && homeResult==null && !homeSuperseded) {
+            if (pendingRecovery!=null && pendingRecovery.recovery().next().equals(next)) return;
+            throw new IllegalStateException("Unknown home CAS must retain its exact request");
+        }
+        requireTransition(observed,next);
+        if (recoverySequence==Long.MAX_VALUE) throw new IOException("Protected recovery identity namespace exhausted");
+        var request=homes.prepareRecovery(new OperationId(recoveryNamespace,0,recoverySequence),observed,next,observed.phase()==TransactionStatus.Phase.PREPARING ? null : outcome);
+        requireHomeRoute(request.descriptor());
+        if (request.recovery().action()==HomeRecovery.Action.ACK) request.recovery().requireOutcome(outcome);
+        pendingRecovery=request; pending=request.command(); recoverySequence++; recoveryReceipt=null; homeResult=null; homeSuperseded=false; persist();
     }
     public CommandResult executeHome() throws IOException {
         RatisRoutedClient.PreparedCommand request;
         synchronized (this) { idle(); if (pending==null) throw new IllegalStateException("No frozen participant home CAS"); if (homeResult!=null) return homeResult; if (homeSuperseded) throw new IllegalStateException("Home CAS semantically superseded; exact RPC result unknown"); request=pending; active=true; }
         try {
-            var result=homes.execute(request);
+            var retained=homes.executeRecovery(pendingRecovery);
+            if (!retained.recovery().equals(pendingRecovery.recovery())) throw new IOException("Protected home receipt changed frozen request");
+            var result=retained.result();
             synchronized (this) {
                 if (result.valueCount()!=0) throw new IOException("Participant home CAS returned unexpected values");
                 if (result.status()==CommandResult.Status.SUCCESS) { var successful=next(request); if (observed.generation()>successful.generation()) monotone(successful,observed); else observe(successful); }
-                homeResult=result; persist(); return result;
+                homeResult=result; recoveryReceipt=retained; persist(); return result;
             }
         } finally { end(); }
     }
@@ -183,7 +194,6 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         var preparation=prepared.preparation();
         if (preparation.ownsOperation(finalizeControl) || preparation.ownsOperation(lastHome) || finalizeControl.equals(lastHome)) throw new IllegalArgumentException("Participant recovery controls overlap retained business/prepare identities");
     }
-    private void requireHomeControl(OperationId operation) { if (prepared.preparation().ownsOperation(operation) || finalizeControl.equals(operation)) throw new IllegalArgumentException("Home recovery identity overlaps participant control/business"); }
     private void requireHomeRoute(RangeDescriptor route) {
         if (!homeRoute.rangeId().equals(route.rangeId()) || !homeRoute.groupId().equals(route.groupId()) || homeRoute.rangeEpoch()!=route.rangeEpoch()
                 || !Arrays.equals(homeRoute.lowerInclusive(),route.lowerInclusive()) || !Arrays.equals(homeRoute.upperExclusive(),route.upperExclusive()) || route.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Original participant home incarnation/bounds changed");
@@ -192,7 +202,6 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private UUID group() { return prepared.preparation().business().groupId(); }
     private static TransactionStatus expected(RatisRoutedClient.PreparedCommand command) { byte[] bytes=command.command().predicates().getFirst().expectedValue(); return bytes==null ? null : TransactionStatus.decode(bytes); }
     private static TransactionStatus next(RatisRoutedClient.PreparedCommand command) { return TransactionStatus.decode(command.command().mutations().getFirst().value()); }
-    private static boolean sameCommand(RatisRoutedClient.PreparedCommand a,RatisRoutedClient.PreparedCommand b) { return a.descriptor().equals(b.descriptor()) && Arrays.equals(DistributedCommandCodec.encode(a.command()),DistributedCommandCodec.encode(b.command())); }
     private static boolean after(ApplyPosition next,ApplyPosition old) { return next!=null && next.term()>=old.term() && next.index()>old.index(); }
     private static TransactionStatus definition(TransactionStatus status) {
         var participants=status.participants().stream().map(p -> new TransactionStatus.Participant(p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.planDigest(),null,false)).toList();
@@ -210,23 +219,29 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         if (closed && !channel.isOpen()) return; closed=true; try { if (lock.isValid()) lock.release(); } finally { channel.close(); }
     }
     private void capacity() throws IOException {
-        requireControls(); data.restoreParticipant(prepared.preparation(),participantRoute);
+        requireControls();
+        if (recoverySequence<0 || recoveryNamespace.equals(lastHome.sessionId()) || recoveryNamespace.equals(finalizeControl.sessionId())
+                || recoveryNamespace.equals(prepared.preparation().operation().sessionId()) || recoveryNamespace.equals(prepared.preparation().business().operationId().sessionId())) throw new IOException("Invalid protected recovery namespace");
+        data.restoreParticipant(prepared.preparation(),participantRoute);
         if (!homeRoute.groupId().equals(prepared.preparation().homeGroup()) || homeRoute.rangeEpoch()!=prepared.preparation().homeEpoch()) throw new IOException("Participant recovery home binding changed");
         monotone(definition,prepared.preparation().registration());
         long routes=SessionWindowJournal.routeSize(participantRoute)+SessionWindowJournal.routeSize(homeRoute)+futureHomeRoute();
         if (routes>MAX_ROUTES || prepared.encode().length+routes+65536L+32>MAX_BYTES) throw new IOException("Participant recovery future route/metadata capacity unavailable");
-        if (pending!=null) { requireHomeRoute(pending.descriptor()); homes.restore(pending.command(),pending.descriptor()); }
+        if (pending!=null) { requireHomeRoute(pending.descriptor()); homes.restoreRecovery(pendingRecovery.recovery(),pending.descriptor()); }
     }
     private long futureHomeRoute() { return 60L+(homeRoute.lowerInclusive()==null ? 0 : homeRoute.lowerInclusive().length)+(homeRoute.upperExclusive()==null ? 0 : homeRoute.upperExclusive().length)+RangeDirectoryCodec.MAX_REPLICAS*(57L+128+256); }
     /** Preparation/registration/business bytes occur once; later home images and native terminal proofs are compact. */
     private byte[] encode() throws IOException {
         var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(MAGIC); out.write(identity); out.write(homeIdentity); blob(out,prepared.encode());
-        route(out,participantRoute); route(out,homeRoute); operation(out,lastHome); operation(out,finalizeControl); status(out,observed);
-        out.writeBoolean(pending!=null);
+        route(out,participantRoute); route(out,homeRoute); operation(out,lastHome); operation(out,finalizeControl); uuid(out,recoveryNamespace); out.writeLong(recoverySequence); status(out,observed);
+        out.writeByte(pending==null ? 0 : 2);
         if (pending!=null) {
             route(out,pending.descriptor()); var command=pending.command(); uuid(out,command.mutations().getFirst().columnId()); out.write(command.schemaDigest()); operation(out,command.operationId()); out.writeLong(command.acknowledgedThrough());
             status(out,expected(pending)); status(out,next(pending));
+            var proof=pendingRecovery.recovery().proof(); out.writeBoolean(proof!=null);
+            if (proof!=null) { uuid(out,proof.participant()); positionValue(out,proof.position()); out.write(proof.digest()); }
         }
+        position(out,recoveryReceipt==null ? null : recoveryReceipt.position());
         out.writeByte(homeResult==null ? 0 : homeResult.status().ordinal()+1); out.writeBoolean(homeSuperseded); out.writeBoolean(finalization!=null); position(out,receipt);
         out.writeBoolean(outcome!=null); if (outcome!=null) { operation(out,outcome.finalization().operation()); positionValue(out,outcome.position()); }
         out.flush(); if (bytes.size()>MAX_BYTES-32) throw new IOException("Participant recovery journal exceeds bound"); return bytes.toByteArray();
@@ -237,18 +252,27 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
             byte[] bound=new byte[32],homeBound=new byte[32]; in.get(bound).get(homeBound);
             if (!Arrays.equals(identity,bound) || !Arrays.equals(homeIdentity,homeBound)) throw new IOException("Participant recovery client identity changed");
             prepared=PreparedParticipant.decode(blob(in,16+PreparedParticipant.Preparation.MAX_BYTES)); definition=definition(prepared.preparation().registration());
-            participantRoute=SessionWindowJournal.route(in); homeRoute=SessionWindowJournal.route(in); lastHome=operation(in); finalizeControl=operation(in);
+            participantRoute=SessionWindowJournal.route(in); homeRoute=SessionWindowJournal.route(in); lastHome=operation(in); finalizeControl=operation(in); recoveryNamespace=uuid(in); recoverySequence=in.getLong();
             var home=status(in); if (home==null) throw new IOException("Participant recovery journal lacks existing home"); observe(home);
-            if (flag(in)) {
+            int homeKind=in.get() & 255; if (homeKind!=0 && homeKind!=2) throw new IOException("Invalid participant recovery home kind");
+            if (homeKind==2) {
                 var route=SessionWindowJournal.route(in); requireHomeRoute(route); UUID column=uuid(in); byte[] schema=new byte[32]; in.get(schema); var operation=operation(in); long ack=in.getLong();
                 var before=status(in); var next=status(in);
                 if (before==null || next==null) throw new IOException("Participant recovery cannot register a missing home");
                 byte[] key=ByteBuffer.allocate(16).putLong(transaction().getMostSignificantBits()).putLong(transaction().getLeastSignificantBits()).array();
-                pending=homes.restore(new DistributedCommand(route.groupId(),route.rangeEpoch(),schema,operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,before.encode())),ack),route);
-                if (!lastHome.equals(operation)) throw new IOException("Participant home high-water identity changed"); monotone(before,observed);
+                HomeRecovery.Proof proof=null;
+                if (flag(in)) { UUID participant=uuid(in); var position=positionValue(in); byte[] digest=new byte[32]; in.get(digest); proof=new HomeRecovery.Proof(participant,position,digest); }
+                var command=new DistributedCommand(route.groupId(),route.rangeEpoch(),schema,operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,before.encode())),ack);
+                pendingRecovery=homes.restoreRecovery(new HomeRecovery(proof==null ? HomeRecovery.Action.ABORT : HomeRecovery.Action.ACK,command,proof),route); pending=pendingRecovery.command();
+                if (!operation.sessionId().equals(recoveryNamespace) || operation.epoch()!=0 || recoverySequence<=0 || operation.sequence()!=recoverySequence-1) throw new IOException("Participant protected high-water identity changed"); monotone(before,observed);
             }
+            var recoveryPosition=position(in);
             int result=in.get() & 255; if (result>CommandResult.Status.values().length) throw new IOException("Invalid participant home result kind");
             homeResult=result==0 ? null : new CommandResult(CommandResult.Status.values()[result-1],List.of()); homeSuperseded=flag(in);
+            if (recoveryPosition!=null) {
+                if (pendingRecovery==null || homeResult==null) throw new IOException("Protected receipt lacks frozen request/result");
+                recoveryReceipt=new HomeRecoveryReceipt(pendingRecovery.recovery(),recoveryPosition,homeResult);
+            } else if (homeResult!=null) throw new IOException("Protected result lacks retained receipt");
             if (flag(in)) finalization=data.restoreFinalization(ownFinalization(),participantRoute);
             receipt=position(in); if (receipt!=null && (finalization==null || !after(receipt,prepared.position()))) throw new IOException("Participant finalization receipt lacks original request/vote ordering");
             if (flag(in)) {
@@ -259,6 +283,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
             if (pending==null) { if (homeResult!=null || homeSuperseded) throw new IOException("Home response/retirement has no pending request"); }
             else {
                 requireTransition(expected(pending),next(pending));
+                if (pendingRecovery.recovery().action()==HomeRecovery.Action.ACK) pendingRecovery.recovery().requireOutcome(outcome);
                 if (homeSuperseded && (homeResult!=null || !supersedes())) throw new IOException("Home semantic retirement has no newer proof");
                 if (homeResult!=null && homeResult.status()==CommandResult.Status.SUCCESS) monotone(next(pending),observed);
             }

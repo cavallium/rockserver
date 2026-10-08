@@ -13,7 +13,7 @@ import java.util.UUID;
 /** The current bounded query protocol for data and catalogue groups. */
 public final class ScopedTransactionRpc {
     public static final int MAGIC = 0x52535458, HEADER_BYTES = 12, HANDLE_BYTES = 56;
-    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22, SNAPSHOT_OWNER = 30, SNAPSHOT_GET = 31, SNAPSHOT_PAGE = 32, SNAPSHOT_RELEASE = 33, SNAPSHOT_CAPTURE = 34, SNAPSHOT_READY = 35, SNAPSHOT_BLOCKERS = 36;
+    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22, SNAPSHOT_OWNER = 30, SNAPSHOT_GET = 31, SNAPSHOT_PAGE = 32, SNAPSHOT_RELEASE = 33, SNAPSHOT_CAPTURE = 34, SNAPSHOT_READY = 35, SNAPSHOT_BLOCKERS = 36, HOME_RECOVERY_PREPARE = 40, HOME_RECOVERY_RESULT = 41, HOME_RECOVERY_CANCEL = 42;
     // A legal physical page continuation can exceed an atomic command's 2 MiB bound.
     public static final int MAX_REQUEST_BYTES = PhysicalRangePage.MAX_BYTES + 128;
     public static final int MAX_REPLY_BYTES = PhysicalRangePage.MAX_BYTES + 128;
@@ -249,8 +249,9 @@ public final class ScopedTransactionRpc {
         if (right == null) return 1;
         return Arrays.compareUnsigned(left, right);
     }
+    public static boolean homeRecovery(int kind) { return kind==HOME_RECOVERY_PREPARE || kind==HOME_RECOVERY_RESULT || kind==HOME_RECOVERY_CANCEL; }
     private static void requireKind(int kind) {
-        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && kind != SNAPSHOT_BLOCKERS && !ownerSnapshot(kind)) {
+        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && kind != SNAPSHOT_BLOCKERS && !homeRecovery(kind) && !ownerSnapshot(kind)) {
             throw invalid("Unknown read frame kind");
         }
     }

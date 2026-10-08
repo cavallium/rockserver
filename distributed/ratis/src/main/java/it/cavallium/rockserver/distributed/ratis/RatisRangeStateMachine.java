@@ -80,7 +80,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
     private RatisSnapshotFences snapshotHomes;
-    private RatisRoutedClient homeRecoveryData;
+    @FunctionalInterface interface HomeRecoveryProofReader { it.cavallium.rockserver.core.common.distributed.ParticipantOutcome read(HomeRecovery recovery) throws IOException; }
+    private HomeRecoveryProofReader homeRecoveryProofs;
     private boolean homeReservations;
     private UUID homeCluster,homeDatabase,homeColumn;
     /** Trusted node configuration, installed before transport exposure; request bytes never select a home connector. */
@@ -98,8 +99,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private void requireDataRole() { if (role!=RatisNodePlan.Role.DATA) throw new IllegalStateException("Range role does not support DATA transaction/snapshot operations"); }
     void homeRecoveryData(RatisRoutedClient data) {
-        if (role!=RatisNodePlan.Role.TRANSACTION_HOME || getLifeCycleState()!=LifeCycle.State.NEW || homeRecoveryData!=null) throw new IllegalStateException("HOME data proof reader is fixed before initialization");
-        homeRecoveryData=java.util.Objects.requireNonNull(data);
+        java.util.Objects.requireNonNull(data);
+        homeRecoveryProofs(recovery -> {
+            if (!data.directory().clusterId().equals(recovery.before().clusterId()) || !data.directory().databaseId().equals(recovery.before().databaseId())) throw new IOException("HOME recovery DATA reader belongs to another database");
+            return data.finalizedParticipant(recovery.proof().participant(),recovery.before().transactionId());
+        });
+    }
+    void homeRecoveryProofs(HomeRecoveryProofReader reader) {
+        if (role!=RatisNodePlan.Role.TRANSACTION_HOME || getLifeCycleState()!=LifeCycle.State.NEW || homeRecoveryProofs!=null) throw new IllegalStateException("HOME data proof reader is fixed before initialization");
+        homeRecoveryProofs=java.util.Objects.requireNonNull(reader);
     }
     void homeRecoveryReservations(UUID cluster,UUID database,UUID column) {
         if (role!=RatisNodePlan.Role.TRANSACTION_HOME || getLifeCycleState()!=LifeCycle.State.NEW || homeReservations) throw new IllegalStateException("HOME reservations are fixed before initialization");
@@ -895,7 +903,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         private SnapshotProposal(SnapshotHold hold,RatisSnapshotRecord request) { this.hold=hold; this.request=request; bytes=request.encode(); digest=request.digest(); }
         public RatisSnapshotRecord request() { return request; }
         public byte[] bytes() { return bytes.clone(); }
-        private boolean authorized() { var a=store.applied(); return !closed && !claimed && !hold.invalidated && !hold.released && hold.generation==admissionGeneration.get() && a!=null && a.term()==hold.term && store.admissionOpen(); }
+        private boolean authorized() { var a=store.applied(); return !closed && !claimed && hold!=null && !hold.invalidated && !hold.released && hold.generation==admissionGeneration.get() && a!=null && a.term()==hold.term && store.admissionOpen(); }
         public boolean valid() {
             final Leadership leader;
             try { leader=leadership(); } catch (IOException unavailable) { return false; }
@@ -1371,10 +1379,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     public final class HomeRecoveryProposal implements AutoCloseable {
         private final HomeHold hold;
+        private final HomeRecovery recovery;
         private boolean claimed,closed;
-        private HomeRecoveryProposal(HomeHold hold) { this.hold=hold; }
-        public HomeRecovery recovery() { return hold.recovery; }
-        public byte[] bytes() { return hold.recovery.encode(); }
+        private HomeRecoveryProposal(HomeHold hold) { this.hold=hold; recovery=hold.recovery; }
+        private HomeRecoveryProposal(HomeRecovery recovery) { this.hold=null; this.recovery=recovery; claimed=true; }
+        public HomeRecovery recovery() { return recovery; }
+        public byte[] bytes() { return recovery.encode(); }
         private boolean authorized() {
             var cut=store.applied();
             return !closed && !claimed && !hold.invalidated && !hold.released && hold.generation==admissionGeneration.get()
@@ -1404,6 +1414,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (generation!=admissionGeneration.get() || cut==null || cut.term()!=leader.term() || !store.admissionOpen()) throw new IllegalStateException("HOME recovery has no current native owner");
             if (!java.util.Objects.equals(observed.capacity().position(),cut)) throw new IllegalStateException("Native HOME cut changed during recovery preparation");
             reconcileOlderProposalTerms(leader.term());
+            // Immutable native proof needs no append authority or new protected input reservation.
+            if (observed.existing()!=null) return new HomeRecoveryProposal(recovery);
             var ready=preparedHomes.get(recovery.operation());
             if (ready!=null) {
                 if (!ready.hold.recovery.equals(recovery)) throw new IllegalArgumentException("HOME recovery identity payload changed");
@@ -1412,7 +1424,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var known=admissions.get(recovery.operation());
             if (known!=null) {
                 if (known.homeRecovery==null || !known.homeRecovery.equals(recovery)) throw new IllegalArgumentException("HOME recovery identity payload changed");
-                if (known.term==leader.term() && known.generation==generation && known.homeHold!=null) return borrowedHome(known.homeHold);
+                if (known.term==leader.term() && known.generation==generation) {
+                    if (known.homeHold!=null) return borrowedHome(known.homeHold);
+                }
                 throw new IllegalStateException("Previous HOME recovery is still settling");
             }
             if (participantIdentityBusy(recovery.operation())) throw new IllegalStateException("HOME recovery identity is already owned");
@@ -1427,9 +1441,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try {
             boolean existing=reserveHomeCapacity(hold);
             if (!existing && recovery.action()==HomeRecovery.Action.ACK) {
-                var data=homeRecoveryData;
-                if (data==null || !data.directory().clusterId().equals(recovery.before().clusterId()) || !data.directory().databaseId().equals(recovery.before().databaseId())) throw new IllegalStateException("HOME recovery has no qualified DATA reader");
-                recovery.requireOutcome(data.finalizedParticipant(recovery.proof().participant(),recovery.before().transactionId()));
+                var reader=homeRecoveryProofs;
+                if (reader==null) throw new IllegalStateException("HOME recovery has no qualified DATA reader");
+                recovery.requireOutcome(reader.read(recovery));
             }
             reserveHomeCapacity(hold);
             synchronized (admissions) {
@@ -1514,6 +1528,22 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
         }
         throw new IllegalStateException("Native HOME cut changed during append admission");
+    }
+    private void checkHomeRecoveryOwner() throws IOException {
+        requireHealthy(); var owner=leadership(); var cut=store.applied();
+        if (role!=RatisNodePlan.Role.TRANSACTION_HOME || !owner.ready() || cut==null || cut.term()!=owner.term() || !store.admissionOpen()) throw new IOException("HOME recovery requires a current completed leader prefix");
+    }
+    public void cancelHomeRecovery(HomeRecovery recovery) throws IOException {
+        requireHomeRecovery(recovery); checkHomeRecoveryOwner();
+        synchronized (admissions) {
+            var hold=homeOwners.get(recovery.operation());
+            if (hold==null) return;
+            if (!hold.recovery.equals(recovery)) throw new IllegalArgumentException("HOME cancellation identity payload changed");
+            var ready=preparedHomes.get(recovery.operation());
+            if (ready!=null) ready.close();
+            else if (preparingHomes.get(recovery.operation())==hold) { hold.invalidated=true; if (hold.scope!=null) proposalFootprints.release(hold.scope); }
+            // Claimed/uncertain append ownership is never donated by cancellation.
+        }
     }
     public long homeRecoveryInputBytes() { synchronized (admissions) { return homeRecoveryInputBytes; } }
     public int homeRecoverySlots() { synchronized (admissions) { return homeRecoverySlots; } }
@@ -1988,9 +2018,30 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private Message framedQuery(byte[] encoded,boolean freshBarrier) throws Exception {
         var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-        if (role!=RatisNodePlan.Role.DATA && packet.kind()!=ScopedTransactionRpc.POINT && packet.kind()!=ScopedTransactionRpc.STATE) throw new IOException("Range role rejects transaction/snapshot queries");
+        if (role!=RatisNodePlan.Role.DATA && packet.kind()!=ScopedTransactionRpc.POINT && packet.kind()!=ScopedTransactionRpc.STATE && !(role==RatisNodePlan.Role.TRANSACTION_HOME && ScopedTransactionRpc.homeRecovery(packet.kind()))) throw new IOException("Range role rejects transaction/snapshot queries");
         var input=ByteBuffer.wrap(packet.body()); byte[] reply;
         switch (packet.kind()) {
+            case ScopedTransactionRpc.HOME_RECOVERY_PREPARE, ScopedTransactionRpc.HOME_RECOVERY_RESULT, ScopedTransactionRpc.HOME_RECOVERY_CANCEL -> {
+                if (!freshBarrier) throw new IOException("HOME recovery requires a fresh linearizable barrier");
+                long generation=admissionGeneration.get();
+                var recovery=HomeRecovery.decode(packet.body()); requireHomeRecovery(recovery); checkHomeRecoveryOwner();
+                if (packet.kind()==ScopedTransactionRpc.HOME_RECOVERY_PREPARE) {
+                    // Existing proof finishes a retry without another log append. New work keeps its ready token.
+                    var proposal=prepareHomeRecovery(recovery); var receipt=store.homeRecoveryResult(recovery);
+                    if (receipt!=null) proposal.close();
+                    checkHomeRecoveryOwner();
+                    if (generation!=admissionGeneration.get()) throw new IOException("HOME preparation reply lost its owner");
+                    byte[] retained=receipt==null ? null : receipt.encode();
+                    var output=ByteBuffer.allocate(40+(retained==null ? 0 : retained.length));
+                    ScopedTransactionRpc.putBlob(output,recovery.digest()); ScopedTransactionRpc.putBlob(output,retained); reply=output.array();
+                } else if (packet.kind()==ScopedTransactionRpc.HOME_RECOVERY_CANCEL) {
+                    cancelHomeRecovery(recovery); reply=recovery.digest();
+                } else {
+                    var receipt=store.homeRecoveryResult(recovery); checkHomeRecoveryOwner();
+                    if (generation!=admissionGeneration.get()) throw new IOException("HOME recovery receipt query lost its owner");
+                    reply=valueBlob(receipt==null ? null : receipt.encode());
+                }
+            }
             case ScopedTransactionRpc.POINT -> {
                 var column=ScopedTransactionRpc.uuid(input); var key=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES-16,false); end(input);
                 try (var pin=readablePoint(column,key)) { var value=pin.get(column,key); reply=valueBlob(value); }

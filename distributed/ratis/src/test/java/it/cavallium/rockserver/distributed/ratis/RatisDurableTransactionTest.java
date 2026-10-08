@@ -51,13 +51,46 @@ class RatisDurableTransactionTest {
                 journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
                 var outcome=journal.resolveParticipant(data.f.groupId).outcome(); assertNotNull(outcome); assertEquals(TransactionStatus.Phase.COMMIT,outcome.finalization().decision().phase());
                 assertArrayEquals(plan.intent().acceptedBusiness().acceptance().result(),outcome.result()); assertArrayEquals(new byte[]{7},data.routed.read(data.f.column,new byte[]{2}));
-                var ack=commit.finalized(data.f.groupId); journal.queueHome(home.statuses.prepare(homeOperation(3),commit,ack)); journal.executeHome();
+                var ack=commit.finalized(data.f.groupId); journal.queueRecovery(ack); journal.executeHome();
                 var consumed=ack.consume(); journal.queueHome(home.statuses.prepare(homeOperation(4),ack,consumed)); journal.executeHome(); assertTrue(journal.snapshot().observedHome().gcEligible());
                 journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
                 assertTrue(journal.snapshot().observedHome().gcEligible()); assertEquals(outcome,journal.snapshot().participant(data.f.groupId).outcome()); helper.released(data);
             } finally { journal.close(); }
         }
     }
+    @Test void protectedAbortAndAckKeepExactRequestsReceiptsAndIndependentHighWaterAcrossReopenAndHomeFloor() throws Exception {
+        helper.root=root;
+        try (var home=helper.new Node("protected-home",true); var data=helper.new Node("protected-data",false); var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
+            var plan=plan(home,data,pin); Path path=root.resolve("protected.bin"); var journal=create(path,home,data,plan);
+            try {
+                journal.executeHome(); var ordinary=journal.snapshot().lastHome(); var abort=plan.initial().decide(TransactionStatus.Phase.ABORT);
+                var initiallyOwned=journal; assertThrows(IllegalArgumentException.class,() -> initiallyOwned.queueHome(home.statuses.prepare(homeOperation(1),plan.initial(),abort)));
+                journal.queueRecovery(abort); var frozen=journal.snapshot().pendingRecovery();
+                assertEquals(0,frozen.recovery().operation().epoch()); assertEquals(0,frozen.recovery().operation().sequence()); assertEquals(ordinary,journal.snapshot().lastHome());
+                home.wire.command(home.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(home.f.groupId,1,new byte[32],new OperationId(home.f.admin,2,0),2));
+                home.wire.lose=true; var owned=journal; assertThrows(IOException.class,owned::executeHome);
+                var nativeAbort=home.statuses.recoveryResult(frozen); assertNotNull(nativeAbort); assertNull(journal.snapshot().recoveryReceipt());
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                assertArrayEquals(frozen.bytes(),journal.snapshot().pendingRecovery().bytes()); assertEquals(frozen.descriptor(),journal.snapshot().pendingRecovery().descriptor());
+                assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status()); assertEquals(nativeAbort,journal.snapshot().recoveryReceipt()); assertEquals(ordinary,journal.snapshot().lastHome());
+                var ack=abort.finalized(data.f.groupId); owned=journal; var noProof=owned; assertThrows(IllegalArgumentException.class,() -> noProof.queueRecovery(ack));
+                pin.close();
+                try (var authorization=data.f.machine.prepareFinalization(home.statuses,plan.initial().transactionId(),plan.intent().finalizeControl())) {
+                    journal.freezeFinalization(data.routed.prepareFinalization(authorization.finalization())); journal.executeFinalization(data.f.groupId);
+                }
+                journal.queueRecovery(ack); var frozenAck=journal.snapshot().pendingRecovery();
+                assertEquals(frozen.recovery().operation().sessionId(),frozenAck.recovery().operation().sessionId()); assertEquals(1,frozenAck.recovery().operation().sequence());
+                frozenAck.recovery().requireOutcome(journal.snapshot().participant(data.f.groupId).outcome()); home.wire.lose=true; owned=journal; assertThrows(IOException.class,owned::executeHome);
+                var nativeAck=home.statuses.recoveryResult(frozenAck); journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
+                assertArrayEquals(frozenAck.bytes(),journal.snapshot().pendingRecovery().bytes()); journal.executeHome(); assertEquals(nativeAck,journal.snapshot().recoveryReceipt());
+                long index=home.wire.index; journal.executeHome(); assertEquals(index,home.wire.index); assertEquals(CommandResult.Status.CONFLICT,journal.result().status()); assertFalse(journal.snapshot().observedHome().consumed());
+                journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed); assertEquals(nativeAck,journal.snapshot().recoveryReceipt()); assertEquals(ordinary,journal.snapshot().lastHome());
+                var consumeControl=new OperationId(new UUID(0,1509),3,0); journal.queueHome(home.statuses.prepare(consumeControl,ack,ack.consume())); journal.executeHome();
+                assertEquals(consumeControl,journal.snapshot().lastHome()); assertNull(journal.snapshot().pendingRecovery()); assertNull(journal.snapshot().recoveryReceipt());
+            } finally { journal.close(); }
+        }
+    }
+
     @Test void anOldSuccessfulRegistrationReceiptDoesNotRegressAnObservedAbort() throws Exception {
         helper.root=root;
         try (var home=helper.new Node("old-home",true); var data=helper.new Node("old-data",false); var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
@@ -157,7 +190,7 @@ class RatisDurableTransactionTest {
                     journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,routed); assertEquals(1,journal.snapshot().pendingHome().descriptor().configurationVersion()); journal.refreshHome(); journal.executeHome();
                     var commit=ready.decide(TransactionStatus.Phase.COMMIT); journal.queueHome(home.statuses.prepare(homeOperation(3),ready,commit)); journal.executeHome();
                     try (var finalize=left.f.machine.prepareFinalization(home.statuses,initial.transactionId(),intents.get(0).finalizeControl())) { journal.freezeFinalization(routed.prepareFinalization(finalize.finalization())); journal.executeFinalization(l.groupId()); }
-                    var ack=commit.finalized(l.groupId()); journal.queueHome(home.statuses.prepare(homeOperation(4),commit,ack)); journal.executeHome();
+                    var ack=commit.finalized(l.groupId()); journal.queueRecovery(ack); journal.executeHome();
                     try (var finalize=right.f.machine.prepareFinalization(home.statuses,initial.transactionId(),intents.get(1).finalizeControl())) { journal.freezeFinalization(routed.prepareFinalization(finalize.finalization())); journal.executeFinalization(r.groupId()); }
                     assertArrayEquals(new byte[]{7},routed.read(column,new byte[]{1})); assertArrayEquals(new byte[]{8},routed.read(column,new byte[]{(byte)130})); helper.released(left); helper.released(right);
                 } finally { journal.close(); }
@@ -173,7 +206,7 @@ class RatisDurableTransactionTest {
                 try (var prepare=data.f.machine.prepareParticipant(pin,data.f.put(2),helper.control(0),home.statuses,plan.initial().transactionId())) {
                     var original=data.routed.prepareParticipant(prepare.preparation()); journal.freezePreparation(original);
                     var pending=data.wire.propose(original.bytes()); assertNull(pending.getException()); data.f.machine.preAppendTransaction(pending); data.f.machine.cancelTransaction(pending);
-                    var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); journal.queueHome(home.statuses.prepare(homeOperation(1),plan.initial(),abort)); journal.executeHome();
+                    var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); journal.queueRecovery(abort); journal.executeHome();
                     try (var finalize=data.f.machine.prepareFinalization(home.statuses,plan.initial().transactionId(),plan.intent().finalizeControl())) { journal.freezeFinalization(data.routed.prepareFinalization(finalize.finalization())); journal.executeFinalization(data.f.groupId); }
                     assertNull(journal.snapshot().participant(data.f.groupId).outcome().vote()); pending.initLogEntry(1,++data.wire.index);
                     assertEquals(ParticipantVote.negative(),RatisParticipantRecord.result(data.f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray()));
@@ -275,7 +308,7 @@ class RatisDurableTransactionTest {
             try (var journal=create(path,home,data,plan)) {
                 journal.executeHome(); Path blocked=path.resolveSibling(path.getFileName()+".pending"); Files.createDirectory(blocked);
                 assertEquals(plan.initial(),journal.refreshHome()); assertNull(journal.resolveParticipant(data.f.groupId).outcome()); assertTrue(Files.isDirectory(blocked),"Unchanged observations must not enter atomic snapshot replacement");
-                var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); assertThrows(IOException.class,() -> journal.queueHome(home.statuses.prepare(homeOperation(1),plan.initial(),abort))); assertEquals(plan.initial(),home.statuses.read(plan.initial().transactionId()));
+                var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); assertThrows(IOException.class,() -> journal.queueRecovery(abort)); assertEquals(plan.initial(),home.statuses.read(plan.initial().transactionId()));
                 assertThrows(IOException.class,journal::executeHome); assertEquals(0,data.wire.index);
             }
             try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); }

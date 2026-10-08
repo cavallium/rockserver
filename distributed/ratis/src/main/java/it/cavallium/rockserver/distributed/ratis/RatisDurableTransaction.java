@@ -49,7 +49,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
     public record ParticipantProgress(Intent intent,RatisRoutedClient.PreparedParticipantOperation preparation,ParticipantVote vote,
             RatisRoutedClient.PreparedFinalizationOperation finalization,ApplyPosition finalizationReceipt,ParticipantOutcome outcome) {}
     public record Snapshot(TransactionStatus initial,TransactionStatus observedHome,RatisRoutedClient.PreparedCommand pendingHome,
-            CommandResult homeResult,boolean homeSuperseded,List<ParticipantProgress> participants) {
+            CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,
+            RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery,HomeRecoveryReceipt recoveryReceipt,List<ParticipantProgress> participants) {
         public ParticipantProgress participant(UUID group) { return participants.stream().filter(p -> p.intent().route().groupId().equals(group)).findFirst().orElseThrow(); }
     }
     private static final class Entry {
@@ -74,6 +75,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private RatisRoutedClient.PreparedCommand pending;
     private CommandResult homeResult;
     private OperationId lastHome;
+    private UUID recoveryNamespace=UUID.randomUUID();
+    private long recoverySequence;
+    private RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery;
+    private HomeRecoveryReceipt recoveryReceipt;
     private boolean active,closed,fenced,homeSuperseded;
 
     public static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,
@@ -131,7 +136,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return before==null ? initial.sameDefinition(observed) : before.sameDefinition(observed) && observed.generation()>before.generation();
     }
     public synchronized Snapshot snapshot() throws IOException {
-        requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,entries.values().stream().map(Entry::progress).toList());
+        requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,pendingRecovery,recoveryReceipt,entries.values().stream().map(Entry::progress).toList());
     }
     /** Returns the globally ordered business outcome only after every native finalization and home ACK is durable. */
     public synchronized CommandResult result() throws IOException {
@@ -194,7 +199,9 @@ public final class RatisDurableTransaction implements AutoCloseable {
         RatisRoutedClient.PreparedCommand request;
         synchronized (this) { idle(); if (pending==null) throw new IllegalStateException("No frozen home request"); if (homeResult!=null) return homeResult; if (homeSuperseded) throw new IllegalStateException("Observed home supersedes this request; exact RPC result is unknown"); request=pending; active=true; }
         try {
-            var result=homes.execute(request);
+            var retained=pendingRecovery==null ? null : homes.executeRecovery(pendingRecovery);
+            var result=retained==null ? homes.execute(request) : retained.result();
+            if (retained!=null && !retained.recovery().equals(pendingRecovery.recovery())) throw new IOException("Protected home receipt changed frozen request");
             synchronized (this) {
                 if (result.valueCount()!=0) throw new IOException("Home CAS returned unexpected values");
                 if (result.status()==CommandResult.Status.SUCCESS) {
@@ -202,7 +209,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
                     if (observed!=null && observed.generation()>successful.generation()) requireMonotone(successful,observed);
                     else observe(successful);
                 }
-                homeResult=result; persist(); return result;
+                homeResult=result; recoveryReceipt=retained; persist(); return result;
             }
         } finally { synchronized (this) { active=false; } }
     }
@@ -218,9 +225,33 @@ public final class RatisDurableTransaction implements AutoCloseable {
         } else {
             if (expected==null || !expected.equals(observed)) throw new IllegalArgumentException("Home CAS does not use current observed image");
             next.requireSuccessorOf(observed); validateEvidence(next);
+            if (protectedTransition(observed,next)) throw new IllegalArgumentException("ABORT/ACK requires protected recovery journal request");
         }
         advance(request.command().operationId());
-        pending=request; homeResult=null; homeSuperseded=false; persist();
+        pending=request; pendingRecovery=null; recoveryReceipt=null; homeResult=null; homeSuperseded=false; persist();
+    }
+    /** Freezes a journal-owned protected ABORT or one proven participant ACK before any RPC. */
+    public synchronized void queueRecovery(TransactionStatus next) throws IOException {
+        idle(); Objects.requireNonNull(next);
+        if (pending!=null && homeResult==null && !homeSuperseded) {
+            if (pendingRecovery!=null && pendingRecovery.recovery().next().equals(next)) return;
+            throw new IllegalStateException("Uncertain home request must retain its exact request");
+        }
+        if (observed==null || !protectedTransition(observed,next)) throw new IllegalArgumentException("Protected recovery requires existing home ABORT or one local ACK");
+        next.requireSuccessorOf(observed); validateEvidence(next);
+        ParticipantOutcome proof=null;
+        if (observed.phase()!=TransactionStatus.Phase.PREPARING) {
+            for (var participant:next.participants()) if (participant.finalized() && !observed.participants().stream().filter(p -> p.groupId().equals(participant.groupId())).findFirst().orElseThrow().finalized()) proof=entry(participant.groupId()).outcome;
+        }
+        if (recoverySequence==Long.MAX_VALUE) throw new IOException("Protected recovery identity namespace exhausted");
+        var request=homes.prepareRecovery(new OperationId(recoveryNamespace,0,recoverySequence),observed,next,proof);
+        requireHomeRoute(request.descriptor());
+        if (proof!=null) request.recovery().requireOutcome(proof);
+        pendingRecovery=request; pending=request.command(); recoverySequence++; recoveryReceipt=null; homeResult=null; homeSuperseded=false; persist();
+    }
+    private static boolean protectedTransition(TransactionStatus before,TransactionStatus next) {
+        if (before.phase()==TransactionStatus.Phase.PREPARING) return next.phase()==TransactionStatus.Phase.ABORT;
+        return next.participants().stream().anyMatch(p -> p.finalized() && !before.participants().stream().filter(old -> old.groupId().equals(p.groupId())).findFirst().orElseThrow().finalized());
     }
     public TransactionStatus refreshHome() throws IOException {
         synchronized (this) { idle(); active=true; }
@@ -332,6 +363,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private static TransactionStatus expected(RatisRoutedClient.PreparedCommand request) { byte[] bytes=request.command().predicates().getFirst().expectedValue(); return bytes==null ? null : TransactionStatus.decode(bytes); }
     private static boolean sameCommand(RatisRoutedClient.PreparedCommand a,RatisRoutedClient.PreparedCommand b) { return a.descriptor().equals(b.descriptor()) && Arrays.equals(DistributedCommandCodec.encode(a.command()),DistributedCommandCodec.encode(b.command())); }
     private void advance(OperationId operation) {
+        if (operation.sessionId().equals(recoveryNamespace)) throw new IllegalArgumentException("Ordinary home identity overlaps protected recovery namespace");
         if (operation.epoch()<lastHome.epoch() || operation.epoch()==lastHome.epoch() && (!operation.sessionId().equals(lastHome.sessionId()) || operation.sequence()<=lastHome.sequence())) throw new IllegalArgumentException("Home recovery operation identity did not advance");
         if (operation.equals(initial.operation()) || entries.values().stream().anyMatch(e -> e.intent.prepareControl().equals(operation) || e.intent.finalizeControl().equals(operation))) throw new IllegalArgumentException("Home identity overlaps participant/business identity");
         lastHome=operation;
@@ -353,6 +385,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
         if (entries.isEmpty() || entries.size()>TransactionStatus.MAX_PARTICIPANTS || entries.size()!=initial.participants().size()) throw new IOException("Invalid participant count");
         if (!Arrays.equals(initial.planDigest(),planDigest(entries.values().stream().map(entry -> entry.intent).toList()))) throw new IOException("Frozen transaction plan digest differs from accepted plans/global result order");
         resultCount();
+        if (recoverySequence<0 || recoveryNamespace.equals(lastHome.sessionId()) || recoveryNamespace.equals(initial.operation().sessionId())
+                || entries.values().stream().anyMatch(e -> recoveryNamespace.equals(e.intent.acceptedBusiness().operationId().sessionId()) || recoveryNamespace.equals(e.intent.prepareControl().sessionId()) || recoveryNamespace.equals(e.intent.finalizeControl().sessionId()))) throw new IOException("Invalid protected recovery namespace");
         long plans=0,routes=SessionWindowJournal.routeSize(homeRoute);
         var controls=new HashSet<OperationId>(); controls.add(initial.operation());
         for (var entry:entries.values()) {
@@ -386,8 +420,9 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return count;
     }
     private byte[] encode() throws IOException {
-        long size=4+64+4L+initial.encode().length+SessionWindowJournal.routeSize(homeRoute)+32+4+(observed==null ? 0 : observed.encode().length)+1;
-        if (pending!=null) size+=4L+DistributedCommandCodec.encodedSize(pending.command())+SessionWindowJournal.routeSize(pending.descriptor());
+        long size=4+64+4L+initial.encode().length+SessionWindowJournal.routeSize(homeRoute)+32+24+4+(observed==null ? 0 : observed.encode().length)+1;
+        if (pending!=null) size+=4L+(pendingRecovery==null ? DistributedCommandCodec.encodedSize(pending.command()) : pendingRecovery.bytes().length)+SessionWindowJournal.routeSize(pending.descriptor());
+        size+=positionSize(recoveryReceipt==null ? null : recoveryReceipt.position());
         size+=4+(homeResult==null ? 0 : homeResult.encode().length)+1+4;
         for (var entry:entries.values()) {
             size+=SessionWindowJournal.routeSize(entry.intent.route())+4L+DistributedCommandCodec.encodedSize(entry.intent.acceptedBusiness())+64+4L+4L*entry.intent.resultPositions().size()+4+(entry.registration==null ? 0 : entry.registration.encode().length)+1+voteSize(entry.vote)+4+(entry.finalization==null ? 0 : entry.finalization.finalization().encode().length)+positionSize(entry.receipt)+1;
@@ -395,8 +430,9 @@ public final class RatisDurableTransaction implements AutoCloseable {
         }
         if (size+32>MAX_BYTES) throw new IOException("Transaction journal bound exceeded");
         var output=ByteBuffer.allocate((int)size).putInt(MAGIC).put(identity).put(homeIdentity);
-        blob(output,initial.encode()); SessionWindowJournal.route(output,homeRoute); operation(output,lastHome); blob(output,observed==null ? null : observed.encode());
-        output.put((byte)(pending==null ? 0 : 1)); if (pending!=null) { blob(output,DistributedCommandCodec.encode(pending.command())); SessionWindowJournal.route(output,pending.descriptor()); }
+        blob(output,initial.encode()); SessionWindowJournal.route(output,homeRoute); operation(output,lastHome); uuid(output,recoveryNamespace); output.putLong(recoverySequence); blob(output,observed==null ? null : observed.encode());
+        output.put((byte)(pending==null ? 0 : pendingRecovery==null ? 1 : 2)); if (pending!=null) { blob(output,pendingRecovery==null ? DistributedCommandCodec.encode(pending.command()) : pendingRecovery.bytes()); SessionWindowJournal.route(output,pending.descriptor()); }
+        position(output,recoveryReceipt==null ? null : recoveryReceipt.position());
         blob(output,homeResult==null ? null : homeResult.encode()); output.put((byte)(homeSuperseded ? 1 : 0)); output.putInt(entries.size());
         for (var entry:entries.values()) {
             var intent=entry.intent;
@@ -413,14 +449,22 @@ public final class RatisDurableTransaction implements AutoCloseable {
             if (input.getInt()!=MAGIC) throw new IOException("Invalid transaction journal format");
             byte[] bound=new byte[32],homeBound=new byte[32]; input.get(bound).get(homeBound);
             if (!Arrays.equals(bound,identity) || !Arrays.equals(homeBound,homeIdentity)) throw new IOException("Wrong transaction journal client identity");
-            initial=TransactionStatus.decode(blob(input,TransactionStatus.MAX_BYTES,false)); initial.requireInitial(); homeRoute=SessionWindowJournal.route(input); lastHome=operation(input);
+            initial=TransactionStatus.decode(blob(input,TransactionStatus.MAX_BYTES,false)); initial.requireInitial(); homeRoute=SessionWindowJournal.route(input); lastHome=operation(input); recoveryNamespace=new UUID(input.getLong(),input.getLong()); recoverySequence=input.getLong();
             byte[] status=blob(input,TransactionStatus.MAX_BYTES,true); observed=status==null ? null : TransactionStatus.decode(status);
             if (observed!=null) requireMonotone(initial,observed);
-            if (flag(input)) {
-                var command=DistributedCommandCodec.decode(blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); var route=SessionWindowJournal.route(input);
-                requireHomeRoute(route); pending=homes.restore(command,route);
+            int homeKind=input.get() & 255; if (homeKind>2) throw new IOException("Invalid pending home request kind");
+            if (homeKind!=0) {
+                byte[] command=blob(input,homeKind==2 ? HomeRecovery.MAX_BYTES : DistributedCommandCodec.MAX_ENCODED_BYTES,false); var route=SessionWindowJournal.route(input);
+                requireHomeRoute(route);
+                if (homeKind==2) { pendingRecovery=homes.restoreRecovery(HomeRecovery.decode(command),route); pending=pendingRecovery.command(); }
+                else pending=homes.restore(DistributedCommandCodec.decode(command),route);
             }
+            var recoveryPosition=position(input);
             byte[] result=blob(input,8,true); homeResult=result==null ? null : CommandResult.decode(result); homeSuperseded=flag(input);
+            if (recoveryPosition!=null) {
+                if (pendingRecovery==null || homeResult==null) throw new IOException("Protected receipt lacks frozen request/result");
+                recoveryReceipt=new HomeRecoveryReceipt(pendingRecovery.recovery(),recoveryPosition,homeResult);
+            } else if (pendingRecovery!=null && homeResult!=null) throw new IOException("Protected result lacks retained receipt");
             int count=input.getInt(); if (count<1 || count>TransactionStatus.MAX_PARTICIPANTS) throw new IOException("Invalid journal participant count");
             for (int i=0;i<count;i++) {
                 var route=SessionWindowJournal.route(input); var business=DistributedCommandCodec.decode(blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false));
@@ -452,9 +496,14 @@ public final class RatisDurableTransaction implements AutoCloseable {
                 }
             }
             if (input.hasRemaining()) throw new IOException("Trailing transaction journal bytes");
-            if (pending==null || !pending.command().operationId().equals(lastHome) || !initial.sameDefinition(next(pending))) throw new IOException("Invalid journal home request");
+            if (pending==null || pendingRecovery==null && !pending.command().operationId().equals(lastHome) || !initial.sameDefinition(next(pending))) throw new IOException("Invalid journal home request");
             if (expected(pending)==null) { if (!next(pending).equals(initial)) throw new IOException("Invalid journal registration"); }
             else next(pending).requireSuccessorOf(expected(pending));
+            if (pendingRecovery!=null) {
+                var op=pendingRecovery.recovery().operation();
+                if (!op.sessionId().equals(recoveryNamespace) || op.epoch()!=0 || recoverySequence<=0 || op.sequence()!=recoverySequence-1) throw new IOException("Protected recovery high-water identity changed");
+                if (pendingRecovery.recovery().action()==HomeRecovery.Action.ACK) pendingRecovery.recovery().requireOutcome(entry(pendingRecovery.recovery().proof().participant()).outcome);
+            } else if (expected(pending)!=null && protectedTransition(expected(pending),next(pending))) throw new IOException("Unprotected recovery journal transition");
             if (homeSuperseded && (homeResult!=null || !homeSupersedesPending())) throw new IOException("Home request retirement has no newer observed proof");
             if (homeResult!=null && homeResult.status()==CommandResult.Status.SUCCESS) {
                 var successful=next(pending);

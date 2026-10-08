@@ -91,7 +91,7 @@ class RatisNegativeParticipantProtocolTest {
                 wire.positive=true; assertThrows(IOException.class,() -> journal.executePreparation(data.f.groupId)); assertNull(journal.snapshot().participant(data.f.groupId).vote());
                 wire.prepared=new PreparedParticipant(preparation,new ApplyPosition(1,1));
                 assertThrows(IOException.class,() -> journal.resolveParticipant(data.f.groupId)); assertNull(journal.snapshot().participant(data.f.groupId).vote());
-                wire.prepared=null; var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); journal.queueHome(home.statuses.prepare(helper.homeOperation(1),plan.initial(),abort)); journal.executeHome();
+                wire.prepared=null; var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); journal.queueRecovery(abort); journal.executeHome();
                 var finalization=new ParticipantFinalization(home.f.groupId,1,data.f.groupId,plan.intent().finalizeControl(),abort);
                 wire.outcome=new ParticipantOutcome(finalization,new ApplyPosition(1,2),ParticipantVote.prepared(new ApplyPosition(1,1)),null);
                 assertThrows(IOException.class,() -> journal.resolveParticipant(data.f.groupId)); assertNull(journal.snapshot().participant(data.f.groupId).outcome()); assertNull(journal.snapshot().participant(data.f.groupId).vote());
@@ -119,8 +119,8 @@ class RatisNegativeParticipantProtocolTest {
     }
     // Locate the single participant's documented current state-kind byte without relying on random body matches.
     private int preparationKind(byte[] body) throws IOException {
-        var b=ByteBuffer.wrap(body); b.position(68); skipBlob(b); SessionWindowJournal.route(b); b.position(b.position()+32); skipBlob(b);
-        assertEquals(1,b.get()); skipBlob(b); SessionWindowJournal.route(b); skipBlob(b); b.get(); assertEquals(1,b.getInt());
+        var b=ByteBuffer.wrap(body); b.position(68); skipBlob(b); SessionWindowJournal.route(b); b.position(b.position()+32+24); skipBlob(b);
+        assertEquals(1,b.get()); skipBlob(b); SessionWindowJournal.route(b); assertEquals(0,b.get()); skipBlob(b); b.get(); assertEquals(1,b.getInt());
         SessionWindowJournal.route(b); skipBlob(b); b.position(b.position()+64); int slots=b.getInt(); b.position(b.position()+4*slots); skipBlob(b); return b.position();
     }
     private void skipBlob(ByteBuffer b) { int size=b.getInt(); if (size>=0) b.position(b.position()+size); }
