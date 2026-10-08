@@ -1383,3 +1383,44 @@ readiness. Coordinated new-cluster/bootstrap workflow, CLI/public API adapters,
 schema/topology transitions, full resource budgets, transactions/2PC and the other
 architecture requirements remain open. Standalone behavior is unchanged and the
 active goal remains incomplete.
+
+## Range-state metadata reads for bootstrap prerequisites
+
+`RangeStateView` now carries a bounded immutable native metadata cut: group/epoch,
+domain, schema/columns/interval, completed apply position and installed session
+authority. Its canonical codec uses strict lengths/order/presence flags and an
+8-byte request that cannot overlap valid legacy point requests (minimum16 bytes).
+Scope matching validates the captured directory/descriptor and authority identity;
+serving prerequisites require a positive-term applied cut and full target authority
+dominance. Those metadata predicates do not establish quorum freshness themselves.
+
+Native snapshot pins read authority through the same RocksDB snapshot as their
+captured A; a later apply cannot contaminate an old metadata reply. The Ratis query
+seam recognizes only the reserved metadata request and retains ordinary point,
+pause/reload and stale-index guards. It releases native pin use before completion.
+No user column/key lookup or mutation is performed for metadata requests.
+
+The routed client selects an active group in its captured directory, uses its
+normal bounded call admission and verifies reply scope before returning. The
+production pooled transport uses sendReadOnly under the node's LINEARIZABLE server
+configuration, never stale-read RPCs. Missing, malformed, wrong-incarnation/schema/
+geometry and unsupported custom-transport replies fail rather than serving as
+readiness proof. Existing custom transports remain source-compatible through a
+default unsupported method; call/client leases settle on every result/failure.
+
+The full ordinary gate passes 82 core/native, 19 patched-server and 86 adapter
+cases (187 total), exit zero: `/tmp/rockserver-range-state-view-full-gate.log`.
+Four codec cases cover canonical/deep immutable round trips, request separation,
+truncation/shape/order/size errors and serving prerequisites. The native pin case
+holds an older A/authority across a later update and proves both old/new cuts.
+Two adapter cases cover uninitialized authority, bound metadata, legacy point
+compatibility, pause/reload/ahead-index rejection, wrong scope/missing replies and
+repeated calls after failure. Production RPC/query paths are compiled; real pooled
+network/read-index quorum acceptance is not exercised. Excluded workflows/density
+fixture remain inactive; no push/deploy or main-checkout change occurred.
+
+Bootstrap can now request range metadata without probing customer keys. Coordinated
+placement/catalogue creation and readiness, CLI/public API/schema adapters, topology,
+full resource budgets, transactions/2PC and other architecture requirements remain
+open. This metadata read is not placement authorization or a claim that all expected
+replicas/failure domains have been accepted. Standalone behavior is unchanged.

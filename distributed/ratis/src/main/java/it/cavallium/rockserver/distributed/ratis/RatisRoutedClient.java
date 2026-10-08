@@ -34,6 +34,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     public interface Transport extends AutoCloseable {
         byte[] read(RangeDescriptor descriptor, UUID columnId, byte[] physicalKey) throws IOException;
         CommandResult command(RangeDescriptor descriptor, DistributedCommand command) throws IOException;
+        default RangeStateView stateView(RangeDescriptor descriptor) throws IOException { throw new IOException("Range-state reads unsupported by this transport"); }
         @Override default void close() throws IOException {}
     }
 
@@ -91,6 +92,21 @@ public final class RatisRoutedClient implements AutoCloseable {
             byte[] value = transport.read(descriptor, columnId, key);
             if (value != null && value.length > DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Point value exceeds budget");
             return value == null ? null : value.clone();
+        } finally { endCall(); }
+    }
+
+    /** Linearizable metadata read through the same pooled Ratis transport; scope is verified against the captured directory. */
+    public RangeStateView stateView(UUID groupId) throws IOException {
+        Objects.requireNonNull(groupId); var observed=current();
+        var descriptor=observed.ranges().stream().filter(range -> range.groupId().equals(groupId)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Range-state group is absent from directory"));
+        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Range-state group is inactive");
+        beginCall();
+        try {
+            var view=transport.stateView(descriptor); if (view==null) throw new IOException("Missing range-state reply");
+            try { view.requireMatches(observed,descriptor); }
+            catch (IllegalArgumentException mismatch) { throw new IOException("Range-state reply differs from routed identity",mismatch); }
+            return view;
         } finally { endCall(); }
     }
 
@@ -260,6 +276,14 @@ public final class RatisRoutedClient implements AutoCloseable {
                 if (size == -1 && !input.hasRemaining()) return null;
                 if (size < 0 || size != input.remaining()) throw new IOException("Invalid point reply length");
                 byte[] value = new byte[size]; input.get(value); return value;
+            } });
+        }
+
+        @Override public RangeStateView stateView(RangeDescriptor descriptor) throws IOException {
+            return rpc(() -> { try (var lease=clients.acquire(descriptor)) {
+                byte[] encoded=content(lease.client().io().sendReadOnly(Message.valueOf(ByteString.copyFrom(RangeStateView.request()))));
+                try { return RangeStateView.decode(encoded); }
+                catch (IllegalArgumentException malformed) { throw new IOException("Invalid range-state reply",malformed); }
             } });
         }
 

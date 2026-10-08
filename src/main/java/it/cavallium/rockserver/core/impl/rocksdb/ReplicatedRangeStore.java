@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
 import it.cavallium.rockserver.core.common.distributed.SessionAuthority;
 import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
+import it.cavallium.rockserver.core.common.distributed.RangeStateView;
 import it.cavallium.rockserver.core.common.distributed.ReceiptUsage;
 import it.cavallium.rockserver.core.common.distributed.ReceiptRetentionEstimate;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
@@ -369,8 +370,9 @@ public final class ReplicatedRangeStore {
     private byte[] authorityKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x13).array(); }
     private byte[] bindingPrefix() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x14).array(); }
     private byte[] bindingKey(long epoch) { return ByteBuffer.allocate(25).put(bindingPrefix()).putLong(epoch).array(); }
-    private SessionAuthority sessionAuthority() throws RocksDBException {
-        byte[] bytes=db.get(state,authorityKey());
+    private SessionAuthority sessionAuthority() throws RocksDBException { return sessionAuthority(null); }
+    private SessionAuthority sessionAuthority(ReadOptions options) throws RocksDBException {
+        byte[] bytes=options==null ? db.get(state,authorityKey()) : db.get(state,options,authorityKey());
         if (bytes==null) return null;
         var control=RangeSessionControl.decode(bytes);
         if (control.binding()) throw new IllegalStateException("Invalid persisted session authority");
@@ -874,6 +876,13 @@ public final class ReplicatedRangeStore {
         public Set<UUID> columns() { return columns.keySet(); }
         public Set<UUID> deterministicMergeColumns() { return deterministicMergeColumns; }
         public RangeOwnership.Interval interval() { return interval; }
+        /** Immutable identity and authority from this same completed native snapshot cut; no user keys are accessed. */
+        public RangeStateView stateView() throws RocksDBException {
+            acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) {
+                return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,columns.keySet(),interval.lowerInclusive(),interval.upperExclusive(),position,sessionAuthority(options));
+            } finally { releaseUse(); }
+        }
         public Configuration configuration() throws RocksDBException {
             acquireUse();
             try (var options = new ReadOptions().setSnapshot(snapshot)) {

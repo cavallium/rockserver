@@ -6,6 +6,7 @@ import java.util.function.Consumer;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommandCodec;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectory;
+import it.cavallium.rockserver.core.common.distributed.RangeStateView;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
 import java.nio.channels.FileChannel;
@@ -776,6 +777,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         try {
             requireHealthy();
             byte[] encoded = request.getContent().toByteArray();
+            if (encoded.length==8) {
+                if (!RangeStateView.isRequest(encoded)) throw new IllegalArgumentException("Invalid range-state request");
+                try (var pin=snapshotPin()) {
+                    return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(pin.stateView().encode())));
+                }
+            }
             if (encoded.length < 16 || encoded.length > DistributedCommandCodec.MAX_ENCODED_BYTES) {
                 throw new IllegalArgumentException("Invalid point read size");
             }
