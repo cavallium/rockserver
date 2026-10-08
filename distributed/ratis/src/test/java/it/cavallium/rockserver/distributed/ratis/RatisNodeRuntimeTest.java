@@ -179,9 +179,10 @@ class RatisNodeRuntimeTest {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest(); final RatisSessionEpochsTest.Fixture catalogue;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"node-runtime-test");
         final RatisSessionClockServiceTest.ManualTimer timer=new RatisSessionClockServiceTest.ManualTimer();
-        final Path nodeRoot; final RatisNodePlan plan; final RatisRoutedClient routed; int transportCloses;
+        final Path nodeRoot; final RatisNodePlan plan; final RatisRoutedClient routed; int transportCloses; boolean resourcesTransferred;
         Env(Path root) throws Exception { this(root,false); }
-        Env(Path root,boolean localCatalogue) throws Exception {
+        Env(Path root,boolean localCatalogue) throws Exception { this(root,localCatalogue,new byte[32]); }
+        Env(Path root,boolean localCatalogue,byte[] schemaDigest) throws Exception {
             catalogue=outer.new Fixture(root.resolve("catalogue")); var ledger=SessionEpochLedger.initial(outer.cluster,outer.database,10);
             catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,ledger));
             UUID local=new UUID(9,1), incarnation=new UUID(9,2); var ranges=new ArrayList<RangeDescriptor>();
@@ -192,7 +193,7 @@ class RatisNodeRuntimeTest {
                 ranges.add(new RangeDescriptor(new UUID(6,i+2),new UUID(3,i+1),1,0,i==0 ? null : new byte[]{(byte)128},i==0 ? new byte[]{(byte)128} : null,
                         RangeDescriptor.TopologyState.ACTIVE,List.of(replica,remote)));
             }
-            var directory=new RangeDirectory(outer.cluster,outer.database,new UUID(6,1),1,new byte[32],1,Set.of(outer.data),0,ranges);
+            var directory=new RangeDirectory(outer.cluster,outer.database,new UUID(6,1),1,schemaDigest,1,Set.of(outer.data),0,ranges);
             var remote=new ReplicaDescriptor(new UUID(8,1),new UUID(8,2),new UUID(8,8),"node8","127.0.0.1:4511",ReplicaDescriptor.Role.VOTER);
             plan=new RatisNodePlan(local,incarnation,directory,new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,localCatalogue ? List.of(remote,new ReplicaDescriptor(local,incarnation,new UUID(9,8),"node9","127.0.0.1:4512",ReplicaDescriptor.Role.VOTER)) : List.of(remote)),Map.of(outer.data,"data"),Set.of(),localCatalogue ? 3 : 2);
             routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
@@ -207,7 +208,10 @@ class RatisNodeRuntimeTest {
                     Duration.ofSeconds(1),1,2,Duration.ofMillis(100));
             return RatisNodeRuntime.open(plan,nodeRoot,ConfigParser.parseDefault(),catalogue.epochs,routed,scheduler,timer,() -> 20L,settings,startup,fake::create);
         }
-        public void close() throws Exception { routed.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close(); }
+        public void close() throws Exception {
+            if (resourcesTransferred) catalogue.pool.close();
+            else { routed.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close(); }
+        }
     }
     static final class FakeServer {
         boolean created,wrongEndpoint,joint,rejectAdd,allFencedAtClose,failCreate,failStart,exposedBeforeStart; int closes,starts;

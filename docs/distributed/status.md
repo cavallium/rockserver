@@ -1565,3 +1565,47 @@ six bootstrap cases and existing catalogue/genesis/session paths still pass.
 This is local native/interface evidence on disk fixtures. Network/quorum,
 server-process, power-loss, performance-density and deployment acceptance remain
 unverified; the excluded density fixture was neither staged nor selected.
+
+## Schema-bound node manifest and optional recovery service
+
+`RatisNodeManifest` provides a canonical, checksummed configuration for a static
+node: schema content, complete directory, catalogue membership/column roles,
+node/incarnation, physical CF bindings, snapshot/receipt/clock/shutdown limits and
+scheduler capacities. Its bounded decoder verifies nested content, canonical UUID
+order, exact local group coverage and safe resource shapes before runtime use.
+Known local data/catalogue column counts must fit the snapshot limit. Operator
+activation and merges are rejected until their distributed activation protocol
+exists. File writes use a stable sibling writer lock, atomic replacement and
+forced storage. The manifest conveys no initial-placement authority.
+
+`RatisNodeService` owns the runtime's shared clients, timer and workload scheduler.
+Its public recovery entry point requires established native and Raft state; it
+never initializes an empty node. Production workload settings are validated
+against manifest capacities. Start reports local division/runtime state, and a
+separate bounded `verifyCatalogue` call freshly checks the exact published schema
+and directory. A failed native drain keeps all dependencies and node ownership
+available for retry. Duplicate start cannot invalidate an already running node.
+
+The optional module's `RatisNodeMain` accepts established-node root, manifest and
+storage-config paths. It launches only the recovery service, keeps the process
+alive and closes resources at shutdown after startup settles. Standalone `Main`,
+its configuration, and its frontend transports are unchanged. The launcher was
+compiled only; no server process or network probe was run. Initial placement
+creation, schema transitions, full frontend/API capability parity and the other
+architecture requirements remain unfinished.
+
+Validation: the established selected `test-compile surefire:test@default-test`
+broader gate passed 90 core, 19 patched-server and 113 adapter cases (222 total),
+exit zero: `/tmp/rockserver-node-service-full-gate.log`. After the independent
+failed-open cleanup fix, the final focused gate passed five manifest and four
+service cases, exit zero: `/tmp/rockserver-node-service-cleanup-gate.log`.
+Unchanged behavior retains the broader-gate evidence. Manifest cases cover
+canonical recovery/configuration identity, malformed/truncated/oversized inputs,
+known local snapshot-column budgets, schema/operator/resource rejection and file
+checksum/writer-lock behavior. Service cases exercise established native recovery
+through controlled Ratis interfaces, fresh schema polling, duplicate start,
+pin-blocked drain with retained clients, explicit retry/idempotent close and
+best-effort failed-open cleanup even when a client close fails. All selected cases
+had zero failures/errors/skips. Production launcher execution, network/quorum,
+power-loss and measured performance acceptance remain unverified; the excluded
+fixture was not selected or staged.
