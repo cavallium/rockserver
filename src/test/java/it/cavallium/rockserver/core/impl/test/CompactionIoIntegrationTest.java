@@ -83,13 +83,68 @@ class CompactionIoIntegrationTest {
             var nativeDb = ((it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB) dbField.get(internal)).get();
             var columnsField = internal.getClass().getDeclaredField("columns");
             columnsField.setAccessible(true);
-            var handle = ((it.cavallium.rockserver.core.impl.ColumnInstance)
-                    ((java.util.Map<?, ?>) columnsField.get(internal)).get(column)).cfh();
-            assertTrue(Long.parseUnsignedLong(nativeDb.getProperty(handle, "rocksdb.num-files-at-level0")) > 0,
-                    "the regression must sample a real flushed L0 SST");
+            var registeredColumn = (it.cavallium.rockserver.core.impl.ColumnInstance)
+                    ((java.util.Map<?, ?>) columnsField.get(internal)).get(column);
+            var handle = registeredColumn.cfh();
+            long levelZeroFiles = Long.parseUnsignedLong(nativeDb.getProperty(handle, "rocksdb.num-files-at-level0"));
+            assertTrue(levelZeroFiles > 0, "the regression must sample a real flushed L0 SST");
+            var perColumnProperty = internal.getClass().getDeclaredMethod("getPerCfLongProperty", String.class);
+            perColumnProperty.setAccessible(true);
+            var counts = (java.util.Map<?, ?>) perColumnProperty.invoke(internal, "rocksdb.num-files-at-level0");
+            assertEquals(Long.valueOf(levelZeroFiles), counts.get("sampler-data"));
+            var aggregateProperty = internal.getClass().getDeclaredMethod("getLongProperty", String.class,
+                    it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode.class);
+            aggregateProperty.setAccessible(true);
+            assertEquals(java.math.BigInteger.valueOf(levelZeroFiles), aggregateProperty.invoke(internal,
+                    "rocksdb.num-files-at-level0", it.cavallium.rockserver.core.impl.RocksDBLongProperty.AggregationMode.PER_CF));
             assertThrows(org.rocksdb.RocksDBException.class,
                     () -> nativeDb.getLongProperty(handle, "rocksdb.num-files-at-level0"),
                     "the native registry exposes this count only through the string-property API");
+            assertEquals(Long.valueOf(0), ((java.util.Map<?, ?>) perColumnProperty.invoke(internal,
+                    "rocksdb.num-files-at-level1")).get("sampler-data"));
+            assertTrue(((java.util.Map<?, ?>) perColumnProperty.invoke(internal, "rocksdb.num-files-at-level9")).isEmpty());
+            // Isolate the cached CF trigger from DB-wide delay using the real flushed L0 count.
+            assertEquals(0, nativeDb.getLongProperty("rocksdb.actual-delayed-write-rate"));
+            var configuredColumnsField = internal.getClass().getDeclaredField("columnsConifg");
+            configuredColumnsField.setAccessible(true);
+            var columnOptions = (org.rocksdb.ColumnFamilyOptions)
+                    ((java.util.Map<?, ?>) configuredColumnsField.get(internal)).get("sampler-data");
+            var pressureColumnsField = internal.getClass().getDeclaredField("storagePressureColumns");
+            pressureColumnsField.setAccessible(true);
+            var originalPressureColumns = (Object[]) pressureColumnsField.get(internal);
+            var cachePressureColumn = internal.getClass().getDeclaredMethod("storagePressureColumn", String.class,
+                    org.rocksdb.ColumnFamilyHandle.class);
+            cachePressureColumn.setAccessible(true);
+            int originalSlowdown = columnOptions.level0SlowdownWritesTrigger();
+            try {
+                for (int trigger : new int[]{1, 2, -1}) {
+                    columnOptions.setLevel0SlowdownWritesTrigger(trigger);
+                    var configured = cachePressureColumn.invoke(internal, "sampler-data", handle);
+                    var cachedTrigger = configured.getClass().getDeclaredMethod("effectiveLevel0SlowdownWritesTrigger");
+                    cachedTrigger.setAccessible(true);
+                    assertEquals(trigger, cachedTrigger.invoke(configured));
+                    var constructor = configured.getClass().getDeclaredConstructors()[0];
+                    constructor.setAccessible(true);
+                    configured = constructor.newInstance((long) handle.getID(), handle, registeredColumn,
+                            columnOptions.softPendingCompactionBytesLimit(), cachedTrigger.invoke(configured));
+                    var snapshot = originalPressureColumns.clone();
+                    var cachedHandle = configured.getClass().getDeclaredMethod("handle");
+                    cachedHandle.setAccessible(true);
+                    for (int index = 0; index < snapshot.length; index++) {
+                        if (((org.rocksdb.ColumnFamilyHandle) cachedHandle.invoke(snapshot[index])).getID() == handle.getID()) {
+                            snapshot[index] = configured;
+                        }
+                    }
+                    pressureColumnsField.set(internal, snapshot);
+                    var classified = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+                    assertEquals(trigger >= 0 && levelZeroFiles >= trigger, classified.urgentPressure());
+                    assertEquals(classified.urgentPressure(), classified.pressure());
+                    assertEquals(!classified.urgentPressure(), classified.recoveryClear());
+                }
+            } finally {
+                pressureColumnsField.set(internal, originalPressureColumns);
+                columnOptions.setLevel0SlowdownWritesTrigger(originalSlowdown);
+            }
             var flushed = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
             assertTrue(flushed.valid());
             assertFalse(flushed.pressure());
@@ -119,6 +174,12 @@ class CompactionIoIntegrationTest {
             assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
                 while (readCounter.count() <= initialReadExport || writeCounter.count() <= initialWriteExport) Thread.sleep(10);
             });
+            assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                while (registry.find("rocksdb.property.long").tag("property_name", "rocksdb.num-files-at-level0")
+                        .tag("column_family", "sampler-data").gauge() == null) Thread.sleep(10);
+            });
+            assertEquals(levelZeroFiles, registry.get("rocksdb.property.long")
+                    .tag("property_name", "rocksdb.num-files-at-level0").tag("column_family", "sampler-data").gauge().value());
             try (var nativeStatistics = ((org.rocksdb.DBOptions) optionsField.get(internal)).statistics()) {
                 long previousReads = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ);
                 long previousWrites = nativeStatistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN);

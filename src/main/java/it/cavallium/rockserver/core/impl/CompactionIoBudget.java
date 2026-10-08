@@ -7,7 +7,14 @@ public final class CompactionIoBudget {
     public enum State { BOOTSTRAP, TRACKING, PROBE, RECOVERY }
     public record Sample(long nanos, long readCount, long readMicros, long bytes,
                          boolean background, boolean pressure, boolean stopped, boolean valid,
-                         boolean foregroundPending, long foregroundCompletions, boolean recoveryClear) {
+                         boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
+                         boolean urgentPressure) {
+        public Sample(long nanos, long readCount, long readMicros, long bytes,
+                      boolean background, boolean pressure, boolean stopped, boolean valid,
+                      boolean foregroundPending, long foregroundCompletions, boolean recoveryClear) {
+            this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, pressure || stopped);
+        }
         public Sample(long nanos, long readCount, long readMicros, long bytes,
                       boolean background, boolean pressure, boolean stopped, boolean valid) {
             this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid, false, 0, !pressure && !stopped);
@@ -46,12 +53,15 @@ public final class CompactionIoBudget {
     public long sample(Sample sample) {
         var old = previous;
         previous = sample;
-        boolean nativePressure = sample.pressure || sample.stopped;
+        boolean nativePressure = sample.urgentPressure || sample.stopped;
         if (nativePressure && state != State.RECOVERY) {
             // Restore useful measured service once; repeated stalled polls must not ramp.
+            boolean tracking = state == State.TRACKING;
             state = State.RECOVERY;
             healthyRecovery = 0;
-            budget = bound(Math.max(Math.max(seed, preThrottle), Math.max(recentAchieved, probeBudget)));
+            double usefulService = Math.max(preThrottle, Math.max(recentAchieved, probeBudget));
+            if (usefulService > 0 && tracking) usefulService = Math.max(usefulService, budget);
+            budget = bound(usefulService > 0 ? usefulService : seed);
             probeBudget = 0;
             clearWindow();
         }
@@ -61,13 +71,14 @@ public final class CompactionIoBudget {
                 || sample.readMicros < old.readMicros || sample.bytes < old.bytes
                 || sample.foregroundCompletions < old.foregroundCompletions) {
             if (state == State.PROBE) finishProbe(false, 0);
+            if (state == State.RECOVERY) healthyRecovery = 0;
             clearWindow();
             return publishBudget();
         }
         long elapsed = sample.nanos - old.nanos;
         long completed = sample.readCount - old.readCount;
         long transferred = sample.bytes - old.bytes;
-        pressuredWindow |= nativePressure || !sample.recoveryClear;
+        pressuredWindow |= nativePressure;
         pendingForeground |= sample.foregroundPending;
         long completedActions = sample.foregroundCompletions - old.foregroundCompletions;
         if (completedActions > 0) noProgressProbeUsed = false;

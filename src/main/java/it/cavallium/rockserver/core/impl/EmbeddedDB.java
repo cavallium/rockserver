@@ -329,7 +329,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private record StoragePressureColumn(long id,
 			ColumnFamilyHandle handle,
 			@Nullable ColumnInstance registeredColumn,
-			long effectiveSoftPendingCompactionBytesLimit) {
+			long effectiveSoftPendingCompactionBytesLimit, int effectiveLevel0SlowdownWritesTrigger) {
 	}
 
 	private static long storagePressurePendingCompactionBytesOverride() {
@@ -1061,7 +1061,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return new StoragePressureColumn(handle.getID(),
 				handle,
 				null,
-				options.softPendingCompactionBytesLimit());
+				options.softPendingCompactionBytesLimit(), options.level0SlowdownWritesTrigger());
 	}
 
 	private void upsertStoragePressureColumn(StoragePressureColumn replacement) {
@@ -1122,7 +1122,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				pressureColumn.id(),
 				pressureColumn.handle(),
 				column,
-				pressureColumn.effectiveSoftPendingCompactionBytesLimit()));
+				pressureColumn.effectiveSoftPendingCompactionBytesLimit(), pressureColumn.effectiveLevel0SlowdownWritesTrigger()));
 
 		logger.info("Registered column: " + column);
 		return id;
@@ -3016,7 +3016,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							continue;
 						}
 						try {
-							val = val.add(new BigInteger(Long.toUnsignedString(db.get().getLongProperty(ci.cfh(), name))));
+							long value = name.startsWith("rocksdb.num-files-at-level")
+									? Long.parseUnsignedLong(db.get().getProperty(ci.cfh(), name))
+									: db.get().getLongProperty(ci.cfh(), name);
+							val = val.add(new BigInteger(Long.toUnsignedString(value)));
 						} catch (org.rocksdb.RocksDBException e) {
 							if (e.getStatus().getCode() == Code.NotFound) {
 								// skip
@@ -3077,12 +3080,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		ops.beginOp();
 		boolean stopped = false;
 		boolean pressure = false;
+		boolean urgentPressure = false;
 		try {
 			var observer = compactionIoSampleObserver;
 			if (observer != null) observer.run();
 			var nativeDb = db.get();
 			stopped = nativeDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY) != 0;
-			pressure = stopped || nativeDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
+			urgentPressure = stopped || nativeDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
+			pressure = urgentPressure;
 			boolean recoveryClear = !pressure;
 			// Unlike admission polling, inspect every column even after a pressure trigger.
 			boolean complete = true;
@@ -3095,8 +3100,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					pressure |= limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
 					recoveryClear &= !(limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit - limit / 5) >= 0);
 					long levelZeroFiles = Long.parseUnsignedLong(nativeDb.getProperty(column.handle(), "rocksdb.num-files-at-level0"));
-					pressure |= Long.compareUnsigned(levelZeroFiles, 20) >= 0;
-					recoveryClear &= Long.compareUnsigned(levelZeroFiles, 16) < 0;
+					int slowdownTrigger = column.effectiveLevel0SlowdownWritesTrigger();
+					urgentPressure |= slowdownTrigger >= 0 && Long.compareUnsigned(levelZeroFiles, slowdownTrigger) >= 0;
+					pressure |= urgentPressure;
+					recoveryClear &= slowdownTrigger < 0
+							|| Long.compareUnsigned(levelZeroFiles, slowdownTrigger - slowdownTrigger / 5) < 0;
 				} finally { if (registered != null) registered.endUse(); }
 			}
 			try (var statistics = dbOptions.statistics()) {
@@ -3111,12 +3119,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						limiter.getTotalBytesThrough(), background, pressure, stopped, complete,
 						foregroundPending,
 						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ)
-								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear);
+								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
-			if (pressure) {
+			if (pressure || urgentPressure) {
 				return new CompactionIoBudget.Sample(System.nanoTime(), 0, 0, 0,
-						false, pressure, stopped, false);
+						false, pressure, stopped, false, false, 0, false, urgentPressure);
 			}
 			throw new RuntimeException(failure);
 		} finally { ops.endOp(); }
@@ -3203,7 +3211,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 				try {
 					String colName = new String(ci.cfh().getName());
-					long value = db.get().getLongProperty(ci.cfh(), name);
+					long value = name.startsWith("rocksdb.num-files-at-level")
+							? Long.parseUnsignedLong(db.get().getProperty(ci.cfh(), name))
+							: db.get().getLongProperty(ci.cfh(), name);
 					result.merge(colName, value, Long::sum);
 				} catch (org.rocksdb.RocksDBException e) {
 					if (e.getStatus().getCode() != Code.NotFound) {

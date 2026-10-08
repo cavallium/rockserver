@@ -55,13 +55,14 @@ class CompactionIoBudgetTest {
         assertTrue(t.policy.budget() > SEED * 4);
         assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
     }
-    @Test void observedStopOverridesPartialSampleAndRecoveryRequiresClearance() {
+    @Test void observedStopOverridesPartialSampleAndRecoveryRequiresUrgentClearance() {
         var p = new CompactionIoBudget(SEED);
         p.sample(new CompactionIoBudget.Sample(1, 0, 0, 0, false, true, true, false));
         assertEquals(CompactionIoBudget.State.RECOVERY, p.state());
         for (int i = 1; i < 20; i++) p.sample(new CompactionIoBudget.Sample(i * 1_000_000_000L,
                 0, 0, 0, false, false, false, true, false, 0, false));
-        assertEquals(CompactionIoBudget.State.RECOVERY, p.state());
+        assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state(),
+                "soft hysteresis alone must not retain urgent recovery");
     }
     @Test void probeTestsServiceWhenBudgetExceedsActualConsumption() {
         var t = new Trace(); t.window(10, 100, SEED);
@@ -181,6 +182,78 @@ class CompactionIoBudgetTest {
         assertEquals(100, t.policy.baselineReadMicros());
         for (int window = 0; window < 5; window++) t.window(10, 100, t.policy.budget());
         assertTrue(t.policy.budget() > CompactionIoBudget.MIN_BYTES_PER_SECOND);
+    }
+
+    @Test void urgentRecoveryYieldsToForegroundCalibrationInsideSoftDebtCorridor() {
+        var p = new CompactionIoBudget(SEED);
+        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
+        for (int second = 1; second <= 15; second++) {
+            p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L,
+                    second * 100, second * 600_000, second * (SEED / 4),
+                    true, false, false, true, true, second * 3_000, false));
+        }
+        assertEquals(CompactionIoBudget.State.PROBE, p.state(),
+                "soft debt hysteresis alone must not bypass foreground calibration indefinitely");
+        assertEquals(SEED / 4 * .75, p.budget());
+        for (int second = 16; second <= 25; second++) {
+            p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L,
+                    second * 100, second * 600_000, 15 * (SEED / 4) + (second - 15) * 187_500,
+                    true, false, false, true, true, second * 3_000, false));
+        }
+        assertEquals(SEED / 4, p.budget(), "an ineffective latency probe must restore observed useful service");
+        assertEquals(CompactionIoBudget.State.TRACKING, p.state());
+    }
+    @Test void urgentEntryRestoresKnownServiceInsteadOfAnUnrelatedStartupSeed() {
+        var t = new Trace();
+        t.window(10, 100, SEED / 4);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, true, true, false));
+        assertEquals(SEED / 4, t.policy.budget());
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
+    }
+
+    @Test void softPressureAloneCannotEnterUrgentRecovery() {
+        var t = new Trace();
+        t.window(0, 0, SEED);
+        for (int second = 1; second <= 5; second++) {
+            t.policy.sample(new CompactionIoBudget.Sample(t.nanos + second * 1_000_000_000L,
+                    second * 100, second * 600_000, t.bytes + second * SEED,
+                    true, true, false, true, true, second * 3_000, false, false));
+        }
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+    }
+    @Test void knownUrgencyOverridesAnIncompleteSnapshotAndInvalidWindowsRestartClearance() {
+        var t = new Trace();
+        t.window(10, 100, SEED / 4);
+        t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0,
+                false, false, false, false, true, 0, false, true));
+        assertEquals(SEED / 4, t.policy.budget());
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
+        var p = new CompactionIoBudget(SEED);
+        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
+        for (int second = 1; second <= 12; second++) {
+            p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L, 0, 0, 0,
+                    false, false, false, second != 6, false, 0, false));
+        }
+        assertEquals(CompactionIoBudget.State.RECOVERY, p.state(), "incomplete samples cannot count toward clearance");
+        for (int second = 13; second <= 17; second++) {
+            p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L, 0, 0, 0,
+                    false, false, false, true, false, 0, false));
+        }
+        assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state());
+    }
+
+    @Test void urgentReentryBeforeCalibrationDoesNotReuseAStaleStartupSeed() {
+        var p = new CompactionIoBudget(SEED);
+        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
+        for (int second = 1; second <= 15; second++) {
+            p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L, 0, 0, second * (SEED / 4),
+                    true, second <= 5, second <= 5, true, false, 0, false));
+        }
+        assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state());
+        assertEquals(SEED, p.budget());
+        p.sample(new CompactionIoBudget.Sample(16_000_000_000L, 0, 0, 4 * SEED, true, true, true, true));
+        assertEquals(SEED / 4, p.budget(), "known service must replace the startup seed before recalibration");
     }
 
 }
