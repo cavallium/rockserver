@@ -1131,3 +1131,52 @@ Automatic multi-range clock/floor scheduling and aggregate completion, bounded
 node/pool/tenant budgets, public runtime integration and the other previously
 listed architecture work remain open. The journal supplies a per-range durable
 control owner; it does not establish catalogue-wide instantaneous expiry.
+
+## Durable bounded multi-range session propagation rounds
+
+`RatisSessionPropagation` now freezes a fresh catalogue authority cut together with
+one complete active directory's digest/generation and sorted group/incarnation
+participants. Starting with inactive coverage or more than the configured range
+budget rejects before publishing a round. An unfinished round cannot be replaced
+by a newer target. A directory refresh during preparation leaves the round
+unstarted; changes before/after step work reject without silently rebasing scope.
+
+Each step visits at most its configured 1..32 unfinished participants and submits
+at most one control per visit. It opens one dedicated clock journal at a time,
+checks that journal's exact range epoch, and counts a participant only when its
+durable `propagated` authority dominates the full frozen target. Resolving an older
+ambiguous success below target leaves that range incomplete for another visit.
+I/O failures retain child identities, advance a durable fairness cursor and return
+bounded errors while allowing other groups to progress. The budget counts visits
+and control submissions, not catalogue reads, leader discovery or raw network RPCs.
+
+The aggregate manifest persists participant completion only after the child stream
+has durably consumed its successful control. Aggregate write failure fences the
+owner; reopen can reconstruct the child's proof without another submission.
+Checksummed bounded manifests, exclusive stable root ownership and atomic forced
+replacement follow the maintenance journal ordering through a shared file helper.
+`Progress` exposes the frozen target, directory digest/generation, exact participants
+and completion counts. Completed historical scope is explicit; neither later
+topology nor another routing domain is implied. A missing/wrong-incarnation clock
+journal cannot contribute an old incarnation's proof to a new participant.
+
+The full ordinary gate passes 77 core/native, 16 read-round and 52 adapter cases
+(145 total), exit zero: `/tmp/rockserver-session-propagation-full-gate.log`.
+After adding the preparation-refresh guard, the final focused gate passes 22
+adapter cases, exit zero: `/tmp/rockserver-session-propagation-final-gate.log`.
+Six propagation cases exercise two native groups, work-budget bounds, failed-first-
+group fairness across reopen, frozen completion below newer catalogue time, lost
+reply/older control resolution, receipt conservation, topology/scope rejection,
+wrong-incarnation proof rejection, preparation refresh, exclusive active ownership,
+corrupt manifests and aggregate persistence failure after durable child success.
+All seven maintenance cases pass with the shared file helper. These remain native/
+interface/filesystem acceptance, not actual transport/quorum, physical-power-loss,
+independent-node or representative performance acceptance. Excluded workflows and
+untracked density fixture remain inactive; no push/deploy/main-checkout change.
+
+A caller can now drive durable multi-range rounds with bounded step work. Automatic
+logical-time advancement and timer/workload-scheduler integration, topology
+reconciliation of unfinished rounds, cross-domain coverage, node/pool/tenant
+budgets and public service/Main integration remain to implement. This component's
+completion proves only the requested frozen directory/cut, not instantaneous
+catalogue-wide expiry.

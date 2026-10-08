@@ -2,12 +2,9 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.io.*;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.file.*;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.*;
 
 /** One pending durable maintenance stream for a range incarnation. Caller owns the borrowed clients. */
@@ -62,6 +59,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
     }
     public synchronized DistributedCommand pendingCommand() { return state.pending()==null ? null : state.pending().command(); }
     public synchronized SessionAuthority propagated() { return state.propagated(); }
+    public long rangeEpoch() { return rangeEpoch; }
     public DistributedCommand prepareAdvance() throws IOException { return prepare(null,0); }
     public DistributedCommand prepareBinding(SessionEpochLedger.Grant grant,int window) throws IOException {
         return prepare(Objects.requireNonNull(grant),window);
@@ -126,7 +124,6 @@ public final class RatisSessionMaintenance implements AutoCloseable {
         finally { lockChannel.close(); }
     }
     private void persist(State next) throws IOException {
-        Path temporary=null;
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
             output.writeInt(MAGIC); output.writeInt(1); output.write(identity); uuid(output,group); output.writeLong(rangeEpoch);
@@ -135,24 +132,10 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             blob(output,next.pending()==null ? null : DistributedCommandCodec.encode(next.pending().command()));
             if (next.pending()!=null) route(output,next.pending().descriptor());
             output.flush(); byte[] body=bytes.toByteArray();
-            if (body.length+32>MAX_JOURNAL) throw new IOException("Maintenance journal exceeds bound");
-            bytes.write(digest(body));
-            temporary=journal.resolveSibling(journal.getFileName()+".pending");
-            try (var file=FileChannel.open(temporary,StandardOpenOption.CREATE,StandardOpenOption.TRUNCATE_EXISTING,StandardOpenOption.WRITE)) {
-                var buffer=ByteBuffer.wrap(bytes.toByteArray()); while (buffer.hasRemaining()) file.write(buffer); file.force(true);
-            }
-            Files.move(temporary,journal,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
-            temporary=null;
-            force(journal.getParent());
+            SessionJournalFiles.write(journal,body,MAX_JOURNAL);
         } catch (IOException failure) { fenced=true; throw failure; }
-        finally { if (temporary!=null) Files.deleteIfExists(temporary); }
     }
-    private byte[] readJournal() throws IOException {
-        long size=Files.size(journal); if (size<32 || size>MAX_JOURNAL) throw new IOException("Invalid maintenance journal size");
-        byte[] encoded=Files.readAllBytes(journal), body=Arrays.copyOf(encoded,encoded.length-32);
-        if (!MessageDigest.isEqual(digest(body),Arrays.copyOfRange(encoded,body.length,encoded.length))) throw new IOException("Maintenance journal checksum mismatch");
-        return body;
-    }
+    private byte[] readJournal() throws IOException { return SessionJournalFiles.read(journal,MAX_JOURNAL); }
     private State decode(DataInputStream input) throws IOException {
         var session=uuid(input); long epoch=input.readLong(), sequence=input.readLong(), acknowledged=input.readLong();
         byte[] propagated=blob(input,RangeSessionControl.ADVANCE_BYTES), pending=blob(input,256);
@@ -201,11 +184,5 @@ public final class RatisSessionMaintenance implements AutoCloseable {
     }
     private static void uuid(DataOutputStream output,UUID id) throws IOException { output.writeLong(id.getMostSignificantBits()); output.writeLong(id.getLeastSignificantBits()); }
     private static UUID uuid(DataInputStream input) throws IOException { return new UUID(input.readLong(),input.readLong()); }
-    private static byte[] digest(byte[] bytes) {
-        try { return MessageDigest.getInstance("SHA-256").digest(bytes); }
-        catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
-    }
-    private static void force(Path path) throws IOException {
-        try (var file=FileChannel.open(path,StandardOpenOption.READ)) { file.force(true); }
-    }
+    private static void force(Path path) throws IOException { SessionJournalFiles.force(path); }
 }
