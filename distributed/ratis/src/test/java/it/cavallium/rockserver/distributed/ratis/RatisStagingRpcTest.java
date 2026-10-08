@@ -58,6 +58,33 @@ class RatisStagingRpcTest {
             }
         }
     }
+    @Test void rangeStagingUsesOrderedPointReturnsAndDurableAcceptedRetryAfterLostReply() throws Exception {
+        var helper=helper();
+        try (var f=helper.fixture("range-staging")) {
+            for (int n:new int[]{1,2,4}) f.apply(f.propose(f.put(n)),f.store.applied().index()+1);
+            var transport=helper.new Controlled(f); transport.index=3; var directory=helper.directory(f);
+            var ledger=SessionEpochLedger.initial(directory.clusterId(),directory.databaseId(),10).issue(f.session,100);
+            var scope=new TransactionScope(List.of(TransactionScope.Span.range(f.column,new byte[]{0},new byte[]{6})));
+            var mutations=List.of(put(f,1,8,Mutation.ReturnMode.PREVIOUS),new Mutation(Mutation.Kind.DELETE_RANGE,f.column,new byte[]{1},new byte[]{4}),put(f,2,9,Mutation.ReturnMode.PREVIOUS));
+            Path path=root.resolve("range-window.bin"); transport.journal=path; byte[] frozen;
+            try (var routed=new RatisRoutedClient(directory,transport)) {
+                try (var window=RatisDurableSessionClient.create(path,routed,ledger,ledger.grants().getFirst(),RatisSessionClient.Limits.defaults()); var tx=routed.openTransaction(scope,Duration.ofSeconds(5))) {
+                    var preview=tx.stage(mutations); assertArrayEquals(new byte[]{7},preview.value(0)); assertNull(preview.value(1));
+                    assertNull(tx.get(f.column,new byte[]{1})); assertArrayEquals(new byte[]{9},tx.get(f.column,new byte[]{2}));
+                    var page=tx.page(f.column,new byte[]{0},new byte[]{6},false,null,4,1024); assertEquals(2,page.rows().size()); assertFalse(page.hasMore());
+                    assertArrayEquals(new byte[]{2},page.rows().getFirst().key()); assertArrayEquals(new byte[]{4},page.rows().getLast().key());
+                    var intent=window.prepareTransactionIntent(mutations); var accepted=tx.plan(intent.command()); assertArrayEquals(preview.encode(),accepted.acceptance().result());
+                    frozen=DistributedCommandCodec.encode(accepted); window.acceptTransaction(intent,accepted); transport.lose=true; assertThrows(IOException.class,() -> window.execute(intent));
+                }
+                try (var window=RatisDurableSessionClient.reopen(path,routed)) {
+                    var pending=window.pending().getFirst(); assertArrayEquals(frozen,DistributedCommandCodec.encode(pending.command()));
+                    var result=window.execute(pending); assertArrayEquals(new byte[]{7},result.value(0)); assertNull(result.value(1)); window.acknowledge(pending);
+                }
+                try (var current=f.store.capture()) { assertNull(current.get(f.column,new byte[]{1})); assertArrayEquals(new byte[]{9},current.get(f.column,new byte[]{2})); assertArrayEquals(new byte[]{7},current.get(f.column,new byte[]{4})); }
+                assertEquals(0,f.store.activeSnapshotPins()); f.assertReleased();
+            }
+        }
+    }
     @Test void malformedStagingResultsDoNotBecomeSuccessfulRepliesAndCanBeRetried() throws Exception {
         var helper=helper();
         try (var f=helper.fixture("stage-reply-shape")) {

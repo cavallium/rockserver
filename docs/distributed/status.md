@@ -41,7 +41,8 @@ does not establish complete distributed API parity or production acceptance.
   conservatively excluded while candidates hold certification; an ACK-bearing
   transaction requires sole metadata ownership.
 - Native scoped staging supplies an immutable read-your-writes prefix for point
-  puts/deletes, ordered native merge operands and collision-bucket member mutations.
+  puts/deletes, finite physical range deletes, ordered native merge operands and
+  collision-bucket member mutations.
   Point/member reads and forward/reverse physical pages combine its indexed batch
   with the original native snapshot. It installs no user effects or receipts and
   does not confer commit authority. Failed predicates/shape/result bounds discard
@@ -53,7 +54,14 @@ does not establish complete distributed API parity or production acceptance.
   extensions preserve the previous view. PLAN requires the exact final business
   prefix, releases staging and accepts it under the real durable operation ID.
   Staging itself uses the ephemeral handle nonce and never appends a command or ACK.
-  Range-delete staging and complete frontend adapters remain incomplete.
+  Range tombstones retain command order in a bounded index over the plan's own
+  points/ranges. They erase earlier staged points and the snapshot base; later
+  PUT/MERGE/member updates can resurrect a row. Page iteration seeks over deleted
+  intervals while stopping at later staged points, in both directions, without
+  enumerating the erased keyspace. Whole physical bucket rows obey range deletion;
+  member updates preceding a later range cannot reappear during native apply.
+  Canonical accepted records retain original range deletes and merge operands.
+  Complete logical/frontend range and cursor adapters remain incomplete.
 - Durable logical sessions now expose one-group scoped transactions over cached
   logical column IDs/keys. Logical GET decodes complete collision buckets; STAGE
   preserves ordered PUT/DELETE prefixes and original-image conditions, including
@@ -119,14 +127,14 @@ and retained command payloads share a separate 16 MiB bound; planners reserve th
 maximum command size before constructing output. Original requests retain normal
 input-slot/byte charges even when their chosen log form is a compact rejection.
 A native staging prefix retains the bounded original command and result plus an
-indexed native batch capped at 18 MiB (16 MiB bucket-plan allowance plus 2 MiB
-command allowance). Construction shares the apply evaluator's bucket working bound.
+indexed native batch capped at 22 MiB (16 MiB bucket-plan allowance plus three
+2 MiB command allowances for indexed effects, resets and hidden-point deletion). Construction shares the apply evaluator's bucket working bound.
 The registry additionally reserves 64 MiB before constructing a replacement while
 keeping the prior view charged. On success it shrinks to accounted original operands,
-raw indexed effects, materialized buckets, result and bounded entry overhead, with a
-24 MiB maximum per retained view. The default aggregate staging allowance is 128 MiB
+raw indexed effects, tombstone/point index, materialized buckets, result and bounded
+entry overhead, with a 32 MiB maximum per retained view. The default aggregate staging allowance is 128 MiB
 per group registry. Tiny prefixes retain their small accounted size rather than a
-24 MiB fixed charge. Busy expired/closed handles retain both old-view and construction
+32 MiB fixed charge. Busy expired/closed handles retain both old-view and construction
 charges until the actual native return and cleanup. These are payload/accounting
 bounds, not measured heap/native allocator limits or global node/pool envelopes.
 Rejected receipts reserve their actual bounded no-effects growth, preserving
@@ -135,84 +143,56 @@ own-ACK progress at the retention cap.
 The handle registry defaults to 128 handles, 16 MiB scope accounting, 16 MiB retained
 plans and a maximum 60-second TTL. A durable logical session additionally bounds its
 open handles by `min(128, outstandingWindow)` (32 by default); opening calls and
-failed/closed handles retain/release that admission explicitly. Logical expiry cannot donate capacity still
-owned by blocked capture/planning/read work. Expiry defaults to 32 groups per
+failed/closed handles retain/release that admission explicitly. Logical expiry cannot
+donate capacity still owned by blocked capture/planning/read work. Expiry defaults to 32 groups per
 100 ms quantum; cleanup may lag under failure/queue pressure, while access rejects
 expired ownership immediately. These are fixed accounting bounds, not measured
 heap/SST residency or end-to-end transport-buffer bounds.
 
 ## Validation and evidence
 
-All verification uses ordinary `test-compile surefire:test@default-test` selections,
+Verification uses ordinary `test-compile surefire:test@default-test` selections,
 not root `mvn test` (which binds fuzzing). Native fixtures use the XFS test-directory
 factories. The excluded density fixture remains untouched and unselected.
 
-The current-format focused gate passed 40 core and 82 adapter cases (122 total):
-`/tmp/rockserver-current-format-focused-green.log`. It covers current semantic kinds,
-strict encoding bounds, image/accounting corruption rejection, install recovery,
-query framing, node identity, durable phases and accepted/rejected outcomes.
+The current range-staging regression gate passed 57 core and 69 adapter cases
+(126 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-range-staging-regression.log`. After removing a duplicate predicate
+read and strengthening lower-bound resurrection coverage, the final native/scoped
+RPC selection passed 19 core and 5 adapter cases (24 total), exit zero:
+`/tmp/rockserver-range-staging-final.log`.
 
-The broad selected gate then passed 137 core, 24 patched-server and 203 adapter
-cases (364 total, zero failures/errors/skips), exit zero:
-`/tmp/rockserver-current-format-final-gate.log`. A final native/bucket/rejection
-selection after removing obsolete format labels passed 14 core and 20 adapter
-cases (34 total), exit zero: `/tmp/rockserver-current-format-native-final.log`.
-
-The native staging regression gate passed 39 core and 31 adapter cases (70 total,
-zero failures/errors/skips), exit zero: `/tmp/rockserver-native-staging-regression.log`.
-It covers immutable-prefix replacement, snapshot isolation, staged forward/reverse
-pages and limits, bucket collisions, ordered native merges, original-operand/result
-parity through accepted native apply, rejection cleanup, pin retention, image/install
-and existing scoped transaction RPC behavior. The five new staging cases exercise
-the native primitive, not a completed public transaction adapter.
-
-The staging RPC regression gate passed 39 core and 76 adapter cases (115 total,
-zero failures/errors/skips), exit zero: `/tmp/rockserver-staging-rpc-regression.log`.
-After adding strict staging-result cardinality validation, the final scoped/RPC/
-bucket selection passed 33 adapter cases, exit zero:
-`/tmp/rockserver-staging-rpc-final.log`. It covers lost staging replies, equal and
-extended prefixes, delayed-prefix rejection, failed-extension preservation, staged
-forward/reverse pages, exact final PLAN matching, forced acceptance/lost commit reply/
-reopen/retry, logical collision buckets, aggregate admission, and expiry during native
-replacement construction. No real server process or quorum was used. Native fixtures
-reported an io_uring allocation warning on the test host; all selected cases completed.
-
-The durable logical transaction regression gate passed 12 core and 87 adapter
-cases (99 total, zero failures/errors/skips), exit zero:
-`/tmp/rockserver-logical-transaction-regression.log`. After removing redundant retained
-plan data, the final logical-session/staging selection passed 13 adapter cases,
-exit zero: `/tmp/rockserver-logical-transaction-final.log`. It verifies forced exact
-accepted bytes before the write RPC, lost PLAN/commit reply recovery, same-identity
-commit retry, conflict/intention reopen and explicit abandonment/ACK, logical
-collision members and key-only presence, scope rejection before sequence allocation,
-and root/handle admission lifetimes. These are native/controlled-dispatch fixtures;
-full frontend parity, real quorum acceptance and range-delete staging remain pending.
-
-The end-to-end local workflow includes native OPEN/read/PLAN, forced acceptance,
-controlled append/native apply, lost reply, close/reopen, exact receipt retry and
-ACK. It also covers failed PLAN followed by durable local abandonment, and missing
-accepted authority resolved through an internal rejection. Ordering fixtures cover
-reversed duplicate owners, original-versus-rejection precedence, same-term ambiguity,
-receipt-cap ACK progress, snapshot-covered deferred resolution, deadline enforcement,
-fixed-cut pages and stale-close replacement protection.
+The exercised native/controlled-dispatch workflows include OPEN/read/STAGE/PLAN,
+forced acceptance before submission, applied native outcomes, lost PLAN/commit
+replies, close/reopen, exact receipt retry and explicit ACK. They cover ordered
+point/range deletes and native merges, overlapping tombstones, collision buckets,
+key-only presence, forward/reverse continuation and inclusive-lower resurrection,
+skipping erased oversized rows, result-overflow atomicity, immutable scope/prefix
+checks, footprint ownership, history conflicts, strict images/install recovery and
+session journal phases. Unaccepted intents can be reopened and explicitly abandoned;
+missing accepted authority resolves through internal rejection. Logical-root/handle
+and in-flight staging retirement fixtures verify that active ownership stays charged
+until actual work returns. Native fixtures reported io_uring allocation warnings on
+the test host; every selected case completed.
 
 The patched Ratis producer remains based on released 3.3.1 with checksum-pinned
 binary inputs. Its fresh-query dispatch hook is selected only after successful
 linearizable read-index and wait-applied barriers; generic/non-linearizable/stale
 paths remain distinct. The vendored upstream `RaftServerImpl` source has SHA-256
 `a1b8cb4b41c8366985a94a2973f2b8926ffc0646556bdce9d135bf5f7a904b78`.
-The packaged server jar has SHA-256
+The packaged server jar still has SHA-256
 `b7226ca8e54c05b157325f5c47b0fb0a4943d9389cbd8a1544941b2a6b21ad36`;
-159 unreplaced released classes were byte-identical and ZIP entries unique.
-Producer source/inputs are unchanged by the current command-format consolidation.
+previous artifact verification established 159 unreplaced released classes were
+byte-identical and ZIP entries unique. Producer source/inputs are unchanged by the
+staging work; the package checksum was rechecked.
 
 Controlled barrier/query/append fixtures prove only their exercised paths. No real
 server process, network/quorum probe, power-loss run or deployment was performed.
 
 ## Required remaining work
 
-- Range-delete staging and remaining logical/frontend transaction adapters; complete public
-  RocksDB API/frontend transaction, range and cursor parity.
+- Remaining logical/frontend transaction adapters; complete public RocksDB API
+  transaction, range and cursor parity, including logical/unbounded range handling.
 - Durable prepared locks, transaction-status groups, 2PC decision/finalization and
   consistent multi-group scoped snapshot fences.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,

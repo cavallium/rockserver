@@ -109,10 +109,10 @@ class NativeScopedStagingTest {
     }
     @Test void orderedNativeMergesReadTheirSnapshotBaseAndRemainOperandsAtCommit() throws Exception {
         RocksDB.loadLibrary(); UUID column=new UUID(0,1),group=new UUID(0,2),domain=new UUID(0,3),session=new UUID(0,4);
-        try (var operator=new StringAppendOperator(","); var cf=new ColumnFamilyOptions().setMergeOperator(operator);
+        for (boolean ranges:new boolean[]{false,true}) try (var operator=new StringAppendOperator(","); var cf=new ColumnFamilyOptions().setMergeOperator(operator);
              var plain=new ColumnFamilyOptions(); var options=new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true)) {
             var handles=new ArrayList<ColumnFamilyHandle>();
-            try (var db=RocksDB.open(options,root.resolve("merge").toString(),List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY,plain),
+            try (var db=RocksDB.open(options,root.resolve("merge-"+ranges).toString(),List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY,plain),
                     new ColumnFamilyDescriptor(key(1),cf),new ColumnFamilyDescriptor(key(2),plain),new ColumnFamilyDescriptor(key(3),plain)),handles)) {
                 try {
                     var ownership=new RangeOwnership(); var owner=new RangeOwnership.Owner(group,1);
@@ -121,17 +121,24 @@ class NativeScopedStagingTest {
                     store.enableScopedHistory(RangeMutationHistory.Limits.defaults()); store.applyNoop(new ApplyPosition(1,0));
                     var seed=new DistributedCommand(group,1,new byte[32],new OperationId(session,1,0),List.of(new Mutation(Mutation.Kind.PUT,column,key(1),"a".getBytes(StandardCharsets.UTF_8))));
                     store.apply(new ApplyPosition(1,1),seed);
-                    var base=new DistributedCommand(group,1,new byte[32],new OperationId(session,1,1),List.of(
+                    var mutations=new ArrayList<>(List.of(
                             new Mutation(Mutation.Kind.MERGE,column,key(1),"b".getBytes(StandardCharsets.UTF_8),Mutation.ReturnMode.PREVIOUS),
                             new Mutation(Mutation.Kind.MERGE,column,key(1),"c".getBytes(StandardCharsets.UTF_8),Mutation.ReturnMode.CURRENT),
                             new Mutation(Mutation.Kind.DELETE,column,key(2),null),new Mutation(Mutation.Kind.MERGE,column,key(2),"z".getBytes(StandardCharsets.UTF_8))));
+                    if (ranges) {
+                        mutations.add(1,new Mutation(Mutation.Kind.DELETE_RANGE,column,key(1),key(2)));
+                        mutations.add(3,new Mutation(Mutation.Kind.MERGE,column,key(1),"d".getBytes(StandardCharsets.UTF_8),Mutation.ReturnMode.CURRENT));
+                    }
+                    var base=new DistributedCommand(group,1,new byte[32],new OperationId(session,1,1),mutations);
+                    String expected=ranges ? "c,d" : "a,b,c";
                     try (var pin=store.captureTracked(range(column)); var stage=pin.stage(base)) {
-                        assertEquals("a",new String(stage.result().value(0),StandardCharsets.UTF_8)); assertEquals("a,b,c",new String(stage.get(column,key(1)),StandardCharsets.UTF_8));
+                        assertEquals("a",new String(stage.result().value(0),StandardCharsets.UTF_8)); assertEquals(expected,new String(stage.get(column,key(1)),StandardCharsets.UTF_8));
                         assertEquals("z",new String(stage.get(column,key(2)),StandardCharsets.UTF_8));
                         var page=stage.page(column,key(1),key(3),false,null,4,1024);
-                        assertEquals(2,page.rows().size()); assertEquals("a,b,c",new String(page.rows().getFirst().value(),StandardCharsets.UTF_8));
+                        assertEquals(2,page.rows().size()); assertEquals(expected,new String(page.rows().getFirst().value(),StandardCharsets.UTF_8));
                         var accepted=store.planScopedCommit(pin,base,0,new UUID(0,9)); assertEquals(base.mutations(),accepted.mutations());
                         assertArrayEquals(stage.result().encode(),store.apply(new ApplyPosition(1,2),accepted));
+                        try (var current=store.capture()) { assertEquals(expected,new String(current.get(column,key(1)),StandardCharsets.UTF_8)); }
                     }
                     assertTrue(store.close(Duration.ZERO));
                 } finally { handles.forEach(ColumnFamilyHandle::close); }

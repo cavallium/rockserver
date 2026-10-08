@@ -9,7 +9,7 @@ import java.util.function.LongSupplier;
 
 /** Bounded ephemeral handle ownership. No native work or close runs under the registry monitor. */
 final class RatisScopedTransactions implements AutoCloseable {
-    static final long STAGING_BUILD_BYTES=64L*1024*1024, STAGING_RETAINED_BYTES=24L*1024*1024;
+    static final long STAGING_BUILD_BYTES=64L*1024*1024, STAGING_RETAINED_BYTES=32L*1024*1024;
     @FunctionalInterface interface StageFactory { ReplicatedRangeStore.ScopedStaging stage(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command) throws Exception; }
     @FunctionalInterface interface PlanFactory { RatisRangeStateMachine.ScopedCommit prepare(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command,RatisRangeStateMachine.ProposalDeadline deadline) throws Exception; }
     record Limits(int handles,long scopeBytes,long planBytes,long stagingBytes,Duration maximumTtl) {

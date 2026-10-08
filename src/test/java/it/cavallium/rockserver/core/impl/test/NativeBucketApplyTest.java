@@ -98,7 +98,7 @@ class NativeBucketApplyTest {
             var logical=command(f.schema,0,List.of(put(bucket,7,1,new byte[]{1},Mutation.ReturnMode.NONE)),List.of(),-1);
             assertThrows(UnsupportedOperationException.class,() -> f.apply(0,logical)); f.store.enableLogicalSchema(f.schema);
             assertThrows(IllegalArgumentException.class,() -> f.store.apply(new ApplyPosition(1,0),logical,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
-            assertThrows(IllegalArgumentException.class,() -> command(f.schema,0,List.of(put(bucket,7,1,new byte[]{1},Mutation.ReturnMode.NONE),new Mutation(Mutation.Kind.DELETE_RANGE,fixed,new byte[]{1},new byte[]{2})),List.of(),-1));
+            assertDoesNotThrow(() -> command(f.schema,0,List.of(put(bucket,7,1,new byte[]{1},Mutation.ReturnMode.NONE),new Mutation(Mutation.Kind.DELETE_RANGE,fixed,new byte[]{1},new byte[]{2})),List.of(),-1));
             f.apply(0,new DistributedCommand(group,1,f.schema.digest(),new OperationId(session,1,1),List.of(new Mutation(Mutation.Kind.PUT,bucket,physical(7),new byte[]{1,2,3}))));
             assertThrows(IllegalArgumentException.class,() -> f.apply(1,logical)); assertEquals(new ApplyPosition(1,0),f.store.applied()); assertEquals(1,f.store.receiptUsage().retainedCount());
         }

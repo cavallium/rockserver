@@ -49,7 +49,7 @@ class NativeAcceptedTransactionTest {
             f.store.enableScopedHistory(RangeMutationHistory.Limits.defaults()); f.store.applyNoop(new ApplyPosition(1,0));
             var scope=new TransactionScope(List.of(TransactionScope.Span.range(outer.fixed,new byte[]{0},new byte[]{10})));
             var base=new DistributedCommand(outer.group,1,f.schema.digest(),new OperationId(outer.session,1,0),
-                    List.of(new Mutation(Mutation.Kind.DELETE_RANGE,outer.fixed,new byte[]{1},new byte[]{9})));
+                    List.of(new Mutation(Mutation.Kind.PUT,outer.fixed,new byte[]{1,2},new byte[]{9})));
             try (var pin=f.store.captureTracked(scope)) {
                 assertThrows(IllegalArgumentException.class,() -> f.store.planScopedCommit(pin,base,0,new UUID(0,1)));
                 assertEquals(new ApplyPosition(1,0),f.store.applied()); assertEquals(0,f.store.receiptUsage().retainedCount());

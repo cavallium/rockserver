@@ -76,7 +76,6 @@ public final class DistributedCommand {
         } else if (minimumSessionEpoch!=-1) throw new IllegalArgumentException("Data/commit command cannot advance an epoch floor");
         this.mutations=List.copyOf(mutations); this.predicates=List.copyOf(predicates);
         hasBucketData=this.mutations.stream().anyMatch(Mutation::bucket) || this.predicates.stream().anyMatch(KeyPredicate::bucket);
-        if (hasBucketData && this.mutations.stream().anyMatch(mutation -> mutation.kind()==Mutation.Kind.DELETE_RANGE)) throw new IllegalArgumentException("Bucket point commands do not support range deletion");
         this.rangeEpoch=rangeEpoch; this.schemaDigest=schemaDigest.clone(); this.acknowledgedThrough=acknowledgedThrough;
         this.minimumSessionEpoch=minimumSessionEpoch; this.sessionControl=sessionControl; this.acceptance=acceptance;
         this.rejectionDigest=rejectionDigest==null ? null : rejectionDigest.clone();
