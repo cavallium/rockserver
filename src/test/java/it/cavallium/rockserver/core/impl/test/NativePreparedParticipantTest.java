@@ -118,11 +118,11 @@ class NativePreparedParticipantTest {
         PreparedParticipant.Preparation preparation; AbortedParticipant fence;
         try (var f=outer.new Fixture(source,true)) {
             enable(f); preparation=preparation(f,put(f,0,1,9),point(outer.fixed,1),1);
-            fence=f.store.applyAbort(new ApplyPosition(1,1),abort(preparation)); assertNull(fence.negative());
+            fence=f.store.applyAbort(new ApplyPosition(1,1),abort(preparation)); assertNull(f.store.rejectedParticipant(fence.finalization().transactionId()));
             assertEquals(ParticipantVote.negative(),f.store.applyPrepared(new ApplyPosition(1,2),preparation));
             assertNull(f.store.preparedParticipant(preparation.transactionId())); assertNull(f.raw(outer.fixed,key(1))); assertEquals(0,f.store.receiptUsage().retainedCount());
             assertEquals(ParticipantVote.negative(),f.store.applyPrepared(new ApplyPosition(2,3),preparation));
-            assertEquals(new ApplyPosition(1,2),f.store.abortedParticipant(preparation.transactionId()).negative().position());
+            assertEquals(new ApplyPosition(1,2),f.store.rejectedParticipant(preparation.transactionId()).position());
             try (var pin=f.store.capture()) { assertEquals(ParticipantVote.negative(),pin.preparationVote(preparation)); NativeRangeImage.write(image,pin,f.store.ownership().interval(),limits); }
             NativeRangeImage.inspect(image,limits);
             try (var read=f.store.captureReadable(point(outer.fixed,1))) { assertNull(read.get(outer.fixed,key(1))); }
@@ -142,12 +142,78 @@ class NativePreparedParticipantTest {
             assertEquals(0,f.store.preparedParticipantCount()); assertNull(f.raw(outer.fixed,key(1)));
         }
     }
+    @Test void rejectionBeforeHomeAbortIsPermanentWithoutEffectsOrPreparedLocksAcrossReopenAndInstall() throws Exception {
+        Path source=root.resolve("rejection-source"),image=root.resolve("rejection-image");
+        var limits=new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4);
+        PreparedParticipant.Preparation preparation;
+        try (var f=outer.new Fixture(source,true)) {
+            enable(f); preparation=preparation(f,put(f,0,1,9),point(outer.fixed,1),1);
+            assertEquals(TransactionStatus.Phase.PREPARING,preparation.registration().phase());
+            assertEquals(ParticipantVote.negative(),f.store.applyRejected(new ApplyPosition(1,1),preparation));
+            assertNull(f.store.abortedParticipant(preparation.transactionId())); assertNull(f.store.finalizedParticipant(preparation.transactionId()));
+            assertNull(f.store.preparedParticipant(preparation.transactionId())); assertNull(f.raw(outer.fixed,key(1)));
+            assertEquals(1,f.store.preparedCapacity().count()); assertEquals(0,f.store.receiptUsage().retainedCount());
+            assertEquals(ParticipantVote.negative(),f.store.estimatePreparation(preparation).existing());
+            try (var read=f.store.captureReadable(point(outer.fixed,1))) { assertNull(read.get(outer.fixed,key(1))); }
+            f.apply(2,put(f,1,1,7)); // A negative vote owns identities, not a read/write scope.
+            assertEquals(ParticipantVote.negative(),f.store.applyPrepared(new ApplyPosition(2,3),preparation));
+            assertArrayEquals(key(7),f.raw(outer.fixed,key(1))); assertEquals(new ApplyPosition(1,1),f.store.rejectedParticipant(preparation.transactionId()).position());
+            var changed=new PreparedParticipant.Preparation(preparation.homeGroup(),preparation.homeEpoch(),new OperationId(new UUID(0,120),1,0),preparation.registration(),preparation.business());
+            assertThrows(IllegalArgumentException.class,() -> f.store.applyRejected(new ApplyPosition(2,4),changed));
+            assertThrows(IllegalArgumentException.class,() -> f.store.estimateReceiptRetention(put(f,0,2,8)));
+            var controlCollision=new DistributedCommand(outer.group,1,f.schema.digest(),preparation.operation(),List.of(new Mutation(Mutation.Kind.PUT,outer.fixed,key(2),key(8))));
+            assertThrows(IllegalArgumentException.class,() -> f.store.estimateReceiptRetention(controlCollision));
+            try (var pin=f.store.capture()) { assertEquals(ParticipantVote.negative(),pin.preparationVote(preparation)); NativeRangeImage.write(image,pin,f.store.ownership().interval(),limits); }
+            NativeRangeImage.inspect(image,limits);
+        }
+        try (var f=outer.new Fixture(source,true)) {
+            assertEquals(ParticipantVote.negative(),f.store.recoveredPreparationVote(preparation));
+            assertNull(f.store.abortedParticipant(preparation.transactionId()));
+            assertEquals(ParticipantVote.negative(),f.store.applyPrepared(new ApplyPosition(2,4),preparation));
+            var finalization=abort(preparation); assertFalse(f.store.estimateFinalization(finalization).newFence());
+            f.store.applyAbort(new ApplyPosition(2,5),finalization);
+            assertEquals(1,f.store.preparedCapacity().count()); assertEquals(ParticipantVote.negative(),f.store.finalizedParticipant(preparation.transactionId()).vote());
+            assertArrayEquals(key(7),f.raw(outer.fixed,key(1)));
+        }
+        try (var f=outer.new Fixture(root.resolve("rejection-target"),true)) {
+            f.store.fence(); f.store.installSnapshot(image,limits);
+            assertEquals(ParticipantVote.negative(),f.store.recoveredPreparationVote(preparation));
+            f.store.activate(); assertEquals(ParticipantVote.negative(),f.store.applyPrepared(new ApplyPosition(2,4),preparation));
+            assertNull(f.store.abortedParticipant(preparation.transactionId())); assertArrayEquals(key(7),f.raw(outer.fixed,key(1)));
+        }
+    }
+    @Test void rejectionCapacityReservesAbortAndNegativeCannotReplaceAPositiveVote() throws Exception {
+        try (var f=outer.new Fixture(root.resolve("rejection-capacity"),true)) {
+            enable(f); var plans=new java.util.ArrayList<PreparedParticipant.Preparation>();
+            for (int n=0;n<ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS;n++) {
+                var p=preparation(f,put(f,n,n,n),point(outer.fixed,n),n); plans.add(p);
+                assertEquals(ParticipantVote.negative(),f.store.applyRejected(new ApplyPosition(1,n+1),p));
+            }
+            assertEquals(64,f.store.preparedCapacity().count());
+            var overflow=preparation(f,put(f,64,64,64),point(outer.fixed,64),64);
+            assertThrows(IllegalStateException.class,() -> f.store.applyRejected(new ApplyPosition(1,65),overflow));
+            assertThrows(IllegalStateException.class,() -> f.store.estimatePreparation(overflow));
+            assertEquals(new ApplyPosition(1,64),f.store.applied());
+            for (int n=0;n<plans.size();n++) {
+                var finalization=abort(plans.get(n)); assertFalse(f.store.estimateFinalization(finalization).newFence());
+                f.store.applyAbort(new ApplyPosition(1,65+n),finalization);
+            }
+            assertEquals(64,f.store.preparedCapacity().count()); f.store.fence(); f.store.activate();
+            assertTrue(f.store.preparedCapacity().bytes()<=ReplicatedRangeStore.MAX_PREPARED_BYTES);
+        }
+        try (var f=outer.new Fixture(root.resolve("positive-reject"),true)) {
+            enable(f); var p=preparation(f,put(f,0,1,9),point(outer.fixed,1),1);
+            var vote=f.store.applyPrepared(new ApplyPosition(1,1),p);
+            assertThrows(IllegalArgumentException.class,() -> f.store.applyRejected(new ApplyPosition(1,2),p));
+            assertEquals(new ApplyPosition(1,1),f.store.applied()); assertEquals(vote,f.store.recoveredPreparationVote(p));
+        }
+    }
     @Test void preparedAbortReleasesScopeButRetainsPositiveVoteAndBusinessIdentity() throws Exception {
         try (var f=outer.new Fixture(root.resolve("positive-abort"),true)) {
             enable(f); var preparation=preparation(f,put(f,0,1,9),point(outer.fixed,1),9);
             var vote=f.store.applyPrepared(new ApplyPosition(1,1),preparation); var fence=f.store.applyAbort(new ApplyPosition(2,2),abort(preparation));
             assertEquals(vote,f.store.applyPrepared(new ApplyPosition(2,3),preparation)); assertNull(f.raw(outer.fixed,key(1)));
-            assertNull(fence.negative()); assertThrows(IllegalArgumentException.class,() -> f.store.estimateReceiptRetention(put(f,0,1,9)));
+            assertNull(f.store.rejectedParticipant(fence.finalization().transactionId())); assertThrows(IllegalArgumentException.class,() -> f.store.estimateReceiptRetention(put(f,0,1,9)));
             try (var read=f.store.captureReadable(point(outer.fixed,1))) { assertNull(read.get(outer.fixed,key(1))); }
             var next=preparation(f,put(f,1,1,7),point(outer.fixed,1),2); assertTrue(f.store.applyPrepared(new ApplyPosition(2,4),next).prepared());
             try (var pin=f.store.capture()) { var image=root.resolve("overlap-image"); var limits=new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4); NativeRangeImage.write(image,pin,f.store.ownership().interval(),limits); NativeRangeImage.inspect(image,limits); }
@@ -180,9 +246,9 @@ class NativePreparedParticipantTest {
         try (var f=outer.new Fixture(root.resolve("corrupt-abort"),true)) {
             enable(f); var late=preparation(f,put(f,0,1,9),point(outer.fixed,1),1); var active=preparation(f,put(f,1,2,7),point(outer.fixed,2),2);
             f.store.applyPrepared(new ApplyPosition(1,1),active); var abort=f.store.applyAbort(new ApplyPosition(1,2),abort(late)); f.store.applyPrepared(new ApplyPosition(1,3),late);
-            var corrupt=new AbortedParticipant(abort.finalization(),abort.position(),new AbortedParticipant.Negative(active.operation(),late.digest(),new ApplyPosition(1,3)));
+            var corrupt=new RejectedParticipant(outer.group,late.homeGroup(),late.homeEpoch(),active.operation(),late.registration(),late.digest(),new ApplyPosition(1,3));
             var dbField=ReplicatedRangeStore.class.getDeclaredField("db"); var stateField=ReplicatedRangeStore.class.getDeclaredField("state"); dbField.setAccessible(true); stateField.setAccessible(true);
-            byte[] key=java.nio.ByteBuffer.allocate(33).putLong(outer.group.getMostSignificantBits()).putLong(outer.group.getLeastSignificantBits()).put((byte)0x21).putLong(0).putLong(1).array();
+            byte[] key=java.nio.ByteBuffer.allocate(33).putLong(outer.group.getMostSignificantBits()).putLong(outer.group.getLeastSignificantBits()).put((byte)0x23).putLong(0).putLong(1).array();
             ((org.rocksdb.RocksDB)dbField.get(f.store)).put((org.rocksdb.ColumnFamilyHandle)stateField.get(f.store),key,corrupt.encode());
             try (var pin=f.store.capture()) { assertThrows(java.io.IOException.class,() -> NativeRangeImage.write(root.resolve("bad-abort-image"),pin,f.store.ownership().interval(),new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4))); }
             f.store.fence(); assertThrows(IllegalArgumentException.class,f.store::activate); assertFalse(f.store.admissionOpen());
@@ -198,7 +264,7 @@ class NativePreparedParticipantTest {
             var overflow=preparation(f,put(f,64,64,64),point(outer.fixed,64),64);
             assertThrows(IllegalStateException.class,() -> f.store.applyPrepared(new ApplyPosition(1,65),overflow)); assertEquals(new ApplyPosition(1,64),f.store.applied());
             assertEquals(64,f.store.preparedParticipantCount()); assertEquals(0,f.store.activeSnapshotPins());
-            var first=f.store.preparedParticipant(new UUID(0,0)); var fence=f.store.applyAbort(new ApplyPosition(1,65),abort(first.preparation())); assertNull(fence.negative());
+            var first=f.store.preparedParticipant(new UUID(0,0)); var fence=f.store.applyAbort(new ApplyPosition(1,65),abort(first.preparation())); assertNull(f.store.rejectedParticipant(fence.finalization().transactionId()));
             assertEquals(64,f.store.preparedCapacity().count()); assertTrue(f.store.preparedCapacity().bytes()<=ReplicatedRangeStore.MAX_PREPARED_BYTES);
             try (var read=f.store.captureReadable(point(outer.fixed,0))) { assertNull(read.get(outer.fixed,key(0))); }
 

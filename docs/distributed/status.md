@@ -338,10 +338,17 @@ Durable participant metadata has a per-range maximum of 64 retained preparations
 and fence-only transactions combined, 16 MiB of reserved record bytes and 16 MiB of
 retained scope accounting. A preparation body fits within 2 MiB minus its eight-byte
 Raft envelope; its stored receipt adds the 16-byte original apply position. Every
-preparation reserves another 8,132 bytes for terminal metadata: an ABORT fence with
-optional compact 80-byte negative receipt, or a COMMIT receipt whose maximum charge
-is 8,051 bytes including its key. Either finalization can drain at the preparation cap.
-Fence-only ABORT reserves the same fence allowance. These capacities
+preparation reserves another 16,134 bytes for terminal metadata: independent negative
+PREPARE and ABORT receipts, or a COMMIT receipt whose maximum charge is 8,051 bytes
+including its key. Negative votes retain the exact preparation digest, frozen home
+registration, control/business identities and first rejection position, without the
+accepted business body. They may precede home ABORT; retries remain negative after
+later writes, reopen and native image installation. The ABORT record contains only
+its decision and first finalization position. A negative vote retains no scope lock
+and does not manufacture a terminal home decision. Positive and negative evidence
+cannot coexist. Either finalization can drain at the participant cap. Fence-only
+ABORT and rejection-only transactions reserve the same combined allowance, counted
+once even after ABORT follows rejection. These capacities
 are separate from ordinary user-receipt GC and are not donated by lease expiration,
 fencing or lock release. Raft PREPARE admission reserves the bounds before append;
 native apply also checks them. Retained terminal records still have no GC path.
