@@ -1877,3 +1877,50 @@ then passed: `/tmp/rockserver-scoped-history-retired-reader-green.log`.
 Actual uncertain RocksDB write failure, distributed commit acceptance, network/
 quorum, power-loss and measured history/SST performance remain unverified. No
 server process/network probe was run; the excluded density fixture is untouched.
+
+## Bounded proposal footprints and uncertain append ownership
+
+`ProposalFootprints` normalizes complete physical write/scope unions and indexes
+points plus augmented range intervals per column. Ordinary proposals may overlap
+one another; exclusive candidate reservations refuse overlaps with either ordinary
+work or other candidates. Disjoint writes continue to pipeline. Limits bound
+ordinary owners, candidates, normalized spans and accounted bytes independently.
+Preparation happens outside the admission monitor; exact owner-sealed leases make
+release idempotent and protect replacement ownership from stale callbacks. Bucket
+members reserve their shared physical key. Saved outcomes and permanently expired
+identities need no future business-write footprint.
+
+Ratis admission now reserves ordinary footprints together with existing proposal
+and receipt quotas. Generation changes invalidate unsubmitted candidates, while
+ordinary ownership follows possible append lifetime. In pinned Ratis 3.3.1,
+`cancelTransaction` may follow log append; an entry-bearing canceled context therefore
+retains its bounded orphan admission, footprint and receipt reservation even after
+all RPC owners leave. Native apply, a matching saved outcome/permanent expiry in a
+verified recovered native cut, or a strictly newer ready leader's completed native
+term barrier can settle that ownership. A same-term generation change alone cannot.
+Unknown recovered suffixes remain charged. Late cancellation cannot release a
+replacement admission or candidate lease.
+
+`reserveProposalScope` provides only an unsubmitted exclusive guard after scope,
+health, lifecycle and completed current-term checks. It does not validate tracked
+history atomically with canonical plan acceptance, authorize append or implement
+transaction commit. Reservation expiry/deadlines, canonical accepted plans,
+read-your-writes transactions, prepared durable locks and 2PC remain unfinished.
+Standalone behavior and durable command/image formats are unchanged.
+
+The broad gate passed 132 core, 19 patched-server and 144 adapter cases (295 total,
+zero failures/errors/skips), exit zero:
+`/tmp/rockserver-proposal-footprints-final-gate.log`. Six deterministic
+model cases cover normalized unsigned interval boundaries, independent quotas,
+indexed insertion/deletion and exact lease ownership. Seven native/controlled-Ratis
+cases cover ordinary pipelining and exclusive overlap, bucket sharing, cancellation
+with an initialized entry, shared retries, same-term generation retention,
+newer-term settlement, covered/unknown snapshot recovery and stale releases.
+Review additionally found that a live RPC owner covered by a recovered receipt
+must settle without waiting for cancellation. Its regression failed before the
+fix: `/tmp/rockserver-proposal-recovery-live-owner-red.log`. Recovery now checks
+all unsettled admissions against the exact native cut. The final selected recovery,
+receipt, bucket and footprint gate passed 21 core and 31 adapter cases (52 total,
+zero failures/errors/skips), exit zero:
+`/tmp/rockserver-proposal-recovery-live-owner-green.log`.
+These fixtures do not establish actual Ratis append/quorum or network acceptance.

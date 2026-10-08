@@ -885,6 +885,12 @@ public final class ReplicatedRangeStore {
         } finally { leaveNative(); }
     }
 
+    /** Memory-only admission state; no native reads or snapshot acquisition. */
+    public boolean admissionOpen() { return !closing && pendingInstallation==null && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
+    /** Memory-only scope validation before entering the short proposal coordination lane. */
+    public void validateScope(TransactionScope scope) {
+        Objects.requireNonNull(scope); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);
+    }
     private void validateSnapshotScope(TransactionScope scope) {
         for (var span : scope.spans()) {
             if (!columns.containsKey(span.columnId())) throw new IllegalArgumentException("Scope column is outside this range");

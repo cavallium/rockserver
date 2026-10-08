@@ -7,6 +7,11 @@ import it.cavallium.rockserver.core.common.distributed.DistributedCommandCodec;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectory;
 import it.cavallium.rockserver.core.common.distributed.RangeStateView;
+import it.cavallium.rockserver.core.common.distributed.ProposalFootprints;
+import it.cavallium.rockserver.core.common.distributed.TransactionScope;
+import it.cavallium.rockserver.core.common.distributed.Mutation;
+import java.util.ArrayList;
+import java.util.List;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
 import java.nio.channels.FileChannel;
@@ -71,11 +76,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         final int bytes;
         final long term, generation, receiptCount, receiptBytes;
         final boolean maintenance, protectedControl;
-        boolean retentionReleased;
+        final ProposalFootprints.OrdinaryLease footprint;
+        boolean retentionReleased,maybeAppended,settled;
         int owners = 1;
         Admission(OperationId id, byte[] digest, int bytes, long term, long generation,
-                long receiptCount, long receiptBytes, boolean maintenance, boolean protectedControl) {
-            this.id = id;
+                long receiptCount, long receiptBytes, boolean maintenance, boolean protectedControl,ProposalFootprints.OrdinaryLease footprint) {
+            this.footprint=footprint; this.id = id;
             this.digest = digest;
             this.bytes = bytes; this.term = term; this.generation = generation;
             this.receiptCount=receiptCount; this.receiptBytes=receiptBytes;
@@ -83,6 +89,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         }
     }
 
+    private final ProposalFootprints proposalFootprints=new ProposalFootprints(ProposalFootprints.Limits.defaults());
+    private long reconciledProposalTerm=-1;
     private final Object gate = new Object();
     private final RaftGroup initialGroup;
     private final NativeRangeImage.Limits limits;
@@ -303,7 +311,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     }
 
     @Override public void pause() {
-        admissionGeneration.incrementAndGet();
+        admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
         try {
             synchronized (gate) {
                 getLifeCycle().transition(LifeCycle.State.PAUSING);
@@ -321,7 +329,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
 
     /** Must run before RaftServer.close(), whose updater waits for outstanding apply futures. */
     public void beginShutdown() {
-        admissionGeneration.incrementAndGet();
+        admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
         IOException failure = new IOException("Range is shutting down");
         synchronized (gate) { storageFailure = failure; store.fence(); }
         failDeferred(failure);
@@ -459,7 +467,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     private record Completion(CompletableFuture<Message> future, Message result) {}
 
     @Override public void reinitialize() throws IOException {
-        admissionGeneration.incrementAndGet(); store.invalidateScopedSnapshots();
+        admissionGeneration.incrementAndGet(); invalidateProposalCandidates(); store.invalidateScopedSnapshots();
         var completions = new java.util.ArrayList<Completion>();
         var coveredOperations = new java.util.ArrayList<OperationId>();
         IOException failure = null;
@@ -491,10 +499,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                 configurations.headMap(a.index(), true).clear();
                 store.activate();
                 if (enableSessionControls) store.enableSessionControls();
+                var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
+                    for (var verified:verifiedAdmissions) if (admissions.get(verified.id)==verified) settleAdmission(verified);
                     for (var id : coveredOperations) {
                         var admission = admissions.get(id);
-                        if (admission != null) releaseRetention(admission);
+                        if (admission != null) settleAdmission(admission);
                     }
                 }
                 getLifeCycle().transition(LifeCycle.State.RUNNING);
@@ -543,6 +553,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             commandValidator.accept(command);
             store.validate(command);
             byte[] digest = command.payloadDigest();
+            var spans=new ArrayList<TransactionScope.Span>(command.mutations().size());
+            for (var mutation:command.mutations()) spans.add(mutation.kind()==Mutation.Kind.DELETE_RANGE
+                    ? TransactionScope.Span.range(mutation.columnId(),mutation.key(),mutation.value()) : TransactionScope.Span.point(mutation.columnId(),mutation.key()));
+            var footprint=proposalFootprints.prepare(spans);
             // Native receipt reads stay outside the short admission lock. If apply
             // advanced while reading, retry validation before acquiring ownership.
             for (int attempt = 0; attempt < 3; attempt++) {
@@ -554,8 +568,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                 // Previously committed outcomes and expired identities cannot advance the fence.
                 if (estimate.newReceipt() && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
                 synchronized (admissions) {
+                    requireHealthy();
                     if (generation != admissionGeneration.get()) throw new IllegalStateException("Admission leadership generation changed");
+                    if (!store.admissionOpen()) throw new IllegalStateException("Native range admission is closed");
                     if (!java.util.Objects.equals(observed, store.applied())) continue;
+                    reconcileOlderProposalTerms(leadership.term());
+                    var known=admissions.get(command.operationId());
+                    if (known!=null && !estimate.newReceipt()) settleAdmission(known);
                     var admission = admissions.get(command.operationId());
                     if (admission != null) {
                         if (!Arrays.equals(admission.digest, digest)) {
@@ -579,9 +598,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                                 || !retentionFits(estimate.usage().retainedBytes(),reservedReceiptBytes,estimate.additionalBytes(),byteLimit)) {
                             throw new IllegalStateException("Retained receipt budget exhausted; acknowledge outcomes or expire epochs");
                         }
-                        admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation,
-                                estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl);
-                        admissions.put(admission.id, admission);
+                        var lease=estimate.newReceipt() && !footprint.isEmpty() ? proposalFootprints.registerOrdinary(footprint,leadership.term(),generation) : null;
+                        if (estimate.newReceipt() && !footprint.isEmpty() && lease==null) throw new IllegalStateException("Proposal overlaps a reserved transaction scope");
+                        try {
+                            admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation,
+                                    estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl,lease);
+                            admissions.put(admission.id, admission);
+                        } catch (RuntimeException | Error failure) {
+                            if (admission!=null) admissions.remove(admission.id,admission);
+                            if (lease!=null) proposalFootprints.release(lease); throw failure;
+                        }
                         admittedBytes += admission.bytes;
                         if (protectedControl) protectedAdmissions++; else { dataAdmissions++; dataProposalBytes+=admission.bytes; }
                         reservedReceiptCount+=admission.receiptCount; reservedReceiptBytes+=admission.receiptBytes;
@@ -614,11 +640,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             Leadership current = leadership();
             var nativePosition = store.applied();
             synchronized (admissions) {
+                requireHealthy();
                 if (!(transaction.getStateMachineContext() instanceof Admission admission)
                         || admissions.get(admission.id) != admission || admission.owners <= 0
                         || !current.ready() || admission.term != current.term()
                         || admission.generation != admissionGeneration.get()
-                        || nativePosition == null || nativePosition.term() != current.term()) {
+                        || nativePosition == null || nativePosition.term() != current.term() || !store.admissionOpen()) {
                     throw new IOException("Admission lost its completed current-term owner before append");
                 }
             }
@@ -661,7 +688,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                 byte[] bytes = store.apply(new ApplyPosition(entry.getTerm(), entry.getIndex()), command);
                 synchronized (admissions) {
                     var admitted = admissions.get(command.operationId());
-                    if (admitted != null) releaseRetention(admitted);
+                    if (admitted != null) settleAdmission(admitted);
                 }
                 advance(entry.getTerm(), entry.getIndex());
                 result = Message.valueOf(ByteString.copyFrom(bytes));
@@ -689,7 +716,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     }
 
     @Override public void notifyNotLeader(Collection<TransactionContext> pendingEntries) {
-        admissionGeneration.incrementAndGet(); store.invalidateScopedSnapshots();
+        admissionGeneration.incrementAndGet(); invalidateProposalCandidates(); store.invalidateScopedSnapshots();
         for (var transaction : pendingEntries) releaseAdmission(transaction);
     }
 
@@ -697,12 +724,66 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         synchronized (admissions) {
             if (transaction.getStateMachineContext() instanceof Admission admission) {
                 transaction.setStateMachineContext(null);
-                if (--admission.owners == 0 && admissions.remove(admission.id, admission)) {
-                    admittedBytes -= admission.bytes;
-                    if (admission.protectedControl) protectedAdmissions--; else { dataAdmissions--; dataProposalBytes-=admission.bytes; }
-                    releaseRetention(admission);
-                }
+                if (transaction.getLogEntry()!=null) admission.maybeAppended=true;
+                if (--admission.owners==0 && (!admission.maybeAppended || admission.settled)) finishAdmission(admission);
             }
+        }
+    }
+    // Caller holds admissions. Exact object identity protects a later replacement from old callbacks.
+    private void finishAdmission(Admission admission) {
+        if (!admissions.remove(admission.id,admission)) return;
+        releaseRetention(admission); if (admission.footprint!=null) proposalFootprints.release(admission.footprint);
+        admittedBytes-=admission.bytes;
+        if (admission.protectedControl) protectedAdmissions--; else { dataAdmissions--; dataProposalBytes-=admission.bytes; }
+    }
+    private void settleAdmission(Admission admission) {
+        admission.settled=true; releaseRetention(admission); if (admission.footprint!=null) proposalFootprints.release(admission.footprint);
+        if (admission.owners==0) finishAdmission(admission);
+    }
+    // Recovery reads one exact native cut outside the admissions monitor. Unknown suffixes remain reserved.
+    private List<Admission> verifiedNativeAdmissionOutcomes() throws Exception {
+        final List<Admission> pending;
+        synchronized (admissions) { pending=admissions.values().stream().filter(admission -> !admission.settled).toList(); }
+        if (pending.isEmpty()) return List.of(); var verified=new ArrayList<Admission>();
+        try (var pin=store.capture()) {
+            for (var admission:pending) {
+                try { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
+                catch (IllegalArgumentException differentPayload) { /* A mismatched speculative request is not verified coverage. */ }
+            }
+        }
+        return verified;
+    }
+    private void invalidateProposalCandidates() { synchronized (admissions) { proposalFootprints.invalidateCandidates(); } }
+    /** Only a strictly newer ready native term proves an older term's unknown suffix can no longer interpose. */
+    private void reconcileOlderProposalTerms(long term) {
+        if (term<=reconciledProposalTerm) return;
+        proposalFootprints.invalidateCandidates();
+        for (var admission:List.copyOf(admissions.values())) if (admission.term<term) settleAdmission(admission);
+        reconciledProposalTerm=term;
+    }
+    public ProposalFootprints.Stats proposalFootprintStats() { synchronized (admissions) { return proposalFootprints.stats(); } }
+    /** Unsubmitted exclusive scope guard only. Native validation and canonical append acceptance are still separate work. */
+    public final class ProposalReservation implements AutoCloseable {
+        private final ProposalFootprints.CandidateLease lease;
+        private ProposalReservation(ProposalFootprints.CandidateLease lease) { this.lease=lease; }
+        public long term() { return lease.term(); }
+        public long generation() { return lease.generation(); }
+        public boolean active() {
+            var applied=store.applied();
+            return lease.active() && lease.generation()==admissionGeneration.get() && applied!=null && applied.term()==lease.term()
+                    && storageFailure==null && getLifeCycleState()==LifeCycle.State.RUNNING && store.admissionOpen();
+        }
+        @Override public void close() { synchronized (admissions) { proposalFootprints.release(lease); } }
+    }
+    public ProposalReservation reserveProposalScope(TransactionScope scope) throws IOException {
+        requireHealthy(); long generation=admissionGeneration.get(); var current=leadership();
+        if (!current.ready()) throw new IOException("Leader is not ready for scope reservation");
+        store.validateScope(scope); var prepared=proposalFootprints.prepare(scope);
+        synchronized (admissions) {
+            requireHealthy(); var applied=store.applied();
+            if (generation!=admissionGeneration.get() || applied==null || applied.term()!=current.term()) throw new IOException("Reservation lost its completed current-term owner");
+            if (!store.admissionOpen()) throw new IOException("Native range admission is closed"); reconcileOlderProposalTerms(current.term());
+            var lease=proposalFootprints.reserveCandidate(prepared,current.term(),generation); return lease==null ? null : new ProposalReservation(lease);
         }
     }
 
