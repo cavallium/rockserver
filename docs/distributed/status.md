@@ -718,3 +718,64 @@ establish power-loss acceptance. The full distributed goal remains incomplete,
 including bootstrap/frontend/API routing, shared node resources, term-bound
 transactions/reservations, 2PC/snapshot fences, dynamic topology, long workflows
 and representative equal-durability performance.
+
+
+## Catalogue session epoch ledger and opt-in floor authority
+
+`SessionEpochLedger` adds bounded catalogue lifetime state in a dedicated logical
+column: cluster/database identity, generation, persisted monotonic logical time,
+minimum/next globally unique epochs, and complete contiguous grants above the
+minimum. Issuance starts at epoch 1; the initial image is empty generation zero.
+At most 1,024 grants are retained, with positive lifetimes bounded to 24 hours in
+catalogue logical time. Epoch/generation exhaustion fails explicitly. Issuing a
+grant preserves all history/time and appends one epoch. Advancing time clamps
+clock rollback and removes only the maximal expired prefix. An expired later
+grant remains present, invalid and capacity-counted until its older prefix closes.
+No expiry or epoch can be rewritten/reused through a valid transition.
+
+The canonical ledger codec is versioned, bounded to 41,036 bytes and validates
+exact count/length/order/lifetime invariants. `RatisSessionEpochs` provides a
+borrowed-client catalogue read/CAS facade. Its deterministic validator requires
+one matching-key PUT/NONE and equality predicate, fixed database key, identity,
+schema and the exact permitted successor. The optional combined catalogue rule
+dispatches by logical column; directory-only rules and existing constructors are
+unchanged. CAS uses the existing v2/v3 commands and original durable outcomes.
+`PreparedGrant` freezes the allocated grant and command, so a successful retry
+never derives its epoch from current nextEpoch. ACK-only/piggyback operations
+collect the issuer's covered receipts without altering grant history. The facade
+normalizes transport/protocol failures and never closes the caller's client.
+
+The opt-in floor-admission callback binds an immutable directory's cluster,
+database, active group, range epoch and schema, then uses one fresh catalogue
+read to check the live issuer and requested floor against the same image. Missing,
+malformed or unavailable state rejects new admission. Committed apply does not
+repeat this mutable lookup. This connects the previously abstract lifetime seam
+without automatically enabling it in the default runtime.
+
+Ordinary validation passes 57 core/native, 16 read-round and 23 adapter cases,
+Maven exit zero: `/tmp/rockserver-session-epoch-authority-full-gate.log`. The final
+focused gate passes four model and eight adapter cases:
+`/tmp/rockserver-session-epoch-ack-final-gate.log`; it includes the added malformed/
+unavailable reply and issuer ACK assertions. Reused unchanged cases give 97
+unique checks overall. Tests cover canonical bounds/truncation, exact transitions,
+out-of-order expiry/prefix closure, clock rollback, capacity/counter boundaries,
+competing native CAS, original grant/result retry, column/key/identity dispatch,
+borrowed ownership, unavailable/malformed replies and no automatic submission.
+
+A native adapter fixture explicitly attaches the real facade callback to
+RatisRangeStateMachine: new floor admission consumes one catalogue image, the
+catalogue becomes unavailable, committed apply still succeeds, and an old-epoch
+data entry produces expiry without effects. Catalogue RPC is represented by an
+in-process native-backed proxy, not real transport/quorum; no live authority or
+independent failure-domain acceptance is implied. The existing io_uring ENOMEM
+fallback explains the native-stream warning; assertions pass.
+
+No excluded fuzzing/security/traffic-isolation/network-probe/process/density or
+paused-registry workflows ran; no main-checkout edits, push, publication or
+production action occurred. This establishes bounded lifetime state in persisted
+logical time. Automatic time advancement, bootstrap/admin authority, first-use
+session/data-admission binding, floor propagation, receipt-count/result-byte
+admission, scheduled reclamation, rolling feature activation and lineage remain
+unfinished. Default floor activation is still disabled. Full architecture,
+frontend parity, transactions/2PC/topology/long workflows and representative
+performance/recovery acceptance remain required.

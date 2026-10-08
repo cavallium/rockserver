@@ -123,6 +123,18 @@ public final class RatisCatalogue {
         };
     }
 
+    /** Optional epoch ledger column; install the combined deterministic rule on every catalogue replica. */
+    public static Consumer<DistributedCommand> validator(UUID clusterId, UUID databaseId, UUID groupId,
+            long rangeEpoch, byte[] schemaDigest, UUID directoryColumn, UUID sessionColumn) {
+        if (directoryColumn.equals(sessionColumn)) throw new IllegalArgumentException("Catalogue columns must be distinct");
+        var directory = validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
+        var sessions = RatisSessionEpochs.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,sessionColumn);
+        return command -> {
+            if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(sessionColumn)) sessions.accept(command);
+            else directory.accept(command);
+        };
+    }
+
     private static RangeDirectory decode(byte[] encoded) {
         if (encoded.length > MAX_DIRECTORY_BYTES) throw new IllegalArgumentException("Catalogue directory exceeds CAS budget");
         var directory = RangeDirectoryCodec.decode(encoded);
