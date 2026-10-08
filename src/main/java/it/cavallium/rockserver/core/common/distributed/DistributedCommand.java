@@ -43,7 +43,7 @@ public final class DistributedCommand {
     /** Origin audit does not constrain replay term; the ordered business plan is retained unchanged. */
     public static DistributedCommand acceptedTransaction(DistributedCommand base,TransactionAcceptance acceptance) {
         Objects.requireNonNull(base); Objects.requireNonNull(acceptance);
-        if (base.kind!=Kind.DATA || base.mutations.isEmpty()) throw new IllegalArgumentException("Only business DATA can become an accepted transaction");
+        if (base.kind!=Kind.DATA || base.mutations.isEmpty() && base.predicates.isEmpty()) throw new IllegalArgumentException("Only business DATA can become an accepted transaction");
         return new DistributedCommand(Kind.COMMIT_ACCEPTED,base.groupId,base.rangeEpoch,base.schemaDigest,base.operationId,base.mutations,base.predicates,
                 base.acknowledgedThrough,-1,null,acceptance,null);
     }
@@ -62,8 +62,8 @@ public final class DistributedCommand {
                 || (long)mutations.size()+predicates.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Invalid command metadata/count/ACK");
         boolean data=kind==Kind.DATA || kind==Kind.COMMIT_ACCEPTED;
         if (!data && (!mutations.isEmpty() || !predicates.isEmpty())
-                || kind==Kind.DATA && mutations.isEmpty() && (!predicates.isEmpty() || acknowledgedThrough<0)
-                || kind==Kind.COMMIT_ACCEPTED && mutations.isEmpty()
+                || kind==Kind.DATA && mutations.isEmpty() && predicates.isEmpty() && acknowledgedThrough<0
+                || kind==Kind.COMMIT_ACCEPTED && mutations.isEmpty() && predicates.isEmpty()
                 || kind==Kind.SESSION_FLOOR && acknowledgedThrough!=-1
                 || (kind==Kind.SESSION_CONTROL)!=(sessionControl!=null)
                 || (kind==Kind.COMMIT_ACCEPTED)!=(acceptance!=null)

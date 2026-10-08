@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.file.*;
+import java.security.*;
 import java.util.*;
 
 /** Caller-driven durable coordinator. Clients are borrowed; no scheduling or decision policy is implied. */
@@ -12,13 +13,39 @@ public final class RatisDurableTransaction implements AutoCloseable {
     public static final int MAX_BYTES=64*1024*1024;
     private static final long MAX_AGGREGATE=16L*1024*1024;
     private static final int MAGIC=0x54584a4c;
-    public record Intent(RangeDescriptor route,DistributedCommand acceptedBusiness,OperationId prepareControl,OperationId finalizeControl) {
+    public record Intent(RangeDescriptor route,DistributedCommand acceptedBusiness,OperationId prepareControl,OperationId finalizeControl,List<Integer> resultPositions) {
+        public Intent(RangeDescriptor route,DistributedCommand acceptedBusiness,OperationId prepareControl,OperationId finalizeControl) {
+            this(route,acceptedBusiness,prepareControl,finalizeControl,java.util.stream.IntStream.range(0,localReturnCount(acceptedBusiness)).boxed().toList());
+        }
         public Intent {
             Objects.requireNonNull(route); Objects.requireNonNull(acceptedBusiness); Objects.requireNonNull(prepareControl); Objects.requireNonNull(finalizeControl);
             if (acceptedBusiness.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || prepareControl.equals(finalizeControl)
                     || prepareControl.equals(acceptedBusiness.operationId()) || finalizeControl.equals(acceptedBusiness.operationId())) throw new IllegalArgumentException("Invalid participant intent identities");
+            resultPositions=List.copyOf(resultPositions);
+            if (resultPositions.size()!=localReturnCount(acceptedBusiness)) throw new IllegalArgumentException("Participant result slot count differs from accepted return modes");
+            int previous=-1; for (int position:resultPositions) { if (position<0 || position>255 || position<=previous) throw new IllegalArgumentException("Participant result slots must be strictly increasing within 0..255"); previous=position; }
         }
     }
+    private static int localReturnCount(DistributedCommand command) {
+        Objects.requireNonNull(command);
+        if (command.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED) throw new IllegalArgumentException("Participant intent requires accepted business plan");
+        var result=CommandResult.decode(command.acceptance().result());
+        if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=command.mutations().stream().filter(m -> m.returnMode()!=Mutation.ReturnMode.NONE).count()) throw new IllegalArgumentException("Accepted result differs from participant return modes");
+        return result.valueCount();
+    }
+    public static byte[] planDigest(List<Intent> intents) {
+        Objects.requireNonNull(intents); if (intents.isEmpty() || intents.size()>TransactionStatus.MAX_PARTICIPANTS) throw new IllegalArgumentException("Invalid transaction intent count");
+        var ordered=intents.stream().sorted((a,b) -> compare(a.route().groupId(),b.route().groupId())).toList();
+        int size=4; for (var intent:ordered) size+=76+4*intent.resultPositions().size();
+        var bytes=ByteBuffer.allocate(size).putInt(ordered.size());
+        for (var intent:ordered) {
+            uuid(bytes,intent.route().groupId()); uuid(bytes,intent.route().rangeId()); bytes.putLong(intent.route().rangeEpoch()).put(intent.acceptedBusiness().payloadDigest()).putInt(intent.resultPositions().size());
+            for (int position:intent.resultPositions()) bytes.putInt(position);
+        }
+        try { return MessageDigest.getInstance("SHA-256").digest(bytes.array()); } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+    private static int compare(UUID a,UUID b) { int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits()); return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits()); }
+    private static void uuid(ByteBuffer bytes,UUID value) { bytes.putLong(value.getMostSignificantBits()).putLong(value.getLeastSignificantBits()); }
     public record ParticipantProgress(Intent intent,RatisRoutedClient.PreparedParticipantOperation preparation,ParticipantVote vote,
             RatisRoutedClient.PreparedFinalizationOperation finalization,ApplyPosition finalizationReceipt,ParticipantOutcome outcome) {}
     public record Snapshot(TransactionStatus initial,TransactionStatus observedHome,RatisRoutedClient.PreparedCommand pendingHome,
@@ -105,6 +132,19 @@ public final class RatisDurableTransaction implements AutoCloseable {
     }
     public synchronized Snapshot snapshot() throws IOException {
         requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,entries.values().stream().map(Entry::progress).toList());
+    }
+    /** Returns the globally ordered business outcome only after every native finalization and home ACK is durable. */
+    public synchronized CommandResult result() throws IOException {
+        requireOpen();
+        if (observed==null || !observed.fullyFinalized() || entries.values().stream().anyMatch(entry -> entry.outcome==null)) throw new IllegalStateException("Transaction result requires all native outcomes and home ACKs");
+        for (var entry:entries.values()) if (!entry.outcome.finalization().decision().equals(observed.terminalDecision())) throw new IOException("Saved participant outcome differs from terminal home");
+        if (observed.phase()==TransactionStatus.Phase.ABORT) return new CommandResult(CommandResult.Status.CONFLICT,List.of());
+        int count=resultCount(); var values=new ArrayList<byte[]>(Collections.nCopies(count,null));
+        for (var entry:entries.values()) {
+            var result=CommandResult.decode(entry.outcome.result());
+            for (int i=0;i<result.valueCount();i++) values.set(entry.intent.resultPositions().get(i),result.value(i));
+        }
+        return new CommandResult(CommandResult.Status.SUCCESS,values);
     }
     public synchronized void freezePreparation(RatisRoutedClient.PreparedParticipantOperation operation) throws IOException {
         idle(); var entry=entry(operation.descriptor().groupId());
@@ -311,6 +351,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
     /** Reserve all later proof/request metadata before registration can have effects. Results live only in accepted intents. */
     private void capacity() throws IOException {
         if (entries.isEmpty() || entries.size()>TransactionStatus.MAX_PARTICIPANTS || entries.size()!=initial.participants().size()) throw new IOException("Invalid participant count");
+        if (!Arrays.equals(initial.planDigest(),planDigest(entries.values().stream().map(entry -> entry.intent).toList()))) throw new IOException("Frozen transaction plan digest differs from accepted plans/global result order");
+        resultCount();
         long plans=0,routes=SessionWindowJournal.routeSize(homeRoute);
         var controls=new HashSet<OperationId>(); controls.add(initial.operation());
         for (var entry:entries.values()) {
@@ -329,12 +371,26 @@ public final class RatisDurableTransaction implements AutoCloseable {
         if (reserve+32>MAX_BYTES) throw new IOException("Transaction future persistence capacity unavailable");
         if (lastHome.equals(initial.operation()) || controls.contains(lastHome)) throw new IOException("Home operation overlaps participant/business identity");
     }
+    private int resultCount() throws IOException {
+        boolean[] assigned=new boolean[256]; int count=0; long bytes=8;
+        for (var entry:entries.values()) {
+            var result=CommandResult.decode(entry.intent.acceptedBusiness().acceptance().result());
+            bytes+=result.encode().length-8L;
+            if (bytes>CommandResult.MAX_BYTES) throw new IOException("Global transaction result exceeds byte budget before registration");
+            for (int position:entry.intent.resultPositions()) {
+                if (assigned[position]) throw new IOException("Duplicate global transaction result slot"); assigned[position]=true; count++;
+            }
+        }
+        if (count>256) throw new IOException("Global transaction result count exceeds bound");
+        for (int i=0;i<count;i++) if (!assigned[i]) throw new IOException("Global transaction result slots must exactly cover 0..N-1");
+        return count;
+    }
     private byte[] encode() throws IOException {
         long size=4+64+4L+initial.encode().length+SessionWindowJournal.routeSize(homeRoute)+32+4+(observed==null ? 0 : observed.encode().length)+1;
         if (pending!=null) size+=4L+DistributedCommandCodec.encodedSize(pending.command())+SessionWindowJournal.routeSize(pending.descriptor());
         size+=4+(homeResult==null ? 0 : homeResult.encode().length)+1+4;
         for (var entry:entries.values()) {
-            size+=SessionWindowJournal.routeSize(entry.intent.route())+4L+DistributedCommandCodec.encodedSize(entry.intent.acceptedBusiness())+64+4+(entry.registration==null ? 0 : entry.registration.encode().length)+1+voteSize(entry.vote)+4+(entry.finalization==null ? 0 : entry.finalization.finalization().encode().length)+positionSize(entry.receipt)+1;
+            size+=SessionWindowJournal.routeSize(entry.intent.route())+4L+DistributedCommandCodec.encodedSize(entry.intent.acceptedBusiness())+64+4L+4L*entry.intent.resultPositions().size()+4+(entry.registration==null ? 0 : entry.registration.encode().length)+1+voteSize(entry.vote)+4+(entry.finalization==null ? 0 : entry.finalization.finalization().encode().length)+positionSize(entry.receipt)+1;
             if (entry.outcome!=null) size+=4L+entry.outcome.finalization().encode().length+16+voteSize(entry.outcome.vote());
         }
         if (size+32>MAX_BYTES) throw new IOException("Transaction journal bound exceeded");
@@ -344,7 +400,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         blob(output,homeResult==null ? null : homeResult.encode()); output.put((byte)(homeSuperseded ? 1 : 0)); output.putInt(entries.size());
         for (var entry:entries.values()) {
             var intent=entry.intent;
-            SessionWindowJournal.route(output,intent.route()); blob(output,DistributedCommandCodec.encode(intent.acceptedBusiness())); operation(output,intent.prepareControl()); operation(output,intent.finalizeControl());
+            SessionWindowJournal.route(output,intent.route()); blob(output,DistributedCommandCodec.encode(intent.acceptedBusiness())); operation(output,intent.prepareControl()); operation(output,intent.finalizeControl()); output.putInt(intent.resultPositions().size()); for (int position:intent.resultPositions()) output.putInt(position);
             blob(output,entry.registration==null ? null : entry.registration.encode()); output.put((byte)(entry.preparation==null ? 0 : entry.preparation.negative() ? 2 : 1)); vote(output,entry.vote); blob(output,entry.finalization==null ? null : entry.finalization.finalization().encode()); position(output,entry.receipt);
             output.put((byte)(entry.outcome==null ? 0 : 1));
             if (entry.outcome!=null) { blob(output,entry.outcome.finalization().encode()); output.putLong(entry.outcome.position().term()).putLong(entry.outcome.position().index()); vote(output,entry.outcome.vote()); }
@@ -368,7 +424,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
             int count=input.getInt(); if (count<1 || count>TransactionStatus.MAX_PARTICIPANTS) throw new IOException("Invalid journal participant count");
             for (int i=0;i<count;i++) {
                 var route=SessionWindowJournal.route(input); var business=DistributedCommandCodec.decode(blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false));
-                var intent=new Intent(route,business,operation(input),operation(input)); var entry=new Entry(intent);
+                var prepareControl=operation(input); var finalizeControl=operation(input); int slots=input.getInt();
+                if (slots<0 || slots>256 || 4L*slots>input.remaining()) throw new IOException("Invalid participant result slot count");
+                var positions=new ArrayList<Integer>(slots); for (int slot=0;slot<slots;slot++) positions.add(input.getInt());
+                var intent=new Intent(route,business,prepareControl,finalizeControl,positions); var entry=new Entry(intent);
                 if (entries.putIfAbsent(route.groupId(),entry)!=null) throw new IOException("Duplicate journal participant");
                 byte[] registration=blob(input,TransactionStatus.MAX_BYTES,true); entry.registration=registration==null ? null : TransactionStatus.decode(registration);
                 if (entry.registration!=null) requirePreparation(entry,preparation(intent,entry.registration));

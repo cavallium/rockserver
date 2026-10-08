@@ -121,7 +121,7 @@ class RatisNegativeParticipantProtocolTest {
     private int preparationKind(byte[] body) throws IOException {
         var b=ByteBuffer.wrap(body); b.position(68); skipBlob(b); SessionWindowJournal.route(b); b.position(b.position()+32); skipBlob(b);
         assertEquals(1,b.get()); skipBlob(b); SessionWindowJournal.route(b); skipBlob(b); b.get(); assertEquals(1,b.getInt());
-        SessionWindowJournal.route(b); skipBlob(b); b.position(b.position()+64); skipBlob(b); return b.position();
+        SessionWindowJournal.route(b); skipBlob(b); b.position(b.position()+64); int slots=b.getInt(); b.position(b.position()+4*slots); skipBlob(b); return b.position();
     }
     private void skipBlob(ByteBuffer b) { int size=b.getInt(); if (size>=0) b.position(b.position()+size); }
 }

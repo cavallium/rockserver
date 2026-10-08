@@ -19,8 +19,8 @@ class RatisDurableTransactionTest {
     Plan plan(RatisParticipantPrepareTest.Node home,RatisParticipantPrepareTest.Node data,it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.ScopedHistoryPin pin) throws Exception {
         var accepted=data.f.machine.participantIntent(pin,data.f.put(2));
         var participant=new TransactionStatus.Participant(data.f.groupId,data.f.groupId,1,new byte[32],accepted.payloadDigest(),null,false);
-        var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1500),accepted.operationId(),1,new byte[32],new byte[32],List.of(participant));
         var intent=new RatisDurableTransaction.Intent(data.directory.ranges().getFirst(),accepted,helper.control(0),new OperationId(new UUID(0,1501),3,0));
+        var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1500),accepted.operationId(),1,new byte[32],RatisDurableTransaction.planDigest(List.of(intent)),List.of(participant));
         return new Plan(initial,home.statuses.prepare(homeOperation(0),null,initial),intent);
     }
     RatisDurableTransaction create(Path path,RatisParticipantPrepareTest.Node home,RatisParticipantPrepareTest.Node data,Plan plan) throws Exception {
@@ -142,8 +142,8 @@ class RatisDurableTransactionTest {
             var rb=new DistributedCommand(r.groupId(),1,new byte[32],operation,List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{(byte)130},new byte[]{8})));
             try (var lp=left.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1})))); var rp=right.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{(byte)130})))); var routed=new RatisRoutedClient(directory,transport)) {
                 var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb);
-                var initial=TransactionStatus.begin(helper.cluster,helper.database,domain,new UUID(0,1603),operation,1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],la.payloadDigest(),null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],ra.payloadDigest(),null,false)));
-                var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,1604),3,0)),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,1605),3,0)));
+                var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,1604),3,0),List.of()),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,1605),3,0),List.of()));
+                var initial=TransactionStatus.begin(helper.cluster,helper.database,domain,new UUID(0,1603),operation,1,new byte[32],RatisDurableTransaction.planDigest(intents),List.of(new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],la.payloadDigest(),null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],ra.payloadDigest(),null,false)));
                 Path path=root.resolve("multi.bin"); var journal=RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents);
                 try {
                     journal.executeHome();
@@ -227,10 +227,10 @@ class RatisDurableTransactionTest {
                 var route=new RangeDescriptor(group,group,1,0,n==0 ? null : new byte[]{(byte)(n*28)},n==8 ? null : new byte[]{(byte)((n+1)*28)},RangeDescriptor.TopologyState.ACTIVE,List.of(replica)); ranges.add(route);
                 byte[] key={(byte)(n*28+1)}; var raw=new DistributedCommand(group,1,new byte[32],business,List.of(new Mutation(Mutation.Kind.PUT,data.f.column,key,new byte[1_900_000])));
                 var scope=new TransactionScope(List.of(TransactionScope.Span.point(data.f.column,key))); var accepted=DistributedCommand.acceptedTransaction(raw,new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1701),scope,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
-                intents.add(new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1702),2,n),new OperationId(new UUID(0,1703),3,n))); participants.add(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false));
+                intents.add(new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1702),2,n),new OperationId(new UUID(0,1703),3,n),List.of())); participants.add(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false));
             }
             var directory=new RangeDirectory(helper.cluster,helper.database,data.directory.domainId(),1,new byte[32],0,Set.of(data.f.column),0,ranges);
-            var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1704),business,1,new byte[32],new byte[32],participants);
+            var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1704),business,1,new byte[32],RatisDurableTransaction.planDigest(intents),participants);
             try (var routed=new RatisRoutedClient(directory,data.wire)) {
                 Path path=root.resolve("budget.bin"); assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents));
                 assertFalse(Files.exists(path)); assertEquals(0,home.wire.index); assertEquals(0,data.wire.index);
@@ -279,6 +279,37 @@ class RatisDurableTransactionTest {
                 assertThrows(IOException.class,journal::executeHome); assertEquals(0,data.wire.index);
             }
             try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); }
+        }
+    }
+
+    @Test void globalResultBytesSlotsAndDigestAreRejectedBeforeAnyHomeOrParticipantRpc() throws Exception {
+        helper.root=root;
+        try (var home=helper.new Node("result-budget-home",true); var data=helper.new Node("result-budget-data",false)) {
+            for (String invalid:List.of("bytes","duplicate","gap","digest")) {
+                var routes=new ArrayList<RangeDescriptor>(); var intents=new ArrayList<RatisDurableTransaction.Intent>(); var participants=new ArrayList<TransactionStatus.Participant>();
+                var business=new OperationId(new UUID(0,1720),1,0);
+                for (int n=0;n<2;n++) {
+                    UUID group=new UUID(0,1730+n); byte[] key={(byte)(n==0 ? 1 : 129)};
+                    var replica=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"result-"+n,"127.0.0.1:"+(16000+n),ReplicaDescriptor.Role.VOTER);
+                    var route=new RangeDescriptor(group,group,1,0,n==0 ? null : new byte[]{(byte)128},n==0 ? new byte[]{(byte)128} : null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica)); routes.add(route);
+                    var raw=new DistributedCommand(group,1,new byte[32],business,List.of(new Mutation(Mutation.Kind.PUT,data.f.column,key,new byte[]{7},Mutation.ReturnMode.PREVIOUS)));
+                    byte[] value=new byte[invalid.equals("bytes") ? 1_100_000 : 1];
+                    var accepted=DistributedCommand.acceptedTransaction(raw,new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1721),new TransactionScope(List.of(TransactionScope.Span.point(data.f.column,key))),new CommandResult(CommandResult.Status.SUCCESS,List.of(value)).encode()));
+                    int slot=invalid.equals("duplicate") ? 0 : invalid.equals("gap") && n==1 ? 2 : n;
+                    intents.add(new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1722),2,n),new OperationId(new UUID(0,1723),3,n),List.of(slot)));
+                    participants.add(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false));
+                    assertThrows(IllegalArgumentException.class,() -> new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1722),2,20),new OperationId(new UUID(0,1723),3,20),List.of()));
+                    assertThrows(IllegalArgumentException.class,() -> new RatisDurableTransaction.Intent(route,accepted,new OperationId(new UUID(0,1722),2,20),new OperationId(new UUID(0,1723),3,20),List.of(256)));
+                }
+                var directory=new RangeDirectory(helper.cluster,helper.database,data.directory.domainId(),1,new byte[32],0,Set.of(data.f.column),0,routes);
+                byte[] digest=RatisDurableTransaction.planDigest(intents); if (invalid.equals("digest")) digest[0]^=1;
+                var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,1740+List.of("bytes","duplicate","gap","digest").indexOf(invalid)),business,1,new byte[32],digest,participants);
+                try (var routed=new RatisRoutedClient(directory,data.wire)) {
+                    Path path=root.resolve("global-result-"+invalid+".bin");
+                    assertThrows(IOException.class,() -> RatisDurableTransaction.create(path,home.statuses,routed,initial,home.statuses.prepare(homeOperation(0),null,initial),intents));
+                    assertFalse(Files.exists(path)); assertEquals(0,home.wire.index); assertEquals(0,data.wire.index);
+                }
+            }
         }
     }
 

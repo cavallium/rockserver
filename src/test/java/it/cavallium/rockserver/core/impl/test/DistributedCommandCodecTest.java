@@ -55,7 +55,8 @@ class DistributedCommandCodecTest {
         for (int offset:new int[] {21,77,85,93}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putLong(offset,-2); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
         for (int offset:new int[] {109,110}) { byte[] bad=valid.clone(); bad[offset]=127; assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
         assertThrows(IllegalArgumentException.class,() -> new DistributedCommand(GROUP,9,new byte[32],OPERATION,List.of(),List.of()));
-        assertThrows(IllegalArgumentException.class,() -> new DistributedCommand(GROUP,9,new byte[32],OPERATION,List.of(),List.of(new KeyPredicate(COLUMN,new byte[0],null)),0));
+        var readOnly=new DistributedCommand(GROUP,9,new byte[32],OPERATION,List.of(),List.of(new KeyPredicate(COLUMN,new byte[0],null)),0);
+        for (var command:List.of(readOnly,DistributedCommand.acceptedTransaction(readOnly,audit()))) assertArrayEquals(DistributedCommandCodec.encode(command),DistributedCommandCodec.encode(DistributedCommandCodec.decode(DistributedCommandCodec.encode(command))));
         for (long ack:new long[] {-2,8,Long.MAX_VALUE}) assertThrows(IllegalArgumentException.class,() -> new DistributedCommand(GROUP,9,new byte[32],OPERATION,List.of(put()),List.of(),ack));
     }
 

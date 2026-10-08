@@ -87,8 +87,8 @@ public final class RatisSessionClient {
             if (!id.sessionId().equals(grant.sessionId()) || id.epoch()!=grant.epoch() || id.sequence()!=sequence
                     || command.acknowledgedThrough()>ack || saved.consumed() && saved.result()==null
                     || client.pending.isEmpty() && saved.consumed()
-                    || saved.intent() && (command.acceptance()!=null || command.mutations().isEmpty() || saved.result()!=null || saved.consumed() || saved.abandoned())
-                    || saved.abandoned() && (command.acceptance()!=null || command.mutations().isEmpty() || saved.result()==null
+                    || saved.intent() && (command.acceptance()!=null || (command.mutations().isEmpty() && command.predicates().isEmpty()) || saved.result()!=null || saved.consumed() || saved.abandoned())
+                    || saved.abandoned() && (command.acceptance()!=null || (command.mutations().isEmpty() && command.predicates().isEmpty()) || saved.result()==null
                             || saved.result().status()!=CommandResult.Status.CONFLICT || saved.result().valueCount()!=0)) throw new IllegalArgumentException("Invalid recovered command/outcome ownership");
             int bytes=DistributedCommandCodec.encodedSize(command), result=maximumResult(command);
             if (bytes>limits.commandBytes()-client.commandBytes || result>limits.resultBytes()-client.resultBytes) throw new IllegalArgumentException("Recovered byte window exceeds limits");
@@ -127,7 +127,7 @@ public final class RatisSessionClient {
 
     /** Allocates an identity/route whose base command can never execute before explicit acceptance. */
     public synchronized Pending prepareTransactionIntent(List<Mutation> mutations,List<KeyPredicate> predicates) {
-        if (mutations.isEmpty()) throw new IllegalArgumentException("Transaction intent requires business mutations");
+        if (mutations.isEmpty() && predicates.isEmpty()) throw new IllegalArgumentException("Transaction intent requires business inputs");
         requireCapacity(); var id=new OperationId(grant.sessionId(),grant.epoch(),nextSequence);
         var prepared=acknowledgedThrough<0 ? routed.prepare(id,mutations,predicates) : routed.prepare(id,mutations,predicates,acknowledgedThrough);
         return retain(prepared,true);
@@ -152,7 +152,7 @@ public final class RatisSessionClient {
     /** Definitive local no-effects outcome: an awaiting intent has never been eligible for a write RPC. */
     public synchronized CommandResult abandonTransactionIntent(Pending entry) {
         requireOwner(entry);
-        if (!entry.awaitingAcceptance || entry.command().acceptance()!=null || entry.command().mutations().isEmpty()
+        if (!entry.awaitingAcceptance || entry.command().acceptance()!=null || (entry.command().mutations().isEmpty() && entry.command().predicates().isEmpty())
                 || entry.executing || entry.result!=null || entry.consumed) throw new IllegalStateException("Operation is not an unresolved transaction intent");
         entry.result=new CommandResult(CommandResult.Status.CONFLICT,List.of()); entry.abandoned=true; entry.awaitingAcceptance=false;
         return entry.result;

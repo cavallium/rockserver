@@ -434,6 +434,11 @@ public final class RatisRoutedClient implements AutoCloseable {
         } finally { endCall(); }
     }
 
+    /** Freeze a complete multi-group business plan before snapshots, allocation or any network dispatch. */
+    public RatisTransactionPlan transactionPlan(OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) {
+        return RatisTransactionPlan.create(current(),operation,mutations,predicates);
+    }
+
     public PreparedCommand prepare(OperationId operation, List<Mutation> mutations) {
         return prepare(operation, mutations, List.of());
     }
@@ -455,7 +460,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         Objects.requireNonNull(operation, "operation");
         Objects.requireNonNull(mutations, "mutations");
         Objects.requireNonNull(predicates, "predicates");
-        if (mutations.isEmpty() || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS) {
+        if (mutations.isEmpty() && predicates.isEmpty() || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS) {
             throw new IllegalArgumentException("Invalid atomic command item count");
         }
         mutations = List.copyOf(mutations);
@@ -522,7 +527,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
-                || command.mutations().isEmpty() && (command.acknowledgedThrough()<0 || !command.predicates().isEmpty())) {
+                || command.mutations().isEmpty() && command.predicates().isEmpty() && command.acknowledgedThrough()<0) {
             throw new IllegalArgumentException("Invalid recovered user command route");
         }
         int prefix=observed.routingPrefixBytes();

@@ -92,8 +92,12 @@ public final class RatisLogicalClient {
     }
     record Plan(List<Mutation> mutations,List<KeyPredicate> predicates) {}
     static Plan plan(DistributedSchema schema,List<Change> changes,List<Condition> conditions) {
+        return plan(schema,changes,conditions,DistributedCommandCodec.MAX_ENCODED_BYTES);
+    }
+    static Plan plan(DistributedSchema schema,List<Change> changes,List<Condition> conditions,long maxBytes) {
+        if (maxBytes<1 || maxBytes>RatisTransactionPlan.MAX_BYTES) throw new IllegalArgumentException("Invalid logical transaction byte budget");
         changes=List.copyOf(changes); conditions=List.copyOf(conditions);
-        if (changes.isEmpty() || (long)changes.size()+conditions.size()>DistributedCommandCodec.MAX_ITEMS) {
+        if (changes.isEmpty() && conditions.isEmpty() || (long)changes.size()+conditions.size()>DistributedCommandCodec.MAX_ITEMS) {
             throw new IllegalArgumentException("Invalid logical atomic command item count");
         }
         var mutations=new ArrayList<Mutation>(changes.size()); var predicates=new ArrayList<KeyPredicate>(conditions.size());
@@ -101,7 +105,7 @@ public final class RatisLogicalClient {
         for (var change:changes) {
             var column=supported(schema,change.column); var encoded=schema.encodeLogicalKey(column.columnId(),change.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
             byte[] value=change.kind==Mutation.Kind.DELETE ? null : storedValue(column,change.value);
-            bytes+=26L+key.length+(value==null ? 0 : value.length)+memberBytes(members); requireBudget(bytes);
+            bytes+=26L+key.length+(value==null ? 0 : value.length)+memberBytes(members); if (bytes>maxBytes) throw new IllegalArgumentException("Logical plan exceeds byte budget");
             if (column.schema().variableLengthKeysCount()!=0) mutations.add(change.kind==Mutation.Kind.PUT
                     ? Mutation.bucketPut(column.columnId(),key,members,value,change.returns)
                     : Mutation.bucketDelete(column.columnId(),key,members,change.returns));
@@ -111,7 +115,7 @@ public final class RatisLogicalClient {
             var column=supported(schema,condition.column); var encoded=schema.encodeLogicalKey(column.columnId(),condition.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
             // Null is an absence predicate even for value-bearing columns.
             byte[] expected=condition.expected==null ? null : storedValue(column,condition.expected);
-            bytes+=25L+key.length+(expected==null ? 0 : expected.length)+memberBytes(members); requireBudget(bytes);
+            bytes+=25L+key.length+(expected==null ? 0 : expected.length)+memberBytes(members); if (bytes>maxBytes) throw new IllegalArgumentException("Logical plan exceeds byte budget");
             predicates.add(column.schema().variableLengthKeysCount()!=0 ? KeyPredicate.bucketMember(column.columnId(),key,members,expected) : new KeyPredicate(column.columnId(),key,expected));
         }
         return new Plan(List.copyOf(mutations),List.copyOf(predicates));

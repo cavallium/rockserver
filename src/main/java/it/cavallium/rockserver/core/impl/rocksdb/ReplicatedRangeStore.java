@@ -1677,7 +1677,7 @@ public final class ReplicatedRangeStore {
     public DistributedCommand planScopedCommit(ScopedHistoryPin pin,DistributedCommand command,long generation,UUID incarnation) throws RocksDBException {
         Objects.requireNonNull(pin); Objects.requireNonNull(command);
         if (pin.owner()!=this) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
-        if (command.acceptance()!=null || command.sessionControl()!=null || command.minimumSessionEpoch()>=0 || command.mutations().isEmpty()) throw new IllegalArgumentException("Expected an unaccepted business command");
+        if (command.acceptance()!=null || command.sessionControl()!=null || command.minimumSessionEpoch()>=0 || command.mutations().isEmpty() && command.predicates().isEmpty()) throw new IllegalArgumentException("Expected an unaccepted business command");
         validate(command);
         validateScopedCommand(pin,command);
         enterNative(); applyLane.lock();
@@ -1730,7 +1730,7 @@ public final class ReplicatedRangeStore {
         /** Builds a bounded read-your-writes view at this exact cut, without applying or accepting anything. */
         public ScopedStaging stage(DistributedCommand command) throws RocksDBException {
             requireReadable(); Objects.requireNonNull(command);
-            if (command.kind()!=DistributedCommand.Kind.DATA || command.mutations().isEmpty()) throw new IllegalArgumentException("Expected business DATA for staging");
+            if (command.kind()!=DistributedCommand.Kind.DATA || command.mutations().isEmpty() && command.predicates().isEmpty()) throw new IllegalArgumentException("Expected business DATA for staging");
             ReplicatedRangeStore.this.validate(command); validateScopedCommand(this,command);
             if (logicalSchema!=null) validateLogical(command);
             return new ScopedStaging(this,command);

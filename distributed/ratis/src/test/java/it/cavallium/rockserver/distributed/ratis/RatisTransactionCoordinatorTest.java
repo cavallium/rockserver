@@ -137,10 +137,11 @@ class RatisTransactionCoordinatorTest {
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return wire(route).participant(route,bytes); }
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return wire(route).transaction(route,bytes,fresh); }
             };
-            var operation=new OperationId(new UUID(0,2012),1,0); var lb=new DistributedCommand(l.groupId(),1,new byte[32],operation,List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{1},new byte[]{7},Mutation.ReturnMode.PREVIOUS))); var rb=new DistributedCommand(r.groupId(),1,new byte[32],operation,List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{(byte)130},new byte[]{8},Mutation.ReturnMode.CURRENT)));
+            var operation=new OperationId(new UUID(0,2012),1,0); var lb=new DistributedCommand(l.groupId(),1,new byte[32],operation,List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{1},new byte[]{7},Mutation.ReturnMode.PREVIOUS))); var rb=new DistributedCommand(r.groupId(),1,new byte[32],operation,List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{(byte)130},new byte[]{8},Mutation.ReturnMode.CURRENT),new Mutation(Mutation.Kind.PUT,column,new byte[]{(byte)130},new byte[0],Mutation.ReturnMode.CURRENT)));
             try (var lp=left.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1})))); var rp=right.f.store.captureTracked(new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{(byte)130})))); var routed=new RatisRoutedClient(directory,transport)) {
-                var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb); var initial=TransactionStatus.begin(helper.cluster,helper.database,domain,new UUID(0,2013),operation,1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],la.payloadDigest(),null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],ra.payloadDigest(),null,false)));
-                var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,2014),3,0)),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,2015),3,0)));
+                var la=left.f.machine.participantIntent(lp,lb); var ra=right.f.machine.participantIntent(rp,rb);
+                var intents=List.of(new RatisDurableTransaction.Intent(l,la,helper.control(0),new OperationId(new UUID(0,2014),3,0),List.of(1)),new RatisDurableTransaction.Intent(r,ra,helper.control(1),new OperationId(new UUID(0,2015),3,0),List.of(0,2)));
+                var initial=TransactionStatus.begin(helper.cluster,helper.database,domain,new UUID(0,2013),operation,1,new byte[32],RatisDurableTransaction.planDigest(intents),List.of(new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],la.payloadDigest(),null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],ra.payloadDigest(),null,false)));
                 try (var journal=RatisDurableTransaction.create(root.resolve("multi-coordinator.bin"),home.statuses,routed,initial,home.statuses.prepare(fixtures.journals.homeOperation(0),null,initial),intents); var coordinator=new RatisTransactionCoordinator(journal,home.statuses,routed,RatisTransactionRecoveryTest::next,(tx,p) -> {
                     var isLeft=p.intent().route().groupId().equals(l.groupId()); var node=isLeft ? left : right; RatisRangeStateMachine.ParticipantProposal token;
                     try {
@@ -149,7 +150,10 @@ class RatisTransactionCoordinatorTest {
                         return new RatisTransactionCoordinator.Authorization(token.preparation(),token.negative(),token);
                     } catch (IOException e) { throw e; } catch (Exception e) { throw new IOException(e); }
                 },(g,t,c) -> { try { var node=g.equals(l.groupId()) ? left : right; var token=node.f.machine.prepareFinalization(home.statuses,t,c); return new RatisTransactionRecovery.Authorization(token.finalization(),token); } catch (Exception e) { throw new IOException(e); } })) {
-                    left.wire.lose=true; int lost=0; boolean partial=false,complete=false;
+                    assertArrayEquals(RatisDurableTransaction.planDigest(intents),RatisDurableTransaction.planDigest(List.of(intents.get(1),intents.get(0))));
+                    var reorderedResults=List.of(new RatisDurableTransaction.Intent(l,la,intents.get(0).prepareControl(),intents.get(0).finalizeControl(),List.of(0)),new RatisDurableTransaction.Intent(r,ra,intents.get(1).prepareControl(),intents.get(1).finalizeControl(),List.of(1,2)));
+                    assertFalse(Arrays.equals(RatisDurableTransaction.planDigest(intents),RatisDurableTransaction.planDigest(reorderedResults)));
+                    assertThrows(IllegalStateException.class,journal::result); left.wire.lose=true; int lost=0; boolean partial=false,complete=false;
                     for (int n=0;n<64 && !complete;n++) {
                         long before=home.wire.index+left.wire.index+right.wire.index;
                         try { complete=coordinator.step().complete(); } catch (IOException expected) { assertTrue(expected.getMessage().contains("Lost applied participant reply")); lost++; }
@@ -157,12 +161,16 @@ class RatisTransactionCoordinatorTest {
                         var state=journal.snapshot(); long finalized=state.participants().stream().filter(p -> p.outcome()!=null).count();
                         if (finalized==1) {
                             partial=true; assertFalse(complete); boolean leftDone=state.participant(l.groupId()).outcome()!=null;
-                            assertArrayEquals(new byte[]{(byte)(leftDone ? 7 : 8)},routed.read(column,leftDone ? new byte[]{1} : new byte[]{(byte)130}));
+                            assertArrayEquals(leftDone ? new byte[]{7} : new byte[0],routed.read(column,leftDone ? new byte[]{1} : new byte[]{(byte)130}));
+                            assertThrows(IllegalStateException.class,journal::result);
                             assertThrows(IOException.class,() -> routed.read(column,leftDone ? new byte[]{(byte)130} : new byte[]{1}));
                         }
                     }
                     assertTrue(complete); assertTrue(partial); assertEquals(1,lost); assertEquals(TransactionStatus.Phase.COMMIT,journal.snapshot().observedHome().phase()); assertTrue(journal.snapshot().observedHome().fullyFinalized()); assertFalse(journal.snapshot().observedHome().consumed());
-                    assertArrayEquals(la.acceptance().result(),journal.snapshot().participant(l.groupId()).outcome().result()); assertArrayEquals(ra.acceptance().result(),journal.snapshot().participant(r.groupId()).outcome().result()); assertArrayEquals(new byte[]{7},routed.read(column,new byte[]{1})); assertArrayEquals(new byte[]{8},routed.read(column,new byte[]{(byte)130})); assertEquals(2,left.wire.index); assertEquals(2,right.wire.index); helper.released(left); helper.released(right);
+                    assertArrayEquals(la.acceptance().result(),journal.snapshot().participant(l.groupId()).outcome().result()); assertArrayEquals(ra.acceptance().result(),journal.snapshot().participant(r.groupId()).outcome().result()); assertArrayEquals(new byte[]{7},routed.read(column,new byte[]{1})); assertArrayEquals(new byte[0],routed.read(column,new byte[]{(byte)130})); assertEquals(2,left.wire.index); assertEquals(2,right.wire.index); helper.released(left); helper.released(right);
+                    var result=journal.result(); assertEquals(CommandResult.Status.SUCCESS,result.status()); assertEquals(3,result.valueCount()); assertArrayEquals(new byte[]{8},result.value(0)); assertNull(result.value(1)); assertArrayEquals(new byte[0],result.value(2)); assertFalse(journal.snapshot().observedHome().consumed());
+                    journal.close();
+                    try (var reopened=RatisDurableTransaction.reopen(root.resolve("multi-coordinator.bin"),home.statuses,routed)) { assertArrayEquals(result.encode(),reopened.result().encode()); assertEquals(List.of(0,2),reopened.snapshot().participant(r.groupId()).intent().resultPositions()); }
                 }
             }
         }
