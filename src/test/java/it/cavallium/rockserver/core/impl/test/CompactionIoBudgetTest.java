@@ -16,7 +16,10 @@ class CompactionIoBudgetTest {
                     transferred > 0, pressure, pressure, true, pending, completions, !pressure));
         }
         void window(long count, long latency, long transferred) {
-            for (int i = 0; i < 5; i++) poll(count, latency, transferred, false, false);
+            for (int i = 0; i < 5; i++) {
+                completions += count;
+                poll(count, latency, transferred, false, false);
+            }
         }
     }
     @Test void bootstrapLearnsAndProbeKeepsOnlyMeasuredImprovement() {
@@ -110,4 +113,74 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.MIN_BYTES_PER_SECOND, new CompactionIoBudget(Long.MIN_VALUE).budget());
         assertEquals(CompactionIoBudget.MAX_BYTES_PER_SECOND, new CompactionIoBudget(Long.MAX_VALUE).budget());
     }
+    @Test void startupBlockReadsWithoutForegroundCompletionsDoNotCalibrateLatency() {
+        var t = new Trace();
+        for (int second = 0; second < 5; second++) t.poll(10, 20, SEED, false, false);
+        assertEquals(0, t.policy.baselineReadMicros());
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(),
+                "startup block reads without completed foreground work cannot calibrate foreground latency");
+        assertEquals(SEED, t.policy.budget());
+    }
+    @Test void mediaShiftWithForegroundProgressDoesNotBackOffPermanently() {
+        var t = new Trace();
+        for (int second = 0; second < 5; second++) t.poll(10, 20, SEED, false, false);
+        for (int window = 0; window < 60; window++) {
+            for (int second = 0; second < 5; second++) {
+                t.completions += 3_000;
+                t.poll(100, 3_000 + window % 3 * 3_000, Math.min(SEED, t.policy.budget()), false, true);
+            }
+        }
+        assertTrue(t.policy.budget() >= SEED * .75,
+                "latency unresponsive to throttling must not erase observed sustainable background service");
+    }
+
+    @Test void highLatencyWithoutProbeBenefitRestoresServiceAndHonorsCooldown() {
+        var t = new Trace();
+        t.window(10, 100, SEED);
+        t.window(10, 100, 750_000); t.window(10, 100, 750_000);
+        assertEquals(SEED, t.policy.budget());
+        for (int window = 0; window < 12; window++) {
+            t.window(10, 6_000, SEED);
+            assertEquals(SEED, t.policy.budget(), "high latency must respect failed-probe cooldown");
+        }
+        t.window(10, 6_000, SEED);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        t.window(10, 6_000, 750_000); t.window(10, 6_000, 750_000);
+        assertEquals(SEED, t.policy.budget(), "no latency response must restore the pre-probe budget");
+    }
+    @Test void apparentLatencyBenefitNeedsReducedBackgroundServiceAndForegroundProgress() {
+        for (int scenario = 0; scenario < 4; scenario++) {
+            var t = new Trace();
+            t.window(20, 100, SEED);
+            for (int second = 0; second < 10; second++) {
+                t.completions += scenario == 2 ? 10 : scenario == 3 ? 0 : 20;
+                t.poll(20, 50, scenario == 0 ? SEED : scenario == 1 ? 0 : 750_000, false, true);
+            }
+            assertEquals(SEED, t.policy.budget(),
+                    "unchanged/zero background service or fewer foreground completions cannot justify a cut");
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        }
+    }
+    @Test void missingProbeSampleRestoresServiceAndIdleBlockReadsDoNotLearnBaseline() {
+        var t = new Trace();
+        t.window(10, 100, SEED);
+        t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, false, false, false));
+        assertEquals(SEED, t.policy.budget());
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        var idle = new Trace();
+        idle.window(10, 100, SEED);
+        idle.window(10, 80, 750_000); idle.window(10, 80, 750_000);
+        assertEquals(80, idle.policy.baselineReadMicros());
+        for (int second = 0; second < 20; second++) idle.poll(10, 20, SEED, false, false);
+        assertEquals(80, idle.policy.baselineReadMicros(), "uncorroborated block I/O must not pollute a calibrated baseline");
+    }
+    @Test void floorSkipsNoOpProbeAndCanGrowWithHealthyMeasuredService() {
+        var t = new Trace();
+        t.window(10, 100, CompactionIoBudget.MIN_BYTES_PER_SECOND);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(100, t.policy.baselineReadMicros());
+        for (int window = 0; window < 5; window++) t.window(10, 100, t.policy.budget());
+        assertTrue(t.policy.budget() > CompactionIoBudget.MIN_BYTES_PER_SECOND);
+    }
+
 }

@@ -21,9 +21,10 @@ public final class CompactionIoBudget {
     private long windowNanos, reads, micros, bytes;
     private boolean background, pressuredWindow, pendingForeground, noProgressProbeUsed;
     private long completions;
-    private double baseline, recentAchieved, lastAchieved;
+    private volatile double baseline;
+    private double recentAchieved, lastAchieved;
     private long preThrottle, probeBudget;
-    private double probeLatency;
+    private double probeLatency, probeAchieved, probeForegroundRate;
     private int settle, cooldown, healthyRecovery;
 
     public CompactionIoBudget(long seed) {
@@ -31,6 +32,7 @@ public final class CompactionIoBudget {
         budget = shutdownBudget = this.seed;
     }
     public long budget() { return budget; }
+    public double baselineReadMicros() { return baseline; }
     public long shutdownBudget() { return shutdownBudget; }
     public State state() { return state; }
     private static long bound(double value) {
@@ -77,7 +79,8 @@ public final class CompactionIoBudget {
         background |= sample.background || old.background || transferred > 0;
         if (windowNanos < 5_000_000_000L) return publishBudget();
         double achieved = bytes * (1_000_000_000d / windowNanos);
-        double latency = reads >= 32 ? (double) micros / reads : Double.NaN;
+        double latency = reads >= 32 && completions >= 32 ? (double) micros / reads : Double.NaN;
+        double foregroundRate = completions * (1_000_000_000d / windowNanos);
         boolean active = background && bytes > 0;
         boolean pressureInWindow = pressuredWindow;
         boolean noForegroundProgress = pendingForeground && completions == 0;
@@ -97,7 +100,9 @@ public final class CompactionIoBudget {
         lastAchieved = active ? achieved : 0;
         if (state == State.PROBE) {
             if (--settle > 0) return publishBudget();
-            finishProbe(active && Double.isFinite(latency) && latency > 0 && latency <= probeLatency * .9, latency);
+            finishProbe(active && Double.isFinite(latency) && latency > 0 && latency <= probeLatency * .9
+                    && probeAchieved > 0 && achieved <= probeAchieved * .9
+                    && foregroundRate >= probeForegroundRate * .9, latency);
             return publishBudget();
         }
         if (!active) {
@@ -114,7 +119,7 @@ public final class CompactionIoBudget {
             state = State.TRACKING;
             if (Double.isFinite(latency) && latency > 0) {
                 baseline = latency;
-                beginProbe(latency);
+                beginProbe(latency, foregroundRate);
             }
             return publishBudget();
         }
@@ -124,17 +129,13 @@ public final class CompactionIoBudget {
                 budget = bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
             } else if (noForegroundProgress && !noProgressProbeUsed && baseline > 0) {
                 noProgressProbeUsed = true;
-                beginProbe(baseline);
+                beginProbe(baseline, foregroundRate);
             }
             return publishBudget();
         }
         if (baseline == 0) baseline = latency;
-        if (latency > baseline * 1.5) {
-            preThrottle = Math.max(preThrottle, bound(recentAchieved));
-            budget = bound(budget * .75);
-            cooldown = 12;
-        } else if (cooldown == 0) {
-            beginProbe(latency);
+        if (cooldown == 0) {
+            beginProbe(latency, foregroundRate);
         } else {
             cooldown--;
             if (latency < baseline * 1.2) {
@@ -161,11 +162,19 @@ public final class CompactionIoBudget {
         state = State.TRACKING;
         cooldown = 12;
     }
-    private void beginProbe(double latency) {
+    private void beginProbe(double latency, double foregroundRate) {
+        long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
+        if (candidate >= budget) {
+            baseline = latency;
+            cooldown = 12;
+            return;
+        }
         probeBudget = budget;
         probeLatency = latency;
+        probeAchieved = lastAchieved;
+        probeForegroundRate = foregroundRate;
         preThrottle = Math.max(preThrottle, bound(recentAchieved));
-        budget = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
+        budget = candidate;
         state = State.PROBE;
         settle = 2;
     }

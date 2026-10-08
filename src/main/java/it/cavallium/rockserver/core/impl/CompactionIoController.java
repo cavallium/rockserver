@@ -29,6 +29,8 @@ final class CompactionIoController implements AutoCloseable {
         meters = List.of(
                 Gauge.builder("rockserver.compaction.io.budget", budget, CompactionIoBudget::budget)
                         .tag("db", name).baseUnit("bytes/second").register(registry),
+                Gauge.builder("rockserver.compaction.io.baseline.read.micros", budget, CompactionIoBudget::baselineReadMicros)
+                        .tag("db", name).baseUnit("microseconds").register(registry),
                 Gauge.builder("rockserver.compaction.io.state", budget, b -> b.state().ordinal())
                         .tag("db", name).register(registry),
                 Gauge.builder("rockserver.compaction.io.adjustment.failures", failures, AtomicLong::doubleValue)

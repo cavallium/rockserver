@@ -155,6 +155,7 @@ class CompactionIoIntegrationTest {
                 }
             }
             assertEquals(0, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
+            assertEquals(0, registry.get("rockserver.compaction.io.baseline.read.micros").gauge().value());
         } finally { registry.close(); }
     }
     @Test void closeJoinsSamplerBeforeClosingNativeResources(@TempDir Path root) throws Exception {
@@ -210,7 +211,7 @@ class CompactionIoIntegrationTest {
                     throw new IllegalStateException("injected sampling failure");
                 }
                 return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(call * 1_000_000_000L,
-                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true);
+                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true);
             };
             var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
                     .getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
@@ -248,7 +249,7 @@ class CompactionIoIntegrationTest {
                     catch (InterruptedException failure) { throw new AssertionError(failure); }
                 }
                 return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(call * 1_000_000_000L,
-                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true);
+                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true);
             };
             var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
                     .getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
