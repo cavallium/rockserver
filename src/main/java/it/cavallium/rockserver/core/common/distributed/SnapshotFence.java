@@ -1,0 +1,93 @@
+package it.cavallium.rockserver.core.common.distributed;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+/** Frozen complete snapshot participant set and physical scopes, independent of mutable capture progress. */
+public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fenceId,UUID homeGroup,
+                            long homeEpoch,long directoryGeneration,long schemaEpoch,byte[] schemaDigest,List<Participant> participants) {
+    public static final int MAX_PARTICIPANTS=64, HEADER_BYTES=140, MAX_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES-8192;
+    private static final int PARTICIPANT_HEADER_BYTES=140;
+    static final Comparator<UUID> UUID_ORDER=(a,b) -> { int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits()); return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits()); };
+    private static final Comparator<TransactionScope.Span> SPAN_ORDER=Comparator.comparing(TransactionScope.Span::columnId,UUID_ORDER)
+            .thenComparing(TransactionScope.Span::lowerInclusive,SnapshotFence::lowerOrder).thenComparingInt(s -> s.isPoint() ? 1 : 2)
+            .thenComparing(TransactionScope.Span::upperExclusive,SnapshotFence::upperOrder);
+    public record Participant(UUID rangeId,UUID groupId,long rangeEpoch,byte[] schemaDigest,OperationId installOperation,OperationId releaseOperation,TransactionScope scope) {
+        public Participant {
+            Objects.requireNonNull(rangeId); Objects.requireNonNull(groupId); Objects.requireNonNull(schemaDigest);
+            Objects.requireNonNull(installOperation); Objects.requireNonNull(releaseOperation); Objects.requireNonNull(scope);
+            if (rangeEpoch<0 || schemaDigest.length!=32 || installOperation.equals(releaseOperation)) throw invalid("Invalid snapshot participant definition");
+            schemaDigest=schemaDigest.clone(); scope=new TransactionScope(ordered(scope));
+        }
+        @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
+        @Override public boolean equals(Object other) { return other instanceof Participant p && Arrays.equals(participantBytes(this),participantBytes(p)); }
+        @Override public int hashCode() { return Arrays.hashCode(participantBytes(this)); }
+    }
+    public SnapshotFence {
+        Objects.requireNonNull(clusterId); Objects.requireNonNull(databaseId); Objects.requireNonNull(domainId); Objects.requireNonNull(fenceId); Objects.requireNonNull(homeGroup);
+        Objects.requireNonNull(schemaDigest); Objects.requireNonNull(participants);
+        if (homeEpoch<0 || directoryGeneration<0 || schemaEpoch<0 || schemaDigest.length!=32 || participants.isEmpty() || participants.size()>MAX_PARTICIPANTS) throw invalid("Invalid snapshot fence identity/bounds");
+        schemaDigest=schemaDigest.clone(); participants=participants.stream().sorted(Comparator.comparing(Participant::groupId,UUID_ORDER)).toList();
+        var ranges=new HashSet<UUID>(); var groups=new HashSet<UUID>(); var operations=new HashSet<OperationId>(); long bytes=HEADER_BYTES;
+        for (var p:participants) {
+            if (!ranges.add(p.rangeId()) || !groups.add(p.groupId()) || !operations.add(p.installOperation()) || !operations.add(p.releaseOperation())) throw invalid("Duplicate snapshot participant/control identity");
+            bytes+=participantSize(p); if (bytes>MAX_BYTES) throw invalid("Snapshot fence exceeds aggregate byte bound");
+        }
+    }
+    @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
+    public Participant participant(UUID group) { return participants.stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow(() -> invalid("Unregistered snapshot participant")); }
+    public byte[] encode() {
+        long size=HEADER_BYTES; for (var p:participants) size+=participantSize(p);
+        if (size>MAX_BYTES) throw invalid("Snapshot fence exceeds aggregate byte bound");
+        var b=ByteBuffer.allocate((int)size); uuid(b,clusterId); uuid(b,databaseId); uuid(b,domainId); uuid(b,fenceId); uuid(b,homeGroup);
+        b.putLong(homeEpoch).putLong(directoryGeneration).putLong(schemaEpoch).put(schemaDigest).putInt(participants.size());
+        for (var p:participants) participant(b,p); return b.array();
+    }
+    public static SnapshotFence decode(byte[] bytes) {
+        Objects.requireNonNull(bytes); if (bytes.length<HEADER_BYTES || bytes.length>MAX_BYTES) throw invalid("Invalid snapshot fence length");
+        try {
+            var b=ByteBuffer.wrap(bytes); UUID cluster=uuid(b),database=uuid(b),domain=uuid(b),fence=uuid(b),home=uuid(b);
+            long homeEpoch=b.getLong(),directory=b.getLong(),schemaEpoch=b.getLong(); byte[] schema=new byte[32]; b.get(schema); int count=b.getInt();
+            if (count<1 || count>MAX_PARTICIPANTS || (long)count*(PARTICIPANT_HEADER_BYTES+25)>b.remaining()) throw invalid("Invalid snapshot participant count");
+            var participants=new ArrayList<Participant>(count);
+            for (int i=0;i<count;i++) {
+                require(b,PARTICIPANT_HEADER_BYTES); UUID range=uuid(b),group=uuid(b); long epoch=b.getLong(); byte[] digest=new byte[32]; b.get(digest);
+                var install=operation(b); var release=operation(b); int spans=b.getInt();
+                if (spans<1 || spans>TransactionScope.MAX_SPANS || 25L*spans>b.remaining()) throw invalid("Invalid snapshot scope span count");
+                var scope=new ArrayList<TransactionScope.Span>(spans); long bounds=0;
+                for (int j=0;j<spans;j++) {
+                    require(b,25); int kind=b.get() & 255; if (kind!=1 && kind!=2) throw invalid("Invalid snapshot scope kind"); UUID column=uuid(b);
+                    byte[] lower=bound(b),upper=bound(b); bounds+=(lower==null ? 0 : lower.length)+(long)(upper==null ? 0 : upper.length);
+                    if (bounds>TransactionScope.MAX_BOUND_BYTES || kind==1 && (lower==null || upper!=null)) throw invalid("Invalid snapshot scope bounds");
+                    scope.add(kind==1 ? TransactionScope.Span.point(column,lower) : TransactionScope.Span.range(column,lower,upper));
+                }
+                participants.add(new Participant(range,group,epoch,digest,install,release,new TransactionScope(scope)));
+            }
+            if (b.hasRemaining()) throw invalid("Trailing snapshot fence bytes");
+            var result=new SnapshotFence(cluster,database,domain,fence,home,homeEpoch,directory,schemaEpoch,schema,participants);
+            if (!Arrays.equals(bytes,result.encode())) throw invalid("Noncanonical snapshot fence"); return result;
+        } catch (RuntimeException malformed) { if (malformed instanceof IllegalArgumentException invalid) throw invalid; throw new IllegalArgumentException("Invalid snapshot fence",malformed); }
+    }
+    @Override public boolean equals(Object other) { return other instanceof SnapshotFence fence && Arrays.equals(encode(),fence.encode()); }
+    @Override public int hashCode() { return Arrays.hashCode(encode()); }
+    private static long participantSize(Participant p) {
+        long size=PARTICIPANT_HEADER_BYTES; for (var span:p.scope().spans()) size+=25L+(span.lowerInclusive()==null ? 0 : span.lowerInclusive().length)+(span.upperExclusive()==null ? 0 : span.upperExclusive().length); return size;
+    }
+    private static byte[] participantBytes(Participant p) { long size=participantSize(p); var b=ByteBuffer.allocate((int)size); participant(b,p); return b.array(); }
+    private static void participant(ByteBuffer b,Participant p) {
+        uuid(b,p.rangeId()); uuid(b,p.groupId()); b.putLong(p.rangeEpoch()).put(p.schemaDigest()); operation(b,p.installOperation()); operation(b,p.releaseOperation());
+        var spans=ordered(p.scope()); b.putInt(spans.size());
+        for (var span:spans) { b.put((byte)(span.isPoint() ? 1 : 2)); uuid(b,span.columnId()); bound(b,span.lowerInclusive()); bound(b,span.upperExclusive()); }
+    }
+    private static List<TransactionScope.Span> ordered(TransactionScope scope) { return scope.spans().stream().sorted(SPAN_ORDER).toList(); }
+    private static int lowerOrder(byte[] a,byte[] b) { return a==null ? b==null ? 0 : -1 : b==null ? 1 : Arrays.compareUnsigned(a,b); }
+    private static int upperOrder(byte[] a,byte[] b) { return a==null ? b==null ? 0 : 1 : b==null ? -1 : Arrays.compareUnsigned(a,b); }
+    private static void bound(ByteBuffer b,byte[] value) { b.putInt(value==null ? -1 : value.length); if (value!=null) b.put(value); }
+    private static byte[] bound(ByteBuffer b) { require(b,4); int size=b.getInt(); if (size== -1) return null; if (size<0 || size>TransactionScope.MAX_BOUND_BYTES || size>b.remaining()) throw invalid("Invalid snapshot bound length"); byte[] value=new byte[size]; b.get(value); return value; }
+    static void uuid(ByteBuffer b,UUID value) { b.putLong(value.getMostSignificantBits()).putLong(value.getLeastSignificantBits()); }
+    static UUID uuid(ByteBuffer b) { return new UUID(b.getLong(),b.getLong()); }
+    private static void operation(ByteBuffer b,OperationId value) { uuid(b,value.sessionId()); b.putLong(value.epoch()).putLong(value.sequence()); }
+    private static OperationId operation(ByteBuffer b) { return new OperationId(uuid(b),b.getLong(),b.getLong()); }
+    static void require(ByteBuffer b,int count) { if (b.remaining()<count) throw invalid("Truncated snapshot record"); }
+    static IllegalArgumentException invalid(String message) { return new IllegalArgumentException(message); }
+}

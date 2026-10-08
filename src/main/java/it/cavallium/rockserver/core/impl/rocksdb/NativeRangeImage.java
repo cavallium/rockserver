@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RejectedParticipant;
+import it.cavallium.rockserver.core.common.distributed.SnapshotGate;
 import it.cavallium.rockserver.core.common.distributed.CommittedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RangeMutationHistory;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
@@ -324,6 +325,8 @@ public final class NativeRangeImage {
         private final List<PreparedParticipant> prepared=new ArrayList<>();
         private final Map<UUID,AbortedParticipant> aborted=new HashMap<>();
         private final Map<UUID,RejectedParticipant> rejected=new HashMap<>();
+        private final Map<UUID,SnapshotGate> gates=new HashMap<>();
+        private long gateBytes;
         private final Map<UUID,CommittedParticipant> committed=new HashMap<>();
         private long preparedBytes,preparedScopeBytes;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
@@ -423,6 +426,24 @@ public final class NativeRangeImage {
                         rejected.put(record.transactionId(),record);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid rejected image record",invalid); }
                 }
+                if (section==Section.STATE && key.length>16 && key[16]==0x24) {
+                    try {
+                        var gate=SnapshotGate.decode(value); var fence=gate.fence(); var participant=fence.participant(gate.participantGroup());
+                        byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x24).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
+                        if (!Arrays.equals(key,expected) || !gate.participantGroup().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
+                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !fence.domainId().equals(header.interval().domainId())
+                                || gate.installed()!=null && (gate.installed().index()>header.position().index() || gate.installed().term()>header.position().term())
+                                || gate.released()!=null && (gate.released().index()>header.position().index() || gate.released().term()>header.position().term())) throw new IOException("Gate image identity/cut differs");
+                        for (var span:participant.scope().spans()) {
+                            byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
+                            if (!header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)
+                                    || upper!=null && (span.isPoint() ? Arrays.compareUnsigned(lo,upper)>=0 : hi==null || Arrays.compareUnsigned(hi,upper)>0)) throw new IOException("Gate image scope crosses ownership");
+                        }
+                        gateBytes+=ReplicatedRangeStore.snapshotGateBytes(fence);
+                        if (gates.size()>=ReplicatedRangeStore.MAX_SNAPSHOT_GATES || gateBytes>ReplicatedRangeStore.MAX_SNAPSHOT_GATE_BYTES) throw new IOException("Gate image capacity exceeded");
+                        gates.put(fence.fenceId(),gate);
+                    } catch (IllegalArgumentException invalid) { throw new IOException("Invalid gate image record",invalid); }
+                }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
                     throw new IOException("Image contains unsupported receipt accounting metadata");
                 }
@@ -463,6 +484,7 @@ public final class NativeRangeImage {
                     for (var commit:committed.values()) if (commit.ownsOperation(id)) throw new IOException("COMMIT image identity also has ordinary receipt");
                     for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("ABORT image identity also has ordinary receipt");
                     for (var record:rejected.values()) if (record.ownsOperation(id)) throw new IOException("Rejected image identity also has ordinary receipt");
+                    for (var gate:gates.values()) if (gate.ownsOperation(id)) throw new IOException("Gate image identity also has ordinary receipt");
                     receiptCount = addUsage(receiptCount, 1);
                     receiptBytes = addUsage(receiptBytes, (long) key.length + value.length);
                 }
@@ -543,6 +565,18 @@ public final class NativeRangeImage {
             var terminalIds=new HashSet<>(aborted.keySet()); terminalIds.addAll(rejected.keySet());
             for (var id:terminalIds) if (prepared.stream().noneMatch(p -> p.preparation().transactionId().equals(id))) terminalOnly++;
             if (prepared.size()+terminalOnly>ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes+terminalOnly*ReplicatedRangeStore.FINALIZATION_RESERVATION>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Participant image capacity exceeded");
+
+            for (var gate:gates.values()) {
+                var participant=gate.fence().participant(gate.participantGroup());
+                for (var id:List.of(participant.installOperation(),participant.releaseOperation())) {
+                    for (var p:prepared) if (p.preparation().ownsOperation(id)) throw new IOException("Gate/preparation image identity reused");
+                    for (var r:rejected.values()) if (r.ownsOperation(id)) throw new IOException("Gate/rejection image identity reused");
+                    for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("Gate/ABORT image identity reused");
+                    for (var commit:committed.values()) if (commit.ownsOperation(id)) throw new IOException("Gate/COMMIT image identity reused");
+                    for (var other:gates.values()) if (other!=gate && other.ownsOperation(id)) throw new IOException("Gate image identity reused");
+                }
+                if (gate.active()) for (var other:gates.values()) if (other!=gate && other.active() && participant.scope().intersects(other.fence().participant(other.participantGroup()).scope())) throw new IOException("Active gate image scopes overlap");
+            }
 
             if (sessionAuthority != null && sessionAuthority.minimumEpoch() > epochFloor) {
                 throw new IOException("Image range session authority exceeds coarse epoch floor");

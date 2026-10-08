@@ -6,6 +6,9 @@ import it.cavallium.rockserver.core.common.distributed.ParticipantFinalization;
 import it.cavallium.rockserver.core.common.distributed.ParticipantVote;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RejectedParticipant;
+import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
+import it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus;
+import it.cavallium.rockserver.core.common.distributed.SnapshotGate;
 import it.cavallium.rockserver.core.common.distributed.CommittedParticipant;
 import it.cavallium.rockserver.core.common.distributed.ParticipantOutcome;
 import it.cavallium.rockserver.core.common.distributed.TransactionStatus;
@@ -80,6 +83,10 @@ public final class ReplicatedRangeStore {
     private volatile Map<UUID,RejectedParticipant> rejectedIndex=Map.of();
     // Reserve both negative vote and terminal decision before either is appended.
     public static final long FINALIZATION_RESERVATION=66L+AbortedParticipant.MAX_BYTES+RejectedParticipant.MAX_BYTES;
+    public static final int MAX_SNAPSHOT_GATES=16;
+    public static final long MAX_SNAPSHOT_GATE_BYTES=16L*1024*1024;
+    private volatile Map<UUID,SnapshotGate> snapshotGates=Map.of();
+    private long retainedGateBytes;
     private volatile DistributedSchema logicalSchema;
     private RangeMutationHistory scopedHistory;
     private RangeMutationHistory.Limits scopedLimits;
@@ -162,7 +169,7 @@ public final class ReplicatedRangeStore {
         } else {
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex();
+            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates();
         }
     }
 
@@ -237,7 +244,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
-            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex();
+            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -519,6 +526,131 @@ public final class ReplicatedRangeStore {
             if (!Arrays.equals(prepared.preparation().business().payloadDigest(),acceptedPlanDigest)) throw new IllegalArgumentException("COMMIT result plan changed"); return commit.result(prepared);
         } finally { applyLane.unlock(); leaveNative(); }
     }
+    public record GateCapacity(ApplyPosition position,int count,long bytes) {}
+    public record GateEstimate(GateCapacity capacity,SnapshotGate existing) {}
+    private byte[] snapshotGateKey(UUID fence) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x24).putLong(fence.getMostSignificantBits()).putLong(fence.getLeastSignificantBits()).array(); }
+    private void requireSnapshotFence(SnapshotFence fence) {
+        var participant=fence.participant(groupId);
+        if (participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),schemaDigest) || !fence.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Snapshot fence differs from range");
+        if (logicalSchema!=null && (!fence.clusterId().equals(logicalSchema.clusterId()) || !fence.databaseId().equals(logicalSchema.databaseId()))) throw new IllegalArgumentException("Snapshot fence database differs from schema");
+        validateSnapshotScope(participant.scope());
+    }
+    private Map<UUID,SnapshotGate> loadSnapshotGates() {
+        var records=new HashMap<UUID,SnapshotGate>();
+        try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x24).array());
+             var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array());
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+            iterator.seekToFirst(); byte[] sizing=new byte[0];
+            while (iterator.isValid()) {
+                if (records.size()>=MAX_SNAPSHOT_GATES || iterator.key(sizing)!=33 || iterator.value(sizing)>SnapshotGate.MAX_BYTES) throw new IllegalStateException("Snapshot gate recovery bound exceeded");
+                var record=SnapshotGate.decode(iterator.value()); requireSnapshotFence(record.fence());
+                if (!record.participantGroup().equals(groupId) || !Arrays.equals(iterator.key(),snapshotGateKey(record.fence().fenceId())) || applied==null
+                        || record.installed()!=null && (record.installed().index()>applied.index() || record.installed().term()>applied.term())
+                        || record.released()!=null && (record.released().index()>applied.index() || record.released().term()>applied.term())) throw new IllegalStateException("Snapshot gate differs from completed cut");
+                records.put(record.fence().fenceId(),record); iterator.next();
+            }
+            iterator.status(); long bytes=0; for (var record:records.values()) bytes+=snapshotGateBytes(record.fence());
+            retainedGateBytes=bytes; return Map.copyOf(records);
+        } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover snapshot gates",failure); }
+    }
+    public static long snapshotGateBytes(SnapshotFence fence) { return 33L+fence.encode().length+128; }
+    private GateCapacity gateCapacityUnderLane() {
+        return new GateCapacity(applied,snapshotGates.size(),retainedGateBytes);
+    }
+    private void requireGateCapacity(SnapshotFence fence) {
+        var capacity=gateCapacityUnderLane();
+        if (capacity.count()>=MAX_SNAPSHOT_GATES || snapshotGateBytes(fence)>MAX_SNAPSHOT_GATE_BYTES-capacity.bytes()) throw new IllegalStateException("Snapshot gate capacity exhausted");
+    }
+    private void requireGateIdentity(SnapshotFence fence) throws RocksDBException {
+        var participant=fence.participant(groupId);
+        for (var id:List.of(participant.installOperation(),participant.releaseOperation())) {
+            for (var prepared:preparedIndex.records()) if (prepared.preparation().ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to preparation");
+            for (var rejected:rejectedIndex.values()) if (rejected.ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to rejection");
+            for (var abort:abortedIndex.values()) if (abort.ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to ABORT");
+            for (var commit:committedIndex.values()) if (commit.ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to COMMIT");
+            for (var other:snapshotGates.values()) if (!other.fence().fenceId().equals(fence.fenceId()) && other.ownsOperation(id)) throw new IllegalArgumentException("Gate identity reused");
+            if (db.get(receipts,receiptKey(id))!=null) throw new IllegalArgumentException("Gate identity has an ordinary receipt");
+        }
+    }
+    private void validateSnapshotGates() {
+        for (var gate:snapshotGates.values()) {
+            try { requireGateIdentity(gate.fence()); } catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate gate identities",failure); }
+            if (gate.active()) for (var other:snapshotGates.values()) if (other!=gate && other.active() && gate.fence().participant(groupId).scope().intersects(other.fence().participant(groupId).scope())) throw new IllegalArgumentException("Active snapshot gates overlap");
+        }
+        if (gateCapacityUnderLane().bytes()>MAX_SNAPSHOT_GATE_BYTES) throw new IllegalStateException("Snapshot gate recovery capacity exceeded");
+    }
+    private SnapshotGate requireActiveGate(SnapshotFence fence) {
+        requireSnapshotFence(fence); var gate=snapshotGates.get(fence.fenceId());
+        if (gate==null || !gate.fence().equals(fence) || !gate.active()) throw new IllegalStateException("Snapshot gate is not active for this fence"); return gate;
+    }
+    public GateCapacity gateCapacity() { enterNative(); applyLane.lock(); try { requireActive(); return gateCapacityUnderLane(); } finally { applyLane.unlock(); leaveNative(); } }
+    public SnapshotGate snapshotGate(UUID fence) { enterNative(); applyLane.lock(); try { requireActive(); return snapshotGates.get(fence); } finally { applyLane.unlock(); leaveNative(); } }
+    public GateEstimate estimateGateInstall(SnapshotFence fence) throws RocksDBException {
+        Objects.requireNonNull(fence); enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireSnapshotFence(fence); var saved=snapshotGates.get(fence.fenceId());
+            if (saved!=null) { if (!saved.fence().equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed"); }
+            else { requireGateIdentity(fence); requireUngated(fence.participant(groupId).scope()); requireGateCapacity(fence); }
+            return new GateEstimate(gateCapacityUnderLane(),saved);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Trusted committed gate seam; the adapter must drain its pre-gate proposal owners before append. */
+    public SnapshotGate applyGateInstall(ApplyPosition position,SnapshotFence fence) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(fence); enterNative(); applyLane.lock();
+        try {
+            var estimate=estimateGateInstall(fence); var saved=estimate.existing();
+            if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied gate installation lacks receipt"); return saved; }
+            requireNext(position); var result=saved==null ? SnapshotGate.install(fence,groupId,position) : saved;
+            publishGate(position,result); return result;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    public GateEstimate estimateGateRelease(SnapshotFenceStatus terminal) throws RocksDBException {
+        Objects.requireNonNull(terminal); enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireSnapshotFence(terminal.fence());
+            if (!terminal.terminal()) throw new IllegalArgumentException("Snapshot gate release requires a terminal home decision");
+            var saved=snapshotGates.get(terminal.fence().fenceId());
+            if (saved!=null) { if (!saved.fence().equals(terminal.fence())) throw new IllegalArgumentException("Snapshot fence definition changed"); }
+            else { requireGateIdentity(terminal.fence()); requireGateCapacity(terminal.fence()); }
+            if (applied==null || applied.index()==Long.MAX_VALUE) throw new IllegalStateException("Completed prefix unavailable/exhausted");
+            var next=new ApplyPosition(Math.max(1,applied.term()),applied.index()+1);
+            if (saved==null) SnapshotGate.released(terminal,groupId,next); else saved.release(terminal,next);
+            return new GateEstimate(gateCapacityUnderLane(),saved);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Home read provenance is verified by the adapter; timers never authorize this release. */
+    public SnapshotGate applyGateRelease(ApplyPosition position,SnapshotFenceStatus terminal) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(terminal); enterNative(); applyLane.lock();
+        try {
+            var estimate=estimateGateRelease(terminal); var saved=estimate.existing();
+            if (applied!=null && position.index()<=applied.index()) { if (saved==null || saved.released()==null) throw new IllegalStateException("Applied gate release lacks receipt"); return saved; }
+            requireNext(position); var result=saved==null ? SnapshotGate.released(terminal,groupId,position) : saved.release(terminal,position);
+            publishGate(position,result); return result;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    private void publishGate(ApplyPosition position,SnapshotGate gate) throws RocksDBException {
+        long bytes=retainedGateBytes+(snapshotGates.containsKey(gate.fence().fenceId()) ? 0 : snapshotGateBytes(gate.fence()));
+        var next=new HashMap<>(snapshotGates); next.put(gate.fence().fenceId(),gate); var published=Map.copyOf(next);
+        var history=prepareScopedWrites(false,List.of(),Map.of());
+        try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+            batch.put(state,snapshotGateKey(gate.fence().fenceId()),gate.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+        }
+        snapshotGates=published; retainedGateBytes=bytes; publishScoped(position,history,false); applied=position;
+    }
+    /** Native readiness is necessary; the adapter must separately prove volatile predecessor drainage. */
+    public List<PreparedParticipant> gateBlockers(SnapshotFence fence) {
+        Objects.requireNonNull(fence); enterNative(); applyLane.lock();
+        try { requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); return preparedIndex.records().stream().filter(p -> !isFinalized(p.preparation().transactionId()) && p.preparation().scope().intersects(scope)).toList(); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    public ScopedSnapshot captureGate(SnapshotFence fence) throws RocksDBException {
+        Objects.requireNonNull(fence); enterNative(); applyLane.lock();
+        try { requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    private boolean gated(TransactionScope scope) { return snapshotGates.values().stream().anyMatch(gate -> gate.active() && gate.fence().participant(groupId).scope().intersects(scope)); }
+    private void requireUngated(TransactionScope scope) { if (gated(scope)) throw new IllegalStateException("Write scope intersects an active snapshot gate"); }
+    private void requireGateOperation(OperationId id) { for (var gate:snapshotGates.values()) if (gate.ownsOperation(id)) throw new IllegalArgumentException("Operation identity belongs to snapshot gate"); }
     private byte[] rejectedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x23).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
     private Set<UUID> unpreparedTransactions(PreparedIndex index) {
         var ids=new java.util.HashSet<>(abortedIndex.keySet()); ids.addAll(rejectedIndex.keySet());
@@ -546,10 +678,12 @@ public final class ReplicatedRangeStore {
         } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover rejected preparations",failure); }
     }
     private void requireRejectionIdentity(PreparedParticipant.Preparation preparation) {
+        requireGateOperation(preparation.operation()); requireGateOperation(preparation.business().operationId());
         for (var rejected:rejectedIndex.values()) if (rejected.transactionId().equals(preparation.transactionId())
                 || rejected.ownsOperation(preparation.operation()) || rejected.ownsOperation(preparation.business().operationId())) throw new IllegalArgumentException("Identity belongs to rejected preparation");
     }
     private void requireFinalizationRejectionIdentity(ParticipantFinalization finalization) {
+        requireGateOperation(finalization.operation()); requireGateOperation(finalization.decision().operation());
         for (var rejected:rejectedIndex.values()) {
             if (rejected.transactionId().equals(finalization.transactionId())) rejected.requireFinalization(finalization);
             else if (rejected.ownsOperation(finalization.operation()) || rejected.ownsOperation(finalization.decision().operation())) throw new IllegalArgumentException("Finalization identity belongs to another rejection");
@@ -726,15 +860,19 @@ public final class ReplicatedRangeStore {
         for (var record:preparedIndex.records()) if (!isFinalized(record.preparation().transactionId()) && record.preparation().scope().intersects(scope)) throw new IllegalStateException("Access overlaps durable prepared transaction");
     }
     private void requireUnlocked(DistributedCommand command) {
+        requireGateOperation(command.operationId());
         for (var rejected:rejectedIndex.values()) if (rejected.ownsOperation(command.operationId())) throw new IllegalArgumentException("Operation identity belongs to rejected preparation");
         for (var commit:committedIndex.values()) if (commit.ownsOperation(command.operationId())) throw new IllegalArgumentException("Operation identity belongs to COMMIT receipt");
         for (var abort:abortedIndex.values()) if (abortOwns(abort,command.operationId())) throw new IllegalArgumentException("Operation identity belongs to durable ABORT fence");
         for (var record:preparedIndex.records()) if (record.preparation().ownsOperation(command.operationId())) throw new IllegalArgumentException("Operation identity is owned by durable preparation");
-        if (command.acceptance()!=null) { requireUnlocked(command.acceptance().scope()); return; }
+        var scope=commandScope(command); if (scope!=null) requireUnlocked(scope);
+    }
+    private TransactionScope commandScope(DistributedCommand command) {
+        if (command.acceptance()!=null) return command.acceptance().scope();
         var spans=new ArrayList<TransactionScope.Span>();
         for (var m:command.mutations()) spans.add(m.kind()==Mutation.Kind.DELETE_RANGE ? TransactionScope.Span.range(m.columnId(),m.key(),m.value()) : TransactionScope.Span.point(m.columnId(),m.key()));
         for (var p:command.predicates()) spans.add(TransactionScope.Span.point(p.columnId(),p.key()));
-        if (!spans.isEmpty()) requireUnlocked(new TransactionScope(spans));
+        return spans.isEmpty() ? null : new TransactionScope(spans);
     }
     public record PreparedCapacity(ApplyPosition position,int count,long bytes,long scopeBytes) {}
     public record PreparationEstimate(PreparedCapacity capacity,ParticipantVote existing) {}
@@ -764,7 +902,10 @@ public final class ReplicatedRangeStore {
             if (id.epoch()<minimum || id.sequence()<=floor || db.get(receipts,receiptKey(id))!=null || db.get(receipts,receiptKey(preparation.operation()))!=null
                     || sessionDecision(business,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepared identity is no longer eligible");
             if (applied==null || applied.index()==Long.MAX_VALUE || business.acceptance().snapshot().index()==Long.MAX_VALUE) throw new IllegalStateException("Participant completed prefix unavailable/exhausted");
-            addPrepared(preparedIndex,new PreparedParticipant(preparation,new ApplyPosition(business.acceptance().snapshot().term(),Math.max(applied.index()+1,business.acceptance().snapshot().index()+1))));
+            if (gated(preparation.scope())) {
+                requireNegativeIdentity(preparation); var capacity=preparedCapacityUnderLane();
+                if (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes()) throw new IllegalStateException("Rejected preparation capacity exhausted");
+            } else addPrepared(preparedIndex,new PreparedParticipant(preparation,new ApplyPosition(business.acceptance().snapshot().term(),Math.max(applied.index()+1,business.acceptance().snapshot().index()+1))));
             return new PreparationEstimate(preparedCapacity(),null);
         } finally { applyLane.unlock(); leaveNative(); }
     }
@@ -801,7 +942,7 @@ public final class ReplicatedRangeStore {
             }
             requireNext(position);
             var abort=abortedIndex.get(preparation.transactionId());
-            if (saved==null && (abort!=null || rejectedIndex.containsKey(preparation.transactionId()))) {
+            if (saved==null && (abort!=null || rejectedIndex.containsKey(preparation.transactionId()) || gated(preparation.scope()))) {
                 return applyRejectedUnderLane(position,preparation);
             }
             if (saved==null) {
@@ -906,6 +1047,10 @@ public final class ReplicatedRangeStore {
             long effectiveMinimum = acceptMaintenance ? command.minimumSessionEpoch() : -1;
             long effectiveAcknowledgement = acceptMaintenance ? command.acknowledgedThrough() : -1;
             boolean installUserEffects = true;
+            var scope=saved==null ? commandScope(command) : null;
+            if (saved==null && scope!=null && gated(scope)) {
+                stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode(); installUserEffects=false;
+            }
             if (saved==null && sessionStatus!=CommandResult.Status.SUCCESS) {
                 stableResult=new CommandResult(sessionStatus,List.of()).encode(); installUserEffects=false;
             }
@@ -1450,7 +1595,7 @@ public final class ReplicatedRangeStore {
         enterNative(); applyLane.lock();
         try {
             requireActive();
-            requireUnlocked(pin.scope());
+            requireUnlocked(pin.scope()); requireUngated(pin.scope());
             if (pin.validateUnderLane()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot failed serializable validation: "+pin.status());
             var id=command.operationId(); long minimum=minimumSessionEpoch(null);
             long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
@@ -2147,7 +2292,7 @@ public final class ReplicatedRangeStore {
                 decodeReceipt(saved, command.receiptDigest());
                 return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
             }
-            requireUnlocked(command);
+            requireUnlocked(command); var scope=commandScope(command); if (scope!=null) requireUngated(scope);
             var authority=sessionAuthority();
             if (requireSessionAuthority && command.sessionControl()==null && command.minimumSessionEpoch()<0 && authority==null) {
                 throw new IllegalStateException("Replicated session authority has not been initialized");

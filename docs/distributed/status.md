@@ -353,6 +353,28 @@ are separate from ordinary user-receipt GC and are not donated by lease expirati
 fencing or lock release. Raft PREPARE admission reserves the bounds before append;
 native apply also checks them. Retained terminal records still have no GC path.
 
+The native snapshot-gate kernel freezes the complete participant set, directory
+and schema identities, local physical scopes, and distinct install/release controls.
+The home progress value requires every READY proof before any capture proof and
+every capture before COMPLETE. Installed gates reject new intersecting PREPARE with
+a durable negative vote and ordinary committed writes with a retained no-effects
+conflict. Existing COMMIT/ABORT finalization can drain prior preparations. Native
+capture checks the exact active gate and absence of intersecting unresolved plans
+under the apply lane. Old retained native pins remain historical after release.
+Release requires a matching completed/aborted home decision; an ABORT release before
+INSTALL suppresses delayed installation. Recovery and native image validation retain
+gates and terminal receipts; restart or expiry never implies release.
+
+Per range, gates have an independent bound of 16 retained fence records and 16 MiB
+of reserved metadata, including future release growth. Released records retain their
+capacity and operation identities until a future fenced GC implementation. A fence
+contains at most 64 participants and an aggregate definition below 2 MiB minus
+8 KiB, leaving bounded room for progress and envelopes. The ephemeral admission
+index can reserve a gate before earlier proposals drain, with independent protected
+limits. Raft gate admission, volatile predecessor proof, replicated home persistence,
+coordinated capture/recovery and frontend snapshot leases remain unfinished; this
+native kernel alone does not establish a consistent cross-group read cut.
+
 Each coordinator journal freezes at most 64 participants and 16 MiB of aggregate
 accepted commands (including their result images), plus 16 MiB of frozen routes and
 reserved pending-home routing. It reserves future registration/decision/proof metadata
