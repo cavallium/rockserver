@@ -14,7 +14,7 @@ import java.util.*;
 /** Bounded durable node configuration; it conveys no placement-creation, recovery-wipe or service-start authority. */
 public final class RatisNodeManifest {
     /** Includes the file checksum; encoded bodies leave room for its 32 bytes. */
-    public static final int MAX_BYTES=5*1024*1024;
+    public static final int MAX_BYTES=8*1024*1024;
     private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=80;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
@@ -34,10 +34,12 @@ public final class RatisNodeManifest {
                 || writeThreads<WorkloadSettings.MIN_PRODUCTION_DATA_THREADS || writeThreads>256) {
             throw new IllegalArgumentException("Unsupported manifest schema/merge activation or scheduler budget");
         }
-        int requiredColumns=plan.localGroups().stream().mapToInt(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId())
-                ? 2 : schema.columnIds().size()).max().orElseThrow();
+        int requiredColumns=plan.localGroups().stream().mapToInt(group -> switch (plan.role(group.getGroupId().getUuid())) {
+            case DATA -> schema.columnIds().size(); case CATALOGUE -> 2; case TRANSACTION_HOME, SNAPSHOT_HOME -> 1;
+        }).max().orElseThrow();
         if (settings.images().maxColumns()<requiredColumns) throw new IllegalArgumentException("Manifest snapshot column budget is below local group scope");
         for (String name:plan.columns().values()) text(name);
+        for (var home:plan.homes()) text(home.physicalName());
         nanos(settings.clockPeriod()); nanos(settings.shutdownTimeout());
         this.readThreads=readThreads; this.writeThreads=writeThreads;
     }
@@ -51,16 +53,21 @@ public final class RatisNodeManifest {
         Objects.requireNonNull(manifest);
         byte[] schema=DistributedSchemaCodec.encode(manifest.schema), directory=RangeDirectoryCodec.encode(manifest.plan.directory());
         byte[] catalogue=RangeDirectoryCodec.encode(synthetic(manifest.plan));
-        long size=8L+12+schema.length+directory.length+catalogue.length+72+SETTINGS_BYTES;
+        long size=4L+12+schema.length+directory.length+catalogue.length+72+4+SETTINGS_BYTES;
+        for (var home:manifest.plan.homes()) size+=25L+RangeDirectoryCodec.encode(home.directory()).length+text(home.physicalName()).length;
         for (var name:manifest.plan.columns().values()) size+=20L+text(name).length;
         if (size>MAX_BYTES-32) throw new IllegalArgumentException("Node manifest exceeds byte budget");
-        var output=ByteBuffer.allocate((int)size).putInt(MAGIC).putInt(1);
+        var output=ByteBuffer.allocate((int)size).putInt(MAGIC);
         blob(output,schema); blob(output,directory); blob(output,catalogue);
         var c=manifest.plan.catalogue(); uuid(output,c.directoryColumn()); uuid(output,c.sessionsColumn());
         uuid(output,manifest.plan.nodeId()); uuid(output,manifest.plan.nodeIncarnation());
         output.putInt(manifest.plan.localGroups().size()).putInt(manifest.plan.columns().size());
         for (UUID column:manifest.plan.columns().keySet().stream().sorted(UUID_ORDER).toList()) {
             uuid(output,column); blob(output,text(manifest.plan.columns().get(column)));
+        }
+        output.putInt(manifest.plan.homes().size());
+        for (var home:manifest.plan.homes()) {
+            output.put((byte)home.role().ordinal()); blob(output,RangeDirectoryCodec.encode(home.directory())); uuid(output,home.column()); blob(output,text(home.physicalName()));
         }
         var settings=manifest.settings; var images=settings.images(); var retention=settings.retention();
         output.putInt(images.maxRowBytes()).putLong(images.maxImageBytes()).putInt(images.maxColumns());
@@ -74,20 +81,30 @@ public final class RatisNodeManifest {
         if (bytes.length<172 || bytes.length>MAX_BYTES-32) throw new IllegalArgumentException("Invalid node manifest size");
         var input=ByteBuffer.wrap(bytes);
         if (input.getInt()!=MAGIC) throw new IllegalArgumentException("Unsupported node manifest header");
-        if (input.getInt()!=1) throw new IllegalArgumentException("Unsupported node manifest version");
         var schema=DistributedSchemaCodec.decode(blob(input,DistributedSchemaCodec.MAX_BYTES));
         var directory=RangeDirectoryCodec.decode(blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES));
         var catalogue=RangeDirectoryCodec.decode(blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES));
-        require(input,72+SETTINGS_BYTES);
+        require(input,72+4+SETTINGS_BYTES);
         UUID directoryColumn=uuid(input), sessionsColumn=uuid(input), node=uuid(input), incarnation=uuid(input);
         int groups=input.getInt(), count=input.getInt();
-        if (groups<1 || groups>RangeDirectoryCodec.MAX_RANGES+1 || count<1 || count>RangeDirectoryCodec.MAX_COLUMNS
-                || (long)count*21>input.remaining()-SETTINGS_BYTES) throw new IllegalArgumentException("Invalid node manifest group/column counts");
+        if (groups<1 || groups>RatisNodePlan.MAX_LOCAL_GROUPS || count<1 || count>RangeDirectoryCodec.MAX_COLUMNS
+                || (long)count*21>input.remaining()-SETTINGS_BYTES-4) throw new IllegalArgumentException("Invalid node manifest group/column counts");
         var columns=new HashMap<UUID,String>(); UUID previous=null;
         for (int i=0;i<count;i++) {
             require(input,16); UUID column=uuid(input);
             if (previous!=null && UUID_ORDER.compare(previous,column)>=0) throw new IllegalArgumentException("Noncanonical manifest physical column order");
             previous=column; String name=text(input); columns.put(column,name);
+        }
+        require(input,4+SETTINGS_BYTES); int homeCount=input.getInt();
+        if (homeCount<0 || homeCount>2) throw new IllegalArgumentException("Invalid manifest home-role count");
+        var homes=new ArrayList<RatisNodePlan.Home>(homeCount); int previousRole=-1; long homeBytes=0;
+        for (int i=0;i<homeCount;i++) {
+            require(input,1+4+16+4+1+SETTINGS_BYTES); int role=input.get() & 255;
+            if (role>=RatisNodePlan.Role.values().length || role<=previousRole) throw new IllegalArgumentException("Invalid/noncanonical manifest home role"); previousRole=role;
+            byte[] encoded=blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES); homeBytes+=encoded.length;
+            if (homeBytes>RatisNodePlan.MAX_HOME_DIRECTORY_BYTES) throw new IllegalArgumentException("Manifest home directory aggregate exceeds bound");
+            var homeDirectory=RangeDirectoryCodec.decode(encoded); require(input,16); UUID column=uuid(input); String name=text(input);
+            homes.add(new RatisNodePlan.Home(RatisNodePlan.Role.values()[role],homeDirectory,column,name));
         }
         require(input,SETTINGS_BYTES);
         var images=new NativeRangeImage.Limits(input.getInt(),input.getLong(),input.getInt());
@@ -99,7 +116,7 @@ public final class RatisNodeManifest {
         if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
         var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown));
         var recovered=catalogue(catalogue,directory,directoryColumn,sessionsColumn);
-        var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,Set.of(),groups);
+        var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,Set.of(),homes,groups);
         if (plan.localGroups().size()!=groups) throw new IllegalArgumentException("Manifest group budget is not canonical");
         var manifest=new RatisNodeManifest(schema,plan,settings,reads,writes);
         if (!Arrays.equals(bytes,encode(manifest))) throw new IllegalArgumentException("Noncanonical node manifest encoding");

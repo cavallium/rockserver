@@ -80,7 +80,30 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private RatisSnapshotPins capturedSnapshots;
     private RatisSnapshotFences snapshotHomes;
     /** Trusted node configuration, installed before transport exposure; request bytes never select a home connector. */
+    @FunctionalInterface interface HomeValueValidator { void validate(byte[] key,byte[] value); }
+    private RatisNodePlan.Role role=RatisNodePlan.Role.DATA;
+    private boolean roleConfigured;
+    private HomeValueValidator homeValues;
+    void role(RatisNodePlan.Role role) { role(role,null); }
+    void role(RatisNodePlan.Role role,HomeValueValidator values) {
+        if (getLifeCycleState()!=LifeCycle.State.NEW || roleConfigured) throw new IllegalStateException("Range role is fixed before initialization");
+        java.util.Objects.requireNonNull(role);
+        boolean home=role==RatisNodePlan.Role.TRANSACTION_HOME || role==RatisNodePlan.Role.SNAPSHOT_HOME;
+        if (home!=(values!=null) || role!=RatisNodePlan.Role.DATA && snapshotHomes!=null) throw new IllegalArgumentException("Invalid range role capabilities");
+        this.role=role; homeValues=values; roleConfigured=true;
+    }
+    private void requireDataRole() { if (role!=RatisNodePlan.Role.DATA) throw new IllegalStateException("Range role does not support DATA transaction/snapshot operations"); }
+    private void requireRoleRecord(byte[] encoded) {
+        if (role==RatisNodePlan.Role.DATA) return;
+        if (RatisSnapshotRecord.isSnapshot(encoded) || RatisParticipantRecord.isParticipant(encoded)) throw new IllegalArgumentException("Range role rejects participant/snapshot records");
+        var command=DistributedCommandCodec.decode(encoded);
+        if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.SESSION_FLOOR && command.kind()!=DistributedCommand.Kind.SESSION_CONTROL) throw new IllegalArgumentException("Range role rejects transaction business records");
+    }
+    private void validateRoleNativeState() throws IOException {
+        if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
+    }
     void snapshotHomes(RatisSnapshotFences homes) {
+        requireDataRole();
         if (getLifeCycleState()!=LifeCycle.State.NEW) throw new IllegalStateException("Snapshot home reader is fixed before initialization");
         if (snapshotHomes!=null) throw new IllegalStateException("Snapshot home reader already configured"); snapshotHomes=java.util.Objects.requireNonNull(homes);
     }
@@ -95,11 +118,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     long transactionTerm() { var a=store.applied(); return a==null ? -1 : a.term(); }
     UUID transactionOwnerIncarnation() { return transactionIncarnation; }
     void checkTransactionOwner() throws IOException {
-        requireHealthy(); var current=leadership(); var a=store.applied();
+        requireDataRole(); requireHealthy(); var current=leadership(); var a=store.applied();
         if (!current.ready() || a==null || a.term()!=current.term() || !store.admissionOpen()) throw new IOException("Transaction leader changed or is not ready");
     }
     /** Null means this replica has no qualified current-term discovery owner. */
     ReplicatedRangeStore.PreparedRecoveryPage preparedRecoveries(UUID after,int limit) throws IOException {
+        if (role!=RatisNodePlan.Role.DATA) return null;
         if (storageFailure!=null) throw new IOException("Native recovery discovery requires repair",storageFailure);
         if (getLifeCycleState()!=LifeCycle.State.RUNNING) return null;
         var owner=leadership(); var applied=store.applied();
@@ -136,15 +160,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     /** Qualified coordinator seam; the caller freezes this incarnation before its first capture request. */
     public UUID snapshotCaptureOwner() throws IOException { checkTransactionOwner(); return transactionIncarnation; }
-    public SnapshotFenceStatus.Capture captureSnapshotPin(RatisSnapshotFences homes,SnapshotFence fence,UUID owner,UUID snapshot,java.time.Duration ttl) throws Exception {
+    public SnapshotFenceStatus.Capture captureSnapshotPin(RatisSnapshotFences homes,SnapshotFence fence,UUID owner,UUID snapshot,java.time.Duration ttl) throws Exception { requireDataRole();
         return capturedSnapshots.capture(homes,fence,owner,snapshot,ttl);
     }
     /** Immutable pin reads do not acquire new leader authority or substitute a current native cut. */
-    public byte[] snapshotPinGet(SnapshotFenceStatus.Capture token,UUID column,byte[] key) throws Exception { return capturedSnapshots.get(token,column,key); }
+    public byte[] snapshotPinGet(SnapshotFenceStatus.Capture token,UUID column,byte[] key) throws Exception { requireDataRole(); return capturedSnapshots.get(token,column,key); }
     public it.cavallium.rockserver.core.common.distributed.PhysicalRangePage snapshotPinPage(SnapshotFenceStatus.Capture token,UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws Exception {
-        return capturedSnapshots.page(token,column,lower,upper,reverse,resume,items,bytes);
+        requireDataRole(); return capturedSnapshots.page(token,column,lower,upper,reverse,resume,items,bytes);
     }
-    public void releaseSnapshotPin(SnapshotFenceStatus.Capture token) throws Exception { capturedSnapshots.release(token); }
+    public void releaseSnapshotPin(SnapshotFenceStatus.Capture token) throws Exception { requireDataRole(); capturedSnapshots.release(token); }
     RatisSnapshotPins.Stats snapshotPinStats() { return capturedSnapshots.stats(); }
 
     private static final class Admission {
@@ -342,8 +366,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             recoveryDir = raftRoot.resolve("native-snapshot-recovery");
             snapshots.init(storage);
             recover(false);
-            store.activate();
-            store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+            store.activate(); validateRoleNativeState();
+            if (role==RatisNodePlan.Role.DATA) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
             if (enableSessionControls) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
         } catch (Exception failure) { throw failRecovery(failure); }
@@ -402,6 +426,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private NativeRangeImage.Manifest validateImage(Path image, TermIndex position) throws IOException {
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         var manifest = NativeRangeImage.visit(image, limits, (section, column, key, value) -> {
+            if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x20 && (key[16]&255)<=0x24) throw new IllegalArgumentException("Non-DATA image contains participant/snapshot state");
+            if (homeValues!=null && section==NativeRangeImage.Section.USER) homeValues.validate(key,value);
             if (section == NativeRangeImage.Section.STATE && key.length == 17 && key[16] == 1) {
                 try { cutConfiguration[0] = ReplicatedRangeStore.Configuration.decode(value); }
                 catch (IllegalArgumentException invalid) { throw new IOException("Invalid image configuration", invalid); }
@@ -653,8 +679,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 deferred.headMap(a.index(), true).clear();
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear();
-                store.activate();
-            store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                store.activate(); validateRoleNativeState();
+            if (role==RatisNodePlan.Role.DATA) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
                 if (enableSessionControls) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
@@ -709,7 +735,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             long generation = admissionGeneration.get();
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
-            byte[] encoded = request.getMessage().getContent().toByteArray();
+            byte[] encoded = request.getMessage().getContent().toByteArray(); requireRoleRecord(encoded);
             if (RatisSnapshotRecord.isSnapshot(encoded)) return startSnapshot(transaction,encoded,generation,leadership);
             if (RatisParticipantRecord.isParticipant(encoded)) return RatisParticipantRecord.isFinalization(encoded) ? startFinalization(transaction,encoded,generation,leadership) : startParticipant(transaction,encoded,generation,leadership);
             var command = DistributedCommandCodec.decode(encoded);
@@ -833,7 +859,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private SnapshotProposal borrowedSnapshot(SnapshotHold hold,RatisSnapshotRecord request) { var view=new SnapshotProposal(hold,request); view.claimed=true; return view; }
     public SnapshotProposal prepareSnapshotInstall(RatisSnapshotFences homes,SnapshotFence fence) throws Exception { return prepareSnapshot(homes,fence,true); }
     public SnapshotProposal prepareSnapshotRelease(RatisSnapshotFences homes,SnapshotFence fence) throws Exception { return prepareSnapshot(homes,fence,false); }
-    private SnapshotProposal prepareSnapshot(RatisSnapshotFences homes,SnapshotFence fence,boolean install) throws Exception {
+    private SnapshotProposal prepareSnapshot(RatisSnapshotFences homes,SnapshotFence fence,boolean install) throws Exception { requireDataRole();
         java.util.Objects.requireNonNull(homes); java.util.Objects.requireNonNull(fence); requireHealthy(); long generation=admissionGeneration.get(); var leader=leadership();
         if (!leader.ready()) throw new IllegalStateException("Snapshot gate leader is not ready");
         var group=store.ownership().owner().groupId(); var participant=fence.participant(group); var operation=install ? participant.installOperation() : participant.releaseOperation();
@@ -940,7 +966,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     public long reservedSnapshotGateCount() { synchronized (admissions) { return reservedSnapshotCount; } }
     public long reservedSnapshotGateBytes() { synchronized (admissions) { return reservedSnapshotBytes; } }
     public ProposalFootprints.GateStats proposalGateStats() { synchronized (admissions) { return proposalFootprints.gateStats(); } }
-    public boolean snapshotGateReady(SnapshotFence fence) throws IOException {
+    public boolean snapshotGateReady(SnapshotFence fence) throws IOException { requireDataRole();
         checkTransactionOwner(); var record=store.snapshotGate(fence.fenceId());
         if (record==null || !record.active()) return false;
         if (!record.fence().equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed");
@@ -951,7 +977,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         return ready;
     }
-    public ReplicatedRangeStore.ScopedSnapshot captureSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence) throws Exception {
+    public ReplicatedRangeStore.ScopedSnapshot captureSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence) throws Exception { requireDataRole();
         checkTransactionOwner(); long generation=admissionGeneration.get(); var read=homes.readRegistration(fence.fenceId()); var status=read.status();
         if (status==null || !status.fence().equals(fence) || status.phase()!=SnapshotFenceStatus.Phase.INSTALLING || !status.allReady()) throw new IllegalStateException("Snapshot capture requires every home ready proof");
         var gate=store.snapshotGate(fence.fenceId());
@@ -1047,6 +1073,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private record AppliedRecord(OperationId operation,byte[] result) {}
     private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
+        requireRoleRecord(encoded);
         if (RatisSnapshotRecord.isSnapshot(encoded)) {
             var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request);
             var record=request.isRelease() ? store.applyGateRelease(positionArg,request.terminal()) : store.applyGateInstall(positionArg,request.fence());
@@ -1068,6 +1095,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return new AppliedRecord(command.operationId(),store.apply(positionArg,command));
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
+        requireRoleRecord(encoded);
         if (RatisSnapshotRecord.isSnapshot(encoded)) {
             var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request);
             var receipt=request.receipt(store.recoveredSnapshotGate(request.fence()));
@@ -1294,7 +1322,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var proposal=new FinalizationProposal(hold,finalization); proposal.claimed=true; return proposal;
     }
     /** Privileged coordinator seam. Bounded protected capacity is held while the fresh home read is in flight. */
-    public FinalizationProposal prepareFinalization(RatisTransactionStatuses homes,UUID transaction,OperationId recovery) throws Exception {
+    public FinalizationProposal prepareFinalization(RatisTransactionStatuses homes,UUID transaction,OperationId recovery) throws Exception { requireDataRole();
         java.util.Objects.requireNonNull(homes); java.util.Objects.requireNonNull(transaction); java.util.Objects.requireNonNull(recovery);
         requireHealthy(); long generation=admissionGeneration.get(); var leader=leadership(); if (!leader.ready()) throw new IllegalStateException("Finalization leader is not ready");
         FinalizationHold hold;
@@ -1426,7 +1454,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     /** Freeze the original read cut/scope/result before registering the home; it is never rebased during PREPARE. */
     public byte[] participantPlanDigest(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception { return participantIntent(pin,business).payloadDigest(); }
     /** Canonical planning data for durable registration; this grants no PREPARE append authority. */
-    public DistributedCommand participantIntent(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception {
+    public DistributedCommand participantIntent(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception { requireDataRole();
         checkTransactionOwner(); long generation=transactionGeneration(); commandValidator.accept(business);
         try (var stage=pin.stage(business)) {
             checkTransactionOwner(); if (generation!=transactionGeneration() || pin.position().term()!=transactionTerm()) throw new IllegalStateException("Participant read owner changed");
@@ -1435,7 +1463,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
     /** Reattach exact live PREPARE authority after a lost coordinator reply; never recreate a read cut. */
-    public ParticipantProposal reattachParticipant(UUID transaction,OperationId control,DistributedCommand accepted) throws IOException {
+    public ParticipantProposal reattachParticipant(UUID transaction,OperationId control,DistributedCommand accepted) throws IOException { requireDataRole();
         java.util.Objects.requireNonNull(transaction); java.util.Objects.requireNonNull(control); java.util.Objects.requireNonNull(accepted);
         if (accepted.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED) throw new IllegalArgumentException("Expected a frozen accepted participant image"); commandValidator.accept(accepted);
         requireHealthy(); long generation=admissionGeneration.get(); var leader=leadership();
@@ -1496,7 +1524,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     public ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,RatisTransactionStatuses homes,UUID transaction) throws Exception {
         return prepareParticipant(pin,business,control,homes,transaction,null);
     }
-    ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,RatisTransactionStatuses homes,UUID transaction,ProposalDeadline deadline) throws Exception {
+    ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,RatisTransactionStatuses homes,UUID transaction,ProposalDeadline deadline) throws Exception { requireDataRole();
         java.util.Objects.requireNonNull(pin); java.util.Objects.requireNonNull(control); commandValidator.accept(business);
         if (control.equals(business.operationId())) throw new IllegalArgumentException("Prepare control identity must differ from business identity");
         var preparing=reserveParticipant(pin.scope(),business.operationId(),control,transaction,false,deadline);
@@ -1508,7 +1536,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         });
     }
     /** Reject a frozen original plan under current gate authority without reopening or rebasing its read cut. */
-    public ParticipantProposal prepareParticipantRejection(DistributedCommand accepted,OperationId control,RatisTransactionStatuses homes,UUID transaction) throws Exception {
+    public ParticipantProposal prepareParticipantRejection(DistributedCommand accepted,OperationId control,RatisTransactionStatuses homes,UUID transaction) throws Exception { requireDataRole();
         java.util.Objects.requireNonNull(accepted); java.util.Objects.requireNonNull(control);
         if (accepted.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || control.equals(accepted.operationId())) throw new IllegalArgumentException("Expected a frozen accepted plan and separate control");
         commandValidator.accept(accepted); store.validate(accepted);
@@ -1590,7 +1618,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     public long reservedParticipantCount() { synchronized (admissions) { return reservedParticipantCount; } }
     public long reservedParticipantBytes() { synchronized (admissions) { return reservedParticipantBytes; } }
     /** Caller supplies a leader-bound tracked cut obtained after its read barrier; no network work occurs here. */
-    public ScopedCommit prepareScopedCommit(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command) throws Exception {
+    public ScopedCommit prepareScopedCommit(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command) throws Exception { requireDataRole();
         return prepareScopedCommit(pin,command,null);
     }
     ScopedCommit prepareScopedCommit(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command,ProposalDeadline deadline) throws Exception {
@@ -1639,7 +1667,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (!retained) reservation.close();
         }
     }
-    public ProposalReservation reserveProposalScope(TransactionScope scope) throws IOException {
+    public ProposalReservation reserveProposalScope(TransactionScope scope) throws IOException { requireDataRole();
         requireHealthy(); long generation=admissionGeneration.get(); var current=leadership();
         if (!current.ready()) throw new IOException("Leader is not ready for scope reservation");
         store.validateScope(scope); var prepared=proposalFootprints.prepare(scope);
@@ -1743,6 +1771,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private Message framedQuery(byte[] encoded,boolean freshBarrier) throws Exception {
         var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+        if (role!=RatisNodePlan.Role.DATA && packet.kind()!=ScopedTransactionRpc.POINT && packet.kind()!=ScopedTransactionRpc.STATE) throw new IOException("Range role rejects transaction/snapshot queries");
         var input=ByteBuffer.wrap(packet.body()); byte[] reply;
         switch (packet.kind()) {
             case ScopedTransactionRpc.POINT -> {

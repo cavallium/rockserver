@@ -29,6 +29,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     @FunctionalInterface interface ServerFactory {
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException;
     }
+    @FunctionalInterface interface HomeClientFactory { RatisRoutedClient connect(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) throws IOException; }
     public record Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,
                            Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout) {
         public Settings {
@@ -51,6 +52,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final Map<RaftGroupId,RatisRangeStateMachine> machines=new LinkedHashMap<>();
     private DistributedStoragePool pool; private RaftServer server; private RatisCatalogueClock clock;
     private RatisSessionPropagation propagation; private RatisSessionClockService service;
+    private final List<RatisSessionPropagation> propagations=new ArrayList<>();
+    private final Map<RatisNodePlan.Role,RatisRoutedClient> homeClients=new EnumMap<>(RatisNodePlan.Role.class);
     private RatisTransactionExpiryService transactionExpiry;
     private final RecoverySettings recoverySettings;
     private RatisParticipantRecoveryRegistry participantRecoveries;
@@ -91,8 +94,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,recoveries,RatisRoutedClient::connect);
+    }
+    static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory) throws IOException {
         var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes,recoveries);
-        try { node.initialize(config,startup,factory); return node; }
+        try { node.initialize(config,startup,factory,homeFactory); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
@@ -103,15 +110,21 @@ public final class RatisNodeRuntime implements AutoCloseable {
         this.plan=Objects.requireNonNull(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
         this.routed=Objects.requireNonNull(routed); this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
         this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); logicalSchema=schema; this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
-        if (recoveries!=null) recoveries.homes().requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
-        if (snapshotHomes!=null) snapshotHomes.requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
+        if (recoveries!=null) {
+            recoveries.homes().requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
+            var home=plan.home(RatisNodePlan.Role.TRANSACTION_HOME); if (home!=null) recoveries.homes().requireDirectoryBinding(home.directory());
+        }
+        if (snapshotHomes!=null) {
+            snapshotHomes.requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
+            var home=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME); if (home!=null) snapshotHomes.requireDirectoryBinding(home.directory());
+        }
         if (schema!=null) schema.requireMatches(plan.directory());
         if (plan.localGroups().stream().anyMatch(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId()))
-                && plan.directory().ranges().size()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
+                && plan.directory().ranges().size()+plan.homes().stream().mapToInt(home -> home.directory().ranges().size()).sum()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
         var catalogue=plan.catalogue(); epochs.requireCatalogueBinding(plan.directory().clusterId(),plan.directory().databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
         if (!Arrays.equals(routed.directory().payloadDigest(),plan.directory().payloadDigest())) throw new IllegalArgumentException("Node routed directory differs from placement plan");
     }
-    private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory) throws IOException {
+    private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory) throws IOException {
         Objects.requireNonNull(startup); Objects.requireNonNull(factory);
         if (!Files.isDirectory(root)) throw new IOException("Node root must already exist on durable storage");
         lockChannel=FileChannel.open(root.resolve("node.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
@@ -145,30 +158,44 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 if (!allowed.contains(group)) throw new IOException("Unplanned persisted Raft group "+group);
             }
         }
+        for (var home:plan.homes()) homeClients.put(home.role(),homeFactory.connect(home.directory()));
+        RatisSnapshotFences captureHomes=snapshotHomes;
+        var snapshotPlan=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME);
+        if (snapshotPlan!=null) {
+            if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
+        }
         pool=DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class));
         try {
             for (var group:plan.localGroups()) {
                 var id=group.getGroupId().getUuid(); RatisRangeStateMachine machine;
-                if (id.equals(plan.catalogue().groupId())) {
+                var role=plan.role(id);
+                if (role==RatisNodePlan.Role.CATALOGUE) {
                     var c=plan.catalogue();
                     var store=pool.openRange(new RangeOwnership.Owner(id,c.epoch()),new RangeOwnership.Interval(id,Set.of(c.directoryColumn(),c.sessionsColumn()),null,null),
                             c.schemaDigest(),Map.of(c.directoryColumn(),"catalogue-directory",c.sessionsColumn(),"catalogue-sessions"),Set.of());
                     machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn()));
+                    machine.role(role);
                 } else {
-                    var descriptor=plan.directory().ranges().stream().filter(range -> range.groupId().equals(id)).findFirst().orElseThrow();
-                    var store=pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(plan.directory().domainId(),plan.directory().columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
-                            plan.directory().schemaDigest(),plan.columns(),plan.merges());
-                    if (logicalSchema!=null) store.enableLogicalSchema(logicalSchema);
-                    machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),command -> {},epochs,plan.directory(),settings.retention());
-                    if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes);
+                    var directory=plan.groupDirectory(id); var descriptor=plan.groupDescriptor(id); var home=plan.home(id);
+                    var bindings=home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
+                    var store=pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
+                            directory.schemaDigest(),bindings,home==null ? plan.merges() : Set.of());
+                    java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
+                    if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
+                    else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
+                    if (role==RatisNodePlan.Role.DATA && logicalSchema!=null) store.enableLogicalSchema(logicalSchema);
+                    machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),validator,epochs,directory,settings.retention());
+                    if (role==RatisNodePlan.Role.TRANSACTION_HOME) machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
+                    else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
+                    else { machine.role(role); if (captureHomes!=null) machine.snapshotHomes(captureHomes); }
                 }
                 machines.put(group.getGroupId(),machine);
             }
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
         server=factory.create(plan,logs,Collections.unmodifiableMap(machines));
-        transactionExpiry=new RatisTransactionExpiryService(scheduler,List.copyOf(machines.values()),32);
+        transactionExpiry=new RatisTransactionExpiryService(scheduler,machines.entrySet().stream().filter(entry -> plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA).map(Map.Entry::getValue).toList(),32);
         if (recoverySettings!=null) {
-            var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (!id.getUuid().equals(plan.catalogue().groupId())) local.add(id.getUuid());
+            var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (plan.role(id.getUuid())==RatisNodePlan.Role.DATA) local.add(id.getUuid());
             participantRecoveries=new RatisParticipantRecoveryRegistry(root.resolve("recovery"),recoverySettings.homes(),routed,recoverySettings.controls(),(group,transaction,control) -> {
                 var machine=machines.get(RaftGroupId.valueOf(group)); if (machine==null || !local.contains(group)) throw new IOException("Participant recovery is outside local DATA groups");
                 try { var proposal=machine.prepareFinalization(recoverySettings.homes(),transaction,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
@@ -183,8 +210,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         if (!machines.containsKey(RaftGroupId.valueOf(plan.catalogue().groupId()))) return;
         clock=new RatisCatalogueClock(root.resolve("sessions/catalogue-clock.bin"),epochs);
-        propagation=new RatisSessionPropagation(root.resolve("sessions"),epochs,routed,settings.maxPropagationRanges());
-        service=new RatisSessionClockService(scheduler,clock,propagation,time,settings.propagationVisits(),this::clockOwnerReady);
+        propagation=new RatisSessionPropagation(root.resolve("sessions"),epochs,routed,settings.maxPropagationRanges()); propagations.add(propagation);
+        for (var home:plan.homes()) {
+            Path scope=Files.createDirectories(root.resolve("sessions").resolve(home.role().name().toLowerCase(Locale.ROOT))); SessionJournalFiles.force(scope); SessionJournalFiles.force(scope.getParent());
+            propagations.add(new RatisSessionPropagation(scope,epochs,homeClients.get(home.role()),settings.maxPropagationRanges()));
+        }
+        service=new RatisSessionClockService(scheduler,clock,propagations,time,settings.propagationVisits(),this::clockOwnerReady);
     }
     public void start() throws IOException {
         synchronized (this) {
@@ -284,11 +315,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Node service drain interrupted",interrupted); }
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Node service did not drain",failure); }
             }
-            if (propagation!=null) propagation.close(); if (clock!=null) clock.close();
+            for (var scope:propagations) scope.close(); if (clock!=null) clock.close();
             for (var machine:machines.values()) machine.beginShutdown();
             if (server!=null && !serverClosed) { server.close(); serverClosed=true; }
             for (var machine:machines.values()) machine.awaitNativeReaders(settings.shutdownTimeout());
             if (pool!=null && !poolClosed) { pool.close(); poolClosed=true; }
+            for (var client:homeClients.values()) client.close();
             if (lock!=null && lock.isValid()) lock.release(); if (lockChannel!=null) lockChannel.close();
             synchronized (this) { closed=true; }
         } finally { synchronized (this) { closing=false; } }

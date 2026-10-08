@@ -16,6 +16,9 @@ public final class RatisSnapshotFences {
         if (!directory.columns().equals(Set.of(column))) throw new IllegalArgumentException("Snapshot fence directory must have its dedicated column");
         cluster=directory.clusterId(); database=directory.databaseId(); schemaDigest=directory.schemaDigest();
     }
+    void requireDirectoryBinding(RangeDirectory expected) {
+        if (!Arrays.equals(routed.directory().payloadDigest(),expected.payloadDigest())) throw new IllegalArgumentException("Home reader differs from declared placement");
+    }
     byte[] identityDigest() {
         var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
@@ -77,6 +80,7 @@ public final class RatisSnapshotFences {
             }
         };
     }
+    static void validateRecord(UUID cluster,UUID database,UUID group,long epoch,byte[] key,byte[] value) { requireIdentity(SnapshotFenceStatus.decode(value),cluster,database,group,epoch,key); }
     private static void requireIdentity(SnapshotFenceStatus status,UUID cluster,UUID database,UUID home,long homeEpoch,byte[] key) {
         var fence=status.fence();
         if (!fence.clusterId().equals(cluster) || !fence.databaseId().equals(database) || !fence.homeGroup().equals(home) || fence.homeEpoch()!=homeEpoch

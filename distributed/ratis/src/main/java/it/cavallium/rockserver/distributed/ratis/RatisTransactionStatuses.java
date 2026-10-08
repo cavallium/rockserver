@@ -19,6 +19,9 @@ public final class RatisTransactionStatuses {
     void requireDatabaseBinding(UUID cluster,UUID database) {
         if (!this.cluster.equals(cluster) || !this.database.equals(database)) throw new IllegalArgumentException("Transaction home reader belongs to another cluster/database");
     }
+    void requireDirectoryBinding(RangeDirectory expected) {
+        if (!Arrays.equals(routed.directory().payloadDigest(),expected.payloadDigest())) throw new IllegalArgumentException("Home reader differs from declared placement");
+    }
     byte[] identityDigest() {
         var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
@@ -72,6 +75,7 @@ public final class RatisTransactionStatuses {
             else { var old=TransactionStatus.decode(predicate.expectedValue()); requireIdentity(old,cluster,database,mutation.key()); next.requireSuccessorOf(old); }
         };
     }
+    static void validateRecord(UUID cluster,UUID database,byte[] key,byte[] value) { requireIdentity(TransactionStatus.decode(value),cluster,database,key); }
     private static void requireIdentity(TransactionStatus status,UUID cluster,UUID database,byte[] key) {
         if (!status.clusterId().equals(cluster) || !status.databaseId().equals(database) || !Arrays.equals(key(status.transactionId()),key)) throw new IllegalArgumentException("Wrong transaction home identity");
     }

@@ -49,6 +49,18 @@ class RatisSessionPropagationTest {
             }
         }
     }
+    @Test void sharedMinimumFreezesExactlyTheVerifiedCutAndRejectsRegressions() throws Exception {
+        try (var f=new Fixture(root); var driver=f.driver(Files.createDirectory(root.resolve("minimum")))) {
+            var minimum=SessionAuthority.from(f.catalogue.epochs.read()); f.advance(20);
+            assertEquals(minimum,driver.begin(minimum).target(),"Fresh newer authority verifies the shared minimum without replacing it");
+            assertTrue(driver.step(2).complete());
+            var fresh=SessionAuthority.from(f.catalogue.epochs.read());
+            assertThrows(IOException.class,() -> driver.begin(new SessionAuthority(fresh.clusterId(),fresh.databaseId(),fresh.generation()+1,30,fresh.minimumEpoch())));
+            assertEquals(minimum,driver.progress().target());
+            assertEquals(fresh,driver.begin().target()); assertTrue(driver.step(2).complete());
+            assertThrows(IOException.class,() -> driver.begin(minimum)); assertEquals(fresh,driver.progress().target());
+        }
+    }
     @Test void lostReplyBelowTargetNeedsAnotherVisitAndCannotPrematurelyCompleteTheRound() throws Exception {
         try (var f=new Fixture(root)) {
             Path journals=Files.createDirectory(root.resolve("older")); var first=f.groups.getFirst();

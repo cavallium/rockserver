@@ -109,4 +109,61 @@ class RatisNodePlanTest {
         var changedCatalogue=new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(remote()));
         assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,directory,changedCatalogue,Map.of(COLUMN,"data"),Set.of(COLUMN),1).identityDigest()));
     }
+    private static RatisNodePlan.Home home(RatisNodePlan.Role role,UUID group,UUID column,UUID domain,String name,List<ReplicaDescriptor> replicas) {
+        byte[] schema=new byte[32]; schema[0]=9;
+        var directory=new RangeDirectory(CLUSTER,DATABASE,domain,7,schema,11,Set.of(column),0,List.of(range(group,null,null,replicas)));
+        return new RatisNodePlan.Home(role,directory,column,name);
+    }
+    private static RatisNodePlan withHomes(List<RatisNodePlan.Home> homes) {
+        var local=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
+        return new RatisNodePlan(NODE,INCARNATION,directory(0,List.of(range(HIGH_GROUP,null,null,List.of(local)))),catalogue(List.of(local,remote())),Map.of(COLUMN,"data"),Set.of(),homes,100);
+    }
+    @Test void dedicatedHomeRolesAreQualifiedCanonicalAndSeparateFromDataAndCatalogue() {
+        var local=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
+        var tx=home(RatisNodePlan.Role.TRANSACTION_HOME,new UUID(0,100),new UUID(0,200),new UUID(0,300),"transaction-homes",List.of(local));
+        var snapshot=home(RatisNodePlan.Role.SNAPSHOT_HOME,new UUID(0,101),new UUID(0,201),new UUID(0,301),"snapshot-homes",List.of(local));
+        var plan=withHomes(List.of(snapshot,tx)); assertEquals(List.of(tx,snapshot),plan.homes()); assertEquals(4,plan.localGroups().size());
+        assertEquals(RatisNodePlan.Role.DATA,plan.role(HIGH_GROUP)); assertEquals(RatisNodePlan.Role.CATALOGUE,plan.role(CATALOGUE)); assertEquals(tx.role(),plan.role(new UUID(0,100)));
+        assertSame(tx,plan.home(tx.role())); assertSame(tx,plan.home(new UUID(0,100))); assertNull(plan.home(HIGH_GROUP)); assertNull(plan.home(RatisNodePlan.Role.DATA));
+        assertSame(tx.directory(),plan.groupDirectory(new UUID(0,100))); assertEquals(tx.directory().ranges().getFirst(),plan.groupDescriptor(new UUID(0,100)));
+        assertThrows(IllegalArgumentException.class,() -> plan.groupDirectory(CATALOGUE)); assertThrows(IllegalArgumentException.class,() -> plan.role(UUID.randomUUID()));
+        assertThrows(UnsupportedOperationException.class,() -> plan.homes().clear()); assertArrayEquals(plan.identityDigest(),withHomes(List.of(tx,snapshot)).identityDigest());
+        assertFalse(Arrays.equals(plan.identityDigest(),withHomes(List.of(tx)).identityDigest()));
+        var changed=new RatisNodePlan.Home(tx.role(),new RangeDirectory(CLUSTER,DATABASE,tx.directory().domainId(),8,tx.directory().schemaDigest(),12,Set.of(tx.column()),0,tx.directory().ranges()),tx.column(),tx.physicalName());
+        assertFalse(Arrays.equals(withHomes(List.of(tx)).identityDigest(),withHomes(List.of(changed)).identityDigest()));
+        assertFalse(Arrays.equals(withHomes(List.of(tx)).identityDigest(),withHomes(List.of(new RatisNodePlan.Home(RatisNodePlan.Role.SNAPSHOT_HOME,tx.directory(),tx.column(),tx.physicalName()))).identityDigest()));
+    }
+    @Test void homeRolesCannotAliasGroupsColumnsPhysicalNamesDomainsOrGlobalReplicaIdentity() {
+        var local=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
+        var tx=home(RatisNodePlan.Role.TRANSACTION_HOME,new UUID(0,100),new UUID(0,200),new UUID(0,300),"transaction-homes",List.of(local));
+        for (var column:List.of(COLUMN,DIRECTORY_COLUMN,SESSIONS_COLUMN)) assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(home(tx.role(),new UUID(0,100),column,new UUID(0,300),tx.physicalName(),List.of(local)))));
+        for (var group:List.of(HIGH_GROUP,CATALOGUE)) assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(home(tx.role(),group,tx.column(),new UUID(0,300),tx.physicalName(),List.of(local)))));
+        for (var domain:List.of(DOMAIN,CATALOGUE)) assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(home(tx.role(),new UUID(0,100),tx.column(),domain,tx.physicalName(),List.of(local)))));
+        assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(home(tx.role(),new UUID(0,100),tx.column(),new UUID(0,300),"data",List.of(local)))));
+        assertThrows(IllegalArgumentException.class,() -> home(tx.role(),new UUID(0,100),tx.column(),new UUID(0,300),"catalogue-directory",List.of(local)));
+        var snapshot=home(RatisNodePlan.Role.SNAPSHOT_HOME,new UUID(0,101),new UUID(0,201),new UUID(0,300),"snapshot-homes",List.of(local));
+        assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(tx,snapshot)));
+        assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(tx,new RatisNodePlan.Home(tx.role(),snapshot.directory(),snapshot.column(),snapshot.physicalName()))));
+        var bad=home(tx.role(),new UUID(0,100),tx.column(),new UUID(0,300),tx.physicalName(),List.of(local("wrong","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER)));
+        assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(bad)));
+        var wrongDatabase=new RangeDirectory(CLUSTER,new UUID(0,999),tx.directory().domainId(),7,tx.directory().schemaDigest(),11,Set.of(tx.column()),0,tx.directory().ranges());
+        assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(new RatisNodePlan.Home(tx.role(),wrongDatabase,tx.column(),tx.physicalName()))));
+    }
+    @Test void sharedHomeColumnCanSpanShardsButRoleScopeAndTotalHomeGroupBudgetStayBounded() {
+        var local=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER); UUID column=new UUID(0,200);
+        var ranges=new ArrayList<RangeDescriptor>();
+        for (int i=0;i<40;i++) ranges.add(range(new UUID(0,2000+i),i==0 ? null : new byte[]{(byte)i},i==39 ? null : new byte[]{(byte)(i+1)},List.of(local)));
+        var tx=new RatisNodePlan.Home(RatisNodePlan.Role.TRANSACTION_HOME,new RangeDirectory(CLUSTER,DATABASE,new UUID(0,300),1,new byte[32],0,Set.of(column),0,ranges),column,"transaction-homes");
+        assertEquals(42,withHomes(List.of(tx)).localGroups().size());
+        var more=new ArrayList<RangeDescriptor>(); for (int i=0;i<25;i++) more.add(range(new UUID(0,3000+i),i==0 ? null : new byte[]{(byte)i},i==24 ? null : new byte[]{(byte)(i+1)},List.of(local)));
+        var snapshot=new RatisNodePlan.Home(RatisNodePlan.Role.SNAPSHOT_HOME,new RangeDirectory(CLUSTER,DATABASE,new UUID(0,301),1,new byte[32],0,Set.of(new UUID(0,201)),0,more),new UUID(0,201),"snapshot-homes");
+        assertThrows(IllegalArgumentException.class,() -> withHomes(List.of(tx,snapshot)));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan.Home(RatisNodePlan.Role.DATA,tx.directory(),column,tx.physicalName()));
+        var projected=new RangeDirectory(CLUSTER,DATABASE,new UUID(0,300),1,new byte[32],0,Set.of(column),1,List.of(range(new UUID(0,100),null,null,List.of(local))));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan.Home(tx.role(),projected,column,tx.physicalName()));
+        var inactive=new RangeDescriptor(new UUID(0,100),new UUID(0,100),1,0,null,null,RangeDescriptor.TopologyState.FENCED,List.of(local));
+        var inactiveDirectory=new RangeDirectory(CLUSTER,DATABASE,new UUID(0,300),1,new byte[32],0,Set.of(column),0,List.of(inactive));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan.Home(tx.role(),inactiveDirectory,column,tx.physicalName()));
+    }
+
 }

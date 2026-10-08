@@ -6,6 +6,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.*;
+import java.util.*;
+import java.lang.reflect.Proxy;
+import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.client.api.BlockingApi;
+import org.apache.ratis.protocol.Message;
 import java.time.Duration;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -128,6 +133,85 @@ class RatisSessionClockServiceTest {
                 env.service.stop().get(5,TimeUnit.SECONDS);
                 assertEquals(0,f.submissions); assertNull(env.clock.pendingCommand()); assertNull(env.clock.observed()); assertNull(env.driver.progress().target());
             } finally { release.countDown(); }
+        }
+    }
+    @Test void threeScopesShareOneBudgetAndAllMustFinishBeforeAnotherClockAdvance() throws Exception {
+        try (var f=new RatisSessionPropagationTest.Fixture(root)) {
+            var wall=new AtomicLong(20);
+            try (var env=new MultiEnv(root,f,wall,List.of(f.catalogue.epochs,f.catalogue.epochs,f.catalogue.epochs))) {
+                for (int i=1;i<=6;i++) {
+                    var status=env.service.tick().get(5,TimeUnit.SECONDS);
+                    assertEquals(i,f.submissions,"One total participant visit per quantum across all scopes");
+                    assertEquals(i==6,status.complete()); assertEquals(3,status.scopes().size());
+                    assertSame(status.scopes().getFirst(),status.propagation());
+                    for (var scope:status.scopes()) assertEquals(20,scope.target().logicalTimeMillis());
+                    assertEquals(i<4 ? 1 : 2,status.scopes().get((i-1)%3).completed());
+                    wall.set(30); assertEquals(20,f.catalogue.epochs.read().logicalTimeMillis());
+                }
+                var next=env.service.tick().get(5,TimeUnit.SECONDS); assertEquals(30,next.clock().authority().logicalTimeMillis());
+                for (var scope:next.scopes()) assertEquals(next.clock().authority(),scope.target());
+                assertThrows(UnsupportedOperationException.class,() -> next.scopes().clear());
+                assertThrows(IllegalArgumentException.class,() -> new RatisSessionClockService(env.scheduler,env.clock,List.of(),wall::get,1));
+                assertThrows(IllegalArgumentException.class,() -> new RatisSessionClockService(env.scheduler,env.clock,List.of(env.drivers.getFirst(),env.drivers.getFirst()),wall::get,1));
+                assertThrows(IllegalArgumentException.class,() -> new RatisSessionClockService(env.scheduler,env.clock,List.of(env.drivers.getFirst(),env.drivers.get(1),env.drivers.get(2),env.drivers.getFirst()),wall::get,1));
+            }
+        }
+    }
+    @Test void unavailableParticipantsCannotStarveOtherScopesOrMultiplyTheQuantum() throws Exception {
+        try (var f=new RatisSessionPropagationTest.Fixture(root);
+             var env=new MultiEnv(root,f,new AtomicLong(20),List.of(f.catalogue.epochs,f.catalogue.epochs,f.catalogue.epochs))) {
+            f.failed.add(f.groups.getFirst());
+            for (int i=1;i<=6;i++) {
+                var status=env.service.tick().get(5,TimeUnit.SECONDS); assertEquals(i,f.submissions);
+                assertEquals(i>3 ? 1 : 0,status.scopes().get((i-1)%3).completed());
+                assertFalse(status.complete()); assertEquals(20,f.catalogue.epochs.read().logicalTimeMillis());
+            }
+            f.failed.clear();
+            for (int i=0;i<3;i++) env.service.tick().get(5,TimeUnit.SECONDS);
+            assertTrue(env.service.latest().complete()); assertEquals(9,f.submissions);
+        }
+    }
+    @Test void restartedPartialScopeBeginDischargesPersistedClockObligationBeforeAdvancing() throws Exception {
+        try (var f=new RatisSessionPropagationTest.Fixture(root)) {
+            var wall=new AtomicLong(20); var fail=new AtomicBoolean(true);
+            var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args) -> {
+                if (!method.getName().equals("sendReadOnly")) throw new AssertionError(method);
+                if (fail.getAndSet(false)) throw new IOException("home catalogue unavailable");
+                return f.catalogue.client.io().sendReadOnly((Message)args[0]);
+            });
+            var client=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args) -> switch (method.getName()) {
+                case "getGroupId" -> f.catalogue.client.getGroupId(); case "io" -> io; default -> throw new AssertionError(method);
+            });
+            var epochs=new RatisSessionEpochs(client,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.sessions);
+            try (var env=new MultiEnv(root,f,wall,List.of(f.catalogue.epochs,epochs))) {
+                assertThrows(ExecutionException.class,() -> env.service.tick().get(5,TimeUnit.SECONDS));
+                assertEquals(20,env.clock.observed().logicalTimeMillis());
+                assertEquals(20,env.drivers.getFirst().progress().target().logicalTimeMillis());
+                assertNull(env.drivers.get(1).progress().target()); assertEquals(0,f.submissions);
+            }
+            wall.set(30);
+            try (var env=new MultiEnv(root,f,wall,List.of(f.catalogue.epochs,f.catalogue.epochs))) {
+                for (int i=0;i<4;i++) {
+                    var status=env.service.tick().get(5,TimeUnit.SECONDS); assertNull(status.clock());
+                    for (var scope:status.scopes()) assertEquals(20,scope.target().logicalTimeMillis());
+                    assertEquals(20,f.catalogue.epochs.read().logicalTimeMillis());
+                }
+                assertTrue(env.service.latest().complete());
+                assertEquals(30,env.service.tick().get(5,TimeUnit.SECONDS).clock().authority().logicalTimeMillis());
+            }
+        }
+    }
+    static final class MultiEnv implements AutoCloseable {
+        final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"multi-session-clock-test");
+        final RatisCatalogueClock clock; final List<RatisSessionPropagation> drivers=new ArrayList<>(); final RatisSessionClockService service;
+        MultiEnv(Path root,RatisSessionPropagationTest.Fixture f,AtomicLong time,List<RatisSessionEpochs> epochs) throws Exception {
+            clock=new RatisCatalogueClock(root.resolve("multi-clock.bin"),f.catalogue.epochs);
+            for (int i=0;i<epochs.size();i++) drivers.add(new RatisSessionPropagation(Files.createDirectories(root.resolve("scope-"+i)),epochs.get(i),f.routed,2));
+            service=new RatisSessionClockService(scheduler,clock,drivers,time::get,1);
+        }
+        public void close() throws Exception {
+            service.stop().get(5,TimeUnit.SECONDS); for (var driver:drivers) driver.close(); clock.close();
+            scheduler.disposeGracefully().block(Duration.ofSeconds(5));
         }
     }
     static final class Env implements AutoCloseable {

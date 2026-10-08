@@ -56,8 +56,12 @@ public final class RatisSessionPropagation implements AutoCloseable {
     public synchronized boolean covers(SessionAuthority target) {
         return round.complete() && Arrays.equals(round.directory(),routed.directory().payloadDigest()) && covers(round.target(),target);
     }
-    /** Freeze one catalogue cut and all current active ranges; an unfinished round is never silently replaced. */
-    public Progress begin() throws IOException {
+    Path scopeIdentity() { return root.normalize(); }
+    /** Freeze one fresh catalogue cut and all current active ranges. */
+    public Progress begin() throws IOException { return beginCut(null); }
+    /** Verify a fresh catalogue image covers the shared cut, then freeze exactly that cut. */
+    public Progress begin(SessionAuthority minimum) throws IOException { return beginCut(Objects.requireNonNull(minimum)); }
+    private Progress beginCut(SessionAuthority minimum) throws IOException {
         final Round before=enter();
         try {
             if (before.target()!=null && !before.complete()) throw new IllegalStateException("Propagation round is unfinished");
@@ -66,9 +70,14 @@ public final class RatisSessionPropagation implements AutoCloseable {
                 throw new IOException("Complete active directory exceeds propagation scope/budget");
             }
             var ledger=epochs.read(); if (ledger==null) throw new IOException("Session catalogue is not initialized");
-            var target=SessionAuthority.from(ledger);
+            var current=SessionAuthority.from(ledger);
+            final SessionAuthority target;
+            try {
+                if (minimum!=null) current.requireAtLeast(minimum);
+                target=minimum==null ? current : minimum;
+                if (before.target()!=null) target.requireAtLeast(before.target());
+            } catch (IllegalArgumentException regressed) { throw new IOException("Propagation authority cut regressed",regressed); }
             if (!target.clusterId().equals(directory.clusterId()) || !target.databaseId().equals(directory.databaseId())) throw new IOException("Wrong propagation catalogue identity");
-            if (before.target()!=null) target.requireAtLeast(before.target());
             if (!Arrays.equals(directory.payloadDigest(),routed.directory().payloadDigest())) throw new IOException("Propagation directory changed during preparation");
             var ranges=directory.ranges().stream().map(range -> new Participant(range.groupId(),range.rangeEpoch())).sorted(Comparator.comparing(Participant::group)).toList();
             var next=new Round(Math.addExact(before.number(),1),target,directory.generation(),directory.payloadDigest(),ranges,new BitSet(),0);
@@ -128,7 +137,7 @@ public final class RatisSessionPropagation implements AutoCloseable {
     private void persist(Round next) throws IOException {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
-            output.writeInt(MAGIC); output.writeInt(1); output.write(identity); output.writeLong(next.number()); output.writeBoolean(next.target()!=null);
+            output.writeInt(MAGIC); output.write(identity); output.writeLong(next.number()); output.writeBoolean(next.target()!=null);
             if (next.target()!=null) {
                 output.write(new RangeSessionControl(next.target(),null,0).encode()); output.writeLong(next.generation()); output.write(next.directory());
                 output.writeInt(next.ranges().size()); output.writeInt(next.cursor());
@@ -143,7 +152,7 @@ public final class RatisSessionPropagation implements AutoCloseable {
     private Round decode(byte[] bytes) throws IOException {
         try {
             var input=new DataInputStream(new ByteArrayInputStream(bytes));
-            if (input.readInt()!=MAGIC || input.readInt()!=1 || !Arrays.equals(input.readNBytes(32),identity)) throw new IOException("Wrong propagation identity/version");
+            if (input.readInt()!=MAGIC || !Arrays.equals(input.readNBytes(32),identity)) throw new IOException("Wrong propagation identity");
             long number=input.readLong(); if (number<0) throw new IOException("Invalid propagation round");
             Round result;
             if (!input.readBoolean()) {

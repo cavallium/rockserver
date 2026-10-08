@@ -5,9 +5,11 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.WorkloadCost;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec;
 import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
+import it.cavallium.rockserver.core.common.distributed.SessionAuthority;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -18,11 +20,19 @@ import reactor.core.scheduler.Scheduler;
 
 /** One queued/running background quantum through the database's existing bounded BATCH write lane. */
 public final class RatisSessionClockService {
-    public record Snapshot(RatisCatalogueClock.Tick clock,RatisSessionPropagation.Progress propagation) {}
+    public record Snapshot(RatisCatalogueClock.Tick clock,List<RatisSessionPropagation.Progress> scopes) {
+        public Snapshot {
+            scopes=List.copyOf(scopes);
+            if (scopes.isEmpty() || scopes.size()>3) throw new IllegalArgumentException("Invalid clock propagation scopes");
+        }
+        public RatisSessionPropagation.Progress propagation() { return scopes.getFirst(); }
+        public boolean complete() { return scopes.stream().allMatch(RatisSessionPropagation.Progress::complete); }
+    }
     private final RWScheduler scheduler;
     private final RWScheduler.WorkloadExecutor executor;
     private final RatisCatalogueClock clock;
-    private final RatisSessionPropagation propagation;
+    private final List<RatisSessionPropagation> propagations;
+    private int scopeCursor;
     private final LongSupplier timeMillis;
     private final BooleanSupplier eligible;
     private final int visits;
@@ -41,10 +51,23 @@ public final class RatisSessionClockService {
     /** Eligibility must be a short memory-only ownership/readiness check; rechecked when queued work dispatches. */
     public RatisSessionClockService(RWScheduler scheduler,RatisCatalogueClock clock,RatisSessionPropagation propagation,
             LongSupplier timeMillis,int visits,BooleanSupplier eligible) {
+        this(scheduler,clock,List.of(propagation),timeMillis,visits,eligible);
+    }
+    public RatisSessionClockService(RWScheduler scheduler,RatisCatalogueClock clock,List<RatisSessionPropagation> propagations,
+            LongSupplier timeMillis,int visits) {
+        this(scheduler,clock,propagations,timeMillis,visits,() -> true);
+    }
+    /** The first scope supplies DATA status; every scope shares one clock cut and work budget. */
+    public RatisSessionClockService(RWScheduler scheduler,RatisCatalogueClock clock,List<RatisSessionPropagation> propagations,
+            LongSupplier timeMillis,int visits,BooleanSupplier eligible) {
         this.eligible=Objects.requireNonNull(eligible);
         this.scheduler=Objects.requireNonNull(scheduler);
         this.executor=scheduler.executor(RequestContext.batch(),OperationFamily.MUTATION);
-        this.clock=Objects.requireNonNull(clock); this.propagation=Objects.requireNonNull(propagation); this.timeMillis=Objects.requireNonNull(timeMillis);
+        this.clock=Objects.requireNonNull(clock); this.propagations=List.copyOf(propagations); this.timeMillis=Objects.requireNonNull(timeMillis);
+        if (this.propagations.isEmpty() || this.propagations.size()>3
+                || this.propagations.stream().map(RatisSessionPropagation::scopeIdentity).distinct().count()!=this.propagations.size()) {
+            throw new IllegalArgumentException("Invalid clock propagation scopes");
+        }
         if (visits<1 || visits>32) throw new IllegalArgumentException("Invalid clock propagation quantum"); this.visits=visits;
         estimatedBytes=Math.min(WorkloadCost.MAX_ESTIMATED_BYTES,2L*SessionEpochLedger.MAX_BYTES+(long)visits*RangeDirectoryCodec.MAX_ENCODED_BYTES);
     }
@@ -91,13 +114,37 @@ public final class RatisSessionClockService {
         return pending==null ? CompletableFuture.completedFuture(null) : pending.drained.copy();
     }
     private Snapshot cycle() throws Exception {
-        var progress=propagation.progress(); RatisCatalogueClock.Tick time=null;
-        if (progress.target()==null || progress.complete()) {
+        var obligation=clock.observed();
+        if (obligation!=null) beginMissing(obligation);
+        RatisCatalogueClock.Tick time=null;
+        // A successful clock CAS persists its obligation before any scope begins. Recovery must
+        // discharge that cut in every directory before another clock advance is permitted.
+        if (propagations.stream().allMatch(scope -> scope.progress().complete() || scope.progress().target()==null)
+                && (obligation==null || propagations.stream().allMatch(scope -> scope.covers(obligation)))) {
             time=clock.advance(timeMillis.getAsLong());
-            if (time.outcome()==RatisCatalogueClock.Outcome.CONFLICT || time.outcome()==RatisCatalogueClock.Outcome.EXPIRED) return new Snapshot(time,progress);
-            if (!propagation.covers(time.authority())) propagation.begin();
+            if (time.outcome()==RatisCatalogueClock.Outcome.CONFLICT || time.outcome()==RatisCatalogueClock.Outcome.EXPIRED) return snapshot(time);
+            beginMissing(time.authority());
         }
-        progress=propagation.step(visits); return new Snapshot(time,progress);
+        var remaining=propagations.stream().mapToInt(scope -> {
+            var progress=scope.progress(); return progress.total()-progress.completed();
+        }).toArray();
+        int work=0, skipped=0;
+        while (work<visits && skipped<propagations.size()) {
+            int index=scopeCursor; var scope=propagations.get(index); scopeCursor=(scopeCursor+1)%propagations.size();
+            var progress=scope.progress();
+            if (progress.target()==null || progress.complete() || remaining[index]==0) { skipped++; continue; }
+            skipped=0; work++; remaining[index]--; scope.step(1);
+        }
+        return snapshot(time);
+    }
+    private void beginMissing(SessionAuthority minimum) throws java.io.IOException {
+        for (var scope:propagations) {
+            var progress=scope.progress();
+            if ((progress.target()==null || progress.complete()) && !scope.covers(minimum)) scope.begin(minimum);
+        }
+    }
+    private Snapshot snapshot(RatisCatalogueClock.Tick time) {
+        return new Snapshot(time,propagations.stream().map(RatisSessionPropagation::progress).toList());
     }
     private void finish(Task task,Snapshot snapshot,Throwable failure) {
         synchronized (this) {
