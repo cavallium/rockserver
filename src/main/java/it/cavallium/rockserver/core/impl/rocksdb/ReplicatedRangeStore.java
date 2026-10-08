@@ -358,7 +358,7 @@ public final class ReplicatedRangeStore {
                 throw new IllegalArgumentException("Predicate outside owned column/interval");
             }
         }
-        if (command.formatVersion()==6) validateLogical(command);
+        if (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null) validateLogical(command);
         if (command.mutations().stream().anyMatch(m -> m.returnMode() != Mutation.ReturnMode.NONE)
                 && command.mutations().stream().anyMatch(m -> m.kind() == Mutation.Kind.DELETE_RANGE)) {
             throw new IllegalArgumentException("Point results with range deletion require a range-aware overlay");
@@ -391,7 +391,7 @@ public final class ReplicatedRangeStore {
             throws RocksDBException {
         Objects.requireNonNull(position);
         validate(command);
-        if (result!=null && (command.sessionControl()!=null || command.formatVersion()==6)) throw new IllegalArgumentException("Session controls require ordered native evaluation");
+        if (result!=null && (command.sessionControl()!=null || command.formatVersion()==6 || command.acceptance()!=null)) throw new IllegalArgumentException("Controls, buckets and accepted plans require ordered native evaluation");
         if (result != null && !command.predicates().isEmpty()) {
             throw new IllegalArgumentException("Precomputed results require a fully evaluated plan without live predicates");
         }
@@ -425,6 +425,8 @@ public final class ReplicatedRangeStore {
                 return original;
             }
             requireNext(position);
+            if (saved==null && command.acceptance()!=null && (command.acceptance().snapshot().index()>=position.index()
+                    || command.acceptance().snapshot().term()!=position.term())) throw new IllegalArgumentException("Accepted transaction does not follow its audited leadership cut");
             var authority=saved==null ? sessionAuthority() : null;
             var sessionStatus = saved==null ? sessionDecision(command,currentFloor,authority) : CommandResult.Status.SUCCESS;
             boolean terminalExpiry = sessionStatus==CommandResult.Status.SESSION_EXPIRED && expiredBoundOutcome(command,currentFloor,authority);
@@ -439,6 +441,9 @@ public final class ReplicatedRangeStore {
             if (saved == null && stableResult == null) {
                 var evaluated = evaluate(command);
                 stableResult = evaluated.result().encode(); effects=evaluated.effects(); bucketEffects=evaluated.buckets();
+                if (command.acceptance()!=null && !Arrays.equals(stableResult,command.acceptance().result())) {
+                    throw new IllegalStateException("Accepted transaction result disagrees with ordered native effects");
+                }
                 installUserEffects = evaluated.result().status() == CommandResult.Status.SUCCESS;
             }
             var writes=prepareScopedWrites(saved==null && installUserEffects,effects,bucketEffects);
@@ -564,7 +569,7 @@ public final class ReplicatedRangeStore {
         Evaluation(CommandResult result,List<Mutation> effects) { this(result,effects,Map.of()); }
     }
     private Evaluation evaluate(DistributedCommand command) throws RocksDBException {
-        if (command.formatVersion()!=6) return new Evaluation(evaluateLegacy(command),command.mutations());
+        if (!command.hasBucketData()) return new Evaluation(evaluateLegacy(command),command.mutations());
         try { return evaluateBuckets(command); }
         catch (DistributedBucket.LimitExceededException limit) { return new Evaluation(new CommandResult(CommandResult.Status.RESULT_TOO_LARGE,List.of()),List.of()); }
     }
@@ -589,7 +594,7 @@ public final class ReplicatedRangeStore {
     }
     private Evaluation evaluateBuckets(DistributedCommand command) throws RocksDBException {
         var budget=new BucketBudget(); var originals=new HashMap<BucketKey,DistributedBucket>();
-        for (var predicate:command.predicates()) {
+        if (command.acceptance()==null) for (var predicate:command.predicates()) {
             byte[] current=predicate.bucket() ? originalBucket(new BucketKey(predicate.columnId(),predicate.key()),originals,budget).get(predicate.memberKeys())
                     : db.get(columns.get(predicate.columnId()),predicate.key());
             if (!Arrays.equals(current,predicate.expectedValue())) return new Evaluation(new CommandResult(CommandResult.Status.CONFLICT,List.of()),List.of());
@@ -625,7 +630,7 @@ public final class ReplicatedRangeStore {
         return new Evaluation(new CommandResult(CommandResult.Status.SUCCESS,values),List.copyOf(effects),staged);
     }
     private CommandResult evaluateLegacy(DistributedCommand command) throws RocksDBException {
-        for (var predicate : command.predicates()) {
+        if (command.acceptance()==null) for (var predicate : command.predicates()) {
             byte[] current = db.get(columns.get(predicate.columnId()), predicate.key());
             if (!Arrays.equals(current, predicate.expectedValue())) {
                 return new CommandResult(CommandResult.Status.CONFLICT, List.of());
@@ -923,6 +928,36 @@ public final class ReplicatedRangeStore {
             applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); }
         }
     }
+    /**
+     * Caller must already own the complete exclusive proposal scope. This only certifies
+     * and freezes the ordered plan; it neither writes native state nor confers append authority.
+     */
+    public DistributedCommand planScopedCommit(ScopedHistoryPin pin,DistributedCommand command,long generation,UUID incarnation) throws RocksDBException {
+        Objects.requireNonNull(pin); Objects.requireNonNull(command);
+        if (pin.owner()!=this) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
+        if (command.acceptance()!=null || command.sessionControl()!=null || command.minimumSessionEpoch()>=0 || command.mutations().isEmpty()) throw new IllegalArgumentException("Expected an unaccepted business command");
+        validate(command);
+        for (var mutation:command.mutations()) {
+            if (mutation.kind()==Mutation.Kind.DELETE_RANGE ? !pin.scope().containsRange(mutation.columnId(),mutation.key(),mutation.value())
+                    : !pin.scope().contains(mutation.columnId(),mutation.key())) throw new IllegalArgumentException("Mutation outside transaction scope");
+        }
+        for (var predicate:command.predicates()) if (!pin.scope().contains(predicate.columnId(),predicate.key())) throw new IllegalArgumentException("Predicate outside transaction scope");
+        enterNative(); applyLane.lock();
+        try {
+            requireActive();
+            if (pin.validateUnderLane()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot failed serializable validation: "+pin.status());
+            var id=command.operationId(); long minimum=minimumSessionEpoch(null);
+            long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
+            if (id.epoch()<minimum || id.sequence()<=floor || db.get(receipts,receiptKey(id))!=null
+                    || sessionDecision(command,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Transaction operation/session is no longer eligible");
+            var evaluation=evaluate(command);
+            if (evaluation.result().status()!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Transaction plan rejected: "+evaluation.result().status());
+            // Close/fence can begin without this lane; it must not race certification unnoticed.
+            requireActive(); if (pin.status()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot lost certification ownership");
+            var accepted=DistributedCommand.acceptedTransaction(command,new it.cavallium.rockserver.core.common.distributed.TransactionAcceptance(pin.position(),generation,incarnation,pin.scope(),evaluation.result().encode()));
+            validate(accepted); return accepted;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
     /** Unprepared physical-scope snapshot. All member accesses in a collision bucket share its one physical stamp. */
     public final class ScopedHistoryPin implements AutoCloseable {
         private final ScopedSnapshot snapshot; private final RangeMutationHistory history; private final RangeMutationHistory.Pin registration;
@@ -931,6 +966,7 @@ public final class ReplicatedRangeStore {
             this.snapshot=snapshot; this.history=history; this.registration=registration; this.generation=generation; this.installation=installation;
         }
         public TransactionScope scope() { return snapshot.scope(); }
+        private ReplicatedRangeStore owner() { return ReplicatedRangeStore.this; }
         public ApplyPosition position() { return snapshot.position(); }
         public RangeMutationHistory.Status status() {
             var status=registration.status(); if (status!=RangeMutationHistory.Status.ACTIVE) return status;
@@ -948,17 +984,19 @@ public final class ReplicatedRangeStore {
         /** Observes complete declared-scope history under the apply lane; a later proposal still needs reservations/revalidation. */
         public RangeMutationHistory.Status validate() {
             applyLane.lock();
-            try {
-                var result=status();
-                if (result==RangeMutationHistory.Status.ACTIVE) {
-                    try { requireActive(); result=history.validate(registration); }
-                    catch (RuntimeException failure) { resetScopedUnderLane(); result=RangeMutationHistory.Status.INVALIDATED; }
-                } else if (registration.status()==RangeMutationHistory.Status.ACTIVE) {
-                    if (result==RangeMutationHistory.Status.CLOSED) history.close(registration);
-                    else invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
-                }
-                if (result!=RangeMutationHistory.Status.ACTIVE) retireScoped(registration); return result;
-            } finally { applyLane.unlock(); drainScopedReleases(); }
+            try { return validateUnderLane(); }
+            finally { applyLane.unlock(); drainScopedReleases(); }
+        }
+        private RangeMutationHistory.Status validateUnderLane() {
+            var result=status();
+            if (result==RangeMutationHistory.Status.ACTIVE) {
+                try { requireActive(); result=history.validate(registration); }
+                catch (RuntimeException failure) { resetScopedUnderLane(); result=RangeMutationHistory.Status.INVALIDATED; }
+            } else if (registration.status()==RangeMutationHistory.Status.ACTIVE) {
+                if (result==RangeMutationHistory.Status.CLOSED) history.close(registration);
+                else invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
+            }
+            if (result!=RangeMutationHistory.Status.ACTIVE) retireScoped(registration); return result;
         }
         @Override public void close() {
             if (!closed.compareAndSet(false,true)) return;

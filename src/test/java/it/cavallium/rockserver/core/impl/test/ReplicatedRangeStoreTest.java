@@ -707,6 +707,33 @@ class ReplicatedRangeStoreTest {
     }
     private static byte[] bytes(String text) { return text.getBytes(StandardCharsets.UTF_8); }
 
+    @Test void acceptedMergePlanPreservesOperandsAndReplaysAfterReopenWithoutHistory() throws Exception {
+        DistributedCommand accepted; byte[] outcome;
+        try (var pool=new Pool(path)) {
+            pool.store.enableScopedHistory(RangeMutationHistory.Limits.defaults()); pool.store.applyNoop(new ApplyPosition(1,0));
+            pool.store.apply(new ApplyPosition(1,1),command(0,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("seed"))));
+            var scope=new TransactionScope(List.of(TransactionScope.Span.point(A,bytes("k"))));
+            try (var pin=pool.store.captureTracked(scope)) {
+                var base=command(1,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("one"),Mutation.ReturnMode.PREVIOUS),
+                        new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("two"),Mutation.ReturnMode.CURRENT));
+                accepted=pool.store.planScopedCommit(pin,base,0,new UUID(0,9));
+                assertEquals(Mutation.Kind.MERGE,accepted.mutations().getFirst().kind()); assertArrayEquals(bytes("one"),accepted.mutations().getFirst().value());
+                var result=CommandResult.decode(accepted.acceptance().result()); assertArrayEquals(bytes("seed"),result.value(0)); assertArrayEquals(bytes("seed,one,two"),result.value(1));
+            }
+            outcome=pool.store.apply(new ApplyPosition(1,2),accepted); assertArrayEquals(accepted.acceptance().result(),outcome);
+        }
+        try (var reopened=new Pool(path)) {
+            assertArrayEquals(outcome,reopened.store.apply(new ApplyPosition(1,2),accepted));
+            reopened.store.apply(new ApplyPosition(2,3),command(2,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("later"))));
+            assertArrayEquals(outcome,reopened.store.apply(new ApplyPosition(2,4),accepted)); assertArrayEquals(bytes("seed,one,two,later"),reopened.db.get(reopened.handles.get(1),bytes("k")));
+        }
+        try (var follower=new Pool(path.resolve("follower"))) {
+            follower.store.applyNoop(new ApplyPosition(1,0)); follower.store.apply(new ApplyPosition(1,1),command(0,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("seed"))));
+            assertArrayEquals(outcome,follower.store.apply(new ApplyPosition(1,2),DistributedCommandCodec.decode(DistributedCommandCodec.encode(accepted))));
+            assertArrayEquals(bytes("seed,one,two"),follower.db.get(follower.handles.get(1),bytes("k")));
+        }
+    }
+
     private static final class Pool implements AutoCloseable {
         final DBOptions options = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
         final ColumnFamilyOptions plain = new ColumnFamilyOptions();

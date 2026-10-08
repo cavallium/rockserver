@@ -45,6 +45,7 @@ public final class ProposalFootprints {
         @Override public boolean active() { return super.active(); }
     }
     public static final class CandidateLease extends Lease {
+        private boolean submitted;
         private CandidateLease(ProposalFootprints owner,PreparedFootprint footprint,long term,long generation) { super(owner,footprint,term,generation); }
         @Override public long term() { return super.term(); }
         @Override public long generation() { return super.generation(); }
@@ -136,7 +137,11 @@ public final class ProposalFootprints {
         requireOwner(lease); if (!lease.active()) return;
         candidateIndex.remove(lease.footprint()); candidates.remove(lease); account(lease.footprint(),-1); ((Lease)lease).active=false;
     }
-    public void invalidateCandidates() { for (var lease:List.copyOf(candidates)) release(lease); }
+    /** Transfer exclusive ownership to an admitted command; generation loss alone cannot release it. */
+    public void submit(CandidateLease lease) {
+        requireOwner(lease); if (!lease.active()) throw new IllegalStateException("Candidate is no longer active"); lease.submitted=true;
+    }
+    public void invalidateCandidates() { for (var lease:List.copyOf(candidates)) if (!lease.submitted) release(lease); }
     public Stats stats() { return new Stats(ordinary.size(),candidates.size(),spans,bytes); }
     private void require(PreparedFootprint footprint,long term,long generation) {
         if (footprint==null || footprint.owner!=this || term<1 || generation<0) throw new IllegalArgumentException("Foreign footprint or invalid proposal term/generation");

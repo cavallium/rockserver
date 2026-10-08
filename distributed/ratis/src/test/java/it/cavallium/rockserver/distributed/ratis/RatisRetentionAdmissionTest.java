@@ -113,6 +113,9 @@ class RatisRetentionAdmissionTest {
         final AtomicReference<RatisRangeStateMachine.Leadership> leadership=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         final DistributedStoragePool pool; final RaftStorage storage; final ReplicatedRangeStore store; final RatisRangeStateMachine machine;
         Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits) throws Exception {
+            this(root,limits,command -> {});
+        }
+        Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator) throws Exception {
             pool=DistributedStoragePool.open(root.resolve("native"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
             storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT)
                     .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
@@ -123,7 +126,7 @@ class RatisRetentionAdmissionTest {
                 if (method.getName().equals("toString")) return "identity-fixture";
                 throw new AssertionError("Unexpected server access "+method);
             });
-            machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),command -> {},command -> {},limits,leadership::get);
+            machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),validator,command -> {},limits,leadership::get);
             machine.initialize(identity,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
         }
         DistributedCommand put(long sequence) { return new DistributedCommand(groupId,1,new byte[32],new OperationId(session,1,sequence),
@@ -140,6 +143,7 @@ class RatisRetentionAdmissionTest {
         }
         long counter(String name) throws Exception { var field=RatisRangeStateMachine.class.getDeclaredField(name); field.setAccessible(true); return ((Number)field.get(machine)).longValue(); }
         void assertReleased() throws Exception {
+            assertEquals(0,counter("preparedCommitBytes"));
             assertEquals(0,counter("reservedReceiptCount")); assertEquals(0,counter("reservedReceiptBytes"));
             assertEquals(0,counter("dataAdmissions")); assertEquals(0,counter("protectedAdmissions")); assertEquals(0,counter("admittedBytes"));
             var field=RatisRangeStateMachine.class.getDeclaredField("maintenanceReservation"); field.setAccessible(true); assertNull(field.get(machine));

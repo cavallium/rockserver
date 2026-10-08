@@ -1924,3 +1924,88 @@ receipt, bucket and footprint gate passed 21 core and 31 adapter cases (52 total
 zero failures/errors/skips), exit zero:
 `/tmp/rockserver-proposal-recovery-live-owner-green.log`.
 These fixtures do not establish actual Ratis append/quorum or network acceptance.
+
+## Canonical single-group accepted transaction plans
+
+Version 7 adds an immutable `TransactionAcceptance`: the complete declared physical
+scope, snapshot cut, leader generation/incarnation and canonical successful result.
+The envelope retains ordered original mutations, predicates and optional own ACK;
+raw MERGE operands remain operands. The 256 mutation/predicate limit is unchanged;
+scope, operands, audit and result together must fit the 2 MiB envelope. Scope has
+its separate 256-span limit. Every mutation (including tombstone
+bounds) and predicate must fit the declaration. Versions 1–6 retain their encoding
+and receipt identities. Catalogue control validators reject accepted user plans.
+
+`RatisRangeStateMachine.prepareScopedCommit` accepts a tracked native cut after the
+caller's read barrier. It reserves the entire scope, rejects overlapping predecessors
+without draining disjoint work, and reserves operation identity before native
+planning. Planning rechecks history, native owner/lifecycle/schema and session
+eligibility under the apply lane; it freezes the ordered result without writing
+business state. The produced accepted form is validated before publication. A
+conflicted pin retires its physical native ownership through the same deferred
+release path as explicit validation. Successful preparation consumes/closes the
+native cut; the exclusive proposal lease then protects the frozen plan.
+
+The caller must retain/persist the complete v7 command before its first Raft RPC.
+New admission requires the exact leader-local authorized command hash and lease;
+forged, abandoned and stale-owner plans cannot gain new authority. Admission
+atomically transfers that lease into submitted exclusive ownership. Caller close
+then retains submitted ownership, and generation loss does not release possibly
+appended ownership. Apply, verified receipt/recovery or the strictly newer ready
+native-term barrier settles the exact lease. Saved/permanently expired retries need
+no local pin or authorization. Preparation and retained plan payloads share a
+16 MiB byte bound, separate from the existing admitted-payload budget. Each native
+planner reserves the maximum 2 MiB accepted-command size before constructing its
+result, then shrinks to actual retained size. Invalidated planners keep their
+charges and count slots until native planning/close actually returns; logical
+lease invalidation cannot donate that capacity. Rollback/transfer use exact tokens.
+Candidate/ordinary/span budgets still apply.
+
+Session metadata participates in this ordering. In-flight new ACK/floor/authority
+work blocks transaction reservation, including entry-bearing orphan admissions.
+Transaction candidates, including submitted candidates, block new such metadata
+work. A transaction carrying its own ACK requires sole candidate ownership and
+holds metadata exclusivity through apply. Disjoint transactions without ACK and
+ordinary data writes without ACK continue to pipeline. This is deliberately
+conservative for piggyback ACK traffic; per-session metadata footprints remain a
+future optimization.
+
+Native accepted apply performs no ephemeral-history or live predicate validation.
+It deterministically lowers bucket/member effects and evaluates ordered return
+operands, checks that the result equals the frozen canonical result, then installs
+effects, receipt, ACK and completed marker in the existing atomic WAL-enabled batch.
+First effects must follow their audited cut in the accepting log term; saved retry
+receipts can resolve in later terms. A result mismatch fails before effects/marker.
+Generic externally supplied precomputed results remain rejected for accepted plans.
+
+This is an internal server acceptance/replay path. Public transaction handles,
+fresh-barrier RPC capture, durable client integration for accepted bytes,
+read-your-writes staging, TTL/deadline policy and frontend transaction parity remain
+unfinished. Qualified logical range-delete planning still rejects early; physical
+raw tombstone scope encoding is supported. Durable prepared locks/2PC, topology,
+full cursor/bulk/CDC/backup coverage and representative performance acceptance also
+remain open. All replicas must support v7 before use; mixed-version negotiation,
+actual quorum, power-loss and network acceptance remain unverified. No server
+process/network probe was run; the excluded density fixture remains untouched.
+
+Validation: the broad `test-compile surefire:test@default-test` gate passed 142 core,
+19 patched-server and 155 adapter cases (316 total, zero failures/errors/skips),
+exit zero: `/tmp/rockserver-accepted-transaction-final-gate.log`.
+Five new codec cases cover immutable canonical round-trips, legacy preservation,
+whole-scope/result/shape bounds and malformed/truncated inputs. Nine adapter cases
+cover frozen results, disjoint pipelining, metadata exclusion, ABA/phantoms,
+ambiguous cancellation, forged/stale/abandoned plans, identity ownership,
+payload-quota rollback/reopening, retired native-planner charges and early adapter
+validation. Native tests cover
+qualified-shape rejection before publication, foreign pins, no-effect result/term
+mismatch, bucket follower replay, original ordered noncommutative merge operands,
+reopen and saved-result retries without history. The planning conflict-pin leak,
+unsubmitable qualified form and same-ID/disjoint admission regressions failed
+before their fixes in `/tmp/rockserver-accepted-transaction-boundary-red.log` and
+`/tmp/rockserver-accepted-transaction-admission-red.log`; the selected boundary gate
+then passed in `/tmp/rockserver-accepted-transaction-boundary-green.log`.
+A controlled apply-lane barrier reproduced invalidation donating a still-running
+planner's payload charge before the retention fix:
+`/tmp/rockserver-accepted-planner-retention-red.log`. The final broad gate includes
+its corrected ordering. All adapter append contexts remain controlled fixtures,
+not real quorum acceptance.

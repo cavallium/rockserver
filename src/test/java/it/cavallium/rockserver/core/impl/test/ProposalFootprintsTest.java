@@ -104,6 +104,14 @@ class ProposalFootprintsTest {
         }
         ordinary.forEach(index::release); candidates.forEach(index::release); assertEquals(new ProposalFootprints.Stats(0,0,0,0),index.stats());
     }
+    @Test void submittedExclusiveLeaseSurvivesGenerationInvalidationUntilItsExactRelease() {
+        var index=index(); var accepted=index.reserveCandidate(fp(index,point(1)),1,0); var pending=index.reserveCandidate(fp(index,point(2)),1,0);
+        index.submit(accepted); index.submit(accepted); index.invalidateCandidates();
+        assertTrue(accepted.active()); assertFalse(pending.active()); assertEquals(1,index.stats().candidates());
+        assertNull(index.registerOrdinary(fp(index,point(1)),2,1)); assertNull(index.reserveCandidate(fp(index,point(1)),2,1));
+        index.release(accepted); index.release(accepted); assertEquals(new ProposalFootprints.Stats(0,0,0,0),index.stats());
+        assertThrows(IllegalStateException.class,() -> index.submit(accepted)); assertThrows(IllegalArgumentException.class,() -> index().submit(pending));
+    }
     private static void assertAccounting(ProposalFootprints index,List<ProposalFootprints.OrdinaryLease> ordinary,List<ProposalFootprints.CandidateLease> candidates) {
         int owners=0, exclusive=0, count=0; long bytes=0;
         for (var lease:ordinary) if (lease.active()) { owners++; count+=lease.footprint().spans().size(); bytes+=accounted(lease.footprint()); }

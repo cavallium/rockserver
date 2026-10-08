@@ -8,7 +8,7 @@ import java.util.Objects;
 import java.util.List;
 import java.util.UUID;
 
-/** Canonical big-endian v1/v2/v3/v4/v5/v6 encoding; decoded legacy commands retain their original bytes/hash. */
+/** Canonical big-endian v1/v2/v3/v4/v5/v6/v7 encoding; decoded legacy commands retain their original bytes/hash. */
 public final class DistributedCommandCodec {
     public static final int FORMAT_VERSION = 2;
     public static final int MAX_ITEMS = 256;
@@ -26,6 +26,7 @@ public final class DistributedCommandCodec {
         int size = headerBytes(command.formatVersion()) + (command.sessionControl()==null ? 0 : command.sessionControl().encodedSize());
         for (Mutation mutation : command.mutations()) size += mutation.encodedSize();
         for (KeyPredicate predicate : command.predicates()) size += predicate.encodedSize();
+        if (command.acceptance()!=null) size+=4+command.acceptance().encodedSize();
         return size;
     }
 
@@ -38,7 +39,7 @@ public final class DistributedCommandCodec {
         output.putLong(command.operationId().epoch()).putLong(command.operationId().sequence());
         output.putInt(command.mutations().size());
         if (command.formatVersion() >= 2) output.putInt(command.predicates().size());
-        if (command.formatVersion() == 3 || command.formatVersion() == 6) output.putLong(command.acknowledgedThrough());
+        if (command.formatVersion() == 3 || command.formatVersion() == 6 || command.formatVersion() == 7) output.putLong(command.acknowledgedThrough());
         if (command.formatVersion() == 4) output.putLong(command.minimumSessionEpoch());
         if (command.formatVersion() == 5) {
             output.putLong(command.acknowledgedThrough()).putInt(command.sessionControl().encodedSize()).put(command.sessionControl().encode());
@@ -67,6 +68,7 @@ public final class DistributedCommandCodec {
             if (expected != null) output.put(expected);
             if (predicate.bucket()) putMembers(output,predicate.memberKeys());
         }
+        if (command.acceptance()!=null) { output.putInt(command.acceptance().encodedSize()); command.acceptance().encode(output); }
         return output.array();
     }
 
@@ -77,7 +79,7 @@ public final class DistributedCommandCodec {
         }
         ByteBuffer input = ByteBuffer.wrap(encoded);
         int version = input.getInt();
-        if (version < 1 || version > 6) throw new IllegalArgumentException("Unsupported command version");
+        if (version < 1 || version > 7) throw new IllegalArgumentException("Unsupported command version");
         if (encoded.length < headerBytes(version)) throw new IllegalArgumentException("Truncated command header");
         UUID group = getUuid(input);
         long rangeEpoch = input.getLong();
@@ -86,7 +88,7 @@ public final class DistributedCommandCodec {
         OperationId operation = new OperationId(getUuid(input), input.getLong(), input.getLong());
         int count = input.getInt();
         int predicateCount = version >= 2 ? input.getInt() : 0;
-        long acknowledgedThrough = version == 3 || version == 5 || version == 6 ? input.getLong() : -1;
+        long acknowledgedThrough = version == 3 || version == 5 || version == 6 || version == 7 ? input.getLong() : -1;
         long minimumEpoch = version == 4 ? input.getLong() : -1;
         RangeSessionControl control=null;
         if (version == 5) {
@@ -105,8 +107,8 @@ public final class DistributedCommandCodec {
             Mutation.Kind kind = switch (input.get()) {
                 case 1 -> Mutation.Kind.PUT; case 2 -> Mutation.Kind.DELETE;
                 case 3 -> Mutation.Kind.MERGE; case 4 -> Mutation.Kind.DELETE_RANGE;
-                case 5 -> { if (version!=6) throw new IllegalArgumentException("Bucket mutation requires v6"); yield Mutation.Kind.BUCKET_PUT; }
-                case 6 -> { if (version!=6) throw new IllegalArgumentException("Bucket mutation requires v6"); yield Mutation.Kind.BUCKET_DELETE; }
+                case 5 -> { if (version!=6 && version!=7) throw new IllegalArgumentException("Bucket mutation requires v6 or v7"); yield Mutation.Kind.BUCKET_PUT; }
+                case 6 -> { if (version!=6 && version!=7) throw new IllegalArgumentException("Bucket mutation requires v6 or v7"); yield Mutation.Kind.BUCKET_DELETE; }
                 default -> throw new IllegalArgumentException("Unknown mutation kind");
             };
             Mutation.ReturnMode mode = switch (input.get()) {
@@ -144,7 +146,7 @@ public final class DistributedCommandCodec {
         for (int i = 0; i < predicateCount; i++) {
             require(input, 25);
             int predicateKind=input.get() & 255;
-            if (predicateKind!=1 && (predicateKind!=2 || version!=6)) throw new IllegalArgumentException("Unknown predicate kind");
+            if (predicateKind!=1 && (predicateKind!=2 || version!=6 && version!=7)) throw new IllegalArgumentException("Unknown predicate kind");
             UUID column = getUuid(input);
             int keyLength = input.getInt();
             if (keyLength < 0 || keyLength > input.remaining() - 4) {
@@ -167,8 +169,14 @@ public final class DistributedCommandCodec {
                 input.position(memberInput.position()); predicates.add(KeyPredicate.bucketMember(column,key,members,expected));
             } else predicates.add(new KeyPredicate(column, key, expected));
         }
+        TransactionAcceptance acceptance=null;
+        if (version==7) {
+            require(input,4); int length=input.getInt();
+            if (length<1 || length>MAX_ENCODED_BYTES || length!=input.remaining()) throw new IllegalArgumentException("Invalid transaction acceptance trailer length");
+            acceptance=TransactionAcceptance.decode(input.slice()); input.position(input.limit());
+        }
         if (input.hasRemaining()) throw new IllegalArgumentException("Trailing command bytes");
-        return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates, acknowledgedThrough, minimumEpoch, control);
+        return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates, acknowledgedThrough, minimumEpoch, control,acceptance);
     }
 
     static byte[] digest(DistributedCommand command) {

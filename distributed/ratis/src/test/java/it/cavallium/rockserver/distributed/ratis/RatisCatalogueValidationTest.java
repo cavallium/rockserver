@@ -41,6 +41,15 @@ class RatisCatalogueValidationTest {
         assertDoesNotThrow(() -> validate.accept(command(null, initial)));
         assertDoesNotThrow(() -> validate.accept(command(initial, RangeDirectoryCodec.encode(directory(cluster, 1)))));
     }
+    @Test void acceptedUserPlansCannotBypassCataloguePredicates() {
+        var base=command(null,RangeDirectoryCodec.encode(directory(cluster,0)));
+        var audit=new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1),
+                new TransactionScope(List.of(TransactionScope.Span.point(column,key))),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
+        var accepted=DistributedCommand.acceptedTransaction(base,audit);
+        assertThrows(IllegalArgumentException.class,() -> validate.accept(accepted));
+        var epochs=RatisSessionEpochs.validator(cluster,database,group,1,new byte[32],column);
+        assertThrows(IllegalArgumentException.class,() -> epochs.accept(accepted));
+    }
     @Test void foreignIdentityGenerationSkipsAndSchemaChangesAreRejected() {
         byte[] initial = RangeDirectoryCodec.encode(directory(cluster, 0));
         assertThrows(IllegalArgumentException.class, () -> validate.accept(command(null, RangeDirectoryCodec.encode(directory(UUID.randomUUID(), 0)))));
