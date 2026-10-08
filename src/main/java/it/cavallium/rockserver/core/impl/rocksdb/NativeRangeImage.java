@@ -3,6 +3,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
+import it.cavallium.rockserver.core.common.distributed.CommittedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RangeMutationHistory;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
@@ -321,6 +322,7 @@ public final class NativeRangeImage {
         private int sessionBindings;
         private final List<PreparedParticipant> prepared=new ArrayList<>();
         private final Map<UUID,AbortedParticipant> aborted=new HashMap<>();
+        private final Map<UUID,CommittedParticipant> committed=new HashMap<>();
         private long preparedBytes,preparedScopeBytes;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
 
@@ -381,7 +383,7 @@ public final class NativeRangeImage {
                         }
                         for (var mutation:plan.mutations()) if (mutation.kind()==Mutation.Kind.MERGE && !header.mergeColumns().contains(mutation.columnId())) throw new IOException("Prepared image merge operator is unavailable");
                         for (var old:prepared) if (old.preparation().sharesOperation(preparation)) throw new IOException("Prepared image identities/scopes overlap");
-                        preparedBytes+=key.length+(long)value.length+ReplicatedRangeStore.ABORT_RESERVATION; preparedScopeBytes+=RangeMutationHistory.accountedScopeBytes(scope);
+                        preparedBytes+=key.length+(long)value.length+ReplicatedRangeStore.FINALIZATION_RESERVATION; preparedScopeBytes+=RangeMutationHistory.accountedScopeBytes(scope);
                         if (prepared.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES || preparedScopeBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Prepared image capacity exceeded");
                         prepared.add(record);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid prepared image record",invalid); }
@@ -397,6 +399,16 @@ public final class NativeRangeImage {
                         if (aborted.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("ABORT image count exceeded");
                         aborted.put(finalization.transactionId(),abort);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid ABORT image record",invalid); }
+                }
+                if (section==Section.STATE && key.length>16 && key[16]==0x22) {
+                    try {
+                        var commit=CommittedParticipant.decode(value); var finalization=commit.finalization(); var participant=finalization.participant();
+                        byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x22).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
+                        if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
+                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !finalization.decision().domainId().equals(header.interval().domainId())
+                                || commit.position().index()>header.position().index() || commit.position().term()>header.position().term()) throw new IOException("COMMIT image identity/cut differs");
+                        if (committed.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("COMMIT image count exceeded"); committed.put(finalization.transactionId(),commit);
+                    } catch (IllegalArgumentException invalid) { throw new IOException("Invalid COMMIT image record",invalid); }
                 }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
                     throw new IOException("Image contains unsupported receipt accounting metadata");
@@ -435,6 +447,7 @@ public final class NativeRangeImage {
                         throw new IOException("Invalid image receipt row");
                     }
                     var receipt=ByteBuffer.wrap(key); receipt.position(16); var id=new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(receipt.getLong(),receipt.getLong()),receipt.getLong(),receipt.getLong());
+                    for (var commit:committed.values()) if (commit.ownsOperation(id)) throw new IOException("COMMIT image identity also has ordinary receipt");
                     for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("ABORT image identity also has ordinary receipt");
                     receiptCount = addUsage(receiptCount, 1);
                     receiptBytes = addUsage(receiptBytes, (long) key.length + value.length);
@@ -487,15 +500,23 @@ public final class NativeRangeImage {
             for (var record:prepared) {
                 var abort=aborted.get(record.preparation().transactionId());
                 if (abort!=null) { try { abort.finalization().requirePrepared(record); if (abort.negative()!=null) throw new IllegalArgumentException("Positive/negative evidence coexist"); } catch (IllegalArgumentException invalid) { throw new IOException("ABORT/preparation binding differs",invalid); } }
-                else for (var other:prepared) if (other!=record && !aborted.containsKey(other.preparation().transactionId()) && other.preparation().scope().intersects(record.preparation().scope())) throw new IOException("Active prepared image scopes overlap");
+                else if (!committed.containsKey(record.preparation().transactionId())) for (var other:prepared) if (other!=record && !committed.containsKey(other.preparation().transactionId()) && !aborted.containsKey(other.preparation().transactionId()) && other.preparation().scope().intersects(record.preparation().scope())) throw new IOException("Active prepared image scopes overlap");
             }
             for (var abort:aborted.values()) {
                 if (abort.finalization().participant().prepared()!=null && prepared.stream().noneMatch(p -> p.preparation().transactionId().equals(abort.finalization().transactionId()))) throw new IOException("ABORT image vote lacks native preparation");
                 for (var p:prepared) if (!p.preparation().transactionId().equals(abort.finalization().transactionId()) && (abort.ownsOperation(p.preparation().operation()) || abort.ownsOperation(p.preparation().business().operationId()))) throw new IOException("ABORT/preparation image identity reused");
                 for (var other:aborted.values()) if (other!=abort && (other.ownsOperation(abort.finalization().operation()) || other.ownsOperation(abort.finalization().decision().operation()) || abort.negative()!=null && other.ownsOperation(abort.negative().operation()))) throw new IOException("ABORT image identity reused");
             }
+            for (var commit:committed.values()) {
+                var id=commit.finalization().transactionId(); if (aborted.containsKey(id)) throw new IOException("COMMIT and ABORT image decisions coexist");
+                var preparation=prepared.stream().filter(p -> p.preparation().transactionId().equals(id)).findFirst().orElseThrow(() -> new IOException("COMMIT image has no retained preparation"));
+                try { commit.finalization().requirePrepared(preparation); } catch (IllegalArgumentException invalid) { throw new IOException("COMMIT image preparation differs",invalid); }
+                for (var p:prepared) if (p!=preparation && (commit.ownsOperation(p.preparation().operation()) || commit.ownsOperation(p.preparation().business().operationId()))) throw new IOException("COMMIT/preparation image identity reused");
+                for (var abort:aborted.values()) if (abort.ownsOperation(commit.finalization().operation()) || abort.ownsOperation(commit.finalization().decision().operation())) throw new IOException("COMMIT/ABORT image identity reused");
+                for (var other:committed.values()) if (other!=commit && (other.ownsOperation(commit.finalization().operation()) || other.ownsOperation(commit.finalization().decision().operation()))) throw new IOException("COMMIT image identity reused");
+            }
             for (var id:aborted.keySet()) if (prepared.stream().noneMatch(p -> p.preparation().transactionId().equals(id))) terminalOnly++;
-            if (prepared.size()+terminalOnly>ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes+terminalOnly*ReplicatedRangeStore.ABORT_RESERVATION>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Participant image capacity exceeded");
+            if (prepared.size()+terminalOnly>ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes+terminalOnly*ReplicatedRangeStore.FINALIZATION_RESERVATION>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Participant image capacity exceeded");
 
             if (sessionAuthority != null && sessionAuthority.minimumEpoch() > epochFloor) {
                 throw new IOException("Image range session authority exceeds coarse epoch floor");

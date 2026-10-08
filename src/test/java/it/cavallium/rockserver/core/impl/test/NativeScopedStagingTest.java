@@ -109,10 +109,10 @@ class NativeScopedStagingTest {
     }
     @Test void orderedNativeMergesReadTheirSnapshotBaseAndRemainOperandsAtCommit() throws Exception {
         RocksDB.loadLibrary(); UUID column=new UUID(0,1),group=new UUID(0,2),domain=new UUID(0,3),session=new UUID(0,4);
-        for (boolean ranges:new boolean[]{false,true}) try (var operator=new StringAppendOperator(","); var cf=new ColumnFamilyOptions().setMergeOperator(operator);
+        for (boolean finalize:new boolean[]{false,true}) for (boolean ranges:new boolean[]{false,true}) try (var operator=new StringAppendOperator(","); var cf=new ColumnFamilyOptions().setMergeOperator(operator);
              var plain=new ColumnFamilyOptions(); var options=new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true)) {
             var handles=new ArrayList<ColumnFamilyHandle>();
-            try (var db=RocksDB.open(options,root.resolve("merge-"+ranges).toString(),List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY,plain),
+            try (var db=RocksDB.open(options,root.resolve("merge-"+ranges+"-"+finalize).toString(),List.of(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY,plain),
                     new ColumnFamilyDescriptor(key(1),cf),new ColumnFamilyDescriptor(key(2),plain),new ColumnFamilyDescriptor(key(3),plain)),handles)) {
                 try {
                     var ownership=new RangeOwnership(); var owner=new RangeOwnership.Owner(group,1);
@@ -137,7 +137,14 @@ class NativeScopedStagingTest {
                         var page=stage.page(column,key(1),key(3),false,null,4,1024);
                         assertEquals(2,page.rows().size()); assertEquals(expected,new String(page.rows().getFirst().value(),StandardCharsets.UTF_8));
                         var accepted=store.planScopedCommit(pin,base,0,new UUID(0,9)); assertEquals(base.mutations(),accepted.mutations());
-                        assertArrayEquals(stage.result().encode(),store.apply(new ApplyPosition(1,2),accepted));
+                        if (finalize) {
+                            var registration=TransactionStatus.begin(new UUID(0,10),new UUID(0,11),domain,new UUID(0,12),base.operationId(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(group,group,1,new byte[32],accepted.payloadDigest(),null,false)));
+                            var preparation=new PreparedParticipant.Preparation(new UUID(0,13),1,new OperationId(new UUID(0,14),1,0),registration,accepted);
+                            var vote=store.applyPrepared(new ApplyPosition(1,2),preparation); var decision=registration.prepared(group,accepted.payloadDigest(),vote.position()).decide(TransactionStatus.Phase.COMMIT);
+                            var intent=new ParticipantFinalization(preparation.homeGroup(),1,group,new OperationId(new UUID(0,15),2,0),decision);
+                            var receipt=store.applyCommit(new ApplyPosition(2,3),intent); assertArrayEquals(stage.result().encode(),store.committedResult(registration.transactionId(),accepted.payloadDigest()));
+                            assertEquals(receipt,store.applyCommit(new ApplyPosition(2,4),intent));
+                        } else assertArrayEquals(stage.result().encode(),store.apply(new ApplyPosition(1,2),accepted));
                         try (var current=store.capture()) { assertEquals(expected,new String(current.get(column,key(1)),StandardCharsets.UTF_8)); }
                     }
                     assertTrue(store.close(Duration.ZERO));

@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
 import it.cavallium.rockserver.core.common.distributed.ParticipantFinalization;
 import it.cavallium.rockserver.core.common.distributed.ParticipantVote;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
+import it.cavallium.rockserver.core.common.distributed.CommittedParticipant;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
 import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
@@ -72,7 +73,8 @@ public final class ReplicatedRangeStore {
     }
     private volatile PreparedIndex preparedIndex=PreparedIndex.empty();
     private volatile Map<UUID,AbortedParticipant> abortedIndex=Map.of();
-    public static final long ABORT_RESERVATION=33L+AbortedParticipant.MAX_BYTES;
+    private volatile Map<UUID,CommittedParticipant> committedIndex=Map.of();
+    public static final long FINALIZATION_RESERVATION=33L+AbortedParticipant.MAX_BYTES;
     private volatile DistributedSchema logicalSchema;
     private RangeMutationHistory scopedHistory;
     private RangeMutationHistory.Limits scopedLimits;
@@ -155,7 +157,7 @@ public final class ReplicatedRangeStore {
         } else {
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            abortedIndex=loadAbortedIndex(); preparedIndex=loadPreparedIndex(); validateAbortedIndex();
+            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex();
         }
     }
 
@@ -230,7 +232,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
-            abortedIndex=loadAbortedIndex(); preparedIndex=loadPreparedIndex(); validateAbortedIndex();
+            abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -378,12 +380,90 @@ public final class ReplicatedRangeStore {
         if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command);
     }
 
+    private boolean isFinalized(UUID transaction) { return abortedIndex.containsKey(transaction) || committedIndex.containsKey(transaction); }
+    private byte[] committedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x22).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
+    private Map<UUID,CommittedParticipant> loadCommittedIndex() {
+        var records=new HashMap<UUID,CommittedParticipant>();
+        try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x22).array());
+             var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x23).array());
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+            iterator.seekToFirst(); byte[] sizing=new byte[0];
+            while (iterator.isValid()) {
+                if (records.size()>=MAX_PREPARED_PARTICIPANTS || iterator.key(sizing)!=33 || iterator.value(sizing)>CommittedParticipant.MAX_BYTES) throw new IllegalStateException("COMMIT recovery bound exceeded");
+                var record=CommittedParticipant.decode(iterator.value()); requireFinalization(record.finalization()); var id=record.finalization().transactionId();
+                if (!Arrays.equals(iterator.key(),committedKey(id)) || applied==null || record.position().index()>applied.index() || record.position().term()>applied.term()) throw new IllegalStateException("COMMIT receipt differs from completed cut");
+                records.put(id,record); iterator.next();
+            }
+            iterator.status(); return Map.copyOf(records);
+        } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover COMMIT receipts",failure); }
+    }
+    private void validateCommittedIndex() {
+        for (var commit:committedIndex.values()) {
+            var id=commit.finalization().transactionId(); if (abortedIndex.containsKey(id)) throw new IllegalArgumentException("COMMIT and ABORT coexist");
+            var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(id)).findFirst().orElseThrow(() -> new IllegalArgumentException("COMMIT has no retained preparation"));
+            commit.finalization().requirePrepared(prepared);
+            for (var p:preparedIndex.records()) if (p!=prepared && (commit.ownsOperation(p.preparation().operation()) || commit.ownsOperation(p.preparation().business().operationId()))) throw new IllegalArgumentException("COMMIT/preparation identity reused");
+            for (var abort:abortedIndex.values()) if (abort.ownsOperation(commit.finalization().operation()) || abort.ownsOperation(commit.finalization().decision().operation())) throw new IllegalArgumentException("COMMIT/ABORT identity reused");
+            for (var other:committedIndex.values()) if (other!=commit && (other.ownsOperation(commit.finalization().operation()) || other.ownsOperation(commit.finalization().decision().operation()))) throw new IllegalArgumentException("COMMIT identity reused");
+        }
+    }
+    /** Trusted committed COMMIT seam. Recovery does not depend on the original business grant remaining live. */
+    public CommittedParticipant applyCommit(ApplyPosition position,ParticipantFinalization finalization) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(finalization); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage(); var candidate=new CommittedParticipant(finalization,position); requireFinalization(finalization);
+            if (abortedIndex.containsKey(finalization.transactionId())) throw new IllegalArgumentException("ABORT decision cannot become COMMIT");
+            var saved=committedIndex.get(finalization.transactionId());
+            if (saved!=null && !saved.finalization().equals(finalization)) throw new IllegalArgumentException("COMMIT intent changed");
+            var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(finalization.transactionId())).findFirst().orElseThrow(() -> new IllegalStateException("COMMIT requires native preparation"));
+            finalization.requirePrepared(prepared);
+            if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied COMMIT lacks its receipt"); return saved; }
+            requireNext(position);
+            Evaluation evaluation=null;
+            if (saved==null) {
+                for (var p:preparedIndex.records()) if (p!=prepared && p.preparation().ownsOperation(finalization.operation())) throw new IllegalArgumentException("COMMIT recovery identity belongs to another prepare");
+                for (var abort:abortedIndex.values()) if (abort.ownsOperation(finalization.operation())) throw new IllegalArgumentException("COMMIT recovery identity belongs to ABORT");
+                for (var other:committedIndex.values()) if (other.ownsOperation(finalization.operation())) throw new IllegalArgumentException("COMMIT recovery identity reused");
+                if (db.get(receipts,receiptKey(finalization.operation()))!=null || db.get(receipts,receiptKey(prepared.preparation().business().operationId()))!=null) throw new IllegalArgumentException("COMMIT identity already has an ordinary receipt");
+                evaluation=evaluate(prepared.preparation().business());
+                if (!Arrays.equals(evaluation.result().encode(),prepared.preparation().business().acceptance().result()) || evaluation.result().status()!=CommandResult.Status.SUCCESS) throw new IllegalStateException("COMMIT effects disagree with prepared result");
+            }
+            var effects=evaluation==null ? List.<Mutation>of() : evaluation.effects(); var buckets=evaluation==null ? Map.<BucketKey,DistributedBucket>of() : evaluation.buckets();
+            var history=prepareScopedWrites(saved==null,effects,buckets); var result=saved==null ? candidate : saved;
+            var next=new HashMap<>(committedIndex); next.put(finalization.transactionId(),result); var published=Map.copyOf(next);
+            try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                for (var mutation:effects) {
+                    var cf=columns.get(mutation.columnId());
+                    switch (mutation.kind()) {
+                        case PUT -> batch.put(cf,mutation.key(),mutation.value()); case DELETE -> batch.delete(cf,mutation.key());
+                        case MERGE -> batch.merge(cf,mutation.key(),mutation.value()); case DELETE_RANGE -> batch.deleteRange(cf,mutation.key(),mutation.value());
+                        case BUCKET_PUT, BUCKET_DELETE -> throw new IllegalStateException("Unlowered bucket finalization effect");
+                    }
+                }
+                for (var entry:buckets.entrySet()) batch.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
+                batch.put(state,committedKey(finalization.transactionId()),result.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            committedIndex=published; publishScoped(position,history,false); applied=position; return result;
+        } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
+        finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    public CommittedParticipant committedParticipant(UUID transaction) { enterNative(); applyLane.lock(); try { requireActive(); return committedIndex.get(transaction); } finally { applyLane.unlock(); leaveNative(); } }
+    /** Retained business result is independent of ordinary receipt/session GC. */
+    public byte[] committedResult(UUID transaction,byte[] acceptedPlanDigest) {
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); var commit=committedIndex.get(transaction); if (commit==null) return null;
+            var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(transaction)).findFirst().orElseThrow(() -> new IllegalStateException("COMMIT plan missing"));
+            if (!Arrays.equals(prepared.preparation().business().payloadDigest(),acceptedPlanDigest)) throw new IllegalArgumentException("COMMIT result plan changed"); return commit.result(prepared);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     private byte[] abortedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x21).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
-    private void requireAbort(AbortedParticipant record) {
-        var decision=record.finalization(); var participant=decision.participant();
+    private void requireAbort(AbortedParticipant record) { requireFinalization(record.finalization()); }
+    private void requireFinalization(ParticipantFinalization decision) {
+        var participant=decision.participant();
         if (!decision.participantGroup().equals(owner.groupId()) || participant.rangeEpoch()!=owner.epoch() || !Arrays.equals(participant.schemaDigest(),schemaDigest)
-                || !decision.decision().domainId().equals(interval.domainId())) throw new IllegalArgumentException("ABORT fence differs from range");
-        if (logicalSchema!=null && (!logicalSchema.clusterId().equals(decision.decision().clusterId()) || !logicalSchema.databaseId().equals(decision.decision().databaseId()))) throw new IllegalArgumentException("ABORT database differs from schema");
+                || !decision.decision().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Finalization differs from range");
+        if (logicalSchema!=null && (!logicalSchema.clusterId().equals(decision.decision().clusterId()) || !logicalSchema.databaseId().equals(decision.decision().databaseId()))) throw new IllegalArgumentException("Finalization database differs from schema");
     }
     private Map<UUID,AbortedParticipant> loadAbortedIndex() {
         var records=new HashMap<UUID,AbortedParticipant>();
@@ -403,6 +483,7 @@ public final class ReplicatedRangeStore {
     }
     private void requireNegativeIdentity(PreparedParticipant.Preparation preparation) throws RocksDBException {
         for (var old:preparedIndex.records()) if (old.preparation().sharesOperation(preparation)) throw new IllegalArgumentException("Negative prepare identity belongs to an existing prepare");
+        for (var commit:committedIndex.values()) if (!commit.finalization().transactionId().equals(preparation.transactionId()) && (commit.ownsOperation(preparation.operation()) || commit.ownsOperation(preparation.business().operationId()))) throw new IllegalArgumentException("Prepared identity belongs to COMMIT receipt");
         for (var abort:abortedIndex.values()) if (!abort.finalization().transactionId().equals(preparation.transactionId()) && (abortOwns(abort,preparation.operation()) || abortOwns(abort,preparation.business().operationId()))) throw new IllegalArgumentException("Negative prepare identity belongs to another ABORT");
         if (db.get(receipts,receiptKey(preparation.operation()))!=null || db.get(receipts,receiptKey(preparation.business().operationId()))!=null) throw new IllegalArgumentException("Negative prepare identity already has a receipt");
     }
@@ -422,14 +503,14 @@ public final class ReplicatedRangeStore {
     }
     private PreparedCapacity preparedCapacityUnderLane() {
         int count=preparedIndex.records().size(); long bytes=preparedIndex.bytes();
-        for (var abort:abortedIndex.values()) if (preparedIndex.records().stream().noneMatch(p -> p.preparation().transactionId().equals(abort.finalization().transactionId()))) { count++; bytes+=ABORT_RESERVATION; }
+        for (var abort:abortedIndex.values()) if (preparedIndex.records().stream().noneMatch(p -> p.preparation().transactionId().equals(abort.finalization().transactionId()))) { count++; bytes+=FINALIZATION_RESERVATION; }
         return new PreparedCapacity(applied,count,bytes,preparedIndex.scopeBytes());
     }
     /** Trusted committed ABORT seam. Its adapter must verify fresh home authority and retain proposal ownership through return. */
     public AbortedParticipant applyAbort(ApplyPosition position,ParticipantFinalization finalization) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(finalization); enterNative(); applyLane.lock();
         try {
-            requireActive(); ensureReceiptUsage(); var candidate=new AbortedParticipant(finalization,position,null); requireAbort(candidate);
+            requireActive(); ensureReceiptUsage(); if (committedIndex.containsKey(finalization.transactionId())) throw new IllegalArgumentException("COMMIT decision cannot become ABORT"); var candidate=new AbortedParticipant(finalization,position,null); requireAbort(candidate);
             var saved=abortedIndex.get(finalization.transactionId());
             if (saved!=null && (!saved.finalization().operation().equals(finalization.operation()) || !Arrays.equals(saved.finalization().decisionDigest(),finalization.decisionDigest()))) throw new IllegalArgumentException("Participant decision changed");
             if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied ABORT lacks its fence"); return saved; }
@@ -440,11 +521,12 @@ public final class ReplicatedRangeStore {
                     if (record.preparation().transactionId().equals(finalization.transactionId())) { finalization.requirePrepared(record); prepared=true; }
                     else if (record.preparation().ownsOperation(finalization.operation()) || record.preparation().ownsOperation(finalization.decision().operation())) throw new IllegalArgumentException("ABORT identity belongs to another prepare");
                 }
+                for (var commit:committedIndex.values()) if (commit.ownsOperation(finalization.operation()) || commit.ownsOperation(finalization.decision().operation())) throw new IllegalArgumentException("ABORT identity belongs to COMMIT receipt");
                 for (var abort:abortedIndex.values()) if (abortOwns(abort,finalization.operation()) || abortOwns(abort,finalization.decision().operation())) throw new IllegalArgumentException("ABORT operation identity reused");
                 if (db.get(receipts,receiptKey(finalization.operation()))!=null || db.get(receipts,receiptKey(finalization.decision().operation()))!=null) throw new IllegalArgumentException("ABORT identity already has a receipt");
                 if (!prepared && finalization.participant().prepared()!=null) throw new IllegalStateException("Home reports missing native prepare evidence");
                 var capacity=preparedCapacityUnderLane();
-                if (!prepared && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || ABORT_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("ABORT fence capacity exhausted");
+                if (!prepared && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("ABORT fence capacity exhausted");
             }
             var result=saved==null ? candidate : saved; var next=new HashMap<>(abortedIndex); next.put(finalization.transactionId(),result);
             publishAbort(position,result); abortedIndex=Map.copyOf(next); return result;
@@ -468,12 +550,13 @@ public final class ReplicatedRangeStore {
         var preparation=value.preparation();
         for (var old:index.records()) {
             if (old.preparation().transactionId().equals(preparation.transactionId()) || old.preparation().sharesOperation(preparation)) throw new IllegalArgumentException("Prepared transaction or operation identity reused");
-            if (!abortedIndex.containsKey(preparation.transactionId()) && !abortedIndex.containsKey(old.preparation().transactionId()) && old.preparation().scope().intersects(preparation.scope())) throw new IllegalStateException("Transaction overlaps durable prepared scope");
+            if (!isFinalized(preparation.transactionId()) && !isFinalized(old.preparation().transactionId()) && old.preparation().scope().intersects(preparation.scope())) throw new IllegalStateException("Transaction overlaps durable prepared scope");
         }
+        for (var commit:committedIndex.values()) if (!commit.finalization().transactionId().equals(preparation.transactionId()) && (commit.ownsOperation(preparation.operation()) || commit.ownsOperation(preparation.business().operationId()))) throw new IllegalArgumentException("Prepared identity belongs to COMMIT receipt");
         for (var abort:abortedIndex.values()) if (!abort.finalization().transactionId().equals(preparation.transactionId()) && (abortOwns(abort,preparation.operation()) || abortOwns(abort,preparation.business().operationId()))) throw new IllegalArgumentException("Prepared identity belongs to ABORT fence");
         long terminalOnly=abortedIndex.keySet().stream().filter(id -> !id.equals(preparation.transactionId()) && index.records().stream().noneMatch(p -> p.preparation().transactionId().equals(id))).count();
-        long bytes=index.bytes()+33L+value.encode().length+ABORT_RESERVATION, scope=index.scopeBytes()+RangeMutationHistory.accountedScopeBytes(preparation.scope());
-        if (index.records().size()+terminalOnly>=MAX_PREPARED_PARTICIPANTS || bytes+terminalOnly*ABORT_RESERVATION>MAX_PREPARED_BYTES || scope>MAX_PREPARED_BYTES) throw new IllegalStateException("Durable prepared capacity exhausted");
+        long bytes=index.bytes()+33L+value.encode().length+FINALIZATION_RESERVATION, scope=index.scopeBytes()+RangeMutationHistory.accountedScopeBytes(preparation.scope());
+        if (index.records().size()+terminalOnly>=MAX_PREPARED_PARTICIPANTS || bytes+terminalOnly*FINALIZATION_RESERVATION>MAX_PREPARED_BYTES || scope>MAX_PREPARED_BYTES) throw new IllegalStateException("Durable prepared capacity exhausted");
         var records=new ArrayList<>(index.records()); records.add(value); return new PreparedIndex(List.copyOf(records),bytes,scope);
     }
     private PreparedIndex loadPreparedIndex() {
@@ -493,9 +576,10 @@ public final class ReplicatedRangeStore {
         } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover durable prepared scopes",failure); }
     }
     private void requireUnlocked(TransactionScope scope) {
-        for (var record:preparedIndex.records()) if (!abortedIndex.containsKey(record.preparation().transactionId()) && record.preparation().scope().intersects(scope)) throw new IllegalStateException("Access overlaps durable prepared transaction");
+        for (var record:preparedIndex.records()) if (!isFinalized(record.preparation().transactionId()) && record.preparation().scope().intersects(scope)) throw new IllegalStateException("Access overlaps durable prepared transaction");
     }
     private void requireUnlocked(DistributedCommand command) {
+        for (var commit:committedIndex.values()) if (commit.ownsOperation(command.operationId())) throw new IllegalArgumentException("Operation identity belongs to COMMIT receipt");
         for (var abort:abortedIndex.values()) if (abortOwns(abort,command.operationId())) throw new IllegalArgumentException("Operation identity belongs to durable ABORT fence");
         for (var record:preparedIndex.records()) if (record.preparation().ownsOperation(command.operationId())) throw new IllegalArgumentException("Operation identity is owned by durable preparation");
         if (command.acceptance()!=null) { requireUnlocked(command.acceptance().scope()); return; }
