@@ -13,7 +13,7 @@ import java.util.UUID;
 /** The current bounded query protocol for data and catalogue groups. */
 public final class ScopedTransactionRpc {
     public static final int MAGIC = 0x52535458, HEADER_BYTES = 12, HANDLE_BYTES = 56;
-    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22;
+    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22, SNAPSHOT_OWNER = 30, SNAPSHOT_GET = 31, SNAPSHOT_PAGE = 32, SNAPSHOT_RELEASE = 33;
     // A legal physical page continuation can exceed an atomic command's 2 MiB bound.
     public static final int MAX_REQUEST_BYTES = PhysicalRangePage.MAX_BYTES + 128;
     public static final int MAX_REPLY_BYTES = PhysicalRangePage.MAX_BYTES + 128;
@@ -59,19 +59,16 @@ public final class ScopedTransactionRpc {
                 .putInt(kind).putInt(body.length).put(body).array();
     }
 
-    public static Packet parse(byte[] encoded, int maxBytes) {
+    public static int kind(byte[] encoded,int maxBytes) {
         Objects.requireNonNull(encoded);
-        if (maxBytes < HEADER_BYTES || maxBytes > MAX_REPLY_BYTES || encoded.length > maxBytes) {
-            throw invalid("Invalid frame budget");
-        }
-        var input = ByteBuffer.wrap(encoded);
-        require(input, HEADER_BYTES);
-        if (input.getInt() != MAGIC) throw invalid("Unsupported read frame");
-        int kind = input.getInt(), length = input.getInt();
-        requireKind(kind);
-        if (length < 0 || length != input.remaining()) throw invalid("Invalid frame body length");
-        byte[] body = new byte[length]; input.get(body);
-        return new Packet(kind, body);
+        if (maxBytes<HEADER_BYTES || maxBytes>MAX_REPLY_BYTES || encoded.length>maxBytes) throw invalid("Invalid frame budget");
+        var input=ByteBuffer.wrap(encoded); require(input,HEADER_BYTES);
+        if (input.getInt()!=MAGIC) throw invalid("Unsupported read frame");
+        int kind=input.getInt(),length=input.getInt(); requireKind(kind);
+        if (length<0 || length!=input.remaining()) throw invalid("Invalid frame body length"); return kind;
+    }
+    public static Packet parse(byte[] encoded,int maxBytes) {
+        int kind=kind(encoded,maxBytes); byte[] body=Arrays.copyOfRange(encoded,HEADER_BYTES,encoded.length); return new Packet(kind,body);
     }
 
     public static void writeHandle(ByteBuffer output, Handle handle) {
@@ -89,6 +86,36 @@ public final class ScopedTransactionRpc {
 
     public static UUID uuid(ByteBuffer input) {
         require(input, 16); return new UUID(input.getLong(), input.getLong());
+    }
+
+    public record SnapshotBinding(java.util.UUID fenceId,byte[] digest) {
+        public SnapshotBinding { Objects.requireNonNull(fenceId); Objects.requireNonNull(digest); if (digest.length!=32) throw invalid("Invalid snapshot binding digest"); digest=digest.clone(); }
+        @Override public byte[] digest() { return digest.clone(); }
+        @Override public boolean equals(Object other) { return other instanceof SnapshotBinding binding && fenceId.equals(binding.fenceId) && Arrays.equals(digest,binding.digest); }
+        @Override public int hashCode() { return Objects.hash(fenceId,Arrays.hashCode(digest)); }
+    }
+    public static void snapshotBinding(ByteBuffer output,SnapshotBinding binding) { uuid(output,binding.fenceId()); output.put(binding.digest()); }
+    public static SnapshotBinding snapshotBinding(ByteBuffer input) { require(input,48); var id=uuid(input); byte[] digest=new byte[32]; input.get(digest); return new SnapshotBinding(id,digest); }
+    public static final int SNAPSHOT_TOKEN_BYTES=48;
+    public static boolean pinnedSnapshot(int kind) { return kind==SNAPSHOT_GET || kind==SNAPSHOT_PAGE || kind==SNAPSHOT_RELEASE; }
+    public static void snapshotToken(ByteBuffer output,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture token) {
+        uuid(output,token.ownerIncarnation()); uuid(output,token.snapshotId()); output.putLong(token.position().term()).putLong(token.position().index());
+    }
+    public static it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture snapshotToken(ByteBuffer input) {
+        require(input,SNAPSHOT_TOKEN_BYTES);
+        return new it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture(uuid(input),uuid(input),new ApplyPosition(input.getLong(),input.getLong()));
+    }
+    /** A null payload is explicit SNAPSHOT_LOST; a successful RELEASE has an empty payload. */
+    public static byte[] snapshotReply(SnapshotBinding binding,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture token,byte[] payload) {
+        int size=48+SNAPSHOT_TOKEN_BYTES+1+(payload==null ? 0 : payload.length);
+        if (size>MAX_REPLY_BYTES-HEADER_BYTES) throw invalid("Snapshot reply exceeds bound");
+        var output=ByteBuffer.allocate(size); snapshotBinding(output,binding); snapshotToken(output,token); output.put((byte)(payload==null ? 1 : 0)); if (payload!=null) output.put(payload); return output.array();
+    }
+    public static byte[] snapshotPayload(byte[] bytes,SnapshotBinding expectedBinding,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture expected) throws RatisSnapshotLostException {
+        var input=ByteBuffer.wrap(bytes); var binding=snapshotBinding(input); var token=snapshotToken(input); require(input,1); int lost=input.get() & 255;
+        if (!binding.equals(expectedBinding) || !token.equals(expected) || lost>1 || lost==1 && input.hasRemaining()) throw invalid("Snapshot reply token/status changed");
+        if (lost==1) throw new RatisSnapshotLostException("Historical pin unavailable on its owner");
+        byte[] payload=new byte[input.remaining()]; input.get(payload); return payload;
     }
 
     public static void uuid(ByteBuffer output, UUID id) {
@@ -218,7 +245,7 @@ public final class ScopedTransactionRpc {
         return Arrays.compareUnsigned(left, right);
     }
     private static void requireKind(int kind) {
-        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE) {
+        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_OWNER && !pinnedSnapshot(kind)) {
             throw invalid("Unknown read frame kind");
         }
     }

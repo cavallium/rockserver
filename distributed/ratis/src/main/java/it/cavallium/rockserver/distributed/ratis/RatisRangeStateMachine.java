@@ -1683,7 +1683,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
-            if (ScopedTransactionRpc.parse(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
+            int kind=ScopedTransactionRpc.kind(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES);
+            if (ScopedTransactionRpc.pinnedSnapshot(kind)) {
+                if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
+                return query(request);
+            }
+            if (kind>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
                 if (minIndex > getLastAppliedTermIndex().getIndex()) throw new IllegalStateException("Requested read index has not completed");
@@ -1698,8 +1703,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> queryLinearizable(Message request) { return query(request,true); }
     private CompletableFuture<Message> query(Message request,boolean freshBarrier) {
         try {
-            requireHealthy();
             byte[] encoded = request.getContent().toByteArray();
+            int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+            if (!ScopedTransactionRpc.pinnedSnapshot(kind)) requireHealthy();
             return CompletableFuture.completedFuture(framedQuery(encoded,freshBarrier));
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
@@ -1757,6 +1763,28 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (!freshBarrier) throw new IOException("Snapshot gate state requires a fresh linearizable barrier");
                 var id=ScopedTransactionRpc.uuid(input); end(input); checkTransactionOwner(); var record=store.snapshotGate(id);
                 byte[] bytes=record==null ? null : record.encode(); var output=ByteBuffer.allocate(4+(bytes==null ? 0 : bytes.length)); ScopedTransactionRpc.putBlob(output,bytes); reply=output.array();
+            }
+            case ScopedTransactionRpc.SNAPSHOT_OWNER -> {
+                if (!freshBarrier) throw new IOException("Snapshot owner discovery requires a fresh linearizable barrier");
+                end(input); checkTransactionOwner(); var server=getServer().getNow(null);
+                if (server==null) throw new IOException("Snapshot peer is not initialized");
+                try (var pin=store.capture()) { reply=new RatisSnapshotOwner(pin.groupId(),pin.rangeEpoch(),pin.schemaDigest(),snapshotCaptureOwner(),server.getId().toString()).encode(); }
+            }
+            case ScopedTransactionRpc.SNAPSHOT_GET, ScopedTransactionRpc.SNAPSHOT_PAGE, ScopedTransactionRpc.SNAPSHOT_RELEASE -> {
+                var binding=ScopedTransactionRpc.snapshotBinding(input); var token=ScopedTransactionRpc.snapshotToken(input); byte[] payload;
+                try {
+                    capturedSnapshots.requireBinding(token,binding);
+                    if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_GET) {
+                        var column=ScopedTransactionRpc.uuid(input); var key=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false); end(input);
+                        payload=valueBlob(snapshotPinGet(token,column,key));
+                    } else if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_PAGE) {
+                        var column=ScopedTransactionRpc.uuid(input); var lower=ScopedTransactionRpc.blob(input,TransactionScope.MAX_BOUND_BYTES,true); var upper=ScopedTransactionRpc.blob(input,TransactionScope.MAX_BOUND_BYTES,true);
+                        int reverse=input.get() & 255; if (reverse>1) throw new IllegalArgumentException("Invalid snapshot direction");
+                        var resume=ScopedTransactionRpc.blob(input,it.cavallium.rockserver.core.common.distributed.PhysicalRangePage.MAX_BYTES,true); int items=input.getInt(),bytes=input.getInt(); end(input);
+                        payload=ScopedTransactionRpc.pageBytes(snapshotPinPage(token,column,lower,upper,reverse==1,resume,items,bytes));
+                    } else { end(input); releaseSnapshotPin(token); payload=new byte[0]; }
+                } catch (RatisSnapshotLostException lost) { payload=null; }
+                reply=ScopedTransactionRpc.snapshotReply(binding,token,payload);
             }
             case ScopedTransactionRpc.CLOSE -> { var handle=ScopedTransactionRpc.readHandle(input); end(input); scopedTransactions.release(handle); reply=new byte[0]; }
             default -> throw new IllegalArgumentException("Unsupported framed query");

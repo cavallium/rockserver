@@ -159,4 +159,97 @@ class RatisClientPoolTest {
         pool.close(); pool.close();
         assertEquals(2, releases.get());
     }
+    @Test void ownerAndOrdinaryClientsShareCapacityButNeverShareRouteKeysOrFactories() throws Exception {
+        var ordinaryOpens=new AtomicInteger(); var ownerOpens=new AtomicInteger(); var closes=new AtomicInteger(); var route=route(1,1,1,1);
+        try (var pool=new RatisClientPool(2,descriptor -> { ordinaryOpens.incrementAndGet(); return client(closes); },(descriptor,owner) -> { assertTrue(descriptor.replicas().contains(owner)); ownerOpens.incrementAndGet(); return client(closes); })) {
+            var ordinary=pool.acquire(route);
+            try (var owner=pool.acquireOwner(route,route.replicas().getFirst()); var same=pool.acquireOwner(route,route.replicas().getFirst())) {
+                assertSame(owner.client(),same.client()); assertNotSame(ordinary.client(),owner.client()); assertEquals(1,ordinaryOpens.get()); assertEquals(1,ownerOpens.get());
+                var nextRoute=route(2,1,1,1); assertThrows(IOException.class,() -> pool.acquireOwner(nextRoute,nextRoute.replicas().getFirst()));
+                ordinary.close();
+                try (var next=pool.acquireOwner(nextRoute,nextRoute.replicas().getFirst())) {
+                    assertEquals(1,closes.get()); assertNotSame(owner.client(),next.client()); assertNotNull(owner.client());
+                    assertThrows(IOException.class,() -> pool.acquire(route(3,1,1,1)));
+                }
+            } finally { ordinary.close(); }
+            assertEquals(1,ordinaryOpens.get()); assertEquals(2,ownerOpens.get());
+        }
+        assertEquals(3,closes.get());
+    }
+
+    @Test void ownerReuseTracksConfigurationAndFullReplicaIncarnationWithoutOrdinaryDiscovery() throws Exception {
+        var opens=new AtomicInteger(); var closes=new AtomicInteger();
+        try (var pool=new RatisClientPool(1,descriptor -> { throw new AssertionError("Owner requests must never use ordinary discovery"); },(descriptor,owner) -> { opens.incrementAndGet(); return client(closes); })) {
+            var original=route(1,1,1,1); RaftClient first;
+            try (var lease=pool.acquireOwner(original,original.replicas().getFirst()); var same=pool.acquireOwner(original,original.replicas().getFirst())) { first=lease.client(); assertSame(first,same.client()); }
+            for (var changed:List.of(route(1,1,2,1),route(1,1,2,2),route(1,2,2,2))) {
+                try (var lease=pool.acquireOwner(changed,changed.replicas().getFirst())) { assertNotSame(first,lease.client()); }
+            }
+            var latest=route(1,2,2,2); assertThrows(IllegalArgumentException.class,() -> pool.acquireOwner(latest,original.replicas().getFirst()));
+            assertEquals(4,opens.get()); assertEquals(3,closes.get());
+        }
+        assertEquals(4,closes.get());
+    }
+
+    @Test void ownerValidationRequiresEveryFrozenMemberFieldBeforeOpeningAnyClient() throws Exception {
+        var opens=new AtomicInteger(); var route=route(1,1,1,1); var owner=route.replicas().getFirst();
+        var changed=List.of(
+                new ReplicaDescriptor(new UUID(1,2),owner.nodeIncarnation(),owner.replicaId(),owner.peerId(),owner.address(),owner.role()),
+                new ReplicaDescriptor(owner.nodeId(),new UUID(2,2),owner.replicaId(),owner.peerId(),owner.address(),owner.role()),
+                new ReplicaDescriptor(owner.nodeId(),owner.nodeIncarnation(),new UUID(3,2),owner.peerId(),owner.address(),owner.role()),
+                new ReplicaDescriptor(owner.nodeId(),owner.nodeIncarnation(),owner.replicaId(),"n2",owner.address(),owner.role()),
+                new ReplicaDescriptor(owner.nodeId(),owner.nodeIncarnation(),owner.replicaId(),owner.peerId(),"127.0.0.1:8002",owner.role()),
+                new ReplicaDescriptor(owner.nodeId(),owner.nodeIncarnation(),owner.replicaId(),owner.peerId(),owner.address(),ReplicaDescriptor.Role.LISTENER));
+        try (var pool=new RatisClientPool(1,descriptor -> { throw new AssertionError("No ordinary discovery"); },(descriptor,target) -> { opens.incrementAndGet(); return client(new AtomicInteger()); })) {
+            for (var target:changed) assertThrows(IllegalArgumentException.class,() -> pool.acquireOwner(route,target));
+            assertEquals(0,opens.get());
+        }
+    }
+
+    @Test void legacyPoolRejectsOwnerModeBeforeEvictingAnIdleOrdinaryClient() throws Exception {
+        var opens=new AtomicInteger(); var closes=new AtomicInteger(); var route=route(1,1,1,1);
+        try (var pool=new RatisClientPool(1,descriptor -> { opens.incrementAndGet(); return client(closes); })) {
+            RaftClient original; try (var lease=pool.acquire(route)) { original=lease.client(); }
+            assertThrows(IOException.class,() -> pool.acquireOwner(route,route.replicas().getFirst())); assertEquals(0,closes.get());
+            try (var lease=pool.acquire(route)) { assertSame(original,lease.client()); } assertEquals(1,opens.get());
+        }
+        assertEquals(1,closes.get());
+    }
+
+    @Test void blockedOwnerCreationIsSharedAndShutdownRetainsTheActualResourceUntilLeasesDrain() throws Exception {
+        var entered=new CountDownLatch(1); var proceed=new CountDownLatch(1); var opens=new AtomicInteger(); var closes=new AtomicInteger(); var route=route(1,1,1,1);
+        var pool=new RatisClientPool(1,descriptor -> { throw new AssertionError("No ordinary discovery"); },(descriptor,owner) -> {
+            opens.incrementAndGet(); entered.countDown();
+            try { if (!proceed.await(5,TimeUnit.SECONDS)) throw new IOException("fixture timeout"); } catch (InterruptedException failure) { throw new IOException(failure); }
+            return client(closes);
+        });
+        try (var executor=Executors.newVirtualThreadPerTaskExecutor()) {
+            var first=executor.submit(() -> pool.acquireOwner(route,route.replicas().getFirst())); assertTrue(entered.await(5,TimeUnit.SECONDS));
+            var second=executor.submit(() -> pool.acquireOwner(route,route.replicas().getFirst()));
+            try {
+                executor.submit(() -> assertThrows(IOException.class,() -> pool.acquire(route(2,1,1,1)))).get(1,TimeUnit.SECONDS);
+                assertEquals(0,closes.get()); assertEquals(1,opens.get());
+            } finally { proceed.countDown(); }
+            try (var a=first.get(5,TimeUnit.SECONDS); var b=second.get(5,TimeUnit.SECONDS)) {
+                assertSame(a.client(),b.client()); assertNotNull(a.client()); assertThrows(IOException.class,pool::close);
+                assertThrows(IOException.class,() -> pool.acquireOwner(route,route.replicas().getFirst())); assertEquals(0,closes.get());
+            }
+        } finally { proceed.countDown(); pool.close(); }
+        assertEquals(1,closes.get());
+    }
+
+    @Test void failedOwnerSetupReclaimsSlotAndFailedOwnerRetirementRetainsTheResource() throws Exception {
+        var attempts=new AtomicInteger(); var closes=new AtomicInteger(); var route=route(1,1,1,1);
+        try (var pool=new RatisClientPool(1,descriptor -> client(closes),(descriptor,owner) -> { if (attempts.incrementAndGet()==1) throw new IOException("owner setup failed"); return client(closes); })) {
+            assertThrows(IOException.class,() -> pool.acquireOwner(route,route.replicas().getFirst()));
+            try (var owner=pool.acquireOwner(route,route.replicas().getFirst())) { assertNotNull(owner.client()); }
+        }
+        assertEquals(2,attempts.get()); assertEquals(1,closes.get());
+        var ordinaryOpens=new AtomicInteger(); var releases=new AtomicInteger();
+        var pool=new RatisClientPool(1,descriptor -> { ordinaryOpens.incrementAndGet(); return client(closes); },(descriptor,owner) -> client(() -> { if (releases.incrementAndGet()==1) throw new IOException("owner close failed"); }));
+        try (var owner=pool.acquireOwner(route,route.replicas().getFirst())) { assertNotNull(owner.client()); }
+        assertThrows(IOException.class,() -> pool.acquire(route(2,1,1,1))); assertEquals(0,ordinaryOpens.get());
+        assertThrows(IOException.class,() -> pool.acquireOwner(route,route.replicas().getFirst())); pool.close(); pool.close(); assertEquals(2,releases.get());
+    }
+
 }

@@ -115,6 +115,13 @@ final class RatisSnapshotPins implements AutoCloseable {
             if (page.payloadBytes()>PhysicalRangePage.MAX_BYTES) throw new IOException("Snapshot page exceeds reply bound"); return page;
         });
     }
+    void requireBinding(SnapshotFenceStatus.Capture token,ScopedTransactionRpc.SnapshotBinding binding) throws RatisSnapshotLostException {
+        requireOwner(Objects.requireNonNull(token).ownerIncarnation());
+        synchronized (this) {
+            var entry=snapshots.get(token.snapshotId()); requireToken(entry,token);
+            if (!entry.fenceId.equals(binding.fenceId()) || !Arrays.equals(entry.digest,binding.digest())) throw lost("Token belongs to another frozen fence");
+        }
+    }
     void release(SnapshotFenceStatus.Capture token) throws Exception {
         requireOwner(Objects.requireNonNull(token).ownerIncarnation());
         synchronized (this) { var entry=snapshots.get(token.snapshotId()); requireToken(entry,token); entry.closed=true; }

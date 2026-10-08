@@ -35,6 +35,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         byte[] read(RangeDescriptor descriptor, UUID columnId, byte[] physicalKey) throws IOException;
         CommandResult command(RangeDescriptor descriptor, DistributedCommand command) throws IOException;
         default byte[] participant(RangeDescriptor descriptor,byte[] record) throws IOException { throw new IOException("Participant prepare unsupported by this transport"); }
+        default byte[] snapshot(RangeDescriptor descriptor,ReplicaDescriptor owner,byte[] request) throws IOException { throw new IOException("Owner-specific snapshots unsupported by this transport"); }
         default RangeStateView stateView(RangeDescriptor descriptor) throws IOException { throw new IOException("Range-state reads unsupported by this transport"); }
         default byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException { throw new IOException("Scoped transactions unsupported by this transport"); }
         @Override default void close() throws IOException {}
@@ -52,6 +53,63 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
         public RangeDescriptor descriptor() { return descriptor; }
         public DistributedCommand command() { return command; }
+    }
+
+    /** Frozen original replica and process incarnation; reads never reselect the current leader. */
+    public static final class SnapshotTarget {
+        private final RangeDirectory source; private final SnapshotFence fence; private final RangeDescriptor descriptor; private final ReplicaDescriptor replica; private final UUID incarnation; private final ScopedTransactionRpc.SnapshotBinding binding;
+        private SnapshotTarget(RangeDirectory source,SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation) { this.source=source; this.fence=fence; this.descriptor=descriptor; this.replica=replica; this.incarnation=incarnation; binding=new ScopedTransactionRpc.SnapshotBinding(fence.fenceId(),snapshotDigest(fence)); }
+        public SnapshotFence fence() { return fence; }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public ReplicaDescriptor replica() { return replica; }
+        public UUID incarnation() { return incarnation; }
+    }
+    private static byte[] snapshotDigest(SnapshotFence fence) {
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(fence.encode()); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+    public SnapshotTarget snapshotTarget(SnapshotFence fence,UUID group) throws IOException {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+        requireSnapshotRoute(observed,descriptor,fence,group);
+        try {
+            var owner=RatisSnapshotOwner.decode(transaction(descriptor,ScopedTransactionRpc.SNAPSHOT_OWNER,new byte[0],true));
+            if (!owner.groupId().equals(group) || owner.rangeEpoch()!=descriptor.rangeEpoch() || !Arrays.equals(owner.schemaDigest(),observed.schemaDigest())) throw new IllegalArgumentException("Snapshot owner reply changed range/schema");
+            var replica=descriptor.replicas().stream().filter(r -> r.peerId().equals(owner.peerId()) && r.role()==ReplicaDescriptor.Role.VOTER).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot owner is not a frozen voter"));
+            return new SnapshotTarget(identity,fence,descriptor,replica,owner.incarnation());
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot owner reply",malformed); }
+    }
+    public SnapshotTarget restoreSnapshotTarget(SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation) {
+        Objects.requireNonNull(incarnation); requireSnapshotRoute(current(),descriptor,fence,descriptor.groupId());
+        if (!descriptor.replicas().contains(replica) || replica.role()!=ReplicaDescriptor.Role.VOTER) throw new IllegalArgumentException("Snapshot replica differs from frozen route");
+        return new SnapshotTarget(identity,fence,descriptor,replica,incarnation);
+    }
+    public byte[] snapshotGet(SnapshotTarget target,SnapshotFenceStatus.Capture token,UUID column,byte[] key) throws IOException {
+        Objects.requireNonNull(key); if (key.length>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Snapshot key exceeds bound");
+        var body=ByteBuffer.allocate(116+key.length); ScopedTransactionRpc.snapshotBinding(body,target.binding); ScopedTransactionRpc.snapshotToken(body,token); ScopedTransactionRpc.uuid(body,column); ScopedTransactionRpc.putBlob(body,key);
+        try { var input=ByteBuffer.wrap(snapshotQuery(target,token,ScopedTransactionRpc.SNAPSHOT_GET,body.array())); var value=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing snapshot point reply"); return value; }
+        catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot point reply",malformed); }
+    }
+    public PhysicalRangePage snapshotPage(SnapshotTarget target,SnapshotFenceStatus.Capture token,UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws IOException {
+        long size=133L+(lower==null ? 0 : lower.length)+(upper==null ? 0 : upper.length)+(resume==null ? 0 : resume.length);
+        if (size>ScopedTransactionRpc.MAX_REQUEST_BYTES-ScopedTransactionRpc.HEADER_BYTES) throw new IllegalArgumentException("Snapshot page request exceeds bound");
+        var body=ByteBuffer.allocate((int)size); ScopedTransactionRpc.snapshotBinding(body,target.binding); ScopedTransactionRpc.snapshotToken(body,token); ScopedTransactionRpc.uuid(body,column);
+        ScopedTransactionRpc.putBlob(body,lower); ScopedTransactionRpc.putBlob(body,upper); body.put((byte)(reverse ? 1 : 0)); ScopedTransactionRpc.putBlob(body,resume); body.putInt(items).putInt(bytes);
+        try { return ScopedTransactionRpc.decodePage(snapshotQuery(target,token,ScopedTransactionRpc.SNAPSHOT_PAGE,body.array())); }
+        catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot page reply",malformed); }
+    }
+    public void releaseSnapshot(SnapshotTarget target,SnapshotFenceStatus.Capture token) throws IOException {
+        var body=ByteBuffer.allocate(48+ScopedTransactionRpc.SNAPSHOT_TOKEN_BYTES); ScopedTransactionRpc.snapshotBinding(body,target.binding); ScopedTransactionRpc.snapshotToken(body,token);
+        if (snapshotQuery(target,token,ScopedTransactionRpc.SNAPSHOT_RELEASE,body.array()).length!=0) throw new IOException("Invalid snapshot release reply");
+    }
+    private byte[] snapshotQuery(SnapshotTarget target,SnapshotFenceStatus.Capture token,int kind,byte[] body) throws IOException {
+        Objects.requireNonNull(target); Objects.requireNonNull(token); requireIdentity(target.source);
+        if (!target.incarnation.equals(token.ownerIncarnation())) throw new RatisSnapshotLostException("Token belongs to another owner incarnation");
+        byte[] request=ScopedTransactionRpc.frame(kind,body); beginCall();
+        try {
+            var reply=ScopedTransactionRpc.parse(transport.snapshot(target.descriptor,target.replica,request),ScopedTransactionRpc.MAX_REPLY_BYTES);
+            if (reply.kind()!=kind) throw new IllegalArgumentException("Snapshot reply opcode changed");
+            return ScopedTransactionRpc.snapshotPayload(reply.body(),target.binding,token);
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid owner-specific snapshot reply",malformed); }
+        finally { endCall(); }
     }
 
     public static final class PreparedSnapshotOperation {
@@ -536,8 +594,18 @@ public final class RatisRoutedClient implements AutoCloseable {
         finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
 
+    /** Uses the SDK's explicitly addressed stale read; no read-index or leader discovery is needed for an immutable pin. */
+    static byte[] snapshotOnOwner(RaftClient client,RangeDescriptor descriptor,ReplicaDescriptor owner,byte[] request) throws IOException {
+        if (!descriptor.replicas().contains(owner)) throw new IllegalArgumentException("Snapshot owner is absent from frozen route");
+        var packet=ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+        if (!ScopedTransactionRpc.pinnedSnapshot(packet.kind())) throw new IllegalArgumentException("Owner transport accepts only immutable pin operations");
+        var reply=client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(request)),0,RaftPeerId.valueOf(owner.peerId()));
+        if (reply!=null && (!reply.getServerId().equals(RaftPeerId.valueOf(owner.peerId())) || !reply.getRaftGroupId().equals(RaftGroupId.valueOf(descriptor.groupId())))) throw new IOException("Snapshot reply came from another peer/group");
+        return RaftTransport.content(reply,ScopedTransactionRpc.MAX_REPLY_BYTES);
+    }
+
     private static final class RaftTransport implements Transport {
-        private final RatisClientPool clients = new RatisClientPool(MAX_CONCURRENT_CALLS, RaftTransport::connected);
+        private final RatisClientPool clients = new RatisClientPool(MAX_CONCURRENT_CALLS, RaftTransport::connected,RaftTransport::connectedOwner);
 
         @Override public void close() throws IOException { clients.close(); }
         @Override public byte[] read(RangeDescriptor descriptor, UUID column, byte[] key) throws IOException {
@@ -568,18 +636,15 @@ public final class RatisRoutedClient implements AutoCloseable {
             } });
         }
 
+        @Override public byte[] snapshot(RangeDescriptor descriptor,ReplicaDescriptor owner,byte[] request) throws IOException {
+            return rpc(() -> { try (var lease=clients.acquireOwner(descriptor,owner)) { return snapshotOnOwner(lease.client(),descriptor,owner,request); } });
+        }
         @Override public byte[] participant(RangeDescriptor descriptor,byte[] record) throws IOException {
             return rpc(() -> { try (var lease=clients.acquire(descriptor)) { return content(lease.client().io().send(Message.valueOf(ByteString.copyFrom(record)))); } });
         }
 
         private static RaftClient connected(RangeDescriptor descriptor) throws IOException {
-            var group = RaftGroup.valueOf(RaftGroupId.valueOf(descriptor.groupId()), descriptor.replicas().stream().map(replica ->
-                    RaftPeer.newBuilder().setId(replica.peerId()).setAddress(replica.address())
-                            .setStartupRole(replica.role() == ReplicaDescriptor.Role.VOTER ? RaftPeerRole.FOLLOWER : RaftPeerRole.LISTENER).build()).toList());
-            var properties = new RaftProperties();
-            RaftConfigKeys.Rpc.setType(properties, SupportedRpcType.GRPC);
-            RaftClientConfigKeys.Rpc.setRequestTimeout(properties, TimeDuration.valueOf(3, TimeUnit.SECONDS));
-            GrpcConfigKeys.Client.setWorkerGroupSize(properties, 1);
+            var group=group(descriptor); var properties=properties();
             RaftPeerId leader = null;
             try (RaftClient probe = build(group, properties, null)) {
                 for (ReplicaDescriptor replica : descriptor.replicas()) {
@@ -600,6 +665,17 @@ public final class RatisRoutedClient implements AutoCloseable {
             return build(group, properties, leader);
         }
 
+        private static RaftClient connectedOwner(RangeDescriptor descriptor,ReplicaDescriptor owner) {
+            return build(group(descriptor),properties(),RaftPeerId.valueOf(owner.peerId()));
+        }
+        private static RaftGroup group(RangeDescriptor descriptor) {
+            return RaftGroup.valueOf(RaftGroupId.valueOf(descriptor.groupId()),descriptor.replicas().stream().map(replica -> RaftPeer.newBuilder().setId(replica.peerId()).setAddress(replica.address())
+                    .setStartupRole(replica.role()==ReplicaDescriptor.Role.VOTER ? RaftPeerRole.FOLLOWER : RaftPeerRole.LISTENER).build()).toList());
+        }
+        private static RaftProperties properties() {
+            var properties=new RaftProperties(); RaftConfigKeys.Rpc.setType(properties,SupportedRpcType.GRPC);
+            RaftClientConfigKeys.Rpc.setRequestTimeout(properties,TimeDuration.valueOf(3,TimeUnit.SECONDS)); GrpcConfigKeys.Client.setWorkerGroupSize(properties,1); return properties;
+        }
         private static RaftClient build(RaftGroup group, RaftProperties properties, RaftPeerId leader) {
             var builder = RaftClient.newBuilder().setRaftGroup(group).setProperties(properties).setRetryPolicy(RetryPolicies.noRetry());
             if (leader != null) builder.setLeaderId(leader);

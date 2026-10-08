@@ -445,11 +445,25 @@ new fence/capture identities may proceed. Shutdown and expiry use the same defer
 cleanup rule. Point values remain bounded to two MiB and physical pages to eight
 MiB. These are payload/count bounds, not measured pinned-SST or node memory limits.
 
-This registry is currently exposed through qualified local participant methods.
-Owner-directed replica transport, durable capture orchestration, frontend token
-binding and safe tombstone reclamation remain unfinished. A client must freeze the
-owner/capture identity and must not follow a current-leader fallback to recreate a
-missing pin.
+Capture creation is currently exposed through qualified local participant methods.
+Owner discovery now uses a fresh linearizable query and freezes the original route,
+exact voter descriptor and owner incarnation. Snapshot GET/PAGE/RELEASE target that
+peer explicitly through the Ratis stale-read API at minimum index zero; this path
+uses no healthy-leader discovery or fallback and validates the reply peer/group.
+Owner and ordinary connections share the same bounded client cache and drain rules.
+
+Each pinned request and reply binds the complete capture token to the frozen fence
+ID and definition digest. Crossed targets from two captures on the same owner cannot
+read or release one another. These immutable requests may serve after leadership
+loss, and explicit lost replies remain readable during storage pause. Capture and
+owner discovery retain their fresh-authority checks; arbitrary stale transaction
+queries and current-index constraints remain rejected.
+
+Durable multi-group capture orchestration, qualified remote capture creation,
+frontend cursor binding and safe tombstone reclamation remain unfinished. Clients
+must freeze owner/capture identity before RPC and must not recreate a missing pin.
+Owner transport is covered by controlled participant and SDK-call fixtures; no live
+network, process or quorum failover acceptance is claimed.
 
 Each coordinator journal freezes at most 64 participants and 16 MiB of aggregate
 accepted commands (including their result images), plus 16 MiB of frozen routes and
