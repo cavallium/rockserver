@@ -150,8 +150,8 @@ class RatisParticipantFinalizeTest {
                 try (var plan=data.f.machine.prepareFinalization(home.statuses,initial.transactionId(),recovery(0))) { data.routed.executeFinalization(data.routed.prepareFinalization(plan.finalization())); }
                 assertEquals(0,data.f.machine.reservedParticipantCount()); assertEquals(0,data.f.machine.reservedParticipantBytes());
             } finally { release.countDown(); }
-            try (var preparation=pending.get(5,TimeUnit.SECONDS)) { assertEquals(ParticipantVote.negative(),data.routed.executeParticipant(data.routed.prepareParticipant(preparation.preparation()))); }
-            released(data);
+            assertThrows(ExecutionException.class,() -> pending.get(5,TimeUnit.SECONDS));
+            assertEquals(0,data.f.machine.proposalFootprintStats().candidates()); released(data);
         }
     }
     @Test void unknownSubmittedFinalizerKeepsFenceCapacityUntilACompletedNewerTerm() throws Exception {
@@ -185,6 +185,23 @@ class RatisParticipantFinalizeTest {
                     var operation=routed.prepareFinalization(finalization); assertThrows(IOException.class,() -> routed.executeFinalization(operation));
                     reply.set(new ApplyPosition(1,2)); assertEquals(new ApplyPosition(1,2),routed.executeFinalization(operation));
                 }
+            }
+        }
+    }
+
+    @Test void aTerminalSnapshotReleasesUnknownPrepareScopeWithoutInventingItsVote() throws Exception {
+        helper.root=root;
+        try (var home=helper.new Node("terminal-snapshot-home",true); var data=helper.new Node("terminal-snapshot-data",false); var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
+            var initial=helper.register(home,data,pin,data.f.put(2),0);
+            try (var prepare=data.f.machine.prepareParticipant(pin,data.f.put(2),helper.control(0),home.statuses,initial.transactionId())) {
+                var pending=data.wire.propose(prepare.bytes()); assertNull(pending.getException()); data.f.machine.preAppendTransaction(pending); pending.initLogEntry(1,3); data.f.machine.cancelTransaction(pending);
+                homeDecision(home,initial,initial.decide(TransactionStatus.Phase.ABORT),1); var finalization=home.statuses.readFinalization(initial.transactionId(),data.f.groupId,recovery(0));
+                data.f.store.applyAbort(new ApplyPosition(1,1),finalization); data.f.machine.takeSnapshot(); data.f.machine.pause(); data.f.machine.reinitialize(); data.wire.index=1;
+                assertEquals(0,data.f.machine.proposalFootprintStats().candidates()); assertEquals(0,data.f.machine.reservedParticipantCount()); assertTrue(data.f.counter("admittedBytes")>0);
+                var write=new DistributedCommand(data.f.groupId,1,new byte[32],new OperationId(new UUID(0,1960),1,0),List.of(new Mutation(Mutation.Kind.PUT,data.f.column,new byte[]{2},new byte[]{9})));
+                assertEquals(CommandResult.Status.SUCCESS,data.wire.command(data.directory.ranges().getFirst(),write).status());
+                assertEquals(ParticipantVote.negative(),RatisParticipantRecord.result(data.f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray())); data.wire.index=3;
+                assertArrayEquals(new byte[]{9},data.routed.read(data.f.column,new byte[]{2})); helper.released(data);
             }
         }
     }

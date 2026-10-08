@@ -576,7 +576,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (enableSessionControls) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
-                    for (var verified:verifiedAdmissions) if (admissions.get(verified.id)==verified) settleAdmission(verified);
+                    for (var terminal:verifiedAdmissions.terminalScopes()) if (admissions.get(terminal.id)==terminal) retirePreparationScope(terminal);
+                    for (var verified:verifiedAdmissions.settled()) if (admissions.get(verified.id)==verified) settleAdmission(verified);
                     for (var id : coveredOperations) {
                         var admission = admissions.get(id);
                         if (admission != null) settleAdmission(admission);
@@ -763,6 +764,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (RatisParticipantRecord.isFinalization(encoded)) {
             var finalization=RatisParticipantRecord.decodeFinalization(encoded);
             var position=finalization.decision().phase()==TransactionStatus.Phase.COMMIT ? store.applyCommit(positionArg,finalization).position() : store.applyAbort(positionArg,finalization).position();
+            synchronized (admissions) { retireFinalizedPreparations(finalization); }
             return new AppliedRecord(finalization.operation(),RatisParticipantRecord.result(position));
         }
         if (RatisParticipantRecord.isParticipant(encoded)) {
@@ -867,6 +869,25 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         admission.settled=true; releaseRetention(admission); releaseFootprint(admission);
         if (admission.owners==0) finishAdmission(admission);
     }
+    // Native terminal state prevents every matching PREPARE from acquiring locks again.
+    private void retireFinalizedPreparations(ParticipantFinalization finalization) {
+        for (var plan:List.copyOf(preparedParticipants.values())) if (matchesFinalization(finalization,plan.preparation)) plan.close();
+        for (var preparing:preparingParticipants.values()) {
+            var hold=preparing.hold();
+            if (hold.transaction.equals(finalization.transactionId()) && hold.business.equals(finalization.decision().operation())
+                    && (hold.preparation==null || matchesFinalization(finalization,hold.preparation))) {
+                proposalFootprints.release(preparing.reservation().lease); finishParticipantHold(hold,true);
+            }
+        }
+        for (var admission:admissions.values()) if (admission.participant!=null && matchesFinalization(finalization,admission.participant)) retirePreparationScope(admission);
+    }
+    private static boolean matchesFinalization(ParticipantFinalization finalization,PreparedParticipant.Preparation preparation) {
+        try { finalization.requirePreparation(preparation); return true; } catch (IllegalArgumentException different) { return false; }
+    }
+    private void retirePreparationScope(Admission admission) {
+        if (admission.acceptedScope!=null) proposalFootprints.release(admission.acceptedScope);
+        if (admission.participantHold!=null) finishParticipantHold(admission.participantHold,true);
+    }
     private void releaseFootprint(Admission admission) {
         if (admission.footprint!=null) proposalFootprints.release(admission.footprint);
         if (admission.acceptedScope!=null) proposalFootprints.release(admission.acceptedScope);
@@ -874,22 +895,23 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (admission.finalizationHold!=null) releaseFinalizationHold(admission.finalizationHold,admission.settled);
     }
     // Recovery reads one exact native cut outside the admissions monitor. Unknown suffixes remain reserved.
-    private List<Admission> verifiedNativeAdmissionOutcomes() throws Exception {
+    private NativeAdmissionProof verifiedNativeAdmissionOutcomes() throws Exception {
         final List<Admission> pending;
         synchronized (admissions) { pending=admissions.values().stream().filter(admission -> !admission.settled).toList(); }
-        if (pending.isEmpty()) return List.of(); var verified=new ArrayList<Admission>();
+        if (pending.isEmpty()) return new NativeAdmissionProof(List.of(),List.of()); var verified=new ArrayList<Admission>(); var terminalScopes=new ArrayList<Admission>();
         try (var pin=store.capture()) {
             for (var admission:pending) {
                 try {
                     if (admission.finalization!=null) { if (pin.finalizationPosition(admission.finalization)!=null) verified.add(admission); }
                     else if (admission.participant==null) { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
-                    else { var vote=pin.preparationVote(admission.participant); if (vote!=null) verified.add(admission); }
+                    else { var vote=pin.preparationVote(admission.participant); if (vote!=null) verified.add(admission); else if (pin.finalizedPreparation(admission.participant)) terminalScopes.add(admission); }
                 }
                 catch (IllegalArgumentException differentPayload) { /* A mismatched speculative request is not verified coverage. */ }
             }
         }
-        return verified;
+        return new NativeAdmissionProof(verified,terminalScopes);
     }
+    private record NativeAdmissionProof(List<Admission> settled,List<Admission> terminalScopes) {}
     private void invalidateProposalCandidates() { synchronized (admissions) { invalidateUnsubmitted(); } }
     private void invalidateUnsubmitted() {
         proposalFootprints.invalidateCandidates();
@@ -962,6 +984,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
         }
     }
+    // Reattach exact live acceptance. The view must not close or donate the original owner's reservation.
+    private FinalizationProposal borrowedFinalization(FinalizationHold hold,ParticipantFinalization finalization) {
+        var proposal=new FinalizationProposal(hold,finalization); proposal.claimed=true; return proposal;
+    }
     /** Privileged coordinator seam. Bounded protected capacity is held while the fresh home read is in flight. */
     public FinalizationProposal prepareFinalization(RatisTransactionStatuses homes,UUID transaction,OperationId recovery) throws Exception {
         java.util.Objects.requireNonNull(homes); java.util.Objects.requireNonNull(transaction); java.util.Objects.requireNonNull(recovery);
@@ -971,6 +997,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             requireHealthy(); var a=store.applied();
             if (generation!=admissionGeneration.get() || a==null || a.term()!=leader.term() || !store.admissionOpen()) throw new IllegalStateException("Finalization has no current native owner");
             reconcileOlderProposalTerms(leader.term());
+            var ready=preparedFinalizations.get(recovery);
+            if (ready!=null && ready.finalization.transactionId().equals(transaction) && ready.authorized()) return borrowedFinalization(ready.hold,ready.finalization);
+            var known=admissions.get(recovery);
+            if (known!=null && known.finalization!=null && known.finalization.transactionId().equals(transaction) && known.term==leader.term() && known.generation==generation) return borrowedFinalization(known.finalizationHold,known.finalization);
             if (protectedAdmissions+protectedFinalizationSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
             if (participantIdentityBusy(recovery) || finalizingTransactions.containsKey(transaction)) throw new IllegalStateException("Finalization identity/transaction is already owned");
             hold=new FinalizationHold(transaction,recovery,leader.term(),generation); preparingFinalizations.put(recovery,hold); finalizingTransactions.put(transaction,hold); finalizationOwners.put(recovery,hold); protectedFinalizationSlots++;

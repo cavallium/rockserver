@@ -1717,6 +1717,19 @@ public final class ReplicatedRangeStore {
             try (var options=new ReadOptions().setSnapshot(snapshot)) { return readFinalizationPosition(expected,options,position); }
             finally { releaseUse(); }
         }
+        public boolean finalizedPreparation(PreparedParticipant.Preparation expected) throws RocksDBException {
+            Objects.requireNonNull(expected); acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) {
+                byte[] commit=db.get(state,options,committedKey(expected.transactionId())),abort=db.get(state,options,abortedKey(expected.transactionId()));
+                if (commit!=null && abort!=null) throw new IllegalArgumentException("Conflicting native finalization decisions");
+                if (commit==null && abort==null) return false;
+                ParticipantFinalization finalization; ApplyPosition finalized;
+                if (commit!=null) { var receipt=CommittedParticipant.decode(commit); finalization=receipt.finalization(); finalized=receipt.position(); }
+                else { var receipt=AbortedParticipant.decode(abort); finalization=receipt.finalization(); finalized=receipt.position(); }
+                requireFinalization(finalization); finalization.requirePreparation(expected);
+                if (position==null || finalized.index()>position.index() || finalized.term()>position.term()) throw new IllegalArgumentException("Terminal preparation proof differs from snapshot cut"); return true;
+            } finally { releaseUse(); }
+        }
         public ParticipantVote preparationVote(PreparedParticipant.Preparation expected) throws RocksDBException {
             var prepared=preparedParticipant(expected.transactionId()); if (prepared!=null) { if (!prepared.preparation().equals(expected)) throw new IllegalArgumentException("Prepared snapshot payload changed"); return ParticipantVote.prepared(prepared.position()); }
             acquireUse();

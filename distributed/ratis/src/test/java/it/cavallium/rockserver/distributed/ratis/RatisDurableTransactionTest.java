@@ -172,9 +172,11 @@ class RatisDurableTransactionTest {
                 journal.executeHome();
                 try (var prepare=data.f.machine.prepareParticipant(pin,data.f.put(2),helper.control(0),home.statuses,plan.initial().transactionId())) {
                     var original=data.routed.prepareParticipant(prepare.preparation()); journal.freezePreparation(original);
+                    var pending=data.wire.propose(original.bytes()); assertNull(pending.getException()); data.f.machine.preAppendTransaction(pending); data.f.machine.cancelTransaction(pending);
                     var abort=plan.initial().decide(TransactionStatus.Phase.ABORT); journal.queueHome(home.statuses.prepare(homeOperation(1),plan.initial(),abort)); journal.executeHome();
                     try (var finalize=data.f.machine.prepareFinalization(home.statuses,plan.initial().transactionId(),plan.intent().finalizeControl())) { journal.freezeFinalization(data.routed.prepareFinalization(finalize.finalization())); journal.executeFinalization(data.f.groupId); }
-                    assertNull(journal.snapshot().participant(data.f.groupId).outcome().vote()); assertEquals(ParticipantVote.negative(),data.routed.executeParticipant(original));
+                    assertNull(journal.snapshot().participant(data.f.groupId).outcome().vote()); pending.initLogEntry(1,++data.wire.index);
+                    assertEquals(ParticipantVote.negative(),RatisParticipantRecord.result(data.f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray()));
                     assertEquals(ParticipantVote.negative(),journal.resolveParticipant(data.f.groupId).outcome().vote()); helper.released(data);
                 }
             }
@@ -247,6 +249,22 @@ class RatisDurableTransactionTest {
                 assertEquals(plan.initial(),journal.snapshot().observedHome()); assertEquals(plan.intent().acceptedBusiness().operationId(),journal.snapshot().initial().operation()); assertEquals(0,data.wire.index);
             }
             try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertEquals(plan.initial(),reopened.snapshot().observedHome()); assertEquals(3,reopened.snapshot().pendingHome().command().operationId().epoch()); }
+        }
+    }
+
+    @Test void aHomeReadFromAnotherRangeCannotRetireAnUncertainRequest() throws Exception {
+        helper.root=root;
+        try (var home=helper.new Node("moved-home",true); var data=helper.new Node("moved-data",false); var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
+            var plan=plan(home,data,pin); Path path=root.resolve("moved.bin");
+            try (var journal=create(path,home,data,plan)) {
+                home.wire.lose=true; assertThrows(IOException.class,journal::executeHome);
+                var original=home.directory.ranges().getFirst(); var different=new RangeDescriptor(new UUID(0,1990),new UUID(0,1991),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,original.replicas());
+                home.routed.refresh(new RangeDirectory(helper.cluster,helper.database,home.directory.domainId(),1,new byte[32],1,home.directory.columns(),0,List.of(different)));
+                assertThrows(IOException.class,journal::refreshHome); assertNull(journal.snapshot().observedHome()); assertFalse(journal.resolveHomeFromObserved()); assertFalse(journal.snapshot().homeSuperseded()); assertEquals(1,home.wire.index);
+                home.routed.refresh(new RangeDirectory(helper.cluster,helper.database,home.directory.domainId(),1,new byte[32],2,home.directory.columns(),0,List.of(original)));
+                assertEquals(plan.initial(),journal.refreshHome()); assertTrue(journal.resolveHomeFromObserved()); assertNull(journal.snapshot().homeResult());
+            }
+            try (var reopened=RatisDurableTransaction.reopen(path,home.statuses,data.routed)) { assertTrue(reopened.snapshot().homeSuperseded()); assertThrows(IllegalStateException.class,reopened::executeHome); }
         }
     }
 

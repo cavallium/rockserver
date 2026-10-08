@@ -122,8 +122,8 @@ does not establish complete distributed API parity or production acceptance.
   transaction-record consumption. Recovery CAS operations have their own identity
   and epoch; they do not replace the frozen business identity.
   This is a home-record kernel, not complete 2PC: reports are not self-verifying
-  participant proofs. Protected status-role activation, recovery scheduling and
-  durable coordinator integration remain.
+  participant proofs. Protected status-role activation, healthy commit orchestration
+  and daemon recovery discovery/admission remain.
 - Finalization intents capture a fresh terminal home decision and its route together.
   Their canonical binding retains the frozen definition, chosen COMMIT/ABORT and
   prepare vote positions, while excluding later home generations, ACKs and client
@@ -182,8 +182,9 @@ does not establish complete distributed API parity or production acceptance.
   establishes settlement. Applied retries return the original typed prepared or negative vote.
   A fresh linearizable participant-state query survives response loss and control-session
   receipt GC. The routed client freezes exact bytes and the original descriptor for
-  retry. The caller-driven coordinator journal now retains them durably; automatic
-  coordinator policy and recovery scheduling remain unfinished.
+  retry. The caller-driven coordinator journal now retains them durably, and the
+  recovery takeover policy below completes chosen decisions. Healthy forward commit
+  orchestration and daemon discovery/admission remain unfinished.
 - The current FINALIZE record carries the verified immutable home decision and its
   independent recovery identity in at most 8,010 encoded bytes. A privileged leader
   coordinator reserves a protected input slot before the fresh home read, validates
@@ -229,8 +230,41 @@ does not establish complete distributed API parity or production acceptance.
   and parent-directory force. Persistence failure fences the instance until reopen.
   One RPC owner operates outside the journal monitor; close during an active RPC
   retains file ownership and rejects, so another owner cannot race it. Clients remain
-  borrowed. This is a durable dispatch/state component, not an automatic coordinator
-  policy or recovery scheduler, and it does not establish cross-group snapshot gates.
+  borrowed. This durable dispatch/state component feeds the recovery policy below;
+  it does not establish healthy forward orchestration or cross-group snapshot gates.
+- `RatisTransactionRecovery` implements explicit takeover in bounded steps. It reads
+  the home freshly, retries an uncertain frozen home request when still relevant,
+  proposes ABORT for otherwise-undecided PREPARING state, and completes a chosen
+  COMMIT or ABORT through native outcome queries, current leader FINALIZE authority
+  and evidence-gated home ACKs. It never submits a new business PREPARE, changes the
+  frozen business identity/plan, overturns COMMIT or automatically consumes results.
+  Each step issues at most one transaction write. Control identities come from the
+  caller's advancing control allocator and are forced before dispatch. Participants
+  rotate before work so an available group can finalize/ACK while a peer fails.
+  A newer home image may durably retire an obsolete expected-image CAS: expected-null
+  registration cannot overwrite the existing matching home, and a later generation
+  cannot match the old expected image again. This semantic retirement stays separate
+  from the exact unknown RPC result. Reads validate the descriptor captured with the
+  status against the frozen home incarnation; peer/configuration refresh is allowed,
+  but another group/range epoch cannot authorize retirement. Exact ready or submitted
+  FINALIZE acceptance may be borrowed for retry without another protected reservation.
+- Native terminal proof now retires matching volatile PREPARE scope ownership.
+  Abandoned ready proposals close; still-running planners lose append authority but
+  retain their input/identity ownership until actual return. Submitted unknown
+  PREPARE releases only its obsolete scope/capacity when finalization is proven,
+  retaining input and control identity until its actual vote or newer-term proof
+  settles. Snapshot recovery makes the same distinction. No vote is invented merely
+  because ABORT is durable, and a late admitted PREPARE can resolve negatively after
+  later user writes without restoring locks or effects.
+- `RatisTransactionRecoveryService` runs supplied takeover objects through the
+  existing reserved CONTROL scheduler. One coalesced quantum visits at most 32
+  recoveries from a bounded membership of 4,096; failed entries rotate and completed
+  entries leave the active queue. Timer ticks do not accumulate dependent futures.
+  Cancelled observer views do not cancel actual ownership. Stop removes queued work,
+  lets the active step settle, skips later visits, and drains before borrowed owners
+  may close. Journals, policies, clients and scheduler remain caller-owned. Startup
+  journal discovery, qualified authority/control providers and node wiring are not
+  supplied by this service.
 - Fresh terminal-outcome queries return one native cut containing the immutable
   COMMIT/ABORT binding, first finalization position, optional original prepare vote,
   and COMMIT-only retained business result. ABORT-before-PREPARE initially has no
@@ -424,6 +458,25 @@ Review confirmed that fix and found no further concrete issue in the examined
 boundary. These fixtures remain controlled RPC/native runs, not power-loss, quorum
 or automatic recovery-scheduler acceptance.
 
+The recovery-policy/service regression gate passed 55 core and 141 adapter cases
+(196 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-transaction-recovery-regression.log`. After the per-visit stop guard
+and captured-home-incarnation check, the final selection passed 53 adapter cases,
+zero failures/errors/skips, exit zero: `/tmp/rockserver-transaction-recovery-final2.log`.
+New fixtures cover reopened unregistered intent, abandoned ready PREPARE, lost COMMIT
+receipt retired by fresh home proof, another coordinator's winning terminal proof,
+competing COMMIT versus recovery ABORT, unavailable grant/invalid authority, same-term
+unknown FINALIZE reattachment, and one unavailable data group while another finalizes
+and ACKs. Service fixtures cover timer completion without consumption, completed-entry
+retirement, cancelled observers, stop/drain while authority blocks, skipping later
+visits after stop, failure fairness and queued removal. Terminal-snapshot recovery
+releases unknown PREPARE scope while retaining its input until a real negative apply.
+Independent review found and confirmed the FINALIZE reattachment fix; no remaining
+concrete issue was found in that reviewed boundary. The final home-route fixture
+rejects a status read from another incarnation without manufacturing an RPC receipt.
+These are controlled fixtures; process/quorum/fault-disk and daemon wiring acceptance
+remain separate and unperformed.
+
 The exercised native preparation cases cover unchanged user values, complete read/
 absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
 planning/admission rejection, stable duplicate prepare positions, separate ordinary
@@ -478,8 +531,8 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Protected status-group node/pool activation, automatic coordinator policy and
-  full 2PC recovery scheduling, and consistent
+- Protected status-group node/pool activation, daemon journal discovery/admission
+  and healthy commit orchestration, and consistent
   multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
   establish these.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,
