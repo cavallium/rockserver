@@ -112,6 +112,31 @@ public final class RatisRoutedClient implements AutoCloseable {
         finally { endCall(); }
     }
 
+    public static final class PreparedSnapshotCapture {
+        private final SnapshotTarget target; private final RatisSnapshotCaptureRequest request; private final byte[] bytes;
+        private PreparedSnapshotCapture(SnapshotTarget target,RatisSnapshotCaptureRequest request) { this.target=target; this.request=request; bytes=ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_CAPTURE,request.encode()); }
+        public SnapshotTarget target() { return target; }
+        public RatisSnapshotCaptureRequest request() { return request; }
+        public byte[] bytes() { return bytes.clone(); }
+    }
+    public PreparedSnapshotCapture prepareSnapshotCapture(SnapshotTarget target,UUID snapshotId,java.time.Duration ttl) {
+        return restoreSnapshotCapture(target,new RatisSnapshotCaptureRequest(target.fence,target.incarnation,snapshotId,ttl));
+    }
+    public PreparedSnapshotCapture restoreSnapshotCapture(SnapshotTarget target,RatisSnapshotCaptureRequest request) {
+        Objects.requireNonNull(target); Objects.requireNonNull(request); requireIdentity(target.source);
+        if (!target.fence.equals(request.fence()) || !target.incarnation.equals(request.owner())) throw new IllegalArgumentException("Capture request differs from frozen target");
+        return new PreparedSnapshotCapture(target,request);
+    }
+    public SnapshotFenceStatus.Capture executeSnapshotCapture(PreparedSnapshotCapture operation) throws IOException {
+        Objects.requireNonNull(operation); requireIdentity(operation.target.source); beginCall();
+        try {
+            var response=ScopedTransactionRpc.parse(transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes),ScopedTransactionRpc.MAX_REPLY_BYTES);
+            if (response.kind()!=ScopedTransactionRpc.SNAPSHOT_CAPTURE) throw new IllegalArgumentException("Capture reply opcode changed");
+            return operation.request.result(response.body());
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid capture reply",malformed); }
+        finally { endCall(); }
+    }
+
     public static final class PreparedSnapshotOperation {
         private final RangeDirectory source; private final RangeDescriptor descriptor; private final RatisSnapshotRecord request; private final byte[] bytes;
         private PreparedSnapshotOperation(RangeDirectory source,RangeDescriptor descriptor,RatisSnapshotRecord request) { this.source=source; this.descriptor=descriptor; this.request=request; bytes=request.encode(); }
@@ -594,11 +619,11 @@ public final class RatisRoutedClient implements AutoCloseable {
         finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
 
-    /** Uses the SDK's explicitly addressed stale read; no read-index or leader discovery is needed for an immutable pin. */
+    /** Addresses the frozen peer directly; capture creation additionally verifies trusted home authority on that participant. */
     static byte[] snapshotOnOwner(RaftClient client,RangeDescriptor descriptor,ReplicaDescriptor owner,byte[] request) throws IOException {
         if (!descriptor.replicas().contains(owner)) throw new IllegalArgumentException("Snapshot owner is absent from frozen route");
         var packet=ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-        if (!ScopedTransactionRpc.pinnedSnapshot(packet.kind())) throw new IllegalArgumentException("Owner transport accepts only immutable pin operations");
+        if (!ScopedTransactionRpc.ownerSnapshot(packet.kind())) throw new IllegalArgumentException("Owner transport accepts only bound snapshot operations");
         var reply=client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(request)),0,RaftPeerId.valueOf(owner.peerId()));
         if (reply!=null && (!reply.getServerId().equals(RaftPeerId.valueOf(owner.peerId())) || !reply.getRaftGroupId().equals(RaftGroupId.valueOf(descriptor.groupId())))) throw new IOException("Snapshot reply came from another peer/group");
         return RaftTransport.content(reply,ScopedTransactionRpc.MAX_REPLY_BYTES);

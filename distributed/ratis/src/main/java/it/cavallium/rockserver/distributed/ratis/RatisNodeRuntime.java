@@ -39,7 +39,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
     }
     private final RatisNodePlan plan; private final DistributedSchema logicalSchema; private final Path root; private final Settings settings;
-    private final RatisSessionEpochs epochs; private final RatisRoutedClient routed;
+    private final RatisSessionEpochs epochs; private final RatisRoutedClient routed; private final RatisSnapshotFences snapshotHomes;
     private final RWScheduler scheduler; private final Scheduler timer; private final LongSupplier time;
     private final Map<RaftGroupId,RatisRangeStateMachine> machines=new LinkedHashMap<>();
     private DistributedStoragePool pool; private RaftServer server; private RatisCatalogueClock clock;
@@ -51,19 +51,28 @@ public final class RatisNodeRuntime implements AutoCloseable {
     /** Fresh placement is an explicit trusted bootstrap assertion, never inferred from the directory. Borrowed clients/schedulers remain caller-owned. */
     public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer);
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,null,null);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,null);
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,null,null);
     }
     public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,schema);
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,schema,null);
+    }
+    /** Operator-qualified home readers are fixed on DATA state machines before the server factory may initialize them. */
+    public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema,RatisSnapshotFences snapshotHomes) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,schema,snapshotHomes);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema) throws IOException {
-        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema);
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,null);
+    }
+    static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes) throws IOException {
+        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes);
         try { node.initialize(config,startup,factory); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
@@ -71,10 +80,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
     }
     private RatisNodeRuntime(RatisNodePlan plan,Path root,RatisSessionEpochs epochs,RatisRoutedClient routed,
-            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema) {
+            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema,RatisSnapshotFences snapshotHomes) {
         this.plan=Objects.requireNonNull(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
         this.routed=Objects.requireNonNull(routed); this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
-        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); logicalSchema=schema;
+        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); logicalSchema=schema; this.snapshotHomes=snapshotHomes;
+        if (snapshotHomes!=null) snapshotHomes.requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
         if (schema!=null) schema.requireMatches(plan.directory());
         if (plan.localGroups().stream().anyMatch(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId()))
                 && plan.directory().ranges().size()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
@@ -130,6 +140,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             plan.directory().schemaDigest(),plan.columns(),plan.merges());
                     if (logicalSchema!=null) store.enableLogicalSchema(logicalSchema);
                     machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),command -> {},epochs,plan.directory(),settings.retention());
+                    if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes);
                 }
                 machines.put(group.getGroupId(),machine);
             }

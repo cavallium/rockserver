@@ -23,9 +23,10 @@ class RatisParticipantPrepareTest {
     final class Node implements AutoCloseable {
         final RatisRetentionAdmissionTest.Fixture f; final Wire wire; final RangeDirectory directory; final RatisRoutedClient routed; final RatisTransactionStatuses statuses;
         Node(String name,boolean home) throws Exception { this(name,home,null); }
-        Node(String name,boolean home,RangeOwnership.Interval interval) throws Exception {
+        Node(String name,boolean home,RangeOwnership.Interval interval) throws Exception { this(name,home,interval,null,System::nanoTime); }
+        Node(String name,boolean home,RangeOwnership.Interval interval,RatisSnapshotFences snapshotHomes,java.util.function.LongSupplier nanos) throws Exception {
             var validator=new java.util.concurrent.atomic.AtomicReference<Consumer<DistributedCommand>>(command -> {});
-            f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validator.get().accept(command),System::nanoTime,interval);
+            f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validator.get().accept(command),nanos,interval,machine -> { if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes); });
             var replica=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"fixture","127.0.0.1:12345",ReplicaDescriptor.Role.VOTER);
             var range=new RangeDescriptor(f.groupId,f.groupId,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
             directory=new RangeDirectory(cluster,database,f.store.ownership().interval().domainId(),1,new byte[32],0,Set.of(f.column),0,List.of(range));

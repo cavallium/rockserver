@@ -123,6 +123,9 @@ class RatisRetentionAdmissionTest {
             this(root,limits,validator,nanos,null);
         }
         Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator,java.util.function.LongSupplier nanos,RangeOwnership.Interval interval) throws Exception {
+            this(root,limits,validator,nanos,interval,machine -> {});
+        }
+        Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits,java.util.function.Consumer<DistributedCommand> validator,java.util.function.LongSupplier nanos,RangeOwnership.Interval interval,java.util.function.Consumer<RatisRangeStateMachine> configure) throws Exception {
             column=interval==null ? UUID.randomUUID() : interval.columns().iterator().next();
             pool=DistributedStoragePool.open(root.resolve("native"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
             storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT)
@@ -135,7 +138,7 @@ class RatisRetentionAdmissionTest {
                 throw new AssertionError("Unexpected server access "+method);
             });
             machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),validator,command -> {},limits,leadership::get);
-            machine.transactionClock(nanos);
+            machine.transactionClock(nanos); configure.accept(machine);
             machine.initialize(identity,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
         }
         DistributedCommand put(long sequence) { return new DistributedCommand(groupId,1,new byte[32],new OperationId(session,1,sequence),

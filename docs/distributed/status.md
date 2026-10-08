@@ -445,9 +445,22 @@ new fence/capture identities may proceed. Shutdown and expiry use the same defer
 cleanup rule. Point values remain bounded to two MiB and physical pages to eight
 MiB. These are payload/count bounds, not measured pinned-SST or node memory limits.
 
-Capture creation is currently exposed through qualified local participant methods.
-Owner discovery now uses a fresh linearizable query and freezes the original route,
-exact voter descriptor and owner incarnation. Snapshot GET/PAGE/RELEASE target that
+Capture creation is exposed through qualified local methods and a frozen-owner RPC.
+The remote request retains the full fence, expected process incarnation, capture ID
+and finite TTL before its first RPC. DATA participants use only an operator-bound
+home reader installed before initialization; request bytes never select connectors.
+The node runtime validates the reader's cluster/database identity before bootstrap
+writes and installs it before server creation can initialize or expose DATA groups.
+Catalogue groups remain unbound, and the reader remains caller-owned.
+
+Exact remote retries preserve the original token after leadership loss or home
+completion. Unknown captures still require the configured reader, fresh all-READY
+home proof, matching local gate and current leader. Wrong owner or expired requests
+return bound SNAPSHOT_LOST without allocating a replacement. Blocked home reads
+retain registry charges until actual completion.
+
+Owner discovery uses a fresh linearizable query and freezes the original route,
+exact voter descriptor and owner incarnation. Snapshot capture/GET/PAGE/RELEASE target that
 peer explicitly through the Ratis stale-read API at minimum index zero; this path
 uses no healthy-leader discovery or fallback and validates the reply peer/group.
 Owner and ordinary connections share the same bounded client cache and drain rules.
@@ -459,7 +472,7 @@ loss, and explicit lost replies remain readable during storage pause. Capture an
 owner discovery retain their fresh-authority checks; arbitrary stale transaction
 queries and current-index constraints remain rejected.
 
-Durable multi-group capture orchestration, qualified remote capture creation,
+Durable multi-group capture orchestration, production home-role/CLI activation,
 frontend cursor binding and safe tombstone reclamation remain unfinished. Clients
 must freeze owner/capture identity before RPC and must not recreate a missing pin.
 Owner transport is covered by controlled participant and SDK-call fixtures; no live

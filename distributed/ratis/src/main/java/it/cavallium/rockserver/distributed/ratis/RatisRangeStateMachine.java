@@ -78,6 +78,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final LeadershipSource leadershipSource;
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
+    private RatisSnapshotFences snapshotHomes;
+    /** Trusted node configuration, installed before transport exposure; request bytes never select a home connector. */
+    void snapshotHomes(RatisSnapshotFences homes) {
+        if (getLifeCycleState()!=LifeCycle.State.NEW) throw new IllegalStateException("Snapshot home reader is fixed before initialization");
+        if (snapshotHomes!=null) throw new IllegalStateException("Snapshot home reader already configured"); snapshotHomes=java.util.Objects.requireNonNull(homes);
+    }
 
     /** Test clock configuration is fixed before this state-machine owner is initialized. */
     void transactionClock(java.util.function.LongSupplier nanos) {
@@ -1684,7 +1690,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
             int kind=ScopedTransactionRpc.kind(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES);
-            if (ScopedTransactionRpc.pinnedSnapshot(kind)) {
+            if (ScopedTransactionRpc.ownerSnapshot(kind)) {
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
@@ -1705,7 +1711,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try {
             byte[] encoded = request.getContent().toByteArray();
             int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-            if (!ScopedTransactionRpc.pinnedSnapshot(kind)) requireHealthy();
+            if (!ScopedTransactionRpc.ownerSnapshot(kind)) requireHealthy();
             return CompletableFuture.completedFuture(framedQuery(encoded,freshBarrier));
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
@@ -1769,6 +1775,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 end(input); checkTransactionOwner(); var server=getServer().getNow(null);
                 if (server==null) throw new IOException("Snapshot peer is not initialized");
                 try (var pin=store.capture()) { reply=new RatisSnapshotOwner(pin.groupId(),pin.rangeEpoch(),pin.schemaDigest(),snapshotCaptureOwner(),server.getId().toString()).encode(); }
+            }
+            case ScopedTransactionRpc.SNAPSHOT_CAPTURE -> {
+                var capture=RatisSnapshotCaptureRequest.decode(packet.body()); SnapshotFenceStatus.Capture token=null;
+                if (capture.owner().equals(transactionIncarnation)) {
+                    if (snapshotHomes==null) throw new IOException("Snapshot home reader is not configured");
+                    snapshotHomes.requireDatabaseBinding(capture.fence().clusterId(),capture.fence().databaseId());
+                    try { token=captureSnapshotPin(snapshotHomes,capture.fence(),capture.owner(),capture.snapshotId(),capture.ttl()); }
+                    catch (RatisSnapshotLostException lost) { /* Explicit loss cannot create a replacement pin. */ }
+                }
+                reply=capture.reply(token);
             }
             case ScopedTransactionRpc.SNAPSHOT_GET, ScopedTransactionRpc.SNAPSHOT_PAGE, ScopedTransactionRpc.SNAPSHOT_RELEASE -> {
                 var binding=ScopedTransactionRpc.snapshotBinding(input); var token=ScopedTransactionRpc.snapshotToken(input); byte[] payload;

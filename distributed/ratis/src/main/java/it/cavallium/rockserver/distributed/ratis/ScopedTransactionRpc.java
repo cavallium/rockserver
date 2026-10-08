@@ -13,7 +13,7 @@ import java.util.UUID;
 /** The current bounded query protocol for data and catalogue groups. */
 public final class ScopedTransactionRpc {
     public static final int MAGIC = 0x52535458, HEADER_BYTES = 12, HANDLE_BYTES = 56;
-    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22, SNAPSHOT_OWNER = 30, SNAPSHOT_GET = 31, SNAPSHOT_PAGE = 32, SNAPSHOT_RELEASE = 33;
+    public static final int POINT = 1, STATE = 2, OPEN = 10, GET = 11, PAGE = 12, PLAN = 13, CLOSE = 14, STAGE = 15, PARTICIPANT_STATE = 20, PARTICIPANT_OUTCOME = 21, SNAPSHOT_GATE_STATE = 22, SNAPSHOT_OWNER = 30, SNAPSHOT_GET = 31, SNAPSHOT_PAGE = 32, SNAPSHOT_RELEASE = 33, SNAPSHOT_CAPTURE = 34;
     // A legal physical page continuation can exceed an atomic command's 2 MiB bound.
     public static final int MAX_REQUEST_BYTES = PhysicalRangePage.MAX_BYTES + 128;
     public static final int MAX_REPLY_BYTES = PhysicalRangePage.MAX_BYTES + 128;
@@ -97,6 +97,7 @@ public final class ScopedTransactionRpc {
     public static void snapshotBinding(ByteBuffer output,SnapshotBinding binding) { uuid(output,binding.fenceId()); output.put(binding.digest()); }
     public static SnapshotBinding snapshotBinding(ByteBuffer input) { require(input,48); var id=uuid(input); byte[] digest=new byte[32]; input.get(digest); return new SnapshotBinding(id,digest); }
     public static final int SNAPSHOT_TOKEN_BYTES=48;
+    public static boolean ownerSnapshot(int kind) { return kind==SNAPSHOT_CAPTURE || pinnedSnapshot(kind); }
     public static boolean pinnedSnapshot(int kind) { return kind==SNAPSHOT_GET || kind==SNAPSHOT_PAGE || kind==SNAPSHOT_RELEASE; }
     public static void snapshotToken(ByteBuffer output,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture token) {
         uuid(output,token.ownerIncarnation()); uuid(output,token.snapshotId()); output.putLong(token.position().term()).putLong(token.position().index());
@@ -245,7 +246,7 @@ public final class ScopedTransactionRpc {
         return Arrays.compareUnsigned(left, right);
     }
     private static void requireKind(int kind) {
-        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_OWNER && !pinnedSnapshot(kind)) {
+        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_OWNER && !ownerSnapshot(kind)) {
             throw invalid("Unknown read frame kind");
         }
     }

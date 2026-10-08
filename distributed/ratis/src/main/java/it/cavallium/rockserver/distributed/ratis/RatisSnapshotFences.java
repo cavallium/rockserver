@@ -16,6 +16,9 @@ public final class RatisSnapshotFences {
         if (!directory.columns().equals(Set.of(column))) throw new IllegalArgumentException("Snapshot fence directory must have its dedicated column");
         cluster=directory.clusterId(); database=directory.databaseId(); schemaDigest=directory.schemaDigest();
     }
+    void requireDatabaseBinding(UUID cluster,UUID database) {
+        if (!this.cluster.equals(cluster) || !this.database.equals(database)) throw new IllegalArgumentException("Snapshot home reader belongs to another cluster/database");
+    }
     public record RegistrationRead(SnapshotFenceStatus status,RangeDescriptor descriptor) {}
     public SnapshotFenceStatus read(UUID fenceId) throws IOException { return readRegistration(fenceId).status(); }
     /** Fresh status and home authority captured by the same read; no participant gate is installed or released. */

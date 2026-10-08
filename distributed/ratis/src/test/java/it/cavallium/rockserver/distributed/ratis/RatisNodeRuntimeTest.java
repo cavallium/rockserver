@@ -190,6 +190,68 @@ class RatisNodeRuntimeTest {
         assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,fake)); assertFalse(fake.created);
         assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
     }
+    @Test void trustedSnapshotHomeReaderIsBoundBeforeEagerStateMachineInitializationOnlyOnDataGroups() throws Exception {
+        try (var env=new Env(root,true); var reader=new SnapshotReader(env.plan.directory(),env.outer.cluster,env.outer.database)) {
+            var fake=new FakeServer(); var checked=new java.util.concurrent.atomic.AtomicInteger();
+            RatisNodeRuntime.ServerFactory eager=(plan,logs,machines) -> {
+                try {
+                    for (var entry:machines.entrySet()) {
+                        assertEquals("NEW",entry.getValue().getLifeCycleState().name());
+                        boolean catalogue=entry.getKey().getUuid().equals(plan.catalogue().groupId());
+                        assertSame(catalogue ? null : reader.homes,snapshotHomes(entry.getValue())); checked.incrementAndGet();
+                    }
+                    var server=fake.create(plan,logs,machines);
+                    for (var group:plan.localGroups()) fake.initialize(group);
+                    return server;
+                } catch (Exception failure) { throw new IOException(failure); }
+            };
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,eager,null,reader.homes)) {
+                assertEquals(3,checked.get()); assertEquals(3,fake.storages.size()); assertEquals(0,fake.starts);
+                var data=fake.machines.entrySet().stream().filter(e -> !e.getKey().getUuid().equals(env.plan.catalogue().groupId())).findFirst().orElseThrow().getValue();
+                assertSame(reader.homes,snapshotHomes(data)); assertThrows(IllegalStateException.class,() -> data.snapshotHomes(reader.homes));
+                node.start(); assertTrue(node.started()); assertTrue(fake.exposedBeforeStart);
+            }
+            assertEquals(0,reader.closes); assertNull(reader.homes.read(new UUID(0,3100))); assertEquals(0,env.transportCloses); assertEquals(0,env.catalogue.closes.get());
+            assertTrue(fake.allFencedAtClose);
+        }
+    }
+    @Test void wrongSnapshotHomeClusterOrDatabaseFailsBeforeAnyNodeBootstrapWrite() throws Exception {
+        try (var env=new Env(root)) {
+            for (boolean cluster:new boolean[]{false,true}) try (var reader=new SnapshotReader(env.plan.directory(),cluster ? new UUID(0,3101) : env.outer.cluster,cluster ? env.outer.database : new UUID(0,3102))) {
+                var fake=new FakeServer();
+                assertThrows(IllegalArgumentException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake,reader.homes));
+                assertFalse(fake.created); assertEquals(0,reader.closes); assertNull(reader.homes.read(new UUID(0,3100)));
+                try (var files=Files.list(env.nodeRoot)) { assertTrue(files.findAny().isEmpty(),"Binding must fail before lock, identity, Raft or native bootstrap files are created"); }
+            }
+        }
+    }
+    @Test void ordinaryConvenienceLeavesSnapshotHomeReaderUnconfiguredOnAllRoles() throws Exception {
+        try (var env=new Env(root,true)) {
+            var fake=new FakeServer();
+            try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake)) {
+                for (var machine:fake.machines.values()) { assertEquals("NEW",machine.getLifeCycleState().name()); assertNull(snapshotHomes(machine)); }
+                node.start(); assertTrue(node.started());
+            }
+        }
+    }
+    private static Object snapshotHomes(RatisRangeStateMachine machine) throws ReflectiveOperationException {
+        var field=RatisRangeStateMachine.class.getDeclaredField("snapshotHomes"); field.setAccessible(true); return field.get(machine);
+    }
+    /** A separate borrowed home directory can have another data domain and schema while sharing cluster/database identity. */
+    static final class SnapshotReader implements AutoCloseable {
+        final RatisRoutedClient routed; final RatisSnapshotFences homes; int closes;
+        SnapshotReader(RangeDirectory source,UUID cluster,UUID database) {
+            UUID column=new UUID(0,3110),group=new UUID(0,3111); byte[] schema=new byte[32]; schema[0]=9;
+            var route=new RangeDescriptor(group,group,3,0,null,null,RangeDescriptor.TopologyState.ACTIVE,source.ranges().getFirst().replicas());
+            var directory=new RangeDirectory(cluster,database,new UUID(0,3112),17,schema,0,Set.of(column),0,List.of(route));
+            routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor descriptor,UUID requestedColumn,byte[] key) { assertEquals(column,requestedColumn); return null; }
+                public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { throw new AssertionError("Read-only home fixture"); }
+                public void close() { closes++; }
+            }); homes=new RatisSnapshotFences(routed,column);
+        }
+        @Override public void close() throws Exception { routed.close(); }
+    }
     static final class Env implements AutoCloseable {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest(); final RatisSessionEpochsTest.Fixture catalogue;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"node-runtime-test");
@@ -218,10 +280,13 @@ class RatisNodeRuntimeTest {
             });
             nodeRoot=Files.createDirectory(root.resolve("node"));
         }
-        RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake) throws IOException {
-            var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),
+        RatisNodeRuntime.Settings settings() {
+            return new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),
                     Duration.ofSeconds(1),1,2,Duration.ofMillis(100));
-            return RatisNodeRuntime.open(plan,nodeRoot,ConfigParser.parseDefault(),catalogue.epochs,routed,scheduler,timer,() -> 20L,settings,startup,fake::create);
+        }
+        RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake) throws IOException { return open(startup,fake,null); }
+        RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake,RatisSnapshotFences snapshotHomes) throws IOException {
+            return RatisNodeRuntime.open(plan,nodeRoot,ConfigParser.parseDefault(),catalogue.epochs,routed,scheduler,timer,() -> 20L,settings(),startup,fake::create,null,snapshotHomes);
         }
         public void close() throws Exception {
             if (resourcesTransferred) catalogue.pool.close();
@@ -279,6 +344,7 @@ class RatisNodeRuntimeTest {
             }); return server;
         }
         void initialize(RaftGroup group) throws Exception {
+            if (storages.containsKey(group.getGroupId())) return;
             var storage=RaftStorage.newBuilder().setDirectory(logs.resolve(group.getGroupId().getUuid().toString()).toFile()).setOption(RaftStorage.StartupOption.RECOVER)
                     .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
                     .setLogCorruptionPolicy(RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build(); storage.initialize(); storages.put(group.getGroupId(),storage);
