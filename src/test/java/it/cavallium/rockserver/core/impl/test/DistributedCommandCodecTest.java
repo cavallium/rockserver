@@ -322,6 +322,28 @@ class DistributedCommandCodecTest {
         assertThrows(IllegalArgumentException.class, () -> DistributedCommandCodec.decode(Arrays.copyOf(encoded,encoded.length+1)));
     }
 
+    @Test void coarseEpochFenceHasCanonicalControlShapeAndPreservesV3Identity() {
+        var ack = new DistributedCommand(GROUP,9,new byte[32],OPERATION,List.of(),List.of(),7);
+        assertEquals("ebeeafc5863ab7d561993812bf4ca4e678710abca99ae429cbc612df89c75e75",HexFormat.of().formatHex(ack.payloadDigest()));
+        for (long floor : new long[]{0,7}) {
+            var control = DistributedCommand.advanceSessionEpochFloor(GROUP,9,new byte[32],OPERATION,floor);
+            var encoded = DistributedCommandCodec.encode(control);
+            assertEquals(108,encoded.length); assertEquals(4,control.formatVersion());
+            var decoded = DistributedCommandCodec.decode(encoded);
+            assertEquals(floor,decoded.minimumSessionEpoch()); assertEquals(-1,decoded.acknowledgedThrough());
+            assertArrayEquals(encoded,DistributedCommandCodec.encode(decoded));
+            assertArrayEquals(control.payloadDigest(),decoded.payloadDigest());
+            for (int n=0;n<encoded.length;n++) {
+                byte[] truncated = Arrays.copyOf(encoded,n);
+                assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(truncated));
+            }
+        }
+        for (long floor : new long[]{-1,8,Long.MAX_VALUE}) {
+            assertThrows(IllegalArgumentException.class,() -> DistributedCommand.advanceSessionEpochFloor(GROUP,9,new byte[32],OPERATION,floor));
+        }
+        assertDoesNotThrow(() -> DistributedCommand.advanceSessionEpochFloor(GROUP,9,new byte[32],new OperationId(OPERATION.sessionId(),Long.MAX_VALUE,0),Long.MAX_VALUE));
+    }
+
     @Test void acknowledgementHeaderConsumesTheExistingEncodedByteBudget() {
         int payload = DistributedCommandCodec.MAX_ENCODED_BYTES - 108 - 26;
         var exact = new DistributedCommand(GROUP,9,new byte[32],OPERATION,

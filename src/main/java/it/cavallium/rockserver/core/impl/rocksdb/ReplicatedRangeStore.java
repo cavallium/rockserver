@@ -265,8 +265,9 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             requireActive();
-            long currentFloor = acknowledgedThrough(command.operationId(), null);
-            if (command.operationId().sequence() <= currentFloor) {
+            long currentEpochFloor = minimumSessionEpoch(null);
+            long currentFloor = command.operationId().epoch() < currentEpochFloor ? -1 : acknowledgedThrough(command.operationId(), null);
+            if (command.operationId().epoch() < currentEpochFloor || command.operationId().sequence() <= currentFloor) {
                 if (applied == null || position.index() > applied.index()) {
                     requireNext(position);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(false)) {
@@ -302,6 +303,9 @@ public final class ReplicatedRangeStore {
                             case MERGE -> batch.merge(cf, mutation.key(), mutation.value());
                             case DELETE_RANGE -> batch.deleteRange(cf, mutation.key(), mutation.value());
                         }
+                    }
+                    if (command.minimumSessionEpoch() > currentEpochFloor) {
+                        batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(command.minimumSessionEpoch()).array());
                     }
                     if (command.acknowledgedThrough() > currentFloor) {
                         long floor = command.acknowledgedThrough();
@@ -549,7 +553,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
-            if (id.sequence() <= acknowledgedThrough(id, null)) return expiredResult();
+            if (id.epoch() < minimumSessionEpoch(null) || id.sequence() <= acknowledgedThrough(id, null)) return expiredResult();
             byte[] saved = db.get(receipts, receiptKey(id));
             return saved == null ? null : decodeReceipt(saved, payloadDigest);
         } finally { applyLane.unlock(); }
@@ -773,7 +777,7 @@ public final class ReplicatedRangeStore {
             try {
                 try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
                     if (payloadDigest.length != 32) throw new IllegalArgumentException("Invalid payload digest");
-                    if (id.sequence() <= acknowledgedThrough(id, options)) return expiredResult();
+                    if (id.epoch() < minimumSessionEpoch(options) || id.sequence() <= acknowledgedThrough(id, options)) return expiredResult();
                     byte[] saved = db.get(receipts, options, receiptKey(id));
                     return saved == null ? null : decodeReceipt(saved, payloadDigest);
                 }
@@ -834,10 +838,30 @@ public final class ReplicatedRangeStore {
             } finally { releaseUse(); }
         }
         public void visitState(SnapshotVisitor visitor) throws RocksDBException, IOException {
-            visit(state, markerKey, null, markerKey, visitor);
+            acquireUse();
+            try (var options = new ReadOptions().setSnapshot(snapshot)) {
+                long minimum = minimumSessionEpoch(options);
+                visit(state, markerKey, null, markerKey, (key, value) -> {
+                    if (key.length == 41 && key[16] == 2) {
+                        long epoch = ByteBuffer.wrap(key,33,8).getLong();
+                        if (epoch >= 0 && epoch < minimum) return;
+                    }
+                    visitor.accept(key,value);
+                });
+            } finally { releaseUse(); }
         }
         public void visitReceipts(SnapshotVisitor visitor) throws RocksDBException, IOException {
-            visit(receipts, markerKey, null, markerKey, visitor);
+            acquireUse();
+            try (var options = new ReadOptions().setSnapshot(snapshot)) {
+                long minimum = minimumSessionEpoch(options);
+                visit(receipts, markerKey, null, markerKey, (key, value) -> {
+                    if (key.length == 48) {
+                        long epoch = ByteBuffer.wrap(key,32,8).getLong();
+                        if (epoch >= 0 && epoch < minimum) return;
+                    }
+                    visitor.accept(key,value);
+                });
+            } finally { releaseUse(); }
         }
         private void visit(ColumnFamilyHandle cf, byte[] lower, byte[] upper, byte[] prefix, SnapshotVisitor visitor)
                 throws RocksDBException, IOException {
@@ -903,6 +927,108 @@ public final class ReplicatedRangeStore {
         if (next.index() != expected || (applied != null && next.term() < applied.term())) {
             throw new IllegalStateException("Noncontiguous or regressing committed apply: " + next);
         }
+    }
+
+    /** Immutable local progress; no native pin/iterator survives between reclamation pages. */
+    public final class ReclamationCursor {
+        private final long cutoff, generation;
+        private final int phase;
+        private final byte[] after;
+        private ReclamationCursor(long cutoff, long generation, int phase, byte[] after) {
+            this.cutoff = cutoff; this.generation = generation; this.phase = phase;
+            this.after = after == null ? null : after.clone();
+        }
+        public long minimumEpoch() { return cutoff; }
+        private boolean belongsTo(ReplicatedRangeStore store) { return ReplicatedRangeStore.this == store; }
+    }
+    public record ReclamationPage(long minimumEpoch, ReclamationCursor continuation,
+                                  int examined, int deleted, long scannedBytes) {}
+
+    /** Physical garbage collection after a committed epoch fence; never advances A or changes user data. */
+    public ReclamationPage reclaimExpiredSessions(ReclamationCursor cursor, int rowLimit, int byteLimit) throws RocksDBException {
+        if (rowLimit < 1 || rowLimit > 4096 || byteLimit < 1 || byteLimit > 8 * 1024 * 1024) {
+            throw new IllegalArgumentException("Invalid session reclamation budget");
+        }
+        enterNative();
+        applyLane.lock();
+        try {
+            requireActive();
+            long minimum = minimumSessionEpoch(null);
+            if (cursor != null && (!cursor.belongsTo(this) || cursor.generation != installationGeneration || cursor.cutoff > minimum)) {
+                throw new IllegalArgumentException("Session reclamation cursor lost its floor or owner");
+            }
+            long cutoff = cursor == null ? minimum : cursor.cutoff;
+            long generation = installationGeneration;
+            if (cutoff == 0) return new ReclamationPage(0,null,0,0,0);
+            int phase = cursor == null ? 0 : cursor.phase;
+            byte[] after = cursor == null ? null : cursor.after;
+            // Persist the fence before any local deletion can become durable without it.
+            if (cursor == null) db.flushWal(true);
+            int examined = 0, deleted = 0;
+            long bytes = 0;
+            try (var batch = new WriteBatch(); var write = new WriteOptions().setDisableWAL(false).setSync(false)) {
+                while (phase < 2 && examined < rowLimit) {
+                    byte[] prefix = phase == 0 ? ByteBuffer.allocate(17).put(markerKey).put((byte)2).array() : markerKey;
+                    byte[] end = prefixEnd(prefix);
+                    var cf = phase == 0 ? state : receipts;
+                    try (var lower = new org.rocksdb.Slice(prefix); var upper = end == null ? null : new org.rocksdb.Slice(end);
+                            var options = new ReadOptions().setFillCache(false).setIterateLowerBound(lower)) {
+                        if (upper != null) options.setIterateUpperBound(upper);
+                        try (var iterator = db.newIterator(cf,options)) {
+                            byte[] sizing = new byte[0];
+                            if (after == null) iterator.seek(prefix);
+                            else {
+                                iterator.seek(after);
+                                if (iterator.isValid() && iterator.key(sizing) == after.length && Arrays.equals(iterator.key(),after)) iterator.next();
+                            }
+                            while (iterator.isValid() && examined < rowLimit) {
+                                int keyBytes = iterator.key(sizing), valueBytes = iterator.value(sizing);
+                                if (keyBytes != (phase == 0 ? 41 : 48) || valueBytes < 0) {
+                                    throw new IllegalStateException("Invalid session reclamation metadata shape");
+                                }
+                                long needed = (long)keyBytes + valueBytes;
+                                if (needed > byteLimit - bytes) {
+                                    if (examined == 0) throw new IllegalArgumentException("Session reclamation needs at least " + needed + " bytes");
+                                    break;
+                                }
+                                byte[] key = iterator.key();
+                                long epoch = ByteBuffer.wrap(key,phase == 0 ? 33 : 32,8).getLong();
+                                if (epoch < 0) throw new IllegalStateException("Invalid reclamation session epoch");
+                                if (epoch < cutoff) { batch.delete(cf,key); deleted++; }
+                                examined++; bytes += needed; after = key;
+                                iterator.next();
+                            }
+                            iterator.status();
+                            if (iterator.isValid()) break; // row/byte budget exhausted; continue this phase later
+                        }
+                    }
+                    phase++; after = null;
+                }
+                if (deleted != 0) db.write(write,batch);
+            }
+            return new ReclamationPage(cutoff,phase == 2 ? null : new ReclamationCursor(cutoff,generation,phase,after),
+                    examined,deleted,bytes);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    private static byte[] prefixEnd(byte[] prefix) {
+        byte[] end = prefix.clone();
+        int i = end.length - 1;
+        while (i >= 0 && Byte.toUnsignedInt(end[i]) == 255) i--;
+        if (i < 0) return null;
+        end[i]++;
+        return Arrays.copyOf(end,i+1);
+    }
+
+    private byte[] epochFloorKey() { return ByteBuffer.allocate(17).put(uuidBytes(groupId)).put((byte) 3).array(); }
+    private long minimumSessionEpoch(ReadOptions options) throws RocksDBException {
+        byte[] value = options == null ? db.get(state, epochFloorKey()) : db.get(state, options, epochFloorKey());
+        if (value == null) return 0;
+        if (value.length != 12) throw new IllegalStateException("Invalid session epoch floor");
+        var input = ByteBuffer.wrap(value);
+        if (input.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported session epoch floor version");
+        long floor = input.getLong();
+        if (floor < 0) throw new IllegalStateException("Invalid session epoch floor");
+        return floor;
     }
 
     private static byte[] expiredResult() {

@@ -14,6 +14,7 @@ public final class DistributedCommand {
     private final List<Mutation> mutations;
     private final List<KeyPredicate> predicates;
     private final long acknowledgedThrough;
+    private final long minimumSessionEpoch;
 
     public DistributedCommand(UUID groupId, long rangeEpoch, byte[] schemaDigest,
                               OperationId operationId, List<Mutation> mutations) {
@@ -31,6 +32,12 @@ public final class DistributedCommand {
         this(3, groupId, rangeEpoch, schemaDigest, operationId, mutations, predicates, acknowledgedThrough);
     }
 
+    /** Committed administrative fence; admission must obtain catalogue lifetime authority. */
+    public static DistributedCommand advanceSessionEpochFloor(UUID groupId, long rangeEpoch, byte[] schemaDigest,
+                                                               OperationId operationId, long minimumEpoch) {
+        return new DistributedCommand(4, groupId, rangeEpoch, schemaDigest, operationId, List.of(), List.of(), -1, minimumEpoch);
+    }
+
     // Decoding retains the original version, including legacy payload/receipt identity.
     DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
                        OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates) {
@@ -40,7 +47,13 @@ public final class DistributedCommand {
     DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
                        OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates,
                        long acknowledgedThrough) {
-        if (formatVersion < 1 || formatVersion > 3) throw new IllegalArgumentException("Unsupported command version");
+        this(formatVersion, groupId, rangeEpoch, schemaDigest, operationId, mutations, predicates, acknowledgedThrough, -1);
+    }
+
+    DistributedCommand(int formatVersion, UUID groupId, long rangeEpoch, byte[] schemaDigest,
+                       OperationId operationId, List<Mutation> mutations, List<KeyPredicate> predicates,
+                       long acknowledgedThrough, long minimumSessionEpoch) {
+        if (formatVersion < 1 || formatVersion > 4) throw new IllegalArgumentException("Unsupported command version");
         this.formatVersion = formatVersion;
         this.groupId = Objects.requireNonNull(groupId, "groupId");
         if (rangeEpoch < 0) throw new IllegalArgumentException("Range epoch must be nonnegative");
@@ -51,7 +64,9 @@ public final class DistributedCommand {
         Objects.requireNonNull(mutations, "mutations");
         Objects.requireNonNull(predicates, "predicates");
         if ((formatVersion == 3 ? acknowledgedThrough < 0 || acknowledgedThrough >= operationId.sequence() : acknowledgedThrough != -1)
-                || (mutations.isEmpty() && (formatVersion != 3 || !predicates.isEmpty()))
+                || (formatVersion == 4 ? minimumSessionEpoch < 0 || operationId.epoch() < minimumSessionEpoch
+                        || !mutations.isEmpty() || !predicates.isEmpty() : minimumSessionEpoch != -1)
+                || (mutations.isEmpty() && ((formatVersion != 3 && formatVersion != 4) || !predicates.isEmpty()))
                 || (long) mutations.size() + predicates.size() > DistributedCommandCodec.MAX_ITEMS
                 || (formatVersion == 1 && !predicates.isEmpty())) {
             throw new IllegalArgumentException("Invalid command items or acknowledgement; v1 has no predicates");
@@ -59,6 +74,7 @@ public final class DistributedCommand {
         this.mutations = List.copyOf(mutations);
         this.predicates = List.copyOf(predicates);
         this.acknowledgedThrough = acknowledgedThrough;
+        this.minimumSessionEpoch = minimumSessionEpoch;
         long size = DistributedCommandCodec.headerBytes(formatVersion);
         for (Mutation mutation : this.mutations) size += mutation.encodedSize();
         for (KeyPredicate predicate : this.predicates) size += predicate.encodedSize();
@@ -78,6 +94,8 @@ public final class DistributedCommand {
     public List<KeyPredicate> predicates() { return predicates; }
     /** -1 for legacy commands without an acknowledgement. */
     public long acknowledgedThrough() { return acknowledgedThrough; }
+    /** -1 unless this is an administrative v4 epoch-floor command. */
+    public long minimumSessionEpoch() { return minimumSessionEpoch; }
     /** SHA-256 of the entire canonical encoding, including identity and ordered operands. */
     public byte[] payloadDigest() { return DistributedCommandCodec.digest(this); }
 }

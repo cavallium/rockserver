@@ -332,6 +332,11 @@ public final class NativeRangeImage {
                         || !Arrays.equals(key, 0, groupPrefix.length, groupPrefix, 0, groupPrefix.length)) {
                     throw new IOException("Wrong image group metadata prefix");
                 }
+                if (section == Section.STATE && key.length > 16 && key[16] == 3) {
+                    if (key.length != 17 || value.length != 12) throw new IOException("Invalid image epoch floor shape");
+                    var epochValue = ByteBuffer.wrap(value);
+                    if (epochValue.getInt() != 1 || epochValue.getLong() < 0) throw new IOException("Invalid image epoch floor");
+                }
                 if (section == Section.STATE && key.length > 16 && key[16] == 2) {
                     if (key.length != 41 || value.length != 12 || ByteBuffer.wrap(key, 33, 8).getLong() < 0) {
                         throw new IOException("Invalid image session floor shape");

@@ -569,6 +569,11 @@ class ReplicatedRangeStoreTest {
                 assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,neverSubmitted));
                 assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(pool.store.apply(new ApplyPosition(1,5),neverSubmitted)).status());
                 assertArrayEquals(bytes("old"),pool.db.get(pool.handles.get(1),bytes("a")));
+                pool.store.apply(new ApplyPosition(1,6),DistributedCommand.advanceSessionEpochFloor(GROUP,1,new byte[32],new OperationId(UUID.randomUUID(),4,0),2));
+                var cleaned = pool.store.reclaimExpiredSessions(null,4096,8*1024*1024);
+                assertNull(cleaned.continuation());
+                assertEquals(CommandResult.Status.SUCCESS,status(other,neighborGroup),"Another group's old epoch remains live");
+                assertEquals(CommandResult.Status.SUCCESS,status(pool.store,neighborEpoch));
             } finally { assertTrue(other.close(Duration.ofSeconds(10))); }
         }
     }
@@ -601,6 +606,88 @@ class ReplicatedRangeStoreTest {
             for (var result : results) assertTrue(Set.of(CommandResult.Status.SUCCESS,CommandResult.Status.SESSION_EXPIRED).contains(result.get(5,TimeUnit.SECONDS)));
             gc.get(5,TimeUnit.SECONDS);
             assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,first));
+        }
+    }
+
+    @Test void coarseFenceCleanupIsBoundedAndDoesNotChangeLogicalImageOrUserData() throws Exception {
+        var limits = new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.Limits(2*1024*1024,16*1024*1024,2);
+        var admin = new UUID(0,1);
+        var old = command(0,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("old")));
+        var ack = ack(1,0,List.of(),List.of());
+        var live = new DistributedCommand(GROUP,1,new byte[32],new OperationId(SESSION,2,0),
+                List.of(new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("live"))));
+        try (Pool pool = new Pool(path)) {
+            pool.store.apply(new ApplyPosition(1,0),old); pool.store.apply(new ApplyPosition(1,1),ack);
+            pool.store.apply(new ApplyPosition(1,2),live);
+            try (var oldCut = pool.store.capture()) {
+                var fence = DistributedCommand.advanceSessionEpochFloor(GROUP,1,new byte[32],new OperationId(admin,4,0),2);
+                var original = pool.store.apply(new ApplyPosition(1,3),fence);
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,ack));
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(oldCut.operationResult(ack.operationId(),ack.payloadDigest())).status());
+                Path before = path.resolve("before-clean.image"), after = path.resolve("after-clean.image");
+                try (var pin = pool.store.capture()) { it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.write(before,pin,pin.interval(),limits); }
+                assertThrows(IllegalArgumentException.class,() -> pool.store.reclaimExpiredSessions(null,1,52));
+                var page = pool.store.reclaimExpiredSessions(null,1,53);
+                assertEquals(1,page.examined()); assertEquals(1,page.deleted()); assertEquals(53,page.scannedBytes());
+                assertNotNull(page.continuation());
+                int scanned = page.examined(), deleted = page.deleted(), pages = 1;
+                while (page.continuation()!=null) {
+                    page = pool.store.reclaimExpiredSessions(page.continuation(),1,1024);
+                    assertTrue(page.examined()<=1); scanned+=page.examined(); deleted+=page.deleted();
+                    assertTrue(++pages<10);
+                }
+                assertEquals(4,scanned); assertEquals(2,deleted);
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(oldCut.operationResult(ack.operationId(),ack.payloadDigest())).status(),
+                        "Pre-fence native pin retains the physically collected receipt");
+                assertEquals(new ApplyPosition(1,3),pool.store.applied());
+                try (var pin = pool.store.capture()) { it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.write(after,pin,pin.interval(),limits); }
+                assertArrayEquals(Files.readAllBytes(before),Files.readAllBytes(after));
+                try (Pool target = new Pool(path.resolve("epoch-target"))) {
+                    target.store.fence(); target.store.installSnapshot(after,limits); target.store.activate();
+                    assertEquals(CommandResult.Status.SESSION_EXPIRED,status(target.store,ack));
+                    assertEquals(CommandResult.Status.SUCCESS,status(target.store,live));
+                    assertArrayEquals(bytes("old,live"),target.db.get(target.handles.get(1),bytes("k")));
+                }
+                assertEquals(CommandResult.Status.SUCCESS,status(pool.store,live));
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,ack));
+                assertArrayEquals(bytes("old,live"),pool.db.get(pool.handles.get(1),bytes("k")));
+                assertArrayEquals(original,pool.store.apply(new ApplyPosition(1,4),fence));
+                var regressive = DistributedCommand.advanceSessionEpochFloor(GROUP,1,new byte[32],new OperationId(admin,4,1),1);
+                pool.store.apply(new ApplyPosition(1,5),regressive);
+                var oldEpochNewSequence = command(99,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("never")));
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(pool.store.apply(new ApplyPosition(1,6),oldEpochNewSequence)).status());
+                assertArrayEquals(bytes("old,live"),pool.db.get(pool.handles.get(1),bytes("k")));
+            }
+        }
+        try (Pool reopened = new Pool(path)) {
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,status(reopened.store,ack));
+            assertEquals(CommandResult.Status.SUCCESS,status(reopened.store,live));
+            var page = reopened.store.reclaimExpiredSessions(null,4096,8*1024*1024);
+            assertNull(page.continuation()); assertEquals(0,page.deleted());
+        }
+    }
+
+    @Test void cleanupKeepsFixedCutoffAcrossNewFenceAndRejectsCursorAfterImageInstall() throws Exception {
+        var limits = new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.Limits(2*1024*1024,16*1024*1024,2);
+        var admin = new UUID(0,1); Path oldImage = path.resolve("old-cut.image");
+        try (Pool pool = new Pool(path)) {
+            var old = command(0,new Mutation(Mutation.Kind.PUT,B,bytes("k"),bytes("value")));
+            pool.store.apply(new ApplyPosition(1,0),old);
+            pool.store.apply(new ApplyPosition(1,1),ack(1,0,List.of(),List.of()));
+            var epoch2 = new DistributedCommand(GROUP,1,new byte[32],new OperationId(SESSION,2,0),
+                    List.of(new Mutation(Mutation.Kind.PUT,B,bytes("k"),bytes("two"))));
+            pool.store.apply(new ApplyPosition(1,2),epoch2);
+            try (var pin = pool.store.capture()) { it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.write(oldImage,pin,pin.interval(),limits); }
+            pool.store.apply(new ApplyPosition(1,3),DistributedCommand.advanceSessionEpochFloor(GROUP,1,new byte[32],new OperationId(admin,4,0),2));
+            var page = pool.store.reclaimExpiredSessions(null,1,1024); var stale = page.continuation();
+            pool.store.apply(new ApplyPosition(1,4),DistributedCommand.advanceSessionEpochFloor(GROUP,1,new byte[32],new OperationId(admin,4,1),3));
+            while (page.continuation()!=null) page = pool.store.reclaimExpiredSessions(page.continuation(),1,1024);
+            assertEquals(2,page.minimumEpoch());
+            var later = pool.store.reclaimExpiredSessions(null,4096,8*1024*1024);
+            assertEquals(3,later.minimumEpoch()); assertEquals(1,later.deleted());
+            pool.store.fence(); pool.store.installSnapshot(oldImage,limits); pool.store.activate();
+            assertThrows(IllegalArgumentException.class,() -> pool.store.reclaimExpiredSessions(stale,1,1024));
+            assertEquals(CommandResult.Status.SUCCESS,status(pool.store,epoch2));
         }
     }
 

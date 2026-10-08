@@ -93,7 +93,7 @@ public final class RatisCatalogue {
                     || !Arrays.equals(command.schemaDigest(), digest)) {
                 throw new IllegalArgumentException("Wrong catalogue identity/schema");
             }
-            if (command.acknowledgedThrough() >= 0 && command.mutations().isEmpty() && command.predicates().isEmpty()) return;
+            if ((command.acknowledgedThrough() >= 0 || command.minimumSessionEpoch() >= 0) && command.mutations().isEmpty() && command.predicates().isEmpty()) return;
             if (command.mutations().size() != 1 || command.predicates().size() != 1) {
                 throw new IllegalArgumentException("Catalogue requires one conditional directory replacement");
             }

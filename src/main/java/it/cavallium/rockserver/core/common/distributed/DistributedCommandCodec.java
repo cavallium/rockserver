@@ -7,7 +7,7 @@ import java.util.ArrayList;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Canonical big-endian v1/v2/v3 encoding; decoded legacy commands retain their original bytes/hash. */
+/** Canonical big-endian v1/v2/v3/v4 encoding; decoded legacy commands retain their original bytes/hash. */
 public final class DistributedCommandCodec {
     public static final int FORMAT_VERSION = 2;
     public static final int MAX_ITEMS = 256;
@@ -17,7 +17,7 @@ public final class DistributedCommandCodec {
     static final int HEADER_BYTES = 4 + 16 + 8 + 32 + 16 + 8 + 8 + 4;
 
     private DistributedCommandCodec() {}
-    static int headerBytes(int version) { return HEADER_BYTES + (version >= 2 ? 4 : 0) + (version == 3 ? 8 : 0); }
+    static int headerBytes(int version) { return HEADER_BYTES + (version >= 2 ? 4 : 0) + (version >= 3 ? 8 : 0); }
 
     public static byte[] encode(DistributedCommand command) {
         Objects.requireNonNull(command, "command");
@@ -33,6 +33,7 @@ public final class DistributedCommandCodec {
         output.putInt(command.mutations().size());
         if (command.formatVersion() >= 2) output.putInt(command.predicates().size());
         if (command.formatVersion() == 3) output.putLong(command.acknowledgedThrough());
+        if (command.formatVersion() == 4) output.putLong(command.minimumSessionEpoch());
         for (Mutation mutation : command.mutations()) {
             output.put((byte) switch (mutation.kind()) {
                 case PUT -> 1; case DELETE -> 2; case MERGE -> 3; case DELETE_RANGE -> 4;
@@ -65,7 +66,7 @@ public final class DistributedCommandCodec {
         }
         ByteBuffer input = ByteBuffer.wrap(encoded);
         int version = input.getInt();
-        if (version < 1 || version > 3) throw new IllegalArgumentException("Unsupported command version");
+        if (version < 1 || version > 4) throw new IllegalArgumentException("Unsupported command version");
         if (encoded.length < headerBytes(version)) throw new IllegalArgumentException("Truncated command header");
         UUID group = getUuid(input);
         long rangeEpoch = input.getLong();
@@ -75,6 +76,7 @@ public final class DistributedCommandCodec {
         int count = input.getInt();
         int predicateCount = version >= 2 ? input.getInt() : 0;
         long acknowledgedThrough = version == 3 ? input.getLong() : -1;
+        long minimumEpoch = version == 4 ? input.getLong() : -1;
         if (count < 0 || predicateCount < 0 || (long) count + predicateCount > MAX_ITEMS
                 || 26L * count + 25L * predicateCount > input.remaining()) {
             throw new IllegalArgumentException("Invalid command item counts");
@@ -131,7 +133,7 @@ public final class DistributedCommandCodec {
             predicates.add(new KeyPredicate(column, key, expected));
         }
         if (input.hasRemaining()) throw new IllegalArgumentException("Trailing command bytes");
-        return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates, acknowledgedThrough);
+        return new DistributedCommand(version, group, rangeEpoch, schema, operation, mutations, predicates, acknowledgedThrough, minimumEpoch);
     }
 
     static byte[] digest(DistributedCommand command) {

@@ -654,3 +654,67 @@ lineage transfer and rolling v3 feature negotiation remain required. Unacknowled
 receipts and floor records are not yet given a complete retention bound. Frontend
 and public Java/Rust/Thrift session/status APIs are also still pending. Next is
 expiry/coarse-floor state and bounded reclamation, preserving this replay fence.
+
+
+## Coarse session epoch fences and bounded local reclamation
+
+Command v4 is an explicit control-only `minimumSessionEpoch` fence. Its issuer
+must belong to a surviving epoch; it has no data mutations, predicates or ACK.
+Old constructors remain v2 and v1/v2/v3 bytes/hashes remain unchanged. Applying a
+new control atomically saves a monotonic group-wide tag3 floor, its original
+receipt and A. Identities from lower epochs return SESSION_EXPIRED before any
+sequence-floor/hash/business lookup; duplicates preserve original outcomes and
+regressive controls cannot lower the fence.
+
+New v4 proposals require a separate admission-only lifetime-authority callback,
+which rejects them by default. The catalogue's structural validator recognizes
+the envelope, but mutable authority never runs during committed follower apply
+or replay. Already saved outcomes and fenced identities need no new authority
+because they cannot advance the floor. Catalogue epoch issuance/lifetime proof is
+not yet implemented, so default runtime activation remains disabled. No arbitrary
+coarse-floor preparation helper was added to the routed client.
+
+`reclaimExpiredSessions` is local physical maintenance, with immutable store-bound
+progress and fixed cutoff, an installation-generation check on every page,
+exclusive last-scanned-key continuation, and aggregate ceilings of 4,096 scanned
+rows and 8 MiB scanned key/value payload per call across both phases. Retained
+rows count against both budgets. Receipt values are sized without copying them.
+Only this group's tag2 floors and receipt prefix are touched; data, marker,
+configuration, tag3 and other metadata remain intact. A first-page WAL force
+persists the fence before deletion can become durable; subsequent pages reuse
+that barrier only in the same installation. Failed pages publish no progress.
+An older sweep keeps its cutoff if a newer fence arrives; a later sweep collects
+the newly obsolete epochs. Reopen restarts cleanup from the beginning safely.
+
+Native image export filters obsolete metadata using the pin's own epoch fence.
+Cleanup therefore preserves the exact logical image bytes at one A. Old native
+pins retain physically deleted receipts; new images preserve the fence on fresh
+installation. Restoring an image invalidates old maintenance cursors, preventing
+them from deleting records made live by recovery at an earlier cut. This is local
+recovery mechanics; exposing a restored range still requires the adapter's full
+committed-tail/ownership readiness protocol.
+
+The combined ordinary gate passes 53 core/native, 16 read-round and 20 adapter
+cases, Maven exit zero: `/tmp/rockserver-epoch-floor-full-gate.log`. Added coverage
+checks v1–v3 identity, v4 shape/issuer bounds, bounded scan/deleted-key/skipped-row
+continuation, byte-limit retry, image-byte identity, reopen, newer floor during a
+sweep, stale cursor after installation and neighboring-group isolation. The final
+targeted gate passes 24 native plus one adapter case:
+`/tmp/rockserver-epoch-floor-install-final-gate.log`; updated assertions prove
+old-pin survival, fresh image install, mutable authority changing before apply,
+committed follower replay and duplicate proposal outcome without reauthorization.
+Unchanged full-gate cases remain reusable. The native-stream warning is the
+previously observed io_uring ENOMEM fallback, with no failed assertions.
+
+No fuzzing, security work, traffic-isolation exercises, network probes, server
+process or density fixtures, or paused-registry validation ran. No main-checkout
+changes, push, publication, deployment or production action occurred.
+
+This implements coarse fencing and reclamation mechanics for a fixed group.
+Catalogue lifetime authority, automatic scheduled reclamation/pressure integration,
+outstanding receipt-count/result-byte admission, rolling feature activation and
+lineage transfer remain required. Native WAL ordering and reopen checks do not
+establish power-loss acceptance. The full distributed goal remains incomplete,
+including bootstrap/frontend/API routing, shared node resources, term-bound
+transactions/reservations, 2PC/snapshot fences, dynamic topology, long workflows
+and representative equal-durability performance.

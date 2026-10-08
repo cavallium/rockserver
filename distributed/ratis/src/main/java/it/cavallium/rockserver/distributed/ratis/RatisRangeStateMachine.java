@@ -42,6 +42,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 public final class RatisRangeStateMachine extends BaseStateMachine {
     private final ReplicatedRangeStore store;
     private final Consumer<DistributedCommand> commandValidator;
+    private final Consumer<DistributedCommand> epochFloorAdmission;
     private volatile Throwable storageFailure;
     private final HashMap<OperationId, Admission> admissions = new HashMap<>();
     private long admittedBytes;
@@ -81,7 +82,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     /** Deterministic envelope validation, repeated on every replica before native apply. */
     public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
             Consumer<DistributedCommand> commandValidator) {
+        this(store, initialGroup, limits, commandValidator, command -> {
+            throw new IllegalStateException("Session epoch floors require catalogue lifetime authority");
+        });
+    }
+
+    /** Authority is checked only at proposal admission; committed replay remains deterministic. */
+    public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission) {
         this.commandValidator = java.util.Objects.requireNonNull(commandValidator);
+        this.epochFloorAdmission = java.util.Objects.requireNonNull(epochFloorAdmission);
         this.store = java.util.Objects.requireNonNull(store);
         this.initialGroup = java.util.Objects.requireNonNull(initialGroup);
         this.limits = java.util.Objects.requireNonNull(limits);
@@ -449,7 +459,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             // advanced while reading, retry validation before acquiring ownership.
             for (int attempt = 0; attempt < 3; attempt++) {
                 var observed = store.applied();
-                store.operationResult(command.operationId(), digest);
+                byte[] saved = store.operationResult(command.operationId(), digest);
+                // Previously committed outcomes and expired identities cannot advance the fence.
+                if (saved == null && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
                 synchronized (admissions) {
                     if (!java.util.Objects.equals(observed, store.applied())) continue;
                     var admission = admissions.get(command.operationId());
