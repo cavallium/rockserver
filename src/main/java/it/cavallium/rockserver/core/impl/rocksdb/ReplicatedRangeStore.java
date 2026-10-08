@@ -7,6 +7,7 @@ import it.cavallium.rockserver.core.common.distributed.ParticipantVote;
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.CommittedParticipant;
 import it.cavallium.rockserver.core.common.distributed.ParticipantOutcome;
+import it.cavallium.rockserver.core.common.distributed.TransactionStatus;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
 import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
@@ -381,6 +382,48 @@ public final class ReplicatedRangeStore {
         if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command);
     }
 
+    public record FinalizationEstimate(PreparedCapacity capacity,boolean newFence,ApplyPosition existing) {}
+    /** Admission observes terminal ownership/capacity at one completed cut; no old business grant is required. */
+    public FinalizationEstimate estimateFinalization(ParticipantFinalization finalization) throws RocksDBException {
+        Objects.requireNonNull(finalization); enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireFinalization(finalization);
+            var commit=committedIndex.get(finalization.transactionId()); var abort=abortedIndex.get(finalization.transactionId());
+            if (commit!=null || abort!=null) {
+                var saved=commit!=null ? commit.finalization() : abort.finalization();
+                if (!saved.equals(finalization)) throw new IllegalArgumentException("Finalization intent changed");
+                return new FinalizationEstimate(preparedCapacityUnderLane(),false,commit!=null ? commit.position() : abort.position());
+            }
+            var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(finalization.transactionId())).findFirst().orElse(null);
+            if (prepared!=null) finalization.requirePrepared(prepared);
+            else if (finalization.decision().phase()==TransactionStatus.Phase.COMMIT || finalization.participant().prepared()!=null) throw new IllegalStateException("Finalization requires missing native preparation");
+            for (var p:preparedIndex.records()) if (p!=prepared && (p.preparation().ownsOperation(finalization.operation()) || p.preparation().ownsOperation(finalization.decision().operation()))) throw new IllegalArgumentException("Finalization identity belongs to another preparation");
+            for (var other:abortedIndex.values()) if (other.ownsOperation(finalization.operation()) || other.ownsOperation(finalization.decision().operation())) throw new IllegalArgumentException("Finalization identity belongs to another ABORT");
+            for (var other:committedIndex.values()) if (other.ownsOperation(finalization.operation()) || other.ownsOperation(finalization.decision().operation())) throw new IllegalArgumentException("Finalization identity belongs to another COMMIT");
+            if (db.get(receipts,receiptKey(finalization.operation()))!=null || db.get(receipts,receiptKey(finalization.decision().operation()))!=null) throw new IllegalArgumentException("Finalization identity already has an ordinary receipt");
+            var capacity=preparedCapacityUnderLane(); boolean newFence=prepared==null;
+            if (newFence && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("Finalization capacity exhausted");
+            return new FinalizationEstimate(capacity,newFence,null);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Exact committed-native proof is available while fenced, before activation after image install. */
+    public ApplyPosition recoveredFinalization(ParticipantFinalization expected) throws RocksDBException {
+        Objects.requireNonNull(expected); enterNative(); applyLane.lock();
+        try { return readFinalizationPosition(expected,null,applied); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    private ApplyPosition readFinalizationPosition(ParticipantFinalization expected,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        byte[] committed=options==null ? db.get(state,committedKey(expected.transactionId())) : db.get(state,options,committedKey(expected.transactionId()));
+        byte[] aborted=options==null ? db.get(state,abortedKey(expected.transactionId())) : db.get(state,options,abortedKey(expected.transactionId()));
+        if (committed!=null && aborted!=null) throw new IllegalArgumentException("Conflicting native finalization decisions");
+        if (committed==null && aborted==null) return null;
+        ParticipantFinalization actual; ApplyPosition position;
+        if (committed!=null) { var receipt=CommittedParticipant.decode(committed); actual=receipt.finalization(); position=receipt.position(); }
+        else { var receipt=AbortedParticipant.decode(aborted); actual=receipt.finalization(); position=receipt.position(); }
+        requireFinalization(actual);
+        if (!actual.equals(expected) || cut==null || position.index()>cut.index() || position.term()>cut.term()) throw new IllegalArgumentException("Native finalization proof differs");
+        return position;
+    }
     private boolean isFinalized(UUID transaction) { return abortedIndex.containsKey(transaction) || committedIndex.containsKey(transaction); }
     private byte[] committedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x22).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
     private Map<UUID,CommittedParticipant> loadCommittedIndex() {
@@ -1668,6 +1711,11 @@ public final class ReplicatedRangeStore {
             } finally {
                 releaseUse();
             }
+        }
+        public ApplyPosition finalizationPosition(ParticipantFinalization expected) throws RocksDBException {
+            Objects.requireNonNull(expected); acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) { return readFinalizationPosition(expected,options,position); }
+            finally { releaseUse(); }
         }
         public ParticipantVote preparationVote(PreparedParticipant.Preparation expected) throws RocksDBException {
             var prepared=preparedParticipant(expected.transactionId()); if (prepared!=null) { if (!prepared.preparation().equals(expected)) throw new IllegalArgumentException("Prepared snapshot payload changed"); return ParticipantVote.prepared(prepared.position()); }

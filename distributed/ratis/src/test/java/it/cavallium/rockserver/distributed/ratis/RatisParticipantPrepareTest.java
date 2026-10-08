@@ -281,6 +281,15 @@ class RatisParticipantPrepareTest {
                     assertThrows(IOException.class,() -> routed.read(column,new byte[]{1})); assertThrows(IOException.class,() -> routed.read(column,new byte[]{(byte)130}));
                     try (var raw=left.f.store.capture()) { assertNull(raw.get(column,new byte[]{1})); }
                     try (var raw=right.f.store.capture()) { assertNull(raw.get(column,new byte[]{(byte)130})); }
+                    try (var lf=left.f.machine.prepareFinalization(home.statuses,registration.transactionId(),new OperationId(new UUID(0,901),2,0)); var rf=right.f.machine.prepareFinalization(home.statuses,registration.transactionId(),new OperationId(new UUID(0,902),2,0))) {
+                        routed.executeFinalization(routed.prepareFinalization(lf.finalization())); assertArrayEquals(new byte[]{7},routed.read(column,new byte[]{1}));
+                        assertThrows(IOException.class,() -> routed.read(column,new byte[]{(byte)130}));
+                        routed.executeFinalization(routed.prepareFinalization(rf.finalization())); assertArrayEquals(new byte[]{8},routed.read(column,new byte[]{(byte)130}));
+                        assertNotNull(routed.finalizedParticipant(l.groupId(),registration.transactionId())); assertNotNull(routed.finalizedParticipant(r.groupId(),registration.transactionId()));
+                        var ackLeft=commit.finalized(l.groupId()); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,900),1,4),commit,ackLeft));
+                        var ackBoth=ackLeft.finalized(r.groupId()); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,900),1,5),ackLeft,ackBoth)); assertTrue(ackBoth.fullyFinalized());
+                        var consumed=ackBoth.consume(); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,900),1,6),ackBoth,consumed)); assertTrue(home.statuses.read(registration.transactionId()).gcEligible());
+                    }
                     released(left); released(right);
                 }
             }

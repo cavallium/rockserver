@@ -2,6 +2,7 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
+import it.cavallium.rockserver.core.common.distributed.ParticipantFinalization;
 import it.cavallium.rockserver.core.common.distributed.TransactionStatus;
 import it.cavallium.rockserver.core.common.distributed.RangeMutationHistory;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
@@ -111,6 +112,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         final ByteString rejectionLogData;
         PreparedParticipant.Preparation participant;
         ParticipantHold participantHold;
+        ParticipantFinalization finalization;
+        FinalizationHold finalizationHold;
         boolean retentionReleased,maybeAppended,settled;
         int owners = 1;
         Admission(OperationId id, byte[] digest, int bytes, long term, long generation,
@@ -133,14 +136,26 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private final HashMap<OperationId,PreparingCommit> preparingCommits=new HashMap<>();
     private static final class ParticipantHold {
-        final OperationId control,business; final long scopeBytes; long bytes; boolean released;
-        ParticipantHold(OperationId control,OperationId business,long bytes,long scopeBytes) { this.control=control; this.business=business; this.bytes=bytes; this.scopeBytes=scopeBytes; }
+        final OperationId control,business; final UUID transaction; final long scopeBytes; long bytes;
+        boolean released,capacityReleased; int finalizers; PreparedParticipant.Preparation preparation;
+        ParticipantHold(UUID transaction,OperationId control,OperationId business,long bytes,long scopeBytes) { this.transaction=transaction; this.control=control; this.business=business; this.bytes=bytes; this.scopeBytes=scopeBytes; }
     }
     private record PreparingParticipant(ProposalReservation reservation,ParticipantHold hold) {}
     private final HashMap<OperationId,PreparingParticipant> preparingParticipants=new HashMap<>();
     private final HashMap<OperationId,ParticipantProposal> preparedParticipants=new HashMap<>();
     private final HashMap<OperationId,ParticipantHold> participantOwners=new HashMap<>();
     private long reservedParticipantCount,reservedParticipantBytes,reservedParticipantScopeBytes;
+    private static final class FinalizationHold {
+        final UUID transaction; final OperationId recovery; final long term,generation;
+        OperationId business; ParticipantHold shared; boolean capacity,released;
+        FinalizationHold(UUID transaction,OperationId recovery,long term,long generation) { this.transaction=transaction; this.recovery=recovery; this.term=term; this.generation=generation; }
+    }
+    private final HashMap<OperationId,FinalizationHold> finalizationOwners=new HashMap<>();
+    private final HashMap<UUID,FinalizationHold> finalizingTransactions=new HashMap<>();
+    private final HashMap<OperationId,FinalizationHold> preparingFinalizations=new HashMap<>();
+    private final HashMap<OperationId,FinalizationProposal> preparedFinalizations=new HashMap<>();
+    private long reservedFinalizationCount,reservedFinalizationBytes;
+    private int protectedFinalizationSlots;
     private long preparedCommitBytes;
     private ProposalFootprints.CandidateLease exclusiveMetadataCandidate;
     private final Object gate = new Object();
@@ -609,7 +624,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray();
-            if (RatisParticipantRecord.isParticipant(encoded)) return startParticipant(transaction,encoded,generation,leadership);
+            if (RatisParticipantRecord.isParticipant(encoded)) return RatisParticipantRecord.isFinalization(encoded) ? startFinalization(transaction,encoded,generation,leadership) : startParticipant(transaction,encoded,generation,leadership);
             var command = DistributedCommandCodec.decode(encoded);
             if (command.transactionRejection()) throw new IllegalArgumentException("Internal rejection records cannot be submitted by clients");
             commandValidator.accept(command);
@@ -640,7 +655,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if (!store.admissionOpen()) throw new IllegalStateException("Native range admission is closed");
                     if (!java.util.Objects.equals(observed, store.applied())) continue;
                     reconcileOlderProposalTerms(leadership.term());
-                    if (participantOwners.containsKey(command.operationId())) throw new IllegalStateException("Operation identity belongs to participant preparation");
+                    if (finalizationOwners.containsKey(command.operationId()) || participantOwners.containsKey(command.operationId())) throw new IllegalStateException("Operation identity belongs to participant preparation");
                     var known=admissions.get(command.operationId());
                     if (known!=null && !estimate.newReceipt()) settleAdmission(known);
                     var admission = admissions.get(command.operationId());
@@ -668,7 +683,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         if (estimate.newReceipt() && (command.acceptance()==null || reject) && estimate.maintenance() && proposalFootprints.stats().candidates()>0) throw new IllegalStateException("Transaction reservations hold session metadata stable");
                         boolean maintenance = estimate.newReceipt() && estimate.maintenance();
                         boolean protectedControl = estimate.maintenance() && command.mutations().isEmpty() && command.predicates().isEmpty();
-                        if (protectedControl ? protectedAdmissions >= 16
+                        if (protectedControl ? protectedAdmissions+protectedFinalizationSlots >= 16
                                 : dataAdmissions >= 1024 || dataProposalBytes + encoded.length > 16L * 1024 * 1024) {
                             throw new IllegalStateException("Range proposal budget exhausted");
                         }
@@ -744,16 +759,25 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     private record AppliedRecord(OperationId operation,byte[] result) {}
-    private AppliedRecord applyRecord(ApplyPosition position,byte[] encoded) throws Exception {
+    private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
+        if (RatisParticipantRecord.isFinalization(encoded)) {
+            var finalization=RatisParticipantRecord.decodeFinalization(encoded);
+            var position=finalization.decision().phase()==TransactionStatus.Phase.COMMIT ? store.applyCommit(positionArg,finalization).position() : store.applyAbort(positionArg,finalization).position();
+            return new AppliedRecord(finalization.operation(),RatisParticipantRecord.result(position));
+        }
         if (RatisParticipantRecord.isParticipant(encoded)) {
             var preparation=RatisParticipantRecord.decode(encoded); commandValidator.accept(preparation.business());
-            var record=store.applyPrepared(position,preparation);
+            var record=store.applyPrepared(positionArg,preparation);
             return new AppliedRecord(preparation.operation(),RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded); commandValidator.accept(command);
-        return new AppliedRecord(command.operationId(),store.apply(position,command));
+        return new AppliedRecord(command.operationId(),store.apply(positionArg,command));
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
+        if (RatisParticipantRecord.isFinalization(encoded)) {
+            var finalization=RatisParticipantRecord.decodeFinalization(encoded); var position=store.recoveredFinalization(finalization);
+            return new AppliedRecord(finalization.operation(),position==null ? null : RatisParticipantRecord.result(position));
+        }
         if (RatisParticipantRecord.isParticipant(encoded)) {
             var preparation=RatisParticipantRecord.decode(encoded); var record=store.recoveredPreparationVote(preparation);
             return new AppliedRecord(preparation.operation(),record==null ? null : RatisParticipantRecord.result(record));
@@ -846,7 +870,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void releaseFootprint(Admission admission) {
         if (admission.footprint!=null) proposalFootprints.release(admission.footprint);
         if (admission.acceptedScope!=null) proposalFootprints.release(admission.acceptedScope);
-        if (admission.participantHold!=null) releaseParticipantHold(admission.participantHold);
+        if (admission.participantHold!=null) releaseParticipantHold(admission.participantHold,admission.settled);
+        if (admission.finalizationHold!=null) releaseFinalizationHold(admission.finalizationHold,admission.settled);
     }
     // Recovery reads one exact native cut outside the admissions monitor. Unknown suffixes remain reserved.
     private List<Admission> verifiedNativeAdmissionOutcomes() throws Exception {
@@ -856,7 +881,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try (var pin=store.capture()) {
             for (var admission:pending) {
                 try {
-                    if (admission.participant==null) { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
+                    if (admission.finalization!=null) { if (pin.finalizationPosition(admission.finalization)!=null) verified.add(admission); }
+                    else if (admission.participant==null) { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
                     else { var vote=pin.preparationVote(admission.participant); if (vote!=null) verified.add(admission); }
                 }
                 catch (IllegalArgumentException differentPayload) { /* A mismatched speculative request is not verified coverage. */ }
@@ -871,6 +897,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         preparedCommits.clear();
         for (var plan:preparedParticipants.values()) { plan.closed=true; preparedCommitBytes-=plan.bytes.length; releaseParticipantHold(plan.hold); }
         preparedParticipants.clear();
+        for (var plan:List.copyOf(preparedFinalizations.values())) plan.close();
         // Invalidated native planners still own their input/result payloads until their finally exits.
     }
     /** Only a strictly newer ready native term proves an older term's unknown suffix can no longer interpose. */
@@ -921,6 +948,95 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
         }
     }
+    public final class FinalizationProposal implements AutoCloseable {
+        private final FinalizationHold hold; private final ParticipantFinalization finalization; private final byte[] bytes,digest;
+        private boolean claimed,closed;
+        private FinalizationProposal(FinalizationHold hold,ParticipantFinalization finalization) { this.hold=hold; this.finalization=finalization; bytes=RatisParticipantRecord.encode(finalization); digest=RatisParticipantRecord.digest(finalization); }
+        public ParticipantFinalization finalization() { return finalization; }
+        public byte[] bytes() { return bytes.clone(); }
+        private boolean authorized() { var a=store.applied(); return !closed && !claimed && hold.generation==admissionGeneration.get() && a!=null && a.term()==hold.term && store.admissionOpen(); }
+        @Override public void close() {
+            synchronized (admissions) {
+                if (closed || claimed) return; closed=true;
+                if (preparedFinalizations.remove(hold.recovery,this)) { protectedFinalizationSlots--; releaseFinalizationHold(hold,false); }
+            }
+        }
+    }
+    /** Privileged coordinator seam. Bounded protected capacity is held while the fresh home read is in flight. */
+    public FinalizationProposal prepareFinalization(RatisTransactionStatuses homes,UUID transaction,OperationId recovery) throws Exception {
+        java.util.Objects.requireNonNull(homes); java.util.Objects.requireNonNull(transaction); java.util.Objects.requireNonNull(recovery);
+        requireHealthy(); long generation=admissionGeneration.get(); var leader=leadership(); if (!leader.ready()) throw new IllegalStateException("Finalization leader is not ready");
+        FinalizationHold hold;
+        synchronized (admissions) {
+            requireHealthy(); var a=store.applied();
+            if (generation!=admissionGeneration.get() || a==null || a.term()!=leader.term() || !store.admissionOpen()) throw new IllegalStateException("Finalization has no current native owner");
+            reconcileOlderProposalTerms(leader.term());
+            if (protectedAdmissions+protectedFinalizationSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+            if (participantIdentityBusy(recovery) || finalizingTransactions.containsKey(transaction)) throw new IllegalStateException("Finalization identity/transaction is already owned");
+            hold=new FinalizationHold(transaction,recovery,leader.term(),generation); preparingFinalizations.put(recovery,hold); finalizingTransactions.put(transaction,hold); finalizationOwners.put(recovery,hold); protectedFinalizationSlots++;
+        }
+        boolean retained=false;
+        try {
+            var finalization=homes.readFinalization(transaction,store.ownership().owner().groupId(),recovery);
+            for (int attempt=0;attempt<3;attempt++) {
+                var estimate=store.estimateFinalization(finalization); var capacity=estimate.capacity();
+                synchronized (admissions) {
+                    requireHealthy();
+                    if (hold.generation!=admissionGeneration.get() || preparingFinalizations.get(recovery)!=hold || capacity.position()==null || capacity.position().term()!=hold.term || !store.admissionOpen()) throw new IllegalStateException("Finalization lost its acceptance owner");
+                    if (!java.util.Objects.equals(capacity.position(),store.applied())) continue;
+                    var business=finalization.decision().operation();
+                    if (finalizationOwners.containsKey(business) || preparedCommits.containsKey(business) || preparingCommits.containsKey(business)) throw new IllegalStateException("Finalization business identity belongs to other work");
+                    var pending=admissions.get(business);
+                    if (pending!=null && (pending.participant==null || !pending.participant.transactionId().equals(transaction))) throw new IllegalStateException("Business operation is still settling outside this transaction");
+                    var shared=participantOwners.get(business);
+                    if (shared!=null) {
+                        if (!shared.transaction.equals(transaction)) throw new IllegalArgumentException("Finalization shares another transaction's identity");
+                        if (shared.preparation!=null) finalization.requirePreparation(shared.preparation);
+                    }
+                    if (estimate.newFence()) {
+                        if (shared!=null && !shared.capacityReleased) { shared.finalizers++; hold.shared=shared; }
+                        else {
+                            if (capacity.count()+reservedParticipantCount+reservedFinalizationCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || ReplicatedRangeStore.FINALIZATION_RESERVATION>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes-reservedFinalizationBytes) throw new IllegalStateException("Finalization fence reservation exhausted");
+                            hold.capacity=true; reservedFinalizationCount++; reservedFinalizationBytes+=ReplicatedRangeStore.FINALIZATION_RESERVATION;
+                        }
+                    }
+                    hold.business=business; finalizationOwners.put(business,hold);
+                    var proposal=new FinalizationProposal(hold,finalization); preparedFinalizations.put(recovery,proposal); preparingFinalizations.remove(recovery,hold); retained=true; return proposal;
+                }
+            }
+            throw new IllegalStateException("Native finalization cut kept changing");
+        } finally {
+            synchronized (admissions) { if (!retained && preparingFinalizations.remove(recovery,hold)) { protectedFinalizationSlots--; releaseFinalizationHold(hold,false); } }
+        }
+    }
+    private TransactionContext startFinalization(TransactionContext transaction,byte[] encoded,long generation,Leadership leadership) throws Exception {
+        var finalization=RatisParticipantRecord.decodeFinalization(encoded); byte[] digest=RatisParticipantRecord.digest(finalization);
+        for (int attempt=0;attempt<3;attempt++) {
+            var estimate=store.estimateFinalization(finalization); var observed=estimate.capacity().position();
+            if (observed==null || observed.term()!=leadership.term()) throw new IllegalStateException("Finalization native prefix is not ready");
+            synchronized (admissions) {
+                requireHealthy(); if (generation!=admissionGeneration.get() || !store.admissionOpen()) throw new IllegalStateException("Finalization owner changed");
+                if (!java.util.Objects.equals(observed,store.applied())) continue; reconcileOlderProposalTerms(leadership.term());
+                var known=admissions.get(finalization.operation());
+                if (known!=null && !Arrays.equals(known.digest,digest)) throw new IllegalArgumentException("Finalization identity payload changed");
+                if (known!=null && estimate.existing()!=null) { settleAdmission(known); known=admissions.get(finalization.operation()); }
+                if (known!=null) {
+                    if (known.finalization==null || known.term!=leadership.term() || known.generation!=generation) throw new IllegalStateException("Previous finalization is still settling");
+                    known.owners++; transaction.setStateMachineContext(known); return transaction;
+                }
+                var accepted=estimate.existing()==null ? preparedFinalizations.get(finalization.operation()) : null;
+                if (estimate.existing()==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Finalization has no fresh home acceptance authority");
+                if (protectedAdmissions+protectedFinalizationSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                var admission=new Admission(finalization.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,true,null,null,null);
+                admission.finalization=finalization; admission.finalizationHold=accepted==null ? null : accepted.hold; admissions.put(admission.id,admission);
+                if (accepted!=null) { accepted.claimed=true; preparedFinalizations.remove(admission.id,accepted); protectedFinalizationSlots--; }
+                protectedAdmissions++; admittedBytes+=admission.bytes; transaction.setStateMachineContext(admission); return transaction;
+            }
+        }
+        throw new IllegalStateException("Native finalization cut changed during append admission");
+    }
+    public int protectedFinalizationSlots() { synchronized (admissions) { return protectedFinalizationSlots; } }
+    public long reservedFinalizationCount() { synchronized (admissions) { return reservedFinalizationCount; } }
     public final class ParticipantProposal implements AutoCloseable {
         private final ProposalReservation reservation; private final ParticipantHold hold;
         private final PreparedParticipant.Preparation preparation; private final byte[] bytes,digest; private final ProposalDeadline deadline;
@@ -940,13 +1056,24 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
         }
     }
-    private void releaseParticipantHold(ParticipantHold hold) {
+    private void releaseParticipantHold(ParticipantHold hold) { releaseParticipantHold(hold,false); }
+    private void releaseParticipantHold(ParticipantHold hold,boolean covered) {
+        hold.released=true; finishParticipantHold(hold,covered);
+    }
+    private void finishParticipantHold(ParticipantHold hold,boolean covered) {
+        if (!hold.capacityReleased && (covered || hold.released && hold.finalizers==0)) {
+            hold.capacityReleased=true; reservedParticipantCount--; reservedParticipantBytes-=hold.bytes; reservedParticipantScopeBytes-=hold.scopeBytes;
+        }
+        if (hold.released && hold.finalizers==0) { participantOwners.remove(hold.control,hold); participantOwners.remove(hold.business,hold); }
+    }
+    private void releaseFinalizationHold(FinalizationHold hold,boolean covered) {
         if (hold.released) return; hold.released=true;
-        participantOwners.remove(hold.control,hold); participantOwners.remove(hold.business,hold);
-        reservedParticipantCount--; reservedParticipantBytes-=hold.bytes; reservedParticipantScopeBytes-=hold.scopeBytes;
+        finalizationOwners.remove(hold.recovery,hold); if (hold.business!=null) finalizationOwners.remove(hold.business,hold); finalizingTransactions.remove(hold.transaction,hold);
+        if (hold.capacity) { reservedFinalizationCount--; reservedFinalizationBytes-=ReplicatedRangeStore.FINALIZATION_RESERVATION; }
+        if (hold.shared!=null) { var shared=hold.shared; hold.shared=null; shared.finalizers--; finishParticipantHold(shared,covered); }
     }
     private boolean participantIdentityBusy(OperationId id) {
-        return participantOwners.containsKey(id) || admissions.containsKey(id) || preparedCommits.containsKey(id) || preparingCommits.containsKey(id);
+        return finalizationOwners.containsKey(id) || participantOwners.containsKey(id) || admissions.containsKey(id) || preparedCommits.containsKey(id) || preparingCommits.containsKey(id);
     }
     /** Freeze the original read cut/scope/result before registering the home; it is never rebased during PREPARE. */
     public byte[] participantPlanDigest(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception {
@@ -976,10 +1103,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if (!java.util.Objects.equals(capacity.position(),store.applied())) continue;
                     if (participantIdentityBusy(control) || participantIdentityBusy(business.operationId())) throw new IllegalStateException("Participant operation identity is already owned");
                     long scope=RangeMutationHistory.accountedScopeBytes(pin.scope()), maximum=49L+PreparedParticipant.Preparation.MAX_BYTES+ReplicatedRangeStore.FINALIZATION_RESERVATION;
-                    if (capacity.count()+reservedParticipantCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || maximum>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes
+                    if (capacity.count()+reservedParticipantCount+reservedFinalizationCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || maximum>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes-reservedFinalizationBytes
                             || scope>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.scopeBytes()-reservedParticipantScopeBytes
                             || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Participant staged capacity exhausted");
-                    var hold=new ParticipantHold(control,business.operationId(),maximum,scope); preparing=new PreparingParticipant(reservation,hold);
+                    var hold=new ParticipantHold(transaction,control,business.operationId(),maximum,scope); preparing=new PreparingParticipant(reservation,hold);
                     preparingParticipants.put(control,preparing); participantOwners.put(control,hold); participantOwners.put(hold.business,hold);
                     reservedParticipantCount++; reservedParticipantBytes+=maximum; reservedParticipantScopeBytes+=scope; preparedCommitBytes+=DistributedCommandCodec.MAX_ENCODED_BYTES;
                 }
@@ -992,11 +1119,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var preparation=new PreparedParticipant.Preparation(home.groupId(),home.rangeEpoch(),control,registration,accepted);
             store.estimatePreparation(preparation); // Reject an unbound/fenced control owner before closing the caller's read cut.
             var plan=new ParticipantProposal(reservation,preparing.hold(),preparation,deadline);
+            synchronized (admissions) { preparing.hold().preparation=preparation; }
             pin.close();
             synchronized (admissions) {
                 requireHealthy(); if (!plan.authorized() || preparingParticipants.get(control)!=preparing) throw new IllegalStateException("Participant lost acceptance ownership");
                 long actual=49L+preparation.encode().length+ReplicatedRangeStore.FINALIZATION_RESERVATION;
-                reservedParticipantBytes+=actual-plan.hold.bytes; plan.hold.bytes=actual;
+                if (!plan.hold.capacityReleased) reservedParticipantBytes+=actual-plan.hold.bytes; plan.hold.bytes=actual;
                 preparedCommitBytes+=plan.bytes.length-DistributedCommandCodec.MAX_ENCODED_BYTES;
                 preparedParticipants.put(control,plan); preparingParticipants.remove(control,preparing);
             }
@@ -1059,7 +1187,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try {
             synchronized (admissions) {
                 if (!reservation.active() || deadline!=null && !deadline.active() || pin.position().term()!=reservation.term()) throw new IllegalStateException("Transaction snapshot changed leadership or expired");
-                if (participantOwners.containsKey(command.operationId()) || admissions.containsKey(command.operationId()) || preparedCommits.containsKey(command.operationId()) || preparingCommits.containsKey(command.operationId())) throw new IllegalStateException("Operation identity already owns a proposal");
+                if (finalizationOwners.containsKey(command.operationId()) || participantOwners.containsKey(command.operationId()) || admissions.containsKey(command.operationId()) || preparedCommits.containsKey(command.operationId()) || preparingCommits.containsKey(command.operationId())) throw new IllegalStateException("Operation identity already owns a proposal");
                 if (preparingCommits.size()+preparedCommits.size()>=64 || preparing.bytes>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Preparing command byte/count budget exhausted");
                 if (command.acknowledgedThrough()>=0) {
                     if (proposalFootprints.stats().candidates()!=1) throw new IllegalStateException("Acknowledging transaction lost exclusive session metadata ownership");

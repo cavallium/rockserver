@@ -122,8 +122,8 @@ does not establish complete distributed API parity or production acceptance.
   transaction-record consumption. Recovery CAS operations have their own identity
   and epoch; they do not replace the frozen business identity.
   This is a home-record kernel, not complete 2PC: reports are not self-verifying
-  participant proofs. Protected status-role activation, Raft FINALIZE admission,
-  recovery scheduling and coordinator integration remain.
+  participant proofs. Protected status-role activation, recovery scheduling and
+  durable coordinator integration remain.
 - Finalization intents capture a fresh terminal home decision and its route together.
   Their canonical binding retains the frozen definition, chosen COMMIT/ABORT and
   prepare vote positions, while excluding later home generations, ACKs and client
@@ -131,7 +131,7 @@ does not establish complete distributed API parity or production acceptance.
   preparation checks the original home, full definition and exact recorded vote;
   ABORT without a vote also matches an applied but unreported prepare. Decision bytes
   do not independently prove read provenance; the adapter must retain the verified
-  read authority through submission. Raft FINALIZE submission is still missing.
+  read authority through submission.
 - The native participant substrate now installs an immutable accepted business plan,
   frozen home/participant binding, complete exclusive scope and stable prepare
   position in the internal state CF, atomically with completed A and accounting.
@@ -155,8 +155,8 @@ does not establish complete distributed API parity or production acceptance.
   image installation and receipt GC. Recovery and pinned lookup recognize either
   vote so snapshot-covered and uncertain admissions can settle. Image and activation
   validation check the shared operation namespace and distinguish active locks from
-  retained aborted plans. This native seam has no public Raft FINALIZE envelope or
-  admission authority yet; the controlled test forces its committed ordering directly.
+  retained aborted plans. Native fixtures force this ordering directly; the Raft
+  FINALIZE path described below now supplies admission authority for append.
 - The trusted committed-native COMMIT seam verifies the exact native prepare vote
   against the immutable home decision, then atomically installs ordered raw/bucket/
   range-delete/native-merge effects, the finalization receipt, completed marker and
@@ -168,8 +168,8 @@ does not establish complete distributed API parity or production acceptance.
   PREPARE evidence also remains unchanged after finalization. COMMIT and ABORT cannot
   coexist; recovery/image validation require the retained matching plan and disjoint
   operation identities. Finalized plans may overlap new active scopes regardless of
-  UUID order. This seam still requires a Raft FINALIZE envelope/admission path and
-  coordinator integration; it is not complete distributed transaction acceptance.
+  UUID order. Raft FINALIZE now connects this native seam to append admission, while
+  durable coordinator integration remains unfinished.
 - Transaction-home and preparation records use one current encoding without format
   release markers or compatibility readers.
 - The Raft participant PREPARE path reserves both control/business identities, durable
@@ -183,7 +183,28 @@ does not establish complete distributed API parity or production acceptance.
   A fresh linearizable participant-state query survives response loss and control-session
   receipt GC. The routed client freezes exact bytes and the original descriptor for
   retry, but callers must durably retain them; a multi-group coordinator journal is
-  still missing. Raft FINALIZE admission and coordinator integration remain unfinished.
+  still missing. Durable coordinator integration remains unfinished.
+- The current FINALIZE record carries the verified immutable home decision and its
+  independent recovery identity in at most 8,010 encoded bytes. A privileged leader
+  coordinator reserves a protected input slot before the fresh home read, validates
+  native terminal ownership/capacity at one completed cut, and rechecks that cut and
+  term/generation before publishing exact accepted bytes. New records without that
+  live authority reject before append; exact native receipt evidence permits retry.
+  FINALIZE shares the sixteen-entry protected lane with metadata controls and uses
+  neither ordinary receipt quota nor volatile scope candidates. Native prepared locks
+  protect COMMIT; ABORT installs its durable fence ahead of late PREPARE. Frozen client
+  bytes and original descriptors survive retries and route refresh, but callers still
+  must journal them durably before the first RPC.
+  PREPARE and FINALIZE share one capacity hold for their transaction when necessary.
+  Separate idempotent owner tokens prevent closing PREPARE from donating its slot.
+  Verified native publication transfers that charge to durable metadata once, while
+  remaining tokens retain identity ownership. A blocked invalidated home read retains
+  its protected slot until actual return. Submitted unknown finalizers retain their
+  ownership through response loss and same-term invalidation; exact native proof or
+  a completed newer term establishes settlement. Covered-snapshot recovery settles
+  the same holds before completing deferred duplicate suffixes. Applied replies retain
+  the first finalization position; the client requires it to follow any registered
+  prepare vote. The routed terminal query supplies saved results.
 - Fresh terminal-outcome queries return one native cut containing the immutable
   COMMIT/ABORT binding, first finalization position, optional original prepare vote,
   and COMMIT-only retained business result. ABORT-before-PREPARE initially has no
@@ -332,6 +353,25 @@ Independent read-only review found no concrete issue at this query boundary. Fin
 writes still enter through trusted native seams in these fixtures; this gate does not
 establish Raft FINALIZE admission or a complete coordinator workflow.
 
+The protected FINALIZE regression gate passed 55 core and 97 adapter cases (152
+total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-finalize-admission-regression.log`. The preceding focused gate passed
+15 core and 22 adapter cases (37 total): `/tmp/rockserver-finalize-admission3.log`.
+Eight new controlled fixtures cover lost replies and exact frozen-route retries,
+expired business/recovery grants, COMMIT and both ABORT orders, 63 durable plus one
+pending preparation with shared capacity retained after close, ABORT overtaking a
+blocked prepare planner, uncertain late PREPARE, full 1,024-entry user admission plus
+an overlapping candidate, blocked invalidated home reads, same-term unknown suffixes
+and newer completed terms, and snapshot-covered finalization with deferred duplicates.
+Independent read-only review found no concrete remaining issue in this seam. One
+fixture initially tried SESSION_FLOOR while PREPARE still held its metadata guard;
+that expected rejection was corrected by moving the floor after finalization/close.
+After dropping the settled finalizer's reference to its former shared payload hold
+and adding reply-position binding to the registered vote, the final lifecycle
+selection passed 23 adapter cases, zero failures/errors/skips, exit zero:
+`/tmp/rockserver-finalize-admission-final2.log`.
+No real network, server process or quorum acceptance is claimed.
+
 The exercised native preparation cases cover unchanged user values, complete read/
 absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
 planning/admission rejection, stable duplicate prepare positions, separate ordinary
@@ -339,10 +379,12 @@ receipt accounting, session-floor independence, count capacity, native pool reop
 portable image installation and corrupt-record fencing. Controlled Raft fixtures
 also cover lost replies, both identity reservations, capacity held during blocked
 home reads, invalidation, frozen route restoration, snapshot-covered deferred apply,
-unknown same-term suffixes and fresh-only state queries. Two data groups report
-actual controlled applied votes to a home before COMMIT; user effects deliberately
-remain unapplied and finalization remains incomplete. These fixtures do not establish
-participant quorum behavior or a complete distributed transaction workflow.
+unknown same-term suffixes and fresh-only state queries. Two data groups now report
+actual controlled applied votes to a home, choose COMMIT, apply both Raft FINALIZEs,
+ACK each participant and consume the home record. While only one group is finalized,
+the other's lock prevents stale user reads. Both values become readable after local
+finalization. This establishes the exercised protocol path, not participant quorum
+behavior, an automatic durable coordinator or the public transaction frontend.
 
 The exercised native/controlled-dispatch workflows include OPEN/read/STAGE/PLAN,
 forced acceptance before submission, applied native outcomes, lost PLAN/commit
@@ -384,8 +426,8 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Raft FINALIZE envelope/admission; protected status-group
-  node/pool activation, durable coordinator journaling, full 2PC recovery and consistent
+- Protected status-group node/pool activation, durable coordinator journaling,
+  automatic full 2PC recovery and consistent
   multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
   establish these.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,

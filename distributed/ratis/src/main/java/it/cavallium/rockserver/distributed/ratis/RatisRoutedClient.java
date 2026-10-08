@@ -54,6 +54,34 @@ public final class RatisRoutedClient implements AutoCloseable {
         public DistributedCommand command() { return command; }
     }
 
+    public static final class PreparedFinalizationOperation {
+        private final RangeDirectory source; private final RangeDescriptor descriptor; private final ParticipantFinalization finalization; private final byte[] bytes;
+        private PreparedFinalizationOperation(RangeDirectory source,RangeDescriptor descriptor,ParticipantFinalization finalization) { this.source=source; this.descriptor=descriptor; this.finalization=finalization; bytes=RatisParticipantRecord.encode(finalization); }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public ParticipantFinalization finalization() { return finalization; }
+        public byte[] bytes() { return bytes.clone(); }
+    }
+    /** Retain exact bytes and original route durably before the first FINALIZE write RPC. */
+    public PreparedFinalizationOperation prepareFinalization(ParticipantFinalization finalization) {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(finalization.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Finalization route absent"));
+        return restoreFinalization(finalization,descriptor);
+    }
+    public PreparedFinalizationOperation restoreFinalization(ParticipantFinalization finalization,RangeDescriptor descriptor) {
+        var observed=current(); var registered=finalization.participant(); var decision=finalization.decision();
+        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || !descriptor.groupId().equals(registered.groupId()) || !descriptor.rangeId().equals(registered.rangeId()) || descriptor.rangeEpoch()!=registered.rangeEpoch()
+                || !Arrays.equals(observed.schemaDigest(),registered.schemaDigest()) || !observed.domainId().equals(decision.domainId()) || !observed.clusterId().equals(decision.clusterId()) || !observed.databaseId().equals(decision.databaseId())) throw new IllegalArgumentException("Finalization route differs from frozen participant");
+        return new PreparedFinalizationOperation(identity,descriptor,finalization);
+    }
+    public ApplyPosition executeFinalization(PreparedFinalizationOperation operation) throws IOException {
+        java.util.Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
+        try {
+            var position=RatisParticipantRecord.finalizationResult(transport.participant(operation.descriptor,operation.bytes)); var vote=operation.finalization.participant().prepared();
+            if (vote!=null && (position.term()<vote.term() || position.index()<=vote.index())) throw new IllegalArgumentException("Finalization reply does not follow its prepared vote");
+            return position;
+        }
+        catch (IllegalArgumentException malformed) { throw new IOException("Invalid finalization applied reply",malformed); }
+        finally { endCall(); }
+    }
     public static final class PreparedParticipantOperation {
         private final RangeDirectory source; private final RangeDescriptor descriptor; private final PreparedParticipant.Preparation preparation; private final byte[] bytes;
         private PreparedParticipantOperation(RangeDirectory source,RangeDescriptor descriptor,PreparedParticipant.Preparation preparation) { this.source=source; this.descriptor=descriptor; this.preparation=preparation; bytes=RatisParticipantRecord.encode(preparation); }
