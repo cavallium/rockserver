@@ -24,6 +24,12 @@ public final class RatisTransactionStatuses {
         try { var status=TransactionStatus.decode(bytes); requireIdentity(status,cluster,database,key(transaction)); return new RegistrationRead(status,read.descriptor()); }
         catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction home record",malformed); }
     }
+    /** Fresh committed decision and home authority captured by the same read; does not submit FINALIZE. */
+    public ParticipantFinalization readFinalization(UUID transaction,UUID participant,OperationId recovery) throws IOException {
+        var read=readRegistration(transaction);
+        if (read.status()==null || read.status().phase()==TransactionStatus.Phase.PREPARING) throw new IOException("Home has no terminal decision");
+        return new ParticipantFinalization(read.descriptor().groupId(),read.descriptor().rangeEpoch(),participant,recovery,read.status());
+    }
     /** Each transition has its own caller-owned operation identity. An uncertain retry retains this exact command.
      * After a confirmed conflict, read the home again and use a new CAS operation identity. */
     public RatisRoutedClient.PreparedCommand prepare(OperationId operation,TransactionStatus expected,TransactionStatus next) {

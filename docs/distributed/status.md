@@ -124,6 +124,15 @@ does not establish complete distributed API parity or production acceptance.
   This is a home-record kernel, not complete 2PC: reports are not self-verifying
   participant proofs. Protected status-role activation, late-PREPARE fencing,
   finalization and recovery scheduling remain.
+- Finalization intents capture a fresh terminal home decision and its route together.
+  Their canonical binding retains the frozen definition, chosen COMMIT/ABORT and
+  prepare vote positions, while excluding later home generations, ACKs and client
+  consumption. Recovery uses a separate operation identity. Matching a native
+  preparation checks the original home, full definition and exact recorded vote;
+  ABORT without a vote also matches an applied but unreported prepare. This is the
+  decision-binding seam only: it neither appends FINALIZE nor releases native locks
+  or installs a late-PREPARE fence. Decision bytes do not independently prove read
+  provenance; the adapter must retain the verified read authority through submission.
 - The native participant substrate now installs an immutable accepted business plan,
   frozen home/participant binding, complete exclusive scope and stable prepare
   position in the internal state CF, atomically with completed A and accounting.
@@ -240,6 +249,14 @@ codec/native-image/home/PREPARE selection passed 24 core and 12 adapter cases
 (36 total, zero failures/errors/skips), exit zero:
 `/tmp/rockserver-current-transaction-format.log`. No legacy reader was added.
 
+The finalization-binding selection passed 11 core and 12 adapter cases (23 total,
+zero failures/errors/skips), exit zero: `/tmp/rockserver-finalization-binding-final.log`.
+It covers stable terminal identity across ACK/consumption, independent recovery IDs,
+exact native vote matching, unreported-prepare ABORT, malformed canonical encodings
+and fresh home reads before/after progress. Independent read-only review found no
+concrete issue at this binding boundary. Native FINALIZE and ABORT-fence acceptance
+are not exercised because those paths remain unimplemented.
+
 The exercised native preparation cases cover unchanged user values, complete read/
 absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
 planning/admission rejection, stable duplicate prepare positions, separate ordinary
@@ -292,7 +309,8 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Participant finalization and late-PREPARE abort fencing; protected status-group
+- Participant finalization and late-PREPARE abort fencing, including explicit durable
+  negative prepare outcomes and recovery/reservation settlement; protected status-group
   node/pool activation, durable coordinator journaling, full 2PC recovery and consistent
   multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
   establish these.

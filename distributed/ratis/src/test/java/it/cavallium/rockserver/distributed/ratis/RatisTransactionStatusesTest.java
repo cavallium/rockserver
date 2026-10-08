@@ -38,6 +38,7 @@ class RatisTransactionStatusesTest {
                 var statuses=new RatisTransactionStatuses(routed,f.column); var initial=initial(directory); assertNull(statuses.read(initial.transactionId()));
                 var begin=statuses.prepare(operation(0),null,initial); writes.lose=true; assertThrows(IOException.class,() -> statuses.execute(begin));
                 assertEquals(CommandResult.Status.SUCCESS,statuses.execute(begin).status()); assertEquals(initial,statuses.read(initial.transactionId()));
+                assertThrows(IOException.class,() -> statuses.readFinalization(initial.transactionId(),a,operation(90)));
                 var first=initial.prepared(a,new byte[32],new ApplyPosition(1,1)); var second=initial.prepared(b,new byte[32],new ApplyPosition(1,2));
                 var voteA=statuses.prepare(operation(1),initial,first); var voteB=statuses.prepare(operation(2),initial,second);
                 var pendingA=f.propose(voteA.command()); var pendingB=f.propose(voteB.command());
@@ -50,10 +51,12 @@ class RatisTransactionStatusesTest {
                 var pendingWin=f.propose(win.command()); var pendingLose=f.propose(lose.command());
                 assertEquals(CommandResult.Status.SUCCESS,f.apply(pendingWin,++writes.index)); assertEquals(CommandResult.Status.CONFLICT,f.apply(pendingLose,++writes.index));
                 assertEquals(chosen,statuses.read(initial.transactionId())); assertEquals(CommandResult.Status.SUCCESS,statuses.execute(win).status());
+                var finalizeA=statuses.readFinalization(initial.transactionId(),a,operation(90));
+                assertEquals(f.groupId,finalizeA.homeGroup()); assertEquals(1,finalizeA.homeEpoch()); assertEquals(chosen.terminalDecision(),finalizeA.decision());
                 assertThrows(IllegalArgumentException.class,() -> chosen.decide(rejected.phase()));
                 var one=chosen.finalized(a); var all=one.finalized(b); var consumed=all.consume();
                 statuses.execute(statuses.prepare(operation(6),chosen,one)); statuses.execute(statuses.prepare(operation(7),one,all)); statuses.execute(statuses.prepare(operation(8),all,consumed));
-                assertTrue(statuses.read(initial.transactionId()).gcEligible()); assertEquals(CommandResult.Status.CONFLICT,statuses.execute(lose).status());
+                assertTrue(statuses.read(initial.transactionId()).gcEligible()); assertEquals(finalizeA,statuses.readFinalization(initial.transactionId(),a,operation(90))); assertEquals(CommandResult.Status.CONFLICT,statuses.execute(lose).status());
                 f.machine.takeSnapshot(); f.machine.pause(); f.machine.reinitialize(); assertEquals(consumed,statuses.read(initial.transactionId()));
                 assertEquals(CommandResult.Status.SUCCESS,statuses.execute(begin).status(),"Original begin receipt does not reset later home state"); assertEquals(consumed,statuses.read(initial.transactionId()));
                 assertTrue(f.store.receiptUsage().retainedCount()>1,"Status consumption does not implicitly ACK CAS receipts");

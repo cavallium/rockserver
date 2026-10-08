@@ -46,6 +46,20 @@ public final class TransactionStatus {
     public UUID transactionId() { return transactionId; } public OperationId operation() { return operation; }
     public long schemaEpoch() { return schemaEpoch; } public byte[] schemaDigest() { return schemaDigest.clone(); } public byte[] planDigest() { return planDigest.clone(); }
     public long generation() { return generation; } public Phase phase() { return phase; } public List<Participant> participants() { return participants; } public boolean consumed() { return consumed; }
+    /** Frozen definition comparison ignores votes, decision, generation, ACKs and consumption. */
+    public boolean sameDefinition(TransactionStatus other) {
+        if (other==null || !clusterId.equals(other.clusterId) || !databaseId.equals(other.databaseId) || !domainId.equals(other.domainId)
+                || !transactionId.equals(other.transactionId) || !operation.equals(other.operation) || schemaEpoch!=other.schemaEpoch
+                || !Arrays.equals(schemaDigest,other.schemaDigest) || !Arrays.equals(planDigest,other.planDigest) || participants.size()!=other.participants.size()) return false;
+        for (int i=0;i<participants.size();i++) if (!participants.get(i).sameDefinition(other.participants.get(i))) return false;
+        return true;
+    }
+    /** Stable chosen decision. Mutable recovery progress is not part of a participant's finalization identity. */
+    public TransactionStatus terminalDecision() {
+        if (phase==Phase.PREPARING) throw invalid("Home has no terminal decision");
+        var frozen=participants.stream().map(p -> new Participant(p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.planDigest(),p.prepared(),false)).toList();
+        return new TransactionStatus(clusterId,databaseId,domainId,transactionId,operation,schemaEpoch,schemaDigest,planDigest,0,phase,frozen,false);
+    }
     public boolean fullyFinalized() { return phase!=Phase.PREPARING && participants.stream().allMatch(Participant::finalized); }
     public boolean gcEligible() { return fullyFinalized() && consumed; }
     public void requireInitial() { if (generation!=0 || phase!=Phase.PREPARING || consumed || participants.stream().anyMatch(p -> p.prepared()!=null || p.finalized())) throw invalid("Initial status must freeze an unvoted participant set"); }
@@ -75,13 +89,10 @@ public final class TransactionStatus {
     /** Validate a single monotonic transition before ordered expected-image CAS. */
     public void requireSuccessorOf(TransactionStatus old) {
         Objects.requireNonNull(old);
-        if (!clusterId.equals(old.clusterId) || !databaseId.equals(old.databaseId) || !domainId.equals(old.domainId) || !transactionId.equals(old.transactionId)
-                || !operation.equals(old.operation) || schemaEpoch!=old.schemaEpoch || !Arrays.equals(schemaDigest,old.schemaDigest) || !Arrays.equals(planDigest,old.planDigest)
-                || old.generation==Long.MAX_VALUE || generation!=old.generation+1 || participants.size()!=old.participants.size()) throw invalid("Transaction definition/generation changed");
+        if (!sameDefinition(old) || old.generation==Long.MAX_VALUE || generation!=old.generation+1) throw invalid("Transaction definition/generation changed");
         int votes=0,acks=0;
         for (int i=0;i<participants.size();i++) {
             var p=participants.get(i); var before=old.participants.get(i);
-            if (!p.sameDefinition(before)) throw invalid("Frozen participant definition changed");
             if (!Objects.equals(p.prepared(),before.prepared())) { if (before.prepared()!=null || p.prepared()==null) throw invalid("Prepared evidence changed"); votes++; }
             if (p.finalized()!=before.finalized()) { if (before.finalized()) throw invalid("Finalization regressed"); acks++; }
         }
