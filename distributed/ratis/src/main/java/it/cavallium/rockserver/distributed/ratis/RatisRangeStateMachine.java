@@ -12,6 +12,9 @@ import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectory;
 import it.cavallium.rockserver.core.common.distributed.RangeStateView;
 import it.cavallium.rockserver.core.common.distributed.ProposalFootprints;
+import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
+import it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus;
+import it.cavallium.rockserver.core.common.distributed.SnapshotGate;
 import it.cavallium.rockserver.core.common.distributed.TransactionScope;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import java.util.ArrayList;
@@ -113,6 +116,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         PreparedParticipant.Preparation participant;
         ParticipantHold participantHold;
         RatisSnapshotRecord snapshot;
+        SnapshotHold snapshotHold;
         ParticipantFinalization finalization;
         FinalizationHold finalizationHold;
         boolean retentionReleased,maybeAppended,settled;
@@ -157,6 +161,25 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final HashMap<OperationId,FinalizationProposal> preparedFinalizations=new HashMap<>();
     private long reservedFinalizationCount,reservedFinalizationBytes;
     private int protectedFinalizationSlots;
+    private static final class SnapshotCharge {
+        final SnapshotFence fence; final long bytes; int references; boolean reserved;
+        SnapshotCharge(SnapshotFence fence,long bytes,boolean reserved) { this.fence=fence; this.bytes=bytes; this.reserved=reserved; }
+    }
+    private static final class SnapshotHold {
+        final SnapshotCharge charge; final boolean install; final long term,generation;
+        final OperationId operation; final ProposalFootprints.GateLease lease;
+        int bytes=DistributedCommandCodec.MAX_ENCODED_BYTES; boolean slot=true,input=true,installCount,invalidated,released;
+        SnapshotHold(SnapshotCharge charge,boolean install,long term,long generation,OperationId operation,ProposalFootprints.GateLease lease) {
+            this.charge=charge; this.install=install; this.installCount=install; this.term=term; this.generation=generation; this.operation=operation; this.lease=lease;
+        }
+    }
+    private final HashMap<UUID,SnapshotCharge> snapshotCharges=new HashMap<>();
+    private final HashMap<OperationId,SnapshotCharge> snapshotControlCharges=new HashMap<>();
+    private final HashMap<OperationId,SnapshotHold> preparingSnapshots=new HashMap<>();
+    private final HashMap<OperationId,SnapshotProposal> preparedSnapshots=new HashMap<>();
+    private long reservedSnapshotCount,reservedSnapshotBytes,snapshotProposalBytes,snapshotInstallBytes;
+    private int snapshotSlots,snapshotInstallOwners,snapshotAdmittedInstalls;
+    private long snapshotAdmittedBytes,snapshotInstallAdmittedBytes;
     private long preparedCommitBytes;
     private ProposalFootprints.CandidateLease exclusiveMetadataCandidate;
     private final Object gate = new Object();
@@ -578,7 +601,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
                     for (var terminal:verifiedAdmissions.terminalScopes()) if (admissions.get(terminal.id)==terminal) retirePreparationScope(terminal);
-                    for (var verified:verifiedAdmissions.settled()) if (admissions.get(verified.id)==verified) settleAdmission(verified);
+                    for (var verified:verifiedAdmissions.settled()) if (admissions.get(verified.id)==verified) {
+                        if (verified.snapshot!=null) materializeSnapshotCharge(verified.snapshot.fence());
+                        settleAdmission(verified);
+                    }
                     for (var id : coveredOperations) {
                         var admission = admissions.get(id);
                         if (admission != null) settleAdmission(admission);
@@ -626,7 +652,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray();
-            if (RatisSnapshotRecord.isSnapshot(encoded)) return startSnapshotRetry(transaction,encoded,generation,leadership);
+            if (RatisSnapshotRecord.isSnapshot(encoded)) return startSnapshot(transaction,encoded,generation,leadership);
             if (RatisParticipantRecord.isParticipant(encoded)) return RatisParticipantRecord.isFinalization(encoded) ? startFinalization(transaction,encoded,generation,leadership) : startParticipant(transaction,encoded,generation,leadership);
             var command = DistributedCommandCodec.decode(encoded);
             if (command.transactionRejection()) throw new IllegalArgumentException("Internal rejection records cannot be submitted by clients");
@@ -658,7 +684,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if (!store.admissionOpen()) throw new IllegalStateException("Native range admission is closed");
                     if (!java.util.Objects.equals(observed, store.applied())) continue;
                     reconcileOlderProposalTerms(leadership.term());
-                    if (finalizationOwners.containsKey(command.operationId()) || participantOwners.containsKey(command.operationId())) throw new IllegalStateException("Operation identity belongs to participant preparation");
+                    if (snapshotControlCharges.containsKey(command.operationId()) || finalizationOwners.containsKey(command.operationId()) || participantOwners.containsKey(command.operationId())) throw new IllegalStateException("Operation identity belongs to participant preparation");
                     var known=admissions.get(command.operationId());
                     if (known!=null && !estimate.newReceipt()) settleAdmission(known);
                     var admission = admissions.get(command.operationId());
@@ -686,7 +712,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         if (estimate.newReceipt() && (command.acceptance()==null || reject) && estimate.maintenance() && proposalFootprints.stats().candidates()>0) throw new IllegalStateException("Transaction reservations hold session metadata stable");
                         boolean maintenance = estimate.newReceipt() && estimate.maintenance();
                         boolean protectedControl = estimate.maintenance() && command.mutations().isEmpty() && command.predicates().isEmpty();
-                        if (protectedControl ? protectedAdmissions+protectedFinalizationSlots >= 16
+                        if (protectedControl ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots >= 16
                                 : dataAdmissions >= 1024 || dataProposalBytes + encoded.length > 16L * 1024 * 1024) {
                             throw new IllegalStateException("Range proposal budget exhausted");
                         }
@@ -726,31 +752,190 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
 
+    public final class SnapshotProposal implements AutoCloseable {
+        private final SnapshotHold hold; private final RatisSnapshotRecord request; private final byte[] bytes,digest;
+        private boolean claimed,closed;
+        private SnapshotProposal(SnapshotHold hold,RatisSnapshotRecord request) { this.hold=hold; this.request=request; bytes=request.encode(); digest=request.digest(); }
+        public RatisSnapshotRecord request() { return request; }
+        public byte[] bytes() { return bytes.clone(); }
+        private boolean authorized() { var a=store.applied(); return !closed && !claimed && !hold.invalidated && !hold.released && hold.generation==admissionGeneration.get() && a!=null && a.term()==hold.term && store.admissionOpen(); }
+        public boolean drained() { synchronized (admissions) { if (hold==null) return true; return hold.lease==null || !hold.lease.active() ? !hold.invalidated && !hold.released : proposalFootprints.drained(hold.lease); } }
+        @Override public void close() {
+            synchronized (admissions) { if (closed || claimed) return; closed=true; if (preparedSnapshots.remove(hold.operation,this)) releaseSnapshotHold(hold); }
+        }
+    }
+    private SnapshotProposal borrowedSnapshot(SnapshotHold hold,RatisSnapshotRecord request) { var view=new SnapshotProposal(hold,request); view.claimed=true; return view; }
+    public SnapshotProposal prepareSnapshotInstall(RatisSnapshotFences homes,SnapshotFence fence) throws Exception { return prepareSnapshot(homes,fence,true); }
+    public SnapshotProposal prepareSnapshotRelease(RatisSnapshotFences homes,SnapshotFence fence) throws Exception { return prepareSnapshot(homes,fence,false); }
+    private SnapshotProposal prepareSnapshot(RatisSnapshotFences homes,SnapshotFence fence,boolean install) throws Exception {
+        java.util.Objects.requireNonNull(homes); java.util.Objects.requireNonNull(fence); requireHealthy(); long generation=admissionGeneration.get(); var leader=leadership();
+        if (!leader.ready()) throw new IllegalStateException("Snapshot gate leader is not ready");
+        var group=store.ownership().owner().groupId(); var participant=fence.participant(group); var operation=install ? participant.installOperation() : participant.releaseOperation();
+        var footprint=install ? proposalFootprints.prepare(participant.scope()) : null; long storageBytes=ReplicatedRangeStore.snapshotGateBytes(fence);
+        SnapshotHold hold=null;
+        for (int attempt=0;attempt<3 && hold==null;attempt++) {
+            var capacity=store.gateCapacity(); var existing=store.recoveredSnapshotGate(fence);
+            synchronized (admissions) {
+                requireHealthy(); var a=store.applied();
+                if (generation!=admissionGeneration.get() || a==null || a.term()!=leader.term() || !store.admissionOpen()) throw new IllegalStateException("Snapshot gate has no current native owner");
+                if (!java.util.Objects.equals(a,capacity.position())) continue; reconcileOlderProposalTerms(leader.term());
+                var ready=preparedSnapshots.get(operation);
+                if (ready!=null && ready.authorized()) { if (!ready.request.fence().equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed"); return borrowedSnapshot(ready.hold,ready.request); }
+                var known=admissions.get(operation);
+                if (known!=null && known.snapshot!=null && known.term==leader.term() && known.generation==generation) {
+                    if (!known.snapshot.fence().equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed");
+                    return borrowedSnapshot(known.snapshotHold,known.snapshot);
+                }
+                if (known!=null) throw new IllegalStateException("Previous snapshot control is still settling");
+                if (preparingSnapshots.containsKey(operation)) throw new IllegalStateException("Snapshot control is still preparing");
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes
+                        || install && (snapshotInstallOwners+snapshotAdmittedInstalls>=8 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-snapshotInstallBytes-snapshotInstallAdmittedBytes)) throw new IllegalStateException("Snapshot protected input budget exhausted");
+                var charge=snapshotCharges.get(fence.fenceId());
+                if (charge!=null && !charge.fence.equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed");
+                if (charge==null) {
+                    for (var id:List.of(participant.installOperation(),participant.releaseOperation())) if (participantIdentityBusy(id)) {
+                        var other=admissions.get(id);
+                        if (other==null || other.snapshot==null || !other.snapshot.fence().equals(fence)) throw new IllegalStateException("Snapshot control identity belongs to other work");
+                    }
+                    long bytes=storageBytes; boolean reserve=existing==null;
+                    if (reserve && (capacity.count()+reservedSnapshotCount>=ReplicatedRangeStore.MAX_SNAPSHOT_GATES || bytes>ReplicatedRangeStore.MAX_SNAPSHOT_GATE_BYTES-capacity.bytes()-reservedSnapshotBytes)) throw new IllegalStateException("Snapshot gate storage reservation exhausted");
+                    charge=new SnapshotCharge(fence,bytes,reserve);
+                }
+                ProposalFootprints.GateLease lease=null;
+                if (install && existing==null) {
+                    lease=proposalFootprints.reserveGate(footprint,leader.term(),generation);
+                    if (lease==null) throw new IllegalStateException("Snapshot gate overlaps another reservation");
+                }
+                if (!snapshotCharges.containsKey(fence.fenceId())) {
+                    snapshotCharges.put(fence.fenceId(),charge); snapshotControlCharges.put(participant.installOperation(),charge); snapshotControlCharges.put(participant.releaseOperation(),charge);
+                    if (charge.reserved) { reservedSnapshotCount++; reservedSnapshotBytes+=charge.bytes; }
+                }
+                if (existing!=null) materializeSnapshotCharge(fence);
+                charge.references++; hold=new SnapshotHold(charge,install,leader.term(),generation,operation,lease);
+                preparingSnapshots.put(operation,hold); snapshotSlots++; snapshotProposalBytes+=hold.bytes;
+                if (install) { snapshotInstallOwners++; snapshotInstallBytes+=hold.bytes; }
+            }
+        }
+        if (hold==null) throw new IllegalStateException("Native snapshot gate cut kept changing"); boolean retained=false;
+        try {
+            var read=homes.readRegistration(fence.fenceId()); var status=read.status();
+            if (status==null || !status.fence().equals(fence) || !read.descriptor().groupId().equals(fence.homeGroup()) || read.descriptor().rangeEpoch()!=fence.homeEpoch()
+                    || (install ? status.phase()!=SnapshotFenceStatus.Phase.INSTALLING : !status.terminal())) throw new IllegalStateException("Snapshot home has no matching gate authority");
+            var request=install ? RatisSnapshotRecord.install(fence,group) : RatisSnapshotRecord.release(status,group);
+            var proposal=new SnapshotProposal(hold,request);
+            for (int attempt=0;attempt<3;attempt++) {
+                var estimate=install ? store.estimateGateInstall(fence) : store.estimateGateRelease(status); var capacity=estimate.capacity();
+                synchronized (admissions) {
+                    requireHealthy();
+                    if (hold.invalidated || hold.generation!=admissionGeneration.get() || preparingSnapshots.get(operation)!=hold || capacity.position()==null || capacity.position().term()!=hold.term || !store.admissionOpen()) throw new IllegalStateException("Snapshot gate lost acceptance ownership");
+                    if (!java.util.Objects.equals(capacity.position(),store.applied())) continue;
+                    if (install && status.progress(group).ready()!=null && (estimate.existing()==null || !status.progress(group).ready().equals(estimate.existing().installed()))) throw new IllegalStateException("Home ready proof lacks matching native gate");
+                    if (estimate.existing()!=null) materializeSnapshotCharge(fence);
+                    snapshotProposalBytes+=proposal.bytes.length-hold.bytes;
+                    if (install) snapshotInstallBytes+=proposal.bytes.length-hold.bytes; hold.bytes=proposal.bytes.length;
+                    preparedSnapshots.put(operation,proposal); preparingSnapshots.remove(operation,hold); retained=true; return proposal;
+                }
+            }
+            throw new IllegalStateException("Native snapshot gate cut kept changing during acceptance");
+        } finally { synchronized (admissions) { if (!retained && preparingSnapshots.remove(operation,hold)) releaseSnapshotHold(hold); } }
+    }
+    private void transferSnapshotInput(SnapshotHold hold) {
+        if (hold.slot) { hold.slot=false; snapshotSlots--; }
+        if (hold.installCount) { hold.installCount=false; snapshotInstallOwners--; }
+        if (hold.input) { hold.input=false; snapshotProposalBytes-=hold.bytes; if (hold.install) snapshotInstallBytes-=hold.bytes; }
+    }
+    private void materializeSnapshotCharge(SnapshotFence fence) {
+        var charge=snapshotCharges.get(fence.fenceId());
+        if (charge!=null && charge.fence.equals(fence) && charge.reserved) { charge.reserved=false; reservedSnapshotCount--; reservedSnapshotBytes-=charge.bytes; }
+    }
+    private void releaseSnapshotHold(SnapshotHold hold) {
+        if (hold==null || hold.released) return; hold.released=true; transferSnapshotInput(hold);
+        if (hold.lease!=null) proposalFootprints.release(hold.lease);
+        var charge=hold.charge;
+        if (--charge.references==0) {
+            if (charge.reserved) { charge.reserved=false; reservedSnapshotCount--; reservedSnapshotBytes-=charge.bytes; }
+            snapshotCharges.remove(charge.fence.fenceId(),charge); var participant=charge.fence.participant(store.ownership().owner().groupId());
+            snapshotControlCharges.remove(participant.installOperation(),charge); snapshotControlCharges.remove(participant.releaseOperation(),charge);
+        }
+    }
+    private void retireSnapshotOwners(SnapshotGate record) {
+        materializeSnapshotCharge(record.fence());
+        for (var plan:List.copyOf(preparedSnapshots.values())) {
+            try { if (plan.request.receipt(record)!=null) plan.close(); } catch (IllegalArgumentException different) { /* Another speculative definition is not proof. */ }
+        }
+        for (var hold:preparingSnapshots.values()) if (hold.charge.fence.equals(record.fence()) && (hold.install || record.released()!=null)) {
+            hold.invalidated=true; if (hold.lease!=null) proposalFootprints.release(hold.lease);
+        }
+        for (var admission:List.copyOf(admissions.values())) if (admission.snapshot!=null) {
+            try { if (admission.snapshot.receipt(record)!=null) settleAdmission(admission); } catch (IllegalArgumentException different) { /* Unrelated outcome. */ }
+        }
+    }
+    public int snapshotPreparationSlots() { synchronized (admissions) { return snapshotSlots; } }
+    public long reservedSnapshotGateCount() { synchronized (admissions) { return reservedSnapshotCount; } }
+    public long reservedSnapshotGateBytes() { synchronized (admissions) { return reservedSnapshotBytes; } }
+    public ProposalFootprints.GateStats proposalGateStats() { synchronized (admissions) { return proposalFootprints.gateStats(); } }
+    public boolean snapshotGateReady(SnapshotFence fence) throws IOException {
+        checkTransactionOwner(); var record=store.snapshotGate(fence.fenceId());
+        if (record==null || !record.active()) return false;
+        if (!record.fence().equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed");
+        boolean ready=store.gateBlockers(fence).isEmpty(); checkTransactionOwner();
+        synchronized (admissions) {
+            for (var hold:preparingSnapshots.values()) if (hold.charge.fence.equals(fence) && hold.lease!=null && hold.lease.active() && !proposalFootprints.drained(hold.lease)) return false;
+            for (var plan:preparedSnapshots.values()) if (plan.request.fence().equals(fence) && !plan.drained()) return false;
+        }
+        return ready;
+    }
+    public ReplicatedRangeStore.ScopedSnapshot captureSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence) throws Exception {
+        checkTransactionOwner(); long generation=admissionGeneration.get(); var read=homes.readRegistration(fence.fenceId()); var status=read.status();
+        if (status==null || !status.fence().equals(fence) || status.phase()!=SnapshotFenceStatus.Phase.INSTALLING || !status.allReady()) throw new IllegalStateException("Snapshot capture requires every home ready proof");
+        var gate=store.snapshotGate(fence.fenceId());
+        if (gate==null || !gate.active() || !gate.fence().equals(fence) || !gate.installed().equals(status.progress(store.ownership().owner().groupId()).ready())) throw new IllegalStateException("Home ready proof differs from native gate");
+        if (!snapshotGateReady(fence)) throw new IllegalStateException("Snapshot gate is not ready");
+        var pin=store.captureGate(fence); boolean retained=false;
+        try { checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot capture lost leadership"); retained=true; return pin; }
+        finally { if (!retained) pin.close(); }
+    }
+
+    private boolean snapshotRetryIdentityBusy(OperationId operation,SnapshotFence fence) {
+        var charge=snapshotControlCharges.get(operation);
+        return charge!=null && !charge.fence.equals(fence) || finalizationOwners.containsKey(operation) || participantOwners.containsKey(operation)
+                || admissions.containsKey(operation) || preparedCommits.containsKey(operation) || preparingCommits.containsKey(operation);
+    }
     private void requireSnapshotParticipant(RatisSnapshotRecord request) {
         if (!request.participantGroup().equals(store.ownership().owner().groupId())) throw new IllegalArgumentException("Snapshot gate command addressed to another participant");
     }
     /** Exact retained outcomes may retry without fresh home authority; new gate admission is a separate privileged seam. */
-    private TransactionContext startSnapshotRetry(TransactionContext transaction,byte[] encoded,long generation,Leadership leader) throws Exception {
+    private TransactionContext startSnapshot(TransactionContext transaction,byte[] encoded,long generation,Leadership leader) throws Exception {
         var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request); byte[] digest=request.digest();
         for (int attempt=0;attempt<3;attempt++) {
             var estimate=request.isRelease() ? store.estimateGateRelease(request.terminal()) : store.estimateGateInstall(request.fence());
             var observed=estimate.capacity().position(); var receipt=request.receipt(estimate.existing());
-            if (receipt==null) throw new IllegalStateException("Snapshot gate has no verified native outcome or fresh home admission authority");
             if (observed==null || observed.term()!=leader.term()) throw new IllegalStateException("Snapshot gate native prefix is not ready");
             synchronized (admissions) {
                 requireHealthy(); if (generation!=admissionGeneration.get() || !store.admissionOpen()) throw new IllegalStateException("Snapshot gate retry owner changed");
                 if (!java.util.Objects.equals(observed,store.applied())) continue; reconcileOlderProposalTerms(leader.term());
                 var known=admissions.get(request.operation());
                 if (known!=null && !Arrays.equals(known.digest,digest)) throw new IllegalArgumentException("Snapshot control identity payload changed");
-                if (known!=null) { settleAdmission(known); known=admissions.get(request.operation()); }
+                if (known!=null && receipt!=null) { materializeSnapshotCharge(request.fence()); settleAdmission(known); known=admissions.get(request.operation()); }
                 if (known!=null) {
                     if (known.snapshot==null || known.term!=leader.term() || known.generation!=generation) throw new IllegalStateException("Snapshot control is still settling");
                     known.owners++; transaction.setStateMachineContext(known); return transaction;
                 }
-                if (participantIdentityBusy(request.operation())) throw new IllegalStateException("Snapshot control identity belongs to other work");
-                if (protectedAdmissions+protectedFinalizationSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                var accepted=receipt==null ? preparedSnapshots.get(request.operation()) : null;
+                if (receipt==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Snapshot gate has no fresh home admission authority");
+                if (accepted!=null && !accepted.drained()) throw new IllegalStateException("Snapshot gate predecessors are still settling");
+                if (accepted==null && snapshotRetryIdentityBusy(request.operation(),request.fence())) throw new IllegalStateException("Snapshot control identity belongs to other work");
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                long transferred=accepted==null ? 0 : accepted.hold.bytes;
+                if (encoded.length>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes+transferred
+                        || !request.isRelease() && (snapshotInstallOwners+snapshotAdmittedInstalls-(accepted==null ? 0 : 1)>=8
+                        || encoded.length>8L*1024*1024-snapshotInstallBytes-snapshotInstallAdmittedBytes+transferred)) throw new IllegalStateException("Snapshot submitted input budget exhausted");
                 var admission=new Admission(request.operation(),digest,encoded.length,leader.term(),generation,0,0,false,true,null,null,null);
-                admission.snapshot=request; admissions.put(admission.id,admission); protectedAdmissions++; admittedBytes+=admission.bytes;
+                admission.snapshot=request; admission.snapshotHold=accepted==null ? null : accepted.hold;
+                if (accepted!=null) { accepted.claimed=true; preparedSnapshots.remove(request.operation(),accepted); transferSnapshotInput(accepted.hold); }
+                else if (receipt!=null) materializeSnapshotCharge(request.fence());
+                admissions.put(admission.id,admission); protectedAdmissions++; admittedBytes+=admission.bytes; snapshotAdmittedBytes+=admission.bytes;
+                if (!request.isRelease()) { snapshotAdmittedInstalls++; snapshotInstallAdmittedBytes+=admission.bytes; }
                 transaction.setStateMachineContext(admission); return transaction;
             }
         }
@@ -783,6 +968,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         || nativePosition == null || nativePosition.term() != current.term() || !store.admissionOpen()) {
                     throw new IOException("Admission lost its completed current-term owner before append");
                 }
+                if (admission.snapshotHold!=null && admission.snapshotHold.install && admission.snapshotHold.lease!=null
+                        && admission.snapshotHold.lease.active() && !proposalFootprints.drained(admission.snapshotHold.lease)) throw new IOException("Snapshot gate predecessors are still settling");
             }
             return super.preAppendTransaction(transaction);
         } catch (Exception stale) {
@@ -797,6 +984,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (RatisSnapshotRecord.isSnapshot(encoded)) {
             var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request);
             var record=request.isRelease() ? store.applyGateRelease(positionArg,request.terminal()) : store.applyGateInstall(positionArg,request.fence());
+            synchronized (admissions) { retireSnapshotOwners(record); }
             return new AppliedRecord(request.operation(),java.util.Objects.requireNonNull(request.receipt(record)).encode());
         }
         if (RatisParticipantRecord.isFinalization(encoded)) {
@@ -906,6 +1094,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (!admissions.remove(admission.id,admission)) return;
         releaseRetention(admission); releaseFootprint(admission);
         admittedBytes-=admission.bytes;
+        if (admission.snapshot!=null) { snapshotAdmittedBytes-=admission.bytes; if (!admission.snapshot.isRelease()) { snapshotAdmittedInstalls--; snapshotInstallAdmittedBytes-=admission.bytes; } }
         if (admission.protectedControl) protectedAdmissions--; else { dataAdmissions--; dataProposalBytes-=admission.bytes; }
     }
     private void settleAdmission(Admission admission) {
@@ -932,6 +1121,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (admission.participantHold!=null) finishParticipantHold(admission.participantHold,true);
     }
     private void releaseFootprint(Admission admission) {
+        if (admission.snapshotHold!=null) releaseSnapshotHold(admission.snapshotHold);
         if (admission.footprint!=null) proposalFootprints.release(admission.footprint);
         if (admission.acceptedScope!=null) proposalFootprints.release(admission.acceptedScope);
         if (admission.participantHold!=null) releaseParticipantHold(admission.participantHold,admission.settled);
@@ -964,6 +1154,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         for (var plan:preparedParticipants.values()) { plan.closed=true; preparedCommitBytes-=plan.bytes.length; releaseParticipantHold(plan.hold); }
         preparedParticipants.clear();
         for (var plan:List.copyOf(preparedFinalizations.values())) plan.close();
+        for (var plan:List.copyOf(preparedSnapshots.values())) plan.close();
+        for (var hold:preparingSnapshots.values()) { hold.invalidated=true; if (hold.lease!=null) proposalFootprints.release(hold.lease); }
         // Invalidated native planners still own their input/result payloads until their finally exits.
     }
     /** Only a strictly newer ready native term proves an older term's unknown suffix can no longer interpose. */
@@ -1045,7 +1237,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (ready!=null && ready.finalization.transactionId().equals(transaction) && ready.authorized()) return borrowedFinalization(ready.hold,ready.finalization);
             var known=admissions.get(recovery);
             if (known!=null && known.finalization!=null && known.finalization.transactionId().equals(transaction) && known.term==leader.term() && known.generation==generation) return borrowedFinalization(known.finalizationHold,known.finalization);
-            if (protectedAdmissions+protectedFinalizationSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+            if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
             if (participantIdentityBusy(recovery) || finalizingTransactions.containsKey(transaction)) throw new IllegalStateException("Finalization identity/transaction is already owned");
             hold=new FinalizationHold(transaction,recovery,leader.term(),generation); preparingFinalizations.put(recovery,hold); finalizingTransactions.put(transaction,hold); finalizationOwners.put(recovery,hold); protectedFinalizationSlots++;
         }
@@ -1100,7 +1292,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 var accepted=estimate.existing()==null ? preparedFinalizations.get(finalization.operation()) : null;
                 if (estimate.existing()==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Finalization has no fresh home acceptance authority");
-                if (protectedAdmissions+protectedFinalizationSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
                 var admission=new Admission(finalization.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,true,null,null,null);
                 admission.finalization=finalization; admission.finalizationHold=accepted==null ? null : accepted.hold; admissions.put(admission.id,admission);
                 if (accepted!=null) { accepted.claimed=true; preparedFinalizations.remove(admission.id,accepted); protectedFinalizationSlots--; }
@@ -1147,7 +1339,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (hold.shared!=null) { var shared=hold.shared; hold.shared=null; shared.finalizers--; finishParticipantHold(shared,covered); }
     }
     private boolean participantIdentityBusy(OperationId id) {
-        return finalizationOwners.containsKey(id) || participantOwners.containsKey(id) || admissions.containsKey(id) || preparedCommits.containsKey(id) || preparingCommits.containsKey(id);
+        return snapshotControlCharges.containsKey(id) || finalizationOwners.containsKey(id) || participantOwners.containsKey(id) || admissions.containsKey(id) || preparedCommits.containsKey(id) || preparingCommits.containsKey(id);
     }
     /** Freeze the original read cut/scope/result before registering the home; it is never rebased during PREPARE. */
     public byte[] participantPlanDigest(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception { return participantIntent(pin,business).payloadDigest(); }
@@ -1288,7 +1480,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try {
             synchronized (admissions) {
                 if (!reservation.active() || deadline!=null && !deadline.active() || pin.position().term()!=reservation.term()) throw new IllegalStateException("Transaction snapshot changed leadership or expired");
-                if (finalizationOwners.containsKey(command.operationId()) || participantOwners.containsKey(command.operationId()) || admissions.containsKey(command.operationId()) || preparedCommits.containsKey(command.operationId()) || preparingCommits.containsKey(command.operationId())) throw new IllegalStateException("Operation identity already owns a proposal");
+                if (snapshotControlCharges.containsKey(command.operationId()) || finalizationOwners.containsKey(command.operationId()) || participantOwners.containsKey(command.operationId()) || admissions.containsKey(command.operationId()) || preparedCommits.containsKey(command.operationId()) || preparingCommits.containsKey(command.operationId())) throw new IllegalStateException("Operation identity already owns a proposal");
                 if (preparingCommits.size()+preparedCommits.size()>=64 || preparing.bytes>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Preparing command byte/count budget exhausted");
                 if (command.acknowledgedThrough()>=0) {
                     if (proposalFootprints.stats().candidates()!=1) throw new IllegalStateException("Acknowledging transaction lost exclusive session metadata ownership");

@@ -376,10 +376,25 @@ provenance; the coordinator must verify those proofs before reporting them.
 Committed snapshot commands dispatch to the native gate kernel through Ratis,
 including verified snapshot-covered replay. Routed operations retain the exact
 body, identity and original route. Fresh gate queries validate the complete frozen
-fence and work independently of expired control grants. Leader retry admission
-requires an exact retained native outcome; a suppressed delayed INSTALL is distinct
-from an applied RELEASE. New INSTALL/RELEASE requests still require the privileged
-admission implementation and are rejected without that authority.
+fence and work independently of expired control grants. Leader admission requires
+fresh privileged home authority or an exact retained native outcome; a suppressed
+delayed INSTALL is distinct from an applied RELEASE.
+
+Privileged INSTALL claims a gate lease before the home read, blocks new conflicts,
+and admits its append only after earlier volatile proposal owners drain. RELEASE
+verifies the matching terminal home decision and can overtake an uncertain INSTALL
+using the same per-fence storage reservation. Both control identities remain owned
+through blocked home reads and uncertain append lifetimes. Same-term invalidation
+does not donate a submitted gate lease. Verified native publication or a completed
+newer term retires obsolete scope ownership, while actual RPC/input owners remain
+charged through return. Capture requires a fresh INSTALLING home with every READY
+proof, the exact local installed position, and no unresolved prepared blocker.
+
+Snapshot input shares the protected sixteen-slot budget with other controls.
+INSTALL has an eight-owner/eight-MiB sublimit; all snapshot preparing, ready and
+submitted input is bounded to sixteen MiB. Retained INSTALL retries use the same
+sublimits and preserve RELEASE headroom. Ready or blocked RELEASE work does not
+reject an exact native INSTALL retry belonging to that same fence.
 
 Per range, gates have an independent bound of 16 retained fence records and 16 MiB
 of reserved metadata, including future release growth. Released records retain their
@@ -387,9 +402,9 @@ capacity and operation identities until a future fenced GC implementation. A fen
 contains at most 64 participants and an aggregate definition below 2 MiB minus
 8 KiB, leaving bounded room for progress and envelopes. The ephemeral admission
 index can reserve a gate before earlier proposals drain, with independent protected
-limits. Privileged new gate admission, volatile predecessor proof, coordinated
-capture/recovery and frontend snapshot leases remain unfinished; this native kernel
-alone does not establish a consistent cross-group read cut.
+limits. Definitive negative PREPARE admission at reserved or installed gates,
+coordinated capture/recovery and frontend snapshot leases remain unfinished; these
+participant seams alone do not establish a consistent cross-group read cut.
 
 Each coordinator journal freezes at most 64 participants and 16 MiB of aggregate
 accepted commands (including their result images), plus 16 MiB of frozen routes and
