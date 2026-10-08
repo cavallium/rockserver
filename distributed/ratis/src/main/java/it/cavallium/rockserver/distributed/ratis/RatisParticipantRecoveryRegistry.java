@@ -29,6 +29,8 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
         final Path path;
         long bytes,temporaryBytes;
         boolean persisted,reserved,queued,complete;
+        byte[] preparedDigest;
+        ApplyPosition preparedPosition;
         FileEntry(Key key,Path path,long bytes,boolean persisted) { this.key=key; this.path=path; this.bytes=bytes; this.persisted=persisted; }
     }
     private static final class Worker {
@@ -115,7 +117,10 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
             return steps;
         } finally { end(); }
     }
-    @Override public boolean step(UUID group,PreparedParticipant prepared) throws IOException {
+    /** Admit and force recovery ownership without proposing any home or participant mutation. */
+    public boolean register(UUID group,PreparedParticipant prepared) throws IOException { return visit(group,prepared,false); }
+    @Override public boolean step(UUID group,PreparedParticipant prepared) throws IOException { return visit(group,prepared,true); }
+    private boolean visit(UUID group,PreparedParticipant prepared,boolean advance) throws IOException {
         Objects.requireNonNull(group); Objects.requireNonNull(prepared);
         if (!allowedGroups.contains(group) || !group.equals(prepared.preparation().business().groupId())) throw new IllegalArgumentException("Participant recovery group is not locally allowed");
         begin();
@@ -127,6 +132,7 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
                     if (files.size()>=limits.maxFiles()) throw new IOException("Participant recovery file admission exhausted");
                     file=new FileEntry(key,directory.resolve(key.filename()),0,false); files.put(key,file);
                 }
+                if (file.complete && file.preparedDigest!=null) { requireSelected(file,prepared); return false; }
                 unqueue(file);
             }
             try {
@@ -136,9 +142,13 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
                 if (worker==null) return false;
                 if (!worker.journal.snapshot().prepared().equals(prepared)) throw new IOException("Recovery journal differs from selected native preparation");
                 synchronized (this) { if (stopping) return false; }
+                if (!advance) return true;
                 var result=run(worker); return result.action()!=RatisParticipantRecovery.Action.WAITING;
             } finally { synchronized (this) { requeue(file); } }
         } finally { end(); }
+    }
+    private static void requireSelected(FileEntry file,PreparedParticipant selected) throws IOException {
+        if (!file.preparedPosition.equals(selected.position()) || !Arrays.equals(file.preparedDigest,selected.preparation().digest())) throw new IOException("Completed recovery native preparation changed");
     }
     public synchronized Snapshot stats() { return new Snapshot(workers.size()+opening,persistedFiles,reservedBytes); }
 
@@ -208,6 +218,7 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
             var snapshot=journal.snapshot();
             if (!file.key.group.equals(snapshot.participantRoute().groupId()) || !file.key.transaction.equals(snapshot.prepared().preparation().transactionId())
                     || selected!=null && !selected.equals(snapshot.prepared())) throw new IOException("Recovery filename/selected proof differs from journal identity");
+            file.preparedDigest=snapshot.prepared().preparation().digest(); file.preparedPosition=snapshot.prepared().position();
             if (complete(snapshot)) { file.complete=true; journal.close(); journal=null; releaseReservation(file); return null; }
             if (ids==null) ids=Objects.requireNonNull(controls.create(file.key.group,file.key.transaction));
             var driver=new RatisParticipantRecovery(journal,homes,data,ids.next(),authority,takeover); var worker=new Worker(file,journal,driver);

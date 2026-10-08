@@ -20,6 +20,7 @@ class PreparedParticipantTest {
         var preparation=preparation(); byte[] bytes=preparation.encode();
         assertEquals(64+preparation.registration().encode().length+DistributedCommandCodec.encodedSize(preparation.business()),bytes.length);
         var decoded=PreparedParticipant.Preparation.decode(bytes); assertEquals(preparation,decoded); assertEquals(preparation.hashCode(),decoded.hashCode()); Arrays.fill(bytes,(byte)1); assertEquals(preparation,decoded);
+        byte[] digest=preparation.digest(); assertArrayEquals(digest,decoded.digest()); Arrays.fill(digest,(byte)1); assertArrayEquals(decoded.digest(),preparation.digest());
         var record=new PreparedParticipant(preparation,new ApplyPosition(1,1)); assertEquals(record,PreparedParticipant.decode(record.encode()));
         assertTrue(preparation.ownsOperation(businessId)); assertTrue(preparation.ownsOperation(prepareId));
         assertThrows(IllegalArgumentException.class,() -> new PreparedParticipant.Preparation(home,1,businessId,preparation.registration(),preparation.business()));

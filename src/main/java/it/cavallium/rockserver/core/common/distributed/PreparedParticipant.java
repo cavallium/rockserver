@@ -24,6 +24,7 @@ public record PreparedParticipant(Preparation preparation,ApplyPosition position
         private final OperationId operation;
         private final TransactionStatus registration;
         private final DistributedCommand business;
+        private volatile byte[] digest;
         public Preparation(UUID homeGroup,long homeEpoch,OperationId operation,TransactionStatus registration,DistributedCommand business) {
             this.homeGroup=Objects.requireNonNull(homeGroup); this.homeEpoch=homeEpoch; this.operation=Objects.requireNonNull(operation); this.registration=Objects.requireNonNull(registration); this.business=Objects.requireNonNull(business);
             if (homeEpoch<0 || registration.phase()!=TransactionStatus.Phase.PREPARING || business.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED
@@ -45,7 +46,12 @@ public record PreparedParticipant(Preparation preparation,ApplyPosition position
         @Override public boolean equals(Object other) { return other instanceof Preparation preparation && Arrays.equals(encode(),preparation.encode()); }
         @Override public int hashCode() { return Arrays.hashCode(encode()); }
         public byte[] digest() {
-            try { return MessageDigest.getInstance("SHA-256").digest(encode()); } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+            byte[] value=digest;
+            if (value==null) {
+                try { value=MessageDigest.getInstance("SHA-256").digest(encode()); } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+                digest=value;
+            }
+            return value.clone();
         }
         public byte[] encode() {
             byte[] home=registration.encode(),plan=DistributedCommandCodec.encode(business);

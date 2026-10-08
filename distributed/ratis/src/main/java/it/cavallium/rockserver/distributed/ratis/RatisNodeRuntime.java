@@ -55,7 +55,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final RecoverySettings recoverySettings;
     private RatisParticipantRecoveryRegistry participantRecoveries;
     private RatisTransactionRecoveryService participantRecoveryService;
-    private boolean recoveriesDiscovered;
+    private RatisNativeParticipantDiscovery nativeParticipantDiscovery;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
 
@@ -174,9 +174,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 try { var proposal=machine.prepareFinalization(recoverySettings.homes(),transaction,control); return new RatisTransactionRecovery.Authorization(proposal.finalization(),proposal); }
                 catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Local participant recovery authority unavailable",failure); }
             },recoverySettings.takeover(),local,recoverySettings.limits());
+            var sources=new ArrayList<RatisNativeParticipantDiscovery.Source>();
+            for (var group:local.stream().sorted().toList()) sources.add(new RatisNativeParticipantDiscovery.Source(group,machines.get(RaftGroupId.valueOf(group))::preparedRecoveries));
+            nativeParticipantDiscovery=new RatisNativeParticipantDiscovery(participantRecoveries,sources);
             participantRecoveryService=new RatisTransactionRecoveryService(scheduler,() -> {
-                if (!recoveriesDiscovered) { participantRecoveries.discover(); recoveriesDiscovered=true; }
-                participantRecoveries.cycle(recoverySettings.visits());
+                nativeParticipantDiscovery.cycle(recoverySettings.visits());
             });
         }
         if (!machines.containsKey(RaftGroupId.valueOf(plan.catalogue().groupId()))) return;

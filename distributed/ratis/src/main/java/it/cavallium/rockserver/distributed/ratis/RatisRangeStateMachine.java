@@ -98,6 +98,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         requireHealthy(); var current=leadership(); var a=store.applied();
         if (!current.ready() || a==null || a.term()!=current.term() || !store.admissionOpen()) throw new IOException("Transaction leader changed or is not ready");
     }
+    /** Null means this replica has no qualified current-term discovery owner. */
+    ReplicatedRangeStore.PreparedRecoveryPage preparedRecoveries(UUID after,int limit) throws IOException {
+        if (storageFailure!=null) throw new IOException("Native recovery discovery requires repair",storageFailure);
+        if (getLifeCycleState()!=LifeCycle.State.RUNNING) return null;
+        var owner=leadership(); var applied=store.applied();
+        if (!owner.ready() || applied==null || applied.term()!=owner.term() || !store.admissionOpen()) return null;
+        long generation=admissionGeneration.get();
+        final ReplicatedRangeStore.PreparedRecoveryPage page;
+        try { page=store.preparedRecoveries(after,limit); }
+        catch (RuntimeException changed) { if (generation!=admissionGeneration.get() || getLifeCycleState()!=LifeCycle.State.RUNNING) return null; throw new IOException("Native recovery discovery unavailable",changed); }
+        var current=leadership();
+        if (storageFailure!=null) throw new IOException("Native recovery discovery requires repair",storageFailure);
+        if (getLifeCycleState()!=LifeCycle.State.RUNNING || generation!=admissionGeneration.get() || !current.ready() || page.position().term()!=current.term() || !store.admissionOpen()) return null;
+        return page;
+    }
     ReplicatedRangeStore.ScopedHistoryPin captureTransaction(TransactionScope scope) throws Exception {
         checkTransactionOwner(); long generation=admissionGeneration.get(); var pin=store.captureTracked(scope); boolean retained=false;
         try {

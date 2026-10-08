@@ -671,6 +671,29 @@ public final class ReplicatedRangeStore {
             return new SnapshotBlockerPage(snapshotGates.get(fence.fenceId()),applied,more ? records.subList(0,limit) : records,more);
         } finally { applyLane.unlock(); leaveNative(); }
     }
+    public record PreparedRecoveryPage(ApplyPosition position,List<PreparedParticipant> records,boolean more) {
+        public PreparedRecoveryPage {
+            java.util.Objects.requireNonNull(position); records=List.copyOf(records);
+            if (records.size()>16 || more && records.isEmpty()) throw new IllegalArgumentException("Invalid prepared recovery page bound");
+            UUID previous=null;
+            for (var record:records) {
+                var id=record.preparation().transactionId(); var prepared=record.position();
+                if (previous!=null && previous.compareTo(id)>=0 || prepared.term()>position.term() || prepared.index()>position.index()
+                        || prepared.index()==position.index() && prepared.term()!=position.term()) throw new IllegalArgumentException("Invalid prepared recovery page order/cut");
+                previous=id;
+            }
+        }
+    }
+    /** Retained positive votes include finalized participants whose home ACK may still need recovery. */
+    public PreparedRecoveryPage preparedRecoveries(UUID after,int limit) {
+        if (limit<1 || limit>16) throw new IllegalArgumentException("Invalid prepared recovery page limit");
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); var records=preparedIndex.records().stream().filter(p -> after==null || p.preparation().transactionId().compareTo(after)>0)
+                    .sorted(java.util.Comparator.comparing(p -> p.preparation().transactionId())).limit(limit+1L).toList();
+            boolean more=records.size()>limit; return new PreparedRecoveryPage(applied,more ? records.subList(0,limit) : records,more);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     public ScopedSnapshot captureGate(SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(fence); enterNative(); applyLane.lock();
         try { requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
