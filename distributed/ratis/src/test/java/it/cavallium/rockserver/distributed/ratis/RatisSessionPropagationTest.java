@@ -145,9 +145,11 @@ class RatisSessionPropagationTest {
         final Map<UUID,ReplicatedRangeStore> stores=new LinkedHashMap<>(); final Map<UUID,RatisRangeStateMachine> machines=new LinkedHashMap<>();
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>(); final List<RaftStorage> storage=new ArrayList<>();
         final Set<UUID> failed=new HashSet<>(),lost=new HashSet<>(); RangeDirectory directory; SessionEpochLedger ledger;
-        final RatisRoutedClient routed; int submissions,metadataReads,customerReads; CountDownLatch started,release;
+        final RatisRoutedClient routed; final byte[] dataSchemaDigest; int submissions,metadataReads,customerReads; CountDownLatch started,release;
         Fixture(Path root) throws Exception { this(root,true); }
-        Fixture(Path root,boolean initialized) throws Exception {
+        Fixture(Path root,boolean initialized) throws Exception { this(root,initialized,new byte[32]); }
+        Fixture(Path root,boolean initialized,byte[] dataSchemaDigest) throws Exception {
+            this.dataSchemaDigest=dataSchemaDigest.clone();
             catalogue=outer.new Fixture(root.resolve("catalogue"));
             var initial=SessionEpochLedger.initial(outer.cluster,outer.database,10);
             if (initialized) catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,initial));
@@ -158,7 +160,7 @@ class RatisSessionPropagationTest {
                 var group=descriptor.groupId(); var peer=RaftPeer.newBuilder().setId(descriptor.replicas().getFirst().peerId()).build();
                 var raft=RaftGroup.valueOf(RaftGroupId.valueOf(group),peer); raftGroups.put(group,raft);
                 var store=catalogue.pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(directory.domainId(),Set.of(outer.data),descriptor.lowerInclusive(),descriptor.upperExclusive()),
-                        new byte[32],Map.of(outer.data,"data"),Set.of()); stores.put(group,store);
+                        this.dataSchemaDigest,Map.of(outer.data,"data"),Set.of()); stores.put(group,store);
                 var machine=RatisRangeStateMachine.withSessions(store,raft,RatisSessionBindingTest.Fixture.LIMITS,command -> {},catalogue.epochs,directory,
                         RatisRangeStateMachine.RetentionLimits.defaults(),() -> new RatisRangeStateMachine.Leadership(1,true)); machines.put(group,machine);
                 var nativeStorage=RaftStorage.newBuilder().setDirectory(root.resolve(group.toString()).toFile()).setOption(RaftStorage.StartupOption.FORMAT)
@@ -212,7 +214,7 @@ class RatisSessionPropagationTest {
                 ranges.add(new RangeDescriptor(new UUID(6,i+2),groups.get(i),i==0 ? firstEpoch : 1,0,i==0 ? null : new byte[]{(byte)128},
                         i==0 ? new byte[]{(byte)128} : null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica)));
             }
-            return new RangeDirectory(outer.cluster,outer.database,new UUID(6,1),1,new byte[32],generation,Set.of(outer.data),0,ranges);
+            return new RangeDirectory(outer.cluster,outer.database,new UUID(6,1),1,dataSchemaDigest,generation,Set.of(outer.data),0,ranges);
         }
         RatisSessionPropagation driver(Path journals) throws IOException { return new RatisSessionPropagation(journals,catalogue.epochs,routed,2); }
         void advance(long time) throws Exception {

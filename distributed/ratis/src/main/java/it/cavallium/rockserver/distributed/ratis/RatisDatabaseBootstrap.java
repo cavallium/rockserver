@@ -10,12 +10,14 @@ import org.apache.ratis.client.RaftClient;
 
 /** Logical bootstrap over already-authorized placements. Readiness observations are rechecked after reopen, never restored as health. */
 public final class RatisDatabaseBootstrap implements AutoCloseable {
-    public enum Phase { PREFLIGHT, GENESIS, CLOCK, PROPAGATE, VERIFY, READY, CONFLICT, EXPIRED }
+    public enum Phase { PREFLIGHT, SCHEMA, GENESIS, CLOCK, PROPAGATE, VERIFY, READY, CONFLICT, EXPIRED }
     public record Progress(Phase phase,String directoryDigest,SessionAuthority target,int checked,int total,Map<UUID,String> failures) {
         public Progress { failures=Map.copyOf(failures); }
     }
     private final RatisNodePlan plan; private final RatisRoutedClient routed; private final LongSupplier time;
     private final byte[] scope; private final RatisCatalogue catalogue;
+    private final DistributedSchema schema; private final RatisSchemaCatalogue schemas;
+    private RatisSchemaPublication publication;
     private final FileChannel lockChannel; private final FileLock lock;
     private RatisCatalogueGenesis genesis; private RatisCatalogueClock clock; private RatisSessionPropagation propagation;
     private record State(Phase phase,SessionAuthority target,BitSet checked,int cursor) {}
@@ -25,18 +27,26 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
     /** Holds no placement-creation authority itself. Clients remain borrowed; root exists on durable storage. */
     public RatisDatabaseBootstrap(Path root,RatisNodePlan plan,RaftClient catalogueClient,RatisRoutedClient routed,
             long initialTime,LongSupplier time,int maxRanges) throws IOException {
+        this(root,plan,catalogueClient,routed,null,initialTime,time,maxRanges);
+    }
+    /** Publishes and freshly verifies the exact content-bound schema before creating the directory/ledger pair. */
+    public RatisDatabaseBootstrap(Path root,RatisNodePlan plan,RaftClient catalogueClient,RatisRoutedClient routed,
+            DistributedSchema schema,long initialTime,LongSupplier time,int maxRanges) throws IOException {
         this.plan=Objects.requireNonNull(plan); this.routed=Objects.requireNonNull(routed); this.time=Objects.requireNonNull(time); scope=plan.directory().payloadDigest();
-        if (plan.directory().generation()!=0 || plan.directory().ranges().size()>maxRanges || maxRanges<1 || maxRanges>RangeDirectoryCodec.MAX_RANGES) {
+        this.schema=schema; if (schema!=null) schema.requireMatches(plan.directory());
+        if (initialTime<0 || plan.directory().generation()!=0 || plan.directory().ranges().size()>maxRanges || maxRanges<1 || maxRanges>RangeDirectoryCodec.MAX_RANGES) {
             throw new IllegalArgumentException("Invalid initial bootstrap scope/budget");
         }
         requireCachedScope(); Path directory=root.toAbsolutePath(); if (!Files.isDirectory(directory)) throw new IOException("Bootstrap root is absent");
         var c=plan.catalogue(); catalogue=new RatisCatalogue(catalogueClient,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
+        schemas=schema==null ? null : new RatisSchemaCatalogue(catalogueClient,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
         var epochs=new RatisSessionEpochs(catalogueClient,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
         lockChannel=FileChannel.open(directory.resolve("bootstrap.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
         FileLock acquired=null;
         try {
             try { acquired=lockChannel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Bootstrap root already owned",owned); }
             if (acquired==null) throw new IOException("Bootstrap root already owned"); lock=acquired;
+            if (schema!=null) publication=new RatisSchemaPublication(directory.resolve("schema.bin"),catalogueClient,plan,schema);
             genesis=new RatisCatalogueGenesis(directory.resolve("genesis.bin"),catalogueClient,plan,initialTime);
             clock=new RatisCatalogueClock(directory.resolve("clock.bin"),epochs);
             Path clocks=Files.createDirectories(directory.resolve("ranges")); SessionJournalFiles.force(clocks); SessionJournalFiles.force(directory);
@@ -45,6 +55,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             try { if (propagation!=null) propagation.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             try { if (clock!=null) clock.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             try { if (genesis!=null) genesis.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+            try { if (publication!=null) publication.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             try { if (acquired!=null) acquired.release(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             try { lockChannel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
@@ -66,7 +77,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             requireCachedScope(); var failures=new LinkedHashMap<UUID,String>();
             Phase phase=before.phase(); SessionAuthority target=before.target(); BitSet checked=(BitSet)before.checked().clone(); int cursor=before.cursor();
             if (phase==Phase.CONFLICT || phase==Phase.EXPIRED) return progress(before,failures);
-            if (phase!=Phase.PREFLIGHT && phase!=Phase.GENESIS) requirePublishedScope();
+            if (phase!=Phase.PREFLIGHT && phase!=Phase.SCHEMA && phase!=Phase.GENESIS) requirePublishedScope();
             switch (phase) {
                 case PREFLIGHT, VERIFY -> {
                     var ranges=plan.directory().ranges(); int visits=0, work=0;
@@ -83,11 +94,18 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
                         }
                     }
                     if (checked.cardinality()==ranges.size()) {
-                        if (phase==Phase.PREFLIGHT) phase=Phase.GENESIS;
+                        if (phase==Phase.PREFLIGHT) phase=schema==null ? Phase.GENESIS : Phase.SCHEMA;
                         else { requirePublishedScope(); phase=Phase.READY; }
                     }
                 }
+                case SCHEMA -> {
+                    var outcome=publication.execute();
+                    if (outcome.status()==CommandResult.Status.SUCCESS || outcome.status()==CommandResult.Status.CONFLICT) {
+                        requirePublishedSchema(); phase=Phase.GENESIS;
+                    } else phase=Phase.EXPIRED;
+                }
                 case GENESIS -> {
+                    requirePublishedSchema();
                     var outcome=genesis.execute();
                     phase=outcome.status()==CommandResult.Status.SUCCESS ? Phase.CLOCK : outcome.status()==CommandResult.Status.CONFLICT ? Phase.CONFLICT : Phase.EXPIRED;
                 }
@@ -114,13 +132,21 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
     private void requirePublishedScope() throws IOException {
         var current=RatisRoutedClient.rpc(() -> catalogue.read(plan.directory().domainId()));
         if (current==null || !Arrays.equals(scope,current.payloadDigest())) throw new IOException("Published directory differs from frozen bootstrap scope");
+        requirePublishedSchema();
+    }
+    private void requirePublishedSchema() throws IOException {
+        if (schema==null) return;
+        var current=RatisRoutedClient.rpc(() -> schemas.read(schema.digest()));
+        if (current==null || !Arrays.equals(DistributedSchemaCodec.encode(schema),DistributedSchemaCodec.encode(current))) {
+            throw new IOException("Published schema differs from frozen bootstrap content");
+        }
     }
     private Progress progress(State state,Map<UUID,String> failures) {
         return new Progress(state.phase(),HexFormat.of().formatHex(scope),state.target(),state.checked().cardinality(),plan.directory().ranges().size(),failures);
     }
     @Override public synchronized void close() throws IOException {
         if (closed) return; if (busy) throw new IOException("Bootstrap work is active"); closing=true;
-        propagation.close(); clock.close(); genesis.close();
+        propagation.close(); clock.close(); genesis.close(); if (publication!=null) publication.close();
         try { if (lock.isValid()) lock.release(); } finally { lockChannel.close(); }
         closed=true;
     }

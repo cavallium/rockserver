@@ -1,6 +1,10 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
+import it.cavallium.rockserver.core.common.*;
+import it.cavallium.buffer.Buf;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
@@ -114,4 +118,72 @@ class RatisDatabaseBootstrapTest {
             }
         }
     }
+    DistributedSchema schema() {
+        var outer=new RatisSessionEpochsTest();
+        return new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(
+                new DistributedSchema.Column(71,outer.data,"data",ColumnSchema.of(IntArrayList.of(1),new ObjectArrayList<>(),true),null)));
+    }
+    RatisDatabaseBootstrap bootstrap(Path path,RatisSessionPropagationTest.Fixture f,DistributedSchema schema) throws IOException {
+        return new RatisDatabaseBootstrap(path,plan(f),f.catalogue.client,f.routed,schema,10,() -> 20L,2);
+    }
+    RatisSchemaCatalogue schemas(RatisSessionPropagationTest.Fixture f) {
+        return new RatisSchemaCatalogue(f.catalogue.client,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
+    }
+    @Test void publishedSchemaBootstrapReopenAndLogicalSessionWorkflow() throws Exception {
+        var schema=schema();
+        try (var f=new RatisSessionPropagationTest.Fixture(root,false,schema.digest())) {
+            Path journals=Files.createDirectory(root.resolve("schema-bootstrap"));
+            try (var boot=bootstrap(journals,f,schema)) {
+                assertEquals(RatisDatabaseBootstrap.Phase.SCHEMA,boot.step(2).phase()); assertEquals(0,f.catalogue.next.get());
+                assertNull(schemas(f).read(schema.digest()));
+                assertEquals(RatisDatabaseBootstrap.Phase.GENESIS,boot.step(1).phase()); assertEquals(1,f.catalogue.next.get());
+                assertArrayEquals(DistributedSchemaCodec.encode(schema),DistributedSchemaCodec.encode(schemas(f).read(schema.digest())));
+                assertNull(f.catalogue.epochs.read(),"Schema publication alone does not create database/session authority"); ready(boot);
+            }
+            long submitted=f.catalogue.next.get();
+            try (var boot=bootstrap(journals,f,schema)) {
+                assertEquals(RatisDatabaseBootstrap.Phase.PREFLIGHT,boot.progress().phase()); ready(boot);
+                assertEquals(submitted,f.catalogue.next.get(),"Recovered publication/genesis do not allocate new mutation identities");
+            }
+            var ledger=f.catalogue.epochs.read(); var issuance=f.catalogue.epochs.prepareGrant(f.outer.operation(77),ledger,f.outer.a,100);
+            f.catalogue.epochs.execute(issuance.command()); ledger=f.catalogue.epochs.read();
+            var logical=new RatisLogicalClient(schemas(f).read(schema.digest()),f.routed,ledger,issuance.grant(),RatisSessionClient.Limits.defaults());
+            var key=new Keys(Buf.wrap(new byte[]{7})); var pending=logical.preparePut(logical.getColumnId("data"),key,Buf.wrap(new byte[]{9}),Mutation.ReturnMode.NONE);
+            f.routed.execute(logical.prepareBinding(f.catalogue.epochs,new OperationId(f.outer.maintenance,ledger.minimumEpoch(),100),pending,-1));
+            int reads=f.catalogue.reads.get(); assertEquals(CommandResult.Status.SUCCESS,logical.execute(pending).status()); logical.acknowledge(pending);
+            assertArrayEquals(new byte[]{9},logical.get(71,key).toByteArray()); assertEquals(reads,f.catalogue.reads.get());
+        }
+    }
+    @Test void identicalSchemaPublicationConflictRequiresFreshContentVerificationBeforeGenesis() throws Exception {
+        var schema=schema();
+        try (var f=new RatisSessionPropagationTest.Fixture(root,false,schema.digest())) {
+            schemas(f).execute(schemas(f).prepare(f.outer.operation(99),schema));
+            Path journals=Files.createDirectory(root.resolve("existing-schema"));
+            try (var boot=bootstrap(journals,f,schema)) {
+                boot.step(2); f.catalogue.missingSchema=true;
+                assertThrows(IOException.class,() -> boot.step(1)); assertEquals(RatisDatabaseBootstrap.Phase.SCHEMA,boot.progress().phase());
+                assertNull(f.catalogue.epochs.read()); long submitted=f.catalogue.next.get(); f.catalogue.missingSchema=false;
+                assertEquals(RatisDatabaseBootstrap.Phase.GENESIS,boot.step(1).phase()); assertEquals(submitted,f.catalogue.next.get());
+                f.catalogue.missingSchema=true; assertThrows(IOException.class,() -> boot.step(1));
+                assertEquals(RatisDatabaseBootstrap.Phase.GENESIS,boot.progress().phase()); assertEquals(submitted,f.catalogue.next.get());
+                f.catalogue.missingSchema=false; ready(boot);
+            } finally { f.catalogue.missingSchema=false; }
+        }
+    }
+    @Test void failedSchemaPollInvalidatesReadyAndSchemaMismatchNeverCreatesIntent() throws Exception {
+        var schema=schema();
+        try (var f=new RatisSessionPropagationTest.Fixture(root,false,schema.digest())) {
+            Path journals=Files.createDirectory(root.resolve("schema-poll"));
+            var wrong=new DistributedSchema(schema.clusterId(),schema.databaseId(),schema.domainId(),2,0,schema.columns());
+            assertThrows(IllegalArgumentException.class,() -> bootstrap(journals,f,wrong)); try (var files=Files.list(journals)) { assertEquals(0,files.count()); }
+            try (var boot=bootstrap(journals,f,schema)) {
+                ready(boot); f.catalogue.schemaUnavailable=true;
+                assertThrows(IOException.class,() -> boot.step(1)); assertEquals(RatisDatabaseBootstrap.Phase.VERIFY,boot.progress().phase());
+                f.catalogue.schemaUnavailable=false; f.catalogue.missingSchema=true;
+                assertThrows(IOException.class,() -> boot.step(1)); assertEquals(RatisDatabaseBootstrap.Phase.VERIFY,boot.progress().phase());
+                f.catalogue.missingSchema=false; ready(boot);
+            } finally { f.catalogue.schemaUnavailable=false; f.catalogue.missingSchema=false; }
+        }
+    }
+
 }

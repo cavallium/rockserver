@@ -1520,3 +1520,48 @@ deletes, saved conflicts, immutable inputs and pre-RPC rejection. Native test
 stores use the existing disk-directory fixture. These results establish local
 native/interface behavior; no server process, network/quorum, power-loss,
 performance-density or deployment acceptance was attempted.
+
+## Immutable schema catalogue publication and bootstrap integration
+
+`RatisSchemaCatalogue` publishes canonical schema images under the existing
+catalogue directory CF using disjoint 33-byte keys (`0x53` plus SHA-256), while
+directory keys remain their original 16-byte domain UUIDs. Publication is one
+bounded v2 PUT/NONE plus an absence predicate. The combined catalogue validator
+now verifies this namespace, exact canonical bytes, cluster/database identity and
+content digest. Schema rows cannot be replaced through that rule. A content row
+alone grants no placement, directory or session authority. The existing atomic
+directory/ledger genesis command and its persisted retry bytes are unchanged.
+All catalogue replicas must run the updated combined validator before accepting
+schema records; this is not mixed-version feature negotiation.
+
+`RatisSchemaPublication` persists a single random epoch-zero/sequence-zero
+identity and exact command before RPC under a stable journal lock. Uncertain
+replies retain that identity; terminal results are forced before being reported.
+Completion-write failure fences the owner until reopen, and an active execution
+prevents close/reownership. Recovery verifies the checksum, original content,
+catalogue binding and canonical command, rather than reconstructing a new write.
+Clients remain borrowed.
+
+The schema-aware `RatisDatabaseBootstrap` overload first checks the manifest
+against the frozen directory, preflights all data ranges, then publishes/verifies
+the schema before directory/session genesis. An absence-CAS conflict is reusable
+only after a fresh exact-content schema read. Later scope/readiness checks also
+verify the published schema, including after reopen and after a prior READY
+observation. Legacy schema-unaware callers remain source-compatible. This path
+uses the already authorized static placements; no new placement authorization,
+node admission, schema migration or operator activation protocol is implied.
+
+Validation: the established selected `test-compile surefire:test@default-test`
+gate passed 90 core, 19 patched-server and 105 adapter cases (214 total, zero
+failures/errors/skips), exit zero:
+`/tmp/rockserver-schema-publication-full-gate.log`. Seven publication cases cover
+native saved outcomes, uncertain reply/reopen with exact identity, immutable
+content conflict, namespace/CAS/hash/identity/size rejection, expiry, lock ownership,
+active close and completion-write fencing/recovery. Three added bootstrap cases
+cover complete publication-to-logical-session write/read, durable reopen without
+new creation mutations, existing-content conflict with fresh verification, schema
+failure before genesis and READY invalidation on a failed schema poll. The legacy
+six bootstrap cases and existing catalogue/genesis/session paths still pass.
+This is local native/interface evidence on disk fixtures. Network/quorum,
+server-process, power-loss, performance-density and deployment acceptance remain
+unverified; the excluded density fixture was neither staged nor selected.

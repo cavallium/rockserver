@@ -123,12 +123,13 @@ public final class RatisCatalogue {
         };
     }
 
-    /** Combined rule: one ordinary CAS or the atomic initial directory/ledger pair. Install on every catalogue replica. */
+    /** Combined rule: directory/session CAS, immutable schema publication or atomic genesis. Install on every catalogue replica. */
     public static Consumer<DistributedCommand> validator(UUID clusterId, UUID databaseId, UUID groupId,
             long rangeEpoch, byte[] schemaDigest, UUID directoryColumn, UUID sessionColumn) {
         if (directoryColumn.equals(sessionColumn)) throw new IllegalArgumentException("Catalogue columns must be distinct");
         var directory = validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         var sessions = RatisSessionEpochs.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,sessionColumn);
+        var schemas = RatisSchemaCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         return command -> {
             if (command.mutations().size()==2) {
                 if (command.formatVersion()!=2 || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
@@ -142,6 +143,8 @@ public final class RatisCatalogue {
                 sessions.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
                         List.of(command.mutations().get(1)),List.of(command.predicates().get(1))));
             } else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(sessionColumn)) sessions.accept(command);
+            else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(directoryColumn)
+                    && command.mutations().getFirst().key().length==33) schemas.accept(command);
             else directory.accept(command);
         };
     }
