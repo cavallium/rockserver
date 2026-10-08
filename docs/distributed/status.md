@@ -1424,3 +1424,51 @@ placement/catalogue creation and readiness, CLI/public API/schema adapters, topo
 full resource budgets, transactions/2PC and other architecture requirements remain
 open. This metadata read is not placement authorization or a claim that all expected
 replicas/failure domains have been accepted. Standalone behavior is unchanged.
+
+## Bounded coordinated logical database bootstrap
+
+`RatisDatabaseBootstrap` now composes the durable genesis, catalogue clock and
+multi-range propagation actors for a frozen initial directory. A stable root lock
+owns those journal streams; clients remain borrowed. Preflight metadata checks
+require exact scope and positive-term native apply for every participant before
+attempting genesis. A genesis conflict/expired result is terminal and never advances
+to clock/authority work. After successful genesis, each step reads the published
+catalogue directory and refuses any revision/scope change rather than rebasing a
+creation intent or resetting metadata.
+
+Clock advancement freezes a target cut. Older in-flight propagation rounds finish
+before a newer required round begins. Final per-range metadata reads require full
+authority dominance and return READY only after the published scope is checked
+again. Work is bounded to 1..32 participant checks or one mutation stage per call;
+discovery/catalogue reads are separate work. Fair cursors and bounded failure maps
+let other ranges progress after per-range errors, including propagation failures.
+State snapshots publish conservatively after guards; a poll from READY invalidates
+it to VERIFY before any fallible catalogue/scope lookup.
+
+Mutation progress remains durable in its owning actors. Readiness observations are
+intentionally not restored: a new coordinator starts at PREFLIGHT, and repeated
+READY polling performs another verification pass. Cached genesis/unchanged clock/
+completed propagation are reused without replaying creation. Close refuses active
+work and otherwise releases owned journal streams before root ownership. This is a
+logical prerequisite workflow over placements already authorized by its caller,
+not creation authority, replica/failure-domain acceptance or permanent health.
+
+The full ordinary gate passes 82 core/native, 19 patched-server and 92 adapter
+cases (193 total), exit zero: `/tmp/rockserver-database-bootstrap-full-gate.log`.
+Six bootstrap cases exercise the complete native logical path: create both metadata
+images, advance/propagate clock, fresh readiness, issue grant, bind, write, consume
+and read the result. Other cases cover fair failed preflight, reopen rechecking,
+either-key genesis conflict stopping later work, published revision rejection,
+READY invalidation on catalogue outage/change, and surfaced propagation errors.
+Preflight/bootstrap make no customer-key reads; the representative user read occurs
+only after readiness/binding/write. Private native test transports now serve both
+catalogue namespaces and scoped metadata, and previous consumers also pass.
+No excluded workflow/density execution, live network/server process, push/deploy or
+main-checkout change occurred. Actual Raft quorum, independent-node, physical-power-
+loss and representative performance acceptance remain unverified.
+
+A coherent logical bootstrap path is now available in the optional library. Trusted
+placement authorization, public CLI/service/schema/API adapters, topology and
+cross-domain recovery, full resource envelopes, transactions/2PC and other original
+architecture requirements remain open. Standalone runtime behavior is unchanged;
+the active goal is not complete.

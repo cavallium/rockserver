@@ -216,9 +216,12 @@ class RatisSessionEpochsTest {
                     if (writeOverride!=null) reply=writeOverride;
                 } else if (method.getName().equals("sendReadOnly")) {
                     reads.incrementAndGet(); byte[] query=((Message)args[0]).getContent().toByteArray();
-                    assertArrayEquals(ByteBuffer.allocate(32).put(bytes(sessions)).put(bytes(database)).array(),query);
+                    assertEquals(32,query.length); var input=ByteBuffer.wrap(query);
+                    UUID column=new UUID(input.getLong(),input.getLong()); byte[] key=new byte[16]; input.get(key);
+                    assertTrue(column.equals(sessions) || column.equals(directoryColumn));
+                    if (column.equals(sessions)) assertArrayEquals(bytes(database),key);
                     try (var pin=store.capture()) {
-                        byte[] value=pin.get(sessions,bytes(database));
+                        byte[] value=pin.get(column,key);
                         reply=value==null ? ByteBuffer.allocate(4).putInt(-1).array() : ByteBuffer.allocate(4+value.length).putInt(value.length).put(value).array();
                     }
                     if (readOverride!=null) reply=readOverride;

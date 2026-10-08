@@ -145,13 +145,15 @@ class RatisSessionPropagationTest {
         final Map<UUID,ReplicatedRangeStore> stores=new LinkedHashMap<>(); final Map<UUID,RatisRangeStateMachine> machines=new LinkedHashMap<>();
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>(); final List<RaftStorage> storage=new ArrayList<>();
         final Set<UUID> failed=new HashSet<>(),lost=new HashSet<>(); RangeDirectory directory; SessionEpochLedger ledger;
-        final RatisRoutedClient routed; int submissions; CountDownLatch started,release;
-        Fixture(Path root) throws Exception {
+        final RatisRoutedClient routed; int submissions,metadataReads,customerReads; CountDownLatch started,release;
+        Fixture(Path root) throws Exception { this(root,true); }
+        Fixture(Path root,boolean initialized) throws Exception {
             catalogue=outer.new Fixture(root.resolve("catalogue"));
             var initial=SessionEpochLedger.initial(outer.cluster,outer.database,10);
-            catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,initial));
-            ledger=initial.issue(outer.a,100); catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(1),initial,ledger));
-            directory=updated(1,1);
+            if (initialized) catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,initial));
+            ledger=initialized ? initial.issue(outer.a,100) : initial;
+            if (initialized) catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(1),initial,ledger));
+            directory=updated(initialized ? 1 : 0,1);
             for (var descriptor:directory.ranges()) {
                 var group=descriptor.groupId(); var peer=RaftPeer.newBuilder().setId(descriptor.replicas().getFirst().peerId()).build();
                 var raft=RaftGroup.valueOf(RaftGroupId.valueOf(group),peer); raftGroups.put(group,raft);
@@ -169,7 +171,20 @@ class RatisSessionPropagationTest {
                 machine.initialize(identity,raft.getGroupId(),nativeStorage); machine.notifyTermIndexUpdated(1,0);
             }
             routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
-                public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { throw new AssertionError(); }
+                public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) throws IOException {
+                    customerReads++;
+                    try {
+                        byte[] request=java.nio.ByteBuffer.allocate(16+key.length).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).put(key).array();
+                        byte[] response=machines.get(descriptor.groupId()).query(Message.valueOf(ByteString.copyFrom(request))).get(5,TimeUnit.SECONDS).getContent().toByteArray();
+                        var input=java.nio.ByteBuffer.wrap(response); int length=input.getInt(); if (length== -1) return null;
+                        byte[] value=new byte[length]; input.get(value); return value;
+                    } catch (Exception failure) { throw new IOException(failure); }
+                }
+                public RangeStateView stateView(RangeDescriptor descriptor) throws IOException {
+                    metadataReads++; if (failed.contains(descriptor.groupId())) throw new IOException("range unavailable");
+                    try { return RangeStateView.decode(machines.get(descriptor.groupId()).query(Message.valueOf(ByteString.copyFrom(RangeStateView.request()))).get(5,TimeUnit.SECONDS).getContent().toByteArray()); }
+                    catch (Exception failure) { throw new IOException(failure); }
+                }
                 public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException {
                     submissions++;
                     if (started!=null) {
@@ -193,7 +208,7 @@ class RatisSessionPropagationTest {
         RangeDirectory updated(long generation,long firstEpoch) {
             var ranges=new ArrayList<RangeDescriptor>();
             for (int i=0;i<2;i++) {
-                var replica=new ReplicaDescriptor(new UUID(5,1),new UUID(5,2),new UUID(5,i+3),"range"+i,"127.0.0.1:"+(i+1),ReplicaDescriptor.Role.VOTER);
+                var replica=new ReplicaDescriptor(new UUID(5,i+1),new UUID(5,i+11),new UUID(5,i+3),"range"+i,"127.0.0.1:"+(i+1),ReplicaDescriptor.Role.VOTER);
                 ranges.add(new RangeDescriptor(new UUID(6,i+2),groups.get(i),i==0 ? firstEpoch : 1,0,i==0 ? null : new byte[]{(byte)128},
                         i==0 ? new byte[]{(byte)128} : null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica)));
             }
