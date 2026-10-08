@@ -41,6 +41,12 @@ public final class RatisDurableSessionClient implements AutoCloseable {
         catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
     public SessionEpochLedger.Grant grant() { return client.grant(); }
+    RatisSessionClient.Limits limits() { return limits; }
+    boolean pristine() throws IOException {
+        lane.lock(); try { requireOpen(); var state=client.snapshot();
+            return state.nextSequence()==0 && state.acknowledgedThrough()==-1 && !state.exhausted() && state.entries().isEmpty();
+        } finally { lane.unlock(); }
+    }
     public List<Pending> pending() throws IOException { lane.lock(); try { requireOpen(); return List.copyOf(retained.values()); } finally { lane.unlock(); } }
     public long acknowledgedThrough() throws IOException { lane.lock(); try { requireOpen(); return client.acknowledgedThrough(); } finally { lane.unlock(); } }
     public Pending prepare(List<Mutation> mutations,List<KeyPredicate> predicates) throws IOException {

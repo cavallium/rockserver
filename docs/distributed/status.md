@@ -1661,3 +1661,57 @@ logical, catalogue, bootstrap and runtime consumers still pass. This establishes
 local disk/native/interface behavior; power-loss, live quorum and measured journal
 performance remain unverified. No server process/network probe was run, and the
 excluded density fixture was neither staged nor selected.
+
+## Durable grant issuance and logical-session recovery
+
+`RatisGrantIssuer` owns one durable user-grant intent with separate stable user
+and catalogue-issuer UUIDs. Each ledger append is frozen before RPC. Lost replies
+retry the original CAS; a conflict is durably consumed before the next explicit
+step reads a fresh ledger and allocates the next issuer sequence with its own ACK.
+Expiry is immutable, and expiry/exhaustion are terminal without replacing the
+identity. SUCCESS retains the exact successful successor image and allocated
+grant, even if later catalogue activity changes or prunes the live ledger. Its
+bounded journal retains no historical attempt list. Missing recovery journals,
+changed authority identity and malformed state fail closed.
+
+`RatisDurableLogicalSession` joins that issuer to the durable operation window.
+A forced INITIAL marker permits only pre-exposure issuer setup; PREPARING is
+forced before any issuance RPC. Handoff requires the exact grant/limits and a
+pristine window (sequence zero, ACK minus one, no entries, not exhausted), then
+forces ACTIVE before admitting user operations. ACTIVE pins the complete grant
+and requires both existing child journals to match it. An empty already-used
+window is not pristine, and replacing both children with another otherwise valid
+session is rejected. Root-file write failure fences operation admission; reopen
+can finish a surviving pristine handoff without allocating another grant.
+
+The logical facade shares the original fixed-key translation and supports cached
+name/numeric bindings, same-range PUT/DELETE/conditions, reads, prepared retries,
+saved outcomes, consumed markers and explicit ACKs across restart. Explicit
+first-use binding has a dedicated durable maintenance journal per group and
+validates recovered controls against the exact grant/window/incarnation. Ordinary
+execution performs no catalogue lookup or automatic rebind/resequence. The root
+tracks bounded active ownership for issuance, reads, writes and binding RPCs;
+close cannot release children or the root while work remains active. Routed and
+catalogue clients remain borrowed.
+
+This integrates the logical point/session workflow, not full frontend transport
+or `RocksDBConnection` capability parity. Bucket protocols, scoped transactions,
+range/cursor adapters, topology, resource/performance calibration and the other
+architecture requirements remain unfinished. Existing standalone APIs and all
+previous durable command/window formats are unchanged.
+
+Validation: the established selected `test-compile surefire:test@default-test`
+gate passed 90 core, 19 patched-server and 134 adapter cases (243 total, zero
+failures/errors/skips), exit zero:
+`/tmp/rockserver-durable-logical-issuance-full-gate.log`. Six issuer cases cover
+native uncertain replies, conflict/ACK progression, cached success after later
+clock changes, expiry, last-sequence exhaustion, corruption/identity/locks,
+completion-write fencing and active ownership. Four logical-session cases cover
+complete issuance-to-native logical write/read, lost binding and data replies,
+recovered consumed holes without another grant, foreign authority rejection,
+ACTIVE-write failure and pristine handoff recovery, INITIAL resumption, missing
+ACTIVE children, used-empty PREPARING rejection, child-journal swaps, binding RPC
+ownership and expiry without replacement. Existing ephemeral and durable clients
+remain covered. These are local disk/native/interface results; no server process,
+network/quorum, power-loss or measured performance acceptance was attempted. The
+excluded density fixture remains unselected and unstaged.

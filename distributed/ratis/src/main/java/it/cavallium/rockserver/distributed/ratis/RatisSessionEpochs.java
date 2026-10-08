@@ -32,6 +32,9 @@ public final class RatisSessionEpochs {
                 || rangeEpoch!=expectedEpoch || !Arrays.equals(schema,expectedSchema) || !column.equals(expectedColumn)) throw new IllegalArgumentException("Wrong node catalogue authority binding");
     }
     void validatePrepared(DistributedCommand command) { validator.accept(command); }
+    void requireDatabaseBinding(UUID expectedCluster,UUID expectedDatabase) {
+        if (!cluster.equals(expectedCluster) || !database.equals(expectedDatabase)) throw new IllegalArgumentException("Wrong session authority database");
+    }
     byte[] identityDigest() {
         byte[] bytes=ByteBuffer.allocate(104).put(uuid(cluster)).put(uuid(database)).put(uuid(group)).put(uuid(column)).putLong(rangeEpoch).put(schema).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); }

@@ -10,7 +10,7 @@ import java.util.*;
 /**
  * Cached-schema logical point operations for one domain. Borrows the routed client and owns one
  * newly issued session sequence window. Prepared identities survive uncertain replies in this
- * instance; restart requires a new grant until durable user-window recovery is available.
+ * instance; use RatisDurableLogicalSession for recovery across restart.
  * Bucket operations, operators, scans and transactions require their own distributed protocols.
  */
 public final class RatisLogicalClient {
@@ -71,7 +71,7 @@ public final class RatisLogicalClient {
     }
     /** Linearizable point read with exactly the standalone fixed-key encoding. */
     public Buf get(long column,Keys keys) throws IOException {
-        var binding=supported(column); byte[] physical=schema.encodeFixedKey(binding.columnId(),keys);
+        var binding=supported(schema,column); byte[] physical=schema.encodeFixedKey(binding.columnId(),keys);
         byte[] value=routed.read(binding.columnId(),physical);
         if (value!=null && !binding.schema().hasValue() && value.length!=0) throw new IOException("Nonempty value in key-only column");
         return value==null ? null : Buf.wrap(value);
@@ -84,6 +84,10 @@ public final class RatisLogicalClient {
     }
     /** One atomic same-range plan. Cross-range inputs are rejected before allocation or any RPC. */
     public Pending prepare(List<Change> changes,List<Condition> conditions) {
+        var plan=plan(schema,changes,conditions); return new Pending(this,session.prepare(plan.mutations(),plan.predicates()));
+    }
+    record Plan(List<Mutation> mutations,List<KeyPredicate> predicates) {}
+    static Plan plan(DistributedSchema schema,List<Change> changes,List<Condition> conditions) {
         changes=List.copyOf(changes); conditions=List.copyOf(conditions);
         if (changes.isEmpty() || (long)changes.size()+conditions.size()>DistributedCommandCodec.MAX_ITEMS) {
             throw new IllegalArgumentException("Invalid logical atomic command item count");
@@ -91,19 +95,19 @@ public final class RatisLogicalClient {
         var mutations=new ArrayList<Mutation>(changes.size()); var predicates=new ArrayList<KeyPredicate>(conditions.size());
         long bytes=0;
         for (var change:changes) {
-            var column=supported(change.column); var key=schema.encodeFixedKey(column.columnId(),change.keys);
+            var column=supported(schema,change.column); var key=schema.encodeFixedKey(column.columnId(),change.keys);
             byte[] value=change.kind==Mutation.Kind.DELETE ? null : storedValue(column,change.value);
             bytes+=26L+key.length+(value==null ? 0 : value.length); requireBudget(bytes);
             mutations.add(new Mutation(change.kind,column.columnId(),key,value,change.returns));
         }
         for (var condition:conditions) {
-            var column=supported(condition.column); var key=schema.encodeFixedKey(column.columnId(),condition.keys);
+            var column=supported(schema,condition.column); var key=schema.encodeFixedKey(column.columnId(),condition.keys);
             // Null is an absence predicate even for value-bearing columns.
             byte[] expected=condition.expected==null ? null : storedValue(column,condition.expected);
             bytes+=25L+key.length+(expected==null ? 0 : expected.length); requireBudget(bytes);
             predicates.add(new KeyPredicate(column.columnId(),key,expected));
         }
-        return new Pending(this,session.prepare(mutations,predicates));
+        return new Plan(List.copyOf(mutations),List.copyOf(predicates));
     }
     /** Frozen retry; IOException retains the same identity, route, payload and sequence window. */
     public CommandResult execute(Pending pending) throws IOException { return session.execute(owned(pending)); }
@@ -112,7 +116,7 @@ public final class RatisLogicalClient {
     public int outstanding() { return session.outstanding(); }
     public long acknowledgedThrough() { return session.acknowledgedThrough(); }
     public Pending prepareAcknowledgement(long column,Keys routingKey) {
-        var binding=supported(column);
+        var binding=supported(schema,column);
         return new Pending(this,session.prepareAcknowledgement(binding.columnId(),schema.encodeFixedKey(binding.columnId(),routingKey)));
     }
     /** Separate maintenance owner must retain/retry the returned binding identity before data submission. */
@@ -123,7 +127,7 @@ public final class RatisLogicalClient {
         if (pending==null || pending.owner!=this) throw new IllegalArgumentException("Operation belongs to another logical client");
         return pending.pending;
     }
-    private DistributedSchema.Column supported(long column) {
+    static DistributedSchema.Column supported(DistributedSchema schema,long column) {
         var binding=schema.column(column);
         if (binding.schema().variableLengthKeysCount()!=0) throw new UnsupportedOperationException("Logical bucket operations require the distributed bucket protocol");
         if (binding.operator()!=null) throw new UnsupportedOperationException("Logical operator operations require verified distributed operator activation");
