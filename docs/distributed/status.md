@@ -182,8 +182,8 @@ does not establish complete distributed API parity or production acceptance.
   establishes settlement. Applied retries return the original typed prepared or negative vote.
   A fresh linearizable participant-state query survives response loss and control-session
   receipt GC. The routed client freezes exact bytes and the original descriptor for
-  retry, but callers must durably retain them; a multi-group coordinator journal is
-  still missing. Durable coordinator integration remains unfinished.
+  retry. The caller-driven coordinator journal now retains them durably; automatic
+  coordinator policy and recovery scheduling remain unfinished.
 - The current FINALIZE record carries the verified immutable home decision and its
   independent recovery identity in at most 8,010 encoded bytes. A privileged leader
   coordinator reserves a protected input slot before the fresh home read, validates
@@ -205,6 +205,32 @@ does not establish complete distributed API parity or production acceptance.
   the same holds before completing deferred duplicate suffixes. Applied replies retain
   the first finalization position; the client requires it to follow any registered
   prepare vote. The routed terminal query supplies saved results.
+- `RatisDurableTransaction` adds an exclusive, caller-driven coordinator journal.
+  Creation forces the initial home CAS, participant list, every accepted business
+  plan/result, original routes and control identities before the first home RPC.
+  Canonical participant planning images can now be captured without closing the
+  original tracked cut or granting append authority. Actual PREPARE and FINALIZE
+  requests are forced before dispatch; votes and terminal proofs are forced before
+  returning resolved progress. PREPARE registrations may include other participants'
+  votes. Each uncertain request retains its exact body, identity and descriptor.
+  A saved FINALIZE append receipt without terminal proof remains unresolved: retries
+  query proof without resending, reject null/contradictory replies, and force the
+  matching outcome before success. A verified ABORT outcome may later gain a negative
+  vote while preserving its original decision and finalization position.
+  Home observations preserve the immutable definition and exact monotone generation
+  steps. An old successful registration receipt cannot regress a newer observed
+  decision. Introducing a home vote requires verified local native evidence; choosing
+  COMMIT requires every positive vote; ACK and consumption require terminal proofs.
+  Definite no-effects registration failure permits a fresh control identity for the
+  same initial transaction image, while uncertain registration does not. New home
+  CASes may use refreshed peer/configuration descriptors within the original home
+  range incarnation; each request then retains that descriptor through uncertainty.
+  Atomic checksummed files use a stable exclusive lock, file force, atomic replacement
+  and parent-directory force. Persistence failure fences the instance until reopen.
+  One RPC owner operates outside the journal monitor; close during an active RPC
+  retains file ownership and rejects, so another owner cannot race it. Clients remain
+  borrowed. This is a durable dispatch/state component, not an automatic coordinator
+  policy or recovery scheduler, and it does not establish cross-group snapshot gates.
 - Fresh terminal-outcome queries return one native cut containing the immutable
   COMMIT/ABORT binding, first finalization position, optional original prepare vote,
   and COMMIT-only retained business result. ABORT-before-PREPARE initially has no
@@ -267,6 +293,15 @@ Fence-only ABORT reserves the same fence allowance. These capacities
 are separate from ordinary user-receipt GC and are not donated by lease expiration,
 fencing or lock release. Raft PREPARE admission reserves the bounds before append;
 native apply also checks them. Retained terminal records still have no GC path.
+
+Each coordinator journal freezes at most 64 participants and 16 MiB of aggregate
+accepted commands (including their result images), plus 16 MiB of frozen routes and
+reserved pending-home routing. It reserves future registration/decision/proof metadata
+before the first home RPC; the complete current snapshot is capped at 64 MiB including
+its checksum. Accepted business/result bytes are stored once, with compact request
+and outcome metadata reconstructed against that immutable intent. Snapshots are
+rewritten atomically per durable transition; write amplification and global journal
+storage/tenant envelopes still require performance/resource qualification.
 
 A transaction-home record has at most 64 frozen participants and 7,926 encoded bytes.
 Both expected and replacement images fit comfortably within the 2 MiB atomic command
@@ -372,6 +407,23 @@ selection passed 23 adapter cases, zero failures/errors/skips, exit zero:
 `/tmp/rockserver-finalize-admission-final2.log`.
 No real network, server process or quorum acceptance is claimed.
 
+The coordinator-journal regression gate passed 55 core and 123 adapter cases (178
+total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-coordinator-journal-regression.log`. The focused gate passed 39
+adapter cases: `/tmp/rockserver-coordinator-journal-final.log`. Eleven new fixtures
+cover lost registration/PREPARE/FINALIZE replies with close/reopen and exact recovery,
+nonregressing old home receipts, fabricated vote/ACK rejection, forced-file failure
+before participant RPC, active-RPC ownership through rejected close, checksum and
+client-identity binding, two groups with a later voted registration and refreshed
+home route, ABORT gaining a delayed negative vote, aggregate rejection before any
+home effect, and registration grant expiry recovered under a fresh control identity.
+Independent review found a saved-receipt/terminal-proof short circuit; it is fixed.
+Its fault test forces the receipt, loses proof, reopens, returns null then a wrong
+position, and succeeds only after matching proof is forced, with one FINALIZE append.
+Review confirmed that fix and found no further concrete issue in the examined
+boundary. These fixtures remain controlled RPC/native runs, not power-loss, quorum
+or automatic recovery-scheduler acceptance.
+
 The exercised native preparation cases cover unchanged user values, complete read/
 absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
 planning/admission rejection, stable duplicate prepare positions, separate ordinary
@@ -426,8 +478,8 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Protected status-group node/pool activation, durable coordinator journaling,
-  automatic full 2PC recovery and consistent
+- Protected status-group node/pool activation, automatic coordinator policy and
+  full 2PC recovery scheduling, and consistent
   multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
   establish these.
 - Topology controllers, lineage-aware routing/receipts, relocation, split/merge,

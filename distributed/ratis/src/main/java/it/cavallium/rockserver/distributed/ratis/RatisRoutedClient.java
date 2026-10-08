@@ -199,11 +199,13 @@ public final class RatisRoutedClient implements AutoCloseable {
             } catch (IllegalArgumentException malformed) { throw new IOException("Invalid staging reply",malformed); }
         }
         public CommandResult stage(List<Mutation> mutations) throws IOException { return stage(mutations,List.of()); }
-        public byte[] participantPlanDigest(DistributedCommand intent,CommandResult stagedResult) throws IOException {
+        public byte[] participantPlanDigest(DistributedCommand intent,CommandResult stagedResult) throws IOException { return participantIntent(intent,stagedResult).payloadDigest(); }
+        /** Freeze an accepted-plan image for registration/journaling; server PREPARE authority is still required. */
+        public DistributedCommand participantIntent(DistributedCommand intent,CommandResult stagedResult) throws IOException {
             synchronized (this) { if (closed) throw new IOException("Transaction handle is closed"); }
             if (!intent.groupId().equals(descriptor.groupId()) || intent.rangeEpoch()!=descriptor.rangeEpoch() || !Arrays.equals(intent.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Participant intent differs from frozen route");
             var audit=new TransactionAcceptance(handle.position(),handle.generation(),handle.owner(),scope,stagedResult.encode());
-            return PreparedParticipant.Preparation.planDigest(DistributedCommand.acceptedTransaction(intent,audit));
+            return DistributedCommand.acceptedTransaction(intent,audit);
         }
         public DistributedCommand plan(DistributedCommand intent) throws IOException {
             byte[] encoded=DistributedCommandCodec.encode(intent); var body=ByteBuffer.allocate(60+encoded.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.putBlob(body,encoded);

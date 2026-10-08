@@ -16,6 +16,13 @@ public final class RatisTransactionStatuses {
         if (!directory.columns().equals(Set.of(column))) throw new IllegalArgumentException("Status directory must have its dedicated status column");
         cluster=directory.clusterId(); database=directory.databaseId(); schemaDigest=directory.schemaDigest();
     }
+    byte[] identityDigest() {
+        var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+    RatisRoutedClient.PreparedCommand restore(DistributedCommand command,RangeDescriptor descriptor) {
+        var restored=routed.restoreSessionCommand(command,descriptor); validate(restored); return restored;
+    }
     public record RegistrationRead(TransactionStatus status,RangeDescriptor descriptor) {}
     public TransactionStatus read(UUID transaction) throws IOException { return readRegistration(transaction).status(); }
     public RegistrationRead readRegistration(UUID transaction) throws IOException {

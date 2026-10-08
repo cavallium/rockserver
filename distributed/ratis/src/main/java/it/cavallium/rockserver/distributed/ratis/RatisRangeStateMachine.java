@@ -1076,12 +1076,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return finalizationOwners.containsKey(id) || participantOwners.containsKey(id) || admissions.containsKey(id) || preparedCommits.containsKey(id) || preparingCommits.containsKey(id);
     }
     /** Freeze the original read cut/scope/result before registering the home; it is never rebased during PREPARE. */
-    public byte[] participantPlanDigest(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception {
-        checkTransactionOwner(); long generation=transactionGeneration();
+    public byte[] participantPlanDigest(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception { return participantIntent(pin,business).payloadDigest(); }
+    /** Canonical planning data for durable registration; this grants no PREPARE append authority. */
+    public DistributedCommand participantIntent(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception {
+        checkTransactionOwner(); long generation=transactionGeneration(); commandValidator.accept(business);
         try (var stage=pin.stage(business)) {
             checkTransactionOwner(); if (generation!=transactionGeneration() || pin.position().term()!=transactionTerm()) throw new IllegalStateException("Participant read owner changed");
             var accepted=DistributedCommand.acceptedTransaction(business,new it.cavallium.rockserver.core.common.distributed.TransactionAcceptance(pin.position(),generation,transactionIncarnation,pin.scope(),stage.result().encode()));
-            return PreparedParticipant.Preparation.planDigest(accepted);
+            commandValidator.accept(accepted); return accepted;
         }
     }
     /** Privileged coordinator seam: verifies the committed home registration, then freezes/reserves one accepted participant plan. */

@@ -127,7 +127,7 @@ final class SessionWindowJournal implements AutoCloseable {
         for (int i=0;i<result.valueCount();i++) { byte[] value=result.value(i); size+=4L+(value==null ? 0 : value.length); }
         if (size>CommandResult.MAX_BYTES) throw new IOException("Session result blob exceeds bound"); return size;
     }
-    private static long routeSize(RangeDescriptor route) throws IOException {
+    static long routeSize(RangeDescriptor route) throws IOException {
         if (route.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IOException("Session route is inactive");
         byte[] lower=route.lowerInclusive(), upper=route.upperExclusive();
         long size=60L+(lower==null ? 0 : lower.length)+(upper==null ? 0 : upper.length);
@@ -146,7 +146,7 @@ final class SessionWindowJournal implements AutoCloseable {
         }
         return output.array();
     }
-    private static void route(ByteBuffer output,RangeDescriptor route) {
+    static void route(ByteBuffer output,RangeDescriptor route) {
         uuid(output,route.rangeId()); uuid(output,route.groupId()); output.putLong(route.rangeEpoch()).putLong(route.configurationVersion());
         blob(output,route.lowerInclusive()); blob(output,route.upperExclusive()); output.putInt(route.replicas().size());
         for (var replica:route.replicas()) {
@@ -155,7 +155,7 @@ final class SessionWindowJournal implements AutoCloseable {
             output.put((byte)(replica.role()==ReplicaDescriptor.Role.VOTER ? 0 : 1));
         }
     }
-    private static RangeDescriptor route(ByteBuffer input) throws IOException {
+    static RangeDescriptor route(ByteBuffer input) throws IOException {
         require(input,48); UUID range=uuid(input), group=uuid(input); long epoch=input.getLong(), configuration=input.getLong();
         byte[] lower=blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES,true), upper=blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES,true);
         require(input,4); int count=input.getInt();
