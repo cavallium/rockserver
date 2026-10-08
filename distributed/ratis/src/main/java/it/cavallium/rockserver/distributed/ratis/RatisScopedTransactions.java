@@ -9,24 +9,27 @@ import java.util.function.LongSupplier;
 
 /** Bounded ephemeral handle ownership. No native work or close runs under the registry monitor. */
 final class RatisScopedTransactions implements AutoCloseable {
+    static final long STAGING_BUILD_BYTES=64L*1024*1024, STAGING_RETAINED_BYTES=24L*1024*1024;
+    @FunctionalInterface interface StageFactory { ReplicatedRangeStore.ScopedStaging stage(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command) throws Exception; }
     @FunctionalInterface interface PlanFactory { RatisRangeStateMachine.ScopedCommit prepare(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command,RatisRangeStateMachine.ProposalDeadline deadline) throws Exception; }
-    record Limits(int handles,long scopeBytes,long planBytes,Duration maximumTtl) {
+    record Limits(int handles,long scopeBytes,long planBytes,long stagingBytes,Duration maximumTtl) {
         Limits {
             if (handles<1 || handles>4096 || scopeBytes<1 || scopeBytes>256L*1024*1024 || planBytes<DistributedCommandCodec.MAX_ENCODED_BYTES
-                    || planBytes>256L*1024*1024 || maximumTtl.isNegative() || maximumTtl.isZero() || maximumTtl.compareTo(Duration.ofMinutes(5))>0) throw new IllegalArgumentException("Invalid transaction handle limits");
+                    || planBytes>256L*1024*1024 || stagingBytes<STAGING_BUILD_BYTES || stagingBytes>256L*1024*1024 || maximumTtl.isNegative() || maximumTtl.isZero() || maximumTtl.compareTo(Duration.ofMinutes(5))>0) throw new IllegalArgumentException("Invalid transaction handle limits");
         }
-        static Limits defaults() { return new Limits(128,16L*1024*1024,16L*1024*1024,Duration.ofSeconds(60)); }
+        static Limits defaults() { return new Limits(128,16L*1024*1024,16L*1024*1024,128L*1024*1024,Duration.ofSeconds(60)); }
     }
     private final RatisRangeStateMachine machine;
     private final UUID owner;
     private final Limits limits;
     private final LongSupplier nanos;
     private final PlanFactory planner;
+    private final StageFactory stager;
     private final Map<UUID,Entry> entries=new HashMap<>();
     private final Map<UUID,Entry> handles=new HashMap<>();
     private final Set<Entry> retired=new HashSet<>();
     private int chargedHandles;
-    private long scopeBytes,planBytes;
+    private long scopeBytes,planBytes,stagingBytes;
     private boolean closed;
     private static final class Entry {
         final UUID id,leaseId=UUID.randomUUID(); final long generation,opened,ttl,scopeBytes; final TransactionScope scope;
@@ -34,6 +37,9 @@ final class RatisScopedTransactions implements AutoCloseable {
         ScopedTransactionRpc.Handle handle;
         RatisRangeStateMachine.ScopedCommit plan;
         byte[] baseDigest;
+        ReplicatedRangeStore.ScopedStaging staging;
+        DistributedCommand stagedCommand;
+        long stagingBytes;
         int planBytes;
         boolean busy,planning,closed,cleaning;
         Entry(UUID id,long generation,long opened,long ttl,long scopeBytes,TransactionScope scope) {
@@ -44,6 +50,10 @@ final class RatisScopedTransactions implements AutoCloseable {
         this(machine,limits,nanos,machine::prepareScopedCommit);
     }
     RatisScopedTransactions(RatisRangeStateMachine machine,Limits limits,LongSupplier nanos,PlanFactory planner) {
+        this(machine,limits,nanos,planner,ReplicatedRangeStore.ScopedHistoryPin::stage);
+    }
+    RatisScopedTransactions(RatisRangeStateMachine machine,Limits limits,LongSupplier nanos,PlanFactory planner,StageFactory stager) {
+        this.stager=Objects.requireNonNull(stager);
         this.machine=Objects.requireNonNull(machine); this.limits=Objects.requireNonNull(limits); this.nanos=Objects.requireNonNull(nanos);
         this.planner=Objects.requireNonNull(planner);
         owner=machine.transactionOwnerIncarnation();
@@ -75,12 +85,59 @@ final class RatisScopedTransactions implements AutoCloseable {
         } finally { finish(entry,!success); }
     }
     byte[] get(ScopedTransactionRpc.Handle handle,UUID column,byte[] key) throws Exception {
-        var entry=begin(handle,false); try { var value=entry.pin.get(column,key); if (value!=null && value.length>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Transaction value exceeds reply budget"); checked(entry); return value; }
+        var entry=begin(handle,false); try { var value=entry.staging==null ? entry.pin.get(column,key) : entry.staging.get(column,key); if (value!=null && value.length>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Transaction value exceeds reply budget"); checked(entry); return value; }
         finally { finish(entry,false); }
     }
     PhysicalRangePage page(ScopedTransactionRpc.Handle handle,UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws Exception {
-        var entry=begin(handle,false); try { var page=entry.pin.page(column,lower,upper,reverse,resume,items,bytes); checked(entry); return page; }
+        var entry=begin(handle,false); try { var page=entry.staging==null ? entry.pin.page(column,lower,upper,reverse,resume,items,bytes) : entry.staging.page(column,lower,upper,reverse,resume,items,bytes); checked(entry); return page; }
         finally { finish(entry,false); }
+    }
+    CommandResult stage(ScopedTransactionRpc.Handle handle,DistributedCommand command) throws Exception {
+        var entry=begin(handle,false); long reserved=0; ReplicatedRangeStore.ScopedStaging replacement=null;
+        try {
+            if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1
+                    || !command.operationId().equals(new OperationId(handle.id(),0,0))) throw new IllegalArgumentException("Staging has no durable operation identity or ACK");
+            if (entry.stagedCommand!=null) {
+                if (!extendsPrefix(entry.stagedCommand,command)) throw new IllegalArgumentException("Staging retry changed or regressed the original prefix");
+                if (Arrays.equals(entry.stagedCommand.payloadDigest(),command.payloadDigest())) { checked(entry); return entry.staging.result(); }
+            }
+            synchronized (this) {
+                if (STAGING_BUILD_BYTES>limits.stagingBytes()-stagingBytes) throw new IOException("Transaction staging admission exhausted");
+                stagingBytes+=STAGING_BUILD_BYTES; entry.stagingBytes+=STAGING_BUILD_BYTES; reserved=STAGING_BUILD_BYTES;
+            }
+            replacement=stager.stage(entry.pin,command); checked(entry);
+            long retained=replacement.accountedBytes();
+            if (retained>STAGING_RETAINED_BYTES) throw new IOException("Staging accounting exceeds retained bound");
+            // Entry.busy excludes readers/planners; close the previous JNI owner before donating its charge.
+            if (entry.staging!=null) entry.staging.close();
+            synchronized (this) {
+                ensureLive(entry);
+                stagingBytes+=retained-entry.stagingBytes;
+                entry.stagingBytes=retained;
+                entry.staging=replacement; entry.stagedCommand=command; replacement=null; reserved=0;
+            }
+            return entry.staging.result();
+        } finally {
+            try { if (replacement!=null) replacement.close(); }
+            finally {
+                synchronized (this) { stagingBytes-=reserved; entry.stagingBytes-=reserved; }
+                finish(entry,false);
+            }
+        }
+    }
+    private static boolean extendsPrefix(DistributedCommand previous,DistributedCommand next) {
+        return previous.groupId().equals(next.groupId()) && previous.rangeEpoch()==next.rangeEpoch()
+                && Arrays.equals(previous.schemaDigest(),next.schemaDigest())
+                && prefix(previous.mutations(),next.mutations()) && prefix(previous.predicates(),next.predicates());
+    }
+    private static boolean prefix(List<?> previous,List<?> next) { return next.size()>=previous.size() && next.subList(0,previous.size()).equals(previous); }
+    private static boolean samePlan(DistributedCommand staged,DistributedCommand intent) {
+        return extendsPrefix(staged,intent) && staged.mutations().equals(intent.mutations()) && staged.predicates().equals(intent.predicates());
+    }
+    private void releaseStaging(Entry entry) {
+        if (entry.staging==null) return;
+        entry.staging.close();
+        synchronized (this) { entry.staging=null; entry.stagedCommand=null; stagingBytes-=entry.stagingBytes; entry.stagingBytes=0; }
     }
     DistributedCommand plan(ScopedTransactionRpc.Handle handle,DistributedCommand command) throws Exception {
         var entry=begin(handle,true); boolean success=false;
@@ -90,6 +147,10 @@ final class RatisScopedTransactions implements AutoCloseable {
                 if (!Arrays.equals(entry.baseDigest,command.payloadDigest())) throw new IllegalArgumentException("Transaction plan retry differs from original operands");
                 checked(entry); return entry.plan.command();
             }
+            if (entry.stagedCommand!=null && !samePlan(entry.stagedCommand,command)) {
+                success=true; throw new IllegalArgumentException("Commit differs from the staged mutation/predicate prefix");
+            }
+            releaseStaging(entry);
             synchronized (this) {
                 if (DistributedCommandCodec.MAX_ENCODED_BYTES>limits.planBytes()-planBytes) throw new IOException("Transaction retained-plan admission exhausted");
                 entry.planBytes=DistributedCommandCodec.MAX_ENCODED_BYTES; planBytes+=entry.planBytes;
@@ -147,7 +208,7 @@ final class RatisScopedTransactions implements AutoCloseable {
         Throwable failure=null;
         for (var entry:release) {
             boolean success=false;
-            try { if (entry.plan!=null) entry.plan.close(); if (entry.pin!=null) entry.pin.close(); success=true; }
+            try { releaseStaging(entry); if (entry.plan!=null) entry.plan.close(); if (entry.pin!=null) entry.pin.close(); success=true; }
             catch (Throwable problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
             finally {
                 synchronized (this) {
@@ -159,6 +220,7 @@ final class RatisScopedTransactions implements AutoCloseable {
         if (failure instanceof Exception exception) throw exception; if (failure instanceof Error error) throw error;
     }
     synchronized int chargedHandles() { return chargedHandles; }
+    synchronized long retainedStagingBytes() { return stagingBytes; }
     synchronized long retainedPlanBytes() { return planBytes; }
     @Override public void close() throws Exception {
         synchronized (this) { closed=true; for (var entry:List.copyOf(entries.values())) retire(entry); }

@@ -78,14 +78,15 @@ public final class RatisRoutedClient implements AutoCloseable {
         try {
             var output=ByteBuffer.wrap(reply); var echoed=ScopedTransactionRpc.uuid(output); var handle=ScopedTransactionRpc.readHandle(output);
             if (output.hasRemaining() || !echoed.equals(nonce)) throw new IOException("Transaction open reply differs from request identity");
-            return new ScopedTransaction(descriptor,handle,scope);
+            return new ScopedTransaction(descriptor,handle,scope,observed.schemaDigest());
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction open reply",malformed); }
     }
     public final class ScopedTransaction implements AutoCloseable {
         private final RangeDescriptor descriptor; private final ScopedTransactionRpc.Handle handle;
         private final TransactionScope scope;
+        private final byte[] schemaDigest;
         private boolean closed;
-        private ScopedTransaction(RangeDescriptor descriptor,ScopedTransactionRpc.Handle handle,TransactionScope scope) { this.descriptor=descriptor; this.handle=handle; this.scope=scope; }
+        private ScopedTransaction(RangeDescriptor descriptor,ScopedTransactionRpc.Handle handle,TransactionScope scope,byte[] schemaDigest) { this.descriptor=descriptor; this.handle=handle; this.scope=scope; this.schemaDigest=schemaDigest.clone(); }
         public ApplyPosition snapshot() { return handle.position(); }
         public RangeDescriptor descriptor() { return descriptor; }
         public byte[] get(UUID column,byte[] key) throws IOException {
@@ -105,6 +106,20 @@ public final class RatisRoutedClient implements AutoCloseable {
             byte[] reply=call(ScopedTransactionRpc.PAGE,body.array());
             try { return ScopedTransactionRpc.decodePage(reply); } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction page reply",malformed); }
         }
+        /** Replaces an ephemeral staged prefix with an equal or extended one. No mutation is submitted to consensus. */
+        public CommandResult stage(List<Mutation> mutations,List<KeyPredicate> predicates) throws IOException {
+            var prefix=new DistributedCommand(descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,new OperationId(handle.id(),0,0),mutations,predicates);
+            byte[] encoded=DistributedCommandCodec.encode(prefix); var body=ByteBuffer.allocate(60+encoded.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.putBlob(body,encoded);
+            byte[] reply=call(ScopedTransactionRpc.STAGE,body.array());
+            if (reply.length<32 || !Arrays.equals(prefix.payloadDigest(),Arrays.copyOf(reply,32))) throw new IOException("Staging reply differs from requested prefix");
+            try {
+                var result=CommandResult.decode(Arrays.copyOfRange(reply,32,reply.length));
+                long returns=prefix.mutations().stream().filter(m -> m.returnMode()!=Mutation.ReturnMode.NONE).count();
+                if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=returns) throw new IOException("Staging reply differs from requested result plan");
+                return result;
+            } catch (IllegalArgumentException malformed) { throw new IOException("Invalid staging reply",malformed); }
+        }
+        public CommandResult stage(List<Mutation> mutations) throws IOException { return stage(mutations,List.of()); }
         public DistributedCommand plan(DistributedCommand intent) throws IOException {
             byte[] encoded=DistributedCommandCodec.encode(intent); var body=ByteBuffer.allocate(60+encoded.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.putBlob(body,encoded);
             byte[] reply=call(ScopedTransactionRpc.PLAN,body.array());

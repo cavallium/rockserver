@@ -1052,6 +1052,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 int items=input.getInt(), bytes=input.getInt(); end(input);
                 reply=ScopedTransactionRpc.pageBytes(scopedTransactions.page(handle,column,lower,upper,direction==1,resume,items,bytes));
             }
+            case ScopedTransactionRpc.STAGE -> {
+                var handle=ScopedTransactionRpc.readHandle(input); var command=DistributedCommandCodec.decode(ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); end(input);
+                byte[] result=scopedTransactions.stage(handle,command).encode();
+                reply=ByteBuffer.allocate(32+result.length).put(command.payloadDigest()).put(result).array();
+            }
             case ScopedTransactionRpc.PLAN -> {
                 var handle=ScopedTransactionRpc.readHandle(input); var command=DistributedCommandCodec.decode(ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); end(input);
                 reply=DistributedCommandCodec.encode(scopedTransactions.plan(handle,command));

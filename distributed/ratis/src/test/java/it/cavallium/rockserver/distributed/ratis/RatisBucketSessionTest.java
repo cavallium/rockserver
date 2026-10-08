@@ -47,6 +47,26 @@ class RatisBucketSessionTest {
             }
         }
     }
+    @Test void scopedRpcStagingPreservesCollisionMembersAndTheAcceptedLogicalResult() throws Exception {
+        var schema=schema(true); var column=schema.column(71).columnId();
+        try (var f=new RatisSessionPropagationTest.Fixture(root,true,schema.digest(),schema)) {
+            var first=schema.encodeLogicalKey(column,key(1)); var second=schema.encodeLogicalKey(column,key(2));
+            var mutations=List.of(Mutation.bucketPut(column,first.physicalKey(),first.variableKeys(),new byte[]{1},Mutation.ReturnMode.PREVIOUS),
+                    Mutation.bucketPut(column,second.physicalKey(),second.variableKeys(),new byte[]{2},Mutation.ReturnMode.CURRENT));
+            var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,first.physicalKey())));
+            var client=new RatisSessionClient(f.routed,f.ledger,f.ledger.grants().getFirst(),RatisSessionClient.Limits.defaults());
+            try (var tx=f.routed.openTransaction(scope,java.time.Duration.ofSeconds(1))) {
+                var preview=tx.stage(mutations); assertNull(preview.value(0)); assertArrayEquals(new byte[]{2},preview.value(1));
+                var bucket=schema.decodeBucket(column,first.physicalKey(),tx.get(column,first.physicalKey()));
+                assertArrayEquals(new byte[]{1},bucket.get(first.variableKeys())); assertArrayEquals(new byte[]{2},bucket.get(second.variableKeys()));
+                var intent=client.prepareTransactionIntent(mutations);
+                f.routed.execute(client.prepareBinding(f.catalogue.epochs,new OperationId(f.outer.maintenance,1,100),intent,-1));
+                var accepted=tx.plan(intent.command()); assertArrayEquals(preview.encode(),accepted.acceptance().result());
+                client.acceptTransaction(intent,accepted); assertArrayEquals(preview.encode(),client.execute(intent).encode()); client.acknowledge(intent);
+            }
+            for (var store:f.stores.values()) assertEquals(0,store.activeSnapshotPins());
+        }
+    }
     @Test void keyOnlyLogicalMembersDistinguishAbsenceAndEmptyPresence() throws Exception {
         var schema=schema(false);
         try (var f=new RatisSessionPropagationTest.Fixture(root,true,schema.digest(),schema)) {

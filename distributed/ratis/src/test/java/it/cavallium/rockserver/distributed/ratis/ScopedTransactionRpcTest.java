@@ -15,7 +15,7 @@ class ScopedTransactionRpcTest {
 
     @Test void framedKindsAreExplicitAndBodiesAreOwned() {
         for (int kind : new int[]{ScopedTransactionRpc.POINT, ScopedTransactionRpc.STATE, ScopedTransactionRpc.OPEN,
-                ScopedTransactionRpc.GET, ScopedTransactionRpc.PAGE, ScopedTransactionRpc.PLAN, ScopedTransactionRpc.CLOSE}) {
+                ScopedTransactionRpc.GET, ScopedTransactionRpc.PAGE, ScopedTransactionRpc.PLAN, ScopedTransactionRpc.CLOSE, ScopedTransactionRpc.STAGE}) {
             byte[] body = {1, 2, 3};
             var packet = new ScopedTransactionRpc.Packet(kind, body); body[0] = 9;
             assertArrayEquals(new byte[]{1, 2, 3}, packet.body()); packet.body()[0] = 9;

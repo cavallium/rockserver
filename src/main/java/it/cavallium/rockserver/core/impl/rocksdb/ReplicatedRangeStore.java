@@ -1031,6 +1031,7 @@ public final class ReplicatedRangeStore {
         private final DistributedCommand command;
         private final WriteBatchWithIndex overlay;
         private final CommandResult result;
+        private final long accountedBytes;
         private boolean closed;
         private ScopedStaging(ScopedHistoryPin parent,DistributedCommand command) throws RocksDBException {
             this.parent=parent; this.command=command;
@@ -1044,6 +1045,10 @@ public final class ReplicatedRangeStore {
                     if (evaluation.result().status()!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Transaction staging rejected: "+evaluation.result().status());
                     for (var entry:evaluation.buckets().entrySet()) building.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
                     result=evaluation.result();
+                    // Original operands, raw indexed effects, materialized buckets, result and bounded entry overhead.
+                    long bytes=2L*DistributedCommandCodec.encodedSize(command)+result.encode().length+4096L+128L*(command.mutations().size()+command.predicates().size());
+                    for (var bucket:evaluation.buckets().values()) bytes+=bucket.encodedSize();
+                    accountedBytes=bytes;
                 }
                 parent.requireReadable(); overlay=building; building=null; success=true;
             } finally {
@@ -1052,6 +1057,7 @@ public final class ReplicatedRangeStore {
         }
         public DistributedCommand command() { return command; }
         public CommandResult result() { return result; }
+        public long accountedBytes() { return accountedBytes; }
         private void requireReadable() {
             if (closed) throw new IllegalStateException("Staged transaction view is closed");
             parent.requireReadable();

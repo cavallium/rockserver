@@ -174,6 +174,12 @@ class RatisSessionPropagationTest {
                 machine.initialize(identity,raft.getGroupId(),nativeStorage); machine.notifyTermIndexUpdated(1,0);
             }
             routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
+                public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean fresh) throws IOException {
+                    try {
+                        var machine=machines.get(descriptor.groupId()); var message=Message.valueOf(ByteString.copyFrom(request));
+                        return (fresh ? machine.queryLinearizable(message) : machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray();
+                    } catch (Exception failure) { throw new IOException(failure); }
+                }
                 public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) throws IOException {
                     customerReads++;
                     try {

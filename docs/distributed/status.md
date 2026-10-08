@@ -46,8 +46,14 @@ does not establish complete distributed API parity or production acceptance.
   with the original native snapshot. It installs no user effects or receipts and
   does not confer commit authority. Failed predicates/shape/result bounds discard
   the view. Its native use remains charged until close, even after parent
-  certification invalidation. RPC/client staging and range-delete staging remain
-  incomplete.
+  certification invalidation. The current framed STAGE operation exposes these
+  prefixes through routed scoped handles; GET/PAGE use the staged view. Identical
+  retries return the cached result, extensions retain all earlier operands and
+  predicates, and delayed/regressing prefixes cannot replace newer ones. Failed
+  extensions preserve the previous view. PLAN requires the exact final business
+  prefix, releases staging and accepts it under the real durable operation ID.
+  Staging itself uses the ephemeral handle nonce and never appends a command or ACK.
+  Logical transaction adapters and range-delete staging remain incomplete.
 - Bounded mutation history detects ABA, same-value writes, absence deletes and range
   phantoms. Physical collision-bucket members share one stamp. Range deletion
   conservatively invalidates tracked observations. Exact native snapshots retain
@@ -103,8 +109,14 @@ input-slot/byte charges even when their chosen log form is a compact rejection.
 A native staging prefix retains the bounded original command and result plus an
 indexed native batch capped at 18 MiB (16 MiB bucket-plan allowance plus 2 MiB
 command allowance). Construction shares the apply evaluator's bucket working bound.
-These are data-size bounds; staging still needs aggregate RPC/registry admission
-before it is exposed through logical transaction handles.
+The registry additionally reserves 64 MiB before constructing a replacement while
+keeping the prior view charged. On success it shrinks to accounted original operands,
+raw indexed effects, materialized buckets, result and bounded entry overhead, with a
+24 MiB maximum per retained view. The default aggregate staging allowance is 128 MiB
+per group registry. Tiny prefixes retain their small accounted size rather than a
+24 MiB fixed charge. Busy expired/closed handles retain both old-view and construction
+charges until the actual native return and cleanup. These are payload/accounting
+bounds, not measured heap/native allocator limits or global node/pool envelopes.
 Rejected receipts reserve their actual bounded no-effects growth, preserving
 own-ACK progress at the retention cap.
 
@@ -140,6 +152,17 @@ parity through accepted native apply, rejection cleanup, pin retention, image/in
 and existing scoped transaction RPC behavior. The five new staging cases exercise
 the native primitive, not a completed public transaction adapter.
 
+The staging RPC regression gate passed 39 core and 76 adapter cases (115 total,
+zero failures/errors/skips), exit zero: `/tmp/rockserver-staging-rpc-regression.log`.
+After adding strict staging-result cardinality validation, the final scoped/RPC/
+bucket selection passed 33 adapter cases, exit zero:
+`/tmp/rockserver-staging-rpc-final.log`. It covers lost staging replies, equal and
+extended prefixes, delayed-prefix rejection, failed-extension preservation, staged
+forward/reverse pages, exact final PLAN matching, forced acceptance/lost commit reply/
+reopen/retry, logical collision buckets, aggregate admission, and expiry during native
+replacement construction. No real server process or quorum was used. Native fixtures
+reported an io_uring allocation warning on the test host; all selected cases completed.
+
 The end-to-end local workflow includes native OPEN/read/PLAN, forced acceptance,
 controlled append/native apply, lost reply, close/reopen, exact receipt retry and
 ACK. It also covers failed PLAN followed by durable local abandonment, and missing
@@ -163,8 +186,7 @@ server process, network/quorum probe, power-loss run or deployment was performed
 
 ## Required remaining work
 
-- RPC/client read-your-writes integration, range-delete staging and logical
-  transaction adapters; complete public
+- Logical transaction adapters and range-delete staging; complete public
   RocksDB API/frontend transaction, range and cursor parity.
 - Durable prepared locks, transaction-status groups, 2PC decision/finalization and
   consistent multi-group scoped snapshot fences.
