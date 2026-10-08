@@ -875,3 +875,45 @@ node/pool/tenant resource envelope or declared per-session outstanding-sequence
 contract. Public bootstrap/session binding, automatic catalogue time/floor jobs,
 scoped transactions/reservations, 2PC, topology and long workflow/resource acceptance
 remain part of the active goal.
+
+## Bounded client session window and consumed-result acknowledgement
+
+`RatisSessionClient` now owns monotonically allocated operation sequences for one
+new catalogue grant and borrows a long-lived `RatisRoutedClient`. The issuance
+image must match the routed cluster/database and the exact live grant. One caller
+must exclusively own each grant; reconstructing a client with a used grant would
+reuse sequences and is forbidden. Restart must issue a fresh grant until durable
+client-window recovery is implemented.
+
+Pending commands retain their immutable route, payload and piggyback ACK. IO
+failure leaves the same identity available for explicit retry. Successful execute
+caches the immutable outcome but does not acknowledge it: the application calls
+`acknowledge` only after durably consuming the outcome. Out-of-order consumed
+entries remain in the bounded window until all earlier entries are consumed, so a
+lost/ambiguous operation cannot permit unlimited sequence or receipt growth.
+New commands piggyback only that contiguous prefix; an explicit ACK can drain a
+range with no further user writes. Duplicate concurrent execution of one handle
+is rejected while independent handles can run. Completed-handle retries return
+the original cached result without another RPC. The wrapper never owns/closes the
+borrowed transport.
+
+Default limits are 32 outstanding entries, 16 MiB command bytes and 16 MiB
+worst-case result bytes. Preparation/routing/byte-budget failures allocate no
+sequence. Exact canonical command sizing now avoids encoding/copying operands
+just to reserve the client window; canonical wire bytes and hashes are unchanged.
+
+Focused Maven gate passes 16 codec and 22 adapter tests (38 total), exit zero:
+`/tmp/rockserver-session-client-gate.log`. A native two-range fixture proves lost
+reply after actual apply, byte-identical retry, an ACK gap across ranges and receipt
+drain after consumption. Controlled concurrency covers duplicate execution and
+independent progress. Tests also cover command/result byte exhaustion, failed
+routing without sequence allocation, foreign handles and invalid/expired grant
+images. These fixtures run no transport/server processes or excluded workflows.
+
+Range-side session binding is still missing. An immutable cached catalogue grant
+alone cannot observe later catalogue logical-time advancement; efficient binding
+must pair a once-per-range grant record with replicated monotonic authority
+clock/floor updates and bounded session metadata. The catalogue and data groups
+must define the ordered expiry boundary, rather than adding a hidden per-write
+cross-group read or relying on wall-clock rollback-prone leases. Wider resource
+budgets, bootstrap and the other previously listed architecture work remain open.

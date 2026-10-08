@@ -1,0 +1,119 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+import it.cavallium.rockserver.core.common.distributed.*;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Objects;
+import java.util.TreeMap;
+import java.util.UUID;
+
+/** Bounded client sequence window. The caller owns the routed client and durably consumes results before acknowledging. */
+public final class RatisSessionClient {
+    public record Limits(int outstanding, long commandBytes, long resultBytes) {
+        public Limits {
+            if (outstanding < 1 || outstanding > 4096 || commandBytes < 1 || resultBytes < 8) {
+                throw new IllegalArgumentException("Invalid session window limits");
+            }
+        }
+        public static Limits defaults() { return new Limits(32,16L*1024*1024,16L*1024*1024); }
+    }
+    public static final class Pending {
+        private final RatisSessionClient owner;
+        private final RatisRoutedClient.PreparedCommand prepared;
+        private final int commandBytes, resultBytes;
+        private CommandResult result;
+        private boolean executing, consumed;
+        private Pending(RatisSessionClient owner,RatisRoutedClient.PreparedCommand prepared,int commandBytes,int resultBytes) {
+            this.owner=owner; this.prepared=prepared; this.commandBytes=commandBytes; this.resultBytes=resultBytes;
+        }
+        public DistributedCommand command() { return prepared.command(); }
+        public RangeDescriptor descriptor() { return prepared.descriptor(); }
+    }
+    private final RatisRoutedClient routed;
+    private final SessionEpochLedger.Grant grant;
+    private final Limits limits;
+    private final TreeMap<Long,Pending> pending = new TreeMap<>();
+    private long nextSequence, acknowledgedThrough=-1, commandBytes, resultBytes;
+    private boolean exhausted;
+
+    /**
+     * One exclusive sequence owner for a newly issued grant. Never reconstruct with a previously used grant:
+     * restart must issue a new grant until durable client-window recovery is available.
+     * The verified issuance image does not substitute for range-side lifetime authority.
+     */
+    public RatisSessionClient(RatisRoutedClient routed,SessionEpochLedger ledger,SessionEpochLedger.Grant grant,Limits limits) {
+        this.routed=Objects.requireNonNull(routed); this.grant=Objects.requireNonNull(grant); this.limits=Objects.requireNonNull(limits);
+        var directory=routed.directory();
+        if (!ledger.clusterId().equals(directory.clusterId()) || !ledger.databaseId().equals(directory.databaseId())
+                || !ledger.isLive(new OperationId(grant.sessionId(),grant.epoch(),0))
+                || !ledger.grants().get((int)(grant.epoch()-ledger.minimumEpoch())).equals(grant)) {
+            throw new IllegalArgumentException("Session grant is not live in this database's issuance image");
+        }
+    }
+    public SessionEpochLedger.Grant grant() { return grant; }
+    public synchronized int outstanding() { return pending.size(); }
+    public synchronized long acknowledgedThrough() { return acknowledgedThrough; }
+
+    public synchronized Pending prepare(List<Mutation> mutations,List<KeyPredicate> predicates) {
+        requireCapacity();
+        var id=new OperationId(grant.sessionId(),grant.epoch(),nextSequence);
+        var prepared=acknowledgedThrough < 0 ? routed.prepare(id,mutations,predicates)
+                : routed.prepare(id,mutations,predicates,acknowledgedThrough);
+        return retain(prepared);
+    }
+    public Pending prepare(List<Mutation> mutations) { return prepare(mutations,List.of()); }
+
+    /** Explicitly drains receipts on a selected range even when no further data command is needed there. */
+    public synchronized Pending prepareAcknowledgement(UUID column,byte[] routingKey) {
+        requireCapacity();
+        if (acknowledgedThrough < 0) throw new IllegalStateException("No consumed contiguous results to acknowledge");
+        return retain(routed.prepareAcknowledgement(new OperationId(grant.sessionId(),grant.epoch(),nextSequence),column,routingKey,acknowledgedThrough));
+    }
+    private void requireCapacity() {
+        if (exhausted) throw new IllegalStateException("Session sequence space exhausted");
+        if (pending.size() >= limits.outstanding()) throw new IllegalStateException("Session outstanding window exhausted");
+    }
+    private Pending retain(RatisRoutedClient.PreparedCommand prepared) {
+        int encoded=DistributedCommandCodec.encodedSize(prepared.command());
+        int maximumResult=prepared.command().mutations().stream().allMatch(m -> m.returnMode()==Mutation.ReturnMode.NONE) ? 8 : CommandResult.MAX_BYTES;
+        if (encoded > limits.commandBytes()-commandBytes || maximumResult > limits.resultBytes()-resultBytes) {
+            throw new IllegalStateException("Session command/result byte window exhausted");
+        }
+        var entry=new Pending(this,prepared,encoded,maximumResult);
+        pending.put(nextSequence,entry); commandBytes+=encoded; resultBytes+=maximumResult;
+        if (nextSequence==Long.MAX_VALUE) exhausted=true; else nextSequence++;
+        return entry;
+    }
+
+    /** Failure leaves the immutable command in the window for explicit same-identity retry. */
+    public CommandResult execute(Pending entry) throws IOException {
+        synchronized (this) {
+            requireOwner(entry);
+            if (entry.result != null) return entry.result;
+            if (entry.executing) throw new IOException("This session operation is already executing");
+            entry.executing=true;
+        }
+        try {
+            CommandResult result=routed.execute(entry.prepared);
+            synchronized (this) { entry.result=result; }
+            return result;
+        } finally {
+            synchronized (this) { entry.executing=false; }
+        }
+    }
+    /** Call only after the application has durably consumed the returned outcome, including conflicts. */
+    public synchronized void acknowledge(Pending entry) {
+        requireOwner(entry);
+        if (entry.result==null) throw new IllegalStateException("Unresolved operation cannot be acknowledged");
+        entry.consumed=true;
+        while (!pending.isEmpty() && pending.firstEntry().getValue().consumed) {
+            var first=pending.pollFirstEntry();
+            acknowledgedThrough=first.getKey();
+            commandBytes-=first.getValue().commandBytes; resultBytes-=first.getValue().resultBytes;
+        }
+    }
+    private void requireOwner(Pending entry) {
+        if (entry==null || entry.owner!=this) throw new IllegalArgumentException("Operation belongs to another session client");
+    }
+}

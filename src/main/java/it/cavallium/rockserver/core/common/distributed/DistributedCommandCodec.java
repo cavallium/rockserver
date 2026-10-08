@@ -19,12 +19,17 @@ public final class DistributedCommandCodec {
     private DistributedCommandCodec() {}
     static int headerBytes(int version) { return HEADER_BYTES + (version >= 2 ? 4 : 0) + (version >= 3 ? 8 : 0); }
 
-    public static byte[] encode(DistributedCommand command) {
+    /** Exact canonical size without allocating or copying command operands. */
+    public static int encodedSize(DistributedCommand command) {
         Objects.requireNonNull(command, "command");
         int size = headerBytes(command.formatVersion());
         for (Mutation mutation : command.mutations()) size += mutation.encodedSize();
         for (KeyPredicate predicate : command.predicates()) size += predicate.encodedSize();
-        ByteBuffer output = ByteBuffer.allocate(size);
+        return size;
+    }
+
+    public static byte[] encode(DistributedCommand command) {
+        ByteBuffer output = ByteBuffer.allocate(encodedSize(command));
         output.putInt(command.formatVersion());
         putUuid(output, command.groupId());
         output.putLong(command.rangeEpoch()).put(command.schemaDigest());
