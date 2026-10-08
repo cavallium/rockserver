@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.ReceiptUsage;
+import it.cavallium.rockserver.core.common.distributed.ReceiptRetentionEstimate;
 import it.cavallium.rockserver.core.common.distributed.DistributedCommand;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
@@ -1048,6 +1049,47 @@ public final class ReplicatedRangeStore {
             ensureReceiptUsage();
             var totals = readUsage(usageKey);
             return new ReceiptUsage(applied, totals.count, totals.bytes);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+
+    /**
+     * Worst net retention growth at one completed apply cut; this reserves nothing and changes no command state.
+     * Callers must serialize outstanding maintenance proposals to avoid spending overlapping ACK/floor removal twice.
+     */
+    public ReceiptRetentionEstimate estimateReceiptRetention(DistributedCommand command) throws RocksDBException {
+        Objects.requireNonNull(command);
+        enterNative();
+        applyLane.lock();
+        try {
+            validate(command);
+            ensureReceiptUsage();
+            Usage total = readUsage(usageKey);
+            var usage = new ReceiptUsage(applied, total.count, total.bytes);
+            boolean maintenance = command.acknowledgedThrough() >= 0 || command.minimumSessionEpoch() >= 0;
+            var id = command.operationId();
+            long minimum = minimumSessionEpoch(null);
+            long floor = id.epoch() < minimum ? -1 : acknowledgedThrough(id, null);
+            if (id.epoch() < minimum || id.sequence() <= floor) {
+                return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
+            }
+            byte[] saved = db.get(receipts, receiptKey(id));
+            if (saved != null) {
+                decodeReceipt(saved, command.payloadDigest());
+                return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
+            }
+            Usage removed = new Usage(0, 0);
+            if (command.minimumSessionEpoch() > minimum) {
+                byte[] end = ByteBuffer.allocate(25).put(usageBucketsPrefix).putLong(command.minimumSessionEpoch()).array();
+                removed = scanUsage(state, usageBucketsPrefix, end, false);
+            }
+            if (command.acknowledgedThrough() > floor) {
+                removed = removed.plus(scanUsage(receipts, receiptKey(new OperationId(id.sessionId(), id.epoch(), 0)),
+                        receiptKey(new OperationId(id.sessionId(), id.epoch(), command.acknowledgedThrough() + 1)), true));
+            }
+            long maximumBytes = 84L + (command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)
+                    ? 8 : CommandResult.MAX_BYTES);
+            return new ReceiptRetentionEstimate(usage, true, Math.max(0, 1 - removed.count),
+                    Math.max(0, maximumBytes - removed.bytes), maintenance);
         } finally { applyLane.unlock(); leaveNative(); }
     }
 

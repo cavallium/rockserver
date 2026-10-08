@@ -45,7 +45,18 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     private final Consumer<DistributedCommand> epochFloorAdmission;
     private volatile Throwable storageFailure;
     private final HashMap<OperationId, Admission> admissions = new HashMap<>();
-    private long admittedBytes;
+    private long admittedBytes, dataProposalBytes;
+    private int dataAdmissions, protectedAdmissions;
+    private long reservedReceiptCount, reservedReceiptBytes;
+    private Admission maintenanceReservation;
+    private final RetentionLimits retentionLimits;
+    public record RetentionLimits(long dataCount, long dataBytes, long maintenanceCount, long maintenanceBytes) {
+        public RetentionLimits {
+            if (dataCount < 1 || dataBytes < 92 || maintenanceCount < 1 || maintenanceBytes < 92) throw new IllegalArgumentException("Invalid retention limits");
+            Math.addExact(dataCount,maintenanceCount); Math.addExact(dataBytes,maintenanceBytes);
+        }
+        public static RetentionLimits defaults() { return new RetentionLimits(4096,16L*1024*1024,16,64*1024); }
+    }
     private final java.util.concurrent.atomic.AtomicLong admissionGeneration = new java.util.concurrent.atomic.AtomicLong();
     record Leadership(long term, boolean ready) {}
     @FunctionalInterface interface LeadershipSource { Leadership get() throws IOException; }
@@ -55,12 +66,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         final OperationId id;
         final byte[] digest;
         final int bytes;
-        final long term, generation;
+        final long term, generation, receiptCount, receiptBytes;
+        final boolean maintenance, protectedControl;
+        boolean retentionReleased;
         int owners = 1;
-        Admission(OperationId id, byte[] digest, int bytes, long term, long generation) {
+        Admission(OperationId id, byte[] digest, int bytes, long term, long generation,
+                long receiptCount, long receiptBytes, boolean maintenance, boolean protectedControl) {
             this.id = id;
             this.digest = digest;
             this.bytes = bytes; this.term = term; this.generation = generation;
+            this.receiptCount=receiptCount; this.receiptBytes=receiptBytes;
+            this.maintenance=maintenance; this.protectedControl=protectedControl;
         }
     }
 
@@ -95,13 +111,25 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     /** Authority is checked only at proposal admission; committed replay remains deterministic. */
     public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
             Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission) {
-        this(store, initialGroup, limits, commandValidator, epochFloorAdmission, null);
+        this(store, initialGroup, limits, commandValidator, epochFloorAdmission, RetentionLimits.defaults(), null);
+    }
+
+    public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission, RetentionLimits retentionLimits) {
+        this(store,initialGroup,limits,commandValidator,epochFloorAdmission,retentionLimits,null);
     }
 
     // Explicit view injection is only for ordinary in-process fixtures without a running Raft division.
     RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
             Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission,
             LeadershipSource leadershipSource) {
+        this(store,initialGroup,limits,commandValidator,epochFloorAdmission,RetentionLimits.defaults(),leadershipSource);
+    }
+
+    RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits,
+            Consumer<DistributedCommand> commandValidator, Consumer<DistributedCommand> epochFloorAdmission,
+            RetentionLimits retentionLimits, LeadershipSource leadershipSource) {
+        this.retentionLimits = java.util.Objects.requireNonNull(retentionLimits);
         this.leadershipSource = leadershipSource;
         this.commandValidator = java.util.Objects.requireNonNull(commandValidator);
         this.epochFloorAdmission = java.util.Objects.requireNonNull(epochFloorAdmission);
@@ -401,6 +429,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     @Override public void reinitialize() throws IOException {
         admissionGeneration.incrementAndGet();
         var completions = new java.util.ArrayList<Completion>();
+        var coveredOperations = new java.util.ArrayList<OperationId>();
         IOException failure = null;
         synchronized (gate) {
             getLifeCycle().transition(LifeCycle.State.STARTING);
@@ -417,6 +446,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                     byte[] result = store.operationResult(command.operationId(), command.payloadDigest());
                     if (result == null) throw new IOException("Installed image omitted deferred receipt");
                     completions.add(new Completion(pending.future(), Message.valueOf(ByteString.copyFrom(result))));
+                    coveredOperations.add(command.operationId());
                 }
                 for (var entry : pendingNoops.headMap(a.index(), true).entrySet()) {
                     if (entry.getValue() > a.term() || entry.getKey() == a.index() && entry.getValue() != a.term()) {
@@ -428,6 +458,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear();
                 store.activate();
+                synchronized (admissions) {
+                    for (var id : coveredOperations) {
+                        var admission = admissions.get(id);
+                        if (admission != null) releaseRetention(admission);
+                    }
+                }
                 getLifeCycle().transition(LifeCycle.State.RUNNING);
             } catch (Exception problem) { failure = failRecovery(problem); }
         }
@@ -477,13 +513,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
             // Native receipt reads stay outside the short admission lock. If apply
             // advanced while reading, retry validation before acquiring ownership.
             for (int attempt = 0; attempt < 3; attempt++) {
-                var observed = store.applied();
+                var estimate = store.estimateReceiptRetention(command);
+                var observed = estimate.usage().appliedPosition();
                 if (observed == null || observed.term() != leadership.term()) {
                     throw new IllegalStateException("Current-term startup prefix has not completed native apply");
                 }
-                byte[] saved = store.operationResult(command.operationId(), digest);
                 // Previously committed outcomes and expired identities cannot advance the fence.
-                if (saved == null && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
+                if (estimate.newReceipt() && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
                 synchronized (admissions) {
                     if (generation != admissionGeneration.get()) throw new IllegalStateException("Admission leadership generation changed");
                     if (!java.util.Objects.equals(observed, store.applied())) continue;
@@ -497,12 +533,26 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                         }
                         admission.owners++;
                     } else {
-                        if (admissions.size() >= 1024 || admittedBytes + encoded.length > 16L * 1024 * 1024) {
+                        boolean maintenance = estimate.newReceipt() && estimate.maintenance();
+                        boolean protectedControl = estimate.maintenance() && command.mutations().isEmpty() && command.predicates().isEmpty();
+                        if (protectedControl ? protectedAdmissions >= 16
+                                : dataAdmissions >= 1024 || dataProposalBytes + encoded.length > 16L * 1024 * 1024) {
                             throw new IllegalStateException("Range proposal budget exhausted");
                         }
-                        admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation);
+                        if (maintenance && maintenanceReservation != null) throw new IllegalStateException("Receipt maintenance is already in flight");
+                        long countLimit = retentionLimits.dataCount() + (maintenance ? retentionLimits.maintenanceCount() : 0);
+                        long byteLimit = retentionLimits.dataBytes() + (maintenance ? retentionLimits.maintenanceBytes() : 0);
+                        if (!retentionFits(estimate.usage().retainedCount(),reservedReceiptCount,estimate.additionalCount(),countLimit)
+                                || !retentionFits(estimate.usage().retainedBytes(),reservedReceiptBytes,estimate.additionalBytes(),byteLimit)) {
+                            throw new IllegalStateException("Retained receipt budget exhausted; acknowledge outcomes or expire epochs");
+                        }
+                        admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation,
+                                estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl);
                         admissions.put(admission.id, admission);
                         admittedBytes += admission.bytes;
+                        if (protectedControl) protectedAdmissions++; else { dataAdmissions++; dataProposalBytes+=admission.bytes; }
+                        reservedReceiptCount+=admission.receiptCount; reservedReceiptBytes+=admission.receiptBytes;
+                        if (maintenance) maintenanceReservation=admission;
                     }
                     return transaction.setStateMachineContext(admission);
                 }
@@ -576,6 +626,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
                 var command = DistributedCommandCodec.decode(encoded);
                 commandValidator.accept(command);
                 byte[] bytes = store.apply(new ApplyPosition(entry.getTerm(), entry.getIndex()), command);
+                synchronized (admissions) {
+                    var admitted = admissions.get(command.operationId());
+                    if (admitted != null) releaseRetention(admitted);
+                }
                 advance(entry.getTerm(), entry.getIndex());
                 result = Message.valueOf(ByteString.copyFrom(bytes));
                 if (pending != null) {
@@ -610,8 +664,25 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
         synchronized (admissions) {
             if (transaction.getStateMachineContext() instanceof Admission admission) {
                 transaction.setStateMachineContext(null);
-                if (--admission.owners == 0 && admissions.remove(admission.id, admission)) admittedBytes -= admission.bytes;
+                if (--admission.owners == 0 && admissions.remove(admission.id, admission)) {
+                    admittedBytes -= admission.bytes;
+                    if (admission.protectedControl) protectedAdmissions--; else { dataAdmissions--; dataProposalBytes-=admission.bytes; }
+                    releaseRetention(admission);
+                }
             }
+        }
+    }
+
+    private static boolean retentionFits(long retained,long reserved,long additional,long ceiling) {
+        // No-growth GC/retries remain possible when a legacy database or conservative in-flight accounting exceeds the ceiling.
+        return additional == 0 || retained <= ceiling && reserved <= ceiling-retained && additional <= ceiling-retained-reserved;
+    }
+    // Caller holds admissions. Applied outcomes no longer consume speculative capacity, even with duplicate RPC waiters.
+    private void releaseRetention(Admission admission) {
+        if (!admission.retentionReleased) {
+            admission.retentionReleased=true;
+            reservedReceiptCount-=admission.receiptCount; reservedReceiptBytes-=admission.receiptBytes;
+            if (maintenanceReservation==admission) maintenanceReservation=null;
         }
     }
 

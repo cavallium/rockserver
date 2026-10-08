@@ -838,3 +838,40 @@ remain to integrate. Bootstrap/lifetime/data-session binding, automatic clock/fl
 propagation, scoped transactions/reservations, 2PC, topology, public API parity,
 long workflows and representative equal-durability/resource acceptance are still
 required by the full active goal.
+
+## Bounded per-range receipt admission and maintenance progress
+
+The native store now estimates worst nonnegative receipt growth from one completed
+usage cut. Existing/expired identities require no new retention; unknown results
+reserve 92 encoded bytes for NONE outcomes or 84 plus the maximum result size for
+returning mutations. ACK/floor removal is measured from retained receipts/buckets,
+then count and bytes are independently clamped at zero. This does not donate
+future deletion capacity to unrelated writes.
+
+Ratis admission combines that cut with outstanding reservations. Data defaults to
+4096 retained receipts/16 MiB, with 16 receipts/64 KiB maintenance headroom;
+constructor limits are configurable. A single in-flight maintenance owner prevents
+overlapping ACK/floor proposals from spending the same removal twice. Pure control
+commands have 16 protected proposal slots beyond the ordinary 1024-entry/16 MiB
+payload queue. Zero-growth GC and retries remain admissible at a full ceiling.
+Duplicate RPCs share one reservation. Cancellation, stale pre-append and last-owner
+release settle it once; successful native apply settles it immediately even with
+remaining duplicate RPC owners. Recovery likewise settles snapshot-covered results
+independently of pending duplicate payload owners. Accepted committed entries are
+never rejected by retention quota during apply.
+
+The ordinary full gate passes 68 core/native, 16 read-round and 30 adapter cases
+(114 total), Maven exit zero:
+`/tmp/rockserver-retention-reservation-full-gate.log`. New native fixtures cover
+pending overbooking, duplicate/cancellation ownership, conservative returning-result
+bytes, ACK progress at capacity, hard maintenance headroom, overlapping removal,
+stale-term release, protected queue slots and snapshot-covered duplicate recovery.
+No transport, independent-node, physical-power-loss or representative performance
+acceptance is implied. Excluded workflows and the untracked density fixture remain
+inactive; no push/deployment or main-checkout change occurred.
+
+These are per-range receipt and proposal bounds, not the architecture's complete
+node/pool/tenant resource envelope or declared per-session outstanding-sequence
+contract. Public bootstrap/session binding, automatic catalogue time/floor jobs,
+scoped transactions/reservations, 2PC, topology and long workflow/resource acceptance
+remain part of the active goal.

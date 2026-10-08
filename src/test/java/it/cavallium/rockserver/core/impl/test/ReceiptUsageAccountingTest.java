@@ -17,6 +17,65 @@ class ReceiptUsageAccountingTest {
     private static final NativeRangeImage.Limits LIMITS = new NativeRangeImage.Limits(4 * 1024 * 1024, 16 * 1024 * 1024, 1);
     @TempDir(factory = DiskTestDirectory.class) Path root;
 
+    @Test void retentionEstimatesBoundNewResultsAndPreserveNativeStateForRetries() throws Exception {
+        try (Pool pool = new Pool(root.resolve("estimates"))) {
+            assertEstimate(pool, command(1, 0), true, 1, 92, false);
+            var returned = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 99),
+                    List.of(new Mutation(Mutation.Kind.PUT, COLUMN, new byte[] {1}, new byte[] {3}, Mutation.ReturnMode.PREVIOUS)));
+            assertEstimate(pool, returned, true, 1, 84L + CommandResult.MAX_BYTES, false);
+            pool.store.apply(new ApplyPosition(1, 0), command(1, 0), new byte[7]);
+            assertEstimate(pool, command(1, 0), false, 0, 0, false);
+            long sequence = pool.db.getLatestSequenceNumber();
+            var reused = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 0),
+                    List.of(new Mutation(Mutation.Kind.PUT, COLUMN, new byte[] {1}, new byte[] {9})));
+            assertThrows(IllegalArgumentException.class, () -> pool.store.estimateReceiptRetention(reused));
+            var wrongGroup = new DistributedCommand(ADMIN, 1, new byte[32], new OperationId(SESSION, 1, 1), List.of(put()));
+            assertThrows(IllegalArgumentException.class, () -> pool.store.estimateReceiptRetention(wrongGroup));
+            assertEquals(sequence, pool.db.getLatestSequenceNumber());
+            assertUsage(pool, new ApplyPosition(1, 0), 1, 91);
+            assertArrayEquals(new byte[] {2}, pool.db.get(pool.handles.get(1), new byte[] {1}));
+        }
+    }
+
+    @Test void retentionEstimatesSubtractOnlyCurrentAckAndCoarseFloorUsageWithoutNegativeCredits() throws Exception {
+        try (Pool pool = new Pool(root.resolve("maintenance-estimates"))) {
+            pool.store.apply(new ApplyPosition(1, 0), command(1, 0), new byte[7]);
+            pool.store.apply(new ApplyPosition(1, 1), command(1, 1), new byte[13]);
+            var partial = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2), List.of(), List.of(), 0);
+            assertEstimate(pool, partial, true, 0, 1, true); // New92 minus covered91; count and bytes clamp independently.
+            var returned = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 2),
+                    List.of(new Mutation(Mutation.Kind.PUT, COLUMN, new byte[] {1}, new byte[] {3}, Mutation.ReturnMode.PREVIOUS)), List.of(), 0);
+            assertEstimate(pool, returned, true, 0, 84L + CommandResult.MAX_BYTES - 91, true);
+            pool.store.apply(new ApplyPosition(1, 2), partial);
+            assertEstimate(pool, partial, false, 0, 0, true);
+            assertEstimate(pool, command(1, 0), false, 0, 0, false);
+            var regressive = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 3), List.of(), List.of(), 0);
+            assertEstimate(pool, regressive, true, 1, 92, true);
+            var advancing = new DistributedCommand(GROUP, 1, new byte[32], new OperationId(SESSION, 1, 3), List.of(), List.of(), 1);
+            assertEstimate(pool, advancing, true, 0, 0, true); // Covered97 exceeds the new92; no negative credit escapes.
+            pool.store.apply(new ApplyPosition(1, 3), command(2, 0));
+            var floor = DistributedCommand.advanceSessionEpochFloor(GROUP, 1, new byte[32], new OperationId(ADMIN, 3, 0), 2);
+            assertEstimate(pool, floor, true, 0, 0, true);
+            pool.store.apply(new ApplyPosition(1, 4), floor);
+            assertEstimate(pool, floor, false, 0, 0, true);
+            assertEstimate(pool, command(1, 99), false, 0, 0, false);
+            var oldFloor = DistributedCommand.advanceSessionEpochFloor(GROUP, 1, new byte[32], new OperationId(ADMIN, 3, 1), 1);
+            assertEstimate(pool, oldFloor, true, 1, 92, true);
+            assertUsage(pool, new ApplyPosition(1, 4), 2, 184);
+            assertArrayEquals(new byte[] {2}, pool.db.get(pool.handles.get(1), new byte[] {1}));
+        }
+    }
+
+    private static void assertEstimate(Pool pool, DistributedCommand command, boolean newReceipt,
+            long additionalCount, long additionalBytes, boolean maintenance) throws Exception {
+        ReceiptUsage usage = pool.store.receiptUsage();
+        long sequence = pool.db.getLatestSequenceNumber();
+        assertEquals(new ReceiptRetentionEstimate(usage, newReceipt, additionalCount, additionalBytes, maintenance),
+                pool.store.estimateReceiptRetention(command));
+        assertEquals(sequence, pool.db.getLatestSequenceNumber(), "Estimating current bound state must not write native metadata or effects");
+        assertEquals(usage, pool.store.receiptUsage());
+    }
+
     @Test void exactRetainedBytesDuplicatesPartialAckCoarseFloorAndCleanupSurviveReopen() throws Exception {
         var first = command(1, 0);
         var second = command(1, 1);
