@@ -132,6 +132,49 @@ class RatisNodeRuntimeTest {
             } finally { env.catalogue.unavailable=false; }
         }
     }
+    @Test void interruptedPreparationResumesOnlyWithExactIdentityAndExplicitPlacementAuthority() throws Exception {
+        try (var env=new Env(root)) {
+            var failed=new FakeServer(); failed.failCreate=true;
+            assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed));
+            assertEquals(0,failed.starts);
+            byte[] identity=SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128); assertEquals(0,identity[4]);
+            assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
+            var resumed=new FakeServer();
+            try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,resumed)) {
+                node.start(); assertTrue(resumed.exposedBeforeStart); assertTrue(node.started());
+            }
+            assertEquals(1,SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128)[4]);
+            try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
+        }
+    }
+    @Test void sealFailureNeverStartsServerAndExposedStartFailureCannotReinitializeMissingVoters() throws Exception {
+        try (var env=new Env(root)) {
+            Path identity=env.nodeRoot.resolve("node.identity"); byte[] preparing; var fake=new FakeServer();
+            try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake)) {
+                preparing=Files.readAllBytes(identity); Files.delete(identity); Files.createDirectory(identity); Files.writeString(identity.resolve("block"),"fixture");
+                assertThrows(IOException.class,node::start); assertEquals(0,fake.starts); assertEquals(RatisNodeRuntime.State.STOPPING,node.state());
+            }
+            Files.delete(identity.resolve("block")); Files.delete(identity); Files.write(identity,preparing);
+            var failed=new FakeServer(); failed.failStart=true;
+            try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed)) {
+                assertThrows(IOException.class,node::start); assertTrue(failed.exposedBeforeStart);
+            }
+            assertEquals(1,SessionJournalFiles.read(identity,128)[4]);
+            assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
+            assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
+        }
+    }
+    @Test void legacyIdentityRemainsExposedAndInvalidPhaseCannotRelaxRecovery() throws Exception {
+        try (var env=new Env(root)) {
+            try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
+            Path identity=env.nodeRoot.resolve("node.identity");
+            SessionJournalFiles.write(identity,java.nio.ByteBuffer.allocate(36).putInt(1).put(env.plan.identityDigest()).array(),128);
+            try (var node=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { node.start(); }
+            var bytes=SessionJournalFiles.read(identity,128); assertEquals(2,java.nio.ByteBuffer.wrap(bytes).getInt()); assertEquals(1,bytes[4]);
+            bytes[4]=2; SessionJournalFiles.write(identity,bytes,128);
+            assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
+        }
+    }
     static final class Env implements AutoCloseable {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest(); final RatisSessionEpochsTest.Fixture catalogue;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"node-runtime-test");
@@ -167,15 +210,20 @@ class RatisNodeRuntimeTest {
         public void close() throws Exception { routed.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close(); }
     }
     static final class FakeServer {
-        boolean created,wrongEndpoint,joint,rejectAdd,allFencedAtClose; int closes;
+        boolean created,wrongEndpoint,joint,rejectAdd,allFencedAtClose,failCreate,failStart,exposedBeforeStart; int closes,starts;
         volatile boolean leader=true,ready=true; volatile long term=1;
         RatisNodePlan plan; Path logs; Map<RaftGroupId,RatisRangeStateMachine> machines; RaftServer server;
         final Map<RaftGroupId,RaftStorage> storages=new LinkedHashMap<>();
-        RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) {
-            created=true; this.plan=plan; this.logs=logs; this.machines=machines;
+        RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException {
+            created=true; if (failCreate) throw new IOException("fixture build failure"); this.plan=plan; this.logs=logs; this.machines=machines;
             server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> switch (method.getName()) {
                 case "getId" -> RaftPeerId.valueOf(plan.peerId()); case "toString" -> "controlled-node-server";
-                case "start" -> { initialize(plan.localGroups().getFirst()); yield null; }
+                case "start" -> {
+                    starts++; byte[] identity=SessionJournalFiles.read(logs.getParent().resolve("node.identity"),128);
+                    exposedBeforeStart=identity.length==37 && identity[4]==1;
+                    if (failStart) throw new IOException("fixture start failure");
+                    initialize(plan.localGroups().getFirst()); yield null;
+                }
                 case "getGroupIds" -> List.copyOf(storages.keySet());
                 case "getDivision" -> division((RaftGroupId)args[0]);
                 case "groupManagement" -> {

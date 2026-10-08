@@ -1294,3 +1294,52 @@ The optional module now has an explicit node lifecycle entry path. New-cluster/
 placement authorization and resumable initialization, CLI/public API adapters,
 topology transitions, full resource envelopes, transactions/2PC and the other
 architecture requirements remain open. Standalone Main/configuration is unchanged.
+
+## Initial-placement preparation and durable exposure boundary
+
+Node identity v2 now records PREPARING or EXPOSED alongside the exact immutable
+placement fingerprint. Fresh authorized preparation writes PREPARING before native/
+server construction. Interrupted preparation can resume only with the same identity
+and explicit initial-placement authorization; ordinary RECOVER never infers that
+a missing voter is safe to recreate. Before every server.start attempt, EXPOSED is
+atomically written and directory-forced. Failure after that boundary never downgrades
+it or permits missing native/Raft state to be initialized under the old incarnation.
+V1 identities remain conservatively EXPOSED and upgrade without relaxing recovery.
+Invalid versions/shapes/phases fail closed.
+
+This boundary follows pinned 3.3.1 construction/start bytecode with the configured
+GRPC/default-disabled-datastream path: build/initGroups creates division futures;
+voting/application loops, state-machine initialization and listeners start through
+server.start. The package-private factory contract therefore forbids exposure in
+create. No assumption is made that a start attempt which throws was never exposed.
+
+The patched server artifact now includes `RockserverRaftServers`, a narrow
+construction bridge used by the node factory. A constructed but unreturned proxy
+is closed if initGroups throws; cleanup failure is suppressed onto the original
+failure. This closes the pinned stock builder's exceptional initGroups ownership
+gap without shadowing a second server jar or adding automatic construction retries.
+The new resource tests inject initialization/cleanup failures without constructing
+or starting a real proxy, RPC service or transport.
+
+The full ordinary gate passes 77 core/native, 19 patched-server and 79 adapter cases
+(175 total), exit zero: `/tmp/rockserver-node-exposure-full-gate.log`. New native
+cases cover constructor failure and authorized preparation retry, rejection by
+RECOVER while PREPARING, forced seal failure before any start, start-attempt failure
+remaining strict, legacy upgrade and corrupt phase rejection. The bridge tests
+cover ownership transfer, IO/runtime/error initialization failures and suppressed
+cleanup failure. Production proxy construction/startup and physical power-loss
+boundaries remain unexecuted; these are controlled native/interface/file tests.
+
+A separate producer-only package gate passes:
+`mvn -f distributed/ratis-server/pom.xml package -DskipTests`, log
+`/tmp/rockserver-node-exposure-package-gate.log`. The jar contains exactly one bridge,
+initializer interface, proxy and each existing read-safety class. Local artifact
+`distributed/ratis-server/target/rockserver-ratis-server-3.3.1-rockserver.1.jar`
+SHA-256: `b0702411cbec6939f46704eca9a4d950f5192e23005c63f8d63565006d1df618`.
+This is local packaging, not Maven installation/publication or deployment. No
+excluded workflow/density execution, network/server process or main-checkout change.
+
+Initial preparation is now resumable before exposure. Repair/resumption after
+exposure, actual placement-creation authority and new-cluster catalogue bootstrap,
+CLI/public API parity, topology and the other full architecture requirements
+remain open; the active goal is not complete.

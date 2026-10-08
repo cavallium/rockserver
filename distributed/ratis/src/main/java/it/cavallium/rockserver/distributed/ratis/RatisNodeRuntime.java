@@ -24,6 +24,7 @@ import reactor.core.scheduler.Scheduler;
 public final class RatisNodeRuntime implements AutoCloseable {
     public enum State { OPEN, STARTING, RUNNING, STOPPING, CLOSED }
     public enum Startup { RECOVER, AUTHORIZED_INITIAL_PLACEMENT }
+    /** Creation must not expose transport or start any group; the runtime seals exposure before calling start. */
     @FunctionalInterface interface ServerFactory {
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException;
     }
@@ -76,12 +77,14 @@ public final class RatisNodeRuntime implements AutoCloseable {
         try { lock=lockChannel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Node root already owned",owned); }
         if (lock==null) throw new IOException("Node root already owned");
         Path identity=root.resolve("node.identity"), logs=root.resolve("raft"), nativePath=root.resolve("native");
-        byte[] expected=ByteBuffer.allocate(36).putInt(1).put(plan.identityDigest()).array();
         if (Files.exists(identity)) {
-            if (!Arrays.equals(expected,SessionJournalFiles.read(identity,128))) throw new IOException("Node identity/schema binding changed");
-            if (!Files.isRegularFile(nativePath.resolve("CURRENT"))) throw new IOException("Established native state is missing; refuse empty-voter recovery");
-            for (var group:plan.localGroups()) if (!Files.isRegularFile(logs.resolve(group.getGroupId().getUuid().toString()).resolve("current/raft-meta"))) {
-                throw new IOException("Established Raft state is missing for "+group.getGroupId());
+            boolean exposed=identityExposed(SessionJournalFiles.read(identity,128));
+            if (!exposed && startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Interrupted initial placement requires explicit authorization to resume");
+            if (exposed) {
+                if (!Files.isRegularFile(nativePath.resolve("CURRENT"))) throw new IOException("Established native state is missing; refuse empty-voter recovery");
+                for (var group:plan.localGroups()) if (!Files.isRegularFile(logs.resolve(group.getGroupId().getUuid().toString()).resolve("current/raft-meta"))) {
+                    throw new IOException("Established Raft state is missing for "+group.getGroupId());
+                }
             }
         } else {
             if (startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Node identity is absent; explicit placement initialization is required");
@@ -89,7 +92,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 Path path=root.resolve(directory);
                 if (Files.exists(path)) try (var entries=Files.list(path)) { if (entries.findAny().isPresent()) throw new IOException("Unidentified node data must not be adopted"); }
             }
-            SessionJournalFiles.write(identity,expected,128);
+            SessionJournalFiles.write(identity,identity(false),128);
         }
         for (String directory:List.of("native","raft","sessions")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
         SessionJournalFiles.force(root);
@@ -131,6 +134,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         try {
             if (!Arrays.equals(routed.directory().payloadDigest(),plan.directory().payloadDigest())) throw new IOException("Node placement changed before start");
+            // Persist before the first possible network/voting exposure, including a start attempt that later fails.
+            SessionJournalFiles.write(root.resolve("node.identity"),identity(true),128);
             server.start(); var existing=new HashSet<RaftGroupId>(); server.getGroupIds().forEach(existing::add);
             if (!machines.keySet().containsAll(existing)) throw new IOException("Server recovered an unplanned group");
             long call=0;
@@ -146,6 +151,21 @@ public final class RatisNodeRuntime implements AutoCloseable {
             synchronized (this) { closeRequested=true; }
             for (var machine:machines.values()) machine.beginShutdown(); throw failure;
         } finally { synchronized (this) { starting=false; } }
+    }
+    private byte[] identity(boolean exposed) {
+        return ByteBuffer.allocate(37).putInt(2).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
+    }
+    private boolean identityExposed(byte[] bytes) throws IOException {
+        if (bytes.length<4) throw new IOException("Truncated node identity");
+        var input=ByteBuffer.wrap(bytes); int version=input.getInt(); boolean exposed;
+        if (version==1 && bytes.length==36) exposed=true; // Older writers did not prove a pre-exposure boundary.
+        else if (version==2 && bytes.length==37) {
+            int phase=input.get() & 255;
+            if (phase>1) throw new IOException("Invalid node exposure phase"); exposed=phase==1;
+        } else throw new IOException("Invalid node identity version/shape");
+        byte[] digest=new byte[32]; input.get(digest);
+        if (!Arrays.equals(digest,plan.identityDigest())) throw new IOException("Node identity/schema/placement binding changed");
+        return exposed;
     }
     private boolean clockOwnerReady() {
         synchronized (this) { if (closeRequested || closed || serverClosed) return false; }
@@ -202,12 +222,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
         GrpcConfigKeys.Server.setHost(properties,host); GrpcConfigKeys.Server.setPort(properties,Integer.parseInt(address.substring(colon+1)));
         GrpcConfigKeys.Server.setBossGroupSize(properties,1); GrpcConfigKeys.Server.setWorkerGroupSize(properties,2);
         GrpcConfigKeys.Server.setAsyncRequestThreadPoolCached(properties,false); GrpcConfigKeys.Server.setAsyncRequestThreadPoolSize(properties,4);
-        return RaftServer.newBuilder().setServerId(RaftPeerId.valueOf(plan.peerId())).setGroup(plan.localGroups().getFirst())
-                .setOption(RaftStorage.StartupOption.RECOVER).setProperties(properties)
-                .setParameters(RatisSnapshotAckInterceptor.parameters((id,term,index) -> {
-                    var machine=machines.get(id); if (machine==null) throw new IOException("Unplanned snapshot group"); machine.syncReceivedSnapshot(term,index);
-                })).setStateMachineRegistry(id -> {
+        return org.apache.ratis.server.impl.RockserverRaftServers.create(RaftPeerId.valueOf(plan.peerId()),plan.localGroups().getFirst(),
+                RaftStorage.StartupOption.RECOVER,id -> {
                     var machine=machines.get(id); if (machine==null) throw new IllegalArgumentException("Unplanned state-machine group"); return machine;
-                }).build();
+                },properties,RatisSnapshotAckInterceptor.parameters((id,term,index) -> {
+                    var machine=machines.get(id); if (machine==null) throw new IOException("Unplanned snapshot group"); machine.syncReceivedSnapshot(term,index);
+                }));
     }
 }
