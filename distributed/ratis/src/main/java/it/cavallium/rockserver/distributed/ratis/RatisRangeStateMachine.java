@@ -459,7 +459,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     private record Completion(CompletableFuture<Message> future, Message result) {}
 
     @Override public void reinitialize() throws IOException {
-        admissionGeneration.incrementAndGet();
+        admissionGeneration.incrementAndGet(); store.invalidateScopedSnapshots();
         var completions = new java.util.ArrayList<Completion>();
         var coveredOperations = new java.util.ArrayList<OperationId>();
         IOException failure = null;
@@ -689,7 +689,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine {
     }
 
     @Override public void notifyNotLeader(Collection<TransactionContext> pendingEntries) {
-        admissionGeneration.incrementAndGet();
+        admissionGeneration.incrementAndGet(); store.invalidateScopedSnapshots();
         for (var transaction : pendingEntries) releaseAdmission(transaction);
     }
 

@@ -6,6 +6,9 @@ import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
 import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.IdentityHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import it.cavallium.rockserver.core.common.distributed.RangeMutationHistory;
 import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
 import it.cavallium.rockserver.core.common.distributed.SessionAuthority;
 import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
@@ -28,6 +31,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -57,6 +61,11 @@ public final class ReplicatedRangeStore {
     /** V6 consensus bound for original bucket bytes plus retained staged bucket replacements. */
     public static final long MAX_BUCKET_PLAN_BYTES=16L*1024*1024;
     private volatile DistributedSchema logicalSchema;
+    private RangeMutationHistory scopedHistory;
+    private RangeMutationHistory.Limits scopedLimits;
+    private final Map<RangeMutationHistory.Pin,ScopedHistoryPin> scopedPins=new IdentityHashMap<>();
+    private final ConcurrentLinkedQueue<ScopedSnapshot> scopedReleases=new ConcurrentLinkedQueue<>();
+    private volatile Object scopedGeneration=new Object();
     private final RocksDB db;
     // getBaseDB() is borrowed and does not retain its original Java/native owner.
     private final RocksDB databaseOwner;
@@ -81,6 +90,8 @@ public final class ReplicatedRangeStore {
     private volatile boolean closing;
     private volatile ApplyPosition applied;
     private final AtomicInteger snapshotPins = new AtomicInteger();
+    private final AtomicInteger trackedSnapshotPins=new AtomicInteger();
+    private final AtomicLong trackedSnapshotScopeBytes=new AtomicLong();
     private volatile byte[] pendingInstallation;
     private volatile long installationGeneration;
 
@@ -138,6 +149,8 @@ public final class ReplicatedRangeStore {
     /** Null means no log entry has yet completed. This is not a durable snapshot watermark. */
     public ApplyPosition applied() { return applied; }
     public int activeSnapshotPins() { return snapshotPins.get(); }
+    public int activeTrackedSnapshotPins() { return trackedSnapshotPins.get(); }
+    public long trackedSnapshotScopeBytes() { return trackedSnapshotScopeBytes.get(); }
     public boolean pendingInstallation() { return pendingInstallation != null; }
     public RangeOwnership.Ownership ownership() { return ownership.get(owner); }
     public byte[] schemaDigest() { return schemaDigest.clone(); }
@@ -189,7 +202,8 @@ public final class ReplicatedRangeStore {
             var current = ownership.get(owner);
             if (current.state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
             else if (current.state() != RangeOwnership.State.FENCED) throw new IllegalStateException("Range cannot be fenced");
-        } finally { applyLane.unlock(); }
+            invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
+        } finally { applyLane.unlock(); drainScopedReleases(); }
     }
 
     /** Local activation only; the range adapter must supply the committed ownership authority. */
@@ -229,6 +243,63 @@ public final class ReplicatedRangeStore {
         finally { applyLane.unlock(); leaveNative(); }
     }
 
+    /** Group-local ephemeral limits, configured once; ordinary read/export pins remain independent. */
+    public void enableScopedHistory(RangeMutationHistory.Limits limits) {
+        Objects.requireNonNull(limits); enterNative(); applyLane.lock();
+        try {
+            requireActive();
+            if (scopedHistory!=null) {
+                if (!scopedLimits.equals(limits)) throw new IllegalArgumentException("Scoped history limits already configured"); return;
+            }
+            scopedHistory=new RangeMutationHistory(limits); scopedLimits=limits;
+            if (applied!=null && applied.term()>0) scopedHistory.advance(applied,List.of());
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public RangeMutationHistory.Stats scopedHistoryStats() {
+        applyLane.lock(); try { if (scopedHistory==null) throw new UnsupportedOperationException("Scoped history is not enabled"); return scopedHistory.stats(); }
+        finally { applyLane.unlock(); }
+    }
+    /** Leader-loss seam: invalidates writable-history observations without fencing follower apply. */
+    public void invalidateScopedSnapshots() {
+        applyLane.lock(); try { invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED); }
+        finally { applyLane.unlock(); drainScopedReleases(); }
+    }
+    private void invalidateScopedUnderLane(RangeMutationHistory.Status reason) {
+        if (scopedHistory==null) return;
+        scopedGeneration=new Object(); scopedHistory.invalidateAll(reason);
+        for (var pin:scopedPins.values()) scopedReleases.add(pin.snapshot); scopedPins.clear();
+    }
+    private void resetScopedUnderLane() {
+        if (scopedHistory==null) return;
+        scopedGeneration=new Object(); scopedHistory.reset();
+        for (var pin:scopedPins.values()) scopedReleases.add(pin.snapshot); scopedPins.clear();
+    }
+    private void retireScoped(List<RangeMutationHistory.Pin> pins) {
+        for (var pin:pins) { var owned=scopedPins.remove(pin); if (owned!=null) scopedReleases.add(owned.snapshot); }
+    }
+    private void retireScoped(RangeMutationHistory.Pin pin) {
+        var owned=scopedPins.remove(pin); if (owned!=null) scopedReleases.add(owned.snapshot);
+    }
+    private void drainScopedReleases() { ScopedSnapshot pin; while ((pin=scopedReleases.poll())!=null) pin.close(); }
+    private RangeMutationHistory.PreparedWrites prepareScopedWrites(boolean business,List<Mutation> effects,Map<BucketKey,DistributedBucket> buckets) {
+        if (scopedHistory==null) return null;
+        if (!business || scopedPins.isEmpty()) return scopedHistory.prepare(List.of());
+        var spans=new ArrayList<TransactionScope.Span>(effects.size()+buckets.size());
+        for (var mutation:effects) spans.add(mutation.kind()==Mutation.Kind.DELETE_RANGE
+                ? TransactionScope.Span.range(mutation.columnId(),mutation.key(),mutation.value()) : TransactionScope.Span.point(mutation.columnId(),mutation.key()));
+        for (var key:buckets.keySet()) spans.add(TransactionScope.Span.point(key.column,key.key));
+        return scopedHistory.prepare(spans);
+    }
+    private void publishScoped(ApplyPosition position,RangeMutationHistory.PreparedWrites writes,boolean configurationChanged) {
+        if (scopedHistory==null) return;
+        try {
+            if (configurationChanged || closing) invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
+            retireScoped(scopedHistory.advance(position,writes));
+        } catch (RuntimeException failure) {
+            // Native data is already committed: no old handle may certify against a partial publication.
+            resetScopedUnderLane();
+        }
+    }
     /** Install exact immutable decoding material before accepting/replaying v6. This grants no schema activation authority. */
     public void enableLogicalSchema(DistributedSchema schema) {
         Objects.requireNonNull(schema); enterNative(); applyLane.lock();
@@ -313,7 +384,7 @@ public final class ReplicatedRangeStore {
             throws RocksDBException {
         enterNative();
         try { return applyUnderAdmission(position, command, result); }
-        finally { leaveNative(); }
+        finally { try { drainScopedReleases(); } finally { leaveNative(); } }
     }
 
     private byte[] applyUnderAdmission(ApplyPosition position, DistributedCommand command, byte[] result)
@@ -337,12 +408,13 @@ public final class ReplicatedRangeStore {
             if (command.operationId().epoch() < currentEpochFloor || command.operationId().sequence() <= currentFloor) {
                 if (applied == null || position.index() > applied.index()) {
                     requireNext(position);
+                    var writes=prepareScopedWrites(false,List.of(),Map.of());
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                         batch.put(state, markerKey, encodePosition(position));
                         batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                         db.write(options, batch);
                     }
-                    applied = position;
+                    publishScoped(position,writes,false); applied = position;
                 }
                 return expiredResult();
             }
@@ -369,6 +441,7 @@ public final class ReplicatedRangeStore {
                 stableResult = evaluated.result().encode(); effects=evaluated.effects(); bucketEffects=evaluated.buckets();
                 installUserEffects = evaluated.result().status() == CommandResult.Status.SUCCESS;
             }
+            var writes=prepareScopedWrites(saved==null && installUserEffects,effects,bucketEffects);
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                 if (saved == null) {
@@ -404,11 +477,10 @@ public final class ReplicatedRangeStore {
                 if (saved != null) batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 db.write(options, batch);
             }
-            applied = position;
+            publishScoped(position,writes,false); applied = position;
             return saved == null ? stableResult : original;
-        } finally {
-            applyLane.unlock();
-        }
+        } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
+        finally { applyLane.unlock(); }
     }
 
     private byte[] authorityKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x13).array(); }
@@ -600,7 +672,7 @@ public final class ReplicatedRangeStore {
     public void applyNoop(ApplyPosition position, byte[] configuration) throws RocksDBException {
         enterNative();
         try { applyNoopUnderAdmission(position, configuration); }
-        finally { leaveNative(); }
+        finally { try { drainScopedReleases(); } finally { leaveNative(); } }
     }
 
     private void applyNoopUnderAdmission(ApplyPosition position, byte[] configuration) throws RocksDBException {
@@ -613,6 +685,7 @@ public final class ReplicatedRangeStore {
             ensureReceiptUsage();
             if (applied != null && position.index() <= applied.index()) return;
             requireNext(position);
+            var writes=prepareScopedWrites(false,List.of(),Map.of());
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                 batch.put(state, markerKey, encodePosition(position));
@@ -622,10 +695,9 @@ public final class ReplicatedRangeStore {
                 }
                 db.write(options, batch);
             }
-            applied = position;
-        } finally {
-            applyLane.unlock();
-        }
+            publishScoped(position,writes,configuration!=null); applied = position;
+        } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
+        finally { applyLane.unlock(); }
     }
 
     /**
@@ -643,7 +715,7 @@ public final class ReplicatedRangeStore {
             InstallationObserver observer) throws IOException, RocksDBException {
         enterNative();
         try { return installUnderAdmission(image, limits, observer); }
-        finally { leaveNative(); }
+        finally { try { drainScopedReleases(); } finally { leaveNative(); } }
     }
 
     private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
@@ -674,7 +746,7 @@ public final class ReplicatedRangeStore {
                 }
             }
             try (var lease = ownership.claimInstall(owner)) {
-                installationGeneration++;
+                resetScopedUnderLane(); installationGeneration++;
                 pendingInstallation = ByteBuffer.allocate(52).putInt(STATE_VERSION)
                         .putLong(expected.position().term()).putLong(expected.position().index()).put(expected.sha256()).array();
                 // Publish recovery authority before the first destructive interval change.
@@ -713,7 +785,7 @@ public final class ReplicatedRangeStore {
                         batch.delete(state, installingKey);
                         db.write(options, batch);
                     }
-                    applied = expected.position();
+                    publishScoped(expected.position(),prepareScopedWrites(false,List.of(),Map.of()),false); applied = expected.position();
                     installationGeneration++;
                     pendingInstallation = null;
                     return actual;
@@ -808,18 +880,88 @@ public final class ReplicatedRangeStore {
         enterNative();
         try {
             requireActive();
-            for (var span : scope.spans()) {
-                if (!columns.containsKey(span.columnId())) throw new IllegalArgumentException("Scope column is outside this range");
-                byte[] lower = span.lowerInclusive(), upper = span.upperExclusive();
-                if (span.isPoint()) {
-                    if (!contains(lower)) throw new IllegalArgumentException("Scope key is outside this range");
-                } else if ((interval.lowerInclusive() != null && (lower == null || Arrays.compareUnsigned(lower, interval.lowerInclusive()) < 0))
-                        || (interval.upperExclusive() != null && (upper == null || Arrays.compareUnsigned(upper, interval.upperExclusive()) > 0))) {
-                    throw new IllegalArgumentException("Scope interval is outside this range");
-                }
-            }
+            validateSnapshotScope(scope);
             return new ScopedSnapshot(scope, captureUnderAdmission());
         } finally { leaveNative(); }
+    }
+
+    private void validateSnapshotScope(TransactionScope scope) {
+        for (var span : scope.spans()) {
+            if (!columns.containsKey(span.columnId())) throw new IllegalArgumentException("Scope column is outside this range");
+            byte[] lower = span.lowerInclusive(), upper = span.upperExclusive();
+            if (span.isPoint()) {
+                if (!contains(lower)) throw new IllegalArgumentException("Scope key is outside this range");
+            } else if ((interval.lowerInclusive() != null && (lower == null || Arrays.compareUnsigned(lower, interval.lowerInclusive()) < 0))
+                    || (interval.upperExclusive() != null && (upper == null || Arrays.compareUnsigned(upper, interval.upperExclusive()) > 0))) {
+                throw new IllegalArgumentException("Scope interval is outside this range");
+            }
+        }
+    }
+    /** The adapter supplies a fresh leader/read barrier; validation alone confers no commit authority. */
+    public ScopedHistoryPin captureTracked(TransactionScope scope) throws RocksDBException {
+        Objects.requireNonNull(scope); enterNative(); applyLane.lock(); ScopedSnapshot snapshot=null; RangeMutationHistory.Pin registration=null;
+        try {
+            requireActive(); validateSnapshotScope(scope); ensureReceiptUsage();
+            if (scopedHistory==null) throw new UnsupportedOperationException("Scoped mutation history is not enabled");
+            if (applied==null || applied.term()==0) throw new IllegalStateException("Tracked snapshot requires a positive completed term");
+            scopedHistory.checkOpenCapacity(scope); long scopeBytes=RangeMutationHistory.accountedScopeBytes(scope);
+            if (trackedSnapshotPins.get()>=scopedLimits.maxPins() || scopeBytes>scopedLimits.maxScopeBytes()-trackedSnapshotScopeBytes.get()) throw new IllegalStateException("Retired native readers retain scoped admission");
+            snapshot=new ScopedSnapshot(scope,captureUnderAdmission());
+            snapshot.pin.historyScopeBytes=scopeBytes; trackedSnapshotScopeBytes.addAndGet(scopeBytes); trackedSnapshotPins.incrementAndGet(); snapshot.pin.historyTracked=true;
+            if (closing) throw new IllegalStateException("Range admission is closing");
+            try { registration=scopedHistory.open(snapshot.position(),scope); }
+            catch (RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
+            var owned=new ScopedHistoryPin(snapshot,scopedHistory,registration,scopedGeneration,installationGeneration); scopedPins.put(registration,owned); snapshot=null; return owned;
+        } finally {
+            if (snapshot!=null) { if (registration!=null) { scopedHistory.close(registration); scopedPins.remove(registration); } scopedReleases.add(snapshot); }
+            applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); }
+        }
+    }
+    /** Unprepared physical-scope snapshot. All member accesses in a collision bucket share its one physical stamp. */
+    public final class ScopedHistoryPin implements AutoCloseable {
+        private final ScopedSnapshot snapshot; private final RangeMutationHistory history; private final RangeMutationHistory.Pin registration;
+        private final Object generation; private final long installation; private final AtomicBoolean closed=new AtomicBoolean();
+        private ScopedHistoryPin(ScopedSnapshot snapshot,RangeMutationHistory history,RangeMutationHistory.Pin registration,Object generation,long installation) {
+            this.snapshot=snapshot; this.history=history; this.registration=registration; this.generation=generation; this.installation=installation;
+        }
+        public TransactionScope scope() { return snapshot.scope(); }
+        public ApplyPosition position() { return snapshot.position(); }
+        public RangeMutationHistory.Status status() {
+            var status=registration.status(); if (status!=RangeMutationHistory.Status.ACTIVE) return status;
+            if (closed.get()) return RangeMutationHistory.Status.CLOSED;
+            return closing || generation!=scopedGeneration || installation!=installationGeneration ? RangeMutationHistory.Status.INVALIDATED : status;
+        }
+        private void requireReadable() { if (status()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Tracked snapshot is no longer valid: "+status()); }
+        public byte[] get(UUID column,byte[] key) throws RocksDBException { requireReadable(); return snapshot.get(column,key); }
+        public PhysicalRangePage page(UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws RocksDBException {
+            requireReadable(); return snapshot.page(column,lower,upper,reverse,resume,items,bytes);
+        }
+        public void visitColumn(UUID column,byte[] lower,byte[] upper,SnapshotVisitor visitor) throws RocksDBException,IOException {
+            requireReadable(); snapshot.visitColumn(column,lower,upper,visitor);
+        }
+        /** Observes complete declared-scope history under the apply lane; a later proposal still needs reservations/revalidation. */
+        public RangeMutationHistory.Status validate() {
+            applyLane.lock();
+            try {
+                var result=status();
+                if (result==RangeMutationHistory.Status.ACTIVE) {
+                    try { requireActive(); result=history.validate(registration); }
+                    catch (RuntimeException failure) { resetScopedUnderLane(); result=RangeMutationHistory.Status.INVALIDATED; }
+                } else if (registration.status()==RangeMutationHistory.Status.ACTIVE) {
+                    if (result==RangeMutationHistory.Status.CLOSED) history.close(registration);
+                    else invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
+                }
+                if (result!=RangeMutationHistory.Status.ACTIVE) retireScoped(registration); return result;
+            } finally { applyLane.unlock(); drainScopedReleases(); }
+        }
+        @Override public void close() {
+            if (!closed.compareAndSet(false,true)) return;
+            try { snapshot.close(); } // Existing JNI users own their deferral; never wait for them under the apply lane.
+            finally {
+                applyLane.lock(); try { history.close(registration); scopedPins.remove(registration); }
+                finally { applyLane.unlock(); drainScopedReleases(); }
+            }
+        }
     }
 
     /** Scope cannot expand; native reader ownership and close/drain semantics are retained by the pin. */
@@ -974,6 +1116,7 @@ public final class ReplicatedRangeStore {
         private final ApplyPosition position;
         private boolean closed;
         private int nativeUsers;
+        private long historyScopeBytes; private volatile boolean historyTracked;
         private SnapshotPin(Snapshot snapshot, ApplyPosition position) {
             this.snapshot = snapshot;
             this.position = position;
@@ -1148,7 +1291,10 @@ public final class ReplicatedRangeStore {
         }
         private void releaseNative() {
             try { db.releaseSnapshot(snapshot); }
-            finally { snapshotPins.decrementAndGet(); }
+            finally {
+                if (historyTracked) { trackedSnapshotScopeBytes.addAndGet(-historyScopeBytes); trackedSnapshotPins.decrementAndGet(); }
+                snapshotPins.decrementAndGet();
+            }
         }
     }
 
@@ -1413,7 +1559,8 @@ public final class ReplicatedRangeStore {
 
     private void ensureReceiptUsage() throws RocksDBException {
         byte[] marker = db.get(state, markerKey);
-        applied = marker == null ? null : decodePosition(marker);
+        var observed=marker==null ? null : decodePosition(marker);
+        if (!Objects.equals(applied,observed)) resetScopedUnderLane(); applied=observed;
         byte[] total = db.get(state, usageKey);
         if (total == null || total.length != 36 || db.get(state, usageRebuildKey) != null
                 || ByteBuffer.wrap(total, 20, 16).getLong() != (applied == null ? 0 : applied.term())

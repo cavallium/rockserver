@@ -1818,3 +1818,62 @@ power-loss and measured resource/performance acceptance remain unverified. Scope
 transactions, range/cursor parity, topology and the other architecture workflows
 remain unfinished. No server process/network probe was run; the excluded density
 fixture was neither staged nor selected. Standalone operation is unchanged.
+
+## Bounded scoped mutation history and native tracked snapshot ownership
+
+`RangeMutationHistory` now indexes latest actual physical-key writes by column and
+unsigned key, with an apply-index index for reclamation. Pins retain their exact
+native cut and complete immutable declared scope. Validation detects ABA,
+same-value writes, absence deletes and insertion/deletion phantoms without value
+comparison or a version CF over all stored keys. All members of a bucket share its
+one physical stamp. Range deletion conservatively conflicts every tracked handle.
+Limits separately bound active handles, accounted scope bytes, history entries and
+accounted history bytes; pressure expires oldest unprepared handles until history
+fits, including expiring all for a single oversized footprint. Committed apply is
+never quota-rejected because of history retention.
+
+`ReplicatedRangeStore.captureTracked` validates scope and capacity, captures the
+native snapshot/marker and registers history under the same apply lane. Reads and
+physical pages stay on that cut and cannot expand scope. Actual write footprints
+are prepared before the native batch and published after it succeeds but before A
+is exposed. Legacy point/merge/range effects and final v6 bucket replacements are
+included; duplicates, canonical failed outcomes and ordinary noops add no stamps.
+Term/configuration changes, fencing, install, shutdown and leader loss invalidate
+tracked observations permanently. Leader-loss invalidation does not fence normal
+follower apply. Native write/publication uncertainty clears tracked certification
+state; injected publication failure does not leave old handles valid.
+
+Logical retirement and physical release have distinct budgets. Expired or closed
+handles whose native readers remain active still consume tracked native pin and
+scope-byte admission. Charges begin immediately after capture, before registration,
+and end only after actual native snapshot release. Snapshot closes run outside the
+apply lane and use existing native-user deferral; neither eviction nor shutdown
+frees a snapshot underneath a blocked reader. Ordinary read/export pins remain
+independent. Failed registration and repeated close preserve resource accounting.
+The byte counters are fixed quota accounting, not measured JVM/SST residency.
+
+This is an unprepared snapshot/history primitive, not transaction commit authority.
+Validation observes the complete declaration at one point; a later write can still
+interpose. The next stage must reserve complete proposal footprints, drain only
+conflicting in-flight work, revalidate the term/generation/history under that
+reservation and append a canonical accepted plan. Prepared plans/durable locks,
+read-your-writes transaction API, 2PC and frontend transaction parity remain open.
+History is ephemeral and opt-in; standalone and durable data formats are unchanged.
+
+Validation: the final selected `test-compile surefire:test@default-test` gate passed
+126 core, 19 patched-server and 138 adapter cases (283 total, zero failures/errors/
+skips), exit zero: `/tmp/rockserver-scoped-history-final-gate.log`. Nine model cases
+cover indexed ABA/phantoms/GC, bounded admission/expiry, prepared footprints and
+owner/term/reset rules. Seven native cases cover exact snapshot reads, missing-key
+and same-value writes, duplicate/conflict/noop exclusion, physical bucket conflicts,
+oldest pressure, raw-pin independence, blocked readers, physical count/byte
+admission after logical retirement, registration cleanup, double close, admission
+reopening after release, fencing/configuration/term/shutdown, injected post-write
+publication failure and snapshot install. One adapter case proves leader-loss
+invalidation leaves follower metadata apply active. The retired-reader budget
+regression failed before its physical ledger fix:
+`/tmp/rockserver-scoped-history-retired-reader-red.log`; the focused 17-case gate
+then passed: `/tmp/rockserver-scoped-history-retired-reader-green.log`.
+Actual uncertain RocksDB write failure, distributed commit acceptance, network/
+quorum, power-loss and measured history/SST performance remain unverified. No
+server process/network probe was run; the excluded density fixture is untouched.
