@@ -21,9 +21,10 @@ public final class RatisParticipantRecord {
     public static byte[] digest(PreparedParticipant.Preparation preparation) {
         try { return MessageDigest.getInstance("SHA-256").digest(encode(preparation)); } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
-    public static byte[] result(ApplyPosition position) { return new CommandResult(CommandResult.Status.SUCCESS,List.of(ByteBuffer.allocate(16).putLong(position.term()).putLong(position.index()).array())).encode(); }
-    public static ApplyPosition result(byte[] bytes) {
-        var result=CommandResult.decode(bytes); if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=1 || result.value(0)==null || result.value(0).length!=16) throw new IllegalArgumentException("Invalid prepared vote receipt");
-        var b=ByteBuffer.wrap(result.value(0)); var position=new ApplyPosition(b.getLong(),b.getLong()); if (position.term()<=0 || position.index()<=0) throw new IllegalArgumentException("Invalid prepared position"); return position;
+    public static byte[] result(ApplyPosition position) { return result(ParticipantVote.prepared(position)); }
+    public static byte[] result(ParticipantVote vote) { if (!vote.prepared()) return new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode(); var position=vote.position(); return new CommandResult(CommandResult.Status.SUCCESS,List.of(ByteBuffer.allocate(16).putLong(position.term()).putLong(position.index()).array())).encode(); }
+    public static ParticipantVote result(byte[] bytes) {
+        var result=CommandResult.decode(bytes); if (result.status()==CommandResult.Status.CONFLICT && result.valueCount()==0) return ParticipantVote.negative(); if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=1 || result.value(0)==null || result.value(0).length!=16) throw new IllegalArgumentException("Invalid prepared vote receipt");
+        var b=ByteBuffer.wrap(result.value(0)); var position=new ApplyPosition(b.getLong(),b.getLong()); if (position.term()<=0 || position.index()<=0) throw new IllegalArgumentException("Invalid prepared position"); return ParticipantVote.prepared(position);
     }
 }

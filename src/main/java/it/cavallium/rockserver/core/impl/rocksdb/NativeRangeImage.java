@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
+import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RangeMutationHistory;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
@@ -319,6 +320,7 @@ public final class NativeRangeImage {
         private SessionAuthority sessionAuthority;
         private int sessionBindings;
         private final List<PreparedParticipant> prepared=new ArrayList<>();
+        private final Map<UUID,AbortedParticipant> aborted=new HashMap<>();
         private long preparedBytes,preparedScopeBytes;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
 
@@ -378,11 +380,23 @@ public final class NativeRangeImage {
                                     || upper!=null && (span.isPoint() ? Arrays.compareUnsigned(lo,upper)>=0 : hi==null || Arrays.compareUnsigned(hi,upper)>0)) throw new IOException("Prepared image scope crosses ownership");
                         }
                         for (var mutation:plan.mutations()) if (mutation.kind()==Mutation.Kind.MERGE && !header.mergeColumns().contains(mutation.columnId())) throw new IOException("Prepared image merge operator is unavailable");
-                        for (var old:prepared) if (old.preparation().sharesOperation(preparation) || old.preparation().scope().intersects(scope)) throw new IOException("Prepared image identities/scopes overlap");
-                        preparedBytes+=key.length+(long)value.length; preparedScopeBytes+=RangeMutationHistory.accountedScopeBytes(scope);
+                        for (var old:prepared) if (old.preparation().sharesOperation(preparation)) throw new IOException("Prepared image identities/scopes overlap");
+                        preparedBytes+=key.length+(long)value.length+ReplicatedRangeStore.ABORT_RESERVATION; preparedScopeBytes+=RangeMutationHistory.accountedScopeBytes(scope);
                         if (prepared.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES || preparedScopeBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Prepared image capacity exceeded");
                         prepared.add(record);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid prepared image record",invalid); }
+                }
+                if (section==Section.STATE && key.length>16 && key[16]==0x21) {
+                    try {
+                        var abort=AbortedParticipant.decode(value); var finalization=abort.finalization(); var participant=finalization.participant();
+                        byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x21).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
+                        if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
+                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !finalization.decision().domainId().equals(header.interval().domainId())
+                                || abort.position().index()>header.position().index() || abort.position().term()>header.position().term()
+                                || abort.negative()!=null && (abort.negative().position().index()>header.position().index() || abort.negative().position().term()>header.position().term())) throw new IOException("ABORT image identity/cut differs");
+                        if (aborted.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("ABORT image count exceeded");
+                        aborted.put(finalization.transactionId(),abort);
+                    } catch (IllegalArgumentException invalid) { throw new IOException("Invalid ABORT image record",invalid); }
                 }
                 if (section == Section.STATE && key.length > 16 && key[16] == 0x12) {
                     throw new IOException("Image contains unsupported receipt accounting metadata");
@@ -420,6 +434,8 @@ public final class NativeRangeImage {
                             || ByteBuffer.wrap(key, 40, 8).getLong() < 0) {
                         throw new IOException("Invalid image receipt row");
                     }
+                    var receipt=ByteBuffer.wrap(key); receipt.position(16); var id=new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(receipt.getLong(),receipt.getLong()),receipt.getLong(),receipt.getLong());
+                    for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("ABORT image identity also has ordinary receipt");
                     receiptCount = addUsage(receiptCount, 1);
                     receiptBytes = addUsage(receiptBytes, (long) key.length + value.length);
                 }
@@ -467,6 +483,20 @@ public final class NativeRangeImage {
 
         void finish() throws IOException {
             if (!marker) throw new IOException("Image has no applied marker");
+            long terminalOnly=0;
+            for (var record:prepared) {
+                var abort=aborted.get(record.preparation().transactionId());
+                if (abort!=null) { try { abort.finalization().requirePrepared(record); if (abort.negative()!=null) throw new IllegalArgumentException("Positive/negative evidence coexist"); } catch (IllegalArgumentException invalid) { throw new IOException("ABORT/preparation binding differs",invalid); } }
+                else for (var other:prepared) if (other!=record && !aborted.containsKey(other.preparation().transactionId()) && other.preparation().scope().intersects(record.preparation().scope())) throw new IOException("Active prepared image scopes overlap");
+            }
+            for (var abort:aborted.values()) {
+                if (abort.finalization().participant().prepared()!=null && prepared.stream().noneMatch(p -> p.preparation().transactionId().equals(abort.finalization().transactionId()))) throw new IOException("ABORT image vote lacks native preparation");
+                for (var p:prepared) if (!p.preparation().transactionId().equals(abort.finalization().transactionId()) && (abort.ownsOperation(p.preparation().operation()) || abort.ownsOperation(p.preparation().business().operationId()))) throw new IOException("ABORT/preparation image identity reused");
+                for (var other:aborted.values()) if (other!=abort && (other.ownsOperation(abort.finalization().operation()) || other.ownsOperation(abort.finalization().decision().operation()) || abort.negative()!=null && other.ownsOperation(abort.negative().operation()))) throw new IOException("ABORT image identity reused");
+            }
+            for (var id:aborted.keySet()) if (prepared.stream().noneMatch(p -> p.preparation().transactionId().equals(id))) terminalOnly++;
+            if (prepared.size()+terminalOnly>ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes+terminalOnly*ReplicatedRangeStore.ABORT_RESERVATION>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Participant image capacity exceeded");
+
             if (sessionAuthority != null && sessionAuthority.minimumEpoch() > epochFloor) {
                 throw new IOException("Image range session authority exceeds coarse epoch floor");
             }

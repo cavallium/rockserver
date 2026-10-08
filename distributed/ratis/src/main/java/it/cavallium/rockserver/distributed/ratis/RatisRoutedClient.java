@@ -73,7 +73,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         restoreSessionCommand(preparation.business(),descriptor);
         return new PreparedParticipantOperation(identity,descriptor,preparation);
     }
-    public ApplyPosition executeParticipant(PreparedParticipantOperation operation) throws IOException {
+    public ParticipantVote executeParticipant(PreparedParticipantOperation operation) throws IOException {
         java.util.Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
         try { return RatisParticipantRecord.result(transport.participant(operation.descriptor,operation.bytes)); }
         catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant vote reply",invalid); }

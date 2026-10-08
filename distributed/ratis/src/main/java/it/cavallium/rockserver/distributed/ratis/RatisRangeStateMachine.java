@@ -748,15 +748,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (RatisParticipantRecord.isParticipant(encoded)) {
             var preparation=RatisParticipantRecord.decode(encoded); commandValidator.accept(preparation.business());
             var record=store.applyPrepared(position,preparation);
-            return new AppliedRecord(preparation.operation(),RatisParticipantRecord.result(record.position()));
+            return new AppliedRecord(preparation.operation(),RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded); commandValidator.accept(command);
         return new AppliedRecord(command.operationId(),store.apply(position,command));
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         if (RatisParticipantRecord.isParticipant(encoded)) {
-            var preparation=RatisParticipantRecord.decode(encoded); var record=store.recoveredParticipant(preparation);
-            return new AppliedRecord(preparation.operation(),record==null ? null : RatisParticipantRecord.result(record.position()));
+            var preparation=RatisParticipantRecord.decode(encoded); var record=store.recoveredPreparationVote(preparation);
+            return new AppliedRecord(preparation.operation(),record==null ? null : RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded);
         return new AppliedRecord(command.operationId(),store.operationResult(command.operationId(),command.receiptDigest()));
@@ -857,7 +857,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             for (var admission:pending) {
                 try {
                     if (admission.participant==null) { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
-                    else { var record=pin.preparedParticipant(admission.participant.transactionId()); if (record!=null && admission.participant.equals(record.preparation())) verified.add(admission); }
+                    else { var vote=pin.preparationVote(admission.participant); if (vote!=null) verified.add(admission); }
                 }
                 catch (IllegalArgumentException differentPayload) { /* A mismatched speculative request is not verified coverage. */ }
             }
@@ -975,7 +975,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     requireHealthy(); if (!reservation.active() || deadline!=null && !deadline.active() || pin.position().term()!=reservation.term()) throw new IllegalStateException("Participant owner expired or changed term");
                     if (!java.util.Objects.equals(capacity.position(),store.applied())) continue;
                     if (participantIdentityBusy(control) || participantIdentityBusy(business.operationId())) throw new IllegalStateException("Participant operation identity is already owned");
-                    long scope=RangeMutationHistory.accountedScopeBytes(pin.scope()), maximum=49L+PreparedParticipant.Preparation.MAX_BYTES;
+                    long scope=RangeMutationHistory.accountedScopeBytes(pin.scope()), maximum=49L+PreparedParticipant.Preparation.MAX_BYTES+ReplicatedRangeStore.ABORT_RESERVATION;
                     if (capacity.count()+reservedParticipantCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || maximum>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes
                             || scope>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.scopeBytes()-reservedParticipantScopeBytes
                             || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Participant staged capacity exhausted");
@@ -995,7 +995,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             pin.close();
             synchronized (admissions) {
                 requireHealthy(); if (!plan.authorized() || preparingParticipants.get(control)!=preparing) throw new IllegalStateException("Participant lost acceptance ownership");
-                long actual=49L+preparation.encode().length;
+                long actual=49L+preparation.encode().length+ReplicatedRangeStore.ABORT_RESERVATION;
                 reservedParticipantBytes+=actual-plan.hold.bytes; plan.hold.bytes=actual;
                 preparedCommitBytes+=plan.bytes.length-DistributedCommandCodec.MAX_ENCODED_BYTES;
                 preparedParticipants.put(control,plan); preparingParticipants.remove(control,preparing);

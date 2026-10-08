@@ -122,17 +122,16 @@ does not establish complete distributed API parity or production acceptance.
   transaction-record consumption. Recovery CAS operations have their own identity
   and epoch; they do not replace the frozen business identity.
   This is a home-record kernel, not complete 2PC: reports are not self-verifying
-  participant proofs. Protected status-role activation, late-PREPARE fencing,
-  finalization and recovery scheduling remain.
+  participant proofs. Protected status-role activation, Raft FINALIZE admission,
+  COMMIT finalization and recovery scheduling remain.
 - Finalization intents capture a fresh terminal home decision and its route together.
   Their canonical binding retains the frozen definition, chosen COMMIT/ABORT and
   prepare vote positions, while excluding later home generations, ACKs and client
   consumption. Recovery uses a separate operation identity. Matching a native
   preparation checks the original home, full definition and exact recorded vote;
-  ABORT without a vote also matches an applied but unreported prepare. This is the
-  decision-binding seam only: it neither appends FINALIZE nor releases native locks
-  or installs a late-PREPARE fence. Decision bytes do not independently prove read
-  provenance; the adapter must retain the verified read authority through submission.
+  ABORT without a vote also matches an applied but unreported prepare. Decision bytes
+  do not independently prove read provenance; the adapter must retain the verified
+  read authority through submission. Raft FINALIZE submission is still missing.
 - The native participant substrate now installs an immutable accepted business plan,
   frozen home/participant binding, complete exclusive scope and stable prepare
   position in the internal state CF, atomically with completed A and accounting.
@@ -146,6 +145,18 @@ does not establish complete distributed API parity or production acceptance.
   available. Existing immutable cuts may finish reading their old values. Administrative
   captures remain available for export/recovery. Malformed prepared metadata blocks
   image export and activation.
+- The trusted committed-native ABORT seam atomically persists the terminal fence,
+  completed marker and accounting, then releases prepared scope ownership. It keeps
+  any original positive vote and blocks reuse of business/control identities. ABORT
+  before PREPARE creates a fence; a matching late committed PREPARE records its exact
+  control identity, payload digest and original negative-outcome position without
+  effects or locks. Retries return a typed negative vote, while PREPARE-first ABORT
+  retains its original positive vote. Fences and negative receipts survive reopen,
+  image installation and receipt GC. Recovery and pinned lookup recognize either
+  vote so snapshot-covered and uncertain admissions can settle. Image and activation
+  validation check the shared operation namespace and distinguish active locks from
+  retained aborted plans. This native seam has no public Raft FINALIZE envelope or
+  admission authority yet; the controlled test forces its committed ordering directly.
 - Transaction-home and preparation records use one current encoding without format
   release markers or compatibility readers.
 - The Raft participant PREPARE path reserves both control/business identities, durable
@@ -155,11 +166,12 @@ does not establish complete distributed API parity or production acceptance.
   it cannot be rebased during preparation. The proposal hands its scope to native
   durable ownership only after publication. Uncertain submitted work retains its
   charges until native outcome, covered-snapshot recovery or a newer completed term
-  establishes settlement. Applied retries return the original typed prepare position.
+  establishes settlement. Applied retries return the original typed prepared or negative vote.
   A fresh linearizable participant-state query survives response loss and control-session
   receipt GC. The routed client freezes exact bytes and the original descriptor for
   retry, but callers must durably retain them; a multi-group coordinator journal is
-  still missing. Finalization and durable late-PREPARE abort fences remain unfinished.
+  still missing. COMMIT finalization, Raft FINALIZE admission and a public independently
+  queryable aborted-state response remain unfinished.
 - Durable grant issuance, logical-session handoff, bounded user/maintenance windows,
   catalogue clocks/propagation, immutable schema publication and static node plans
   have local recovery fixtures. The owned node launcher checks established storage,
@@ -200,13 +212,16 @@ bounds, not measured heap/native allocator limits or global node/pool envelopes.
 Rejected receipts reserve their actual bounded no-effects growth, preserving
 own-ACK progress at the retention cap.
 
-Durable native preparation has a separate per-range maximum of 64 records, 16 MiB of
-encoded records and 16 MiB of scope accounting. A preparation body is at most 2 MiB
-minus its eight-byte Raft envelope;
-its stored receipt adds the 16-byte original apply position. These capacities are not
-part of ordinary user-receipt GC and are not donated by lease expiration or fencing.
-Raft admission reserves these bounds before PREPARE append; the native seam also
-rejects overflow before writing. No finalize/release/GC path is exposed yet.
+Durable participant metadata has a per-range maximum of 64 retained preparations
+and fence-only transactions combined, 16 MiB of reserved record bytes and 16 MiB of
+retained scope accounting. A preparation body fits within 2 MiB minus its eight-byte
+Raft envelope; its stored receipt adds the 16-byte original apply position. Every
+preparation reserves another 8,132 bytes for an ABORT fence and optional compact
+80-byte negative receipt. Thus ABORT of an existing preparation can drain at the
+preparation cap. Fence-only ABORT reserves the same fence allowance. These capacities
+are separate from ordinary user-receipt GC and are not donated by lease expiration,
+fencing or lock release. Raft PREPARE admission reserves the bounds before append;
+native apply also checks them. Retained terminal records still have no GC path.
 
 A transaction-home record has at most 64 frozen participants and 7,926 encoded bytes.
 Both expected and replacement images fit comfortably within the 2 MiB atomic command
@@ -254,8 +269,20 @@ zero failures/errors/skips), exit zero: `/tmp/rockserver-finalization-binding-fi
 It covers stable terminal identity across ACK/consumption, independent recovery IDs,
 exact native vote matching, unreported-prepare ABORT, malformed canonical encodings
 and fresh home reads before/after progress. Independent read-only review found no
-concrete issue at this binding boundary. Native FINALIZE and ABORT-fence acceptance
-are not exercised because those paths remain unimplemented.
+concrete issue at this binding boundary. That earlier gate does not establish native FINALIZE or ABORT-fence acceptance.
+
+The native ABORT/typed-vote regression gate passed 39 core and 86 adapter cases
+(125 total, zero failures/errors/skips), exit zero:
+`/tmp/rockserver-abort-fence-regression.log`. After image-ownership checks and added
+recovery coverage, the final selection passed 32 core and 14 adapter cases (46 total),
+exit zero: `/tmp/rockserver-abort-fence-final.log`. Review found and confirmed fixes
+for unchecked negative control ownership and UUID-order-dependent recovery of
+released overlapping scopes; no further concrete finding remained in that review.
+The final cases include ABORT-before-admitted-PREPARE, lost negative replies,
+reinitialize, stable exact retry, no effects/locks, full-cap ABORT, positive evidence
+retention, reversed UUID reopen/install, cross-role/fence/ordinary receipt collisions,
+and malformed ABORT metadata rejected by export and activation. ABORT itself enters
+through the committed-native seam; this is not Raft FINALIZE or full 2PC acceptance.
 
 The exercised native preparation cases cover unchanged user values, complete read/
 absence/range/bucket lock scope, disjoint access, old immutable readers, new capture/
@@ -309,8 +336,8 @@ server process, network/quorum probe, power-loss run or deployment was performed
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Participant finalization and late-PREPARE abort fencing, including explicit durable
-  negative prepare outcomes and recovery/reservation settlement; protected status-group
+- COMMIT finalization, Raft FINALIZE envelope/admission, and public durable abort/final
+  outcome queries; protected status-group
   node/pool activation, durable coordinator journaling, full 2PC recovery and consistent
   multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
   establish these.

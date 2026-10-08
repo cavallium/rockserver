@@ -81,7 +81,7 @@ class RatisParticipantPrepareTest {
                 var operation=data.routed.prepareParticipant(plan.preparation()); assertArrayEquals(plan.bytes(),operation.bytes());
                 data.wire.lose=true; assertThrows(IOException.class,() -> data.routed.executeParticipant(operation));
                 assertEquals(1,data.f.store.preparedParticipantCount()); assertEquals(0,data.f.machine.proposalFootprintStats().candidates()); released(data);
-                var vote=data.routed.executeParticipant(operation); assertEquals(new ApplyPosition(1,2),vote);
+                var vote=data.routed.executeParticipant(operation).position(); assertEquals(new ApplyPosition(1,2),vote);
                 var durable=data.routed.preparedParticipant(data.f.groupId,registration.transactionId()); assertEquals(vote,durable.position()); assertEquals(plan.preparation(),durable.preparation());
                 var queryBody=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(queryBody,registration.transactionId());
                 var query=ScopedTransactionRpc.frame(ScopedTransactionRpc.PARTICIPANT_STATE,queryBody.array());
@@ -107,8 +107,8 @@ class RatisParticipantPrepareTest {
                 var original=data.wire.propose(plan.bytes()); assertNull(original.getException()); data.f.machine.preAppendTransaction(original); original.initLogEntry(1,1);
                 data.f.machine.cancelTransaction(original); assertEquals(1,data.f.machine.reservedParticipantCount());
                 data.f.store.applyPrepared(new ApplyPosition(1,1),plan.preparation()); data.wire.index=1; // Controlled native publication before the adapter callback.
-                var vote=data.routed.executeParticipant(data.routed.prepareParticipant(plan.preparation())); assertEquals(new ApplyPosition(1,1),vote); released(data);
-                assertEquals(vote,RatisParticipantRecord.result(data.f.machine.applyTransaction(original).get(5,TimeUnit.SECONDS).getContent().toByteArray())); released(data);
+                var vote=data.routed.executeParticipant(data.routed.prepareParticipant(plan.preparation())).position(); assertEquals(new ApplyPosition(1,1),vote); released(data);
+                assertEquals(vote,RatisParticipantRecord.result(data.f.machine.applyTransaction(original).get(5,TimeUnit.SECONDS).getContent().toByteArray()).position()); released(data);
             }
         }
     }
@@ -141,6 +141,31 @@ class RatisParticipantPrepareTest {
                 assertTrue(entered.await(5,TimeUnit.SECONDS)); data.f.machine.notifyNotLeader(List.of()); assertEquals(1,data.f.machine.reservedParticipantCount()); assertTrue(data.f.machine.reservedParticipantBytes()>0); assertFalse(pending.isDone());
             } finally { release.countDown(); }
             assertThrows(ExecutionException.class,() -> pending.get(5,TimeUnit.SECONDS)); released(data);
+        }
+    }
+    @Test void prepareVoteCodecDistinguishesNegativeVotesFromMalformedOrTransientOutcomes() {
+        assertEquals(ParticipantVote.negative(),RatisParticipantRecord.result(RatisParticipantRecord.result(ParticipantVote.negative())));
+        assertEquals(ParticipantVote.prepared(new ApplyPosition(1,1)),RatisParticipantRecord.result(RatisParticipantRecord.result(new ApplyPosition(1,1))));
+        for (var status:List.of(CommandResult.Status.SESSION_EXPIRED,CommandResult.Status.RESULT_TOO_LARGE)) assertThrows(IllegalArgumentException.class,() -> RatisParticipantRecord.result(new CommandResult(status,List.of()).encode()));
+        assertThrows(IllegalArgumentException.class,() -> RatisParticipantRecord.result(new CommandResult(CommandResult.Status.CONFLICT,List.of(new byte[]{1})).encode()));
+        assertThrows(IllegalArgumentException.class,() -> new ParticipantVote(false,new ApplyPosition(1,1)));
+    }
+    @Test void abortFenceBeforeAdmittedPrepareProducesStableNegativeVoteAndSettlesOwnership() throws Exception {
+        try (var home=new Node("abort-home",true); var data=new Node("abort-data",false); var pin=data.f.store.captureTracked(scope(data,1,4))) {
+            var business=data.f.put(2); var registration=register(home,data,pin,business,0);
+            try (var plan=data.f.machine.prepareParticipant(pin,business,control(0),home.statuses,registration.transactionId())) {
+                var pending=data.wire.propose(plan.bytes()); assertNull(pending.getException()); data.f.machine.preAppendTransaction(pending);
+                var abort=registration.decide(TransactionStatus.Phase.ABORT); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,1),registration,abort));
+                var intent=home.statuses.readFinalization(registration.transactionId(),data.f.groupId,new OperationId(new UUID(0,777),2,0));
+                data.f.store.applyAbort(new ApplyPosition(1,1),intent); data.wire.index=1; pending.initLogEntry(1,2);
+                assertEquals(ParticipantVote.negative(),RatisParticipantRecord.result(data.f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray())); data.wire.index=2; released(data);
+                var operation=data.routed.prepareParticipant(plan.preparation()); data.wire.lose=true;
+                assertThrows(IOException.class,() -> data.routed.executeParticipant(operation)); assertEquals(ParticipantVote.negative(),data.routed.executeParticipant(operation)); released(data);
+                assertNull(data.routed.preparedParticipant(data.f.groupId,registration.transactionId())); assertNull(data.routed.read(data.f.column,new byte[]{2}));
+                data.f.machine.takeSnapshot(); data.f.machine.pause(); data.f.machine.reinitialize();
+                assertEquals(ParticipantVote.negative(),data.routed.executeParticipant(operation)); released(data);
+                assertEquals(CommandResult.Status.SUCCESS,data.wire.command(operation.descriptor(),data.f.put(3)).status());
+            }
         }
     }
     @Test void durableCapacityAndPendingHoldsShareOneBoundAcrossScopeHandoff() throws Exception {
@@ -195,7 +220,7 @@ class RatisParticipantPrepareTest {
                         new TransactionStatus.Participant(l.rangeId(),l.groupId(),1,new byte[32],ld,null,false),new TransactionStatus.Participant(r.rangeId(),r.groupId(),1,new byte[32],rd,null,false)));
                 home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,900),1,0),null,registration));
                 try (var lplan=left.f.machine.prepareParticipant(lp,lb,control(0),home.statuses,registration.transactionId()); var rplan=right.f.machine.prepareParticipant(rp,rb,control(1),home.statuses,registration.transactionId())) {
-                    var lv=routed.executeParticipant(routed.prepareParticipant(lplan.preparation())); var rv=routed.executeParticipant(routed.prepareParticipant(rplan.preparation()));
+                    var lv=routed.executeParticipant(routed.prepareParticipant(lplan.preparation())).position(); var rv=routed.executeParticipant(routed.prepareParticipant(rplan.preparation())).position();
                     var voted=registration.prepared(l.groupId(),ld,lv); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,900),1,1),registration,voted));
                     assertThrows(IllegalArgumentException.class,() -> voted.decide(TransactionStatus.Phase.COMMIT));
                     var ready=voted.prepared(r.groupId(),rd,rv); home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,900),1,2),voted,ready));
@@ -219,10 +244,10 @@ class RatisParticipantPrepareTest {
                 data.f.store.applyPrepared(new ApplyPosition(1,1),plan.preparation()); assertEquals(1,data.f.machine.takeSnapshot());
                 data.f.machine.pause(); var covered=data.f.machine.applyTransaction(first); var suffix=data.f.machine.applyTransaction(duplicate);
                 assertFalse(covered.isDone()); assertFalse(suffix.isDone()); data.f.machine.reinitialize();
-                assertEquals(new ApplyPosition(1,1),RatisParticipantRecord.result(covered.get(5,TimeUnit.SECONDS).getContent().toByteArray()));
+                assertEquals(new ApplyPosition(1,1),RatisParticipantRecord.result(covered.get(5,TimeUnit.SECONDS).getContent().toByteArray()).position());
                 assertFalse(suffix.isDone()); assertEquals(0,data.f.machine.reservedParticipantCount()); assertEquals(0,data.f.machine.proposalFootprintStats().candidates());
-                assertEquals(new ApplyPosition(1,1),RatisParticipantRecord.result(data.f.machine.applyTransaction(duplicate).get(5,TimeUnit.SECONDS).getContent().toByteArray()));
-                assertEquals(new ApplyPosition(1,1),RatisParticipantRecord.result(suffix.get(5,TimeUnit.SECONDS).getContent().toByteArray())); released(data);
+                assertEquals(new ApplyPosition(1,1),RatisParticipantRecord.result(data.f.machine.applyTransaction(duplicate).get(5,TimeUnit.SECONDS).getContent().toByteArray()).position());
+                assertEquals(new ApplyPosition(1,1),RatisParticipantRecord.result(suffix.get(5,TimeUnit.SECONDS).getContent().toByteArray()).position()); released(data);
                 assertEquals(new ApplyPosition(1,1),data.routed.preparedParticipant(data.f.groupId,registration.transactionId()).position());
             }
         }
