@@ -112,8 +112,20 @@ does not establish complete distributed API parity or production acceptance.
   Groups without writes use explicit zero-effect certification. Acceptance retains
   the original handles and complete scopes, rejects writes outside that projection,
   and prevents changed owner/generation/cut audits. No replacement OPEN is used.
-  The public writable lease facade and legacy API/transport integration remain
-  unfinished.
+  `RatisTransactionClient` now supplies bounded asynchronous writable leases over
+  those captures. Logical points, buckets, pages and borrowed cursors use scoped
+  handles and their read-your-writes views. STAGE takes the complete equal/extended
+  prefix, retains one uncertain request and its per-group acknowledgements, and
+  blocks reads and commit until that exact prefix resolves. Publication follows
+  final deadline checks; a new staged revision invalidates old cursors.
+  Commit freezes all captured participants and result slots, then uses
+  `RatisAtomicClient.executeAccepted` without another OPEN or STAGE. Snapshot and
+  commit identity blocks and journal paths are disjoint. Actual work retains
+  ownership after observer cancellation; cleanup uses the same bounded task views.
+  Mutable prefixes are ephemeral: frontend loss permits cleanup-only reopening,
+  while a forced commit journal permits exact atomic recovery. Completion does not
+  consume the transaction result. Explicit release closes settled commit ownership
+  before snapshot cleanup. Legacy API/transport parity remains unfinished.
 - Scoped OPEN/GET/PAGE/PLAN/CLOSE use one framed query protocol for data and catalogue
   groups. OPEN requires a proven fresh linearizable barrier and ready native owner.
   Later owned operations use the fixed snapshot cut, not a new current read. Stale

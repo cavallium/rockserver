@@ -58,6 +58,29 @@ public final class RatisAtomicClient implements AutoCloseable {
         var plan=RatisTransactionPlan.logical(schema,data.directory(),identity.business(),changes,conditions);
         return executePlan(journal,identity,plan,ttl,context,deadline);
     }
+    /** Submit a fully frozen captured projection without staging again or opening replacement cuts. */
+    public Operation executeAccepted(Path path,Identity identity,RatisTransactionPlan.Accepted accepted,RequestContext context) throws IOException {
+        long deadline=scheduler.resolveMonotonicDeadline(context); Objects.requireNonNull(identity); Objects.requireNonNull(accepted);
+        var initial=accepted.initial(); initial.requireInitial();
+        if (!initial.transactionId().equals(identity.transaction()) || !initial.operation().equals(identity.business())
+                || !initial.clusterId().equals(schema.clusterId()) || !initial.databaseId().equals(schema.databaseId()) || !initial.domainId().equals(schema.domainId())
+                || initial.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(initial.schemaDigest(),schema.digest())
+                || !Arrays.equals(initial.planDigest(),RatisDurableTransaction.planDigest(accepted.intents())) || accepted.intents().size()!=initial.participants().size()) throw new IllegalArgumentException("Accepted projection differs from reserved atomic identity/schema");
+        var ordered=accepted.intents().stream().sorted(Comparator.comparing(i -> i.route().groupId())).toList();
+        var groups=new HashSet<UUID>(); long bytes=64*1024L+2*1024*1024L; int n=0;
+        for (var intent:ordered) {
+            if (!groups.add(intent.route().groupId()) || intent.captureId()==null || !intent.acceptedBusiness().operationId().equals(identity.business())
+                    || !intent.prepareControl().equals(identity.control(n)) || !intent.finalizeControl().equals(identity.control(64+n++))) throw new IllegalArgumentException("Accepted projection changed its original handles or control block");
+            var participant=initial.participants().stream().filter(p -> p.groupId().equals(intent.route().groupId())).findFirst().orElseThrow();
+            if (!participant.rangeId().equals(intent.route().rangeId()) || participant.rangeEpoch()!=intent.route().rangeEpoch() || !Arrays.equals(participant.planDigest(),intent.acceptedBusiness().payloadDigest())) throw new IllegalArgumentException("Accepted participant differs from HOME definition");
+            data.restoreTransaction(intent); // Pure binding validation; this never issues OPEN or reads latest data.
+            bytes+=2L*DistributedCommandCodec.encodedSize(intent.acceptedBusiness())+2L*SessionWindowJournal.routeSize(intent.route())+64*1024L;
+        }
+        if (bytes>RatisDurableTransaction.MAX_BYTES) throw new IOException("Accepted projection exceeds retained journal capacity");
+        RatisDurableTransaction.validateResultPlan(accepted.intents());
+        var registration=homes.prepare(identity.control(128),null,initial);
+        var operation=admit(path,identity,null,null,bytes,accepted,registration); operation.beginExecution(context,deadline); return operation;
+    }
     Operation executePlan(Path journal,Identity identity,RatisTransactionPlan plan,Duration ttl,RequestContext context,long deadline) throws IOException {
         Objects.requireNonNull(identity); Objects.requireNonNull(plan); Objects.requireNonNull(ttl); Objects.requireNonNull(context);
         if (!identity.business().equals(plan.operation()) || !Arrays.equals(data.directory().payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Atomic plan/TTL differs from frozen request");
@@ -72,10 +95,14 @@ public final class RatisAtomicClient implements AutoCloseable {
     public synchronized Stats stats() { return new Stats(operations.size(),chargedBytes); }
     private synchronized void requireOpen() throws IOException { if (closing || closed) throw new IOException("Atomic client closing/closed"); }
     private synchronized Operation admit(Path journal,Identity identity,RatisTransactionPlan plan,Duration ttl,long bytes) throws IOException {
+        return admit(journal,identity,plan,ttl,bytes,null,null);
+    }
+    private synchronized Operation admit(Path journal,Identity identity,RatisTransactionPlan plan,Duration ttl,long bytes,RatisTransactionPlan.Accepted accepted,RatisRoutedClient.PreparedCommand registration) throws IOException {
         requireOpen(); Path path=Objects.requireNonNull(journal).toAbsolutePath().normalize();
         if (operations.containsKey(path)) throw new IOException("Atomic journal already owned; use its existing operation handle");
         if (operations.size()>=limits.operations() || bytes>limits.bytes()-chargedBytes) throw new IOException("Atomic operation/byte capacity exhausted");
-        var operation=new Operation(path,identity,plan,ttl,bytes); operations.put(path,operation); chargedBytes+=bytes; return operation;
+        var operation=new Operation(path,identity,plan,ttl,bytes); operation.initialization=accepted; operation.registration=registration;
+        operations.put(path,operation); chargedBytes+=bytes; return operation;
     }
     private synchronized void release(Operation operation) { if (operations.remove(operation.path,operation)) chargedBytes-=operation.bytes; }
     private static long estimate(RatisTransactionPlan plan) throws IOException {
@@ -115,8 +142,11 @@ public final class RatisAtomicClient implements AutoCloseable {
         private Task<?> active;
         private Task<CommandResult> execution;
         private boolean closeRequested,closingOperation,closed;
+        private CommandResult terminalResult;
         private Operation(Path path,Identity identity,RatisTransactionPlan plan,Duration ttl,long bytes) { this.path=path; this.identity=identity; this.plan=plan; this.ttl=ttl; this.bytes=bytes; }
         public Path path() { return path; }
+        synchronized boolean busy() { return active!=null || closingOperation; }
+        synchronized boolean terminalReady() { return terminalResult!=null; }
         public boolean rejectedBeforeRegistration() { return rejected!=null; }
         public synchronized CompletableFuture<CommandResult> completion() { return execution==null ? CompletableFuture.failedFuture(new IOException("Atomic execution not admitted")) : execution.view(); }
         public CompletableFuture<CommandResult> resume(RequestContext context) { return execute(context,scheduler.resolveMonotonicDeadline(context)); }
@@ -151,10 +181,11 @@ public final class RatisAtomicClient implements AutoCloseable {
         }
         private CommandResult drive(Task<CommandResult> task) throws Exception {
             task.check();
-            if (rejected!=null) { rejected.consumed(); closeCaptures(); return new CommandResult(CommandResult.Status.CONFLICT,List.of()); }
+            if (rejected!=null) { rejected.consumed(); closeCaptures(); return completed(new CommandResult(CommandResult.Status.CONFLICT,List.of())); }
             if (journal==null) {
-                if (plan==null) {
-                    if (RatisAtomicRejection.isRejection(path)) { rejected=RatisAtomicRejection.reopen(path,binding); identity=rejected.identity(); return new CommandResult(CommandResult.Status.CONFLICT,List.of()); }
+                if (initialization!=null) publish();
+                else if (plan==null) {
+                    if (RatisAtomicRejection.isRejection(path)) { rejected=RatisAtomicRejection.reopen(path,binding); identity=rejected.identity(); return completed(new CommandResult(CommandResult.Status.CONFLICT,List.of())); }
                     var candidate=RatisDurableTransaction.reopen(path,homes,data);
                     try {
                         var saved=candidate.snapshot(); var first=saved.participants().stream().map(p -> p.intent().prepareControl()).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();
@@ -165,7 +196,7 @@ public final class RatisAtomicClient implements AutoCloseable {
                     } catch (Exception invalid) { try { candidate.close(); } catch (IOException cleanup) { invalid.addSuppressed(cleanup); } throw invalid; }
                 } else initialize(task);
             }
-            if (rejected!=null) { rejected.consumed(); closeCaptures(); return new CommandResult(CommandResult.Status.CONFLICT,List.of()); }
+            if (rejected!=null) { rejected.consumed(); closeCaptures(); return completed(new CommandResult(CommandResult.Status.CONFLICT,List.of())); }
             try (var coordinator=new RatisTransactionCoordinator(journal,homes,data,identity::next,(transaction,participant) -> {
                 task.check(); var intent=participant.intent(); var capture=captures.get(intent.route().groupId());
                 if (capture==null) { capture=data.restoreTransaction(intent); captures.put(intent.route().groupId(),capture); }
@@ -173,10 +204,11 @@ public final class RatisAtomicClient implements AutoCloseable {
                 task.check();
                 return new RatisTransactionCoordinator.Authorization(authorized.preparation(),authorized.negative(),() -> {});
             })) {
-                for (int n=0;n<1024;n++) { task.check(); if (coordinator.step().complete()) { var result=journal.result(); closeCaptures(); return result; } }
+                for (int n=0;n<1024;n++) { task.check(); if (coordinator.step().complete()) { var result=journal.result(); closeCaptures(); return completed(result); } }
             }
             throw new IOException("Atomic work quantum exhausted; resume the same journal");
         }
+        private synchronized CommandResult completed(CommandResult result) { terminalResult=result; return result; }
         private void initialize(Task<?> task) throws Exception {
             if (!freshChecked) { if (java.nio.file.Files.exists(path)) throw new IOException("Atomic journal already exists; reopen it"); freshChecked=true; }
             if (rejectedRequest!=null) { publishRejection(); return; }

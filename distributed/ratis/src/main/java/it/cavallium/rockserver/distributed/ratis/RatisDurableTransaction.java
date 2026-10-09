@@ -455,12 +455,15 @@ public final class RatisDurableTransaction implements AutoCloseable {
         if (lastHome.equals(initial.operation()) || controls.contains(lastHome)) throw new IOException("Home operation overlaps participant/business identity");
     }
     private int resultCount() throws IOException {
+        return validateResultPlan(entries.values().stream().map(entry -> entry.intent).toList());
+    }
+    static int validateResultPlan(List<Intent> intents) throws IOException {
         boolean[] assigned=new boolean[256]; int count=0; long bytes=8;
-        for (var entry:entries.values()) {
-            var result=CommandResult.decode(entry.intent.acceptedBusiness().acceptance().result());
+        for (var intent:intents) {
+            var result=CommandResult.decode(intent.acceptedBusiness().acceptance().result());
             bytes+=result.encode().length-8L;
             if (bytes>CommandResult.MAX_BYTES) throw new IOException("Global transaction result exceeds byte budget before registration");
-            for (int position:entry.intent.resultPositions()) {
+            for (int position:intent.resultPositions()) {
                 if (assigned[position]) throw new IOException("Duplicate global transaction result slot"); assigned[position]=true; count++;
             }
         }

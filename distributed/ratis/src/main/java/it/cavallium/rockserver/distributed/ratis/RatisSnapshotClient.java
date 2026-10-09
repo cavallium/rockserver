@@ -35,12 +35,16 @@ public final class RatisSnapshotClient implements AutoCloseable {
     private final RatisRoutedClient data;
     private final RWScheduler scheduler;
     private final Limits limits;
+    private final RatisSnapshotCaptureRequest.Mode mode;
     private final Map<Path,Lease> leases=new LinkedHashMap<>();
     private long chargedBytes;
     private int reads,cursors;
     private boolean closing,closed;
     public RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
-        this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
+        this(schema,homes,data,scheduler,limits,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
+    }
+    RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode) {
+        this.mode=Objects.requireNonNull(mode); this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
         schema.requireMatches(data.directory()); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
     }
     public Lease open(Path path,Identity identity,TransactionScope scope,Duration ttl,RequestContext context) throws IOException {
@@ -52,7 +56,13 @@ public final class RatisSnapshotClient implements AutoCloseable {
         var lease=admit(path,plan,ttl,bytes); lease.beginAcquire(context,deadline); return lease;
     }
     public Lease reopen(Path path,RequestContext context) throws IOException {
+        if (mode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED) throw new IOException("Writable frontend prefixes are ephemeral; resume the original lease");
         long deadline=scheduler.resolveMonotonicDeadline(context); var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES); lease.beginAcquire(context,deadline); return lease;
+    }
+    /** Recover only durable cleanup direction; no frontend prefix or read authority is reconstructed. */
+    Lease reopenForRelease(Path path,RequestContext context) throws IOException {
+        requireOpen(); Objects.requireNonNull(context);
+        var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES); lease.release(context); return lease;
     }
     public synchronized Lease lease(Path path) { return leases.get(path.toAbsolutePath().normalize()); }
     public synchronized Stats stats() { return new Stats(leases.size(),reads,cursors,chargedBytes); }
@@ -70,19 +80,32 @@ public final class RatisSnapshotClient implements AutoCloseable {
     private synchronized void refund(long bytes,boolean read,boolean cursor) { chargedBytes-=bytes; if (read) reads--; if (cursor) cursors--; }
     private synchronized void remove(Lease lease) { if (leases.remove(lease.path,lease)) chargedBytes-=lease.bytes; }
     private static void validateTtl(Duration ttl) { if (Objects.requireNonNull(ttl).isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Snapshot TTL must be 1..60000 whole milliseconds"); }
-    private enum Kind { ACQUIRE, RELEASE, GET, PAGE }
+    /** Per-group headers are not duplicated in the global result's single eight-byte header. */
+    static long checkedResultBytes(long total,CommandResult result) throws IOException {
+        if (total<8 || total>CommandResult.MAX_BYTES) throw new IllegalArgumentException("Invalid aggregate staged-result accounting");
+        long next=total+Objects.requireNonNull(result).encode().length-8;
+        if (next>CommandResult.MAX_BYTES) throw new IOException("Aggregate staged result exceeds transaction result budget; prefix remains uncertain");
+        return next;
+    }
+    private enum Kind { ACQUIRE, RELEASE, STAGE, GET, PAGE }
     @FunctionalInterface private interface Work<T> { T run(Task<T> task) throws Exception; }
     public final class Lease implements AutoCloseable {
         private final Path path; private final long bytes;
         private RatisSnapshotPlan plan; private Duration ttl;
         private volatile RatisDurableSnapshot journal;
-        private record ReadBinding(TransactionScope scope,List<RatisLogicalSnapshotPages.Owner> owners) {}
+        private record ReadBinding(TransactionScope scope,List<RatisLogicalSnapshotPages.Owner> owners,RatisLogicalSnapshotPages.OwnerReader reader,Map<UUID,RatisRoutedClient.ScopedTransaction> captures) {}
         private volatile ReadBinding binding;
         private volatile boolean completed,lost;
         private boolean releaseRequested,closeRequested,closingLease,closed,creationAttempted;
         private Task<?> control;
         private Task<Void> acquisition;
         private Task<Void> releasing;
+        private Task<Map<UUID,CommandResult>> staging;
+        private RatisTransactionPlan pendingPrefix,stagedPrefix;
+        private final Map<UUID,CommandResult> pendingResults=new LinkedHashMap<>();
+        private Map<UUID,CommandResult> stagedResults=Map.of();
+        private long pendingPrefixBytes,stagedPrefixBytes,pendingResultBytes=8;
+        private boolean commitFrozen,commitFinished;
         private final Set<Task<?>> reading=new HashSet<>();
         private final Set<Cursor> borrowedCursors=new HashSet<>();
         private Lease(Path path,RatisSnapshotPlan plan,Duration ttl,long bytes) { this.path=path; this.plan=plan; this.ttl=ttl; this.bytes=bytes; }
@@ -92,12 +115,13 @@ public final class RatisSnapshotClient implements AutoCloseable {
         private synchronized void beginAcquire(RequestContext context,long deadline) { if (control!=null) return; var task=new Task<Void>(this,Kind.ACQUIRE,deadline,0,OperationFamily.MUTATION,this::acquire); acquisition=task; submitControl(task,context); }
         public synchronized CompletableFuture<Void> resume(RequestContext context) {
             if (releaseRequested) return release(context);
+            if (pendingPrefix!=null) return CompletableFuture.failedFuture(new IOException("Resume the exact uncertain prefix through stagePrefix"));
             if (control!=null) return control.kind==Kind.ACQUIRE ? acquisition.view() : CompletableFuture.failedFuture(new IOException("Snapshot control already active"));
             beginAcquire(context,scheduler.resolveMonotonicDeadline(context)); return acquisition.view();
         }
         private void requireIdleControl() throws IOException { if (closed || closeRequested) throw new IOException("Snapshot lease closing/closed"); if (control!=null || !reading.isEmpty()) throw new IOException("Snapshot work active; ownership retained"); }
         private <T> void submitControl(Task<T> task,RequestContext context) {
-            try { requireOpen(); requireIdleControl(); control=task; scheduler.executor(context.profile(),task.family,task.deadline).execute(task,Math.min(bytes,WorkloadCost.MAX_ESTIMATED_BYTES)); }
+            try { requireOpen(); requireIdleControl(); control=task; scheduler.executor(context.profile(),task.family,task.deadline).execute(task,Math.min(bytes+task.bytes,WorkloadCost.MAX_ESTIMATED_BYTES)); }
             catch (Exception failure) { task.fail(failure); }
         }
         private <T> CompletableFuture<T> read(Kind kind,OperationFamily family,long cost,RequestContext context,long deadline,Work<T> work,Cursor cursor) {
@@ -115,26 +139,40 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         private List<RatisLogicalSnapshotPages.Owner> owners() throws IOException {
             if (closed || closeRequested || releaseRequested || lost) throw new RatisSnapshotLostException("Snapshot lease closed, released or lost");
+            if (pendingPrefix!=null || commitFrozen) throw new IOException("Writable prefix uncertain or commit frozen");
             if (!completed || journal==null) throw new IOException("Snapshot acquisition is not complete");
             var current=binding; if (current==null) throw new RatisSnapshotLostException("Original snapshot capture vector is unavailable"); return current.owners();
         }
         private ReadBinding binding(RatisDurableSnapshot.Snapshot saved) throws IOException {
-            if (saved.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IOException("Read-only client cannot acquire writable snapshot journal");
+            if (saved.captureMode()!=mode) throw new IOException("Snapshot journal capture mode differs from client");
             if (saved.releaseRequested() || saved.observedHome()==null || saved.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE) throw new RatisSnapshotLostException("Snapshot has no usable COMPLETE image");
             var owners=new ArrayList<RatisLogicalSnapshotPages.Owner>();
             for (var p:saved.participants()) {
                 if (p.capture()==null || p.captureToken()==null || p.captureLost() || p.captureReleased() || p.captureReleaseLost()) throw new RatisSnapshotLostException("Original snapshot owner capture is unavailable");
                 owners.add(new RatisLogicalSnapshotPages.Owner(p.capture().target().descriptor(),p.capture().target(),p.captureToken(),saved.initial().fence().participant(p.route().groupId()).scope()));
             }
-            return new ReadBinding(RatisSnapshotPlan.scope(saved.initial().fence()),List.copyOf(owners));
+            var captures=new LinkedHashMap<UUID,RatisRoutedClient.ScopedTransaction>();
+            if (mode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED) for (var p:saved.participants()) {
+                if (p.certifiedHandle()==null) throw new IOException("Writable capture has no original certified handle");
+                captures.put(p.route().groupId(),data.capturedTransaction(p.capture(),new RatisSnapshotCaptureRequest.Result(p.captureToken(),p.certifiedHandle())));
+            }
+            var reader=new RatisLogicalSnapshotPages.OwnerReader() {
+                public byte[] get(RatisLogicalSnapshotPages.Owner owner,UUID column,byte[] key) throws IOException {
+                    return mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? data.snapshotGet(owner.target(),owner.token(),column,key) : captures.get(owner.route().groupId()).get(column,key);
+                }
+                public PhysicalRangePage page(RatisLogicalSnapshotPages.Owner owner,UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws IOException {
+                    return mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? data.snapshotPage(owner.target(),owner.token(),column,lower,upper,reverse,resume,items,bytes) : captures.get(owner.route().groupId()).page(column,lower,upper,reverse,resume,items,bytes);
+                }
+            };
+            return new ReadBinding(RatisSnapshotPlan.scope(saved.initial().fence()),List.copyOf(owners),reader,Map.copyOf(captures));
         }
         public CompletableFuture<Buf> get(long column,Keys key,RequestContext context) {
             long deadline=scheduler.resolveMonotonicDeadline(context); Keys frozen=freeze(Objects.requireNonNull(key));
-            return read(Kind.GET,OperationFamily.POINT_LOOKUP,POINT_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.get(data,owners(),scope(),schema,column,frozen); },null);
+            return read(Kind.GET,OperationFamily.POINT_LOOKUP,POINT_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.get(binding.reader(),owners(),scope(),schema,column,frozen); },null);
         }
         public CompletableFuture<RangePage<KV>> page(long column,Keys lower,Keys upper,boolean reverse,Keys resume,RangeBudget budget,RequestContext context) {
             long deadline=scheduler.resolveMonotonicDeadline(context); Keys low=freeze(lower), high=freeze(upper), after=freeze(resume); Objects.requireNonNull(budget);
-            return read(Kind.PAGE,OperationFamily.RANGE_PAGE,PAGE_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.read(data,owners(),scope(),schema,column,low,high,reverse,after,budget); },null);
+            return read(Kind.PAGE,OperationFamily.RANGE_PAGE,PAGE_BYTES,context,deadline,task -> { task.check(); return RatisLogicalSnapshotPages.read(binding.reader(),owners(),scope(),schema,column,low,high,reverse,after,budget); },null);
         }
         private TransactionScope scope() throws IOException { var current=binding; if (current==null) throw new RatisSnapshotLostException("Snapshot read scope unavailable"); return current.scope(); }
         private OperationId firstControl() throws IOException {
@@ -146,7 +184,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             return new OperationId(last.sessionId(),last.epoch(),last.sequence()+1);
         }
         private void validateIdentity(RatisDurableSnapshot candidate) throws IOException {
-            if (candidate.mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IOException("Read-only client cannot acquire writable snapshot journal");
+            if (candidate.mode()!=mode) throw new IOException("Snapshot journal capture mode differs from client");
             var saved=candidate.snapshot(); var fence=saved.initial().fence();
             if (!fence.clusterId().equals(schema.clusterId()) || !fence.databaseId().equals(schema.databaseId()) || !fence.domainId().equals(schema.domainId()) || fence.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(fence.schemaDigest(),schema.digest())) throw new IOException("Snapshot journal schema differs from this client");
             var first=fence.participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow(); new Identity(fence.fenceId(),fence.operation(),first);
@@ -169,7 +207,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
                     var candidate=RatisDurableSnapshot.reopen(path,homes,data);
                     try { if (!candidate.snapshot().initial().equals(initial) || !ttl.equals(candidate.snapshot().requestedTtl())) throw new IOException("Uncertain snapshot publication changed its frozen definition/lifetime"); validateIdentity(candidate); journal=candidate; }
                     catch (Exception failure) { try { candidate.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Invalid uncertain snapshot publication",failure); }
-                } else journal=RatisDurableSnapshot.create(path,homes,data,initial,homes.prepare(new OperationId(first.sessionId(),first.epoch(),first.sequence()+128),null,initial),plan.routes(),ttl);
+                } else journal=RatisDurableSnapshot.create(path,homes,data,initial,homes.prepare(new OperationId(first.sessionId(),first.epoch(),first.sequence()+128),null,initial),plan.routes(),ttl,mode);
                 plan=null;
             }
             ttl=journal.snapshot().requestedTtl();
@@ -180,8 +218,8 @@ public final class RatisSnapshotClient implements AutoCloseable {
                 for (int n=0;n<1024;n++) {
                     task.check(); if (coordinator.step().complete()) {
                         var saved=journal.snapshot(); if (saved.observedHome()==null || saved.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE) throw new RatisSnapshotLostException("Snapshot acquisition aborted or expired");
-                        binding=binding(saved);
-                        completed=true; return null;
+                        var acquired=binding(saved);
+                        task.committed=() -> { binding=acquired; completed=true; }; return null;
                     }
                 }
             }
@@ -189,10 +227,14 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         /** Explicit durable close intent, gate cleanup, consumption and exact owner-pin release. */
         public synchronized CompletableFuture<Void> release(RequestContext context) {
+            if (commitFrozen && !commitFinished) return CompletableFuture.failedFuture(new IOException("Atomic commit still owns captured native handles"));
             if (control!=null) return control.kind==Kind.RELEASE ? releasing.view() : CompletableFuture.failedFuture(new IOException("Snapshot control active"));
             if (!reading.isEmpty()) return CompletableFuture.failedFuture(new IOException("Snapshot readers active; ownership retained"));
             releaseRequested=true; for (var cursor:List.copyOf(borrowedCursors)) cursor.close();
             var task=new Task<Void>(this,Kind.RELEASE,scheduler.resolveMonotonicDeadline(context),0,OperationFamily.MUTATION,this::releasePins); releasing=task; submitControl(task,context); return task.view();
+        }
+        synchronized CompletableFuture<Void> releaseCompletion() {
+            return releasing==null ? CompletableFuture.failedFuture(new IOException("Snapshot release not admitted")) : releasing.view();
         }
         private Void releasePins(Task<Void> task) throws Exception {
             task.check(); if (journal==null) initialize(); journal.requestRelease();
@@ -211,6 +253,92 @@ public final class RatisSnapshotClient implements AutoCloseable {
             }
             return null;
         }
+        private long prefixBytes(RatisTransactionPlan prefix) throws IOException {
+            boolean returning=prefix.partitions().stream().anyMatch(part -> !part.resultPositions().isEmpty());
+            // One aggregate final result and one active reply, rather than a full reply per group.
+            long bytes=65536L+136L*prefix.partitions().size()+(returning ? 2L*CommandResult.MAX_BYTES : 8);
+            for (var part:prefix.partitions()) bytes+=2L*DistributedCommandCodec.encodedSize(part.command());
+            if (bytes>2L*RatisTransactionPlan.MAX_BYTES+2L*CommandResult.MAX_BYTES+65536+136L*SnapshotFence.MAX_PARTICIPANTS) throw new IOException("Writable prefix retained budget exceeded");
+            return bytes;
+        }
+        private boolean samePrefix(RatisTransactionPlan a,RatisTransactionPlan b) {
+            if (!a.operation().equals(b.operation()) || !Arrays.equals(a.directory().payloadDigest(),b.directory().payloadDigest()) || a.partitions().size()!=b.partitions().size()) return false;
+            for (int n=0;n<a.partitions().size();n++) {
+                var x=a.partitions().get(n); var y=b.partitions().get(n);
+                if (!x.route().equals(y.route()) || !x.resultPositions().equals(y.resultPositions()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(x.scope()),ScopedTransactionRpc.scopeBytes(y.scope())) || !Arrays.equals(DistributedCommandCodec.encode(x.command()),DistributedCommandCodec.encode(y.command()))) return false;
+            }
+            return true;
+        }
+        private boolean extendsPrefix(RatisTransactionPlan before,RatisTransactionPlan next) {
+            if (!before.operation().equals(next.operation()) || before.partitions().size()!=next.partitions().size()) return false;
+            for (int n=0;n<before.partitions().size();n++) {
+                var a=before.partitions().get(n); var b=next.partitions().get(n);
+                if (!a.route().equals(b.route()) || !prefix(a.command().mutations(),b.command().mutations()) || !prefix(a.command().predicates(),b.command().predicates()) || !prefix(a.resultPositions(),b.resultPositions())) return false;
+            }
+            return true;
+        }
+        private boolean prefix(List<?> before,List<?> next) { return next.size()>=before.size() && next.subList(0,before.size()).equals(before); }
+        private void requireProjection(RatisTransactionPlan prefix) throws IOException {
+            var mutations=new ArrayList<Mutation>(); var predicates=new ArrayList<KeyPredicate>();
+            for (var part:prefix.partitions()) { mutations.addAll(part.command().mutations()); predicates.addAll(part.command().predicates()); }
+            // Rebuild only for validating the complete original capture vector. Result positions are
+            // caller-global ordering and need not follow the grouped flattened validation operands.
+            var checked=RatisTransactionPlan.captured(prefix.directory(),prefix.operation(),mutations,predicates,snapshot());
+            if (checked.partitions().size()!=prefix.partitions().size()) throw new IllegalArgumentException("Prefix omits original captured participants");
+            for (int n=0;n<checked.partitions().size();n++) {
+                var a=checked.partitions().get(n); var b=prefix.partitions().get(n);
+                if (!a.route().equals(b.route()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(a.scope()),ScopedTransactionRpc.scopeBytes(b.scope())) || !Arrays.equals(DistributedCommandCodec.encode(a.command()),DistributedCommandCodec.encode(b.command()))) throw new IllegalArgumentException("Prefix changes original captured projection");
+            }
+        }
+        synchronized CompletableFuture<Map<UUID,CommandResult>> stagePrefix(RatisTransactionPlan prefix,RequestContext context) {
+            try {
+                Objects.requireNonNull(prefix); if (mode!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED || commitFrozen) throw new IOException("Writable staging is unavailable");
+                if (control!=null) {
+                    if (control.kind==Kind.STAGE && samePrefix(pendingPrefix,prefix)) return staging.view();
+                    throw new IOException("Snapshot control active or prefix changed");
+                }
+                if (closed || closeRequested || releaseRequested || lost || !completed || binding==null) throw new IOException("Writable lease unavailable");
+                requireIdleControl(); requireProjection(prefix);
+                if (pendingPrefix!=null && !samePrefix(pendingPrefix,prefix)) throw new IOException("Resume the exact uncertain full prefix");
+                if (pendingPrefix==null) {
+                    if (stagedPrefix!=null && samePrefix(stagedPrefix,prefix)) return CompletableFuture.completedFuture(stagedResults);
+                    if (stagedPrefix!=null && !extendsPrefix(stagedPrefix,prefix)) throw new IllegalArgumentException("Staged prefix changed or regressed");
+                    long bytes=prefixBytes(prefix); reserve(bytes,false,false); pendingPrefixBytes=bytes; pendingPrefix=prefix; pendingResults.clear(); pendingResultBytes=8;
+                }
+                var task=new Task<Map<UUID,CommandResult>>(this,Kind.STAGE,scheduler.resolveMonotonicDeadline(context),pendingPrefixBytes,OperationFamily.MUTATION,this::stagePending); staging=task; submitControl(task,context); return task.view();
+            } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+        }
+        private Map<UUID,CommandResult> stagePending(Task<Map<UUID,CommandResult>> task) throws Exception {
+            for (var part:pendingPrefix.partitions()) {
+                task.check(); UUID group=part.route().groupId(); if (pendingResults.containsKey(group)) continue;
+                var result=part.command().readCertification() ? new CommandResult(CommandResult.Status.SUCCESS,List.of()) : binding.captures().get(group).stage(part.command().mutations(),part.command().predicates());
+                synchronized (this) { pendingResultBytes=checkedResultBytes(pendingResultBytes,result); pendingResults.put(group,result); }
+            }
+            var results=Map.copyOf(pendingResults);
+            task.committed=() -> {
+                refund(stagedPrefixBytes,false,false); stagedPrefix=pendingPrefix; stagedResults=results; stagedPrefixBytes=pendingPrefixBytes;
+                pendingPrefix=null; pendingPrefixBytes=0; pendingResults.clear(); pendingResultBytes=8; for (var cursor:List.copyOf(borrowedCursors)) cursor.close();
+            };
+            return results;
+        }
+        synchronized RatisTransactionPlan.Accepted preparedPrefix(RatisAtomicClient.Identity identity) throws IOException {
+            if (mode!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED || commitFrozen) throw new IOException("Writable commit unavailable");
+            owners(); requireIdleControl();
+            var prefix=stagedPrefix==null ? RatisTransactionPlan.captured(data.directory(),identity.business(),List.of(),List.of(),snapshot()) : stagedPrefix;
+            if (!prefix.operation().equals(identity.business())) throw new IllegalArgumentException("Commit business differs from staged prefix");
+            var accepted=new LinkedHashMap<UUID,DistributedCommand>(); var prepares=new LinkedHashMap<UUID,OperationId>(); var finalizes=new LinkedHashMap<UUID,OperationId>(); int n=0;
+            for (var part:prefix.partitions()) {
+                var group=part.route().groupId(); var capture=binding.captures().get(group);
+                var result=stagedResults.get(group);
+                accepted.put(group,part.command().readCertification() ? part.command() : capture.participantIntent(part.command(),Objects.requireNonNull(result,"Missing settled stage result")));
+                prepares.put(group,new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),identity.firstControl().sequence()+n));
+                finalizes.put(group,new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),identity.firstControl().sequence()+64+n++));
+            }
+            var result=prefix.acceptCaptured(identity.transaction(),accepted,prepares,finalizes);
+            commitFrozen=true; for (var cursor:List.copyOf(borrowedCursors)) cursor.close(); return result;
+        }
+        synchronized void undoCommitFreeze() { if (!commitFinished) commitFrozen=false; }
+        synchronized void finishCommitOwnership() { if (!commitFrozen) throw new IllegalStateException("Commit was not frozen"); commitFinished=true; }
         public synchronized Cursor openCursor(long column,Keys lower,Keys upper,boolean reverse) throws IOException {
             owners(); if (control!=null) throw new IOException("Snapshot control active"); RatisLogicalClient.supported(schema,column);
             Keys low=freeze(lower),high=freeze(upper); RatisLogicalRangePages.validateBounds(scope(),schema,column,low,high); long bytes=256+keyBytes(low)+keyBytes(high)+TransactionScope.MAX_BOUND_BYTES+RangeBudget.DEFAULT_MAX_BYTES;
@@ -240,7 +368,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
                     try {
                         pendingBudget=Objects.requireNonNull(budget);
                         pending=Lease.this.<RangePage<KV>>startRead(Kind.PAGE,OperationFamily.RANGE_PAGE,PAGE_BYTES,context,deadline,task -> {
-                            var result=RatisLogicalSnapshotPages.read(data,owners(),scope(),schema,column,lower,upper,reverse,after,budget);
+                            var result=RatisLogicalSnapshotPages.read(binding.reader(),owners(),scope(),schema,column,lower,upper,reverse,after,budget);
                             task.committed=() -> { if (!closed) { resume=RatisLogicalRangePages.copy(result.resumeAfter()); exhausted=!result.hasMore(); } };
                             return result;
                         },this);
@@ -257,8 +385,8 @@ public final class RatisSnapshotClient implements AutoCloseable {
             @Override public void close() { synchronized (Lease.this) { closed=true; if (!active) refundCursor(); } }
         }
         @Override public void close() throws IOException {
-            synchronized (this) { if (closed) return; if (control!=null || !reading.isEmpty() || closingLease) throw new IOException("Snapshot work active; ownership retained"); closeRequested=true; closingLease=true; for (var cursor:List.copyOf(borrowedCursors)) cursor.close(); }
-            try { if (journal!=null) journal.close(); synchronized (this) { closed=true; } remove(this); }
+            synchronized (this) { if (closed) return; if (control!=null || !reading.isEmpty() || closingLease || commitFrozen && !commitFinished) throw new IOException("Snapshot work active; ownership retained"); closeRequested=true; closingLease=true; for (var cursor:List.copyOf(borrowedCursors)) cursor.close(); }
+            try { if (journal!=null) journal.close(); synchronized (this) { closed=true; refund(pendingPrefixBytes+stagedPrefixBytes,false,false); pendingPrefixBytes=stagedPrefixBytes=0; pendingPrefix=stagedPrefix=null; pendingResults.clear(); pendingResultBytes=8; stagedResults=Map.of(); } remove(this); }
             finally { synchronized (this) { closingLease=false; } }
         }
     }
