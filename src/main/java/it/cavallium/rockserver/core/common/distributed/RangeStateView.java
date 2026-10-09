@@ -7,14 +7,14 @@ import java.util.*;
 public record RangeStateView(UUID groupId,long rangeEpoch,UUID domainId,byte[] schemaDigest,Set<UUID> columns,
                              byte[] lowerInclusive,byte[] upperExclusive,ApplyPosition applied,long minimumSessionEpoch,SessionAuthority sessionAuthority) {
     public static final int MAX_BYTES=2*1024*1024;
-    private static final int MAGIC=0x52535657, MIN_BYTES=114;
+    private static final int MAGIC=0x52535657, MIN_BYTES=98;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
     };
     public RangeStateView {
         Objects.requireNonNull(groupId); Objects.requireNonNull(domainId);
-        if (rangeEpoch<0 || minimumSessionEpoch<0 || schemaDigest.length!=32 || columns.isEmpty() || columns.size()>RangeDirectoryCodec.MAX_COLUMNS
+        if (rangeEpoch<0 || minimumSessionEpoch<0 || schemaDigest.length!=32 || columns.size()>RangeDirectoryCodec.MAX_COLUMNS
                 || (lowerInclusive!=null && upperExclusive!=null && Arrays.compareUnsigned(lowerInclusive,upperExclusive)>=0)
                 || encodedSize(columns.size(),lowerInclusive,upperExclusive,applied,sessionAuthority)>MAX_BYTES) {
             throw new IllegalArgumentException("Invalid bounded range state view");
@@ -43,7 +43,7 @@ public record RangeStateView(UUID groupId,long rangeEpoch,UUID domainId,byte[] s
         if (input.getInt()!=MAGIC) throw new IllegalArgumentException("Unsupported range state view header");
         UUID group=uuid(input); long epoch=input.getLong(); UUID domain=uuid(input); byte[] schema=new byte[32]; input.get(schema);
         int count=input.getInt();
-        if (epoch<0 || count<1 || count>RangeDirectoryCodec.MAX_COLUMNS || (long)count*16>input.remaining()-18) {
+        if (epoch<0 || count<0 || count>RangeDirectoryCodec.MAX_COLUMNS || (long)count*16>input.remaining()-18) {
             throw new IllegalArgumentException("Invalid range state view epoch/columns");
         }
         var columns=new HashSet<UUID>(); UUID previous=null;

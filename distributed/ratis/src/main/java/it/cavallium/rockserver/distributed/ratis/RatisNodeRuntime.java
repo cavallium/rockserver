@@ -208,8 +208,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
-                    if (role==RatisNodePlan.Role.DATA && logicalSchema!=null) store.enableLogicalSchema(logicalSchema);
-                    machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),validator,epochs,directory,settings.retention());
+                    if (role==RatisNodePlan.Role.DATA && logicalSchema!=null) {
+                        var effectiveSchema=store.installedSchema();
+                        store.enableLogicalSchema(effectiveSchema==null ? logicalSchema : effectiveSchema);
+                    }
+                    var effectiveDirectory=role==RatisNodePlan.Role.DATA && store.schemaInstallation()!=null
+                            ? store.schemaInstallation().definition().targetDirectory() : directory;
+                    machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),validator,epochs,effectiveDirectory,settings.retention());
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
                         machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
                         machine.homeRecoveryData(routed); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
@@ -218,7 +223,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
                     }
-                    else { machine.role(role); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),directory); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
+                    else { machine.role(role); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),effectiveDirectory); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
                 }
                 machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);

@@ -1096,6 +1096,12 @@ public class RocksDBLoader {
                     options.setCreateIfMissing(true);
                     existingColumnFamilies = mapList(RocksDB.listColumnFamilies(options, path.toString()), b -> new String(b, StandardCharsets.UTF_8));
                 }
+                // Distributed configuration selects options, never the set of existing user CFs.
+                // In particular, a deleted configured CF must not be recreated at restart.
+                if (!extraInternalColumns.isEmpty()) {
+                    columnConfigMap.keySet().removeIf(name -> !name.equals("default")
+                            && !existingColumnFamilies.contains(name) && !extraInternalColumns.contains(name));
+                }
                 for (String existingColumnFamily : existingColumnFamilies) {
                     columnConfigMap.putIfAbsent(existingColumnFamily, databaseOptions.global().fallbackColumnOptions());
                 }

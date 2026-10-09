@@ -38,6 +38,7 @@ import java.util.ArrayList;
 import java.util.List;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
+import it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -322,7 +323,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.SESSION_FLOOR && command.kind()!=DistributedCommand.Kind.SESSION_CONTROL) throw new IllegalArgumentException("Range role rejects transaction business records");
     }
     private void validateRoleNativeState() throws IOException {
-        if (role!=RatisNodePlan.Role.DATA && store.schemaFence()!=null) throw new IOException("Non-DATA range contains schema fence state");
+        if (role!=RatisNodePlan.Role.DATA && (store.schemaFence()!=null || store.schemaInstallation()!=null)) throw new IOException("Non-DATA range contains schema transition state");
         if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.homeRecoveryCapacity().effectiveCount()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
         if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
     }
@@ -754,7 +755,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private NativeRangeImage.Manifest validateImage(Path image, TermIndex position) throws IOException {
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         NativeRangeImage.RowVisitor visitor = (section, column, key, value) -> {
-            if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)==0x27) throw new IllegalArgumentException("Non-DATA image contains schema fence state");
+            if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x27 && (key[16]&255)<=0x2a) throw new IllegalArgumentException("Non-DATA image contains schema transition state");
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x20 && (key[16]&255)<=0x24) throw new IllegalArgumentException("Non-DATA image contains participant/snapshot state");
             if (role!=RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && ((key[16]&255)==0x25 || (key[16]&255)==0x26)) throw new IllegalArgumentException("Image role rejects protected HOME recovery receipts");
             if (role==RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)==0x25) {
@@ -778,10 +779,23 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             throw new IOException("Snapshot lacks configuration at its cut");
         }
         validateConfiguration(cfg.data());
+        boolean currentSchema=manifest.interval().equals(store.ownership().interval())
+                && Arrays.equals(manifest.schemaDigest(),store.schemaDigest())
+                && manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns());
+        var installed=store.schemaInstallation();
+        boolean precedingSchema=false;
+        if (installed!=null && manifest.position().index()<installed.position().index()
+                && manifest.position().term()<=installed.position().term()) {
+            var source=installed.definition().sourceSchema();
+            var descriptor=installed.definition().sourceDirectory().ranges().stream()
+                    .filter(range -> range.groupId().equals(manifest.owner().groupId())).findFirst().orElseThrow();
+            precedingSchema=manifest.owner().epoch()==descriptor.rangeEpoch()
+                    && manifest.interval().equals(new RangeOwnership.Interval(source.domainId(),source.columnIds(),descriptor.lowerInclusive(),descriptor.upperExclusive()))
+                    && Arrays.equals(manifest.schemaDigest(),source.digest())
+                    && manifest.deterministicMergeColumns().equals(installed.sourceMerges());
+        }
         if (!manifest.owner().equals(store.ownership().owner())
-                || !manifest.interval().equals(store.ownership().interval())
-                || !Arrays.equals(manifest.schemaDigest(), store.schemaDigest())
-                || !manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns())
+                || !currentSchema && !precedingSchema
                 || manifest.position().term() != position.getTerm() || manifest.position().index() != position.getIndex()) {
             throw new IOException("Snapshot identity does not match native range/filename");
         }

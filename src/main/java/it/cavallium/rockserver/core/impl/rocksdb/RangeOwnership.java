@@ -29,7 +29,6 @@ public final class RangeOwnership {
         public Interval {
             Objects.requireNonNull(domainId, "domainId");
             columns = Set.copyOf(columns);
-            if (columns.isEmpty()) throw new IllegalArgumentException("Ownership requires columns");
             if (lowerInclusive != null && upperExclusive != null
                     && Arrays.compareUnsigned(lowerInclusive, upperExclusive) >= 0) {
                 throw new IllegalArgumentException("Interval must have increasing unsigned bounds");
@@ -60,6 +59,110 @@ public final class RangeOwnership {
 
     private final Map<UUID, Ownership> owners = new HashMap<>();
     private final Map<UUID, Lease> leases = new HashMap<>();
+    private final Map<UUID, SchemaTransition> schemaTransitions = new HashMap<>();
+
+    /** Trusted native schema intent, permitting only its recorded source and target column sets. */
+    public static final class SchemaTransition {
+        private final UUID changeId, domainId;
+        private final Set<UUID> sourceColumns, targetColumns;
+        private SchemaTransition(UUID changeId, UUID domainId, Set<UUID> source, Set<UUID> target) {
+            this.changeId=changeId; this.domainId=domainId; sourceColumns=source; targetColumns=target;
+        }
+    }
+
+    public synchronized SchemaTransition beginSchemaTransition(UUID changeId, UUID domainId,
+            Set<UUID> sourceColumns, Set<UUID> targetColumns) {
+        Objects.requireNonNull(changeId); Objects.requireNonNull(domainId);
+        var source=Set.copyOf(sourceColumns); var target=Set.copyOf(targetColumns);
+        var removed=new java.util.HashSet<>(source); removed.removeAll(target);
+        var added=new java.util.HashSet<>(target); added.removeAll(source);
+        if (removed.size()+added.size()!=1) throw new IllegalArgumentException("Schema transition changes exactly one column");
+        var previous=schemaTransitions.get(domainId);
+        if (previous!=null) {
+            if (!previous.changeId.equals(changeId) || !previous.sourceColumns.equals(source) || !previous.targetColumns.equals(target))
+                throw new IllegalStateException("Another schema transition owns this domain");
+            return previous;
+        }
+        for (var other:owners.values()) if (other.state()!=State.RETIRED && other.interval().domainId().equals(domainId)
+                && !other.interval().columns().equals(source) && !other.interval().columns().equals(target))
+            throw new IllegalArgumentException("Schema transition differs from existing domain columns");
+        var transition=new SchemaTransition(changeId,domainId,source,target);
+        schemaTransitions.put(domainId,transition); return transition;
+    }
+
+    /** Recovery registration uses the same durable intent as live installation. */
+    public synchronized Ownership registerSchema(Owner owner, Interval interval, State state, SchemaTransition transition) {
+        Objects.requireNonNull(state); Objects.requireNonNull(interval); requireSchemaTransition(transition,interval);
+        if (state!=State.FENCED && state!=State.RETIRED) throw new IllegalArgumentException("Schema recovery owner must be fenced");
+        requireNew(owner); requireUnleased(interval);
+        if (state!=State.RETIRED) requireUnowned(interval,Set.of());
+        var result=new Ownership(owner,interval,state); owners.put(owner.groupId(),result); return result;
+    }
+
+    public synchronized void validateSchemaReplacement(Owner owner, Interval expectedSource, Interval target, SchemaTransition transition) {
+        requireSchemaTransition(transition,expectedSource); requireSchemaTransition(transition,target);
+        if (!expectedSource.columns().equals(transition.sourceColumns) || !target.columns().equals(transition.targetColumns)
+                || !Arrays.equals(expectedSource.lowerInclusive,target.lowerInclusive) || !Arrays.equals(expectedSource.upperExclusive,target.upperExclusive))
+            throw new IllegalArgumentException("Schema install changes bounds or column intent");
+        var current=get(owner); requireFenced(current);
+        if (!current.interval().equals(expectedSource)) throw new IllegalStateException("Schema source ownership changed");
+        requireUnleased(expectedSource); requireUnleased(target); requireUnowned(target,Set.of(owner.groupId()));
+    }
+
+    public synchronized Ownership replaceSchema(Owner owner, Interval expectedSource, Interval target, SchemaTransition transition) {
+        validateSchemaReplacement(owner,expectedSource,target,transition);
+        var result=new Ownership(owner,target,State.FENCED); owners.put(owner.groupId(),result); return result;
+    }
+
+    /** Reserve the union of old and new columns through native DDL and durable generation publication. */
+    public synchronized SchemaLease claimSchemaReplacement(Owner owner, Interval expectedSource, Interval target, SchemaTransition transition) {
+        validateSchemaReplacement(owner,expectedSource,target,transition);
+        var protectedColumns=new java.util.HashSet<>(expectedSource.columns()); protectedColumns.addAll(target.columns());
+        var installing=new Ownership(owner,expectedSource,State.INSTALLING);
+        var reservation=new Lease(installing,true,new Interval(expectedSource.domainId(),protectedColumns,expectedSource.lowerInclusive,expectedSource.upperExclusive));
+        owners.put(owner.groupId(),installing); leases.put(owner.groupId(),reservation);
+        return new SchemaLease(reservation,target,transition);
+    }
+
+    public final class SchemaLease implements AutoCloseable {
+        private final Lease reservation;
+        private final Interval target;
+        private final SchemaTransition transition;
+        private boolean published;
+        private SchemaLease(Lease reservation, Interval target, SchemaTransition transition) {
+            this.reservation=reservation; this.target=target; this.transition=transition;
+        }
+        /** Invoke only after the target generation and completed marker are durably installed. */
+        public Ownership publish() {
+            synchronized (RangeOwnership.this) {
+                requireSchemaTransition(transition,target);
+                var owner=reservation.ownership.owner();
+                if (reservation.closed || leases.get(owner.groupId())!=reservation) throw new IllegalStateException("Schema lease is closed");
+                var current=get(owner);
+                if (current.state()!=State.INSTALLING) throw new IllegalStateException("Schema lease lost install ownership");
+                if (published) return current;
+                var result=new Ownership(owner,target,State.INSTALLING); owners.put(owner.groupId(),result); published=true; return result;
+            }
+        }
+        @Override public void close() { reservation.close(); }
+    }
+
+    public synchronized void completeSchemaTransition(SchemaTransition transition) {
+        requireSchemaTransition(transition,null);
+        for (var current:owners.values()) if (current.state()!=State.RETIRED && current.interval().domainId().equals(transition.domainId)) {
+            if (!current.interval().columns().equals(transition.targetColumns)) throw new IllegalStateException("Schema source owner remains");
+            requireUnleased(current.interval());
+        }
+        schemaTransitions.remove(transition.domainId);
+    }
+
+    private void requireSchemaTransition(SchemaTransition transition, Interval interval) {
+        Objects.requireNonNull(transition);
+        if (schemaTransitions.get(transition.domainId)!=transition) throw new IllegalStateException("Unknown or completed schema transition");
+        if (interval!=null && (!interval.domainId().equals(transition.domainId)
+                || !interval.columns().equals(transition.sourceColumns) && !interval.columns().equals(transition.targetColumns)))
+            throw new IllegalArgumentException("Interval is outside recorded schema transition");
+    }
 
     public synchronized Ownership register(Owner owner, Interval interval, State state) {
         Objects.requireNonNull(owner, "owner");
@@ -196,11 +299,15 @@ public final class RangeOwnership {
     public final class Lease implements AutoCloseable {
         private final Ownership ownership;
         private final boolean installing;
+        private final Interval protectedInterval;
         private boolean closed;
 
         private Lease(Ownership ownership, boolean installing) {
-            this.ownership = ownership;
-            this.installing = installing;
+            this(ownership,installing,ownership.interval());
+        }
+
+        private Lease(Ownership ownership, boolean installing, Interval protectedInterval) {
+            this.ownership=ownership; this.installing=installing; this.protectedInterval=protectedInterval;
         }
 
         public Ownership ownership() { return ownership; }
@@ -210,7 +317,7 @@ public final class RangeOwnership {
                 if (closed) return;
                 if (installing) {
                     owners.put(ownership.owner().groupId(),
-                            new Ownership(ownership.owner(), ownership.interval(), State.FENCED));
+                            new Ownership(ownership.owner(), get(ownership.owner()).interval(), State.FENCED));
                 }
                 leases.remove(ownership.owner().groupId());
                 closed = true;
@@ -229,7 +336,7 @@ public final class RangeOwnership {
 
     private void requireCompatibleDomain(Interval interval) {
         for (Ownership other : owners.values()) {
-            if (other.interval().domainId().equals(interval.domainId())
+            if (other.state()!=State.RETIRED && other.interval().domainId().equals(interval.domainId())
                     && !other.interval().columns().equals(interval.columns())) {
                 throw new IllegalArgumentException("Domain columns cannot change within this guard");
             }
@@ -238,7 +345,7 @@ public final class RangeOwnership {
 
     private void requireUnleased(Interval interval) {
         for (Lease lease : leases.values()) {
-            if (overlaps(interval, lease.ownership.interval())) {
+            if (overlaps(interval, lease.protectedInterval)) {
                 throw new IllegalStateException("Interval is exclusively leased");
             }
         }

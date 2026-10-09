@@ -17,6 +17,18 @@ class RangeStateViewTest {
         return new RangeStateView(GROUP,1,DOMAIN,new byte[32],Set.of(COLUMN),null,null,null,0,null);
     }
 
+    @Test void emptyUserDomainKeepsControlIdentityAndServingAuthority() {
+        var empty=new RangeStateView(GROUP,1,DOMAIN,new byte[32],Set.of(),null,null,null,0,null);
+        assertEquals(98,empty.encode().length); assertEquals(empty,RangeStateView.decode(empty.encode()));
+        var replica=new ReplicaDescriptor(new UUID(0,10),new UUID(0,11),new UUID(0,12),"peer","127.0.0.1:9000",ReplicaDescriptor.Role.VOTER);
+        var range=new RangeDescriptor(new UUID(0,13),GROUP,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
+        var directory=new RangeDirectory(CLUSTER,DATABASE,DOMAIN,2,new byte[32],1,Set.of(),0,List.of(range));
+        var serving=new RangeStateView(GROUP,1,DOMAIN,new byte[32],Set.of(),null,null,new ApplyPosition(2,3),0,AUTHORITY);
+        assertEquals(serving,RangeStateView.decode(serving.encode()));
+        serving.requireMatches(directory,range); serving.requireServing(AUTHORITY);
+        assertThrows(IllegalStateException.class,() -> empty.requireServing(AUTHORITY));
+    }
+
     @Test void roundTripAndCanonicalUnsignedColumnsRetainDefensiveCopies() {
         byte[] schema=new byte[32], lower={1,2}, upper={3,4}; var columns=new HashSet<>(Set.of(HIGH_COLUMN,COLUMN));
         var original=new RangeStateView(GROUP,1,DOMAIN,schema,columns,lower,upper,new ApplyPosition(2,3),0,AUTHORITY);
@@ -74,7 +86,6 @@ class RangeStateViewTest {
         assertThrows(IllegalArgumentException.class,() -> new RangeStateView(GROUP,1,DOMAIN,new byte[32],Set.of(COLUMN),large,new byte[] {1},null,0,null));
         assertThrows(IllegalArgumentException.class,() -> new RangeStateView(GROUP,-1,DOMAIN,new byte[32],Set.of(COLUMN),null,null,null,0,null));
         assertThrows(IllegalArgumentException.class,() -> new RangeStateView(GROUP,1,DOMAIN,new byte[31],Set.of(COLUMN),null,null,null,0,null));
-        assertThrows(IllegalArgumentException.class,() -> new RangeStateView(GROUP,1,DOMAIN,new byte[32],Set.of(),null,null,null,0,null));
         assertThrows(IllegalArgumentException.class,() -> new RangeStateView(GROUP,1,DOMAIN,new byte[32],Set.of(COLUMN),new byte[] {(byte)255},new byte[] {1},null,0,null));
         assertThrows(IllegalArgumentException.class,() -> new RangeStateView(GROUP,1,DOMAIN,new byte[32],Set.of(COLUMN),new byte[] {1},new byte[] {1},null,0,null));
     }

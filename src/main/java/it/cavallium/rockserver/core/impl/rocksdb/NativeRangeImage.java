@@ -294,7 +294,7 @@ public final class NativeRangeImage {
         input.readFully(schema);
         var position = new ApplyPosition(input.readLong(), input.readLong());
         UUID domain = readUuid(input);
-        Set<UUID> columns = readIds(input, counted, limits, false);
+        Set<UUID> columns = readIds(input, counted, limits, true);
         byte[] lower = readBound(input, counted, limits);
         byte[] upper = readBound(input, counted, limits);
         Set<UUID> mergeColumns = readIds(input, counted, limits, true);
@@ -380,6 +380,12 @@ public final class NativeRangeImage {
         private final Map<UUID,SnapshotGate> gates=new HashMap<>();
         private long gateBytes,homeRecoveryBytes,homeCreditBytes;
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaFence schemaFence;
+        private it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation schemaInstallation;
+        private final Map<String,it.cavallium.rockserver.core.common.distributed.DistributedSchema> schemaHistory=new HashMap<>();
+        private final List<byte[]> referencedSchemas=new ArrayList<>();
+        private long schemaBytes; private int schemaRecords;
+        private boolean currentSchemaHistorySeen;
+        private boolean acceptSchema(byte[] digest) { referencedSchemas.add(digest.clone()); return true; }
         private int homeCreditCount;
         private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
         private final Map<OperationId,HomeRecoveryReceipt> homeRecoveries=new HashMap<>();
@@ -410,12 +416,38 @@ public final class NativeRangeImage {
                         || !Arrays.equals(key, 0, groupPrefix.length, groupPrefix, 0, groupPrefix.length)) {
                     throw new IOException("Wrong image group metadata prefix");
                 }
+                if(section==Section.STATE && key.length>16 && (key[16]==0x28 || key[16]==0x2a)) {
+                    try {
+                        var installation=it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation.decode(value);
+                        var definition=installation.definition(); installation.requireCut(header.position());
+                        installation.requireRange(header.owner().groupId(),header.owner().epoch(),header.interval().domainId(),header.interval().lowerInclusive(),header.interval().upperExclusive());
+                        if(!installation.fence().participant().groupId().equals(header.owner().groupId()) || installation.fence().participant().rangeEpoch()!=header.owner().epoch()
+                                || !definition.sourceSchema().domainId().equals(header.interval().domainId()) || installation.position().index()>header.position().index()) throw new IllegalArgumentException("Installation outside image cut/owner");
+                        if(key[16]==0x28) {
+                            if(key.length!=17 || schemaInstallation!=null || !Arrays.equals(definition.targetSchema().digest(),header.schema())
+                                    || !definition.targetSchema().columnIds().equals(header.interval().columns()) || !installation.targetMerges().equals(header.mergeColumns())) throw new IllegalArgumentException("Installed image generation differs");
+                            schemaInstallation=installation;
+                        } else {
+                            if(schemaInstallation==null) throw new IllegalArgumentException("Completed schema history lacks current installed generation");
+                            installation.requireCut(schemaInstallation.position());
+                            var id=definition.changeId(); var expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
+                            if(!Arrays.equals(key,expected) || ++schemaRecords>64 || (schemaBytes+=value.length)>16L*1024*1024) throw new IllegalArgumentException("Invalid schema history identity/budget");
+                            if(id.equals(schemaInstallation.definition().changeId())) {
+                                if(!Arrays.equals(value,schemaInstallation.encode())) throw new IllegalArgumentException("Current schema install differs from immutable history");
+                                currentSchemaHistorySeen=true;
+                            }
+                            schemaHistory.put(java.util.HexFormat.of().formatHex(definition.sourceSchema().digest()),definition.sourceSchema());
+                            schemaHistory.put(java.util.HexFormat.of().formatHex(definition.targetSchema().digest()),definition.targetSchema());
+                        }
+                    } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema generation",failure); }
+                }
+                if(section==Section.STATE && key.length>16 && key[16]==0x29) throw new IOException("Uncompleted schema install cannot be exported");
                 if (section==Section.STATE && key.length>16 && key[16]==0x27) {
                     try {
                         if (key.length!=17 || schemaFence!=null) throw new IllegalArgumentException("Invalid schema fence key/count");
                         schemaFence=it.cavallium.rockserver.core.common.distributed.NativeSchemaFence.decode(value); schemaFence.requireCut(header.position());
                         if (!schemaFence.participant().groupId().equals(header.owner().groupId()) || schemaFence.participant().rangeEpoch()!=header.owner().epoch()
-                                || !schemaFence.domainId().equals(header.interval().domainId()) || !Arrays.equals(schemaFence.sourceSchemaDigest(),header.schema())) throw new IllegalArgumentException("Schema fence differs from image ownership/schema");
+                                || !schemaFence.domainId().equals(header.interval().domainId()) || !acceptSchema(schemaFence.sourceSchemaDigest())) throw new IllegalArgumentException("Schema fence differs from image ownership/schema");
                     } catch (IllegalArgumentException failure) { throw new IOException("Invalid native schema fence image state",failure); }
                 }
                 if (section == Section.STATE && key.length > 16 && (key[16] == 0x13 || key[16] == 0x14)) {
@@ -444,14 +476,14 @@ public final class NativeRangeImage {
                         var record=PreparedParticipant.decode(value); var preparation=record.preparation(); var plan=preparation.business(); var scope=preparation.scope();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x20).putLong(preparation.transactionId().getMostSignificantBits()).putLong(preparation.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !plan.groupId().equals(header.owner().groupId()) || plan.rangeEpoch()!=header.owner().epoch()
-                                || !Arrays.equals(plan.schemaDigest(),header.schema()) || !preparation.registration().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(plan.schemaDigest()) || !preparation.registration().domainId().equals(header.interval().domainId())
                                 || record.position().index()>header.position().index() || record.position().term()>header.position().term() || record.position().index()==header.position().index() && record.position().term()!=header.position().term()) throw new IOException("Prepared image identity/cut differs");
                         for (var span:scope.spans()) {
                             byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
-                            if (!header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)
+                            if (Arrays.equals(plan.schemaDigest(),header.schema()) && !header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)
                                     || upper!=null && (span.isPoint() ? Arrays.compareUnsigned(lo,upper)>=0 : hi==null || Arrays.compareUnsigned(hi,upper)>0)) throw new IOException("Prepared image scope crosses ownership");
                         }
-                        for (var mutation:plan.mutations()) if (mutation.kind()==Mutation.Kind.MERGE && !header.mergeColumns().contains(mutation.columnId())) throw new IOException("Prepared image merge operator is unavailable");
+                        for (var mutation:plan.mutations()) if (Arrays.equals(plan.schemaDigest(),header.schema()) && mutation.kind()==Mutation.Kind.MERGE && !header.mergeColumns().contains(mutation.columnId())) throw new IOException("Prepared image merge operator is unavailable");
                         for (var old:prepared) if (old.preparation().sharesOperation(preparation)) throw new IOException("Prepared image identities/scopes overlap");
                         preparedBytes+=key.length+(long)value.length+ReplicatedRangeStore.FINALIZATION_RESERVATION; preparedScopeBytes+=RangeMutationHistory.accountedScopeBytes(scope);
                         if (prepared.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || preparedBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES || preparedScopeBytes>ReplicatedRangeStore.MAX_PREPARED_BYTES) throw new IOException("Prepared image capacity exceeded");
@@ -463,7 +495,7 @@ public final class NativeRangeImage {
                         var abort=AbortedParticipant.decode(value); var finalization=abort.finalization(); var participant=finalization.participant();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x21).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !finalization.decision().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(participant.schemaDigest()) || !finalization.decision().domainId().equals(header.interval().domainId())
                                 || abort.position().index()>header.position().index() || abort.position().term()>header.position().term() || abort.position().index()==header.position().index() && abort.position().term()!=header.position().term()) throw new IOException("ABORT image identity/cut differs");
                         if (aborted.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("ABORT image count exceeded");
                         aborted.put(finalization.transactionId(),abort);
@@ -474,7 +506,7 @@ public final class NativeRangeImage {
                         var commit=CommittedParticipant.decode(value); var finalization=commit.finalization(); var participant=finalization.participant();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x22).putLong(finalization.transactionId().getMostSignificantBits()).putLong(finalization.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !participant.groupId().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !finalization.decision().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(participant.schemaDigest()) || !finalization.decision().domainId().equals(header.interval().domainId())
                                 || commit.position().index()>header.position().index() || commit.position().term()>header.position().term() || commit.position().index()==header.position().index() && commit.position().term()!=header.position().term()) throw new IOException("COMMIT image identity/cut differs");
                         if (committed.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("COMMIT image count exceeded"); committed.put(finalization.transactionId(),commit);
                     } catch (IllegalArgumentException invalid) { throw new IOException("Invalid COMMIT image record",invalid); }
@@ -485,7 +517,7 @@ public final class NativeRangeImage {
                         var participant=record.registration().participants().stream().filter(p -> p.groupId().equals(record.participantGroup())).findFirst().orElseThrow();
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x23).putLong(record.transactionId().getMostSignificantBits()).putLong(record.transactionId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !record.participantGroup().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !record.registration().domainId().equals(header.interval().domainId())
+                                || !acceptSchema(participant.schemaDigest()) || !record.registration().domainId().equals(header.interval().domainId())
                                 || record.position().index()>header.position().index() || record.position().term()>header.position().term() || record.position().index()==header.position().index() && record.position().term()!=header.position().term()) throw new IOException("Rejected image identity/cut differs");
                         if (rejected.size()>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS) throw new IOException("Rejected image count exceeded");
                         rejected.put(record.transactionId(),record);
@@ -496,10 +528,10 @@ public final class NativeRangeImage {
                         var gate=SnapshotGate.decode(value); gate.requireCompletedCut(header.position()); var fence=gate.fence(); var participant=fence.participant(gate.participantGroup());
                         byte[] expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x24).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
                         if (!Arrays.equals(key,expected) || !gate.participantGroup().equals(header.owner().groupId()) || participant.rangeEpoch()!=header.owner().epoch()
-                                || !Arrays.equals(participant.schemaDigest(),header.schema()) || !fence.domainId().equals(header.interval().domainId())) throw new IOException("Gate image identity/cut differs");
+                                || !acceptSchema(participant.schemaDigest()) || !fence.domainId().equals(header.interval().domainId())) throw new IOException("Gate image identity/cut differs");
                         for (var span:participant.scope().spans()) {
                             byte[] lo=span.lowerInclusive(),hi=span.upperExclusive();
-                            if (!header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)
+                            if (Arrays.equals(participant.schemaDigest(),header.schema()) && !header.interval().columns().contains(span.columnId()) || lower!=null && (lo==null || Arrays.compareUnsigned(lo,lower)<0)
                                     || upper!=null && (span.isPoint() ? Arrays.compareUnsigned(lo,upper)>=0 : hi==null || Arrays.compareUnsigned(hi,upper)>0)) throw new IOException("Gate image scope crosses ownership");
                         }
                         gateBytes+=ReplicatedRangeStore.snapshotGateBytes(fence);
@@ -658,6 +690,24 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            for(var digest:referencedSchemas) if(!Arrays.equals(digest,header.schema()) && !schemaHistory.containsKey(java.util.HexFormat.of().formatHex(digest))) throw new IOException("Historical schema metadata missing");
+            if(schemaInstallation!=null) {
+                if(!currentSchemaHistorySeen) throw new IOException("Current schema install lacks immutable history");
+                if(schemaFence==null || !Arrays.equals(schemaInstallation.fence().encode(),schemaFence.encode())) throw new IOException("Installed generation lacks original fence");
+                for(var gate:gates.values()) {
+                    var participant=gate.fence().participant(header.owner().groupId());
+                    if(!Arrays.equals(participant.schemaDigest(),header.schema())) {
+                        var old=schemaHistory.get(java.util.HexFormat.of().formatHex(participant.schemaDigest()));
+                        if(gate.active() || old==null || participant.scope().spans().stream().anyMatch(span -> !old.columnIds().contains(span.columnId()))) throw new IOException("Historical gate remains active or differs from schema");
+                    }
+                }
+                for(var prepared:prepared) if(!Arrays.equals(prepared.preparation().business().schemaDigest(),header.schema())) {
+                    var id=prepared.preparation().transactionId();
+                    if(!committed.containsKey(id) && !aborted.containsKey(id)) throw new IOException("Historical preparation remains unresolved");
+                    var old=schemaHistory.get(java.util.HexFormat.of().formatHex(prepared.preparation().business().schemaDigest()));
+                    if(old==null || prepared.preparation().scope().spans().stream().anyMatch(span -> !old.columnIds().contains(span.columnId()))) throw new IOException("Historical preparation columns differ");
+                }
+            }
             if (!marker) throw new IOException("Image has no applied marker");
             if (homeRecoveries.size()+homeCreditCount>ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeRecoveryBytes+homeCreditBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES) throw new IOException("HOME image actual/future capacity exceeded");
             long terminalOnly=0;

@@ -21,6 +21,106 @@ class RangeOwnershipTest {
     private byte[] key(int value) { return new byte[]{(byte) value}; }
     private Interval interval(byte[] lower, byte[] upper) { return new Interval(DOMAIN, Set.of(COLUMN), lower, upper); }
 
+    @Test void schemaDeletionMovesEachFencedOwnerWithoutRelaxingOrdinaryDomainChecks() {
+        var guard=new RangeOwnership(); var left=owner(1); var right=owner(2);
+        var a=interval(null,key(0x80)); var b=interval(key(0x80),null);
+        guard.register(left,a,State.ACTIVE); guard.register(right,b,State.FENCED);
+        var change=new UUID(3,1); var token=guard.beginSchemaTransition(change,DOMAIN,Set.of(COLUMN),Set.of());
+        assertSame(token,guard.beginSchemaTransition(change,DOMAIN,Set.of(COLUMN),Set.of()));
+        var targetA=new Interval(DOMAIN,Set.of(),null,key(0x80)); var targetB=new Interval(DOMAIN,Set.of(),key(0x80),null);
+        assertThrows(IllegalStateException.class,() -> guard.replaceSchema(left,a,targetA,token));
+        guard.fence(left);
+        try (var lease=guard.claimInstall(left)) { assertThrows(IllegalStateException.class,() -> guard.replaceSchema(left,a,targetA,token)); }
+        assertThrows(IllegalArgumentException.class,() -> guard.replaceSchema(left,a,new Interval(DOMAIN,Set.of(),null,key(0x81)),token));
+        assertThrows(IllegalStateException.class,() -> guard.replaceSchema(new Owner(left.groupId(),6),a,targetA,token));
+        assertEquals(State.FENCED,guard.replaceSchema(left,a,targetA,token).state());
+        assertEquals(Set.of(COLUMN),guard.get(right).interval().columns());
+        assertThrows(IllegalArgumentException.class,() -> guard.register(owner(3),new Interval(DOMAIN,Set.of(),key(0x81),key(0x82)),State.RETIRED));
+        assertThrows(IllegalStateException.class,() -> guard.completeSchemaTransition(token));
+        assertThrows(IllegalStateException.class,() -> guard.beginSchemaTransition(new UUID(3,2),DOMAIN,Set.of(COLUMN),Set.of()));
+        guard.replaceSchema(right,b,targetB,token);
+        try (var lease=guard.claimInstall(right)) { assertThrows(IllegalStateException.class,() -> guard.completeSchemaTransition(token)); }
+        guard.completeSchemaTransition(token);
+        assertThrows(IllegalStateException.class,() -> guard.replaceSchema(left,a,targetA,token));
+        guard.activate(left); guard.activate(right);
+        assertThrows(IllegalStateException.class,() -> guard.register(owner(4),new Interval(DOMAIN,Set.of(),null,null),State.ACTIVE));
+        assertDoesNotThrow(() -> guard.register(owner(5),new Interval(UUID.randomUUID(),Set.of(),null,null),State.ACTIVE));
+    }
+
+    @Test void schemaCreationStillRejectsCrossDomainPhysicalOverlap() {
+        var guard=new RangeOwnership(); var extra=new UUID(0,3); var original=interval(null,null);
+        guard.register(owner(1),original,State.FENCED);
+        guard.register(owner(2),new Interval(new UUID(0,4),Set.of(extra),null,null),State.ACTIVE);
+        var token=guard.beginSchemaTransition(new UUID(3,1),DOMAIN,Set.of(COLUMN),Set.of(COLUMN,extra));
+        var target=new Interval(DOMAIN,Set.of(COLUMN,extra),null,null);
+        assertThrows(IllegalStateException.class,() -> guard.validateSchemaReplacement(owner(1),original,target,token));
+        assertThrows(IllegalStateException.class,() -> guard.replaceSchema(owner(1),original,target,token));
+        assertEquals(original,guard.get(owner(1)).interval());
+        var foreign=new RangeOwnership().beginSchemaTransition(new UUID(3,1),DOMAIN,Set.of(COLUMN),Set.of(COLUMN,extra));
+        assertThrows(IllegalStateException.class,() -> guard.replaceSchema(owner(1),original,target,foreign));
+    }
+
+    @Test void schemaLeaseProtectsBothColumnSetsAndPublishesOnlyBeforeClose() {
+        var guard=new RangeOwnership(); var extra=new UUID(0,3); var original=interval(null,null);
+        var target=new Interval(DOMAIN,Set.of(COLUMN,extra),null,null);
+        guard.register(owner(1),original,State.FENCED);
+        var token=guard.beginSchemaTransition(new UUID(3,1),DOMAIN,Set.of(COLUMN),target.columns());
+        var abandoned=guard.claimSchemaReplacement(owner(1),original,target,token);
+        assertEquals(State.INSTALLING,guard.get(owner(1)).state());
+        for (var column:Set.of(COLUMN,extra)) assertThrows(IllegalStateException.class,() -> guard.register(owner(2),new Interval(new UUID(0,4),Set.of(column),null,null),State.ACTIVE));
+        assertThrows(IllegalStateException.class,() -> guard.claimInstall(owner(1)));
+        assertThrows(IllegalStateException.class,() -> guard.completeSchemaTransition(token));
+        abandoned.close(); assertEquals(original,guard.get(owner(1)).interval());
+        assertThrows(IllegalStateException.class,abandoned::publish);
+        var installed=guard.claimSchemaReplacement(owner(1),original,target,token);
+        assertEquals(target,installed.publish().interval()); assertEquals(target,installed.publish().interval());
+        assertEquals(State.INSTALLING,guard.get(owner(1)).state());
+        assertThrows(IllegalStateException.class,() -> guard.activate(owner(1)));
+        installed.close(); installed.close(); assertEquals(target,guard.get(owner(1)).interval());
+        assertEquals(State.FENCED,guard.get(owner(1)).state()); guard.completeSchemaTransition(token);
+        assertThrows(IllegalStateException.class,installed::publish);
+        guard.activate(owner(1));
+    }
+
+    @Test void recoveryRegistersOnlyQualifiedMixedFencedGenerationsAndCanAdvanceAgain() {
+        var guard=new RangeOwnership(); var extra=new UUID(0,3); var changed=Set.of(COLUMN,extra);
+        var token=guard.beginSchemaTransition(new UUID(3,1),DOMAIN,Set.of(COLUMN),changed);
+        var source=interval(key(0x80),null); var target=new Interval(DOMAIN,changed,null,key(0x80));
+        assertThrows(IllegalArgumentException.class,() -> guard.registerSchema(owner(1),target,State.ACTIVE,token));
+        guard.registerSchema(owner(1),target,State.FENCED,token); guard.registerSchema(owner(2),source,State.FENCED,token);
+        guard.replaceSchema(owner(2),source,new Interval(DOMAIN,changed,key(0x80),null),token); guard.completeSchemaTransition(token);
+        var next=guard.beginSchemaTransition(new UUID(3,2),DOMAIN,changed,Set.of(COLUMN));
+        assertThrows(IllegalStateException.class,() -> guard.registerSchema(owner(3),target,State.RETIRED,token));
+        guard.replaceSchema(owner(1),target,interval(null,key(0x80)),next);
+        guard.replaceSchema(owner(2),new Interval(DOMAIN,changed,key(0x80),null),source,next);
+        guard.completeSchemaTransition(next);
+        assertEquals(Set.of(COLUMN),guard.get(owner(1)).interval().columns());
+    }
+
+    @Test void publishedDeletionStillReservesRemovedColumnUntilLeaseClose() {
+        var guard=new RangeOwnership(); var kept=new UUID(0,3);
+        var source=new Interval(DOMAIN,Set.of(COLUMN,kept),null,null);
+        var target=new Interval(DOMAIN,Set.of(kept),null,null);
+        var foreign=new Interval(new UUID(0,4),Set.of(COLUMN),null,null);
+        guard.register(owner(1),source,State.FENCED);
+        var token=guard.beginSchemaTransition(new UUID(3,1),DOMAIN,source.columns(),target.columns());
+        var lease=guard.claimSchemaReplacement(owner(1),source,target,token); lease.publish();
+        assertEquals(target,guard.get(owner(1)).interval());
+        assertThrows(IllegalStateException.class,() -> guard.register(owner(2),foreign,State.ACTIVE));
+        lease.close(); guard.completeSchemaTransition(token);
+        assertDoesNotThrow(() -> guard.register(owner(2),foreign,State.ACTIVE));
+    }
+
+    @Test void retiredSourceDoesNotPinFutureDomainColumnSets() {
+        var guard=new RangeOwnership(); var original=interval(null,null);
+        guard.register(owner(1),original,State.FENCED); guard.retire(owner(1));
+        var token=guard.beginSchemaTransition(new UUID(3,1),DOMAIN,Set.of(COLUMN),Set.of());
+        guard.registerSchema(owner(2),new Interval(DOMAIN,Set.of(),null,null),State.FENCED,token);
+        guard.completeSchemaTransition(token);
+        assertEquals(State.RETIRED,guard.get(owner(1)).state());
+        assertThrows(IllegalArgumentException.class,() -> guard.beginSchemaTransition(new UUID(3,2),DOMAIN,Set.of(),Set.of()));
+    }
+
     @Test
     void immutableIntervalsUseUnsignedBoundsAndInfinity() {
         var guard = new RangeOwnership();

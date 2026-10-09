@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
+import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
 import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.common.distributed.HomeRecovery;
 import it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt;
@@ -163,6 +164,55 @@ public final class ReplicatedRangeStore {
     private long retainedGateBytes;
     private volatile DistributedSchema logicalSchema;
     private volatile NativeSchemaFence activeSchemaFence;
+    private volatile NativeSchemaInstallation activeSchemaInstallation;
+    private record SchemaGeneration(DistributedSchema schema,RangeOwnership.Interval interval,Map<UUID,ColumnFamilyHandle> columns,Set<UUID> deterministicMergeColumns) {
+        public SchemaGeneration { columns=Map.copyOf(columns); deterministicMergeColumns=Set.copyOf(deterministicMergeColumns); }
+    }
+    private volatile SchemaGeneration installedGeneration;
+    public DistributedSchema installedSchema() { var generation=installedGeneration; return generation==null ? logicalSchema : generation.schema(); }
+    private volatile Map<String,DistributedSchema> schemaHistory=Map.of();
+    public NativeSchemaInstallation schemaInstallation() { return activeSchemaInstallation; }
+    private static String schemaIdentity(byte[] digest) { return java.util.HexFormat.of().formatHex(digest); }
+    private boolean knownSchema(byte[] digest) { return Arrays.equals(schemaDigest,digest) || schemaHistory.containsKey(schemaIdentity(digest)); }
+    private byte[] schemaStateKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
+    private byte[] schemaHistoryKey(UUID change) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x2a).putLong(change.getMostSignificantBits()).putLong(change.getLeastSignificantBits()).array(); }
+    private void recoverSchemaMetadata() throws RocksDBException { recoverSchemaMetadata(applied); }
+    private void recoverSchemaMetadata(ApplyPosition cut) throws RocksDBException {
+        byte[] installedBytes=db.get(state,schemaStateKey(0x28));
+        var installed=installedBytes==null ? null : NativeSchemaInstallation.decode(installedBytes);
+        if(installed!=null) {
+            installed.requireCut(cut); installed.requireRange(groupId,rangeEpoch,interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
+            var target=installed.definition().targetSchema();
+            if(!Arrays.equals(target.digest(),schemaDigest) || !target.columnIds().equals(columns.keySet())) throw new IllegalStateException("Installed generation differs from opened handles");
+            if(!Arrays.equals(installed.fence().encode(),db.get(state,schemaFenceKey()))) throw new IllegalStateException("Installed generation lacks its original source fence");
+        }
+        var history=new HashMap<String,DistributedSchema>(); boolean currentHistorySeen=false;
+        try(var iterator=db.newIterator(state)) {
+            var prefix=schemaStateKey(0x2a); iterator.seek(prefix); int count=0; long bytes=0;
+            while(iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length)) {
+                if(installed==null) throw new IllegalStateException("Completed schema history lacks current installed generation");
+                byte[] value=iterator.value();
+                if(++count>64 || (bytes+=value.length)>16L*1024*1024) throw new IllegalStateException("Schema history exceeds retention budget");
+                var record=NativeSchemaInstallation.decode(value); record.requireCut(installed.position());
+                record.requireRange(groupId,rangeEpoch,interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
+                if(!Arrays.equals(iterator.key(),schemaHistoryKey(record.definition().changeId()))) throw new IllegalStateException("Historical schema key differs from its change identity");
+                if(record.definition().changeId().equals(installed.definition().changeId())) {
+                    if(!Arrays.equals(value,installedBytes)) throw new IllegalStateException("Current schema install differs from immutable history");
+                    currentHistorySeen=true;
+                }
+                history.put(schemaIdentity(record.definition().sourceSchema().digest()),record.definition().sourceSchema());
+                history.put(schemaIdentity(record.definition().targetSchema().digest()),record.definition().targetSchema()); iterator.next();
+            }
+            iterator.status();
+        }
+        if(installed!=null && !currentHistorySeen) throw new IllegalStateException("Current schema install lacks immutable history");
+        schemaHistory=Map.copyOf(history);
+        if(installed!=null) {
+            activeSchemaInstallation=installed; logicalSchema=installed.definition().targetSchema();
+            installedGeneration=new SchemaGeneration(logicalSchema,interval,columns,deterministicMergeColumns);
+        }
+    }
+
     private volatile boolean catalogueScopeCompaction;
     private RangeMutationHistory scopedHistory;
     private RangeMutationHistory.Limits scopedLimits;
@@ -174,9 +224,9 @@ public final class ReplicatedRangeStore {
     private final RocksDB databaseOwner;
     private final UUID groupId;
     private final long rangeEpoch;
-    private final byte[] schemaDigest;
-    private final Map<UUID, ColumnFamilyHandle> columns;
-    private final Set<UUID> deterministicMergeColumns;
+    private volatile byte[] schemaDigest;
+    private volatile Map<UUID, ColumnFamilyHandle> columns;
+    private volatile Set<UUID> deterministicMergeColumns;
     private final ColumnFamilyHandle state;
     private final ColumnFamilyHandle receipts;
     private final byte[] markerKey;
@@ -186,7 +236,7 @@ public final class ReplicatedRangeStore {
     private final byte[] usageBucketsPrefix;
     private final RangeOwnership ownership;
     private final RangeOwnership.Owner owner;
-    private final RangeOwnership.Interval interval;
+    private volatile RangeOwnership.Interval interval;
     private final ReentrantLock applyLane = new ReentrantLock();
     private final ReentrantReadWriteLock nativeLifecycle = new ReentrantReadWriteLock();
     private volatile boolean closing;
@@ -245,6 +295,7 @@ public final class ReplicatedRangeStore {
             }
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
         } else {
+            recoverSchemaMetadata();
             ensureReceiptUsage();
             validateReceiptUsage(applied);
             homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied);
@@ -262,9 +313,9 @@ public final class ReplicatedRangeStore {
     public int activeTrackedSnapshotPins() { return trackedSnapshotPins.get(); }
     public long trackedSnapshotScopeBytes() { return trackedSnapshotScopeBytes.get(); }
     public boolean pendingInstallation() { return pendingInstallation != null; }
-    public RangeOwnership.Ownership ownership() { return ownership.get(owner); }
-    public byte[] schemaDigest() { return schemaDigest.clone(); }
-    public Set<UUID> deterministicMergeColumns() { return deterministicMergeColumns; }
+    public RangeOwnership.Ownership ownership() { nativeLifecycle.readLock().lock(); try { return ownership.get(owner); } finally { nativeLifecycle.readLock().unlock(); } }
+    public byte[] schemaDigest() { var generation=installedGeneration; return generation==null ? schemaDigest.clone() : generation.schema().digest(); }
+    public Set<UUID> deterministicMergeColumns() { var generation=installedGeneration; return generation==null ? deterministicMergeColumns : generation.deterministicMergeColumns(); }
 
     public record Configuration(long term, long index, byte[] data) {
         public Configuration {
@@ -327,6 +378,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
+            try { recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
             homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
@@ -353,9 +405,10 @@ public final class ReplicatedRangeStore {
         if (bytes==null) return null;
         var fence=NativeSchemaFence.decode(bytes); fence.requireCut(cut);
         if (!fence.participant().groupId().equals(groupId) || fence.participant().rangeEpoch()!=rangeEpoch
-                || !fence.domainId().equals(interval.domainId()) || !Arrays.equals(fence.sourceSchemaDigest(),schemaDigest)
+                || !fence.domainId().equals(interval.domainId()) || !knownSchema(fence.sourceSchemaDigest())
                 || homeRecoveryContext!=null || snapshotHomeContext!=null) throw new IllegalArgumentException("Recovered schema fence differs from DATA ownership");
-        if (logicalSchema!=null) requireSchemaFenceSchema(fence,logicalSchema);
+        if(activeSchemaInstallation!=null && !Arrays.equals(activeSchemaInstallation.fence().encode(),fence.encode())) throw new IllegalArgumentException("Installed generation original fence changed");
+        if (logicalSchema!=null && activeSchemaInstallation==null) requireSchemaFenceSchema(fence,logicalSchema);
         return fence;
     }
     public NativeSchemaFence schemaFence() { return activeSchemaFence; }
@@ -376,13 +429,13 @@ public final class ReplicatedRangeStore {
             requireActive(); ensureReceiptUsage();
             var proposed=new NativeSchemaFence(header,groupId,position);
             if (homeRecoveryContext!=null || snapshotHomeContext!=null || logicalSchema==null) throw new IllegalStateException("Schema fence requires qualified DATA schema");
-            requireSchemaFenceSchema(proposed,logicalSchema);
             if (proposed.participant().rangeEpoch()!=rangeEpoch) throw new IllegalArgumentException("Schema fence participant epoch differs from ownership");
             if (activeSchemaFence!=null) {
                 activeSchemaFence.requireHeader(header);
                 if (position.index()<activeSchemaFence.position().index() || position.index()==activeSchemaFence.position().index() && position.term()!=activeSchemaFence.position().term()) throw new IllegalArgumentException("Schema fence callback regresses or changes original position");
                 advanceCompletedMarker(position); return activeSchemaFence;
             }
+            requireSchemaFenceSchema(proposed,logicalSchema);
             requireNext(position); var history=prepareScopedWrites(false,List.of(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
                 batch.put(state,schemaFenceKey(),proposed.encode()); batch.put(state,markerKey,encodePosition(position));
@@ -390,6 +443,64 @@ public final class ReplicatedRangeStore {
             }
             activeSchemaFence=proposed; publishScoped(position,history,false); applied=position; return proposed;
         } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+
+    @FunctionalInterface interface SchemaHandles { Map<UUID,ColumnFamilyHandle> create() throws RocksDBException; }
+    NativeSchemaInstallation installSchema(NativeSchemaInstallation record,RangeOwnership.SchemaTransition transition,DistributedStoragePool.SchemaInstallObserver observer,SchemaHandles create) throws RocksDBException {
+        nativeLifecycle.writeLock().lock(); applyLane.lock();
+        try {
+            requireSnapshotReleaseHealthy(); if(closing) throw new IllegalStateException("Range is closing");
+            if(activeSchemaInstallation!=null && activeSchemaInstallation.definition().changeId().equals(record.definition().changeId())) {
+                activeSchemaInstallation.requireDefinition(record.definition());
+                if(!Arrays.equals(activeSchemaInstallation.encode(),record.encode())) throw new IllegalArgumentException("Original install identity changed");
+                return activeSchemaInstallation;
+            }
+            if(activeSchemaFence==null) throw new IllegalStateException("Installation requires native schema fence");
+            activeSchemaFence.requireHeader(record.definition().header());
+            if(!Arrays.equals(schemaDigest,record.definition().sourceSchema().digest())) throw new IllegalArgumentException("Install source schema differs");
+            record.requireRange(groupId,rangeEpoch,interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
+            if(snapshotPins.get()!=0 || preparedIndex.records().stream().anyMatch(p -> !isFinalized(p.preparation().transactionId()))
+                    || snapshotGates.values().stream().anyMatch(SnapshotGate::active)) throw new IllegalStateException("Schema owners have not drained");
+            var target=new RangeOwnership.Interval(interval.domainId(),record.targetNames().keySet(),interval.lowerInclusive(),interval.upperExclusive());
+            var prior=interval;
+            if(ownership.get(owner).state()==RangeOwnership.State.ACTIVE) ownership.fence(owner);
+            ownership.validateSchemaReplacement(owner,prior,target,transition);
+            try(var lease=ownership.claimSchemaReplacement(owner,prior,target,transition)) {
+            byte[] encoded=record.encode(), pending=db.get(state,schemaStateKey(0x29));
+            if(pending!=null && !Arrays.equals(pending,encoded)) throw new IllegalArgumentException("Different pending installation");
+            if(pending==null) {
+                requireNext(record.position()); int count=0; long bytes=3L*encoded.length;
+                var previousMetadata=db.get(state,schemaStateKey(0x28)); if(previousMetadata!=null) bytes+=previousMetadata.length;
+                try(var iterator=db.newIterator(state)) {
+                    var prefix=schemaStateKey(0x2a); iterator.seek(prefix);
+                    while(iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length)) {
+                        count++; bytes=Math.addExact(bytes,iterator.value().length); iterator.next();
+                    }
+                    iterator.status();
+                }
+                if(count>=64 || bytes>16L*1024*1024) throw new IllegalStateException("Retained schema metadata budget exhausted");
+                try(var options=new WriteOptions().setDisableWAL(false).setSync(true)) { db.put(state,options,schemaStateKey(0x29),encoded); }
+            }
+            observer.after(DistributedStoragePool.SchemaInstallStage.INTENT);
+            var nextColumns=Map.copyOf(create.create());
+            observer.after(DistributedStoragePool.SchemaInstallStage.COLUMN_FAMILIES);
+            if(!nextColumns.keySet().equals(record.targetNames().keySet())) throw new IllegalArgumentException("Target handles differ");
+            try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                batch.put(state,schemaStateKey(0x28),encoded); batch.put(state,schemaHistoryKey(record.definition().changeId()),encoded);
+                batch.delete(state,schemaStateKey(0x29)); batch.put(state,markerKey,encodePosition(record.position()));
+                batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),record.position())); db.write(options,batch);
+            }
+            observer.after(DistributedStoragePool.SchemaInstallStage.COMMITTED);
+            lease.publish();
+            interval=target; columns=nextColumns; deterministicMergeColumns=record.targetMerges(); schemaDigest=record.definition().targetSchema().digest();
+            logicalSchema=record.definition().targetSchema();
+            installedGeneration=new SchemaGeneration(logicalSchema,target,nextColumns,record.targetMerges()); activeSchemaInstallation=record;
+            var history=new HashMap<>(schemaHistory); history.put(schemaIdentity(record.definition().sourceSchema().digest()),record.definition().sourceSchema());
+            history.put(schemaIdentity(schemaDigest),logicalSchema); schemaHistory=Map.copyOf(history);
+            resetScopedUnderLane(); applied=record.position();
+            }
+            ownership.activate(owner); return record;
+        } finally { applyLane.unlock(); nativeLifecycle.writeLock().unlock(); }
     }
 
     private boolean contains(byte[] key) {
@@ -487,13 +598,14 @@ public final class ReplicatedRangeStore {
                     || logicalSchema!=null && !Arrays.equals(logicalSchema.digest(),schema.digest())
                     || prefix>0 && (interval.lowerInclusive()!=null && interval.lowerInclusive().length!=prefix
                             || interval.upperExclusive()!=null && interval.upperExclusive().length!=prefix)) throw new IllegalArgumentException("Logical schema differs from native ownership");
-            if (activeSchemaFence!=null) requireSchemaFenceSchema(activeSchemaFence,schema);
-            logicalSchema=schema;
+            if (activeSchemaFence!=null && activeSchemaInstallation==null) requireSchemaFenceSchema(activeSchemaFence,schema);
+            logicalSchema=schema; installedGeneration=new SchemaGeneration(schema,interval,columns,deterministicMergeColumns);
             for (var prepared:preparedIndex.records()) requirePreparation(prepared.preparation(),true);
         } finally { applyLane.unlock(); leaveNative(); }
     }
-    private void validateLogical(DistributedCommand command) {
-        var schema=logicalSchema; if (schema==null) throw new UnsupportedOperationException("Bucket decoding schema is not installed");
+    private void validateLogical(DistributedCommand command) { validateLogical(command,logicalSchema); }
+    private void validateLogical(DistributedCommand command,DistributedSchema schema) {
+         if (schema==null) throw new UnsupportedOperationException("Bucket decoding schema is not installed");
         for (var mutation:command.mutations()) {
             if (mutation.kind()==Mutation.Kind.DELETE_RANGE) continue; // Bounds address whole physical rows, not member keys or stored values.
             var shape=schema.column(mutation.columnId()).schema(); boolean bucket=shape.variableLengthKeysCount()!=0;
@@ -527,14 +639,17 @@ public final class ReplicatedRangeStore {
         if (command.sessionControl()!=null && !sessionControlsEnabled) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
         if (active) { requireActive(); requireSchemaAdmission(); }
+        var commandSchemaDigest=command.schemaDigest(); boolean currentSchema=Arrays.equals(schemaDigest,commandSchemaDigest);
+        var historical=!active && !currentSchema ? schemaHistory.get(schemaIdentity(commandSchemaDigest)) : null;
+        var commandColumns=historical==null ? columns.keySet() : historical.columnIds();
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
-                || !Arrays.equals(schemaDigest, command.schemaDigest())) {
+                || !currentSchema && historical==null) {
             throw new IllegalArgumentException("Wrong group, epoch or schema");
         }
         for (var mutation : command.mutations()) {
             if (snapshotHomeContext!=null && mutation.kind()==Mutation.Kind.PUT) requireSnapshotHomeUser(snapshotHomeContext,mutation.key(),SnapshotFenceStatus.decode(mutation.value()));
-            if (!columns.containsKey(mutation.columnId())) throw new IllegalArgumentException("Unknown logical column");
-            if (mutation.kind() == Mutation.Kind.MERGE && !deterministicMergeColumns.contains(mutation.columnId())) {
+            if (!commandColumns.contains(mutation.columnId())) throw new IllegalArgumentException("Unknown logical column");
+            if (mutation.kind() == Mutation.Kind.MERGE && !(historical==null ? deterministicMergeColumns.contains(mutation.columnId()) : historical.column(mutation.columnId()).operator()!=null)) {
                 throw new IllegalArgumentException("Column has no admitted deterministic merge operator");
             }
             if (!contains(mutation.key())) throw new IllegalArgumentException("Mutation outside owned interval");
@@ -546,11 +661,11 @@ public final class ReplicatedRangeStore {
             }
         }
         for (var predicate : command.predicates()) {
-            if (!columns.containsKey(predicate.columnId()) || !contains(predicate.key())) {
+            if (!commandColumns.contains(predicate.columnId()) || !contains(predicate.key())) {
                 throw new IllegalArgumentException("Predicate outside owned column/interval");
             }
         }
-        if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command);
+        if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command,historical==null ? logicalSchema : historical);
     }
 
     public record RetirementCandidate(TransactionStatus transaction,SnapshotFenceStatus snapshot,boolean orphan) {
@@ -1036,7 +1151,7 @@ public final class ReplicatedRangeStore {
     private record ParticipantAnchor(UUID home,long epoch,UUID group,TransactionStatus definition) {}
     private void requireParticipantDefinition(UUID participantGroup,TransactionStatus definition,ReadOptions options) throws RocksDBException {
         var participant=definition.participants().stream().filter(p -> p.groupId().equals(participantGroup)).findFirst().orElseThrow(() -> new IllegalArgumentException("Unregistered participant identity"));
-        if (!participantGroup.equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),schemaDigest)
+        if (!participantGroup.equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !knownSchema(participant.schemaDigest())
                 || !definition.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Participant identity differs from native owner/schema");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(definition.clusterId()) || !logicalSchema.databaseId().equals(definition.databaseId()))) throw new IllegalArgumentException("Participant identity database differs from schema");
         var authority=sessionAuthority(options);
@@ -1298,11 +1413,17 @@ public final class ReplicatedRangeStore {
     public record GateCapacity(ApplyPosition position,int count,long bytes) {}
     public record GateEstimate(GateCapacity capacity,SnapshotGate existing,SnapshotFenceProof retirement) {}
     private byte[] snapshotGateKey(UUID fence) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x24).putLong(fence.getMostSignificantBits()).putLong(fence.getLeastSignificantBits()).array(); }
-    private void requireSnapshotFence(SnapshotFence fence) {
+    private void requireSnapshotFence(SnapshotFence fence) { requireSnapshotFence(fence,false); }
+    private void requireSnapshotFence(SnapshotFence fence,boolean terminal) {
         var participant=fence.participant(groupId);
-        if (participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),schemaDigest) || !fence.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Snapshot fence differs from range");
+        if (participant.rangeEpoch()!=rangeEpoch || !knownSchema(participant.schemaDigest()) || !fence.domainId().equals(interval.domainId())) throw new IllegalArgumentException("Snapshot fence differs from range");
         if (logicalSchema!=null && (!fence.clusterId().equals(logicalSchema.clusterId()) || !fence.databaseId().equals(logicalSchema.databaseId()))) throw new IllegalArgumentException("Snapshot fence database differs from schema");
-        validateSnapshotScope(participant.scope());
+        if(Arrays.equals(participant.schemaDigest(),schemaDigest)) validateSnapshotScope(participant.scope());
+        else {
+            var historical=schemaHistory.get(schemaIdentity(participant.schemaDigest()));
+            if(!terminal || historical==null) throw new IllegalArgumentException("Historical snapshot fence cannot acquire admission");
+            validateSnapshotScope(participant.scope(),historical.columnIds());
+        }
     }
     private Map<UUID,SnapshotGate> loadSnapshotGates() {
         var records=new HashMap<UUID,SnapshotGate>();
@@ -1312,7 +1433,7 @@ public final class ReplicatedRangeStore {
             iterator.seekToFirst(); byte[] sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_SNAPSHOT_GATES || iterator.key(sizing)!=33 || iterator.value(sizing)>SnapshotGate.MAX_BYTES) throw new IllegalStateException("Snapshot gate recovery bound exceeded");
-                var record=SnapshotGate.decode(iterator.value()); requireSnapshotFence(record.fence());
+                var record=SnapshotGate.decode(iterator.value()); requireSnapshotFence(record.fence(),!record.active());
                 try { record.requireCompletedCut(applied); } catch (IllegalArgumentException invalid) { throw new IllegalStateException("Snapshot gate differs from completed cut",invalid); }
                 if (!record.participantGroup().equals(groupId) || !Arrays.equals(iterator.key(),snapshotGateKey(record.fence().fenceId()))) throw new IllegalStateException("Snapshot gate recovery identity differs");
                 records.put(record.fence().fenceId(),record); iterator.next();
@@ -1361,9 +1482,9 @@ public final class ReplicatedRangeStore {
         finally { applyLane.unlock(); leaveNative(); }
     }
     private SnapshotGate readSnapshotGate(SnapshotFence fence,ReadOptions options,ApplyPosition cut) throws RocksDBException {
-        requireSnapshotFence(fence); byte[] key=snapshotGateKey(fence.fenceId());
-        byte[] bytes=options==null ? db.get(state,key) : db.get(state,options,key); if (bytes==null) return null;
-        var record=SnapshotGate.decode(bytes);
+        byte[] key=snapshotGateKey(fence.fenceId());
+        byte[] bytes=options==null ? db.get(state,key) : db.get(state,options,key); if (bytes==null) { requireSnapshotFence(fence); return null; }
+        var record=SnapshotGate.decode(bytes); requireSnapshotFence(fence,!record.active());
         record.requireCompletedCut(cut);
         if (!record.fence().equals(fence) || !record.participantGroup().equals(groupId)) throw new IllegalArgumentException("Recovered snapshot gate binding changed");
         return record;
@@ -1373,7 +1494,6 @@ public final class ReplicatedRangeStore {
         enterNative(); applyLane.lock(); try { requireActive(); return minimumSessionEpoch(null); } finally { applyLane.unlock(); leaveNative(); }
     }
     private SnapshotGateResult readSnapshotGateResult(SnapshotFence fence,ReadOptions options,ApplyPosition cut) throws RocksDBException {
-        requireSnapshotFence(fence);
         if (options==null && pendingInstallation!=null) throw new IllegalStateException("Snapshot gate metadata is being installed");
         byte[] marker=stateRow(markerKey,options); var actual=marker==null ? null : decodePosition(marker);
         if (!Objects.equals(cut,actual)) throw new IllegalStateException("Snapshot gate proof cut differs from completed native marker");
@@ -1381,7 +1501,7 @@ public final class ReplicatedRangeStore {
         if (authority!=null && (!authority.clusterId().equals(fence.clusterId()) || !authority.databaseId().equals(fence.databaseId()))) throw new IllegalArgumentException("Snapshot fence differs from native database authority");
         byte[] bytes=stateRow(snapshotGateKey(fence.fenceId()),options);
         if (bytes!=null) {
-            var retained=SnapshotGate.decode(bytes); retained.requireCompletedCut(cut); requireSnapshotFence(retained.fence());
+            var retained=SnapshotGate.decode(bytes); retained.requireCompletedCut(cut); requireSnapshotFence(retained.fence(),!retained.active());
             if (!retained.participantGroup().equals(groupId)) throw new IllegalArgumentException("Snapshot gate participant changed");
             if (retained.fence().operation().equals(fence.operation())) {
                 if (!retained.fence().equals(fence)) throw new IllegalArgumentException("Retained snapshot business definition changed");
@@ -1389,6 +1509,7 @@ public final class ReplicatedRangeStore {
             }
             if (fence.operation().epoch()>=minimumSessionEpoch(options)) throw new IllegalArgumentException("Snapshot UUID belongs to another live business anchor");
         }
+        requireSnapshotFence(fence);
         long floor=minimumSessionEpoch(options);
         return fence.operation().epoch()<floor ? SnapshotGateResult.retired(new SnapshotFenceProof(fence,groupId,floor,cut)) : null;
     }
@@ -1452,7 +1573,7 @@ public final class ReplicatedRangeStore {
     public GateEstimate estimateGateRelease(SnapshotFenceStatus terminal) throws RocksDBException {
         Objects.requireNonNull(terminal); enterNative(); applyLane.lock();
         try {
-            requireActive(); requireSnapshotFence(terminal.fence());
+            requireActive();
             if (!terminal.terminal()) throw new IllegalArgumentException("Snapshot gate release requires a terminal home decision");
             var result=readSnapshotGateResult(terminal.fence(),null,applied);
             if (result!=null && result.retired()) return new GateEstimate(gateCapacityUnderLane(),null,result.retirement());
@@ -1550,7 +1671,7 @@ public final class ReplicatedRangeStore {
     private void requireRejected(RejectedParticipant record) {
         requireHomeRecoveryFree(record.operation()); requireHomeRecoveryFree(record.registration().operation());
         var participant=record.registration().participants().stream().filter(p -> p.groupId().equals(record.participantGroup())).findFirst().orElseThrow();
-        if (!record.participantGroup().equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !Arrays.equals(participant.schemaDigest(),schemaDigest)
+        if (!record.participantGroup().equals(groupId) || participant.rangeEpoch()!=rangeEpoch || !knownSchema(participant.schemaDigest())
                 || !record.registration().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Rejected preparation differs from range");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(record.registration().clusterId()) || !logicalSchema.databaseId().equals(record.registration().databaseId()))) throw new IllegalArgumentException("Rejected preparation database differs from schema");
     }
@@ -1636,7 +1757,7 @@ public final class ReplicatedRangeStore {
     private void requireFinalization(ParticipantFinalization decision) {
         requireHomeRecoveryFree(decision.operation()); requireHomeRecoveryFree(decision.decision().operation());
         var participant=decision.participant();
-        if (!decision.participantGroup().equals(owner.groupId()) || participant.rangeEpoch()!=owner.epoch() || !Arrays.equals(participant.schemaDigest(),schemaDigest)
+        if (!decision.participantGroup().equals(owner.groupId()) || participant.rangeEpoch()!=owner.epoch() || !knownSchema(participant.schemaDigest())
                 || !decision.decision().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Finalization differs from range");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(decision.decision().clusterId()) || !logicalSchema.databaseId().equals(decision.decision().databaseId()))) throw new IllegalArgumentException("Finalization database differs from schema");
     }
@@ -1721,7 +1842,12 @@ public final class ReplicatedRangeStore {
     private byte[] preparedKey(UUID transaction) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x20).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array(); }
     private void requirePreparation(PreparedParticipant.Preparation preparation,boolean material) {
         requireHomeRecoveryFree(preparation.operation()); requireHomeRecoveryFree(preparation.business().operationId());
-        var business=preparation.business(); validateCommand(business,false,material || logicalSchema!=null); validateSnapshotScope(preparation.scope());
+        var business=preparation.business(); validateCommand(business,false,material || logicalSchema!=null);
+        if(Arrays.equals(business.schemaDigest(),schemaDigest)) validateSnapshotScope(preparation.scope());
+        else {
+            if(!isFinalized(preparation.transactionId())) throw new IllegalArgumentException("Unresolved preparation from historical schema");
+            validateSnapshotScope(preparation.scope(),schemaHistory.get(schemaIdentity(business.schemaDigest())).columnIds());
+        }
         if (!preparation.registration().domainId().equals(interval.domainId())) throw new IllegalArgumentException("Prepared domain differs from range");
         if (logicalSchema!=null && (!logicalSchema.clusterId().equals(preparation.registration().clusterId()) || !logicalSchema.databaseId().equals(preparation.registration().databaseId()))) throw new IllegalArgumentException("Prepared database differs from schema");
     }
@@ -2401,11 +2527,13 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (activeSchemaFence!=null) {
-                var incoming=new NativeSchemaFence[1];
+                var incoming=new NativeSchemaFence[1]; var incomingInstall=new NativeSchemaInstallation[1];
                 NativeRangeImage.visit(image,limits,(section,column,key,value) -> {
                     if (section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x27) incoming[0]=NativeSchemaFence.decode(value);
+                    if (section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x28) incomingInstall[0]=NativeSchemaInstallation.decode(value);
                 });
                 if (!activeSchemaFence.equals(incoming[0])) throw new IOException("Snapshot cannot discard or change a committed native schema fence");
+                if(activeSchemaInstallation!=null && (incomingInstall[0]==null || !Arrays.equals(activeSchemaInstallation.encode(),incomingInstall[0].encode()))) throw new IOException("Snapshot cannot discard or change an installed schema generation");
             }
             if (snapshotPins.get() != 0) throw new IllegalStateException("Native snapshot readers have not drained");
             if (ownership.get(owner).state() != RangeOwnership.State.FENCED) {
@@ -2455,6 +2583,7 @@ public final class ReplicatedRangeStore {
                     if (!Arrays.equals(expected.sha256(), actual.sha256())) throw new IOException("Snapshot changed during installation");
                     writer.flush();
                     // The current image supplies counters bound to its completed position; never normalize imported state.
+                    recoverSchemaMetadata(expected.position());
                     validateReceiptUsage(expected.position());
                     activeSchemaFence=loadSchemaFence(expected.position());
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
@@ -2572,9 +2701,10 @@ public final class ReplicatedRangeStore {
     public void validateScope(TransactionScope scope) {
         Objects.requireNonNull(scope); requireSchemaAdmission(); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);
     }
-    private void validateSnapshotScope(TransactionScope scope) {
+    private void validateSnapshotScope(TransactionScope scope) { validateSnapshotScope(scope,columns.keySet()); }
+    private void validateSnapshotScope(TransactionScope scope,Set<UUID> scopeColumns) {
         for (var span : scope.spans()) {
-            if (!columns.containsKey(span.columnId())) throw new IllegalArgumentException("Scope column is outside this range");
+            if (!scopeColumns.contains(span.columnId())) throw new IllegalArgumentException("Scope column is outside this range");
             byte[] lower = span.lowerInclusive(), upper = span.upperExclusive();
             if (span.isPoint()) {
                 if (!contains(lower)) throw new IllegalArgumentException("Scope key is outside this range");
@@ -2994,6 +3124,9 @@ public final class ReplicatedRangeStore {
         private final Snapshot snapshot;
         private final ApplyPosition position;
         private final PoolSnapshotAdmission.Lease admissionLease;
+        private final byte[] capturedSchemaDigest;
+        private final RangeOwnership.Interval capturedInterval;
+        private final Set<UUID> capturedColumns,capturedMergeColumns;
         private boolean closed;
         private int nativeUsers;
         private long historyScopeBytes; private volatile boolean historyTracked;
@@ -3001,14 +3134,15 @@ public final class ReplicatedRangeStore {
             this.snapshot = snapshot;
             this.position = position;
             this.admissionLease = lease;
+            capturedSchemaDigest=schemaDigest.clone(); capturedInterval=interval; capturedColumns=Set.copyOf(columns.keySet()); capturedMergeColumns=deterministicMergeColumns;
         }
         public ApplyPosition position() { return position; }
         public UUID groupId() { return groupId; }
         public long rangeEpoch() { return rangeEpoch; }
-        public byte[] schemaDigest() { return schemaDigest.clone(); }
-        public Set<UUID> columns() { return columns.keySet(); }
-        public Set<UUID> deterministicMergeColumns() { return deterministicMergeColumns; }
-        public RangeOwnership.Interval interval() { return interval; }
+        public byte[] schemaDigest() { return capturedSchemaDigest.clone(); }
+        public Set<UUID> columns() { return capturedColumns; }
+        public Set<UUID> deterministicMergeColumns() { return capturedMergeColumns; }
+        public RangeOwnership.Interval interval() { return capturedInterval; }
         /** Immutable identity and authority from this same completed native snapshot cut; no user keys are accessed. */
         public RangeStateView stateView() throws RocksDBException {
             acquireUse();

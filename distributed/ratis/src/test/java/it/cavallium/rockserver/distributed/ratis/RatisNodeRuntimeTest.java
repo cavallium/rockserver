@@ -20,6 +20,41 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Native node lifecycle with controlled Ratis interfaces. Production server factory is compiled, never executed here. */
 class RatisNodeRuntimeTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    @Test void installedEmptySchemaReopensUsingOriginalNodeManifestAndRemainsFenced() throws Exception {
+        var schema=new DistributedSchema(new UUID(1,1),new UUID(1,2),new UUID(6,1),1,0,List.of(
+                new DistributedSchema.Column(1,new UUID(2,3),"data",it.cavallium.rockserver.core.common.ColumnSchema.of(
+                        it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
+        try (var env=new Env(root,false,schema.digest())) {
+            var target=new DistributedSchema(schema.clusterId(),schema.databaseId(),schema.domainId(),2,0,List.of());
+            var definition=new SchemaChange.Definition(new UUID(55,1),new OperationId(new UUID(55,2),1,0),env.plan.directory(),schema,target);
+            var first=new FakeServer();
+            try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first)) {
+                node.start();
+                var poolField=RatisNodeRuntime.class.getDeclaredField("pool"); poolField.setAccessible(true);
+                var pool=(DistributedStoragePool)poolField.get(node);
+                var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
+                for (var machine:first.machines.values()) {
+                    var store=(ReplicatedRangeStore)storeField.get(machine); store.enableLogicalSchema(schema);
+                    assertEquals(0,machine.takeSnapshot(),"Recovery must tolerate the preceding source-generation snapshot");
+                    store.applySchemaFence(new ApplyPosition(1,1),definition.header());
+                    pool.installSchema(store,new ApplyPosition(1,2),definition,Map.of(),Set.of());
+                }
+            }
+            byte[] identity=Files.readAllBytes(env.nodeRoot.resolve("node.identity"));
+            var recovered=new FakeServer();
+            try (var node=env.open(RatisNodeRuntime.Startup.RECOVER,recovered)) {
+                node.start();
+                var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
+                for (var machine:recovered.machines.values()) {
+                    var store=(ReplicatedRangeStore)storeField.get(machine);
+                    assertArrayEquals(target.digest(),store.schemaDigest()); assertEquals(Set.of(),store.ownership().interval().columns());
+                    assertEquals(new ApplyPosition(1,2),store.schemaInstallation().position());
+                    assertThrows(IllegalStateException.class,store::capture,"Catalogue activation has not occurred");
+                }
+            }
+            assertArrayEquals(identity,Files.readAllBytes(env.nodeRoot.resolve("node.identity")));
+        }
+    }
     @Test void configuredParticipantRecoveryRunsOnControlAndDrainsBeforeNodeClose() throws Exception {
         try (var env=new Env(root); var homes=new TransactionHomeReader(env,env.outer.cluster)) {
             var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
