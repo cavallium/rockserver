@@ -10,7 +10,9 @@ class CompactionBulkFeedbackTest {
         final CompactionIoBudget p = new CompactionIoBudget(RATE, 16L << 20);
         long nanos, pointReads, pointTime, done, bytes, bulkCount, bulkTime, bulkKeys, readDone,
                 compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys;
-        long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail;
+        long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail,
+                compTransferred = 64L << 20, compReadMicros = 250000;
+        int bytePeriod = 1, bytePhase, sampleIndex, compReadCalls = 1000;
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
         boolean point = true, pointNative = true, bulkStats = true, pressure, stopped, bulkPending;
         Trace() { step(); }
@@ -23,7 +25,8 @@ class CompactionBulkFeedbackTest {
             if (bulkStats) { bulkCount += calls; bulkTime += calls * bulkCallMicros; bulkKeys += (long) calls * shape; }
             nativeBulks += calls; nativeBulkKeys += (long) calls * shape;
             readDone += calls;
-            compBytes += 64L << 20; compTime += 250000; compCalls += 1000;
+            if ((++sampleIndex + bytePhase) % bytePeriod == 0) compBytes += compTransferred;
+            compTime += compReadMicros; compCalls += compReadCalls;
             if (applied > 0) { prefCount += 32; prefBytes += 32 * applied; }
             p.sample(new CompactionIoBudget.Sample(nanos, pointReads, pointTime, bytes, true,
                     pressure, stopped, true, true, done, !pressure, pressure,
@@ -302,6 +305,59 @@ class CompactionBulkFeedbackTest {
         t.seconds(240);
         assertEquals(0, t.applied);
         assertEquals(healthy, tail.getDouble(t.p), .001, "stationary worse tails must not replace the protected reference");
+    }
+    @Test void laggedCompactionBytesDoNotSuppressHealthyLoadedPrefetchAcrossPulsePhases() {
+        for (int phase = 0; phase < 5; phase++) {
+            var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+            t.bulkCallMicros = 128000;
+            t.bytePeriod = 5; t.bytePhase = phase; t.compTransferred = 16L << 20; t.compReadCalls = 64;
+            t.seconds(1200);
+            assertTrue(t.applied >= 65536, "healthy per-read timing must remain progress between job byte publications, phase " + phase);
+            long stable = t.applied; t.seconds(300);
+            assertEquals(stable, t.applied, "publication phase cannot drive artificial shrink/regrowth");
+        }
+    }
+    @Test void pulsePhaseAndSmallRateJitterCannotCrossHealthyReadaheadLadderBoundaries() {
+        for (long pulse : new long[]{1L << 20, 16L << 20}) {
+            for (int phase = 0; phase < 5; phase++) {
+                var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+                t.bulkCallMicros = 128000; t.bytePeriod = 5; t.bytePhase = phase;
+                t.compTransferred = pulse; t.compReadCalls = 64; t.seconds(1200);
+                long cap = pulse / 16;
+                assertEquals(cap, t.applied);
+                for (int window = 0; window < 12; window++) {
+                    t.compReadMicros = window % 2 == 0 ? 260000 : 240000;
+                    for (int poll = 0; poll < 30; poll++) {
+                        t.step(); assertEquals(cap, t.applied, "rounding or byte-publication phase is not service regression");
+                    }
+                }
+            }
+        }
+    }
+    @Test void subHundredMillisecondReadCollapseShrinksFromRetainedCohortOnFirstPoll() {
+        var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.bulkCallMicros = 128000; t.bytePeriod = 5; t.compTransferred = 16L << 20; t.compReadCalls = 64;
+        t.seconds(1200); assertEquals(1L << 20, t.applied);
+        t.compReadMicros = 6000000; // 93.75ms/read: below the immediate duration limit, but a real service collapse.
+        t.step(); assertTrue(t.applied <= 512 * 1024);
+    }
+    @Test void readTimingStalenessAndCounterResetRemainUnsafeDespiteLaterBytePulses() throws Exception {
+        for (boolean reset : new boolean[]{false, true}) {
+            var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+            t.bulkCallMicros = 128000; t.bytePeriod = 5; t.compTransferred = 16L << 20; t.compReadCalls = 64;
+            t.seconds(1200); assertTrue(t.applied > 0);
+            if (reset) {
+                t.compBytes = t.compTime = t.compCalls = 0;
+                t.step();
+                for (String name : new String[]{"recentReadBytes", "recentReadMicros", "recentReadCount"}) {
+                    var field = CompactionIoBudget.class.getDeclaredField(name); field.setAccessible(true);
+                    assertEquals(0, field.getLong(t.p), "counter reset must discard the retained service epoch");
+                }
+            } else {
+                t.compReadCalls = 0; t.compReadMicros = 0; t.seconds(3);
+            }
+            assertEquals(0, t.applied);
+        }
     }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;

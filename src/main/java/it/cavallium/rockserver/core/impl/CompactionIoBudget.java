@@ -71,7 +71,8 @@ public final class CompactionIoBudget {
     private final long seed, readaheadCeiling;
     private volatile long readaheadBytes;
     private long appliedReadahead, readWindowNanos, compactionBytes, compactionMicros, compactionReads,
-            prefetchEvents, prefetchedBytes, settleUntil, probeHoldUntil, lastReadServiceNanos;
+            prefetchEvents, prefetchedBytes, settleUntil, probeHoldUntil, lastReadServiceNanos,
+            recentReadBytes, recentReadMicros, recentReadCount;
     private double serviceRate, prefetchMean, priorPrefetchMean;
     private double pointTailBaseline, bulkTailBaseline, pointTailCalibration, bulkTailCalibration,
             bulkTailShape, bulkTailCalibrationShape, lastBulkTailShape, probeBulkTailShape;
@@ -185,6 +186,7 @@ public final class CompactionIoBudget {
             invalidateBulk();
             clearWindow();
             clearReadWindow();
+            recentReadBytes = recentReadMicros = recentReadCount = 0;
             foregroundHealthy = false;
             if (sample.valid && old != null && old.valid
                     && (sample.nativePointCompletions < old.nativePointCompletions || sample.nativePointCompletions < 0
@@ -565,27 +567,36 @@ public final class CompactionIoBudget {
                 || sample.compactionReadMicros < 0 || sample.compactionReadCount < 0
                 || sample.prefetchCount < 0 || sample.prefetchBytes < 0) {
             clearReadWindow(); serviceRate = 0;
+            recentReadBytes = recentReadMicros = recentReadCount = 0;
+            lastReadServiceNanos = 0;
             reduceReadahead(0);
             return;
         }
         long count = sample.compactionReadCount - old.compactionReadCount;
         long transferred = sample.compactionReadBytes - old.compactionReadBytes;
         long readTime = sample.compactionReadMicros - old.compactionReadMicros;
-        if (count > 0 && transferred > 0 && readTime > 0) {
+        // Read timings are per I/O; COMPACT_READ_BYTES is published in job batches, independently.
+        if (count > 0 && readTime > 0) {
             lastReadServiceNanos = sample.nanos;
-            double rate = transferred * (1_000_000d / readTime);
-            if (serviceRate > 0 && rate < serviceRate) serviceRate = rate;
-            reduceReadahead(readTime / count >= 100_000 ? 0 : serviceReadaheadLimit(Math.min(rate, budget)));
-        } else if (count > 0 || sample.background && (lastReadServiceNanos == 0
+            if (readTime / count >= 100_000) reduceReadahead(0);
+            reduceReadahead(serviceReadaheadLimit(budget));
+        } else if (count > 0 || readTime > 0 || sample.background && (lastReadServiceNanos == 0
                 || sample.nanos - lastReadServiceNanos >= 3_000_000_000L)) {
             reduceReadahead(0);
         }
         readWindowNanos += elapsed;
-        compactionBytes += sample.compactionReadBytes - old.compactionReadBytes;
-        compactionMicros += sample.compactionReadMicros - old.compactionReadMicros;
-        compactionReads += sample.compactionReadCount - old.compactionReadCount;
+        compactionBytes += transferred;
+        compactionMicros += readTime;
+        compactionReads += count;
         prefetchEvents += sample.prefetchCount - old.prefetchCount;
         prefetchedBytes += sample.prefetchBytes - old.prefetchBytes;
+        if (count > 0 && readTime > 0 && recentReadCount >= 32 && recentReadBytes > 0 && recentReadMicros > 0) {
+            double reference = recentReadBytes * (1_000_000d / recentReadMicros);
+            double rate = (recentReadBytes + (double) compactionBytes)
+                    * (1_000_000d / (recentReadMicros + (double) compactionMicros));
+            if (rate <= reference * .75 || readaheadBytes > rate / 10)
+                reduceReadahead(serviceReadaheadLimit(Math.min(rate, budget)));
+        }
         readWindowTracking &= state != State.PROBE;
     }
     private void evaluateReadService(Sample sample) {
@@ -595,6 +606,12 @@ public final class CompactionIoBudget {
         double rawRate = compactionMicros > 0 ? compactionBytes * (1_000_000d / compactionMicros) : 0;
         boolean reliable = compactionReads >= 32 && compactionBytes > 0 && rawRate > 0 && Double.isFinite(rawRate);
         boolean tracking = readWindowTracking && foregroundHealthy;
+        double priorRate = serviceRate;
+        if (reliable) {
+            recentReadBytes = compactionBytes;
+            recentReadMicros = compactionMicros;
+            recentReadCount = compactionReads;
+        }
         readWindowNanos = compactionBytes = compactionMicros = compactionReads = prefetchEvents = prefetchedBytes = 0;
         readWindowTracking = true;
         if (!reliable) {
@@ -620,7 +637,8 @@ public final class CompactionIoBudget {
         if (readaheadUnknown) { reliableGrowthWindows = 0; return; }
         // 100ms estimated reader service and admission bounds, with 25% headroom BEFORE the operator ceiling.
         long target = serviceReadaheadLimit(Math.min(Math.min(serviceRate, rawRate), budget));
-        if (target < readaheadBytes && (target == 0 || target <= readaheadBytes * .75)) {
+        if (target < readaheadBytes && (priorRate > 0 && rawRate <= priorRate * .75
+                || readaheadBytes > rawRate / 10)) {
             reduceReadahead(target);
         } else if (tracking && state != State.PROBE && !readaheadSettling && target > readaheadBytes) {
             if (++reliableGrowthWindows >= 2) {
