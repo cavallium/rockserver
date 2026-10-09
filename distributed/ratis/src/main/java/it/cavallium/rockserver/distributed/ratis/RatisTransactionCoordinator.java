@@ -16,7 +16,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
     }
     public enum Action {
         RETRIED_HOME, REGISTRATION_ATTEMPTED, PREPARED, PREPARATION_REJECTED, PARTICIPANT_RETIRED, VOTE_ATTEMPTED, COMMIT_ATTEMPTED,
-        ABORT_ATTEMPTED, FINALIZED, ACK_ATTEMPTED, VERIFIED, COMPLETE
+        ABORT_ATTEMPTED, FINALIZED, ACK_ATTEMPTED, VERIFIED, HOME_RETIRED, COMPLETE
     }
     /** CAS actions identify attempts; PREPARED/REJECTED identify durable votes. Completion never implies consumption. */
     public record Step(Action action,UUID participant,boolean complete) {}
@@ -46,7 +46,8 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
             if (active) throw new IOException("Transaction coordinator step already active");
             active=true;
         }
-        try { return advance(); }
+        try { if (journal.snapshot().homeRetirementProof()!=null) return new Step(Action.HOME_RETIRED,null,true); return advance(); }
+        catch (RatisHomeRetiredException retired) { return new Step(Action.HOME_RETIRED,null,true); }
         finally { synchronized (this) { active=false; } }
     }
     private Step advance() throws IOException {

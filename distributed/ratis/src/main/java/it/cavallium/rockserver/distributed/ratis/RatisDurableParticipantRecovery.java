@@ -15,7 +15,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     public record Snapshot(PreparedParticipant prepared,RangeDescriptor participantRoute,RangeDescriptor homeRoute,TransactionStatus observedHome,
             RatisRoutedClient.PreparedCommand pendingHome,CommandResult homeResult,boolean homeSuperseded,OperationId finalizeControl,
             RatisRoutedClient.PreparedFinalizationOperation finalization,ApplyPosition finalizationReceipt,ParticipantOutcome outcome,
-            RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery,HomeRecoveryReceipt recoveryReceipt,ParticipantFenceProof retirementProof) {}
+            RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery,HomeRecoveryReceipt recoveryReceipt,ParticipantFenceProof retirementProof,HomeFenceProof homeRetirementProof) {}
     private final Path path;
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
@@ -37,6 +37,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private ApplyPosition receipt;
     private ParticipantOutcome outcome;
     private ParticipantFenceProof retirementProof;
+    private HomeFenceProof homeRetirementProof;
 
     public static RatisDurableParticipantRecovery create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,PreparedParticipant nativePrepared,
             RangeDescriptor participantRoute) throws IOException {
@@ -73,13 +74,17 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     synchronized void requireClients(RatisTransactionStatuses expectedHomes,RatisRoutedClient expectedData) throws IOException {
         requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,Objects.requireNonNull(expectedData).sessionIdentityDigest())) throw new IllegalArgumentException("Participant recovery clients differ from journal binding");
     }
-    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(prepared,participantRoute,homeRoute,observed,pending,homeResult,homeSuperseded,finalizeControl,finalization,receipt,outcome,pendingRecovery,recoveryReceipt,retirementProof); }
+    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(prepared,participantRoute,homeRoute,observed,pending,homeResult,homeSuperseded,finalizeControl,finalization,receipt,outcome,pendingRecovery,recoveryReceipt,retirementProof,homeRetirementProof); }
     public TransactionStatus refreshHome() throws IOException {
         synchronized (this) { idle(); active=true; }
         try {
             var read=homes.readRegistration(transaction());
             try { requireHomeRoute(read.descriptor()); } catch (IllegalArgumentException changed) { throw new IOException("Participant transaction home incarnation/bounds changed",changed); }
-            if (read.status()==null) throw new IOException("Existing participant transaction home disappeared");
+            if (read.status()==null || !definition.sameDefinition(read.status())) {
+                var retirement=homes.fence(homes.identity(definition,homeRoute));
+                if (retirement!=null) { synchronized (this) { mergeHomeRetirement(retirement); persist(); } throw new RatisHomeRetiredException(retirement); }
+                if (read.status()==null) throw new IOException("Existing participant transaction home disappeared");
+            }
             synchronized (this) { if (!read.status().equals(observed)) { observe(read.status()); persist(); } return observed; }
         } finally { end(); }
     }
@@ -113,6 +118,8 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
                 if (result.status()==CommandResult.Status.SUCCESS) { var successful=next(request); if (observed.generation()>successful.generation()) monotone(successful,observed); else observe(successful); }
                 homeResult=result; recoveryReceipt=retained; persist(); return result;
             }
+        } catch (RatisHomeRetiredException retired) {
+            synchronized (this) { mergeHomeRetirement(retired.proof()); persist(); } throw retired;
         } finally { end(); }
     }
     public synchronized void freezeFinalization(RatisRoutedClient.PreparedFinalizationOperation operation) throws IOException {
@@ -215,8 +222,12 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
     private static TransactionStatus expected(RatisRoutedClient.PreparedCommand command) { byte[] bytes=command.command().predicates().getFirst().expectedValue(); return bytes==null ? null : TransactionStatus.decode(bytes); }
     private static TransactionStatus next(RatisRoutedClient.PreparedCommand command) { return TransactionStatus.decode(command.command().mutations().getFirst().value()); }
     private static boolean after(ApplyPosition next,ApplyPosition old) { return next!=null && next.term()>=old.term() && next.index()>old.index(); }
+    private void mergeHomeRetirement(HomeFenceProof proof) throws IOException {
+        if (!homes.identity(definition,homeRoute).equals(proof.identity()) || homeRetirementProof!=null && !proof.covers(homeRetirementProof)) throw new IOException("HOME retirement proof identity changed or regressed");
+        homeRetirementProof=proof;
+    }
     private void requireOpen() throws IOException { if (closed || fenced || !lock.isValid()) throw new IOException("Participant recovery journal closed/fenced; reopen it"); }
-    private void idle() throws IOException { requireOpen(); if (active) throw new IOException("Participant recovery RPC already active"); }
+    private void idle() throws IOException { requireOpen(); if (homeRetirementProof!=null) throw new RatisHomeRetiredException(homeRetirementProof); if (active) throw new IOException("Participant recovery RPC already active"); }
     private synchronized void end() { active=false; }
     private void persist() throws IOException {
         try { SessionJournalFiles.write(path,encode(),MAX_BYTES); }
@@ -233,7 +244,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         if (!homeRoute.groupId().equals(prepared.preparation().homeGroup()) || homeRoute.rangeEpoch()!=prepared.preparation().homeEpoch()) throw new IOException("Participant recovery home binding changed");
         monotone(definition,prepared.preparation().registration());
         long routes=SessionWindowJournal.routeSize(participantRoute)+SessionWindowJournal.routeSize(homeRoute)+futureHomeRoute();
-        if (routes>MAX_ROUTES || prepared.encode().length+routes+HomeRecovery.MAX_BYTES+ParticipantFenceProof.MAX_BYTES+65536L+32>MAX_BYTES) throw new IOException("Participant recovery future route/metadata capacity unavailable");
+        if (routes>MAX_ROUTES || prepared.encode().length+routes+HomeRecovery.MAX_BYTES+ParticipantFenceProof.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536L+32>MAX_BYTES) throw new IOException("Participant recovery future route/metadata capacity unavailable");
         if (pending!=null) { requireHomeRoute(pending.descriptor()); homes.restoreRecovery(pendingRecovery.recovery(),pending.descriptor()); }
     }
     private long futureHomeRoute() { return 60L+(homeRoute.lowerInclusive()==null ? 0 : homeRoute.lowerInclusive().length)+(homeRoute.upperExclusive()==null ? 0 : homeRoute.upperExclusive().length)+RangeDirectoryCodec.MAX_REPLICAS*(57L+128+256); }
@@ -249,6 +260,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         out.writeByte(homeResult==null ? 0 : homeResult.status().ordinal()+1); out.writeBoolean(homeSuperseded); out.writeBoolean(finalization!=null); position(out,receipt);
         out.writeBoolean(retirementProof!=null); if (retirementProof!=null) blob(out,retirementProof.encode());
         out.writeBoolean(outcome!=null); if (outcome!=null) { operation(out,outcome.finalization().operation()); positionValue(out,outcome.position()); }
+        out.writeBoolean(homeRetirementProof!=null); if (homeRetirementProof!=null) blob(out,homeRetirementProof.encode());
         out.flush(); if (bytes.size()>MAX_BYTES-32) throw new IOException("Participant recovery journal exceeds bound"); return bytes.toByteArray();
     }
     private void decode(byte[] body) throws IOException {
@@ -280,6 +292,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
                 var control=operation(in); var position=positionValue(in); var value=new ParticipantFinalization(prepared.preparation().homeGroup(),prepared.preparation().homeEpoch(),group(),control,observed);
                 mergeOutcome(new ParticipantOutcome(value,position,ParticipantVote.prepared(prepared.position()),observed.phase()==TransactionStatus.Phase.COMMIT ? prepared.preparation().business().acceptance().result() : null));
             }
+            if (flag(in)) mergeHomeRetirement(HomeFenceProof.decode(blob(in,HomeFenceProof.MAX_BYTES)));
             if (in.hasRemaining()) throw new IOException("Trailing participant recovery journal bytes");
             if (pending==null) { if (homeResult!=null || homeSuperseded) throw new IOException("Home response/retirement has no pending request"); }
             else {

@@ -115,7 +115,9 @@ does not establish complete distributed API parity or production acceptance.
   global/participant plan hashes. PREPARING records monotonically collect reports
   of applied prepare positions; COMMIT requires every registered report. COMMIT or
   ABORT is immutable, and finalization ACKs and explicit client consumption advance
-  separately. No deletion/automatic GC is admitted, even when a record is eligible.
+  separately. Ordinary CAS cannot delete a HOME; protected retirement now reclaims
+  an exact consumed record after every DATA family has retired and HOME's business
+  epoch floor has advanced. Automatic retirement discovery remains unfinished.
   Every changed image advances one generation and one vote/decision/ACK/consumption
   step. Replica validators reject accepted-command predicate bypass, extra effects,
   altered definitions and noncanonical bytes. Receipt ACK/GC is independent of
@@ -362,8 +364,18 @@ proofs. Unresolved positive preparations remain finalizable after business expir
 A never-prepared expired participant can ACK ABORT through fresh atomic DATA
 absence/floor evidence. Journals persist that evidence separately from native votes
 and receipts, and explicit client consumption remains required. Missing consumed
-COMMIT results raise a typed outcome-expired error. HOME records, recovery receipts,
-snapshot gates, pin tombstones and client journals still need their own GC paths.
+COMMIT results raise a typed outcome-expired error. HOME retirement deletes the
+consumed USER row and its protected recovery receipts atomically, after fresh fixed
+DATA readers confirm every participant's fenced absence. Expired conflict-only
+orphan receipts have a local cleanup mode; it never invents a consumed decision or
+waits for DATA availability. A fresh control cannot register an expired business
+anchor again. HOME expiry proofs remain separate from decisions and actual receipts,
+and old journals terminate explicitly as HOME_RETIRED while preserving previously
+proven COMMIT or ABORT results. New businesses may reuse a transaction UUID without
+being adopted or deleted by old retries. HOME retirement shares the 16 protected
+slots and retains at most 1 MiB of input per group through actual RPC termination.
+Snapshot gates, pin tombstones, client journals and automatic GC discovery remain
+unfinished.
 
 The native snapshot-gate kernel freezes the complete participant set, directory
 and schema identities, local physical scopes, and distinct install/release controls.

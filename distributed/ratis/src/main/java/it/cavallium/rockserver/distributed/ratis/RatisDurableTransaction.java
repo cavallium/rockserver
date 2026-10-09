@@ -50,7 +50,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
             RatisRoutedClient.PreparedFinalizationOperation finalization,ApplyPosition finalizationReceipt,ParticipantOutcome outcome,ParticipantFenceProof retirementProof) {}
     public record Snapshot(TransactionStatus initial,TransactionStatus observedHome,RatisRoutedClient.PreparedCommand pendingHome,
             CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,
-            RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery,HomeRecoveryReceipt recoveryReceipt,List<ParticipantProgress> participants) {
+            RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery,HomeRecoveryReceipt recoveryReceipt,List<ParticipantProgress> participants,HomeFenceProof homeRetirementProof) {
         public ParticipantProgress participant(UUID group) { return participants.stream().filter(p -> p.intent().route().groupId().equals(group)).findFirst().orElseThrow(); }
     }
     private static final class Entry {
@@ -80,6 +80,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private long recoverySequence;
     private RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery;
     private HomeRecoveryReceipt recoveryReceipt;
+    private HomeFenceProof homeRetirementProof;
     private boolean active,closed,fenced,homeSuperseded;
 
     public static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,
@@ -137,11 +138,13 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return before==null ? initial.sameDefinition(observed) : before.sameDefinition(observed) && observed.generation()>before.generation();
     }
     public synchronized Snapshot snapshot() throws IOException {
-        requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,pendingRecovery,recoveryReceipt,entries.values().stream().map(Entry::progress).toList());
+        requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,pendingRecovery,recoveryReceipt,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof);
     }
     /** Returns the globally ordered business outcome only after every native finalization and home ACK is durable. */
     public synchronized CommandResult result() throws IOException {
         requireOpen();
+        if (homeRetirementProof!=null && (observed==null || !observed.fullyFinalized()
+                || entries.values().stream().anyMatch(entry -> entry.outcome==null && (observed.phase()!=TransactionStatus.Phase.ABORT || entry.retirementProof==null)))) throw new RatisTransactionOutcomeExpiredException(initial.transactionId());
         if (observed==null || !observed.fullyFinalized() || entries.values().stream().anyMatch(entry -> entry.outcome==null && entry.retirementProof==null)) throw new IllegalStateException("Transaction result requires all participant proofs and home ACKs");
         if (observed.phase()==TransactionStatus.Phase.COMMIT && entries.values().stream().anyMatch(entry -> entry.outcome==null)) throw new RatisTransactionOutcomeExpiredException(initial.transactionId());
         for (var entry:entries.values()) if (entry.outcome!=null && !entry.outcome.finalization().decision().equals(observed.terminalDecision())) throw new IOException("Saved participant outcome differs from terminal home");
@@ -214,6 +217,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
                 }
                 homeResult=result; recoveryReceipt=retained; persist(); return result;
             }
+        } catch (RatisHomeRetiredException retired) {
+            synchronized (this) { mergeHomeRetirement(retired.proof()); persist(); } throw retired;
         } finally { synchronized (this) { active=false; } }
     }
     public synchronized void queueHome(RatisRoutedClient.PreparedCommand request) throws IOException {
@@ -263,6 +268,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
             var read=homes.readRegistration(initial.transactionId());
             try { requireHomeRoute(read.descriptor()); } catch (IllegalArgumentException invalid) { throw new IOException("Home read changed frozen range incarnation",invalid); }
             var status=read.status();
+            if (status==null || !initial.sameDefinition(status)) {
+                var retirement=homes.fence(homes.identity(initial,homeRoute));
+                if (retirement!=null) { synchronized (this) { mergeHomeRetirement(retirement); persist(); } throw new RatisHomeRetiredException(retirement); }
+            }
             synchronized (this) { if (status==null) { if (observed!=null) throw new IOException("Home registration disappeared"); return null; } if (status.equals(observed)) return observed; observe(status); persist(); return observed; }
         } finally { synchronized (this) { active=false; } }
     }
@@ -382,8 +391,12 @@ public final class RatisDurableTransaction implements AutoCloseable {
         lastHome=operation;
     }
     private Entry entry(UUID group) { var entry=entries.get(group); if (entry==null) throw new IllegalArgumentException("Unregistered participant group"); return entry; }
+    private void mergeHomeRetirement(HomeFenceProof proof) throws IOException {
+        if (!homes.identity(initial,homeRoute).equals(proof.identity()) || homeRetirementProof!=null && !proof.covers(homeRetirementProof)) throw new IOException("HOME retirement proof identity changed or regressed");
+        homeRetirementProof=proof;
+    }
     private void requireOpen() throws IOException { if (closed || fenced || !lock.isValid()) throw new IOException("Transaction journal closed/fenced; reopen it"); }
-    private void idle() throws IOException { requireOpen(); if (active) throw new IOException("Transaction journal RPC already active"); }
+    private void idle() throws IOException { requireOpen(); if (homeRetirementProof!=null) throw new RatisHomeRetiredException(homeRetirementProof); if (active) throw new IOException("Transaction journal RPC already active"); }
     private void persist() throws IOException {
         try { SessionJournalFiles.write(path,encode(),MAX_BYTES); }
         catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Transaction journal persistence failed; reopen it",failure); }
@@ -413,7 +426,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         routes+=pendingRouteReserve;
         if (plans>MAX_AGGREGATE || routes>MAX_AGGREGATE) throw new IOException("Transaction aggregate intent/route bound exceeded");
         // One initial and observed home, one bounded home CAS, and two finalization decisions per participant.
-        long reserve=plans+routes+4L*TransactionStatus.MAX_BYTES+65536L
+        long reserve=plans+routes+4L*TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536L
                 +entries.size()*(2L*ParticipantFinalization.MAX_BYTES+TransactionStatus.MAX_BYTES+2L*ParticipantFenceProof.MAX_BYTES+512);
         if (reserve+32>MAX_BYTES) throw new IOException("Transaction future persistence capacity unavailable");
         if (lastHome.equals(initial.operation()) || controls.contains(lastHome)) throw new IOException("Home operation overlaps participant/business identity");
@@ -436,7 +449,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         long size=4+64+4L+initial.encode().length+SessionWindowJournal.routeSize(homeRoute)+32+24+4+(observed==null ? 0 : observed.encode().length)+1;
         if (pending!=null) size+=4L+(pendingRecovery==null ? DistributedCommandCodec.encodedSize(pending.command()) : pendingRecovery.bytes().length)+SessionWindowJournal.routeSize(pending.descriptor());
         size+=positionSize(recoveryReceipt==null ? null : recoveryReceipt.position());
-        size+=4+(homeResult==null ? 0 : homeResult.encode().length)+1+4;
+        size+=4+(homeResult==null ? 0 : homeResult.encode().length)+1+4+(homeRetirementProof==null ? 0 : homeRetirementProof.encode().length)+4;
         for (var entry:entries.values()) {
             size+=SessionWindowJournal.routeSize(entry.intent.route())+4L+DistributedCommandCodec.encodedSize(entry.intent.acceptedBusiness())+64+4L+4L*entry.intent.resultPositions().size()+4+(entry.registration==null ? 0 : entry.registration.encode().length)+1+voteSize(entry.vote)+4+(entry.finalization==null ? 0 : entry.finalization.finalization().encode().length)+positionSize(entry.receipt)+4+(entry.retirementProof==null ? 0 : entry.retirementProof.encode().length)+1;
             if (entry.outcome!=null) size+=4L+entry.outcome.finalization().encode().length+16+voteSize(entry.outcome.vote());
@@ -446,7 +459,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         blob(output,initial.encode()); SessionWindowJournal.route(output,homeRoute); operation(output,lastHome); uuid(output,recoveryNamespace); output.putLong(recoverySequence); blob(output,observed==null ? null : observed.encode());
         output.put((byte)(pending==null ? 0 : pendingRecovery==null ? 1 : 2)); if (pending!=null) { blob(output,pendingRecovery==null ? DistributedCommandCodec.encode(pending.command()) : pendingRecovery.bytes()); SessionWindowJournal.route(output,pending.descriptor()); }
         position(output,recoveryReceipt==null ? null : recoveryReceipt.position());
-        blob(output,homeResult==null ? null : homeResult.encode()); output.put((byte)(homeSuperseded ? 1 : 0)); output.putInt(entries.size());
+        blob(output,homeResult==null ? null : homeResult.encode()); output.put((byte)(homeSuperseded ? 1 : 0)); blob(output,homeRetirementProof==null ? null : homeRetirementProof.encode()); output.putInt(entries.size());
         for (var entry:entries.values()) {
             var intent=entry.intent;
             SessionWindowJournal.route(output,intent.route()); blob(output,DistributedCommandCodec.encode(intent.acceptedBusiness())); operation(output,intent.prepareControl()); operation(output,intent.finalizeControl()); output.putInt(intent.resultPositions().size()); for (int position:intent.resultPositions()) output.putInt(position);
@@ -474,6 +487,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
             }
             var recoveryPosition=position(input);
             byte[] result=blob(input,8,true); homeResult=result==null ? null : CommandResult.decode(result); homeSuperseded=flag(input);
+            var homeRetirement=blob(input,HomeFenceProof.MAX_BYTES,true); if (homeRetirement!=null) mergeHomeRetirement(HomeFenceProof.decode(homeRetirement));
             if (recoveryPosition!=null) {
                 if (pendingRecovery==null || homeResult==null) throw new IOException("Protected receipt lacks frozen request/result");
                 recoveryReceipt=new HomeRecoveryReceipt(pendingRecovery.recovery(),recoveryPosition,homeResult);

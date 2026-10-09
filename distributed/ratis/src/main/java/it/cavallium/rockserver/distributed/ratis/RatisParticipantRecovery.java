@@ -6,7 +6,7 @@ import java.util.*;
 
 /** Recover one existing native preparation. Completion is local; other participants and consumption remain independent. */
 public final class RatisParticipantRecovery implements AutoCloseable {
-    public enum Action { WAITING, RETRIED_HOME, ABORT_ATTEMPTED, FINALIZED, VERIFIED, ACK_ATTEMPTED, COMPLETE }
+    public enum Action { WAITING, RETRIED_HOME, ABORT_ATTEMPTED, FINALIZED, VERIFIED, ACK_ATTEMPTED, HOME_RETIRED, COMPLETE }
     public record Step(Action action,boolean complete) {}
     private final RatisDurableParticipantRecovery journal;
     private final RatisTransactionStatuses homes;
@@ -23,7 +23,8 @@ public final class RatisParticipantRecovery implements AutoCloseable {
     /** One synchronous CONTROL quantum, at most one state-changing RPC; clients and journal are borrowed. */
     public Step step() throws IOException {
         synchronized (this) { if (closed || active) throw new IOException("Participant recovery closed or step active"); active=true; }
-        try { return advance(); } finally { synchronized (this) { active=false; } }
+        try { if (journal.snapshot().homeRetirementProof()!=null) return new Step(Action.HOME_RETIRED,true); return advance(); }
+        catch (RatisHomeRetiredException retired) { return new Step(Action.HOME_RETIRED,true); } finally { synchronized (this) { active=false; } }
     }
     private Step advance() throws IOException {
         journal.refreshHome(); journal.resolveHomeFromObserved(); var snapshot=journal.snapshot();

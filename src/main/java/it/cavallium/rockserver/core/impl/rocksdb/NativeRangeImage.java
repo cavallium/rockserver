@@ -133,8 +133,8 @@ public final class NativeRangeImage {
                 pin.visitState((key, value) -> append.accept(Section.STATE, null, key, value));
                 pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
                 tracker.finish();
-                try { pin.validateHomeCreditImage(tracker.homeCredits); }
-                catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("HOME image user/promise reverse proof differs",invalid); }
+                try { pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries); }
+                catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("HOME image user/promise/recovery proof differs",invalid); }
                 output.writeByte(0);
                 output.writeLong(tracker.count);
                 bodyOutput.on(false);
@@ -216,10 +216,15 @@ public final class NativeRangeImage {
             if (input.read() != -1 || counted.count != size) throw new IOException("Trailing or changing image bytes");
             var manifest=manifest(header, tracker.count, size, whole.digest());
             var homeContext=tracker.homeContext(required);
-            if (verifyCreditUsers && homeContext!=null) {
-                var matched=new HashSet<UUID>();
-                var checked=visit(image,limits,(section,column,key,value) -> { if (section==Section.USER) tracker.requireHomeUser(homeContext,column,key,value,matched); },false,null);
-                if (matched.size()!=tracker.homeCredits.size() || !Arrays.equals(manifest.sha256(),checked.sha256())) throw new IOException("HOME image promises have missing user rows or image changed between passes");
+            if (verifyCreditUsers && (homeContext!=null || tracker.homeSuccessCount()!=0)) {
+                var matched=new HashSet<UUID>(); var successful=new HashSet<OperationId>();
+                var checked=visit(image,limits,(section,column,key,value) -> {
+                    if (section==Section.USER) {
+                        if (homeContext!=null) tracker.requireHomeUser(homeContext,column,key,value,matched);
+                        tracker.requireHomeSuccessor(column,key,value,successful);
+                    }
+                },false,null);
+                if (matched.size()!=tracker.homeCredits.size() || successful.size()!=tracker.homeSuccessCount() || !Arrays.equals(manifest.sha256(),checked.sha256())) throw new IOException("HOME image promises/success receipts have missing USER rows or image changed between passes");
             }
             return manifest;
         } catch (IllegalArgumentException malformed) {
@@ -351,6 +356,7 @@ public final class NativeRangeImage {
         private int homeCreditCount;
         private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
         private final Map<OperationId,HomeRecoveryReceipt> homeRecoveries=new HashMap<>();
+        private Map<UUID,List<HomeRecoveryReceipt>> successfulHomeUsers;
         private final Map<UUID,CommittedParticipant> committed=new HashMap<>();
         private long preparedBytes,preparedScopeBytes;
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
@@ -575,7 +581,11 @@ public final class NativeRangeImage {
                 var actual=new HomeContext(credit.cluster(),credit.database(),credit.column());
                 if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
             }
-            if (context!=null && !header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership"); return context;
+            if (context!=null) {
+                if (!header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership");
+                for (var receipt:homeRecoveries.values()) if (!receipt.recovery().before().clusterId().equals(context.cluster()) || !receipt.recovery().before().databaseId().equals(context.database()) || !receipt.recovery().command().mutations().getFirst().columnId().equals(context.column())) throw new IOException("Qualified HOME receipt database differs");
+            }
+            return context;
         }
         void requireHomeUser(HomeContext context,UUID column,byte[] key,byte[] value,Set<UUID> matched) throws IOException {
             if (!context.column().equals(column) || key.length!=16 || value.length>it.cavallium.rockserver.core.common.distributed.TransactionStatus.MAX_BYTES) throw new IOException("Invalid qualified HOME image user row");
@@ -585,6 +595,25 @@ public final class NativeRangeImage {
             var credit=homeCredits.get(id);
             if (ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)>0 && (credit==null || !credit.current().equals(status)) || ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)==0 && credit!=null) throw new IOException("Unfinished HOME image user row lacks exact promise");
             if (credit!=null) matched.add(id);
+        }
+
+        private Map<UUID,List<HomeRecoveryReceipt>> successfulHomeUsers() {
+            if (successfulHomeUsers==null) {
+                successfulHomeUsers=new HashMap<>();
+                for (var receipt:homeRecoveries.values()) if (receipt.result().status()==it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS)
+                    successfulHomeUsers.computeIfAbsent(receipt.recovery().before().transactionId(),ignored -> new ArrayList<>()).add(receipt);
+            }
+            return successfulHomeUsers;
+        }
+        long homeSuccessCount() { return successfulHomeUsers().values().stream().mapToLong(List::size).sum(); }
+        void requireHomeSuccessor(UUID column,byte[] key,byte[] value,Set<OperationId> matched) throws IOException {
+            if (key.length!=16) return; var bytes=ByteBuffer.wrap(key); var records=successfulHomeUsers().get(new UUID(bytes.getLong(),bytes.getLong())); if (records==null) return;
+            for (var receipt:records) {
+                var mutation=receipt.recovery().command().mutations().getFirst(); if (!mutation.columnId().equals(column)) continue;
+                try { ReplicatedRangeStore.requireHomeRecoverySuccessor(receipt,it.cavallium.rockserver.core.common.distributed.TransactionStatus.decode(value)); }
+                catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Successful HOME receipt has no matching USER successor",invalid); }
+                matched.add(receipt.recovery().operation());
+            }
         }
 
         private static long addUsage(long a, long b) throws IOException {

@@ -271,12 +271,12 @@ class RatisDurableTransactionTest {
         }
     }
 
-    @Test void definitelyExpiredRegistrationCanUseANewControlIdentityWithoutChangingBusinessIntent() throws Exception {
+    @Test void definitelyExpiredHomeControlCanBeReplacedWhileOriginalBusinessRemainsLive() throws Exception {
         helper.root=root;
         try (var home=helper.new Node("expired-home",true); var data=helper.new Node("expired-data",false); var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
             var plan=plan(home,data,pin); Path path=root.resolve("expired.bin");
             try (var journal=create(path,home,data,plan)) {
-                home.wire.command(home.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(home.f.groupId,1,new byte[32],new OperationId(home.f.admin,2,0),2));
+                home.wire.command(home.directory.ranges().getFirst(),new DistributedCommand(home.f.groupId,1,new byte[32],homeOperation(1),List.of(),List.of(),0));
                 assertEquals(CommandResult.Status.SESSION_EXPIRED,journal.executeHome().status()); assertNull(journal.refreshHome());
                 var recovery=new OperationId(new UUID(0,1800),3,0); journal.queueHome(home.statuses.prepare(recovery,null,plan.initial())); assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status());
                 assertEquals(plan.initial(),journal.snapshot().observedHome()); assertEquals(plan.intent().acceptedBusiness().operationId(),journal.snapshot().initial().operation()); assertEquals(0,data.wire.index);

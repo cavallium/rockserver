@@ -69,7 +69,7 @@ class RatisParticipantPrepareTest {
         @Override public void close() throws Exception { if (snapshotHelp!=null) snapshotHelp.stop().get(5,TimeUnit.SECONDS); nodes.remove(f.groupId,this); routed.close(); f.close(); if (scheduler!=null) scheduler.disposeGracefully().block(java.time.Duration.ofSeconds(5)); }
     }
     static final class Wire implements RatisRoutedClient.Transport {
-        final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Runnable afterRead,beforeFinalization; IOException readFailure;
+        final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Runnable afterRead,beforeFinalization,beforeFence; IOException readFailure;
         Wire(RatisRetentionAdmissionTest.Fixture f) { this.f=f; }
         TransactionContext propose(byte[] bytes) throws Exception {
             return f.machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(f.peer.getId()).setGroupId(f.group.getGroupId()).setCallId(1)
@@ -86,7 +86,7 @@ class RatisParticipantPrepareTest {
         public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return CommandResult.decode(append(DistributedCommandCodec.encode(command))); }
         public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return append(record); }
         public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException {
-            try { if (beforeFinalization!=null && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.FINALIZATION_PREPARE) beforeFinalization.run(); var message=Message.valueOf(ByteString.copyFrom(request)); return (fresh ? f.machine.queryLinearizable(message) : f.machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
+            try { if (beforeFence!=null && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.PARTICIPANT_FENCE) beforeFence.run(); if (beforeFinalization!=null && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.FINALIZATION_PREPARE) beforeFinalization.run(); var message=Message.valueOf(ByteString.copyFrom(request)); return (fresh ? f.machine.queryLinearizable(message) : f.machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
             catch (Exception failure) { throw new IOException(failure); }
         }
         public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException {

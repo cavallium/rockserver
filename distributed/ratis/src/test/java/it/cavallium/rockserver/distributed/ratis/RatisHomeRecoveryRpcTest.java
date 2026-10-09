@@ -62,7 +62,7 @@ class RatisHomeRecoveryRpcTest {
         public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException {
             assertFalse(closed); routes.add(route); appends++;
             try {
-                var result=helper.apply(f.nativeHome,helper.propose(f.nativeHome,HomeRecovery.decode(bytes)),++index).encode();
+                var result=HomeRecoveryResult.applied(helper.apply(f.nativeHome,helper.propose(f.nativeHome,HomeRecovery.decode(bytes)),++index)).encode();
                 if (loseReply) { loseReply=false; throw new IOException("Lost applied HOME reply"); }
                 return forged==null ? result : forged;
             } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
@@ -91,7 +91,7 @@ class RatisHomeRecoveryRpcTest {
             f.homes.executeRecovery(f.abort(0)); var operation=f.ack(1); var actual=helper.outcome.get(); helper.outcome.set(null);
             assertThrows(IOException.class,() -> f.homes.executeRecovery(operation)); assertEquals(1,f.wire.appends); helper.released(f.nativeHome);
             helper.outcome.set(actual); var other=f.abort(2);
-            var forged=new HomeRecoveryReceipt(other.recovery(),new ApplyPosition(1,3),new CommandResult(CommandResult.Status.SUCCESS,List.of())).encode();
+            var forged=HomeRecoveryResult.applied(new HomeRecoveryReceipt(other.recovery(),new ApplyPosition(1,3),new CommandResult(CommandResult.Status.SUCCESS,List.of()))).encode();
             f.wire.forgedPreparation=forged; assertThrows(IOException.class,() -> f.homes.executeRecovery(operation)); assertEquals(1,f.wire.appends); f.wire.forgedPreparation=null;
             f.wire.forged=forged; assertThrows(IOException.class,() -> f.homes.executeRecovery(operation)); assertEquals(2,f.wire.appends); f.wire.forged=null;
             f.wire.forgedLookup=forged; assertThrows(IOException.class,() -> f.homes.recoveryResult(operation)); f.wire.forgedLookup=null;
@@ -106,7 +106,7 @@ class RatisHomeRecoveryRpcTest {
             f.homes.authorizeRecovery(operation); TransactionContext pending=helper.propose(f.nativeHome,operation.recovery()); assertNull(pending.getException());
             f.nativeHome.machine.preAppendTransaction(pending); pending.initLogEntry(1,++f.wire.index); f.nativeHome.machine.cancelTransaction(pending);
             f.homes.cancelRecovery(operation); assertEquals(1,f.nativeHome.machine.proposalFootprintStats().candidates()); assertEquals(operation.bytes().length,f.nativeHome.machine.homeRecoveryInputBytes());
-            var result=HomeRecoveryReceipt.decode(f.nativeHome.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray());
+            var result=HomeRecoveryResult.decode(f.nativeHome.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray()).receipt();
             assertEquals(result,f.homes.recoveryResult(operation)); helper.released(f.nativeHome);
         }
     }

@@ -9,7 +9,7 @@ public final class RatisTransactionRecovery implements AutoCloseable {
     @FunctionalInterface public interface ControlIds {
         OperationId nextAfter(OperationId last) throws IOException;
     }
-    public enum Action { RETRIED_HOME, REGISTRATION_ATTEMPTED, ABORT_ATTEMPTED, FINALIZED, ACK_ATTEMPTED, VERIFIED, COMPLETE }
+    public enum Action { RETRIED_HOME, REGISTRATION_ATTEMPTED, ABORT_ATTEMPTED, FINALIZED, ACK_ATTEMPTED, VERIFIED, HOME_RETIRED, COMPLETE }
     /** Action identifies the attempted quantum; home CAS success/conflict remains in the journal's homeResult. */
     public record Step(Action action,UUID participant,boolean complete) {}
 
@@ -40,11 +40,13 @@ public final class RatisTransactionRecovery implements AutoCloseable {
             active=true;
         }
         try {
+            if (journal.snapshot().homeRetirementProof()!=null) return new Step(Action.HOME_RETIRED,null,true);
             if (!terminalOnly) return advance();
             var snapshot=journal.snapshot();
             if (snapshot.observedHome()==null || snapshot.observedHome().phase()==TransactionStatus.Phase.PREPARING || snapshot.homeResult()==null && !snapshot.homeSuperseded()) throw new IOException("Terminal completion requires a verified decision and resolved home request");
             return finishTerminal(snapshot);
         }
+        catch (RatisHomeRetiredException retired) { return new Step(Action.HOME_RETIRED,null,true); }
         finally { synchronized (this) { active=false; } }
     }
 

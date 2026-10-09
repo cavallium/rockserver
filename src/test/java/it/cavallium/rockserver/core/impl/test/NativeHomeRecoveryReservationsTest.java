@@ -41,17 +41,17 @@ class NativeHomeRecoveryReservationsTest {
             for (int n=0;n<ReplicatedRangeStore.MAX_HOME_RECOVERIES;n++) {
                 var conflict=helper.abort(helper.initial(10000+n),10000+n);
                 try { var estimate=f.store.estimateHomeRecovery(conflict); assertFalse(estimate.creditCovered()); } catch (IllegalStateException full) { break; }
-                assertEquals(CommandResult.Status.CONFLICT,f.store.applyHomeRecovery(new ApplyPosition(1,++index),conflict).result().status());
+                assertEquals(CommandResult.Status.CONFLICT,f.store.applyHomeRecovery(new ApplyPosition(1,++index),conflict).receipt().result().status());
             }
             assertEquals(promises,f.store.homeRecoveryCapacity().reservedCount()); var full=f.store.homeRecoveryCapacity();
             var stale=helper.abort(original,20000); assertThrows(IllegalStateException.class,() -> f.store.estimateHomeRecovery(stale)); final int failedIndex=index+1;
-            assertThrows(IllegalStateException.class,() -> f.store.applyHomeRecovery(new ApplyPosition(1,failedIndex),stale)); assertEquals(full,f.store.homeRecoveryCapacity());
+            assertThrows(IllegalStateException.class,() -> f.store.applyHomeRecovery(new ApplyPosition(1,failedIndex),stale).receipt()); assertEquals(full,f.store.homeRecoveryCapacity());
             var abort=helper.abort(voted,20001); var estimate=f.store.estimateHomeRecovery(abort); assertTrue(estimate.creditCovered()); assertEquals(0,estimate.additionalCount()); assertEquals(0,estimate.additionalBytes());
-            assertEquals(CommandResult.Status.SUCCESS,f.store.applyHomeRecovery(new ApplyPosition(1,++index),abort).result().status()); assertEquals(promises-1,f.store.homeRecoveryCapacity().reservedCount());
+            assertEquals(CommandResult.Status.SUCCESS,f.store.applyHomeRecovery(new ApplyPosition(1,++index),abort).receipt().result().status()); assertEquals(promises-1,f.store.homeRecoveryCapacity().reservedCount());
             var terminal=voted.decide(TransactionStatus.Phase.ABORT); var finalization=new ParticipantFinalization(helper.group,1,helper.participant,new OperationId(new UUID(0,800),1,0),terminal);
             var outcome=new ParticipantOutcome(finalization,new ApplyPosition(7,50),ParticipantVote.prepared(new ApplyPosition(1,1)),null);
             var ack=new HomeRecovery(HomeRecovery.Action.ACK,helper.cas(new OperationId(helper.recoverySession,0,20002),terminal,terminal.finalized(helper.participant)),HomeRecovery.Proof.from(outcome));
-            assertTrue(f.store.estimateHomeRecovery(ack).creditCovered()); assertEquals(CommandResult.Status.SUCCESS,f.store.applyHomeRecovery(new ApplyPosition(1,++index),ack).result().status());
+            assertTrue(f.store.estimateHomeRecovery(ack).creditCovered()); assertEquals(CommandResult.Status.SUCCESS,f.store.applyHomeRecovery(new ApplyPosition(1,++index),ack).receipt().result().status());
             assertEquals(promises-2,f.store.homeRecoveryCapacity().reservedCount()); assertTrue(f.store.homeRecoveryCapacity().effectiveCount()<=ReplicatedRangeStore.MAX_HOME_RECOVERIES); assertTrue(f.store.homeRecoveryCapacity().effectiveBytes()<=ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES);
         }
     }
@@ -67,7 +67,7 @@ class NativeHomeRecoveryReservationsTest {
             assertEquals(2,f.store.homeRecoveryCapacity().reservedCount()); assertTrue(f.store.estimateHomeRecovery(helper.abort(initial,0)).creditCovered());
             var vote=initial.prepared(helper.participant,new byte[32],new ApplyPosition(1,1));
             assertThrows(IllegalStateException.class,() -> helper.apply(f,3,helper.cas(new OperationId(helper.user,5,0),initial,vote))); assertEquals(new ApplyPosition(1,2),f.store.applied());
-            f.store.applyHomeRecovery(new ApplyPosition(1,3),helper.abort(initial,0)); assertEquals(1,f.store.homeRecoveryCapacity().reservedCount());
+            f.store.applyHomeRecovery(new ApplyPosition(1,3),helper.abort(initial,0)).receipt(); assertEquals(1,f.store.homeRecoveryCapacity().reservedCount());
         }
         try (var f=helper.new Fixture(root.resolve("target"))) {
             f.store.fence(); f.store.installSnapshot(image,helper.limits); f.store.activate(); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount()); configure(f);

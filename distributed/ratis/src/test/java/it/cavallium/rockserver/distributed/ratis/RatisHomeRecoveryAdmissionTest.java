@@ -67,7 +67,7 @@ class RatisHomeRecoveryAdmissionTest {
     }
     HomeRecoveryReceipt apply(RatisRetentionAdmissionTest.Fixture f,TransactionContext pending,long index) throws Exception {
         assertNull(pending.getException()); f.machine.preAppendTransaction(pending); pending.initLogEntry(1,index);
-        return HomeRecoveryReceipt.decode(f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray());
+        return HomeRecoveryResult.decode(f.machine.applyTransaction(pending).get(5,TimeUnit.SECONDS).getContent().toByteArray()).receipt();
     }
     void released(RatisRetentionAdmissionTest.Fixture f) throws Exception {
         assertEquals(0,f.machine.homeRecoveryInputBytes()); assertEquals(0,f.machine.homeRecoverySlots()); assertEquals(0,f.machine.reservedHomeRecoveryCount()); assertEquals(0,f.machine.proposalFootprintStats().candidates()); f.assertReleased();

@@ -271,7 +271,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     private HomeRecoveryReceipt authorizeHomeRecoveryCall(PreparedHomeRecoveryOperation operation) throws IOException {
         try {
             var input=ByteBuffer.wrap(transactionReply(operation.descriptor,ScopedTransactionRpc.HOME_RECOVERY_PREPARE,operation.bytes,true));
-            byte[] digest=ScopedTransactionRpc.blob(input,32,false),receipt=ScopedTransactionRpc.blob(input,HomeRecoveryReceipt.MAX_BYTES,true);
+            byte[] digest=ScopedTransactionRpc.blob(input,32,false),receipt=ScopedTransactionRpc.blob(input,HomeRecoveryResult.MAX_BYTES,true);
             if (!Arrays.equals(digest,operation.recovery.digest()) || input.hasRemaining()) throw new IllegalArgumentException("HOME recovery preparation changed its frozen request");
             return receipt==null ? null : homeReceipt(operation,receipt);
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid HOME recovery preparation reply",malformed); }
@@ -288,7 +288,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
         try {
             var input=ByteBuffer.wrap(transactionReply(operation.descriptor,ScopedTransactionRpc.HOME_RECOVERY_RESULT,operation.bytes,true));
-            var bytes=ScopedTransactionRpc.blob(input,HomeRecoveryReceipt.MAX_BYTES,true);
+            var bytes=ScopedTransactionRpc.blob(input,HomeRecoveryResult.MAX_BYTES,true);
             if (input.hasRemaining()) throw new IllegalArgumentException("Trailing HOME recovery receipt");
             return bytes==null ? null : homeReceipt(operation,bytes);
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid retained HOME recovery receipt",malformed); }
@@ -302,9 +302,16 @@ public final class RatisRoutedClient implements AutoCloseable {
             if (!Arrays.equals(reply,operation.recovery.digest())) throw new IOException("HOME recovery cancellation identity changed");
         } finally { endCall(); }
     }
-    private static HomeRecoveryReceipt homeReceipt(PreparedHomeRecoveryOperation operation,byte[] bytes) {
+    private static HomeRecoveryReceipt homeReceipt(PreparedHomeRecoveryOperation operation,byte[] bytes) throws RatisHomeRetiredException {
         if (bytes==null) throw new IllegalArgumentException("Missing HOME recovery receipt");
-        var receipt=HomeRecoveryReceipt.decode(bytes);
+        var outcome=HomeRecoveryResult.decode(bytes);
+        if (outcome.retired()) {
+            var command=operation.recovery.command(); var proof=outcome.retirement();
+            var expected=new HomeIdentity(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.mutations().getFirst().columnId(),operation.recovery.before());
+            if (!proof.identity().equals(expected)) throw new IllegalArgumentException("Retired HOME recovery identity changed");
+            throw new RatisHomeRetiredException(proof);
+        }
+        var receipt=outcome.receipt();
         if (!receipt.recovery().equals(operation.recovery)) throw new IllegalArgumentException("HOME recovery receipt belongs to another frozen request");
         return receipt;
     }
@@ -428,6 +435,41 @@ public final class RatisRoutedClient implements AutoCloseable {
                     || !Arrays.equals(participant.schemaDigest(),observed.schemaDigest()) || !decision.clusterId().equals(observed.clusterId()) || !decision.databaseId().equals(observed.databaseId()) || !decision.domainId().equals(observed.domainId())) throw new IllegalArgumentException("Participant outcome route/identity changed");
             return outcome;
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant outcome reply",invalid); }
+    }
+    private RangeDescriptor homeRoute(HomeIdentity identity) {
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(identity.groupId())).findFirst().orElseThrow(() -> new IllegalArgumentException("HOME route absent"));
+        if (descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || descriptor.rangeEpoch()!=identity.rangeEpoch() || !observed.columns().equals(java.util.Set.of(identity.columnId()))
+                || !observed.clusterId().equals(identity.definition().clusterId()) || !observed.databaseId().equals(identity.definition().databaseId()) || !Arrays.equals(observed.schemaDigest(),identity.schemaDigest())) throw new IllegalArgumentException("HOME identity differs from route");
+        return descriptor;
+    }
+    public HomeFenceProof homeFence(HomeIdentity identity) throws IOException {
+        Objects.requireNonNull(identity); var descriptor=homeRoute(identity); beginCall();
+        try {
+            var input=ByteBuffer.wrap(transactionReply(descriptor,ScopedTransactionRpc.HOME_FENCE,identity.encode(),true));
+            if (input.remaining()<36) throw new IllegalArgumentException("Truncated HOME fence reply"); byte[] digest=new byte[32]; input.get(digest);
+            byte[] bytes=ScopedTransactionRpc.blob(input,HomeFenceProof.MAX_BYTES,true);
+            if (!Arrays.equals(digest,identity.digest()) || input.hasRemaining()) throw new IllegalArgumentException("HOME fence binding changed");
+            if (bytes==null) return null; var proof=HomeFenceProof.decode(bytes); if (!proof.identity().equals(identity)) throw new IllegalArgumentException("HOME fence identity changed"); return proof;
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid HOME fence reply",malformed); }
+        finally { endCall(); }
+    }
+    public void retireHome(HomeRetirement retirement) throws IOException {
+        Objects.requireNonNull(retirement); var descriptor=homeRoute(retirement.identity()); beginCall();
+        try {
+            byte[] record=RatisHomeRetirementRecord.encode(retirement),digest=retirement.digest();
+            byte[] reply=transactionReply(descriptor,ScopedTransactionRpc.HOME_RETIRE_PREPARE,record,true);
+            if (reply.length!=33 || !Arrays.equals(Arrays.copyOf(reply,32),digest) || (reply[32]&255)>1) throw new IOException("Invalid HOME retirement authority reply");
+            if (reply[32]==1) return;
+            var result=CommandResult.decode(transport.participant(descriptor,record));
+            if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=0) throw new IOException("Invalid HOME retirement applied reply");
+        } finally { endCall(); }
+    }
+    public void cancelHomeRetirement(HomeRetirement retirement) throws IOException {
+        Objects.requireNonNull(retirement); var descriptor=homeRoute(retirement.identity()); beginCall();
+        try {
+            byte[] reply=transactionReply(descriptor,ScopedTransactionRpc.HOME_RETIRE_CANCEL,RatisHomeRetirementRecord.encode(retirement),true);
+            if (reply.length!=33 || !Arrays.equals(Arrays.copyOf(reply,32),retirement.digest()) || reply[32]!=0) throw new IOException("Invalid HOME retirement cancellation reply");
+        } finally { endCall(); }
     }
     /** Reclaim only the exact terminal family after qualified server-side consumed HOME validation. */
     public void retireParticipant(ParticipantRetirement retirement) throws IOException {

@@ -29,6 +29,18 @@ public final class RatisTransactionStatuses {
     RatisRoutedClient.PreparedCommand restore(DistributedCommand command,RangeDescriptor descriptor) {
         var restored=routed.restoreSessionCommand(command,descriptor); validate(restored); return restored;
     }
+    public HomeIdentity identity(TransactionStatus definition,RangeDescriptor descriptor) {
+        var identity=new HomeIdentity(descriptor.groupId(),descriptor.rangeEpoch(),routed.directory().schemaDigest(),column,definition);
+        if (!definition.clusterId().equals(cluster) || !definition.databaseId().equals(database)) throw new IllegalArgumentException("HOME definition belongs to another database"); return identity;
+    }
+    public HomeFenceProof fence(HomeIdentity identity) throws IOException {
+        if (!identity.columnId().equals(column) || !identity.definition().clusterId().equals(cluster) || !identity.definition().databaseId().equals(database)) throw new IllegalArgumentException("HOME fence context changed");
+        return routed.homeFence(identity);
+    }
+    public void retire(HomeRetirement retirement) throws IOException {
+        if (!retirement.identity().columnId().equals(column) || !retirement.identity().definition().clusterId().equals(cluster) || !retirement.identity().definition().databaseId().equals(database)) throw new IllegalArgumentException("HOME retirement context changed");
+        routed.retireHome(retirement);
+    }
     public record RegistrationRead(TransactionStatus status,RangeDescriptor descriptor) {}
     public TransactionStatus read(UUID transaction) throws IOException { return readRegistration(transaction).status(); }
     public RegistrationRead readRegistration(UUID transaction) throws IOException {
