@@ -641,6 +641,12 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
         public CommandResult stage(List<Mutation> mutations) throws IOException { return stage(mutations,List.of()); }
         public byte[] participantPlanDigest(DistributedCommand intent,CommandResult stagedResult) throws IOException { return participantIntent(intent,stagedResult).payloadDigest(); }
+        /** Freeze the original complete read scope as a participant with no user effects. */
+        public DistributedCommand readCertification(OperationId operation) throws IOException {
+            synchronized (this) { if (closed) throw new IOException("Transaction handle is closed"); }
+            var audit=new TransactionAcceptance(handle.position(),handle.generation(),handle.owner(),scope,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
+            return DistributedCommand.readCertification(descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,operation,audit);
+        }
         /** Freeze an accepted-plan image for registration/journaling; server PREPARE authority is still required. */
         public DistributedCommand participantIntent(DistributedCommand intent,CommandResult stagedResult) throws IOException {
             synchronized (this) { if (closed) throw new IOException("Transaction handle is closed"); }
@@ -648,7 +654,7 @@ public final class RatisRoutedClient implements AutoCloseable {
             var audit=new TransactionAcceptance(handle.position(),handle.generation(),handle.owner(),scope,stagedResult.encode());
             return DistributedCommand.acceptedTransaction(intent,audit);
         }
-        /** Authorize this handle's exact staged accepted image without rebasing its original pin. */
+        /** Authorize this handle's accepted writes or complete read scope without rebasing its original pin. */
         public PreparedParticipantOperation authorizeParticipant(DistributedCommand acceptedBusiness,OperationId control,UUID transactionId) throws IOException {
             Objects.requireNonNull(control); Objects.requireNonNull(transactionId);
             synchronized (this) { if (closed) throw new IOException("Transaction handle is closed"); }
@@ -839,7 +845,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
-                || command.mutations().isEmpty() && command.predicates().isEmpty() && command.acknowledgedThrough()<0) {
+                || command.mutations().isEmpty() && command.predicates().isEmpty() && command.acknowledgedThrough()<0 && !command.readCertification()) {
             throw new IllegalArgumentException("Invalid recovered user command route");
         }
         int prefix=observed.routingPrefixBytes();

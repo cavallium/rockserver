@@ -55,7 +55,6 @@ public final class DistributedCommandCodec {
         var operation=new OperationId(uuid(input),input.getLong(),input.getLong()); long ack=input.getLong(); int count=input.getInt(), predicates=input.getInt();
         boolean data=kind==DistributedCommand.Kind.DATA || kind==DistributedCommand.Kind.COMMIT_ACCEPTED;
         if (epoch<0 || ack< -1 || ack>=operation.sequence() || kind==DistributedCommand.Kind.SESSION_FLOOR && ack!=-1
-                || kind==DistributedCommand.Kind.COMMIT_ACCEPTED && count==0 && predicates==0
                 || kind==DistributedCommand.Kind.DATA && count==0 && predicates==0 && ack<0
                 || count<0 || predicates<0 || (long)count+predicates>MAX_ITEMS || !data && (count!=0 || predicates!=0)
                 || 26L*count+25L*predicates>input.remaining()) throw new IllegalArgumentException("Invalid command kind/item counts");

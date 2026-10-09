@@ -87,6 +87,14 @@ does not establish complete distributed API parity or production acceptance.
   phantoms. Physical collision-bucket members share one stamp. Range deletion
   conservatively invalidates tracked observations. Exact native snapshots retain
   old values; there is no version CF over every stored user key.
+  A tracked gate capture registers that history and its native snapshot under one
+  apply-lane cut. Read-only participants use COMMIT_ACCEPTED with the complete
+  original scope and a zero-value SUCCESS result, without invented predicates or
+  mutations. PREPARE certifies history before transferring the full scope to a
+  durable read lock; COMMIT records success without user effects. Routed scoped
+  handles authorize these participants only when no staged effects would be lost.
+  Public cross-group writable capture/adoption remains unfinished; immutable
+  snapshot leases cannot be promoted after capture.
 - Scoped OPEN/GET/PAGE/PLAN/CLOSE use one framed query protocol for data and catalogue
   groups. OPEN requires a proven fresh linearizable barrier and ready native owner.
   Later owned operations use the fixed snapshot cut, not a new current read. Stale

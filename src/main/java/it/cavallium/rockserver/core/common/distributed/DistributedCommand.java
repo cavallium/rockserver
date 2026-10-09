@@ -47,6 +47,10 @@ public final class DistributedCommand {
         return new DistributedCommand(Kind.COMMIT_ACCEPTED,base.groupId,base.rangeEpoch,base.schemaDigest,base.operationId,base.mutations,base.predicates,
                 base.acknowledgedThrough,-1,null,acceptance,null);
     }
+    /** Explicit serializable read dependency, carrying its original nonempty physical scope and no user effects. */
+    public static DistributedCommand readCertification(UUID groupId,long rangeEpoch,byte[] schemaDigest,OperationId operationId,TransactionAcceptance acceptance) {
+        return new DistributedCommand(Kind.COMMIT_ACCEPTED,groupId,rangeEpoch,schemaDigest,operationId,List.of(),List.of(),-1,-1,null,Objects.requireNonNull(acceptance),null);
+    }
     /** Internal no-effects record retaining the accepted command's receipt identity, without its operands. */
     public static DistributedCommand rejectAcceptedTransaction(DistributedCommand original) {
         Objects.requireNonNull(original);
@@ -63,7 +67,7 @@ public final class DistributedCommand {
         boolean data=kind==Kind.DATA || kind==Kind.COMMIT_ACCEPTED;
         if (!data && (!mutations.isEmpty() || !predicates.isEmpty())
                 || kind==Kind.DATA && mutations.isEmpty() && predicates.isEmpty() && acknowledgedThrough<0
-                || kind==Kind.COMMIT_ACCEPTED && mutations.isEmpty() && predicates.isEmpty()
+                || kind==Kind.COMMIT_ACCEPTED && mutations.isEmpty() && predicates.isEmpty() && acknowledgedThrough!=-1
                 || kind==Kind.SESSION_FLOOR && acknowledgedThrough!=-1
                 || (kind==Kind.SESSION_CONTROL)!=(sessionControl!=null)
                 || (kind==Kind.COMMIT_ACCEPTED)!=(acceptance!=null)
@@ -103,6 +107,7 @@ public final class DistributedCommand {
     public long minimumSessionEpoch() { return minimumSessionEpoch; }
     public RangeSessionControl sessionControl() { return sessionControl; }
     public TransactionAcceptance acceptance() { return acceptance; }
+    public boolean readCertification() { return kind==Kind.COMMIT_ACCEPTED && mutations.isEmpty() && predicates.isEmpty(); }
     public boolean hasBucketData() { return hasBucketData; }
     public boolean transactionRejection() { return kind==Kind.COMMIT_REJECTED; }
     public byte[] rejectionDigest() { return rejectionDigest==null ? null : rejectionDigest.clone(); }

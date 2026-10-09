@@ -17,6 +17,7 @@ import it.cavallium.rockserver.core.common.distributed.ParticipantFinalizationRe
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RejectedParticipant;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
+import it.cavallium.rockserver.core.common.distributed.TransactionAcceptance;
 import it.cavallium.rockserver.core.common.distributed.SnapshotHomeIdentity;
 import it.cavallium.rockserver.core.common.distributed.SnapshotHomeFenceProof;
 import it.cavallium.rockserver.core.common.distributed.SnapshotHomeRetirement;
@@ -1731,7 +1732,7 @@ public final class ReplicatedRangeStore {
             requirePreparation(preparation,true);
             var control=preparation.operation(); long minimumControl=minimumSessionEpoch(null); long controlFloor=control.epoch()<minimumControl ? -1 : acknowledgedThrough(control,null);
             var business=preparation.business();
-            var controlCommand=new DistributedCommand(business.groupId(),business.rangeEpoch(),business.schemaDigest(),control,business.mutations(),business.predicates());
+            var controlCommand=business.readCertification() ? DistributedCommand.readCertification(business.groupId(),business.rangeEpoch(),business.schemaDigest(),control,business.acceptance()) : new DistributedCommand(business.groupId(),business.rangeEpoch(),business.schemaDigest(),control,business.mutations(),business.predicates());
             if (control.epoch()<minimumControl || control.sequence()<=controlFloor || sessionDecision(controlCommand,controlFloor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepare control session is fenced; query its durable state");
             for (var record:preparedIndex.records()) if (record.preparation().transactionId().equals(preparation.transactionId())) {
                 if (!record.preparation().equals(preparation)) throw new IllegalArgumentException("Prepared transaction payload changed");
@@ -2417,10 +2418,16 @@ public final class ReplicatedRangeStore {
         }
     }
     /** The adapter supplies a fresh leader/read barrier; validation alone confers no commit authority. */
-    public ScopedHistoryPin captureTracked(TransactionScope scope) throws RocksDBException {
+    public ScopedHistoryPin captureTracked(TransactionScope scope) throws RocksDBException { return captureTracked(scope,null); }
+    /** Active-gate capture plus history registration is one atomic native cut; release does not replace this pin. */
+    public ScopedHistoryPin captureTrackedGate(SnapshotFence fence) throws RocksDBException {
+        Objects.requireNonNull(fence); return captureTracked(fence.participant(groupId).scope(),fence);
+    }
+    private ScopedHistoryPin captureTracked(TransactionScope scope,SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(scope); enterNative(); applyLane.lock(); ScopedSnapshot snapshot=null; RangeMutationHistory.Pin registration=null;
         try {
             requireActive(); validateSnapshotScope(scope); ensureReceiptUsage(); requireUnlocked(scope);
+            if (fence!=null) { requireSnapshotFence(fence); if (fence.operation().epoch()<minimumSessionEpoch(null)) throw new SnapshotRetentionExpiredException(); requireActiveGate(fence); }
             if (scopedHistory==null) throw new UnsupportedOperationException("Scoped mutation history is not enabled");
             if (applied==null || applied.term()==0) throw new IllegalStateException("Tracked snapshot requires a positive completed term");
             scopedHistory.checkOpenCapacity(scope); long scopeBytes=RangeMutationHistory.accountedScopeBytes(scope);
@@ -2463,6 +2470,21 @@ public final class ReplicatedRangeStore {
             validate(accepted); return accepted;
         } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
+    /** Certify the complete original read scope with no fabricated predicates or user mutations. */
+    public DistributedCommand planReadCertification(ScopedHistoryPin pin,OperationId operation,long generation,UUID incarnation) throws RocksDBException {
+        Objects.requireNonNull(pin); Objects.requireNonNull(operation); Objects.requireNonNull(incarnation);
+        if (pin.owner()!=this) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireUnlocked(pin.scope()); requireUngated(pin.scope());
+            if (pin.validateUnderLane()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot failed serializable validation: "+pin.status());
+            var accepted=DistributedCommand.readCertification(groupId,rangeEpoch,schemaDigest,operation,new TransactionAcceptance(pin.position(),generation,incarnation,pin.scope(),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
+            validate(accepted); long minimum=minimumSessionEpoch(null); long floor=operation.epoch()<minimum ? -1 : acknowledgedThrough(operation,null);
+            if (operation.epoch()<minimum || operation.sequence()<=floor || db.get(receipts,receiptKey(operation))!=null || sessionDecision(accepted,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Read certification operation/session is no longer eligible");
+            requireActive(); if (pin.status()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot lost certification ownership");
+            return accepted;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
     private void validateScopedCommand(ScopedHistoryPin pin,DistributedCommand command) {
         for (var mutation:command.mutations()) {
             if (mutation.kind()==Mutation.Kind.DELETE_RANGE ? !pin.scope().containsRange(mutation.columnId(),mutation.key(),mutation.value())
@@ -2479,6 +2501,7 @@ public final class ReplicatedRangeStore {
         }
         public TransactionScope scope() { return snapshot.scope(); }
         private ReplicatedRangeStore owner() { return ReplicatedRangeStore.this; }
+        public boolean belongsTo(ReplicatedRangeStore store) { return owner()==store; }
         public ApplyPosition position() { return snapshot.position(); }
         public RangeMutationHistory.Status status() {
             var status=registration.status(); if (status!=RangeMutationHistory.Status.ACTIVE) return status;

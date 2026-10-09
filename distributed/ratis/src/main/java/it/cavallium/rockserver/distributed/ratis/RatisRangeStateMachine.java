@@ -28,6 +28,8 @@ import it.cavallium.rockserver.core.common.distributed.SnapshotGateRetirement;
 import it.cavallium.rockserver.core.common.distributed.SnapshotHomeIdentity;
 import it.cavallium.rockserver.core.common.distributed.SnapshotHomeRetirement;
 import it.cavallium.rockserver.core.common.distributed.TransactionScope;
+import it.cavallium.rockserver.core.common.distributed.TransactionAcceptance;
+import it.cavallium.rockserver.core.common.distributed.CommandResult;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import java.util.ArrayList;
 import java.util.List;
@@ -1162,7 +1164,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         return ready;
     }
-    public ReplicatedRangeStore.ScopedSnapshot captureSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence) throws Exception { requireDataRole();
+    public ReplicatedRangeStore.ScopedSnapshot captureSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence) throws Exception {
+        return captureSnapshotGate(homes,fence,() -> store.captureGate(fence));
+    }
+    /** The snapshot gate cut also retains complete scoped history for later read certification. */
+    public ReplicatedRangeStore.ScopedHistoryPin captureTrackedSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence) throws Exception {
+        return captureSnapshotGate(homes,fence,() -> store.captureTrackedGate(fence));
+    }
+    private <T extends AutoCloseable> T captureSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence,java.util.concurrent.Callable<T> capture) throws Exception {
+        requireDataRole(); java.util.Objects.requireNonNull(homes); java.util.Objects.requireNonNull(fence);
         checkTransactionOwner(); long generation=admissionGeneration.get();
         if (store.snapshotFence(fence)!=null) throw new RatisSnapshotLostException("Snapshot gate has retired");
         var read=homes.readRegistration(fence.fenceId()); var status=read.status();
@@ -1176,8 +1186,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (store.snapshotFence(fence)!=null) throw new RatisSnapshotLostException("Snapshot gate retired during capture",unavailable);
             throw unavailable;
         }
-        final ReplicatedRangeStore.ScopedSnapshot pin;
-        try { pin=store.captureGate(fence); } catch (it.cavallium.rockserver.core.common.distributed.SnapshotRetentionExpiredException expired) { throw new RatisSnapshotLostException("Snapshot business epoch expired",expired); }
+        final T pin;
+        try { pin=capture.call(); } catch (it.cavallium.rockserver.core.common.distributed.SnapshotRetentionExpiredException expired) { throw new RatisSnapshotLostException("Snapshot business epoch expired",expired); }
         boolean retained=false;
         try { checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot capture lost leadership"); retained=true; return pin; }
         finally { if (!retained) pin.close(); }
@@ -2114,12 +2124,26 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     public byte[] participantPlanDigest(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception { return participantIntent(pin,business).payloadDigest(); }
     /** Canonical planning data for durable registration; this grants no PREPARE append authority. */
     public DistributedCommand participantIntent(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business) throws Exception { requireDataRole();
+        java.util.Objects.requireNonNull(pin);
+        if (!pin.belongsTo(store)) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
         checkTransactionOwner(); long generation=transactionGeneration(); commandValidator.accept(business);
         try (var stage=pin.stage(business)) {
             checkTransactionOwner(); if (generation!=transactionGeneration() || pin.position().term()!=transactionTerm()) throw new IllegalStateException("Participant read owner changed");
             var accepted=DistributedCommand.acceptedTransaction(business,new it.cavallium.rockserver.core.common.distributed.TransactionAcceptance(pin.position(),generation,transactionIncarnation,pin.scope(),stage.result().encode()));
             commandValidator.accept(accepted); return accepted;
         }
+    }
+    /** Freeze a read dependency at its original complete scope without inventing DATA operands. */
+    public DistributedCommand participantReadIntent(ReplicatedRangeStore.ScopedHistoryPin pin,OperationId operation) throws Exception { requireDataRole();
+        java.util.Objects.requireNonNull(pin); java.util.Objects.requireNonNull(operation);
+        checkTransactionOwner(); long generation=transactionGeneration();
+        if (!pin.belongsTo(store)) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
+        if (pin.status()!=RangeMutationHistory.Status.ACTIVE || pin.position().term()!=transactionTerm()) throw new IllegalStateException("Participant read owner changed");
+        var accepted=DistributedCommand.readCertification(store.ownership().owner().groupId(),store.ownership().owner().epoch(),store.schemaDigest(),operation,
+                new TransactionAcceptance(pin.position(),generation,transactionIncarnation,pin.scope(),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
+        commandValidator.accept(accepted); store.validate(accepted);
+        checkTransactionOwner(); if (generation!=transactionGeneration() || pin.status()!=RangeMutationHistory.Status.ACTIVE || pin.position().term()!=transactionTerm()) throw new IllegalStateException("Participant read owner changed");
+        return accepted;
     }
     /** Reattach exact live PREPARE authority after a lost coordinator reply; never recreate a read cut. */
     public ParticipantProposal reattachParticipant(UUID transaction,OperationId control,DistributedCommand accepted) throws IOException { requireDataRole();
@@ -2182,6 +2206,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     ParticipantProposal prepareHandleParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand accepted,OperationId control,UUID transaction,ProposalDeadline deadline) throws Exception {
         var homes=transactionHomes; if (homes==null) throw new IOException("Qualified transaction HOME reader is not configured");
+        if (accepted.readCertification()) return prepareReadParticipant(pin,accepted,control,homes,transaction,deadline);
         var business=new DistributedCommand(accepted.groupId(),accepted.rangeEpoch(),accepted.schemaDigest(),accepted.operationId(),accepted.mutations(),accepted.predicates(),accepted.acknowledgedThrough());
         var proposal=prepareParticipant(pin,business,control,homes,transaction,deadline);
         if (!Arrays.equals(proposal.preparation().business().payloadDigest(),accepted.payloadDigest())) { proposal.close(); throw new IllegalArgumentException("Participant preparation changed original staged cut/result"); }
@@ -2191,6 +2216,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return prepareParticipant(pin,business,control,homes,transaction,null);
     }
     ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,RatisTransactionStatuses homes,UUID transaction,ProposalDeadline deadline) throws Exception { requireDataRole();
+        if (business.readCertification()) return prepareReadParticipant(pin,business,control,homes,transaction,deadline);
         java.util.Objects.requireNonNull(pin); java.util.Objects.requireNonNull(control); commandValidator.accept(business);
         if (control.equals(business.operationId())) throw new IllegalArgumentException("Prepare control identity must differ from business identity");
         var preparing=reserveParticipant(pin.scope(),business.operationId(),control,transaction,false,deadline);
@@ -2199,6 +2225,24 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (preparing.hold().payload!=null) return participantIntent(pin,business);
             if (!store.estimateReceiptRetention(business,enableSessionControls).newReceipt()) throw new IllegalStateException("Business operation already has an outcome");
             return store.planScopedCommit(pin,business,preparing.hold().generation,transactionIncarnation);
+        });
+    }
+    private ParticipantProposal prepareReadParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand accepted,OperationId control,RatisTransactionStatuses homes,UUID transaction,ProposalDeadline deadline) throws Exception {
+        java.util.Objects.requireNonNull(pin); java.util.Objects.requireNonNull(control); checkTransactionOwner();
+        if (!pin.belongsTo(store)) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
+        if (pin.status()!=RangeMutationHistory.Status.ACTIVE || pin.position().term()!=transactionTerm()) throw new IllegalStateException("Original participant read owner changed");
+        var audit=accepted.acceptance();
+        if (!accepted.readCertification() || control.equals(accepted.operationId()) || !audit.snapshot().equals(pin.position())
+                || audit.leaderGeneration()!=transactionGeneration() || !audit.ownerIncarnation().equals(transactionIncarnation)
+                || !Arrays.equals(ScopedTransactionRpc.scopeBytes(audit.scope()),ScopedTransactionRpc.scopeBytes(pin.scope()))) throw new IllegalArgumentException("Read certification differs from original pin/owner");
+        commandValidator.accept(accepted); store.validate(accepted);
+        var preparing=reserveParticipant(pin.scope(),accepted.operationId(),control,transaction,false,deadline);
+        return finishParticipantPreparation(preparing,homes,transaction,pin,deadline,() -> {
+            if (pin.position().term()!=preparing.hold().term) throw new IllegalStateException("Original participant pin changed term");
+            if (preparing.hold().payload!=null) return accepted;
+            var certified=store.planReadCertification(pin,accepted.operationId(),preparing.hold().generation,transactionIncarnation);
+            if (!Arrays.equals(certified.payloadDigest(),accepted.payloadDigest())) throw new IllegalArgumentException("Read certification changed original cut/scope/result");
+            return certified;
         });
     }
     /** Reject a frozen original plan under current gate authority without reopening or rebasing its read cut. */

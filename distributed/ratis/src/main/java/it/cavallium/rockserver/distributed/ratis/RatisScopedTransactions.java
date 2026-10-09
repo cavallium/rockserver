@@ -175,7 +175,9 @@ final class RatisScopedTransactions implements AutoCloseable {
                 if (!original.transactionId().equals(transaction) || !original.operation().equals(control) || !Arrays.equals(original.business().payloadDigest(),accepted.payloadDigest())) throw new IllegalArgumentException("Participant authorization retry changed original image");
                 try (var current=machine.reattachParticipant(transaction,control,accepted)) { checked(entry); return current.bytes(); }
             }
-            if (entry.stagedCommand==null || !samePlan(entry.stagedCommand,accepted) || !Arrays.equals(entry.staging.result().encode(),audit.result())) throw new IllegalArgumentException("Participant differs from exact staged prefix/result");
+            if (accepted.readCertification()) {
+                if (entry.stagedCommand!=null) throw new IllegalArgumentException("Read certification cannot discard staged effects");
+            } else if (entry.stagedCommand==null || !samePlan(entry.stagedCommand,accepted) || !Arrays.equals(entry.staging.result().encode(),audit.result())) throw new IllegalArgumentException("Participant differs from exact staged prefix/result");
             int reserve=PreparedParticipant.Preparation.MAX_BYTES+8;
             synchronized (this) { if (reserve>limits.planBytes()-planBytes) throw new IOException("Participant retained-plan admission exhausted"); entry.planBytes=reserve; planBytes+=reserve; entry.planning=true; }
             preserve=false;

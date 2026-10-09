@@ -18,6 +18,43 @@ class RatisRemoteParticipantAuthorizationTest {
         var initial=TransactionStatus.begin(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,48000),accepted.operationId(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(data.f.groupId,data.f.groupId,1,new byte[32],accepted.payloadDigest(),null,false)));
         home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,0),null,initial)); return initial;
     }
+    @Test void remoteReadParticipantPreparesOriginalScopeAndCommitsWithoutUserEffects() throws Exception {
+        helper.root=root;
+        try (var home=helper.new Node("read-home",true); var data=helper.new Node("read-data",false);
+             var handle=data.routed.openTransaction(helper.scope(data,1,4),Duration.ofSeconds(30))) {
+            assertNull(handle.get(data.f.column,new byte[]{2}));
+            var accepted=handle.readCertification(new OperationId(data.f.session,1,10));
+            var initial=register(home,data,accepted);
+            var operation=handle.authorizeParticipant(accepted,helper.control(0),initial.transactionId());
+            assertTrue(operation.preparation().business().readCertification());
+            assertEquals(handle.snapshot(),operation.preparation().business().acceptance().snapshot());
+            var vote=data.routed.executeParticipant(operation);
+            assertTrue(vote.prepared());
+            assertNotNull(data.f.propose(data.f.put(2)).getException());
+            var prepared=initial.prepared(data.f.groupId,accepted.payloadDigest(),vote.position());
+            home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,1),initial,prepared));
+            var decision=prepared.decide(TransactionStatus.Phase.COMMIT);
+            home.statuses.execute(home.statuses.prepare(new OperationId(new UUID(0,4),1,2),prepared,decision));
+            data.routed.executeFinalization(data.routed.prepareFinalization(new ParticipantFinalization(home.f.groupId,1,data.f.groupId,helper.control(1),decision)));
+            var result=CommandResult.decode(data.routed.finalizedParticipant(data.f.groupId,initial.transactionId()).result());
+            assertEquals(CommandResult.Status.SUCCESS,result.status()); assertEquals(0,result.valueCount());
+            assertNull(data.wire.read(handle.descriptor(),data.f.column,new byte[]{2}));
+        }
+    }
+    @Test void remoteReadCertificationRejectsPhantomsAndCannotDiscardStagedWrites() throws Exception {
+        helper.root=root;
+        for (boolean staged:new boolean[]{false,true}) try (var home=helper.new Node("read-conflict-home-"+staged,true); var data=helper.new Node("read-conflict-data-"+staged,false);
+             var handle=data.routed.openTransaction(helper.scope(data,1,4),Duration.ofSeconds(30))) {
+            assertNull(handle.get(data.f.column,new byte[]{2}));
+            if (staged) handle.stage(data.f.put(2).mutations());
+            var accepted=handle.readCertification(new OperationId(data.f.session,1,10));
+            var initial=register(home,data,accepted);
+            if (!staged) data.wire.command(handle.descriptor(),data.f.put(2));
+            if (staged) assertThrows(IOException.class,() -> handle.authorizeParticipant(accepted,helper.control(0),initial.transactionId()));
+            else assertThrows(RatisPreparationUnavailableException.class,() -> handle.authorizeParticipant(accepted,helper.control(0),initial.transactionId()));
+            assertNull(data.routed.preparedParticipant(data.f.groupId,initial.transactionId()));
+        }
+    }
     @Test void remoteOriginalHandleAuthorizesCommitAndAbortAndLostAuthorizationReplyRetriesExactBytes() throws Exception {
         helper.root=root;
         for (boolean commit:new boolean[]{false,true}) try (var home=helper.new Node("home-"+commit,true); var data=helper.new Node("data-"+commit,false)) {
