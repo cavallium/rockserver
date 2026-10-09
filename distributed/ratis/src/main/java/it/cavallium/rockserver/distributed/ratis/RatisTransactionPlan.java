@@ -75,14 +75,22 @@ public final class RatisTransactionPlan {
     private static byte[] minimum(byte[] value,byte[] bound) { return bound==null || Arrays.compareUnsigned(value,bound)<=0 ? value : bound; }
     /** Server acceptance must preserve each original partition exactly; all result mappings enter the home definition digest. */
     public Accepted accept(UUID transaction,Map<UUID,DistributedCommand> accepted,Map<UUID,OperationId> prepares,Map<UUID,OperationId> finalizes) {
+        return accept(transaction,accepted,prepares,finalizes,Map.of(),false);
+    }
+    /** Freeze every original remote server capture after acceptance; no new capture is acquired here. */
+    public Accepted accept(UUID transaction,Map<UUID,DistributedCommand> accepted,Map<UUID,OperationId> prepares,Map<UUID,OperationId> finalizes,Map<UUID,UUID> captureIds) {
+        return accept(transaction,accepted,prepares,finalizes,Map.copyOf(captureIds),true);
+    }
+    private Accepted accept(UUID transaction,Map<UUID,DistributedCommand> accepted,Map<UUID,OperationId> prepares,Map<UUID,OperationId> finalizes,Map<UUID,UUID> captureIds,boolean remote) {
         Objects.requireNonNull(transaction); var groups=new HashSet<UUID>(); partitions.forEach(p -> groups.add(p.route().groupId()));
+        if (remote && !groups.equals(captureIds.keySet())) throw new IllegalArgumentException("Incomplete original remote capture set");
         if (!groups.equals(accepted.keySet()) || !groups.equals(prepares.keySet()) || !groups.equals(finalizes.keySet())) throw new IllegalArgumentException("Incomplete accepted transaction/control set");
         var intents=new ArrayList<RatisDurableTransaction.Intent>(); var participants=new ArrayList<TransactionStatus.Participant>();
         for (var partition:partitions) {
             var route=partition.route(); var plan=Objects.requireNonNull(accepted.get(route.groupId()));
             if (plan.acceptance()==null || !Arrays.equals(DistributedCommandCodec.encode(plan),DistributedCommandCodec.encode(DistributedCommand.acceptedTransaction(partition.command(),plan.acceptance())))) throw new IllegalArgumentException("Accepted transaction partition changed original business plan");
             if (!partition.scope().spans().stream().allMatch(span -> span.isPoint() ? plan.acceptance().scope().contains(span.columnId(),span.lowerInclusive()) : plan.acceptance().scope().containsRange(span.columnId(),span.lowerInclusive(),span.upperExclusive()))) throw new IllegalArgumentException("Accepted snapshot omitted transaction inputs");
-            intents.add(new RatisDurableTransaction.Intent(route,plan,prepares.get(route.groupId()),finalizes.get(route.groupId()),partition.resultPositions()));
+            intents.add(new RatisDurableTransaction.Intent(route,plan,prepares.get(route.groupId()),finalizes.get(route.groupId()),partition.resultPositions(),captureIds.get(route.groupId())));
             participants.add(new TransactionStatus.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),plan.payloadDigest(),null,false));
         }
         var initial=TransactionStatus.begin(directory.clusterId(),directory.databaseId(),directory.domainId(),transaction,operation,directory.schemaEpoch(),directory.schemaDigest(),RatisDurableTransaction.planDigest(intents),participants);

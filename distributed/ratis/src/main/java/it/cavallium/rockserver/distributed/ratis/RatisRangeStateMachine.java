@@ -2180,6 +2180,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         throw new IllegalStateException("Native cut kept changing during participant admission");
     }
+    ParticipantProposal prepareHandleParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand accepted,OperationId control,UUID transaction,ProposalDeadline deadline) throws Exception {
+        var homes=transactionHomes; if (homes==null) throw new IOException("Qualified transaction HOME reader is not configured");
+        var business=new DistributedCommand(accepted.groupId(),accepted.rangeEpoch(),accepted.schemaDigest(),accepted.operationId(),accepted.mutations(),accepted.predicates(),accepted.acknowledgedThrough());
+        var proposal=prepareParticipant(pin,business,control,homes,transaction,deadline);
+        if (!Arrays.equals(proposal.preparation().business().payloadDigest(),accepted.payloadDigest())) { proposal.close(); throw new IllegalArgumentException("Participant preparation changed original staged cut/result"); }
+        return proposal;
+    }
     public ParticipantProposal prepareParticipant(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand business,OperationId control,RatisTransactionStatuses homes,UUID transaction) throws Exception {
         return prepareParticipant(pin,business,control,homes,transaction,null);
     }
@@ -2426,7 +2433,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
             if (!ScopedTransactionRpc.ownerSnapshot(kind)) requireHealthy();
             if (kind==ScopedTransactionRpc.SNAPSHOT_HELP) return snapshotHelpQuery(encoded,freshBarrier);
-            if (kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
+            if (kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
                 // Reject before coalescing: a stale request must never borrow a fresh request's authority.
                 if (!freshBarrier) throw new IOException("Proof preparation requires a fresh linearizable barrier");
                 if (kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE) { if (role!=RatisNodePlan.Role.SNAPSHOT_HOME) throw new IOException("Only snapshot HOME prepares retirement"); }
@@ -2435,7 +2442,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 } else requireDataRole();
             }
             if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) requireDataRole();
-            if (kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
+            if (kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
                 var executor=proofQueries; if (executor==null) throw new IOException("Bounded proof query dispatcher is not configured");
                 long generation=admissionGeneration.get();
                 return executor.submit(store.ownership().owner().groupId(),encoded,kind!=ScopedTransactionRpc.SNAPSHOT_CAPTURE,ownedRequest -> {
@@ -2626,6 +2633,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var resume=ScopedTransactionRpc.blob(input,it.cavallium.rockserver.core.common.distributed.PhysicalRangePage.MAX_BYTES,true);
                 int items=input.getInt(), bytes=input.getInt(); end(input);
                 reply=ScopedTransactionRpc.pageBytes(scopedTransactions.page(handle,column,lower,upper,direction==1,resume,items,bytes));
+            }
+            case ScopedTransactionRpc.PARTICIPANT_AUTHORIZE -> {
+                if (!freshBarrier) throw new IOException("Participant authority requires a fresh linearizable barrier"); requireDataRole(); long generation=admissionGeneration.get(); checkTransactionOwner();
+                var handle=ScopedTransactionRpc.readHandle(input); var control=new OperationId(ScopedTransactionRpc.uuid(input),input.getLong(),input.getLong()); var transaction=ScopedTransactionRpc.uuid(input);
+                var accepted=DistributedCommandCodec.decode(ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); end(input);
+                try { byte[] canonical=scopedTransactions.authorizeParticipant(handle,accepted,control,transaction); reply=ByteBuffer.allocate(1+canonical.length).put((byte)0).put(canonical).array(); }
+                catch (RatisPreparationUnavailableException unavailable) { reply=new byte[]{1}; }
+                if (generation!=admissionGeneration.get()) throw new IOException("Participant authorization lost leader generation"); checkTransactionOwner();
             }
             case ScopedTransactionRpc.STAGE -> {
                 var handle=ScopedTransactionRpc.readHandle(input); var command=DistributedCommandCodec.decode(ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); end(input);

@@ -252,7 +252,32 @@ does not establish complete distributed API parity or production acceptance.
   home finalization ACKs; consumption remains an explicit client action. Saved terminal
   proof may authorize ACK while a participant is temporarily unavailable. The driver
   does not manufacture a consistent cross-group read cut or assemble legacy global
-  result order; scoped snapshot fences and frontend result binding remain unfinished.
+  result order by itself. Public atomic mutation result binding is supplied by the
+  async facade below; arbitrary cross-group snapshot reads remain separate work.
+- `RatisAtomicClient` exposes asynchronous logical atomic mutations and predicates
+  over one frozen schema/directory. It opens bounded original local cuts, stages
+  exact partition prefixes and forces a transaction journal before HOME/PREPARE
+  writes. Handle-bound remote authorization uses those original pins and a configured
+  qualified HOME reader. Journals bind each server lease ID into the global plan;
+  reopening restores that lease without OPEN, TTL extension or a replacement cut.
+  Original unavailable authority permits ABORT; uncertain transport retains the
+  request. Success waits for every native finalization and HOME ACK, preserving
+  original logical return order and complete collision buckets. Ordinary success
+  and close never consume results; consumption is explicit.
+  Caller-supplied identities exclusively reserve 256 control slots in an issued,
+  adequately bound grant. Grant issuance/window maintenance remains caller-owned.
+  Work uses the existing workload scheduler and a bound request deadline. Client
+  limits cap operation owners and retained bytes; each actual task admits at most
+  16 waiter views. Cancelled views do not donate actual ownership or capacity.
+  A failed condition at an original cut is a forced local CONFLICT with no HOME,
+  PREPARE or DATA writes. Its compact rejection record reopens without remote work;
+  it is not fabricated accepted-plan or terminal-HOME evidence. Rejection and accepted
+  journals share the same stable path lock and cannot overwrite one another.
+  This mutation API does not expose arbitrary multi-group reads as a shared snapshot.
+  It currently uses the coordinator for every participant count; the existing
+  one-group logical-session fast path remains available. Public legacy API/transport
+  integration, automatic identity allocation and this facade's one-group optimization
+  remain unfinished.
 - `RatisTransactionRecovery` implements explicit takeover in bounded steps. It reads
   the home freshly, retries an uncertain frozen home request when still relevant,
   proposes ABORT for otherwise-undecided PREPARING state, and completes a chosen

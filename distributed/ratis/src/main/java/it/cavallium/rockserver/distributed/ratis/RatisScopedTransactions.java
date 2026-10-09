@@ -36,6 +36,7 @@ final class RatisScopedTransactions implements AutoCloseable {
         ReplicatedRangeStore.ScopedHistoryPin pin;
         ScopedTransactionRpc.Handle handle;
         RatisRangeStateMachine.ScopedCommit plan;
+        RatisRangeStateMachine.ParticipantProposal participant;
         byte[] baseDigest;
         ReplicatedRangeStore.ScopedStaging staging;
         DistributedCommand stagedCommand;
@@ -142,6 +143,7 @@ final class RatisScopedTransactions implements AutoCloseable {
     DistributedCommand plan(ScopedTransactionRpc.Handle handle,DistributedCommand command) throws Exception {
         var entry=begin(handle,true); boolean success=false;
         try {
+            if (entry.participant!=null) throw new IllegalArgumentException("Participant already owns this handle");
             if (entry.plan!=null) {
                 success=true; // A conflicting retry must not destroy the already frozen canonical plan.
                 if (!Arrays.equals(entry.baseDigest,command.payloadDigest())) throw new IllegalArgumentException("Transaction plan retry differs from original operands");
@@ -162,10 +164,39 @@ final class RatisScopedTransactions implements AutoCloseable {
             success=true; return entry.plan.command();
         } finally { finish(entry,!success); }
     }
+    byte[] authorizeParticipant(ScopedTransactionRpc.Handle handle,DistributedCommand accepted,OperationId control,UUID transaction) throws Exception {
+        var entry=beginParticipant(handle); boolean preserve=true;
+        try {
+            if (entry.plan!=null) throw new IllegalArgumentException("Ordinary plan already owns this handle");
+            var audit=accepted.acceptance();
+            if (audit==null || accepted.acknowledgedThrough()!=-1 || !audit.snapshot().equals(handle.position()) || audit.leaderGeneration()!=handle.generation() || !audit.ownerIncarnation().equals(handle.owner()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(audit.scope()),ScopedTransactionRpc.scopeBytes(entry.scope))) throw new IllegalArgumentException("Participant accepted cut differs from original handle");
+            if (entry.participant!=null) {
+                var original=entry.participant.preparation();
+                if (!original.transactionId().equals(transaction) || !original.operation().equals(control) || !Arrays.equals(original.business().payloadDigest(),accepted.payloadDigest())) throw new IllegalArgumentException("Participant authorization retry changed original image");
+                try (var current=machine.reattachParticipant(transaction,control,accepted)) { checked(entry); return current.bytes(); }
+            }
+            if (entry.stagedCommand==null || !samePlan(entry.stagedCommand,accepted) || !Arrays.equals(entry.staging.result().encode(),audit.result())) throw new IllegalArgumentException("Participant differs from exact staged prefix/result");
+            int reserve=PreparedParticipant.Preparation.MAX_BYTES+8;
+            synchronized (this) { if (reserve>limits.planBytes()-planBytes) throw new IOException("Participant retained-plan admission exhausted"); entry.planBytes=reserve; planBytes+=reserve; entry.planning=true; }
+            preserve=false;
+            entry.participant=machine.prepareHandleParticipant(entry.pin,accepted,control,transaction,new RatisRangeStateMachine.ProposalDeadline(nanos,entry.opened,entry.ttl));
+            synchronized (this) { int bytes=entry.participant.bytes().length; planBytes+=bytes-entry.planBytes; entry.planBytes=bytes; ensureLive(entry); }
+            releaseStaging(entry); preserve=true; checked(entry); return entry.participant.bytes();
+        } catch (IllegalStateException failure) {
+            if (entry.participant==null && entry.pin.status()==RangeMutationHistory.Status.CONFLICT) throw new RatisPreparationUnavailableException("Original participant pin failed serializable validation",failure);
+            throw failure;
+        } finally {
+            if (!preserve && entry.participant==null) {
+                synchronized (this) { planBytes-=entry.planBytes; entry.planBytes=0; }
+                preserve=entry.pin.status()==RangeMutationHistory.Status.ACTIVE;
+            }
+            finish(entry,!preserve);
+        }
+    }
     void release(ScopedTransactionRpc.Handle handle) throws Exception {
         Entry entry;
         synchronized (this) {
-            if (!owner.equals(handle.owner())) throw new IOException("Transaction owner incarnation changed");
+            if (!owner.equals(handle.owner())) return; // The old incarnation alone owns its outstanding native work.
             entry=handles.get(handle.id()); if (entry==null) return;
             requireHandle(entry,handle); retire(entry);
         }
@@ -177,13 +208,22 @@ final class RatisScopedTransactions implements AutoCloseable {
         }
         cleanup();
     }
+    private Entry beginParticipant(ScopedTransactionRpc.Handle handle) throws Exception {
+        machine.checkTransactionOwner(); expire();
+        synchronized (this) {
+            var entry=handles.get(handle.id());
+            if (entry==null || closed || !owner.equals(handle.owner()) || !Objects.equals(entry.handle,handle) || !live(entry)) throw new RatisPreparationUnavailableException("Original participant handle expired or changed owner");
+            if (entry.busy) throw new IOException("Transaction operation is already running");
+            entry.busy=true; return entry;
+        }
+    }
     private Entry begin(ScopedTransactionRpc.Handle handle,boolean permitPlan) throws Exception {
         machine.checkTransactionOwner(); expire();
         synchronized (this) {
             var entry=handles.get(handle.id()); if (entry==null || closed) throw new IOException("Transaction expired or leader changed");
             requireHandle(entry,handle); ensureLive(entry);
             if (entry.busy) throw new IOException("Transaction operation is already running");
-            if (!permitPlan && entry.plan!=null) throw new IOException("Transaction plan is already frozen");
+            if (!permitPlan && (entry.plan!=null || entry.participant!=null)) throw new IOException("Transaction plan is already frozen");
             entry.busy=true; return entry;
         }
     }
@@ -191,7 +231,7 @@ final class RatisScopedTransactions implements AutoCloseable {
     private boolean live(Entry entry) {
         return !closed && !entry.closed && entry.generation==machine.transactionGeneration() && nanos.getAsLong()-entry.opened<entry.ttl
                 && (entry.pin==null || entry.pin.position().term()==machine.transactionTerm())
-                && (entry.plan!=null || entry.planning || entry.pin==null || entry.pin.status()==RangeMutationHistory.Status.ACTIVE);
+                && (entry.plan!=null || entry.participant!=null || entry.planning || entry.pin==null || entry.pin.status()==RangeMutationHistory.Status.ACTIVE);
     }
     private void ensureLive(Entry entry) throws IOException { if (!live(entry)) throw new IOException("Transaction expired or leader changed"); }
     private void requireHandle(Entry entry,ScopedTransactionRpc.Handle handle) throws IOException {
@@ -208,7 +248,7 @@ final class RatisScopedTransactions implements AutoCloseable {
         Throwable failure=null;
         for (var entry:release) {
             boolean success=false;
-            try { releaseStaging(entry); if (entry.plan!=null) entry.plan.close(); if (entry.pin!=null) entry.pin.close(); success=true; }
+            try { releaseStaging(entry); if (entry.plan!=null) entry.plan.close(); if (entry.participant!=null) entry.participant.close(); if (entry.pin!=null) entry.pin.close(); success=true; }
             catch (Throwable problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
             finally {
                 synchronized (this) {

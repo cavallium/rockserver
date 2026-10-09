@@ -28,6 +28,32 @@ class RatisTransactionPlanTest {
             assertThrows(IllegalArgumentException.class,() -> RatisTransactionPlan.create(f.directory,operation(0),List.of(),List.of()));
         }
     }
+    @Test void remoteAcceptanceFreezesACompleteCaptureSetAndLocalAuthorityRemainsExplicit() throws Exception {
+        try (var f=fixture("capture-map")) {
+            var plan=f.data.transactionPlan(operation(0),List.of(new Mutation(Mutation.Kind.PUT,helper.column,new byte[]{1},new byte[]{7},Mutation.ReturnMode.CURRENT),
+                    new Mutation(Mutation.Kind.PUT,helper.column,new byte[]{(byte)130},new byte[]{8},Mutation.ReturnMode.CURRENT)),List.of());
+            var accepted=new HashMap<UUID,DistributedCommand>(); var prepares=new HashMap<UUID,OperationId>(); var finalizes=new HashMap<UUID,OperationId>(); var ids=new HashMap<UUID,UUID>();
+            int index=0;
+            for (var part:plan.partitions()) try (var pin=f.node(part.route().groupId()).f.store.captureTracked(part.scope())) {
+                var group=part.route().groupId(); accepted.put(group,f.node(group).f.machine.participantIntent(pin,part.command()));
+                prepares.put(group,helper.control(100+index)); finalizes.put(group,helper.control(110+index)); ids.put(group,new UUID(0,10100+index++));
+            }
+            var transaction=new UUID(0,10110); var frozen=plan.accept(transaction,accepted,prepares,finalizes,ids);
+            for (var intent:frozen.intents()) assertEquals(ids.get(intent.route().groupId()),intent.captureId());
+            var local=plan.accept(transaction,accepted,prepares,finalizes); assertTrue(local.intents().stream().allMatch(intent -> intent.captureId()==null));
+            assertFalse(Arrays.equals(local.initial().planDigest(),frozen.initial().planDigest()));
+            assertThrows(IllegalArgumentException.class,() -> plan.accept(transaction,accepted,prepares,finalizes,Map.of()));
+            var missing=new HashMap<>(ids); missing.remove(plan.partitions().getFirst().route().groupId());
+            assertThrows(IllegalArgumentException.class,() -> plan.accept(transaction,accepted,prepares,finalizes,missing));
+            var extra=new HashMap<>(ids); extra.put(new UUID(0,10111),new UUID(0,10112));
+            assertThrows(IllegalArgumentException.class,() -> plan.accept(transaction,accepted,prepares,finalizes,extra));
+            var nullId=new HashMap<>(ids); nullId.put(plan.partitions().getFirst().route().groupId(),null);
+            assertThrows(NullPointerException.class,() -> plan.accept(transaction,accepted,prepares,finalizes,nullId));
+            UUID group=plan.partitions().getFirst().route().groupId(); UUID original=ids.put(group,new UUID(0,10113));
+            assertEquals(original,frozen.intents().stream().filter(intent -> intent.route().groupId().equals(group)).findFirst().orElseThrow().captureId());
+            assertFalse(Arrays.equals(frozen.initial().planDigest(),plan.accept(transaction,accepted,prepares,finalizes,ids).initial().planDigest())); assertEquals(0,f.writes());
+        }
+    }
     @Test void predicateOnlyParticipantLocksItsReadAndContributesNoSpuriousResult() throws Exception {
         try (var f=fixture("read-only")) {
             var seed=new Mutation(Mutation.Kind.PUT,helper.column,new byte[]{1},new byte[]{2}); f.data.execute(f.data.prepare(operation(0),List.of(seed)));

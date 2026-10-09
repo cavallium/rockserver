@@ -589,6 +589,17 @@ public final class RatisRoutedClient implements AutoCloseable {
             return new ScopedTransaction(descriptor,handle,scope,observed.schemaDigest());
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction open reply",malformed); }
     }
+    /** Reattach only the original server handle recorded with an accepted intent; never opens a new cut. */
+    public ScopedTransaction restoreTransaction(RatisDurableTransaction.Intent intent) throws IOException {
+        Objects.requireNonNull(intent); if (intent.captureId()==null) throw new RatisPreparationUnavailableException("Intent has no original remote capture handle");
+        var directory=current(); var accepted=intent.acceptedBusiness(); var audit=Objects.requireNonNull(accepted.acceptance(),"Intent has no accepted cut"); var route=intent.route();
+        restoreSessionCommand(accepted,route);
+        var participants=audit.scope().participants(directory,1);
+        if (participants.size()!=1) throw new IllegalArgumentException("Original capture scope changed participant");
+        var current=participants.getFirst();
+        if (!current.rangeId().equals(route.rangeId()) || !current.groupId().equals(route.groupId()) || current.rangeEpoch()!=route.rangeEpoch() || !Arrays.equals(current.lowerInclusive(),route.lowerInclusive()) || !Arrays.equals(current.upperExclusive(),route.upperExclusive())) throw new IllegalArgumentException("Original capture route changed ownership/bounds");
+        return new ScopedTransaction(route,new ScopedTransactionRpc.Handle(audit.ownerIncarnation(),intent.captureId(),audit.leaderGeneration(),audit.snapshot()),audit.scope(),accepted.schemaDigest());
+    }
     public final class ScopedTransaction implements AutoCloseable {
         private final RangeDescriptor descriptor; private final ScopedTransactionRpc.Handle handle;
         private final TransactionScope scope;
@@ -596,6 +607,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         private boolean closed;
         private ScopedTransaction(RangeDescriptor descriptor,ScopedTransactionRpc.Handle handle,TransactionScope scope,byte[] schemaDigest) { this.descriptor=descriptor; this.handle=handle; this.scope=scope; this.schemaDigest=schemaDigest.clone(); }
         public ApplyPosition snapshot() { return handle.position(); }
+        public UUID captureId() { return handle.id(); }
         public RangeDescriptor descriptor() { return descriptor; }
         public byte[] get(UUID column,byte[] key) throws IOException {
             Objects.requireNonNull(key); if (key.length>DistributedCommandCodec.MAX_ENCODED_BYTES-16) throw new IllegalArgumentException("Transaction key exceeds budget");
@@ -635,6 +647,25 @@ public final class RatisRoutedClient implements AutoCloseable {
             if (!intent.groupId().equals(descriptor.groupId()) || intent.rangeEpoch()!=descriptor.rangeEpoch() || !Arrays.equals(intent.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Participant intent differs from frozen route");
             var audit=new TransactionAcceptance(handle.position(),handle.generation(),handle.owner(),scope,stagedResult.encode());
             return DistributedCommand.acceptedTransaction(intent,audit);
+        }
+        /** Authorize this handle's exact staged accepted image without rebasing its original pin. */
+        public PreparedParticipantOperation authorizeParticipant(DistributedCommand acceptedBusiness,OperationId control,UUID transactionId) throws IOException {
+            Objects.requireNonNull(control); Objects.requireNonNull(transactionId);
+            synchronized (this) { if (closed) throw new IOException("Transaction handle is closed"); }
+            var audit=Objects.requireNonNull(acceptedBusiness.acceptance(),"Expected accepted participant intent");
+            if (!acceptedBusiness.groupId().equals(descriptor.groupId()) || acceptedBusiness.rangeEpoch()!=descriptor.rangeEpoch() || !Arrays.equals(acceptedBusiness.schemaDigest(),schemaDigest)
+                    || !audit.snapshot().equals(handle.position()) || audit.leaderGeneration()!=handle.generation() || !audit.ownerIncarnation().equals(handle.owner()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(scope),ScopedTransactionRpc.scopeBytes(audit.scope()))) throw new IllegalArgumentException("Participant authorization differs from original handle");
+            byte[] encoded=DistributedCommandCodec.encode(acceptedBusiness); var body=ByteBuffer.allocate(108+encoded.length); ScopedTransactionRpc.writeHandle(body,handle);
+            ScopedTransactionRpc.uuid(body,control.sessionId()); body.putLong(control.epoch()).putLong(control.sequence()); ScopedTransactionRpc.uuid(body,transactionId); ScopedTransactionRpc.putBlob(body,encoded);
+            byte[] response=transaction(descriptor,ScopedTransactionRpc.PARTICIPANT_AUTHORIZE,body.array(),true);
+            if (response.length==1 && response[0]==1) throw new RatisPreparationUnavailableException("Original participant handle is no longer available");
+            if (response.length<2 || response[0]!=0) throw new IOException("Invalid participant authorization disposition");
+            byte[] reply=Arrays.copyOfRange(response,1,response.length);
+            try {
+                var preparation=RatisParticipantRecord.decode(reply); boolean negative=RatisParticipantRecord.isNegative(reply);
+                if (!preparation.transactionId().equals(transactionId) || !preparation.operation().equals(control) || !Arrays.equals(DistributedCommandCodec.encode(preparation.business()),encoded)) throw new IOException("Participant authority reply changed original request");
+                var operation=restoreParticipant(preparation,descriptor,negative); if (!Arrays.equals(operation.bytes(),reply)) throw new IOException("Noncanonical participant authority reply"); return operation;
+            } catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant authority reply",invalid); }
         }
         public DistributedCommand plan(DistributedCommand intent) throws IOException {
             byte[] encoded=DistributedCommandCodec.encode(intent); var body=ByteBuffer.allocate(60+encoded.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.putBlob(body,encoded);
