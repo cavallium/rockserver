@@ -30,6 +30,9 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         public OperationId lastControl() { return new OperationId(firstControl.sessionId(),firstControl.epoch(),firstControl.sequence()+CONTROL_SLOTS-1); }
     }
+    public RatisRoutedClient.SnapshotTarget restoreExportTarget(SnapshotFence fence,RatisExportJournal.SourceOwner owner,SnapshotFenceStatus.Capture capture) {
+        return data.restoreSnapshotTarget(fence,owner.route(),owner.replica(),capture.ownerIncarnation());
+    }
     private final DistributedSchema schema;
     private final RatisSnapshotFences homes;
     private final RatisRoutedClient data;

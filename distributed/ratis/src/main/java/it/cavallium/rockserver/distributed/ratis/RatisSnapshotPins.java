@@ -213,6 +213,14 @@ final class RatisSnapshotPins implements AutoCloseable {
             if (!entry.fenceId.equals(binding.fenceId()) || !Arrays.equals(entry.digest,binding.digest())) throw lost("Token belongs to another frozen fence");
         }
     }
+    void requireExport(SnapshotFenceStatus.Capture token,SnapshotFence fence) throws RatisSnapshotLostException {
+        requireBinding(token,ScopedTransactionRpc.SnapshotBinding.of(fence));
+        synchronized (this) {
+            var entry=snapshots.get(token.snapshotId()); requireToken(entry,token); ensureLive(entry);
+            if (entry.mode!=RatisSnapshotCaptureRequest.Mode.READ_ONLY)
+                throw new IllegalArgumentException("Immutable exports require an original read-only capture");
+        }
+    }
     void release(SnapshotFenceStatus.Capture token) throws Exception {
         requireOwner(Objects.requireNonNull(token).ownerIncarnation()); final Entry entry;
         synchronized (this) { entry=snapshots.get(token.snapshotId()); requireToken(entry,token); entry.closed=true; }

@@ -30,13 +30,21 @@ class RatisExportClientTest {
     static void seed(Fixture f) throws Exception {
         RatisRocksDBAdapterTest.seed(f,71,key(2),value(1),1900); RatisRocksDBAdapterTest.seed(f,71,key(4),value(2),1901); RatisRocksDBAdapterTest.seed(f,71,key(200),value(3),1902);
     }
+    @FunctionalInterface interface LocalWriter { CompletableFuture<NativeRangeSstExport.Chunk> write(Path file,RatisExportJournal.ChunkIntent intent,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture token,RequestContext context); }
+    static RatisExportClient.ChunkSource localSource(LocalWriter writer) {
+        return new RatisExportClient.ChunkSource() {
+            public void bind(RatisExportJournal.Snapshot saved) {}
+            public CompletableFuture<NativeRangeSstExport.Chunk> write(RatisExportSourceRpc.BuildRequest request,Path file,RequestContext context) { return writer.write(file,request.intent(),request.definition().capture(),context); }
+            public CompletableFuture<Void> release(RatisExportSourceRpc.JobDefinition definition,RequestContext context) { return CompletableFuture.completedFuture(null); }
+        };
+    }
     static RatisExportClient.ChunkSource nativeWriter(Fixture f,RatisExportJournal.Definition definition,Executor executor) {
-        return (file,intent,token,context) -> CompletableFuture.supplyAsync(() -> {
+        return localSource((file,intent,token,context) -> CompletableFuture.supplyAsync(() -> {
             try {
                 var span=definition.fence().participant(intent.group()).scope().spans().stream().filter(value -> value.columnId().equals(definition.column())).findFirst().orElseThrow();
                 return f.machines.get(intent.group()).exportSnapshotPinChunk(token,pin -> f.catalogue.pool.exportSstChunk(file,pin,intent.column(),intent.scopeStart(),span.upperExclusive(),intent.limits()));
             } catch (Exception failure) { throw new CompletionException(failure); }
-        },executor);
+        },executor));
     }
     static void ready(RatisExportClient.Job job) throws Exception {
         for (int n=0;n<16 && job.snapshot().phase()!=RatisExportJournal.Phase.READY;n++) await(job.step(RequestContext.batch()));
@@ -57,7 +65,7 @@ class RatisExportClientTest {
         }
         Files.delete(sourcePath);
         var scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,1,1,4,1,"offline-export-sdk");
-        try (var client=new RatisExportClient(null,scheduler,(file,intent,token,context) -> { throw new AssertionError("READY cannot access the source"); },RatisExportClient.Limits.defaults());
+        try (var client=new RatisExportClient(null,scheduler,localSource((file,intent,token,context) -> { throw new AssertionError("READY cannot access the source"); }),RatisExportClient.Limits.defaults());
              var job=client.reopen(path,RequestContext.batch()); var options=new Options().setCreateIfMissing(true); var destination=RocksDB.open(options,root.resolve("destination").toString())) {
             await(job.completion()); assertTrue(job.snapshot().acknowledged().isEmpty());
             for (var chunk:chunks) {
@@ -78,10 +86,10 @@ class RatisExportClientTest {
     @Test void cancellationWaitsForActualNativeExportAndCopiedObserversCannotDonateOwnership() throws Exception {
         try (var f=new Fixture(root.resolve("busy-source"),true); var source=snapshots(f); var executor=Executors.newVirtualThreadPerTaskExecutor()) {
             seed(f); var directory=Files.createDirectory(root.resolve("busy-job")); var definition=definition(f,source,directory.resolve("source.snapshot")); var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
-            RatisExportClient.ChunkSource writer=(artifact,intent,token,context) -> CompletableFuture.supplyAsync(() -> {
+            RatisExportClient.ChunkSource writer=localSource((artifact,intent,token,context) -> CompletableFuture.supplyAsync(() -> {
                 try { return f.machines.get(intent.group()).exportSnapshotPinChunk(token,pin -> { entered.countDown(); if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); var span=definition.fence().participant(intent.group()).scope().spans().getFirst(); return f.catalogue.pool.exportSstChunk(artifact,pin,intent.column(),intent.scopeStart(),span.upperExclusive(),intent.limits()); }); }
                 catch (Exception failure) { throw new CompletionException(failure); }
-            },executor);
+            },executor));
             try (var client=new RatisExportClient(source,f.scheduler,writer,RatisExportClient.Limits.defaults()); var job=client.create(directory.resolve("export.log"),definition,RequestContext.batch())) {
                 await(job.completion()); await(job.step(RequestContext.batch())); var view=job.step(RequestContext.batch());
                 try {
@@ -107,9 +115,9 @@ class RatisExportClientTest {
             seed(f); var directory=Files.createDirectory(root.resolve("descriptor-job")); var definition=definition(f,source,directory.resolve("source.snapshot"));
             var nativeDone=new CompletableFuture<NativeRangeSstExport.Chunk>(); var reply=new CompletableFuture<NativeRangeSstExport.Chunk>(); var builds=new AtomicInteger();
             var nativeSource=nativeWriter(f,definition,executor);
-            RatisExportClient.ChunkSource writer=(artifact,intent,token,context) -> {
-                builds.incrementAndGet(); nativeSource.write(artifact,intent,token,context).whenComplete((chunk,failure) -> { if (failure==null) nativeDone.complete(chunk); else nativeDone.completeExceptionally(failure); }); return reply;
-            };
+            RatisExportClient.ChunkSource writer=localSource((artifact,intent,token,context) -> {
+                builds.incrementAndGet(); nativeSource.write(new RatisExportSourceRpc.BuildRequest(new RatisExportSourceRpc.JobDefinition(definition.jobId(),definition.fence(),intent.group(),definition.column(),token,definition.limits()),intent),artifact,context).whenComplete((chunk,failure) -> { if (failure==null) nativeDone.complete(chunk); else nativeDone.completeExceptionally(failure); }); return reply;
+            });
             long oneStep=definition.limits().chunk().maximumPayloadBytes()+definition.limits().chunk().maximumFileBytes()+8L*1024*1024;
             var limits=new RatisExportClient.Limits(1,RatisExportClient.Limits.defaults().metadataBytes(),oneStep);
             try (var client=new RatisExportClient(source,scheduler,writer,limits); var job=client.create(directory.resolve("export.log"),definition,RequestContext.batch())) {
@@ -152,7 +160,7 @@ class RatisExportClientTest {
                 assertTrue(RatisExportWorkflowTest.export(journal,f,f.groups.getFirst()).hasMore()); original=Files.readAllBytes(sourcePath); lease.close();
             }
             Files.delete(sourcePath); int calls=f.rpcs.get(),captures=f.captureRequests.get();
-            try (var client=new RatisExportClient(source,f.scheduler,(artifact,intent,token,context) -> { throw new AssertionError("Missing original source cannot build"); },RatisExportClient.Limits.defaults()); var job=client.reopen(path,RequestContext.batch())) {
+            try (var client=new RatisExportClient(source,f.scheduler,localSource((artifact,intent,token,context) -> { throw new AssertionError("Missing original source cannot build"); }),RatisExportClient.Limits.defaults()); var job=client.reopen(path,RequestContext.batch())) {
                 await(job.completion()); assertThrows(ExecutionException.class,() -> await(job.step(RequestContext.batch())));
                 assertEquals(RatisExportJournal.Phase.SNAPSHOT_LOST,job.snapshot().phase()); assertEquals(calls,f.rpcs.get()); assertEquals(captures,f.captureRequests.get()); assertFalse(Files.exists(sourcePath));
                 // Restore only the caller's saved original journal to settle its original owners.
@@ -180,7 +188,7 @@ class RatisExportClientTest {
             seed(f); var directory=Files.createDirectory(root.resolve("mismatch-job")); var sourcePath=directory.resolve("source.snapshot");
             var lease=source.open(sourcePath,RatisSnapshotClientTest.snapshotIdentity(f,1),RatisSnapshotClientTest.scope(f),Duration.ofSeconds(30),RequestContext.batch()); await(lease.completion()); var original=lease.snapshot().initial().fence(); lease.close();
             var definition=definition(f,source,sourcePath); int calls=f.rpcs.get();
-            try (var client=new RatisExportClient(source,f.scheduler,(artifact,intent,token,context) -> { throw new AssertionError("Wrong source cannot build"); },RatisExportClient.Limits.defaults())) {
+            try (var client=new RatisExportClient(source,f.scheduler,localSource((artifact,intent,token,context) -> { throw new AssertionError("Wrong source cannot build"); }),RatisExportClient.Limits.defaults())) {
                 var job=client.create(directory.resolve("export.log"),definition,RequestContext.batch()); await(job.completion());
                 assertThrows(ExecutionException.class,() -> await(job.step(RequestContext.batch()))); assertEquals(calls,f.rpcs.get());
                 job.close(); assertEquals(0,client.stats().jobs()); assertEquals(0,client.stats().metadataBytes()); assertNull(source.lease(sourcePath)); assertEquals(calls,f.rpcs.get());

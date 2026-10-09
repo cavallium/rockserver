@@ -21,6 +21,7 @@ class RatisParticipantPrepareTest {
     final UUID cluster=new UUID(0,1),database=new UUID(0,2),controlSession=new UUID(0,3);
     RatisTransactionStatuses transactionHomes;
     RatisSnapshotReadinessHelper.Recovery snapshotRecovery;
+    Consumer<RatisRangeStateMachine> dataInitializer=machine -> {};
     final Map<UUID,Node> nodes=new ConcurrentHashMap<>();
     OperationId control(long n) { return new OperationId(controlSession,1,n); }
     final class Node implements AutoCloseable {
@@ -40,6 +41,7 @@ class RatisParticipantPrepareTest {
                 if (snapshotHomes!=null) machine.snapshotHomes(snapshotHomes);
                 if (!home && transactionHomes!=null) machine.transactionHomes(transactionHomes);
                 if (!home && recoveryProvider!=null) machine.snapshotRecovery(recoveryProvider,snapshotHelp);
+                if (!home) dataInitializer.accept(machine);
                 if (home) {
                     machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(cluster,database,key,value));
                     machine.homeRecoveryReservations(cluster,database,ownedInterval.columns().iterator().next());

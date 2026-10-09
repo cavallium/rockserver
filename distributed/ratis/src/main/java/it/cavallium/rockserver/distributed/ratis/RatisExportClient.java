@@ -27,8 +27,10 @@ public final class RatisExportClient implements AutoCloseable {
         public FilePage { Objects.requireNonNull(chunk); bytes=bytes.clone(); }
         @Override public byte[] bytes() { return bytes.clone(); }
     }
-    @FunctionalInterface public interface ChunkSource {
-        CompletableFuture<NativeRangeSstExport.Chunk> write(Path artifact,RatisExportJournal.ChunkIntent intent,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture token,RequestContext context);
+    public interface ChunkSource {
+        void bind(RatisExportJournal.Snapshot snapshot) throws IOException;
+        CompletableFuture<NativeRangeSstExport.Chunk> write(RatisExportSourceRpc.BuildRequest request,Path artifact,RequestContext context);
+        CompletableFuture<Void> release(RatisExportSourceRpc.JobDefinition definition,RequestContext context);
     }
     private final RatisSnapshotClient source;
     private final RWScheduler scheduler;
@@ -94,6 +96,7 @@ public final class RatisExportClient implements AutoCloseable {
                 }
                 try {
                     definition=journal.snapshot().definition(); reserveSource(this,definition.sourceJournal());
+                    if (writer!=null && !journal.snapshot().sourceCleanup().isEmpty()) writer.bind(journal.snapshot());
                     if (journal.snapshot().phase()==RatisExportJournal.Phase.READY) cacheArtifacts();
                 } catch (IOException | RuntimeException failure) {
                     var failed=journal; journal=null;
@@ -142,11 +145,11 @@ public final class RatisExportClient implements AutoCloseable {
             switch (saved.phase()) {
                 case READY, RELEASED, CANCELLED, SNAPSHOT_LOST -> { return CompletableFuture.completedFuture(saved); }
                 case CAPTURING -> {
-                    return capture(task,saved.definition()).thenCompose(lease -> task.io(false,() -> { journal.bindSource(lease.snapshot()); return journal.snapshot(); }));
+                    return capture(task,saved.definition()).thenCompose(lease -> task.io(false,() -> { journal.bindSource(lease.snapshot()); if (writer!=null) writer.bind(journal.snapshot()); return journal.snapshot(); }));
                 }
                 case MATERIALIZED -> {
                     return captureForCleanup(task,saved.definition()).thenCompose(lease -> task.io(true,() -> lease.release(task.remaining())).thenCompose(value -> value))
-                            .thenCompose(ignored -> task.io(false,() -> { journal.markReady(capture.snapshot()); cleanupConfirmed=true; cacheArtifacts(); closeCapture(); return journal.snapshot(); }));
+                            .thenCompose(ignored -> cleanupRemote(task)).thenCompose(ignored -> task.io(false,() -> { journal.markReady(capture.snapshot()); cleanupConfirmed=true; cacheArtifacts(); closeCapture(); return journal.snapshot(); }));
                 }
                 case EXPORTING -> {
                     if (knownNative!=null) return CompletableFuture.completedFuture(forceKnownNative());
@@ -156,11 +159,14 @@ public final class RatisExportClient implements AutoCloseable {
                         UUID group=saved.definition().fence().participants().stream().map(p -> p.groupId()).filter(id -> saved.chunks().stream().noneMatch(chunk -> chunk.group().equals(id) && !chunk.hasMore())).findFirst().orElseThrow();
                         intent=journal.freezeChunk(group);
                     }
-                    var frozen=intent; var token=saved.captures().get(frozen.group());
+                    var frozen=intent; var request=new RatisExportSourceRpc.BuildRequest(RatisExportJournal.sourceDefinition(saved,frozen.group()),frozen);
                     if (writer==null) throw new IOException("Original export chunk source unavailable");
-                    return capture(task,saved.definition()).thenCompose(ignored -> {
+                    if (source==null || source.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !Arrays.equals(source.identityDigest(),saved.definition().sourceIdentity())) throw new IOException("Original export source identity changed");
+                    if (capture==null && source.lease(saved.definition().sourceJournal())!=null) { foreignRejected=true; throw new IOException("Source snapshot lease already owned by another caller"); }
+                    if (!Files.exists(saved.definition().sourceJournal(),LinkOption.NOFOLLOW_LINKS)) throw new RatisSnapshotLostException("Original bound source journal is missing");
+                    {
                         CompletableFuture<NativeRangeSstExport.Chunk> actual;
-                        try { actual=Objects.requireNonNull(writer.write(journal.artifactPath(frozen),frozen,token,task.remaining())); }
+                        try { actual=Objects.requireNonNull(writer.write(request,journal.artifactPath(frozen),task.remaining())); }
                         catch (Throwable failure) { actual=CompletableFuture.failedFuture(failure); }
                         return actual.handle((chunk,failure) -> {
                             if (failure==null) synchronized (this) {
@@ -176,7 +182,7 @@ public final class RatisExportClient implements AutoCloseable {
                             // The native artifact is now known: force its exact descriptor even if the observer deadline elapsed.
                             return forceKnownNative();
                         }));
-                    });
+                    }
                 }
             }
             throw new IOException("Unknown export phase");
@@ -245,7 +251,7 @@ public final class RatisExportClient implements AutoCloseable {
         public CompletableFuture<Void> release(RequestContext context) {
             try { return this.<Void>start("release",context,65536,true,task -> {
                 task.check(); var phase=journal.snapshot().phase();
-                if (phase==RatisExportJournal.Phase.READY || phase==RatisExportJournal.Phase.RELEASED) { journal.release(); return CompletableFuture.<Void>completedFuture(null); }
+                if (phase==RatisExportJournal.Phase.READY || phase==RatisExportJournal.Phase.RELEASED) { return cleanupRemote(task).thenCompose(ignored -> task.io(true,() -> { journal.release(); return null; })); }
                 return cleanupSource(task).thenCompose(ignored -> task.io(true,() -> { journal.release(); return null; }));
             }).view(); }
             catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
@@ -274,10 +280,20 @@ public final class RatisExportClient implements AutoCloseable {
         }
         private CompletableFuture<Void> cleanupSource(Task<?> task) {
             try {
-                if (cleanupConfirmed || foreignRejected && capture==null) { cleanupConfirmed=true; return CompletableFuture.completedFuture(null); }
+                if (cleanupConfirmed || foreignRejected && capture==null) { cleanupConfirmed=true; return cleanupRemote(task); }
                 var saved=journal.snapshot();
-                if (!Files.exists(saved.definition().sourceJournal()) && capture==null) { cleanupConfirmed=true; return CompletableFuture.completedFuture(null); }
-                return captureForCleanup(task,saved.definition()).thenCompose(lease -> task.io(true,() -> lease.release(task.remaining())).thenCompose(value -> value)).thenCompose(ignored -> task.io(true,() -> { cleanupConfirmed=true; closeCapture(); return null; }));
+                if (!Files.exists(saved.definition().sourceJournal()) && capture==null) { cleanupConfirmed=true; return cleanupRemote(task); }
+                return captureForCleanup(task,saved.definition()).thenCompose(lease -> task.io(true,() -> lease.release(task.remaining())).thenCompose(value -> value)).thenCompose(ignored -> task.io(true,() -> { cleanupConfirmed=true; closeCapture(); return null; })).thenCompose(ignored -> cleanupRemote(task));
+            } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+        }
+        private CompletableFuture<Void> cleanupRemote(Task<?> task) {
+            try {
+                var saved=journal.snapshot(); if (saved.sourceCleanup().isEmpty()) return CompletableFuture.completedFuture(null);
+                if (writer==null) throw new IOException("Original export artifact cleanup source unavailable");
+                writer.bind(saved);
+                CompletableFuture<Void> result=CompletableFuture.completedFuture(null);
+                for (var group:saved.sourceCleanup()) result=result.thenCompose(ignored -> task.io(true,() -> writer.release(RatisExportJournal.sourceDefinition(saved,group),task.remaining())).thenCompose(value -> value)).thenCompose(ignored -> task.io(true,() -> { journal.sourceReleased(group); return null; }));
+                return result;
             } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
         }
         private RatisExportJournal.Snapshot ready() throws IOException { initializeIfReady(); var saved=journal.snapshot(); if (saved.phase()!=RatisExportJournal.Phase.READY) throw new IOException("Export delivery requires READY immutable artifacts"); return saved; }
@@ -302,7 +318,7 @@ public final class RatisExportClient implements AutoCloseable {
                     if (capture.uninitializedFailure()) { closeCapture(); cleanupConfirmed=true; }
                     else { var state=capture.snapshot(); if (!settled(state)) throw new IOException("Original source captures remain owned or unresolved; retry cleanup"); closeCapture(); cleanupConfirmed=true; }
                 }
-                if (journal!=null) { var phase=journal.snapshot().phase(); if (!cleanupConfirmed && (phase==RatisExportJournal.Phase.SNAPSHOT_LOST || phase==RatisExportJournal.Phase.CANCELLED || phase==RatisExportJournal.Phase.MATERIALIZED || phase==RatisExportJournal.Phase.EXPORTING) && Files.exists(journal.snapshot().definition().sourceJournal())) throw new IOException("Recovered source cleanup must settle before ownership release"); journal.close(); }
+                if (journal!=null) { var phase=journal.snapshot().phase(); if (!journal.snapshot().sourceCleanup().isEmpty() && phase!=RatisExportJournal.Phase.CAPTURING) throw new IOException("Remote artifact cleanup remains pending"); if (!cleanupConfirmed && (phase==RatisExportJournal.Phase.SNAPSHOT_LOST || phase==RatisExportJournal.Phase.CANCELLED || phase==RatisExportJournal.Phase.MATERIALIZED || phase==RatisExportJournal.Phase.EXPORTING) && Files.exists(journal.snapshot().definition().sourceJournal())) throw new IOException("Recovered source cleanup must settle before ownership release"); journal.close(); }
                 synchronized (this) { closed=true; } remove(this);
             } finally { synchronized (this) { localClosing=false; } }
         }

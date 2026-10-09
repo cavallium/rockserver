@@ -98,6 +98,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @FunctionalInterface interface ProofQueryExecutor { CompletableFuture<Message> submit(UUID group,byte[] encoded,boolean coalesce,ProofQueryAction action); }
     private SnapshotHelpExecutor snapshotHelpExecutor;
     private ProofQueryExecutor proofQueries;
+    private RatisExportSourceService exportSources;
     private RatisSnapshotReadinessHelper.Recovery snapshotRecovery;
     private final HashMap<UUID,RatisSnapshotReadinessHelper> snapshotHelpers=new HashMap<>();
     private RatisSnapshotFences snapshotHomes;
@@ -182,6 +183,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     void proofQueries(ProofQueryExecutor executor) {
         if (getLifeCycleState()!=LifeCycle.State.NEW || proofQueries!=null) throw new IllegalStateException("Proof query dispatcher is fixed before initialization");
         proofQueries=java.util.Objects.requireNonNull(executor);
+    }
+    void exportSources(RatisExportSourceService service) {
+        requireDataRole();
+        if (getLifeCycleState()!=LifeCycle.State.NEW || exportSources!=null)
+            throw new IllegalStateException("Export source dispatcher is fixed before initialization");
+        exportSources=java.util.Objects.requireNonNull(service);
+    }
+    void requireExportPin(RatisExportSourceRpc.JobDefinition definition) throws Exception {
+        requireDataRole();
+        var participant=definition.fence().participant(definition.group());
+        if (!store.ownership().owner().groupId().equals(definition.group())
+                || store.ownership().owner().epoch()!=participant.rangeEpoch()
+                || !java.util.Arrays.equals(store.schemaDigest(),participant.schemaDigest()))
+            throw new RatisSnapshotLostException("Original export range or schema is unavailable");
+        capturedSnapshots.requireExport(definition.capture(),definition.fence());
     }
     void snapshotRecovery(RatisSnapshotReadinessHelper.Recovery recovery,SnapshotHelpExecutor executor) {
         requireDataRole();
@@ -2462,7 +2478,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
             int kind=ScopedTransactionRpc.kind(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES);
-            if (ScopedTransactionRpc.ownerSnapshot(kind)) {
+            if (ScopedTransactionRpc.ownerSnapshot(kind) || ScopedTransactionRpc.ownerExport(kind)) {
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
@@ -2483,7 +2499,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try {
             byte[] encoded = request.getContent().toByteArray();
             int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-            if (!ScopedTransactionRpc.ownerSnapshot(kind)) requireHealthy();
+            if (!ScopedTransactionRpc.ownerSnapshot(kind) && !ScopedTransactionRpc.ownerExport(kind)) requireHealthy();
+            if (ScopedTransactionRpc.ownerExport(kind)) {
+                requireDataRole(); var dispatcher=exportSources;
+                if (dispatcher==null) throw new IOException("Durable export sources are not configured");
+                var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+                return dispatcher.submit(store.ownership().owner().groupId(),kind,packet.body()).thenApply(payload ->
+                        Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,payload))));
+            }
             if (kind==ScopedTransactionRpc.SNAPSHOT_HELP) return snapshotHelpQuery(encoded,freshBarrier);
             if (kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
                 // Reject before coalescing: a stale request must never borrow a fresh request's authority.

@@ -62,6 +62,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisNativeParticipantDiscovery nativeParticipantDiscovery;
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
+    private RatisExportSourceService exportSources;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
 
@@ -210,6 +211,29 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 machines.put(group.getGroupId(),machine);
             }
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
+        exportSources=new RatisExportSourceService(root.resolve("exports"),RatisExportSourceRegistry.Budgets.defaults(),
+                new RatisExportSourceRegistry.NativeBuilder() {
+                    public it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport.Chunk build(
+                            RatisExportSourceRpc.JobDefinition definition,RatisExportJournal.ChunkIntent intent,
+                            Path artifact,RatisExportSourceRegistry.Completion completion) throws Exception {
+                        var machine=machines.get(RaftGroupId.valueOf(definition.group()));
+                        if (machine==null) throw new RatisSnapshotLostException("Original export group is absent");
+                        machine.requireExportPin(definition);
+                        return machine.exportSnapshotPinChunk(definition.capture(),pin -> {
+                            var chunk=pool.exportSstChunk(artifact,pin,intent.column(),intent.scopeStart(),
+                                    definition.scope().upperExclusive(),intent.limits());
+                            completion.persist(chunk); return chunk;
+                        });
+                    }
+                    public boolean tokenUsable(RatisExportSourceRpc.JobDefinition definition) throws Exception {
+                        var machine=machines.get(RaftGroupId.valueOf(definition.group()));
+                        if (machine==null) return false;
+                        try { machine.requireExportPin(definition); return true; }
+                        catch (RatisSnapshotLostException lost) { return false; }
+                    }
+                },scheduler);
+        for (var entry:machines.entrySet()) if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA)
+            entry.getValue().exportSources(exportSources);
         var retirementSources=new ArrayList<RatisRetirementCoordinator.Source>();
         for (var id:machines.keySet().stream().sorted(java.util.Comparator.comparing(RaftGroupId::toString)).toList()) {
             var machine=machines.get(id); var role=plan.role(id.getUuid());
@@ -329,6 +353,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            if (exportSources!=null) {
+                try { exportSources.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Export source drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Export sources did not drain",failure); }
+            }
             if (retirementService!=null) {
                 try { retirementService.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Retirement drain interrupted",interrupted); }

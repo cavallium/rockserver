@@ -56,7 +56,7 @@ class RatisExportWorkflowTest {
                 RatisExportJournal.Chunk chunk; do { chunk=export(journal,f,participant.groupId()); } while (chunk.hasMore());
             }
             assertEquals(RatisExportJournal.Phase.MATERIALIZED,journal.snapshot().phase()); assertEquals(3,journal.snapshot().chunks().size());
-            await(lease.release(RequestContext.batch())); journal.markReady(lease.snapshot()); lease.close();
+            await(lease.release(RequestContext.batch())); for (var group:journal.snapshot().sourceCleanup()) journal.sourceReleased(group); journal.markReady(lease.snapshot()); lease.close();
             assertEquals(RatisExportJournal.Phase.READY,journal.snapshot().phase()); assertEquals(captureRequests,f.captureRequests.get()); assertEquals(0,f.opens.get());
             for (var machine:f.machines.values()) assertEquals(0,machine.snapshotPinStats().pins());
             try (var options=new Options().setCreateIfMissing(true); var db=RocksDB.open(options,target.toString())) {

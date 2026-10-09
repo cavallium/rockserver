@@ -17,6 +17,8 @@ public final class ScopedTransactionRpc {
     // A legal physical page continuation can exceed an atomic command's 2 MiB bound.
     public static final int MAX_REQUEST_BYTES = PhysicalRangePage.MAX_BYTES + 128;
     public static final int MAX_REPLY_BYTES = PhysicalRangePage.MAX_BYTES + 128;
+    public static final int EXPORT_BUILD=52, EXPORT_READ=53, EXPORT_RELEASE=54;
+    public static boolean ownerExport(int kind) { return kind==EXPORT_BUILD || kind==EXPORT_READ || kind==EXPORT_RELEASE; }
     private static final Comparator<TransactionScope.Span> SPAN_ORDER = Comparator
             .comparing(TransactionScope.Span::columnId)
             .thenComparing(TransactionScope.Span::lowerInclusive, ScopedTransactionRpc::compareBounds)
@@ -251,7 +253,7 @@ public final class ScopedTransactionRpc {
     }
     public static boolean homeRecovery(int kind) { return kind==HOME_RECOVERY_PREPARE || kind==HOME_RECOVERY_RESULT || kind==HOME_RECOVERY_CANCEL; }
     private static void requireKind(int kind) {
-        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_AUTHORIZE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != PARTICIPANT_FENCE && kind != PARTICIPANT_RETIRE_PREPARE && kind != PARTICIPANT_RETIRE_CANCEL && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_FENCE && kind != SNAPSHOT_RETIRE_PREPARE && kind != SNAPSHOT_RETIRE_CANCEL && kind != FINALIZATION_PREPARE && kind != FINALIZATION_CANCEL && kind != HOME_FENCE && kind != HOME_RETIRE_PREPARE && kind != HOME_RETIRE_CANCEL && kind != SNAPSHOT_HOME_FENCE && kind != SNAPSHOT_HOME_RETIRE_PREPARE && kind != SNAPSHOT_HOME_RETIRE_CANCEL && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && kind != SNAPSHOT_BLOCKERS && kind != SNAPSHOT_HELP && kind != SNAPSHOT_GATE_PREPARE && kind != SNAPSHOT_GATE_CANCEL && !homeRecovery(kind) && !ownerSnapshot(kind)) {
+        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_AUTHORIZE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != PARTICIPANT_FENCE && kind != PARTICIPANT_RETIRE_PREPARE && kind != PARTICIPANT_RETIRE_CANCEL && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_FENCE && kind != SNAPSHOT_RETIRE_PREPARE && kind != SNAPSHOT_RETIRE_CANCEL && kind != FINALIZATION_PREPARE && kind != FINALIZATION_CANCEL && kind != HOME_FENCE && kind != HOME_RETIRE_PREPARE && kind != HOME_RETIRE_CANCEL && kind != SNAPSHOT_HOME_FENCE && kind != SNAPSHOT_HOME_RETIRE_PREPARE && kind != SNAPSHOT_HOME_RETIRE_CANCEL && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && kind != SNAPSHOT_BLOCKERS && kind != SNAPSHOT_HELP && kind != SNAPSHOT_GATE_PREPARE && kind != SNAPSHOT_GATE_CANCEL && !homeRecovery(kind) && !ownerSnapshot(kind) && !ownerExport(kind)) {
             throw invalid("Unknown read frame kind");
         }
     }

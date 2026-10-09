@@ -114,6 +114,39 @@ public final class RatisRoutedClient implements AutoCloseable {
         var body=ByteBuffer.allocate(48+ScopedTransactionRpc.SNAPSHOT_TOKEN_BYTES); ScopedTransactionRpc.snapshotBinding(body,target.binding); ScopedTransactionRpc.snapshotToken(body,token);
         if (snapshotQuery(target,token,ScopedTransactionRpc.SNAPSHOT_RELEASE,body.array()).length!=0) throw new IOException("Invalid snapshot release reply");
     }
+    public RatisExportSourceRpc.Descriptor exportBuild(SnapshotTarget target,RatisExportSourceRpc.BuildRequest request) throws IOException {
+        try {
+            var reply=RatisExportSourceRpc.BuildReply.decode(exportQuery(target,request.definition(),ScopedTransactionRpc.EXPORT_BUILD,request.encode()));
+            if (!Arrays.equals(request.encode(),reply.request().encode())) throw new IllegalArgumentException("Export BUILD echo changed");
+            if (reply.descriptor()==null) throw new RatisSnapshotLostException("Original export pin is lost and no durable chunk exists");
+            RatisExportSourceRpc.requireDescriptor(request,reply.descriptor()); return reply.descriptor();
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid export BUILD reply",malformed); }
+    }
+    public byte[] exportRead(SnapshotTarget target,RatisExportSourceRpc.ReadRequest request) throws IOException {
+        try {
+            var reply=RatisExportSourceRpc.ReadReply.decode(exportQuery(target,request.definition(),ScopedTransactionRpc.EXPORT_READ,request.encode()));
+            if (!Arrays.equals(request.encode(),reply.request().encode())) throw new IllegalArgumentException("Export READ echo changed");
+            return reply.bytes();
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid export READ reply",malformed); }
+    }
+    public void releaseExport(SnapshotTarget target,RatisExportSourceRpc.ReleaseRequest request) throws IOException {
+        try {
+            var reply=RatisExportSourceRpc.ReleaseReply.decode(exportQuery(target,request.definition(),ScopedTransactionRpc.EXPORT_RELEASE,request.encode()));
+            if (!Arrays.equals(request.encode(),reply.request().encode())) throw new IllegalArgumentException("Export RELEASE echo changed");
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid export RELEASE reply",malformed); }
+    }
+    private byte[] exportQuery(SnapshotTarget target,RatisExportSourceRpc.JobDefinition definition,int kind,byte[] body) throws IOException {
+        Objects.requireNonNull(target); Objects.requireNonNull(definition); requireIdentity(target.source);
+        if (!target.fence.equals(definition.fence()) || !target.descriptor.groupId().equals(definition.group())
+                || !target.incarnation.equals(definition.capture().ownerIncarnation()))
+            throw new IllegalArgumentException("Export differs from original frozen owner");
+        byte[] request=ScopedTransactionRpc.frame(kind,body); beginCall();
+        try {
+            var reply=ScopedTransactionRpc.parse(transport.snapshot(target.descriptor,target.replica,request),ScopedTransactionRpc.MAX_REPLY_BYTES);
+            if (reply.kind()!=kind) throw new IllegalArgumentException("Export reply opcode changed");
+            return reply.body();
+        } finally { endCall(); }
+    }
     private byte[] snapshotQuery(SnapshotTarget target,SnapshotFenceStatus.Capture token,int kind,byte[] body) throws IOException {
         Objects.requireNonNull(target); Objects.requireNonNull(token); requireIdentity(target.source);
         if (!target.incarnation.equals(token.ownerIncarnation())) throw new RatisSnapshotLostException("Token belongs to another owner incarnation");
@@ -979,7 +1012,7 @@ public final class RatisRoutedClient implements AutoCloseable {
     static byte[] snapshotOnOwner(RaftClient client,RangeDescriptor descriptor,ReplicaDescriptor owner,byte[] request) throws IOException {
         if (!descriptor.replicas().contains(owner)) throw new IllegalArgumentException("Snapshot owner is absent from frozen route");
         var packet=ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-        if (!ScopedTransactionRpc.ownerSnapshot(packet.kind())) throw new IllegalArgumentException("Owner transport accepts only bound snapshot operations");
+        if (!ScopedTransactionRpc.ownerSnapshot(packet.kind()) && !ScopedTransactionRpc.ownerExport(packet.kind())) throw new IllegalArgumentException("Owner transport accepts only bound snapshot/export operations");
         var reply=client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(request)),0,RaftPeerId.valueOf(owner.peerId()));
         if (reply!=null && (!reply.getServerId().equals(RaftPeerId.valueOf(owner.peerId())) || !reply.getRaftGroupId().equals(RaftGroupId.valueOf(descriptor.groupId())))) throw new IOException("Snapshot reply came from another peer/group");
         return RaftTransport.content(reply,ScopedTransactionRpc.MAX_REPLY_BYTES);
