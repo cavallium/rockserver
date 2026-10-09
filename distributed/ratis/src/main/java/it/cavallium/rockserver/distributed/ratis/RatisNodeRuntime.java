@@ -53,6 +53,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             source.maximumMetadataBytes(),source.maximumBufferBytes(),1),RatisExportSourceService.IoLimits.defaults());
         }
     }
+    /** Node-local trust is injected, never accepted from a schema request or serialized as a lambda. */
+    public record SchemaReplicaConfig(RatisSchemaReplicaService.Limits limits,RatisSchemaReplicaService.OperatorPolicy policy) {
+        public SchemaReplicaConfig { Objects.requireNonNull(limits); Objects.requireNonNull(policy); }
+        public static SchemaReplicaConfig defaults() {
+            return new SchemaReplicaConfig(RatisSchemaReplicaService.Limits.defaults(),operator -> { throw new IOException("Node operator policy has not admitted this artifact"); });
+        }
+    }
     public record RecoverySettings(RatisTransactionStatuses homes,boolean takeover,RatisParticipantRecoveryRegistry.Limits limits,Duration period,int visits) {
         public RecoverySettings {
             Objects.requireNonNull(homes); Objects.requireNonNull(limits); Objects.requireNonNull(period);
@@ -60,6 +67,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
     }
     private final RatisNodePlan plan; private final DistributedSchema logicalSchema; private final Path root; private final Settings settings;
+    private final SchemaReplicaConfig schemaReplicaConfig;
     private final RatisSessionEpochs epochs; private final RatisRoutedClient routed; private final RatisSnapshotFences snapshotHomes;
     private final RWScheduler scheduler; private final Scheduler timer; private final LongSupplier time;
     private final Map<RaftGroupId,RatisRangeStateMachine> machines=new LinkedHashMap<>();
@@ -78,6 +86,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
     private RatisExportSourceService exportSources;
+    private RatisSchemaReplicaService schemaReplicas;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
 
@@ -111,13 +120,21 @@ public final class RatisNodeRuntime implements AutoCloseable {
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
         return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,schema,snapshotHomes,recoveries);
     }
+    public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,SchemaReplicaConfig replicas) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,RatisNodeRuntime::buildServer,schema,snapshotHomes,recoveries,RatisRoutedClient::connect,replicas);
+    }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
         return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,recoveries,RatisRoutedClient::connect);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory) throws IOException {
-        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes,recoveries);
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,recoveries,homeFactory,SchemaReplicaConfig.defaults());
+    }
+    static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas) throws IOException {
+        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes,recoveries,replicas);
         try { node.initialize(config,startup,factory,homeFactory); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
@@ -125,10 +142,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
     }
     private RatisNodeRuntime(RatisNodePlan plan,Path root,RatisSessionEpochs epochs,RatisRoutedClient routed,
-            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) {
+            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,SchemaReplicaConfig replicas) {
         this.plan=Objects.requireNonNull(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
         this.routed=Objects.requireNonNull(routed); this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
-        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); logicalSchema=schema; this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
+        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); schemaReplicaConfig=Objects.requireNonNull(replicas); logicalSchema=schema; this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
         if (recoveries!=null) {
             recoveries.homes().requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
             var home=plan.home(RatisNodePlan.Role.TRANSACTION_HOME); if (home!=null) recoveries.homes().requireDirectoryBinding(home.directory());
@@ -173,13 +190,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }
         } else {
             if (startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Node identity is absent; explicit placement initialization is required");
-            for (String directory:List.of("native","raft","sessions","recovery")) {
+            for (String directory:List.of("native","raft","sessions","recovery","schema-replicas")) {
                 Path path=root.resolve(directory);
                 if (Files.exists(path)) try (var entries=Files.list(path)) { if (entries.findAny().isPresent()) throw new IOException("Unidentified node data must not be adopted"); }
             }
             SessionJournalFiles.write(identity,identity(false),128);
         }
-        for (String directory:List.of("native","raft","sessions","recovery")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
+        for (String directory:List.of("native","raft","sessions","recovery","schema-replicas")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
         SessionJournalFiles.force(root);
         var allowed=new HashSet<UUID>(); for (var group:plan.localGroups()) allowed.add(group.getGroupId().getUuid());
         try (var entries=Files.list(logs)) {
@@ -210,6 +227,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
         pool=logicalSchema==null ? DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class))
                 : DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class),logicalSchema,plan.columns(),metadataBindings);
         pool.configureSnapshotAdmission(settings.exports().pins());
+        if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.DATA))
+            schemaReplicas=new RatisSchemaReplicaService(nativePath,root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());
         try {
             for (var group:plan.localGroups()) {
                 var id=group.getGroupId().getUuid(); RatisRangeStateMachine machine;
@@ -244,7 +263,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
                     }
-                    else { machine.role(role); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),effectiveDirectory); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
+                    else { machine.role(role); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),effectiveDirectory); machine.schemaReplicas(schemaReplicas,ownReplica(descriptor)); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
                 }
                 machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
@@ -337,6 +356,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for (var machine:machines.values()) machine.beginShutdown(); throw failure;
         } finally { synchronized (this) { starting=false; } }
     }
+    private it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor ownReplica(it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor) {
+        return descriptor.replicas().stream().filter(replica -> replica.nodeId().equals(plan.nodeId()) && replica.nodeIncarnation().equals(plan.nodeIncarnation())
+                && replica.peerId().equals(plan.peerId()) && replica.address().equals(plan.address())).findFirst().orElseThrow(() -> new IllegalArgumentException("DATA placement lacks this durable node replica identity"));
+    }
     private byte[] identity(boolean exposed) {
         return ByteBuffer.allocate(33).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
     }
@@ -398,6 +421,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            if (schemaReplicas!=null) {
+                try { schemaReplicas.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Schema replica drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Schema replica service did not drain",failure); }
+            }
             if (exportSources!=null) {
                 try { exportSources.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Export source drain interrupted",interrupted); }

@@ -28,6 +28,29 @@ class RatisNodeServiceTest {
     RatisNodeService.Resources resources(RatisNodeRuntimeTest.Env env) {
         env.resourcesTransferred=true; return new RatisNodeService.Resources(env.catalogue.client,env.routed,env.scheduler,env.timer);
     }
+    @Test void recoveryUsesPersistedReplicaBudgetsAndBorrowedPolicy() throws Exception {
+        var schema=schema();
+        try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
+            initialize(env,schema);
+            var original=manifest(env,schema); var limits=new RatisSchemaReplicaService.Limits(3,96L*1024*1024,80L*1024*1024,5,7,0);
+            var configured=RatisNodeManifest.decode(RatisNodeManifest.encode(new RatisNodeManifest(schema,env.plan,original.settings(),3,3,limits)));
+            class Policy implements RatisSchemaReplicaService.OperatorPolicy,AutoCloseable {
+                int closes;
+                public it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract admit(DistributedSchema.Operator operator) throws IOException { throw new IOException("This node fixture has no approved operator"); }
+                public void close() { closes++; }
+            }
+            var policy=new Policy(); var fake=new RatisNodeRuntimeTest.FakeServer();
+            try (var service=RatisNodeService.recover(configured,env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create,policy)) {
+                var nodeField=RatisNodeService.class.getDeclaredField("node"); nodeField.setAccessible(true); var node=nodeField.get(service);
+                var replicaField=RatisNodeRuntime.class.getDeclaredField("schemaReplicas"); replicaField.setAccessible(true); var replicas=replicaField.get(node); assertNotNull(replicas);
+                var limitsField=RatisSchemaReplicaService.class.getDeclaredField("limits"); limitsField.setAccessible(true); assertEquals(limits,limitsField.get(replicas));
+                var policyField=RatisSchemaReplicaService.class.getDeclaredField("policy"); policyField.setAccessible(true); assertSame(policy,policyField.get(replicas));
+                service.start();
+            }
+            assertEquals(0,policy.closes); assertEquals(1,fake.closes); assertTrue(env.timer.isDisposed());
+        }
+    }
+
     void publish(RatisNodeRuntimeTest.Env env,DistributedSchema schema) throws Exception {
         var o=env.outer; var c=new RatisSchemaCatalogue(env.catalogue.client,o.cluster,o.database,o.catalogue,1,new byte[32],o.directoryColumn);
         c.execute(c.prepare(o.operation(1),schema)); var d=env.plan.directory();

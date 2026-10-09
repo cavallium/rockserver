@@ -50,7 +50,11 @@ public final class RatisNodeService implements AutoCloseable {
     }
     /** Never grants placement-creation authority. Root must contain established native and Raft state. */
     public static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config) throws IOException {
-        Objects.requireNonNull(manifest); Objects.requireNonNull(config); preflight(root,manifest.plan());
+        return recover(manifest,root,config,RatisNodeRuntime.SchemaReplicaConfig.defaults().policy());
+    }
+    /** Trusted node-local operator admission; manifest budgets persist independently of this borrowed policy. */
+    public static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,RatisSchemaReplicaService.OperatorPolicy policy) throws IOException {
+        Objects.requireNonNull(manifest); Objects.requireNonNull(config); Objects.requireNonNull(policy); preflight(root,manifest.plan());
         final WorkloadSettings workload;
         try { workload=WorkloadSettings.resolve(config); } catch (Exception invalid) { throw new IOException("Invalid storage workload configuration",invalid); }
         if (workload.readParallelism()!=manifest.readThreads() || workload.writeParallelism()!=manifest.writeThreads()) {
@@ -70,16 +74,20 @@ public final class RatisNodeService implements AutoCloseable {
             try { if (scheduler!=null) scheduler.dispose(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
         }
-        return recover(manifest,root,config,new Resources(client,routed,scheduler,timer),null);
+        return recover(manifest,root,config,new Resources(client,routed,scheduler,timer),null,policy);
     }
     static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory) throws IOException {
+        return recover(manifest,root,config,resources,factory,RatisNodeRuntime.SchemaReplicaConfig.defaults().policy());
+    }
+    static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy) throws IOException {
         try {
             preflight(root,manifest.plan()); manifest.schema().requireMatches(resources.routed.directory());
             var plan=manifest.plan(); var c=plan.catalogue();
             var epochs=new RatisSessionEpochs(resources.catalogue,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
+            var replicaConfig=new RatisNodeRuntime.SchemaReplicaConfig(manifest.schemaReplicaLimits(),Objects.requireNonNull(policy));
             var node=factory==null
-                    ? RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,manifest.schema())
-                    : RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,factory,manifest.schema());
+                    ? RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,manifest.schema(),null,null,replicaConfig)
+                    : RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,factory,manifest.schema(),null,null,RatisRoutedClient::connect,replicaConfig);
             return new RatisNodeService(manifest,resources,node);
         } catch (IOException | RuntimeException | Error failure) {
             resources.abort(failure); throw failure;

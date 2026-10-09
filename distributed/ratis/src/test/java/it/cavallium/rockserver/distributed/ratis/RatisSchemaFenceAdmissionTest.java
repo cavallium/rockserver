@@ -29,7 +29,7 @@ class RatisSchemaFenceAdmissionTest {
     static Message message(byte[] bytes) { return Message.valueOf(ByteString.copyFrom(bytes)); }
     static final class Fixture implements AutoCloseable {
         final UUID groupId=id(9),column=id(4);
-        final RaftPeer peer=RaftPeer.newBuilder().setId("fixture").build();
+        final RaftPeer peer=RaftPeer.newBuilder().setId("fixture").setAddress("127.0.0.1:9999").build();
         final RaftGroup group=RaftGroup.valueOf(RaftGroupId.valueOf(groupId),peer);
         final DistributedSchema schema=new DistributedSchema(id(1),id(2),id(3),1,0,List.of(new DistributedSchema.Column(1,column,"data",ColumnSchema.of(IntArrayList.of(1),ObjectArrayList.of(),true),null)));
         final RangeDirectory directory=new RangeDirectory(id(1),id(2),id(3),1,schema.digest(),1,Set.of(column),0,List.of(new RangeDescriptor(id(8),groupId,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(new ReplicaDescriptor(id(5),id(6),id(7),"fixture","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER)))));
@@ -128,6 +128,18 @@ class RatisSchemaFenceAdmissionTest {
             }
             assertTrue(f.state().ready());
             f.machine.pause(); f.machine.reinitialize(); assertEquals(new ApplyPosition(1,1),f.state().fence().position());
+        }
+    }
+    @Test void addressOnlyConfigurationChangeRejectsFreshFencePreparation() throws Exception {
+        try (var f=new Fixture(root)) {
+            var changed=RaftConfigurationProto.newBuilder().addPeers(RaftPeer.newBuilder().setId(f.peer.getId()).setAddress("127.0.0.1:10000").build().getRaftPeerProto()).build();
+            f.machine.notifyConfigurationChanged(1,1,changed); f.machine.notifyTermIndexUpdated(1,1);
+            var failure=assertThrows(ExecutionException.class,() -> f.prepare().get(5,TimeUnit.SECONDS));
+            assertTrue(failure.getCause().getMessage().contains("peer address/role configuration changed"));
+            assertNull(f.store.schemaFence());
+            var restored=RaftConfigurationProto.newBuilder().addPeers(f.peer.getRaftPeerProto()).build();
+            f.machine.notifyConfigurationChanged(1,2,restored); f.machine.notifyTermIndexUpdated(1,2);
+            f.prepare().get(5,TimeUnit.SECONDS);
         }
     }
     @Test void queuedConfigurationInvalidatesFenceAuthorityBeforeNativeApply() throws Exception {

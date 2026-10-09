@@ -141,6 +141,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private UUID schemaCluster,schemaDatabase,schemaColumn;
     private SchemaHold schemaHold;
     private DistributedStoragePool schemaStorage;
+    private RatisSchemaReplicaService schemaReplicas;
     private int schemaSlots;
     // Queue-time schema authority invalidation; ordinary DATA generation changes only on native apply.
     private long schemaConfigurationStamp; // guarded by admissions
@@ -150,6 +151,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
         DistributedStoragePool.SchemaInstallPlan installPlan;
         RatisSchemaActivateRecord activation;
+        it.cavallium.rockserver.core.common.distributed.NativeSchemaCapacityReservation capacity;
         final long term,generation,configurationStamp;
         final ProposalFootprints.GateLease lease;
         boolean reading=true,qualified,submitted,maybeAppended,invalidated,released,nativeReady,cleaning;
@@ -158,6 +160,38 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         SchemaHold(Object record,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease) {
             this.record=record; this.term=term; this.generation=generation; this.configurationStamp=configurationStamp; this.lease=lease;
         }
+    }
+    void schemaReplicas(RatisSchemaReplicaService service,it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor replica) {
+        requireDataRole();
+        if (getLifeCycleState()!=LifeCycle.State.NEW || schemaReplicas!=null || schemaAuthority==null || schemaDescriptor==null
+                || !schemaDescriptor.replicas().contains(replica)) throw new IllegalStateException("Schema replica owner is fixed before initialization");
+        schemaReplicas=java.util.Objects.requireNonNull(service);
+        service.register(store.ownership().owner().groupId(),store,replica,schemaAuthority::read,this::validateSchemaReplicaTarget);
+    }
+    private long validateSchemaReplicaTarget(RatisSchemaReplicaRpc.Target target,boolean currentSource) throws Exception {
+        requireSchemaGroup(target.binding().groupId()); requireHealthy();
+        if (getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || !store.admissionOpen() || store.applied()==null) throw new IOException("Schema replica lacks a completed running configuration");
+        long stamp; synchronized (admissions) { stamp=schemaConfigurationStamp; }
+        var descriptor=target.binding().source(); var ownership=store.ownership(); var interval=ownership.interval();
+        if (schemaDescriptor==null || !descriptor.rangeId().equals(schemaDescriptor.rangeId()) || descriptor.rangeEpoch()!=ownership.owner().epoch()
+                || descriptor.configurationVersion()!=schemaDescriptor.configurationVersion() || !descriptor.replicas().equals(schemaDescriptor.replicas())
+                || !interval.domainId().equals(target.binding().header().domainId()) || !Arrays.equals(interval.lowerInclusive(),descriptor.lowerInclusive())
+                || !Arrays.equals(interval.upperExclusive(),descriptor.upperExclusive())) throw new IOException("Schema replica source placement changed");
+        var cfg=store.configuration(); if (cfg==null) throw new IOException("Schema replica has no native configuration");
+        requireSchemaMembership(descriptor,cfg.data());
+        if (currentSource) requireSchemaOwnership(target.binding().definition().sourceDirectory(),target.binding().groupId());
+        synchronized (admissions) { if (schemaConfigurationPending || stamp!=schemaConfigurationStamp) throw new IOException("Schema replica configuration changed during validation"); }
+        return stamp;
+    }
+    private static void requireSchemaMembership(it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor,byte[] configuration) throws IOException {
+        var nativeConfiguration=RaftConfigurationProto.parseFrom(configuration);
+        var actual=new java.util.HashMap<String,String>();
+        if (nativeConfiguration.getOldPeersCount()!=0 || nativeConfiguration.getOldListenersCount()!=0) throw new IOException("Schema replica waits for stable native membership");
+        for (var peer:nativeConfiguration.getPeersList()) if (actual.put(peer.getId().toStringUtf8(),peer.getAddress()+"|VOTER")!=null) throw new IOException("Invalid native voter identity");
+        for (var peer:nativeConfiguration.getListenersList()) if (actual.put(peer.getId().toStringUtf8(),peer.getAddress()+"|LISTENER")!=null) throw new IOException("Invalid native listener identity");
+        var expected=new java.util.HashMap<String,String>();
+        for (var peer:descriptor.replicas()) if (expected.put(peer.peerId(),peer.address()+"|"+peer.role())!=null) throw new IOException("Duplicate frozen replica identity");
+        if (!actual.equals(expected)) throw new IOException("Schema replica native peer address/role configuration changed");
     }
     List<ReplicatedRangeStore.ActivatedSchema> schemaRoutingHistory() throws org.rocksdb.RocksDBException {
         requireDataRole(); return store.activatedSchemas();
@@ -258,13 +292,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void requireSchemaOwnership(RangeDirectory directory,UUID group) throws Exception {
         var descriptor=directory.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow();
         var ownership=store.ownership(); var interval=ownership.interval(); var cfg=store.configuration();
-        if (cfg!=null) {
-            var nativeConfiguration=RaftConfigurationProto.parseFrom(cfg.data());
-            var voters=nativeConfiguration.getPeersList().stream().map(p -> p.getId().toStringUtf8()).collect(java.util.stream.Collectors.toSet());
-            var listeners=nativeConfiguration.getListenersList().stream().map(p -> p.getId().toStringUtf8()).collect(java.util.stream.Collectors.toSet());
-            if (!voters.equals(descriptor.replicas().stream().filter(p -> p.role()==it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor.Role.VOTER).map(it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor::peerId).collect(java.util.stream.Collectors.toSet()))
-                    || !listeners.equals(descriptor.replicas().stream().filter(p -> p.role()==it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor.Role.LISTENER).map(it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor::peerId).collect(java.util.stream.Collectors.toSet()))) throw new IllegalArgumentException("Native membership differs from schema source");
-        }
+        if (cfg!=null) requireSchemaMembership(descriptor,cfg.data());
         if (descriptor.rangeEpoch()!=ownership.owner().epoch() || cfg==null || schemaDescriptor==null
                 || !descriptor.rangeId().equals(schemaDescriptor.rangeId()) || descriptor.configurationVersion()!=schemaDescriptor.configurationVersion()
                 || !descriptor.replicas().equals(schemaDescriptor.replicas())
@@ -297,11 +325,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         boolean qualified=false;
         try {
             var authority=reader.read(record.header()); // Network work never owns admissions or the native gate monitor.
-            requireSchemaSource(record,authority); checkTransactionOwner(); var current=leadership();
+            requireSchemaSource(record,authority);
+            var capacity=schemaReplicas==null ? null : schemaStorage.requireSchemaFenceCapacity(store,record.header());
+            checkTransactionOwner(); var current=leadership();
             synchronized (admissions) {
                 if (schemaHold!=hold || hold.invalidated || hold.released || generation!=admissionGeneration.get() || current.term()!=hold.term || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp)
                     throw new IOException("Schema preparation lost its authority owner");
-                hold.qualified=true; qualified=true;
+                hold.capacity=capacity; hold.qualified=true; qualified=true;
                 if (!proposalFootprints.drained(hold.lease)) throw new IOException("Schema predecessors have not drained");
             }
         } finally {
@@ -328,7 +358,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             } else {
                 var hold=schemaHold;
                 if (hold==null || !hold.record.equals(record) || hold.reading || !hold.qualified || hold.invalidated || hold.released
-                        || hold.term!=leader.term() || hold.generation!=generation || hold.configurationStamp!=schemaConfigurationStamp || generation!=admissionGeneration.get() || !proposalFootprints.drained(hold.lease))
+                        || hold.term!=leader.term() || hold.generation!=generation || hold.configurationStamp!=schemaConfigurationStamp || generation!=admissionGeneration.get() || !proposalFootprints.drained(hold.lease)
+                        || schemaReplicas!=null && hold.capacity==null)
                     throw new IOException("Schema FENCE lacks drained current-owner preparation");
                 hold.submitted=true; hold.owners++; transaction.setStateMachineContext(hold);
             }
@@ -1693,7 +1724,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
         if (RatisSchemaFenceRecord.isFence(encoded)) {
-            var record=RatisSchemaFenceRecord.decode(encoded); var proof=store.applySchemaFence(positionArg,record.header()); schemaProof(record);
+            var record=RatisSchemaFenceRecord.decode(encoded);
+            var existing=store.lookupSchemaFence(record.header());
+            var proof=schemaReplicas==null || existing!=null ? store.applySchemaFence(positionArg,record.header())
+                    : schemaStorage.applySchemaFence(store,positionArg,record.header(),schemaStorage.requireSchemaFenceCapacity(store,record.header()));
+            schemaProof(record);
             return new AppliedRecord(null,proof.encode());
         }
         if (RatisSchemaActivateRecord.isActivate(encoded)) {
@@ -3020,6 +3055,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             byte[] encoded = request.getContent().toByteArray();
             int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
             if (!ScopedTransactionRpc.ownerSnapshot(kind) && !ScopedTransactionRpc.ownerExport(kind)) requireHealthy();
+            if (ScopedTransactionRpc.schemaReplica(kind)) {
+                requireDataRole(); var replicas=schemaReplicas;
+                if (replicas==null) throw new IOException("Schema replica preparation is not configured");
+                return replicas.submit(store.ownership().owner().groupId(),encoded).thenApply(bytes -> Message.valueOf(ByteString.copyFrom(bytes)));
+            }
             if (ScopedTransactionRpc.ownerExport(kind)) {
                 requireDataRole(); var dispatcher=exportSources;
                 if (dispatcher==null) throw new IOException("Durable export sources are not configured");

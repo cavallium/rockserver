@@ -15,7 +15,7 @@ import java.util.*;
 public final class RatisNodeManifest {
     /** Includes the file checksum; encoded bodies leave room for its 32 bytes. */
     public static final int MAX_BYTES=8*1024*1024;
-    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=164;
+    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=200;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
@@ -24,8 +24,13 @@ public final class RatisNodeManifest {
     private final RatisNodePlan plan;
     private final RatisNodeRuntime.Settings settings;
     private final int readThreads,writeThreads;
+    private final RatisSchemaReplicaService.Limits schemaReplicaLimits;
 
     public RatisNodeManifest(DistributedSchema schema,RatisNodePlan plan,RatisNodeRuntime.Settings settings,int readThreads,int writeThreads) {
+        this(schema,plan,settings,readThreads,writeThreads,RatisSchemaReplicaService.Limits.defaults());
+    }
+    public RatisNodeManifest(DistributedSchema schema,RatisNodePlan plan,RatisNodeRuntime.Settings settings,int readThreads,int writeThreads,RatisSchemaReplicaService.Limits replicaLimits) {
+        schemaReplicaLimits=Objects.requireNonNull(replicaLimits);
         this.schema=Objects.requireNonNull(schema); this.plan=Objects.requireNonNull(plan); this.settings=Objects.requireNonNull(settings);
         schema.requireMatches(plan.directory());
         if (!plan.columns().keySet().equals(schema.columnIds()) || !plan.merges().equals(mergeColumns(schema))
@@ -45,6 +50,7 @@ public final class RatisNodeManifest {
     public DistributedSchema schema() { return schema; }
     public RatisNodePlan plan() { return plan; }
     public RatisNodeRuntime.Settings settings() { return settings; }
+    public RatisSchemaReplicaService.Limits schemaReplicaLimits() { return schemaReplicaLimits; }
     public int readThreads() { return readThreads; }
     public int writeThreads() { return writeThreads; }
     private static Set<UUID> mergeColumns(DistributedSchema schema) {
@@ -83,6 +89,8 @@ public final class RatisNodeManifest {
         output.putInt(source.maximumJobs()).putInt(source.maximumChunks()).putLong(source.maximumDiskBytes())
                 .putLong(source.maximumMetadataBytes()).putLong(source.maximumBufferBytes()).putInt(source.concurrentBuilds());
         output.putLong(io.minimumFreeBytes()).putLong(io.readBytesPerSecond()).putInt(io.readBurstBytes());
+        var replicas=manifest.schemaReplicaLimits;
+        output.putInt(replicas.maximumUploads()).putLong(replicas.maximumDiskBytes()).putLong(replicas.maximumHeapBytes()).putInt(replicas.maximumTasks()).putInt(replicas.maximumObservers()).putLong(replicas.minimumFreeBytes());
         return output.array();
     }
     public static RatisNodeManifest decode(byte[] bytes) {
@@ -125,12 +133,13 @@ public final class RatisNodeManifest {
         var pins=new it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits(input.getInt(),input.getLong(),Duration.ofNanos(input.getLong()),input.getLong());
         var source=new RatisExportSourceRegistry.Budgets(input.getInt(),input.getInt(),input.getLong(),input.getLong(),input.getLong(),input.getInt());
         var io=new RatisExportSourceService.IoLimits(input.getLong(),input.getLong(),input.getInt());
+        var replicaLimits=new RatisSchemaReplicaService.Limits(input.getInt(),input.getLong(),input.getLong(),input.getInt(),input.getInt(),input.getLong());
         if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
         var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io));
         var recovered=catalogue(catalogue,directory,directoryColumn,sessionsColumn);
         var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,mergeColumns(schema),homes,groups);
         if (plan.localGroups().size()!=groups) throw new IllegalArgumentException("Manifest group budget is not canonical");
-        var manifest=new RatisNodeManifest(schema,plan,settings,reads,writes);
+        var manifest=new RatisNodeManifest(schema,plan,settings,reads,writes,replicaLimits);
         if (!Arrays.equals(bytes,encode(manifest))) throw new IllegalArgumentException("Noncanonical node manifest encoding");
         return manifest;
     }

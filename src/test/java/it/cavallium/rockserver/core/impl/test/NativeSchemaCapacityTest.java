@@ -48,8 +48,11 @@ class NativeSchemaCapacityTest {
         var source=empty(fixture.domain,0); var target=populated(source,fixture.column); var change=change(source,target,fixture.group); var path=root.resolve("reservation"); NativeSchemaCapacityReservation proof;
         try(var pool=fixture.open(path)) {
             var store=range(pool,fixture.group,source,Map.of()); store.applyNoop(new ApplyPosition(1,0));
+            var absent=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(DistributedStoragePool.SchemaCapacityState.NONE,absent.state()); assertNull(absent.reservation()); assertFalse(absent.forcedDurable()); assertFalse(absent.ready());
+            assertThrows(IllegalStateException.class,() -> pool.requireSchemaFenceCapacity(store,change.header()));
             proof=pool.reserveSchemaCapacity(store,change,Map.of(fixture.column,"future"),Set.of());
             assertEquals(proof,NativeSchemaCapacityReservation.decode(proof.encode())); assertNull(store.schemaFence());
+            var active=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(proof,active.reservation()); assertEquals(DistributedStoragePool.SchemaCapacityState.ACTIVE,active.state()); assertTrue(active.forcedDurable()); assertTrue(active.ready()); assertEquals(proof,pool.requireSchemaFenceCapacity(store,change.header()));
             try(var pin=store.captureForRecovery()) { assertTrue(pin.columns().isEmpty()); }
             store.applyNoop(new ApplyPosition(1,1)); assertFalse(loaded(pool).definitiveColumnFamilyOptionsMap().containsKey("future"));
             assertEquals(proof,pool.reserveSchemaCapacity(store,change,Map.of(fixture.column,"future"),Set.of()));
@@ -58,13 +61,25 @@ class NativeSchemaCapacityTest {
         try(var pool=fixture.open(path)) {
             var store=range(pool,fixture.group,source,Map.of()); assertEquals(proof,pool.lookupSchemaCapacity(store,change.header())); assertNull(store.schemaFence());
             pool.applySchemaFence(store,new ApplyPosition(2,2),change.header(),proof);
+            var fenced=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(DistributedStoragePool.SchemaCapacityState.FENCED,fenced.state()); assertTrue(fenced.forcedDurable()); assertFalse(fenced.ready()); assertEquals(proof,pool.requireSchemaFenceCapacity(store,change.header()));
             assertThrows(IllegalStateException.class,() -> pool.releaseSchemaCapacity(store,proof,abort(change)));
             var installed=pool.installSchema(store,new ApplyPosition(2,3),change,Map.of(fixture.column,"future"),Set.of());
             pool.releaseSchemaCapacity(store,proof,SchemaCapacityRelease.completed(installed.proof()));
-            store.applySchemaActivation(new ApplyPosition(2,4),installed.proof(),UUID.randomUUID(),new ApplyPosition(2,1));
+            UUID catalogue=UUID.randomUUID(); store.applySchemaActivation(new ApplyPosition(2,4),installed.proof(),catalogue,new ApplyPosition(2,1));
+            var consumed=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(proof,consumed.reservation()); assertEquals(DistributedStoragePool.SchemaCapacityState.CONSUMED,consumed.state()); assertTrue(consumed.forcedDurable()); assertFalse(consumed.ready()); assertThrows(IllegalStateException.class,() -> pool.requireSchemaFenceCapacity(store,change.header()));
+            assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,change,"changed",false)); assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,change,"future",true));
+            var changedDefinition=new SchemaChange.Definition(change.changeId(),new OperationId(UUID.randomUUID(),1,0),change.sourceDirectory(),source,target);
+            assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,changedDefinition,"future",false));
+            assertThrows(IllegalArgumentException.class,() -> pool.requireSchemaFenceCapacity(store,changedDefinition.header()));
+            var retired=SchemaChange.Status.begin(change.header()).beginFencing().fenced(fixture.group,installed.fence().position()).installed(fixture.group,installed.position()).publish().activated(fixture.group,new ApplyPosition(2,4)).retire();
+            pool.releaseSchemaCapacity(store,proof,SchemaCapacityRelease.retired(retired,catalogue,new ApplyPosition(2,20)));
+            var status=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(DistributedStoragePool.SchemaCapacityState.RETIRED,status.state()); assertFalse(status.ready());
             assertEquals(proof,pool.reserveSchemaCapacity(store,change,Map.of(fixture.column,"future"),Set.of()));
         }
-        try(var pool=fixture.open(path)) { var store=range(pool,fixture.group,source,Map.of()); assertEquals(proof,pool.lookupSchemaCapacity(store,change.header())); assertArrayEquals(target.digest(),store.schemaDigest()); }
+        try(var pool=fixture.open(path)) { var store=range(pool,fixture.group,source,Map.of()); assertEquals(proof,pool.lookupSchemaCapacity(store,change.header())); assertArrayEquals(target.digest(),store.schemaDigest());
+            var status=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(proof,status.reservation()); assertEquals(DistributedStoragePool.SchemaCapacityState.RETIRED,status.state()); assertTrue(status.forcedDurable()); assertFalse(status.ready()); assertThrows(IllegalStateException.class,() -> pool.requireSchemaFenceCapacity(store,change.header()));
+            assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,change,"changed",false));
+        }
     }
     @Test void lastPermanentPoolSlotIsSharedAcrossGroupsAndBlocksConcurrentOtherDomainsUntilAuthoritativeAbort() throws Exception {
         var source=empty(fixture.domain,0); var path=root.resolve("last-pool-slot"); var permanent=new HashMap<UUID,String>();
@@ -103,10 +118,11 @@ class NativeSchemaCapacityTest {
                 var store=range(pool,fixture.group,source,Map.of()); pool.schemaCapacityForceObserver(boundary -> { if(boundary==after) throw new org.rocksdb.RocksDBException("controlled force"); });
                 assertThrows(org.rocksdb.RocksDBException.class,() -> pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of()));
                 original=pool.lookupSchemaCapacity(store,definition.header()); assertNotNull(original); assertNull(store.schemaFence());
+                var unknown=pool.lookupSchemaCapacityStatus(store,definition,"future",false); assertEquals(original,unknown.reservation()); assertEquals(DistributedStoragePool.SchemaCapacityState.ACTIVE,unknown.state()); assertFalse(unknown.forcedDurable()); assertFalse(unknown.ready()); assertThrows(IllegalStateException.class,() -> pool.requireSchemaFenceCapacity(store,definition.header()));
                 assertThrows(IllegalStateException.class,() -> pool.applySchemaFence(store,new ApplyPosition(1,0),definition.header(),original));
-                pool.schemaCapacityForceObserver(boundary -> {}); assertEquals(original,pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of()));
+                pool.schemaCapacityForceObserver(boundary -> {}); assertEquals(original,pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of())); assertTrue(pool.lookupSchemaCapacityStatus(store,definition,"future",false).ready()); assertEquals(original,pool.requireSchemaFenceCapacity(store,definition.header()));
             }
-            try(var pool=fixture.open(path)) { var store=range(pool,fixture.group,source,Map.of()); assertEquals(original,pool.lookupSchemaCapacity(store,definition.header())); pool.releaseSchemaCapacity(store,original,abort(definition)); assertThrows(IllegalStateException.class,() -> store.applySchemaFence(new ApplyPosition(1,0),definition.header())); }
+            try(var pool=fixture.open(path)) { var store=range(pool,fixture.group,source,Map.of()); assertEquals(original,pool.lookupSchemaCapacity(store,definition.header())); pool.releaseSchemaCapacity(store,original,abort(definition)); var released=pool.lookupSchemaCapacityStatus(store,definition,"future",false); assertEquals(original,released.reservation()); assertEquals(DistributedStoragePool.SchemaCapacityState.ABORTED,released.state()); assertTrue(released.forcedDurable()); assertFalse(released.ready()); assertThrows(IllegalStateException.class,() -> pool.requireSchemaFenceCapacity(store,definition.header())); assertThrows(IllegalStateException.class,() -> store.applySchemaFence(new ApplyPosition(1,0),definition.header())); }
         }
     }
     @Test void finalHistorySlotIsReservedBeforeFenceAndRecoveredWithoutClosingBusinessData() throws Exception {
@@ -158,7 +174,10 @@ class NativeSchemaCapacityTest {
             var installed=pool.installSchema(store,new ApplyPosition(1,2),first,Map.of(fixture.column,"data"),Set.of()); original=installed.proof();
             store.applySchemaActivation(new ApplyPosition(1,3),original,catalogue,new ApplyPosition(1,1));
             var other=pool.reserveSchemaCapacity(store,second,Map.of(),Set.of()); pool.applySchemaFence(store,new ApplyPosition(1,4),second.header(),other);
-            var deleted=pool.installSchema(store,new ApplyPosition(1,5),second,Map.of(),Set.of()); store.applySchemaActivation(new ApplyPosition(1,6),deleted.proof(),catalogue,new ApplyPosition(1,2));
+            var deleted=pool.installSchema(store,new ApplyPosition(1,5),second,Map.of(),Set.of());
+            var deletedStatus=pool.lookupSchemaCapacityStatus(store,second,null,false); assertEquals(DistributedStoragePool.SchemaCapacityState.CONSUMED,deletedStatus.state()); assertFalse(deletedStatus.ready());
+            assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,second,"data",false)); assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,second,null,true));
+            store.applySchemaActivation(new ApplyPosition(1,6),deleted.proof(),catalogue,new ApplyPosition(1,2));
         }
         try(var pool=fixture.open(root.resolve("short-history-donor"))) {
             var store=range(pool,fixture.group,middle,Map.of(fixture.column,"data"));

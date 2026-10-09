@@ -56,6 +56,18 @@ class RatisNodeManifestTest {
         assertEquals(resources,reopened.settings().exports()); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
     }
 
+    @Test void configuredSchemaReplicaBudgetsUseOneCanonicalManifestLayout() {
+        var original=manifest(false);
+        var limits=new RatisSchemaReplicaService.Limits(5,128L*1024*1024,96L*1024*1024,7,9,8192);
+        var configured=new RatisNodeManifest(original.schema(),original.plan(),original.settings(),3,5,limits);
+        byte[] encoded=RatisNodeManifest.encode(configured); var reopened=RatisNodeManifest.decode(encoded);
+        assertEquals(limits,reopened.schemaReplicaLimits()); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
+        assertEquals(RatisSchemaReplicaService.Limits.defaults(),original.schemaReplicaLimits());
+        assertFalse(Arrays.equals(encoded,RatisNodeManifest.encode(original)));
+        ByteBuffer.wrap(encoded).putInt(encoded.length-16,0);
+        assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(encoded));
+    }
+
     @Test void operatorBindingsAndEmptyUserSchemaSurviveCurrentManifestRoundTrip() {
         var merged=schema(false,true);
         var operatorManifest=new RatisNodeManifest(merged,plan(merged,Map.of(A,"a",B,"b"),Set.of(B)),settings(),3,3);
@@ -134,8 +146,9 @@ class RatisNodeManifestTest {
         byte[] reversed=valid.clone(); System.arraycopy(valid,bindings,reversed,second,16); System.arraycopy(valid,second,reversed,bindings,16);
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(reversed));
         byte[] groupBudget=valid.clone(); ByteBuffer.wrap(groupBudget).putInt(tail+64,3); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(groupBudget));
-        for (int offset:new int[] {valid.length-92,valid.length-88}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
-        byte[] duration=valid.clone(); ByteBuffer.wrap(duration).putLong(valid.length-116,0); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(duration));
+        int settingsStart=valid.length-200;
+        for (int offset:new int[] {settingsStart+72,settingsStart+76}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
+        byte[] duration=valid.clone(); ByteBuffer.wrap(duration).putLong(settingsStart+48,0); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(duration));
     }
 
     @Test void syntheticCatalogueMustRemainExactlyTheDeclaredMetadataRange() {

@@ -32,7 +32,7 @@ class RatisSchemaLifecycleAdmissionTest {
     }
     static final class Fixture implements AutoCloseable {
         final UUID groupId=id(9),column=id(4),added=id(40);
-        final RaftPeer peer=RaftPeer.newBuilder().setId("fixture").build();
+        final RaftPeer peer=RaftPeer.newBuilder().setId("fixture").setAddress("127.0.0.1:9999").build();
         final RaftGroup group=RaftGroup.valueOf(RaftGroupId.valueOf(groupId),peer);
         final DistributedSchema source=new DistributedSchema(id(1),id(2),id(3),1,0,List.of(column(1,column,"data")));
         final RangeDirectory sourceDirectory=new RangeDirectory(id(1),id(2),id(3),1,source.digest(),1,Set.of(column),0,List.of(new RangeDescriptor(id(8),groupId,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(new ReplicaDescriptor(id(5),id(6),id(7),"fixture","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER)))));

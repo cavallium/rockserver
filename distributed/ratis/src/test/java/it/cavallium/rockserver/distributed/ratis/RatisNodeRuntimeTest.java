@@ -553,6 +553,62 @@ class RatisNodeRuntimeTest {
             }
         }
     }
+    @Test void schemaReplicaServiceIsBoundBeforeEagerInitializationToDurableVoterAndListenerIdentities() throws Exception {
+        try (var env=new Env(root,true)) {
+            var fake=new FakeServer(); var owned=new java.util.concurrent.atomic.AtomicReference<Object>(); var groups=new java.util.concurrent.atomic.AtomicInteger();
+            RatisNodeRuntime.ServerFactory eager=(plan,logs,machines) -> {
+                try {
+                    for (var entry:machines.entrySet()) {
+                        assertEquals("NEW",entry.getValue().getLifeCycleState().name());
+                        var replicas=schemaReplicaService(entry.getValue());
+                        if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA) {
+                            assertNotNull(replicas); if (owned.get()==null) owned.set(replicas); else assertSame(owned.get(),replicas); groups.incrementAndGet();
+                            var own=plan.groupDescriptor(entry.getKey().getUuid()).replicas().stream().filter(replica -> replica.nodeId().equals(plan.nodeId())).findFirst().orElseThrow();
+                            assertEquals(plan.nodeIncarnation(),own.nodeIncarnation());
+                        } else assertNull(replicas);
+                    }
+                    var server=fake.create(plan,logs,machines); for (var group:plan.localGroups()) fake.initialize(group); return server;
+                } catch (Exception failure) { throw new IOException(failure); }
+            };
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,eager)) {
+                assertEquals(2,groups.get()); assertEquals(0,fake.starts); node.start(); assertTrue(node.started());
+                var listener=env.plan.directory().ranges().stream().filter(range -> range.replicas().stream().anyMatch(replica -> replica.nodeId().equals(env.plan.nodeId()) && replica.role()==ReplicaDescriptor.Role.LISTENER)).findFirst().orElseThrow();
+                var machine=fake.machines.get(RaftGroupId.valueOf(listener.groupId())); var own=listener.replicas().stream().filter(replica -> replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow();
+                assertThrows(IllegalStateException.class,() -> machine.schemaReplicas((RatisSchemaReplicaService)owned.get(),own));
+            }
+            assertEquals(1,fake.closes); assertFalse(env.timer.isDisposed()); assertEquals(0,env.transportCloses);
+        }
+    }
+    @Test void schemaReplicaDrainTimeoutRetainsNodePoolAndStagingOwnershipUntilActualPolicyWorkEnds() throws Exception {
+        var outer=new RatisSessionEpochsTest(); var shape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true);
+        var source=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",shape,null)));
+        byte[] jar=appendArtifact(); var operator=new DistributedSchema.Operator("append",1,AppendOperator.class.getName(),OperatorUpload.sha256(jar),1,1,"pure-append",1);
+        var addedShape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true,operator.name(),operator.version(),operator.className());
+        var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of(source.column(71),new DistributedSchema.Column(72,new UUID(77,1),"added",addedShape,operator)));
+        var entered=new java.util.concurrent.CountDownLatch(1); var unblock=new java.util.concurrent.CountDownLatch(1);
+        try (var env=new Env(root,false,source.digest())) {
+            var fake=new FakeServer(); var contract=new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true);
+            var config=new RatisNodeRuntime.SchemaReplicaConfig(new RatisSchemaReplicaService.Limits(4,64L*1024*1024,64L*1024*1024,4,4,0),descriptor -> { assertEquals(operator,descriptor); entered.countDown(); if (!unblock.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Policy fixture timeout"); return contract; });
+            var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,source,null,null,RatisRoutedClient::connect,config);
+            try {
+                node.start(); var route=env.plan.directory().ranges().getLast(); var own=route.replicas().stream().filter(replica -> replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow(); assertEquals(ReplicaDescriptor.Role.LISTENER,own.role());
+                var definition=new SchemaChange.Definition(new UUID(77,2),new OperationId(new UUID(77,3),1,0),env.plan.directory(),source,target);
+                var upload=OperatorUpload.create(new UUID(77,4),source.clusterId(),source.databaseId(),operator,jar);
+                var request=new RatisSchemaReplicaRpc.Request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE,new RatisSchemaReplicaRpc.Target(new RatisSchemaReplicaRpc.Binding(definition,route.groupId(),"added",true),own),upload,-1,null);
+                var service=(RatisSchemaReplicaService)schemaReplicaService(fake.machines.get(RaftGroupId.valueOf(route.groupId())));
+                var observer=service.submit(route.groupId(),request.encode()); assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); var actual=service.submit(route.groupId(),request.encode()); assertTrue(observer.cancel(false));
+                assertThrows(IOException.class,node::close); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(0,fake.closes);
+                for (var path:List.of(env.nodeRoot.resolve("node.lock"),env.nodeRoot.resolve("schema-replicas/lock"))) try (var owner=java.nio.channels.FileChannel.open(path,StandardOpenOption.WRITE)) { assertThrows(java.nio.channels.OverlappingFileLockException.class,owner::tryLock); }
+                assertFalse(env.timer.isDisposed()); assertEquals(0,env.transportCloses);
+                unblock.countDown(); assertFalse(RatisSchemaReplicaRpc.decodeReply(actual.get(5,java.util.concurrent.TimeUnit.SECONDS),request).artifactReady());
+                node.close(); assertEquals(RatisNodeRuntime.State.CLOSED,node.state()); assertEquals(1,fake.closes); assertTrue(fake.allFencedAtClose);
+                try (var owner=java.nio.channels.FileChannel.open(env.nodeRoot.resolve("schema-replicas/lock"),StandardOpenOption.WRITE); var acquired=owner.tryLock()) { assertNotNull(acquired); }
+            } finally { unblock.countDown(); node.close(); }
+        }
+    }
+    private static Object schemaReplicaService(RatisRangeStateMachine machine) throws ReflectiveOperationException {
+        var field=RatisRangeStateMachine.class.getDeclaredField("schemaReplicas"); field.setAccessible(true); return field.get(machine);
+    }
     private static Object snapshotHomes(RatisRangeStateMachine machine) throws ReflectiveOperationException {
         var field=RatisRangeStateMachine.class.getDeclaredField("snapshotHomes"); field.setAccessible(true); return field.get(machine);
     }
