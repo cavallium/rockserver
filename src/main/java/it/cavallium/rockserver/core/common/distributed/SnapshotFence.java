@@ -20,8 +20,15 @@ public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fe
             schemaDigest=schemaDigest.clone(); scope=new TransactionScope(ordered(scope));
         }
         @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
-        @Override public boolean equals(Object other) { return other instanceof Participant p && Arrays.equals(participantBytes(this),participantBytes(p)); }
-        @Override public int hashCode() { return Arrays.hashCode(participantBytes(this)); }
+        @Override public boolean equals(Object other) { return this==other || other instanceof Participant p
+                && rangeId.equals(p.rangeId) && groupId.equals(p.groupId) && rangeEpoch==p.rangeEpoch
+                && Arrays.equals(schemaDigest,p.schemaDigest) && installOperation.equals(p.installOperation)
+                && releaseOperation.equals(p.releaseOperation) && sameScope(scope,p.scope); }
+        @Override public int hashCode() {
+            int hash=31*rangeId.hashCode()+groupId.hashCode(); hash=31*hash+Long.hashCode(rangeEpoch);
+            hash=31*hash+Arrays.hashCode(schemaDigest); hash=31*hash+installOperation.hashCode();
+            return 31*(31*hash+releaseOperation.hashCode())+scopeHash(scope);
+        }
     }
     public SnapshotFence {
         Objects.requireNonNull(clusterId); Objects.requireNonNull(databaseId); Objects.requireNonNull(domainId); Objects.requireNonNull(fenceId); Objects.requireNonNull(homeGroup);
@@ -68,12 +75,30 @@ public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fe
             if (!Arrays.equals(bytes,result.encode())) throw invalid("Noncanonical snapshot fence"); return result;
         } catch (RuntimeException malformed) { if (malformed instanceof IllegalArgumentException invalid) throw invalid; throw new IllegalArgumentException("Invalid snapshot fence",malformed); }
     }
-    @Override public boolean equals(Object other) { return this==other || other instanceof SnapshotFence fence && Arrays.equals(encode(),fence.encode()); }
-    @Override public int hashCode() { return Arrays.hashCode(encode()); }
+    @Override public boolean equals(Object other) { return this==other || other instanceof SnapshotFence fence
+            && clusterId.equals(fence.clusterId) && databaseId.equals(fence.databaseId) && domainId.equals(fence.domainId)
+            && fenceId.equals(fence.fenceId) && homeGroup.equals(fence.homeGroup) && homeEpoch==fence.homeEpoch
+            && operation.equals(fence.operation) && directoryGeneration==fence.directoryGeneration
+            && schemaEpoch==fence.schemaEpoch && Arrays.equals(schemaDigest,fence.schemaDigest)
+            && participants.equals(fence.participants); }
+    @Override public int hashCode() {
+        int hash=31*clusterId.hashCode()+databaseId.hashCode(); hash=31*hash+domainId.hashCode();
+        hash=31*hash+fenceId.hashCode(); hash=31*hash+homeGroup.hashCode(); hash=31*hash+Long.hashCode(homeEpoch);
+        hash=31*hash+operation.hashCode(); hash=31*hash+Long.hashCode(directoryGeneration);
+        hash=31*hash+Long.hashCode(schemaEpoch); hash=31*hash+Arrays.hashCode(schemaDigest);
+        return 31*hash+participants.hashCode();
+    }
+    private static boolean sameScope(TransactionScope a,TransactionScope b) {
+        var first=a.spans(); var second=b.spans(); if (first.size()!=second.size()) return false;
+        for (int i=0;i<first.size();i++) if (!first.get(i).sameValue(second.get(i))) return false;
+        return true;
+    }
+    private static int scopeHash(TransactionScope scope) {
+        int hash=1; var spans=scope.spans(); for (int i=0;i<spans.size();i++) hash=31*hash+spans.get(i).valueHash(); return hash;
+    }
     private static long participantSize(Participant p) {
         long size=PARTICIPANT_HEADER_BYTES; for (var span:p.scope().spans()) size+=25L+(span.lowerInclusive()==null ? 0 : span.lowerInclusive().length)+(span.upperExclusive()==null ? 0 : span.upperExclusive().length); return size;
     }
-    private static byte[] participantBytes(Participant p) { long size=participantSize(p); var b=ByteBuffer.allocate((int)size); participant(b,p); return b.array(); }
     private static void participant(ByteBuffer b,Participant p) {
         uuid(b,p.rangeId()); uuid(b,p.groupId()); b.putLong(p.rangeEpoch()).put(p.schemaDigest()); operation(b,p.installOperation()); operation(b,p.releaseOperation());
         var spans=ordered(p.scope()); b.putInt(spans.size());

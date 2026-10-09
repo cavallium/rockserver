@@ -40,6 +40,14 @@ public final class TransactionScope {
         public boolean isPoint() { return point; }
         public byte[] lowerInclusive() { return lower == null ? null : lower.clone(); }
         public byte[] upperExclusive() { return upper == null ? null : upper.clone(); }
+        boolean sameValue(Span other) {
+            return point == other.point && columnId.equals(other.columnId)
+                    && Arrays.equals(lower, other.lower) && Arrays.equals(upper, other.upper);
+        }
+        int valueHash() {
+            int hash=31*columnId.hashCode()+Boolean.hashCode(point);
+            return 31*(31*hash+Arrays.hashCode(lower))+Arrays.hashCode(upper);
+        }
         private boolean contains(byte[] key) {
             return point ? Arrays.equals(lower, key) : (lower == null || Arrays.compareUnsigned(lower, key) <= 0)
                     && (upper == null || Arrays.compareUnsigned(key, upper) < 0);

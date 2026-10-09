@@ -38,6 +38,19 @@ class SnapshotFenceTest {
         assertThrows(IllegalArgumentException.class,() -> new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),1,fence.operation(),2,3,new byte[32],List.of(huge)));
         assertThrows(IllegalArgumentException.class,() -> fence.participant(UUID.randomUUID()));
     }
+    @Test void definitionEqualityBindsEveryIdentityAndPhysicalScopeField() {
+        var reference=fence(); byte[] canonical=reference.encode();
+        int[] fields={0,16,32,48,64,87,88,111,119,127,135,136,172,188,211,212,244,267,275,276,299,307,338,355,360};
+        for (int offset:fields) {
+            byte[] bytes=canonical.clone(); bytes[offset]^=(byte)(offset==355 ? 1 : 16);
+            var changed=SnapshotFence.decode(bytes);
+            assertNotEquals(reference,changed,"Changed identity or scope byte at "+offset);
+            var restored=SnapshotFence.decode(changed.encode());
+            assertEquals(changed,restored); assertEquals(changed.hashCode(),restored.hashCode());
+        }
+        byte[] range=canonical.clone(); range[339]=2;
+        assertNotEquals(reference,SnapshotFence.decode(range));
+    }
     @Test void malformedAndNoncanonicalDefinitionFramesAreRejected() {
         byte[] bytes=fence().encode();
         for (int n=0;n<bytes.length;n++) { byte[] truncated=Arrays.copyOf(bytes,n); assertThrows(IllegalArgumentException.class,() -> SnapshotFence.decode(truncated)); }

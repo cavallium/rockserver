@@ -21,6 +21,8 @@ public final class SnapshotFenceStatus {
     private final Phase phase;
     private final List<Progress> progress;
     private final boolean consumed;
+    private volatile byte[] digest;
+    private volatile SnapshotFenceStatus decision;
     private SnapshotFenceStatus(SnapshotFence fence,Phase phase,List<Progress> progress,boolean consumed) {
         this.fence=Objects.requireNonNull(fence); this.phase=Objects.requireNonNull(phase); this.progress=List.copyOf(progress); this.consumed=consumed;
         if (consumed && phase==Phase.INSTALLING) throw SnapshotFence.invalid("Only a terminal snapshot may be consumed");
@@ -63,7 +65,13 @@ public final class SnapshotFenceStatus {
     }
     public SnapshotFenceStatus terminalDecision() {
         if (!terminal()) throw SnapshotFence.invalid("Snapshot has no terminal decision");
-        return consumed ? new SnapshotFenceStatus(fence,phase,progress,false) : this;
+        if (!consumed) return this;
+        var original=decision;
+        if (original==null) synchronized (this) {
+            original=decision;
+            if (original==null) decision=original=new SnapshotFenceStatus(fence,phase,progress,false);
+        }
+        return original;
     }
     public void requireSuccessorOf(SnapshotFenceStatus previous) {
         Objects.requireNonNull(previous);
@@ -114,10 +122,22 @@ public final class SnapshotFenceStatus {
         } catch (RuntimeException malformed) { if (malformed instanceof IllegalArgumentException invalid) throw invalid; throw new IllegalArgumentException("Invalid snapshot status",malformed); }
     }
     public byte[] digest() {
-        try { return MessageDigest.getInstance("SHA-256").digest(encode()); } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        var value=digest;
+        if (value==null) synchronized (this) {
+            value=digest;
+            if (value==null) {
+                try { digest=value=MessageDigest.getInstance("SHA-256").digest(encode()); }
+                catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+            }
+        }
+        return value.clone();
     }
-    @Override public boolean equals(Object other) { return other instanceof SnapshotFenceStatus status && Arrays.equals(encode(),status.encode()); }
-    @Override public int hashCode() { return Arrays.hashCode(encode()); }
+    @Override public boolean equals(Object other) { return this==other || other instanceof SnapshotFenceStatus status
+            && consumed==status.consumed && phase==status.phase && fence.equals(status.fence) && progress.equals(status.progress); }
+    @Override public int hashCode() {
+        int hash=31*fence.hashCode()+phase.hashCode(); hash=31*hash+progress.hashCode();
+        return 31*hash+Boolean.hashCode(consumed);
+    }
     private int index(UUID group) { for (int i=0;i<progress.size();i++) if (progress.get(i).groupId().equals(group)) return i; throw SnapshotFence.invalid("Unregistered snapshot participant"); }
     private void requireInstalling() { if (terminal()) throw SnapshotFence.invalid("Snapshot decision is immutable"); }
     static void positive(ApplyPosition position) { Objects.requireNonNull(position); if (position.term()<=0 || position.index()<=0) throw SnapshotFence.invalid("Snapshot proof position must be positive"); }
