@@ -257,4 +257,15 @@ class RatisSnapshotPinsTest {
             f.data.f.machine.releaseSnapshotPin(fresh); assertEquals(0,f.data.f.machine.snapshotPinStats().pins()); assertEquals(0,f.data.f.store.activeSnapshotPins());
         }
     }
+    @Test void releasingLivePinBelowAdvancedFloorSettlesItsActualOwnerBeforeSuccess() throws Exception {
+        try (var f=new Fixture("release-floor")) {
+            var clock=new AtomicLong(); var calls=new AtomicInteger();
+            try (var pins=f.registry(clock,calls)) {
+                var token=pins.capture(f.home.homes,f.fence,f.owner,f.snapshot,ttl,() -> 0); f.complete(token);
+                pins.retireBefore(f.fence.operation().epoch()+1); assertEquals(1,pins.stats().pins());
+                assertDoesNotThrow(() -> pins.release(token)); assertEquals(new RatisSnapshotPins.Stats(0,0,0),pins.stats()); assertEquals(0,f.data.f.store.activeSnapshotPins());
+            }
+        }
+    }
+
 }

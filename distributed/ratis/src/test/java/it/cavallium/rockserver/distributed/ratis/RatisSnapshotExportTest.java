@@ -60,7 +60,7 @@ class RatisSnapshotExportTest {
                     entered.countDown(); if (!proceed.await(5,TimeUnit.SECONDS)) throw new IOException("Exporter was not unblocked");
                     return f.data.f.pool.exportSstChunk(root.resolve("draining.sst"),pin,f.data.f.column,new byte[]{1},new byte[]{4},LIMITS);
                 }));
-                try { await(entered); pins.release(token); assertEquals(1,pins.stats().pins()); assertEquals(1,f.data.f.store.activeSnapshotPins()); assertFalse(actual.isDone()); }
+                try { await(entered); assertThrows(IOException.class,() -> pins.release(token)); assertEquals(1,pins.stats().pins()); assertEquals(1,f.data.f.store.activeSnapshotPins()); assertFalse(actual.isDone()); }
                 finally { proceed.countDown(); }
                 assertInstanceOf(RatisSnapshotLostException.class,assertThrows(ExecutionException.class,() -> actual.get(5,TimeUnit.SECONDS)).getCause());
                 assertEquals(0,pins.stats().pins()); assertEquals(0,f.data.f.store.activeSnapshotPins()); assertEquals(1,calls.get());

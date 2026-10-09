@@ -46,8 +46,13 @@ public final class NativeRangeSstExport {
         public Chunk { Objects.requireNonNull(manifest); if (hasMore && (manifest.rows()==0 || manifest.upperExclusive()==null)) throw new IllegalArgumentException("Chunk boundary needs progress and an exact next key"); }
     }
     static final class Prepared {
-        final Manifest manifest; final boolean more; final Path temporary,target; final long started,duration;
+        final Manifest manifest; final boolean more; final Path temporary,target; final long started,duration; boolean buildingOwned=true;
         Prepared(Manifest manifest,boolean more,Path temporary,Path target,long started,long duration) { this.manifest=manifest; this.more=more; this.temporary=temporary; this.target=target; this.started=started; this.duration=duration; }
+    }
+    /** Exact private build ownership for this artifact; existing files require explicit drained-job reclamation. */
+    public static Path buildingPath(Path target) {
+        var absolute=Objects.requireNonNull(target).toAbsolutePath().normalize(); if (absolute.getFileName()==null) throw new IllegalArgumentException("SST artifact must name a file");
+        return absolute.resolveSibling(absolute.getFileName()+".building");
     }
     /** Source options must belong to this column's retained pool. Caller retains the scoped snapshot. */
     public static Manifest write(Path destination,ReplicatedRangeStore.ScopedSnapshot snapshot,UUID column,
@@ -74,12 +79,14 @@ public final class NativeRangeSstExport {
         if (snapshot.position()==null) throw new IllegalArgumentException("SST export requires a completed applied cut");
         if ((long)(lowerInclusive==null ? 0 : lowerInclusive.length)+(upperExclusive==null ? 0 : upperExclusive.length)>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("SST export bounds exceed budget");
         byte[] lower=lowerInclusive==null ? snapshot.interval().lowerInclusive() : lowerInclusive.clone(),upper=upperExclusive==null ? snapshot.interval().upperExclusive() : upperExclusive.clone();
-        long started=System.nanoTime(),duration=limits.maximumDuration().toNanos(); Path target=Objects.requireNonNull(destination).toAbsolutePath();
+        long started=System.nanoTime(),duration=limits.maximumDuration().toNanos(); Path target=Objects.requireNonNull(destination).toAbsolutePath().normalize();
         if (Files.exists(target,LinkOption.NOFOLLOW_LINKS)) throw new FileAlreadyExistsException(target.toString());
         Path temporary=null; boolean complete=false; Prepared result;
         try {
             try (var cursor=snapshot.openCursor(column,lower,upper,false)) {
-                temporary=Files.createTempFile(target.getParent(),".range-sst-building-",".tmp"); long rows=0,payload=0; boolean more=false; byte[] boundary=upper;
+                var building=buildingPath(target);
+                try (var claim=FileChannel.open(building,StandardOpenOption.CREATE_NEW,StandardOpenOption.WRITE)) { temporary=building; claim.force(true); }
+                long rows=0,payload=0; boolean more=false; byte[] boundary=upper;
                 try (var env=new EnvOptions(databaseOptions); var options=new Options(databaseOptions,columnOptions); var writer=new SstFileWriter(env,options)) {
                     writer.open(temporary.toString());
                     scan: while (true) {
@@ -107,7 +114,7 @@ public final class NativeRangeSstExport {
                 result=new Prepared(manifest(snapshot,column,lower,boundary,rows,payload,fileBytes,new byte[rows==0 ? 0 : 32],rows==0 ? null : target),more,temporary,target,started,duration);
             }
             complete=true; return result;
-        } finally { if (!complete && temporary!=null) Files.deleteIfExists(temporary); }
+        } finally { if (!complete && temporary!=null) { Files.deleteIfExists(temporary); force(target.getParent()); } }
     }
     /** No native owner remains here; the link is published only after writer/cursor/retains close. */
     static Chunk publish(Prepared prepared) throws IOException {
@@ -118,12 +125,14 @@ public final class NativeRangeSstExport {
         boolean linked=false,complete=false;
         try {
             Files.createLink(prepared.target,prepared.temporary); linked=true; force(prepared.target.getParent());
-            Files.delete(prepared.temporary); force(prepared.target.getParent()); deadline(prepared.started,prepared.duration);
+            Files.delete(prepared.temporary); prepared.buildingOwned=false; force(prepared.target.getParent()); deadline(prepared.started,prepared.duration);
             var result=new Manifest(built.groupId(),built.rangeEpoch(),built.columnId(),built.schemaDigest(),built.position(),built.lowerInclusive(),built.upperExclusive(),built.rows(),built.payloadBytes(),built.fileBytes(),checksum,prepared.target);
             complete=true; return new Chunk(result,prepared.more);
         } finally { if (linked && !complete) { Files.deleteIfExists(prepared.target); force(prepared.target.getParent()); } }
     }
-    static void discard(Prepared prepared) throws IOException { if (prepared!=null) Files.deleteIfExists(prepared.temporary); }
+    static void discard(Prepared prepared) throws IOException {
+        if (prepared!=null && prepared.buildingOwned) { Files.deleteIfExists(prepared.temporary); prepared.buildingOwned=false; force(prepared.target.getParent()); }
+    }
     private static Manifest manifest(ReplicatedRangeStore.ScopedSnapshot snapshot, UUID column, byte[] lower, byte[] upper,
                                      long rows, long payload, long bytes, byte[] hash, Path file) {
         return new Manifest(snapshot.groupId(),snapshot.rangeEpoch(),column,snapshot.schemaDigest(),snapshot.position(),

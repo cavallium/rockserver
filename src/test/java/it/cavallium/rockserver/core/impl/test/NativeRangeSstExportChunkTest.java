@@ -45,7 +45,7 @@ class NativeRangeSstExportChunkTest {
                 var last=NativeRangeSstExport.writeChunk(root.resolve("last.sst"),snapshot,MERGED,first.manifest().upperExclusive(),bytes("f"),source.options,source.merged,limits(2,1024));
                 assertFalse(last.hasMore()); assertEquals(2,last.manifest().rows()); assertArrayEquals(bytes("d"),last.manifest().lowerInclusive()); assertArrayEquals(bytes("f"),last.manifest().upperExclusive());
                 for (var chunk:List.of(first,last)) {
-                    var manifest=chunk.manifest(); assertEquals(new ApplyPosition(1,1),manifest.position()); assertEquals(GROUP,manifest.groupId()); assertEquals(1,manifest.rangeEpoch()); assertArrayEquals(new byte[32],manifest.schemaDigest()); assertEquals(Files.size(manifest.file()),manifest.fileBytes()); assertEquals(32,manifest.sha256().length);
+                    var manifest=chunk.manifest(); assertEquals(new ApplyPosition(1,1),manifest.position()); assertEquals(GROUP,manifest.groupId()); assertEquals(1,manifest.rangeEpoch()); assertArrayEquals(new byte[32],manifest.schemaDigest()); assertEquals(Files.size(manifest.file()),manifest.fileBytes()); assertEquals(32,manifest.sha256().length); assertFalse(Files.exists(NativeRangeSstExport.buildingPath(manifest.file())));
                     try (var ingest=new IngestExternalFileOptions().setMoveFiles(false)) { target.db.ingestExternalFile(target.handles.get(1),List.of(manifest.file().toString()),ingest); }
                 }
                 assertArrayEquals(bytes("old-a"),target.db.get(target.handles.get(1),bytes("a"))); assertArrayEquals(bytes("one,two"),target.db.get(target.handles.get(1),bytes("b"))); assertNull(target.db.get(target.handles.get(1),bytes("c"))); assertArrayEquals(bytes("old-d"),target.db.get(target.handles.get(1),bytes("d")));
@@ -64,7 +64,7 @@ class NativeRangeSstExportChunkTest {
                 var last=NativeRangeSstExport.writeChunk(root.resolve("payload-last.sst"),snapshot,PLAIN,bytes("d"),bytes("z"),source.options,source.plain,limits(100,6));
                 assertFalse(last.hasMore()); assertArrayEquals(bytes("z"),last.manifest().upperExclusive()); assertEquals(1,last.manifest().rows());
                 var empty=NativeRangeSstExport.writeChunk(root.resolve("empty.sst"),snapshot,PLAIN,bytes("z"),null,source.options,source.plain,limits(1,6));
-                assertFalse(empty.hasMore()); assertEquals(0,empty.manifest().rows()); assertArrayEquals(bytes("z"),empty.manifest().lowerInclusive()); assertNull(empty.manifest().upperExclusive()); assertNull(empty.manifest().file()); assertFalse(Files.exists(root.resolve("empty.sst")));
+                assertFalse(empty.hasMore()); assertEquals(0,empty.manifest().rows()); assertArrayEquals(bytes("z"),empty.manifest().lowerInclusive()); assertNull(empty.manifest().upperExclusive()); assertNull(empty.manifest().file()); assertFalse(Files.exists(root.resolve("empty.sst"))); assertFalse(Files.exists(NativeRangeSstExport.buildingPath(root.resolve("empty.sst"))));
             }
         }
     }
@@ -75,7 +75,7 @@ class NativeRangeSstExportChunkTest {
                 assertThrows(java.io.IOException.class,() -> NativeRangeSstExport.writeChunk(root.resolve("oversized.sst"),snapshot,PLAIN,null,null,source.options,source.plain,limits(1,1)));
                 assertThrows(java.io.IOException.class,() -> NativeRangeSstExport.writeChunk(root.resolve("file-limit.sst"),snapshot,PLAIN,null,null,source.options,source.plain,new NativeRangeSstExport.Limits(1,1024,1,Duration.ofSeconds(10))));
                 assertFalse(Files.exists(root.resolve("oversized.sst"))); assertFalse(Files.exists(root.resolve("file-limit.sst")));
-                try (var files=Files.list(root)) { assertTrue(files.noneMatch(file -> file.getFileName().toString().startsWith(".range-sst-building-"))); }
+                try (var files=Files.list(root)) { assertTrue(files.noneMatch(file -> file.getFileName().toString().endsWith(".sst.building"))); }
                 assertEquals(1,source.store.activeSnapshotPins()); assertArrayEquals(bytes("value"),snapshot.get(PLAIN,bytes("a")));
             }
         }
@@ -92,4 +92,18 @@ class NativeRangeSstExportChunkTest {
             }
         }
     }
+    @Test void exactOrphanBuildPreventsExportWithoutChangingItsBytesOrAnExistingStableArtifact() throws Exception {
+        try (var source=new Fixture(root.resolve("orphan-build"))) {
+            source.store.apply(new ApplyPosition(1,1),command(0,new Mutation(Mutation.Kind.PUT,PLAIN,bytes("a"),bytes("value"))));
+            try (var snapshot=source.store.capture(new TransactionScope(List.of(TransactionScope.Span.range(PLAIN,null,null))))) {
+                var target=root.resolve("orphan.sst"); var building=NativeRangeSstExport.buildingPath(target); byte[] original=bytes("another invocation's retained build"); Files.write(building,original,StandardOpenOption.CREATE_NEW);
+                assertThrows(FileAlreadyExistsException.class,() -> NativeRangeSstExport.writeChunk(target,snapshot,PLAIN,null,null,source.options,source.plain,limits(1,1024))); assertArrayEquals(original,Files.readAllBytes(building)); assertFalse(Files.exists(target)); assertEquals(1,source.store.activeSnapshotPins());
+                Files.delete(building); var published=NativeRangeSstExport.writeChunk(target,snapshot,PLAIN,null,null,source.options,source.plain,limits(1,1024)); byte[] stable=Files.readAllBytes(published.manifest().file()); assertFalse(Files.exists(building));
+                Files.write(building,original,StandardOpenOption.CREATE_NEW);
+                assertThrows(FileAlreadyExistsException.class,() -> NativeRangeSstExport.writeChunk(target,snapshot,PLAIN,null,null,source.options,source.plain,limits(1,1024))); assertArrayEquals(stable,Files.readAllBytes(target)); assertArrayEquals(original,Files.readAllBytes(building));
+            }
+            assertEquals(0,source.store.activeSnapshotPins());
+        }
+    }
+
 }

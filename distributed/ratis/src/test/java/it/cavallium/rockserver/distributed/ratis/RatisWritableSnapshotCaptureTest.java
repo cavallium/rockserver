@@ -96,10 +96,10 @@ class RatisWritableSnapshotCaptureTest {
             var command=new DistributedCommand(f.data.f.groupId,1,new byte[32],new OperationId(captured.handle().id(),0,0),f.data.f.put(3).mutations());
             var pending=executor.submit(() -> registry.stage(captured.handle(),command));
             try {
-                assertTrue(entered.await(5,TimeUnit.SECONDS)); long bytes=pins.stats().bytes(); pins.release(captured.token());
+                assertTrue(entered.await(5,TimeUnit.SECONDS)); long bytes=pins.stats().bytes(); assertThrows(IOException.class,() -> pins.release(captured.token()));
                 assertEquals(1,pins.stats().pins()); assertEquals(bytes,pins.stats().bytes()); assertEquals(1,registry.chargedHandles()); assertEquals(1,f.data.f.store.activeTrackedSnapshotPins());
             } finally { release.countDown(); }
-            assertThrows(ExecutionException.class,() -> pending.get(5,TimeUnit.SECONDS)); pins.expire();
+            assertThrows(ExecutionException.class,() -> pending.get(5,TimeUnit.SECONDS)); pins.expire(); assertDoesNotThrow(() -> pins.release(captured.token()));
             assertEquals(0,pins.stats().pins()); assertEquals(RatisSnapshotPins.TOMBSTONE_BYTES,pins.stats().bytes()); assertEquals(0,registry.chargedHandles()); assertEquals(0,f.data.f.store.activeSnapshotPins());
         } finally { release.countDown(); }
     }

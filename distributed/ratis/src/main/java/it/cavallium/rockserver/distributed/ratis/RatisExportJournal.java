@@ -13,7 +13,7 @@ import java.util.*;
 /** Append-only export control; immutable artifacts remain independently usable after source loss. */
 public final class RatisExportJournal implements AutoCloseable {
     private static final int MAGIC=0x5245584a,MAX_RECORD=4*1024*1024+4096,FRAME=36;
-    public enum Phase { CAPTURING, EXPORTING, MATERIALIZED, READY, SNAPSHOT_LOST, RELEASED }
+    public enum Phase { CAPTURING, EXPORTING, MATERIALIZED, READY, SNAPSHOT_LOST, CANCELLED, RELEASED }
     public record Limits(int maximumChunks,long maximumJournalBytes,long maximumDiskBytes,NativeRangeSstExport.Limits chunk) {
         public Limits { Objects.requireNonNull(chunk); if (maximumChunks<1 || maximumChunks>65536 || maximumJournalBytes<2L*MAX_RECORD+1024 || maximumJournalBytes>64L*1024*1024 || maximumDiskBytes<chunk.maximumFileBytes()) throw new IllegalArgumentException("Invalid export budgets"); }
         public static Limits defaults() { return new Limits(4096,64L*1024*1024,1024L*1024*1024,new NativeRangeSstExport.Limits(65536,16L*1024*1024,32L*1024*1024,Duration.ofSeconds(30))); }
@@ -42,12 +42,12 @@ public final class RatisExportJournal implements AutoCloseable {
         }
         @Override public byte[] lowerInclusive() { return copy(lowerInclusive); } @Override public byte[] upperExclusive() { return copy(upperExclusive); } @Override public byte[] sha256() { return sha256.clone(); }
     }
-    public record Snapshot(Definition definition,Phase phase,Map<UUID,SnapshotFenceStatus.Capture> captures,ChunkIntent pending,List<Chunk> chunks,Set<String> acknowledged,long pendingArtifactBytes) { public Snapshot { captures=Map.copyOf(captures); chunks=List.copyOf(chunks); acknowledged=Set.copyOf(acknowledged); } }
+    public record Snapshot(Definition definition,Phase phase,Map<UUID,SnapshotFenceStatus.Capture> captures,ChunkIntent pending,List<Chunk> chunks,Set<String> acknowledged,long pendingArtifactBytes,boolean reclaiming,boolean artifactsReclaimed) { public Snapshot { captures=Map.copyOf(captures); chunks=List.copyOf(chunks); acknowledged=Set.copyOf(acknowledged); } }
     @FunctionalInterface public interface ChunkWriter { NativeRangeSstExport.Chunk write(Path artifact,ChunkIntent intent) throws Exception; }
     private static final class Progress { byte[] next; long ordinal; boolean complete; Progress(byte[] lower) { next=copy(lower); } }
     private final Path path; private final FileChannel ownership,log; private final FileLock lock;
     private Definition definition; private final Map<UUID,SnapshotFenceStatus.Capture> captures=new LinkedHashMap<>(); private final Map<UUID,ApplyPosition> sourceReleases=new LinkedHashMap<>(); private byte[] sourceDecision; private final Map<UUID,Progress> progress=new LinkedHashMap<>(); private final List<Chunk> chunks=new ArrayList<>(); private final Set<String> acknowledged=new HashSet<>();
-    private ChunkIntent pending; private byte[] chain=new byte[32]; private long disk,orphanBytes; private Phase phase=Phase.CAPTURING; private boolean active,closed,fenced;
+    private ChunkIntent pending; private byte[] chain=new byte[32]; private long disk,orphanBytes; private Phase phase=Phase.CAPTURING; private boolean active,closed,fenced,reclaiming,artifactsReclaimed;
     public static RatisExportJournal create(Path path,Definition definition) throws IOException { return new RatisExportJournal(path,Objects.requireNonNull(definition)); }
     public static RatisExportJournal reopen(Path path) throws IOException { return new RatisExportJournal(path,null); }
     private RatisExportJournal(Path path,Definition initial) throws IOException {
@@ -57,11 +57,11 @@ public final class RatisExportJournal implements AutoCloseable {
             try { acquired=ownership.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Export journal already owned",owned); } if (acquired==null) throw new IOException("Export journal already owned"); lock=acquired;
             opened=FileChannel.open(this.path,initial==null ? new StandardOpenOption[]{StandardOpenOption.READ,StandardOpenOption.WRITE} : new StandardOpenOption[]{StandardOpenOption.CREATE_NEW,StandardOpenOption.READ,StandardOpenOption.WRITE}); log=opened;
             if (initial!=null) { define(initial); append(1,definitionBytes(initial)); SessionJournalFiles.force(this.path.getParent()); }
-            else { replay(); for (var chunk:chunks) verifyArtifact(chunk); log.force(true); }
+            else { replay(); if (!reclaiming && !artifactsReclaimed) for (var chunk:chunks) verifyArtifact(chunk); log.force(true); }
         } catch (IOException | RuntimeException | Error failure) { if (opened!=null) try { opened.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } if (acquired!=null) try { acquired.release(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } try { ownership.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
     private void define(Definition value) { definition=value; for (var participant:value.fence().participants()) progress.put(participant.groupId(),new Progress(scope(participant.groupId()).lowerInclusive())); }
-    public synchronized Snapshot snapshot() throws IOException { open(); if (active) throw new IOException("Export journal work active"); return new Snapshot(definition,phase,captures,pending,chunks,acknowledged,orphanBytes); }
+    public synchronized Snapshot snapshot() throws IOException { open(); if (active) throw new IOException("Export journal work active"); return new Snapshot(definition,phase,captures,pending,chunks,acknowledged,orphanBytes,reclaiming,artifactsReclaimed); }
     /** Freeze the original complete read-only cut and released native gates before any chunk build. */
     public void bindSource(RatisDurableSnapshot.Snapshot source) throws IOException {
         Objects.requireNonNull(source); admit();
@@ -104,7 +104,7 @@ public final class RatisExportJournal implements AutoCloseable {
         var intent=new ChunkIntent(group,definition.column(),captures.get(group).position(),state.next,state.ordinal,definition.limits().chunk()); var artifact=artifactPath(intent);
         if (Files.exists(artifact,LinkOption.NOFOLLOW_LINKS) || Files.exists(sidecar(artifact),LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unbound export artifact already exists"); append(3,intentBytes(intent)); pending=intent; return intent;
     }
-    public Path artifactPath(ChunkIntent intent) { return path.resolveSibling(definition.jobId()+"-"+intent.group()+"-"+intent.ordinal()+".sst"); }
+    public Path artifactPath(ChunkIntent intent) { return path.resolveSibling(hex(hash(path.getFileName().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)))+"-"+definition.jobId()+"-"+intent.group()+"-"+intent.ordinal()+".sst"); }
     public Chunk export(UUID group,ChunkWriter writer) throws Exception {
         Objects.requireNonNull(writer); admit(); try { var intent=freeze(group); var recovered=recover(); if (recovered!=null) return recovered; return publishInternal(intent,writer.write(artifactPath(intent),intent)); } finally { finish(); }
     }
@@ -149,7 +149,7 @@ public final class RatisExportJournal implements AutoCloseable {
         admit();
         try {
             if (phase==Phase.READY || phase==Phase.MATERIALIZED || phase==Phase.RELEASED) throw new IllegalStateException("Retained complete export remains independent of source loss");
-            if (phase==Phase.SNAPSHOT_LOST) return;
+            if (phase==Phase.SNAPSHOT_LOST || phase==Phase.CANCELLED) return;
             try { recover(); } catch (IOException invalidOrBareArtifact) { if (fenced) throw invalidOrBareArtifact; }
             if (phase==Phase.MATERIALIZED) return; // An exact durable sidecar rescued the complete immutable coverage.
             long bytes=0;
@@ -157,7 +157,36 @@ public final class RatisExportJournal implements AutoCloseable {
             append(6,ByteBuffer.allocate(8).putLong(bytes).array()); orphanBytes=bytes; phase=Phase.SNAPSHOT_LOST;
         } finally { finish(); }
     }
-    public void release() throws IOException { admit(); try { if (phase==Phase.RELEASED) return; if (phase!=Phase.READY && phase!=Phase.SNAPSHOT_LOST || phase==Phase.READY && acknowledged.size()!=chunks.size()) throw new IllegalStateException("Release requires all published chunks explicitly acknowledged"); append(7,new byte[0]); phase=Phase.RELEASED; } finally { finish(); } }
+    public void release() throws IOException { admit(); try { if (phase==Phase.RELEASED) return; if (phase!=Phase.READY && phase!=Phase.SNAPSHOT_LOST && phase!=Phase.CANCELLED || phase==Phase.READY && acknowledged.size()!=chunks.size()) throw new IllegalStateException("Release requires all published chunks explicitly acknowledged"); append(7,new byte[0]); phase=Phase.RELEASED; } finally { finish(); } }
+    /** Explicit abandonment is distinct from evidence that the original source was lost. */
+    public void cancel() throws IOException {
+        admit();
+        try {
+            if (phase==Phase.CANCELLED || phase==Phase.RELEASED || phase==Phase.SNAPSHOT_LOST) return;
+            long bytes=0; if (pending!=null) { var artifact=artifactPath(pending); if (Files.isRegularFile(artifact,LinkOption.NOFOLLOW_LINKS)) bytes=Files.size(artifact); }
+            append(9,ByteBuffer.allocate(8).putLong(bytes).array()); orphanBytes=bytes; phase=Phase.CANCELLED;
+        }
+        finally { finish(); }
+    }
+    /** Caller must first drain all source writers and artifact readers; the journal retains its lock inode. */
+    public void reclaimArtifacts() throws IOException {
+        admit();
+        try {
+            if (phase!=Phase.RELEASED) throw new IllegalStateException("Export artifacts remain retained until explicit release");
+            if (artifactsReclaimed) return;
+            if (!reclaiming) {
+                for (var chunk:chunks) verifyArtifact(chunk);
+                append(10,new byte[0]); reclaiming=true;
+            }
+            for (var chunk:chunks) {
+                var artifact=artifactPath(new ChunkIntent(chunk.group(),chunk.column(),chunk.cut(),chunk.lowerInclusive(),chunk.ordinal(),definition.limits().chunk()));
+                Files.deleteIfExists(artifact); Files.deleteIfExists(NativeRangeSstExport.buildingPath(artifact)); Files.deleteIfExists(sidecar(artifact)); Files.deleteIfExists(sidecar(artifact).resolveSibling(sidecar(artifact).getFileName()+".pending"));
+            }
+            if (pending!=null) { var artifact=artifactPath(pending); Files.deleteIfExists(artifact); Files.deleteIfExists(NativeRangeSstExport.buildingPath(artifact)); Files.deleteIfExists(sidecar(artifact)); Files.deleteIfExists(sidecar(artifact).resolveSibling(sidecar(artifact).getFileName()+".pending")); }
+            SessionJournalFiles.force(path.getParent());
+            append(11,new byte[0]); reclaiming=false; artifactsReclaimed=true; disk=orphanBytes=0;
+        } finally { finish(); }
+    }
     private void requireIntent(ChunkIntent value) throws IOException { if (pending==null || !Arrays.equals(intentBytes(value),intentBytes(pending))) throw new IOException("Original export chunk intent changed"); }
     private TransactionScope.Span scope(UUID group) { return projection(definition.fence().participant(group),definition.column()); }
     private static int lowerOrder(byte[] a,byte[] b) { return a==null ? b==null ? 0 : -1 : b==null ? 1 : Arrays.compareUnsigned(a,b); }
@@ -202,11 +231,14 @@ public final class RatisExportJournal implements AutoCloseable {
             case 4 -> { if (phase!=Phase.EXPORTING) throw new IOException("Export publication after terminal state"); var chunk=decodeChunk(in); requireChunk(chunk); if (chunks.size()>=definition.limits().maximumChunks() || disk+chunk.fileBytes()>definition.limits().maximumDiskBytes()) throw new IOException("Export recovered capacity exceeded"); applyChunk(chunk); }
             case 5 -> { if (phase!=Phase.READY) throw new IOException("Export ACK precedes READY"); byte[] digest=new byte[32]; in.get(digest); String id=hex(digest); if (acknowledged.size()>=chunks.size() || !hex(hash(uncheckedChunkBytes(chunks.get(acknowledged.size())))).equals(id) || !acknowledged.add(id)) throw new IOException("Invalid export acknowledgement"); }
             case 6 -> { if (phase!=Phase.CAPTURING && phase!=Phase.EXPORTING) throw new IOException("Invalid export source loss transition"); orphanBytes=in.getLong(); if (orphanBytes<0 || pending==null && orphanBytes!=0) throw new IOException("Invalid retained orphan artifact bytes"); phase=Phase.SNAPSHOT_LOST; }
-            case 7 -> { if (phase!=Phase.READY && phase!=Phase.SNAPSHOT_LOST || phase==Phase.READY && acknowledged.size()!=chunks.size()) throw new IOException("Invalid export release transition"); phase=Phase.RELEASED; }
+            case 7 -> { if (phase!=Phase.READY && phase!=Phase.SNAPSHOT_LOST && phase!=Phase.CANCELLED || phase==Phase.READY && acknowledged.size()!=chunks.size()) throw new IOException("Invalid export release transition"); phase=Phase.RELEASED; }
             case 8 -> {
                 if (phase!=Phase.MATERIALIZED || pending!=null) throw new IOException("Export READY precedes complete materialization"); byte[] decision=new byte[32]; in.get(decision); if (!Arrays.equals(decision,sourceDecision) || in.getInt()!=progress.size()) throw new IOException("Export READY participant count differs");
                 for (var group:progress.keySet()) { if (!group.equals(uuid(in))) throw new IOException("Export READY participant changed"); int lost=in.get() & 255; var release=position(in); var token=captures.get(group); if (lost>1 || !atLeast(release,sourceReleases.get(group)) || release.index()<=token.position().index() || release.term()<token.position().term()) throw new IOException("Export READY release/capture proof differs"); } phase=Phase.READY;
             }
+            case 9 -> { if (phase==Phase.RELEASED || phase==Phase.CANCELLED || phase==Phase.SNAPSHOT_LOST) throw new IOException("Invalid export cancellation transition"); orphanBytes=in.getLong(); if (orphanBytes<0 || pending==null && orphanBytes!=0) throw new IOException("Invalid cancelled artifact accounting"); phase=Phase.CANCELLED; }
+            case 10 -> { if (phase!=Phase.RELEASED || reclaiming || artifactsReclaimed) throw new IOException("Invalid export reclamation intent"); reclaiming=true; }
+            case 11 -> { if (phase!=Phase.RELEASED || !reclaiming || artifactsReclaimed) throw new IOException("Invalid export reclamation completion"); reclaiming=false; artifactsReclaimed=true; disk=orphanBytes=0; }
             default -> throw new IOException("Unknown export record kind");
         }
     }

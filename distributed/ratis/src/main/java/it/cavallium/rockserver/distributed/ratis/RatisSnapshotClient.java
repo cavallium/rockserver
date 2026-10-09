@@ -47,31 +47,57 @@ public final class RatisSnapshotClient implements AutoCloseable {
         this.mode=Objects.requireNonNull(mode); this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
         schema.requireMatches(data.directory()); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
     }
+    RatisSnapshotCaptureRequest.Mode captureMode() { return mode; }
+    public byte[] identityDigest() {
+        var bytes=java.nio.ByteBuffer.allocate(97).put(data.sessionIdentityDigest()).put(homes.identityDigest()).put(schema.digest()).put((byte)(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? 0 : 1)).array();
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); }
+        catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+    /** Frozen capture definition is checked against cached placement before any source RPC. */
+    public Lease openFrozen(Path path,SnapshotFence expected,Duration ttl,RequestContext context) throws IOException {
+        Objects.requireNonNull(expected); validateTtl(ttl); long deadline=scheduler.resolveMonotonicDeadline(context);
+        var home=homes.route(expected.fenceId());
+        if (!home.groupId().equals(expected.homeGroup()) || home.rangeEpoch()!=expected.homeEpoch()) throw new IOException("Frozen source HOME placement changed");
+        var first=expected.participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();
+        var plan=RatisSnapshotPlan.create(data.directory(),RatisSnapshotPlan.scope(expected),expected.fenceId(),expected.operation(),expected.homeGroup(),expected.homeEpoch(),first);
+        if (!plan.fence().equals(expected)) throw new IOException("Frozen source definition differs from current cached projection");
+        long bytes=64*1024L+3L*expected.encode().length+128*1024L*plan.routes().size(); for (var route:plan.routes()) bytes+=2L*SessionWindowJournal.routeSize(route);
+        if (bytes>RatisDurableSnapshot.MAX_BYTES) throw new IOException("Snapshot retained metadata exceeds journal capacity");
+        var lease=admit(path,plan,ttl,bytes,expected); lease.beginAcquire(context,deadline); return lease;
+    }
+    public Lease reopenFrozen(Path path,SnapshotFence expected,RequestContext context) throws IOException {
+        Objects.requireNonNull(expected);
+        if (mode!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IOException("Mutable frontend cannot reopen its prefix");
+        long deadline=scheduler.resolveMonotonicDeadline(context); var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES,expected); lease.beginAcquire(context,deadline); return lease;
+    }
     public Lease open(Path path,Identity identity,TransactionScope scope,Duration ttl,RequestContext context) throws IOException {
         long deadline=scheduler.resolveMonotonicDeadline(context); Objects.requireNonNull(identity); validateTtl(ttl);
         var home=homes.route(identity.fence());
         var plan=RatisSnapshotPlan.create(data.directory(),scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
         long bytes=64*1024L+3L*plan.fence().encode().length+128*1024L*plan.routes().size(); for (var route:plan.routes()) bytes+=2L*SessionWindowJournal.routeSize(route);
         if (bytes>RatisDurableSnapshot.MAX_BYTES) throw new IOException("Snapshot retained metadata exceeds journal capacity");
-        var lease=admit(path,plan,ttl,bytes); lease.beginAcquire(context,deadline); return lease;
+        var lease=admit(path,plan,ttl,bytes,null); lease.beginAcquire(context,deadline); return lease;
     }
     public Lease reopen(Path path,RequestContext context) throws IOException {
         if (mode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED) throw new IOException("Writable frontend prefixes are ephemeral; resume the original lease");
-        long deadline=scheduler.resolveMonotonicDeadline(context); var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES); lease.beginAcquire(context,deadline); return lease;
+        long deadline=scheduler.resolveMonotonicDeadline(context); var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES,null); lease.beginAcquire(context,deadline); return lease;
     }
     /** Recover only durable cleanup direction; no frontend prefix or read authority is reconstructed. */
     Lease reopenForRelease(Path path,RequestContext context) throws IOException {
         requireOpen(); Objects.requireNonNull(context);
-        var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES); lease.release(context); return lease;
+        var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES,null); lease.release(context); return lease;
+    }
+    Lease reopenForReleaseFrozen(Path path,SnapshotFence expected,RequestContext context) throws IOException {
+        Objects.requireNonNull(expected); requireOpen(); var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES,expected); lease.release(context); return lease;
     }
     public synchronized Lease lease(Path path) { return leases.get(path.toAbsolutePath().normalize()); }
     public synchronized Stats stats() { return new Stats(leases.size(),reads,cursors,chargedBytes); }
     private synchronized void requireOpen() throws IOException { if (closing || closed) throw new IOException("Snapshot client closing/closed"); }
-    private synchronized Lease admit(Path file,RatisSnapshotPlan plan,Duration ttl,long bytes) throws IOException {
+    private synchronized Lease admit(Path file,RatisSnapshotPlan plan,Duration ttl,long bytes,SnapshotFence expectedFence) throws IOException {
         requireOpen(); Path path=Objects.requireNonNull(file).toAbsolutePath().normalize();
         if (leases.containsKey(path)) throw new IOException("Snapshot journal already owned; reuse its lease");
         if (leases.size()>=limits.leases() || bytes>limits.bytes()-chargedBytes) throw new IOException("Snapshot lease/byte capacity exhausted");
-        var lease=new Lease(path,plan,ttl,bytes); leases.put(path,lease); chargedBytes+=bytes; return lease;
+        var lease=new Lease(path,plan,ttl,bytes,expectedFence); leases.put(path,lease); chargedBytes+=bytes; return lease;
     }
     private synchronized void reserve(long bytes,boolean read,boolean cursor) throws IOException {
         requireOpen(); if (bytes>limits.bytes()-chargedBytes || read && reads>=MAX_READS || cursor && cursors>=MAX_CURSORS) throw new IOException("Snapshot reader/cursor/byte capacity exhausted");
@@ -92,6 +118,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     public final class Lease implements AutoCloseable {
         private final Path path; private final long bytes;
         private RatisSnapshotPlan plan; private Duration ttl;
+        private final SnapshotFence expectedFence;
         private volatile RatisDurableSnapshot journal;
         private record ReadBinding(TransactionScope scope,List<RatisLogicalSnapshotPages.Owner> owners,RatisLogicalSnapshotPages.OwnerReader reader,Map<UUID,RatisRoutedClient.ScopedTransaction> captures) {}
         private volatile ReadBinding binding;
@@ -108,7 +135,9 @@ public final class RatisSnapshotClient implements AutoCloseable {
         private boolean commitFrozen,commitFinished;
         private final Set<Task<?>> reading=new HashSet<>();
         private final Set<Cursor> borrowedCursors=new HashSet<>();
-        private Lease(Path path,RatisSnapshotPlan plan,Duration ttl,long bytes) { this.path=path; this.plan=plan; this.ttl=ttl; this.bytes=bytes; }
+        private Lease(Path path,RatisSnapshotPlan plan,Duration ttl,long bytes,SnapshotFence expectedFence) { this.path=path; this.plan=plan; this.ttl=ttl; this.bytes=bytes; this.expectedFence=expectedFence; }
+        boolean initialized() { return journal!=null; }
+        synchronized boolean uninitializedFailure() { return journal==null && control==null && acquisition!=null && acquisition.result.isCompletedExceptionally(); }
         public Path path() { return path; }
         public synchronized RatisDurableSnapshot.Snapshot snapshot() throws IOException { if (closed || closeRequested || journal==null) throw new IOException("Snapshot journal unavailable"); return journal.snapshot(); }
         public synchronized CompletableFuture<Void> completion() { return acquisition==null ? CompletableFuture.failedFuture(new IOException("Snapshot acquisition not admitted")) : acquisition.view(); }
@@ -121,7 +150,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         private void requireIdleControl() throws IOException { if (closed || closeRequested) throw new IOException("Snapshot lease closing/closed"); if (control!=null || !reading.isEmpty()) throw new IOException("Snapshot work active; ownership retained"); }
         private <T> void submitControl(Task<T> task,RequestContext context) {
-            try { if (task.kind==Kind.RELEASE) { synchronized (RatisSnapshotClient.this) { if (closed) throw new IOException("Snapshot client closed"); } } else requireOpen(); requireIdleControl(); control=task; scheduler.executor(context.profile(),task.family,task.deadline).execute(task,Math.min(bytes+task.bytes,WorkloadCost.MAX_ESTIMATED_BYTES)); }
+            try { if (task.kind==Kind.RELEASE) { synchronized (RatisSnapshotClient.this) { if (closed) throw new IOException("Snapshot client closed"); } } else requireOpen(); requireIdleControl(); control=task; (task.kind==Kind.RELEASE ? scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,task.deadline) : scheduler.executor(context.profile(),task.family,task.deadline)).execute(task,Math.min(bytes+task.bytes,WorkloadCost.MAX_ESTIMATED_BYTES)); }
             catch (Exception failure) { task.fail(failure); }
         }
         private <T> CompletableFuture<T> read(Kind kind,OperationFamily family,long cost,RequestContext context,long deadline,Work<T> work,Cursor cursor) {
@@ -187,6 +216,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         private void validateIdentity(RatisDurableSnapshot candidate) throws IOException {
             if (candidate.mode()!=mode) throw new IOException("Snapshot journal capture mode differs from client");
             var saved=candidate.snapshot(); var fence=saved.initial().fence();
+            if (expectedFence!=null && !expectedFence.equals(fence)) throw new IOException("Original source journal differs from frozen expected fence");
             if (!fence.clusterId().equals(schema.clusterId()) || !fence.databaseId().equals(schema.databaseId()) || !fence.domainId().equals(schema.domainId()) || fence.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(fence.schemaDigest(),schema.digest())) throw new IOException("Snapshot journal schema differs from this client");
             var first=fence.participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow(); new Identity(fence.fenceId(),fence.operation(),first);
             int n=0; for (var p:fence.participants()) {

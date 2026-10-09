@@ -112,4 +112,46 @@ class RatisExportJournalTest {
         assertTrue(Files.exists(artifact)); try (var journal=RatisExportJournal.reopen(path)) { assertEquals(RatisExportJournal.Phase.RELEASED,journal.snapshot().phase()); assertEquals(3,journal.snapshot().pendingArtifactBytes()); }
     }
 
+    @Test void explicitCancellationFencesPendingPublicationAndReclaimsItsPrivateArtifacts() throws Exception {
+        var directory=directory(1); var definition=definition(directory); var path=root.resolve("cancel.export"); Path artifact;
+        try (var journal=RatisExportJournal.create(path,definition)) {
+            journal.bindSource(capturedSource(directory,definition.fence(),tokens(definition.fence())));
+            var intent=journal.freezeChunk(directory.ranges().getFirst().groupId()); artifact=journal.artifactPath(intent);
+            var result=artifact(journal,intent,null,false,false);
+            var partial=artifact.resolveSibling(artifact.getFileName()+".manifest.pending"); Files.write(partial,new byte[]{1,2},StandardOpenOption.CREATE_NEW); var building=NativeRangeSstExport.buildingPath(artifact); Files.write(building,new byte[]{3,4},StandardOpenOption.CREATE_NEW);
+            journal.cancel(); journal.cancel(); assertEquals(RatisExportJournal.Phase.CANCELLED,journal.snapshot().phase());
+            assertThrows(IOException.class,() -> journal.publish(intent,result)); assertThrows(IllegalStateException.class,journal::reclaimArtifacts);
+            journal.release(); journal.reclaimArtifacts(); journal.reclaimArtifacts();
+            assertTrue(journal.snapshot().artifactsReclaimed()); assertFalse(Files.exists(artifact)); assertFalse(Files.exists(partial)); assertFalse(Files.exists(building)); assertEquals(0,journal.snapshot().pendingArtifactBytes());
+        }
+        try (var journal=RatisExportJournal.reopen(path)) { assertEquals(RatisExportJournal.Phase.RELEASED,journal.snapshot().phase()); assertTrue(journal.snapshot().artifactsReclaimed()); }
+    }
+    @Test void acknowledgedReclamationRecoversAfterDeletionBeforeCompletionMarker() throws Exception {
+        var directory=directory(1); var definition=definition(directory); var path=root.resolve("reclaim.export"); long released; Path artifact;
+        try (var journal=RatisExportJournal.create(path,definition)) {
+            var captures=tokens(definition.fence()); journal.bindSource(capturedSource(directory,definition.fence(),captures));
+            var intent=journal.freezeChunk(directory.ranges().getFirst().groupId()); var chunk=journal.publish(intent,artifact(journal,intent,null,false,false)); artifact=chunk.file();
+            journal.markReady(releasedSource(directory,definition.fence(),captures)); journal.acknowledge(chunk); journal.release(); released=Files.size(path);
+            journal.reclaimArtifacts(); assertFalse(Files.exists(artifact));
+        }
+        // Keep only the forced reclamation intent; the data removals already happened.
+        try (var channel=FileChannel.open(path,StandardOpenOption.WRITE)) { channel.truncate(released+69); channel.force(true); }
+        try (var journal=RatisExportJournal.reopen(path)) {
+            assertTrue(journal.snapshot().reclaiming()); assertFalse(journal.snapshot().artifactsReclaimed()); journal.reclaimArtifacts(); assertTrue(journal.snapshot().artifactsReclaimed());
+        }
+        assertTrue(Files.exists(path.resolveSibling(path.getFileName()+".lock")));
+    }
+
+    @Test void reclamationCannotDeleteArtifactsOwnedByAnotherJournalInTheSameDirectory() throws Exception {
+        var directory=directory(1); var definition=definition(directory); var captures=tokens(definition.fence()); var group=directory.ranges().getFirst().groupId();
+        try (var first=RatisExportJournal.create(root.resolve("first.export"),definition); var second=RatisExportJournal.create(root.resolve("second.export"),definition)) {
+            first.bindSource(capturedSource(directory,definition.fence(),captures)); second.bindSource(capturedSource(directory,definition.fence(),captures));
+            var a=first.freezeChunk(group); var b=second.freezeChunk(group); assertNotEquals(first.artifactPath(a),second.artifactPath(b));
+            var c=first.publish(a,artifact(first,a,null,false,false)); var d=second.publish(b,artifact(second,b,null,false,false));
+            first.markReady(releasedSource(directory,definition.fence(),captures)); first.acknowledge(c); first.release(); first.reclaimArtifacts();
+            assertFalse(Files.exists(c.file())); assertTrue(Files.exists(d.file())); assertEquals(1,second.snapshot().chunks().size());
+        }
+        try (var remaining=RatisExportJournal.reopen(root.resolve("second.export"))) { assertEquals(RatisExportJournal.Phase.MATERIALIZED,remaining.snapshot().phase()); assertTrue(Files.exists(remaining.snapshot().chunks().getFirst().file())); }
+    }
+
 }

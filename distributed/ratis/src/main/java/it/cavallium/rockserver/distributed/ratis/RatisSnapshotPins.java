@@ -214,9 +214,12 @@ final class RatisSnapshotPins implements AutoCloseable {
         }
     }
     void release(SnapshotFenceStatus.Capture token) throws Exception {
-        requireOwner(Objects.requireNonNull(token).ownerIncarnation());
-        synchronized (this) { var entry=snapshots.get(token.snapshotId()); requireToken(entry,token); entry.closed=true; }
+        requireOwner(Objects.requireNonNull(token).ownerIncarnation()); final Entry entry;
+        synchronized (this) { entry=snapshots.get(token.snapshotId()); requireToken(entry,token); entry.closed=true; }
         cleanup();
+        synchronized (this) {
+            if (entry.busy || entry.cleaning || entry.pin!=null || entry.handle!=null) throw new IOException("Snapshot actual work/cleanup still active; release not settled");
+        }
     }
     void expire() throws Exception {
         synchronized (this) {
