@@ -69,7 +69,6 @@ class GrpcFastGetTest {
 	private static final it.cavallium.rockserver.core.common.api.proto.RequestContext BATCH_CONTEXT =
 			it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-					.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE)
 					.build();
 
@@ -77,8 +76,8 @@ class GrpcFastGetTest {
 	Path tempDir;
 
 	@Test
-	void fastGetRejectsMissingAndNonV3RequestContexts() throws Exception {
-		try (var embedded = openEmbedded("strict-v3")) {
+	void fastGetRejectsMissingProfileAndTimeoutButAllowsProtectedCleanup() throws Exception {
+		try (var embedded = openEmbedded("strict-context")) {
 			long columnId = populate(embedded);
 			var embeddedApi = embedded.getSyncApi(
 					it.cavallium.rockserver.core.common.RequestContext.batch());
@@ -86,39 +85,23 @@ class GrpcFastGetTest {
 			try (var server = new GrpcServer(embedded, new InetSocketAddress("127.0.0.1", 0))) {
 				server.start();
 				try (var client = ClientHandle.forTcp("127.0.0.1", server.getPort())) {
-					for (int version : new int[] {0, 2, 4}) {
-						var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
-								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-								.setTimeoutNanos(Long.MAX_VALUE);
-						if (version != 0) context.setWorkloadContractVersion(version);
-						var request = request(columnId, 0L, 0L).toBuilder().setContext(context).build();
-						var failure = assertThrows(StatusRuntimeException.class,
-								() -> client.stub().get(request));
-						assertEquals(Status.Code.INVALID_ARGUMENT, failure.getStatus().getCode());
-					}
-					var protectedFailure = assertThrows(StatusRuntimeException.class,
-							() -> client.stub().closeIterator(
-									it.cavallium.rockserver.core.common.api.proto.CloseIteratorRequest
-											.newBuilder().setIteratorId(1L).build()));
-					assertEquals(Status.Code.INVALID_ARGUMENT, protectedFailure.getStatus().getCode());
-					var v2Context = BATCH_CONTEXT.toBuilder().setWorkloadContractVersion(2).build();
-					var rollbackFailure = assertThrows(StatusRuntimeException.class,
-							() -> client.stub().closeTransaction(
-									it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest
-											.newBuilder()
-											.setTransactionId(rollbackTransaction)
-											.setCommit(false)
-											.setContext(v2Context)
-											.build()));
-					assertEquals(Status.Code.INVALID_ARGUMENT, rollbackFailure.getStatus().getCode());
-					assertEquals(1, embedded.getInternalDB().getOpenTransactionsCount(),
-							"v2 rollback reached the protected backend");
+                    for (var context : java.util.List.of(
+                            it.cavallium.rockserver.core.common.api.proto.RequestContext.getDefaultInstance(),
+                            BATCH_CONTEXT.toBuilder().setTimeoutNanos(0L).build())) {
+                        var request = request(columnId, 0L, 0L).toBuilder().setContext(context).build();
+                        var failure = assertThrows(StatusRuntimeException.class, () -> client.stub().get(request));
+                        assertEquals(Status.Code.INVALID_ARGUMENT, failure.getStatus().getCode());
+                    }
+                    var rollback = client.stub().closeTransaction(
+                            it.cavallium.rockserver.core.common.api.proto.CloseTransactionRequest.newBuilder()
+                                    .setTransactionId(rollbackTransaction).setCommit(false).build());
+                    assertTrue(rollback.getSuccessful());
+                    assertEquals(0, embedded.getInternalDB().getOpenTransactionsCount());
 
 					var missingPrecondition = assertThrows(StatusRuntimeException.class,
 							() -> client.stub().cdcCreate(
 									it.cavallium.rockserver.core.common.api.proto.CdcCreateRequest.newBuilder()
 											.setId("must-not-create")
-											.setWorkloadContractVersion(3)
 											.build()));
 					assertEquals(Status.Code.INVALID_ARGUMENT, missingPrecondition.getStatus().getCode());
 					assertEquals(java.util.OptionalLong.empty(), embedded.getSyncApi(

@@ -13,8 +13,8 @@ use tonic::{Request, Status}; // Disambiguate from proto
 
 pub type Result<T> = std::result::Result<T, Status>;
 
-pub const REQUIRED_WORKLOAD_CONTRACT_VERSION: i32 = 3;
 const DEFAULT_CDC_MAX_RESPONSE_BYTES: i32 = 4 * 1024 * 1024;
+const MAX_DECODING_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 fn duration_nanos(value: Duration) -> Result<i64> {
     if value.is_zero() {
@@ -60,6 +60,7 @@ impl std::error::Error for RockserverConnectError {
 pub struct RockserverClient {
     client: DeadlineClient,
     context: RequestContext,
+    capabilities: Capabilities,
 }
 
 type DeadlineClient = RocksDbServiceClient<InterceptedService<Channel, DeadlineInterceptor>>;
@@ -129,45 +130,68 @@ impl RockserverClient {
             .connect()
             .await
             .map_err(RockserverConnectError::Transport)?;
-        let mut handshake_client = RocksDbServiceClient::new(channel.clone());
-        Self::require_capabilities(&mut handshake_client)
+        let mut handshake_client = RocksDbServiceClient::new(channel.clone())
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES);
+        let capabilities = Self::require_capabilities(&mut handshake_client)
             .await
             .map_err(RockserverConnectError::Capabilities)?;
         Ok(Self {
-            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor),
+            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES),
             context,
+            capabilities,
         })
     }
 
     /// Creates a new client from an existing Tonic `Channel` after the mandatory
-    /// workload-contract capability handshake.
+    /// backend capability handshake.
     pub async fn new(channel: Channel, context: RequestContext) -> Result<Self> {
-        let mut handshake_client = RocksDbServiceClient::new(channel.clone());
-        Self::require_capabilities(&mut handshake_client).await?;
+        let mut handshake_client = RocksDbServiceClient::new(channel.clone())
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES);
+        let capabilities = Self::require_capabilities(&mut handshake_client).await?;
         Ok(Self {
-            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor),
+            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES),
             context,
+            capabilities,
         })
     }
 
     #[cfg(test)]
     fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
         Self {
-            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor),
+            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES),
             context,
+            capabilities: Capabilities {
+                backend_mode: BackendMode::Standalone,
+                raw_scan_mode: RawScanMode::PhysicalSst,
+                maximum_range_page_keys: 4_096,
+                maximum_range_page_bytes: 8 * 1024 * 1024,
+            },
         }
     }
 
-    async fn require_capabilities(client: &mut RocksDbServiceClient<Channel>) -> Result<()> {
+    async fn require_capabilities(
+        client: &mut RocksDbServiceClient<Channel>,
+    ) -> Result<Capabilities> {
         let mut request = Request::new(CapabilitiesRequest {});
         request.set_timeout(Duration::from_secs(10));
-        let capabilities = client.get_capabilities(request).await?.into_inner();
-        if capabilities.workload_contract_version != REQUIRED_WORKLOAD_CONTRACT_VERSION {
-            return Err(Status::failed_precondition(format!(
-				"incompatible Rockserver workload contract: required version {} with bounded ranges and resumable raw scans, got version {}",
-				REQUIRED_WORKLOAD_CONTRACT_VERSION,
-				capabilities.workload_contract_version,
-			)));
+        let capabilities =
+            Capabilities::try_from(client.get_capabilities(request).await?.into_inner())?;
+        capabilities.with_transport_limit(MAX_DECODING_MESSAGE_BYTES)
+    }
+
+    /// Returns backend capabilities validated and limited to this client's transport at connection time.
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    fn require_physical_raw_scan(&self) -> Result<()> {
+        if self.capabilities.raw_scan_mode != RawScanMode::PhysicalSst {
+            return Err(Status::failed_precondition(
+                "physical SST raw scans are not supported by this backend",
+            ));
         }
         Ok(())
     }
@@ -178,6 +202,7 @@ impl RockserverClient {
         Self {
             client: self.client.clone(),
             context,
+            capabilities: self.capabilities,
         }
     }
 
@@ -199,11 +224,6 @@ impl RockserverClient {
                     "unknown workload profile: {value}"
                 )));
             }
-        }
-        if self.context.workload_contract_version != REQUIRED_WORKLOAD_CONTRACT_VERSION {
-            return Err(Status::invalid_argument(
-                "request context must use workload contract version 3",
-            ));
         }
         if self.context.timeout_nanos <= 0 {
             return Err(Status::invalid_argument("timeout_nanos must be positive"));
@@ -243,15 +263,6 @@ impl RockserverClient {
         let prepared = self.contextual_request(message)?;
         let future = call(self.client.clone(), prepared.request);
         await_bound_call(prepared.deadline, future).await
-    }
-
-    fn protected_request<T>(&self, message: T) -> Result<Request<T>> {
-        if self.context.workload_contract_version != REQUIRED_WORKLOAD_CONTRACT_VERSION {
-            return Err(Status::invalid_argument(
-                "request context must use workload contract version 3",
-            ));
-        }
-        Ok(Request::new(message))
     }
 
     // ============================================================================================
@@ -297,20 +308,14 @@ impl RockserverClient {
             })
             .await?
         } else {
-            self.client
-                .clone()
-                .close_transaction(self.protected_request(req)?)
-                .await?
+            self.client.clone().close_transaction(req).await?
         };
         Ok(resp.into_inner().successful)
     }
 
     /// Closes a failed update explicitly.
     pub async fn close_failed_update(&self, update_id: i64) -> Result<()> {
-        let req = CloseFailedUpdateRequest {
-            update_id,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = CloseFailedUpdateRequest { update_id };
         self.client.clone().close_failed_update(req).await?;
         Ok(())
     }
@@ -379,14 +384,19 @@ impl RockserverClient {
 
     /// Aggregates current SST properties without flushing. Excludes memtables and blob files.
     /// Requires an ANALYTICAL or BATCH context. Counts physical entries, not live logical rows.
-    pub async fn get_table_properties(&self, column_id: i64) -> Result<ColumnTablePropertiesResponse> {
+    pub async fn get_table_properties(
+        &self,
+        column_id: i64,
+    ) -> Result<ColumnTablePropertiesResponse> {
         let req = GetTablePropertiesRequest {
             column_id,
             context: Some(self.context.clone()),
         };
-        let resp = self.call_contextual(req, |mut client, request| async move {
-            client.get_table_properties(request).await
-        }).await?;
+        let resp = self
+            .call_contextual(req, |mut client, request| async move {
+                client.get_table_properties(request).await
+            })
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -1251,10 +1261,7 @@ impl RockserverClient {
 
     /// Closes an active iterator.
     pub async fn close_iterator(&self, iterator_id: i64) -> Result<()> {
-        let req = CloseIteratorRequest {
-            iterator_id,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = CloseIteratorRequest { iterator_id };
         self.client.clone().close_iterator(req).await?;
         Ok(())
     }
@@ -1431,12 +1438,7 @@ impl RockserverClient {
             1 | 2 => {}
             _ => return Err(Status::invalid_argument("range request type is required")),
         }
-        if budget.max_items <= 0 {
-            return Err(Status::invalid_argument("range max_items must be positive"));
-        }
-        if budget.max_bytes <= 0 {
-            return Err(Status::invalid_argument("range max_bytes must be positive"));
-        }
+        self.capabilities.validate_range_budget(&budget)?;
         let req = GetRangePageRequest {
             transaction_id,
             column_id,
@@ -1463,6 +1465,7 @@ impl RockserverClient {
         shard_index: i32,
         shard_count: i32,
     ) -> Result<impl Stream<Item = Result<KvBatch>>> {
+        self.require_physical_raw_scan()?;
         let req = ScanRawRequest {
             column_id,
             shard_index,
@@ -1500,6 +1503,7 @@ impl RockserverClient {
         shard_count: i32,
         completed_ssts: impl IntoIterator<Item = RawSstToken>,
     ) -> Result<impl Stream<Item = Result<RawScanEvent>>> {
+        self.require_physical_raw_scan()?;
         let req = ScanRawRequest {
             column_id,
             shard_index,
@@ -1527,18 +1531,14 @@ impl RockserverClient {
 
     /// Flushes the database.
     pub async fn flush(&self) -> Result<()> {
-        let req = FlushRequest {
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = FlushRequest {};
         self.client.clone().flush(req).await?;
         Ok(())
     }
 
     /// Compacts the database.
     pub async fn compact(&self) -> Result<()> {
-        let req = CompactRequest {
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = CompactRequest {};
         self.client.clone().compact(req).await?;
         Ok(())
     }
@@ -1563,7 +1563,6 @@ impl RockserverClient {
             expected_last_committed: Some(cdc_create_request::ExpectedLastCommitted::ExpectAbsent(
                 (),
             )),
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self.client.clone().cdc_create(req).await?;
         Ok(resp.into_inner().start_seq)
@@ -1592,7 +1591,6 @@ impl RockserverClient {
             column_ids,
             resolved_values,
             expected_last_committed,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self
             .client
@@ -1605,10 +1603,7 @@ impl RockserverClient {
 
     /// Deletes a CDC stream.
     pub async fn cdc_delete(&self, id: String) -> Result<()> {
-        let req = CdcDeleteRequest {
-            id,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = CdcDeleteRequest { id };
         self.client.clone().cdc_delete(req).await?;
         Ok(())
     }
@@ -1618,9 +1613,7 @@ impl RockserverClient {
         let resp = self
             .client
             .clone()
-            .cdc_get_earliest_available_sequence(CdcGetEarliestAvailableSequenceRequest {
-                workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-            })
+            .cdc_get_earliest_available_sequence(CdcGetEarliestAvailableSequenceRequest {})
             .await?;
         Ok(resp.into_inner().sequence)
     }
@@ -1629,10 +1622,7 @@ impl RockserverClient {
     ///
     /// `None` means that the subscription metadata does not exist.
     pub async fn cdc_get_last_committed_sequence(&self, id: String) -> Result<Option<i64>> {
-        let req = CdcGetLastCommittedSequenceRequest {
-            id,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = CdcGetLastCommittedSequenceRequest { id };
         let resp = self
             .client
             .clone()
@@ -1643,11 +1633,7 @@ impl RockserverClient {
 
     /// Commits a sequence number for a CDC stream.
     pub async fn cdc_commit(&self, id: String, seq: i64) -> Result<()> {
-        let req = CdcCommitRequest {
-            id,
-            seq,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = CdcCommitRequest { id, seq };
         self.client.clone().cdc_commit(req).await?;
         Ok(())
     }
@@ -1658,11 +1644,7 @@ impl RockserverClient {
         id: String,
         seq: i64,
     ) -> std::result::Result<(), CdcError> {
-        let req = CdcCommitRequest {
-            id,
-            seq,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
-        };
+        let req = CdcCommitRequest { id, seq };
         self.client
             .clone()
             .cdc_commit(req)
@@ -1683,7 +1665,6 @@ impl RockserverClient {
             from_seq,
             max_events,
             max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self.client.clone().cdc_poll(req).await?;
         Ok(resp.into_inner())
@@ -1702,7 +1683,6 @@ impl RockserverClient {
             from_seq,
             max_events,
             max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self
             .client
@@ -1726,7 +1706,6 @@ impl RockserverClient {
             from_seq,
             max_events,
             max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self.client.clone().cdc_poll_batch(req).await?;
         Ok(resp.into_inner())
@@ -1744,7 +1723,6 @@ impl RockserverClient {
             from_seq,
             max_events,
             max_response_bytes: DEFAULT_CDC_MAX_RESPONSE_BYTES,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         };
         let resp = self
             .client
@@ -1958,11 +1936,10 @@ mod workload_context_tests {
     }
 
     #[tokio::test]
-    async fn wrong_contract_context_fails_before_transport() {
+    async fn invalid_profile_fails_before_transport() {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let context = RequestContext {
-            profile: 2,
-            workload_contract_version: 2,
+            profile: 0,
             timeout_nanos: 1,
         };
         let error = RockserverClient::new_unchecked(channel, context)
@@ -1973,18 +1950,33 @@ mod workload_context_tests {
     }
 
     #[tokio::test]
-    async fn wrong_contract_rollback_fails_before_transport() {
+    async fn export_jobs_reject_physical_scans_before_transport() {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        let context = RequestContext {
-            profile: 2,
-            workload_contract_version: 2,
-            timeout_nanos: 1,
-        };
-        let error = RockserverClient::new_unchecked(channel, context)
-            .close_transaction(1, false)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        let mut client = RockserverClient::new_unchecked(channel, RequestContext::analytical());
+        client.capabilities.backend_mode = BackendMode::Distributed;
+        client.capabilities.raw_scan_mode = RawScanMode::ImmutableExportJobs;
+        assert_eq!(
+            client.scan_raw(1, 0, 1).await.err().unwrap().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
+                .scan_raw_resumable(
+                    1,
+                    0,
+                    1,
+                    [RawSstToken::new("000001.sst".to_owned()).unwrap()]
+                )
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client.with_context(RequestContext::batch()).capabilities(),
+            client.capabilities()
+        );
     }
 
     #[tokio::test]

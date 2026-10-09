@@ -290,7 +290,6 @@ public final class GrpcRawScanBenchmark {
 					.setShardCount(1)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE)
 							.build());
 			// The untouched baseline may predate the extension. Invoke the new builder

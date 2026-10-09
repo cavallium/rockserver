@@ -56,6 +56,27 @@ class EmbeddedConnectionAsyncRegressionTest {
 	Path tempDir;
 
 	@Test
+	void boundedPagesChargeEncodedItemsBeforeAdvancingTheCursor() throws Exception {
+		try (var connection = singleThreadedConnection("encoded-page-budget")) {
+			var api = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
+			long column = api.createColumn("rows", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			api.put(0, column, key(1), value(1), RequestType.none());
+			api.put(0, column, key(2), value(2), RequestType.none());
+			long bytes = it.cavallium.rockserver.core.common.RangeBudget.itemBytes(
+					new it.cavallium.rockserver.core.common.KV(key(1), value(1)));
+			var budget = new it.cavallium.rockserver.core.common.RangeBudget(2, bytes);
+			var first = api.getRangePage(0, column, null, null, false, null, RequestType.allInRange(), budget);
+			assertEquals(1, first.items().size()); assertEquals(key(1), first.resumeAfter()); assertTrue(first.hasMore());
+			var second = api.getRangePage(0, column, null, null, false, first.resumeAfter(), RequestType.allInRange(), budget);
+			assertEquals(1, second.items().size()); assertEquals(key(2), second.resumeAfter()); assertFalse(second.hasMore());
+			var failure = assertThrows(RocksDBException.class, () -> api.getRangePage(0, column,
+					null, null, false, null, RequestType.allInRange(),
+					new it.cavallium.rockserver.core.common.RangeBudget(2, bytes-1)));
+			assertEquals(RocksDBErrorType.RANGE_ITEM_TOO_LARGE, failure.getErrorUniqueId());
+		}
+	}
+
+	@Test
 	void completedAsyncSeekReleasesAdmissionBeforeCompletionIsVisible() throws Exception {
 		try (var connection = singleThreadedConnection("seek-completion-order")) {
 			var syncApi = connection.getSyncApi(it.cavallium.rockserver.core.common.RequestContext.batch());
@@ -552,7 +573,7 @@ class EmbeddedConnectionAsyncRegressionTest {
 	private static final class FixedFutureConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 

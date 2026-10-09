@@ -44,9 +44,9 @@ class GrpcPhysicalMaintenanceIdentityTest {
 					.build();
 			try {
 				var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
-				stub.flush(FlushRequest.newBuilder().setWorkloadContractVersion(3).build())
+				stub.flush(FlushRequest.newBuilder().build())
 						.block(Duration.ofSeconds(5));
-				stub.compact(CompactRequest.newBuilder().setWorkloadContractVersion(3).build())
+				stub.compact(CompactRequest.newBuilder().build())
 						.block(Duration.ofSeconds(5));
 
 				assertEquals(1, backend.flushCalls.get());
@@ -170,7 +170,7 @@ class GrpcPhysicalMaintenanceIdentityTest {
 
 	private static final class MaintenanceBackend implements RocksDBConnection, InternalConnection, AutoCloseable {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE; }
 
 		private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
 		private final RWScheduler scheduler = RWScheduler.forTesting(

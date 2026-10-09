@@ -240,7 +240,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 				WorkloadProfile.BATCH)) {
 			contexts[profile.ordinal()] = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfileValue(profile.wireValue())
-					.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 					.setTimeoutNanos(RequestContext.NO_TIMEOUT)
 					.build();
 		}
@@ -303,8 +302,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 					.withDeadlineAfter(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
 					.getCapabilities(CapabilitiesRequest.getDefaultInstance())
 					.get(CAPABILITY_HANDSHAKE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-			capabilities = new RockserverCapabilities(response.getWorkloadContractVersion());
-			capabilities.requireCompatible();
+			capabilities = decodeCapabilities(response).withTransportLimit(maxInboundMessageSize);
 		} catch (InterruptedException interrupted) {
 			Thread.currentThread().interrupt();
 			closeFailedConstruction(channel, eventLoopGroup, callbackExecutor);
@@ -341,6 +339,18 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@Override
 	public RockserverCapabilities getCapabilities() {
 		return capabilities;
+	}
+
+	private static RockserverCapabilities decodeCapabilities(CapabilitiesResponse response) {
+		try {
+			return new RockserverCapabilities(
+					RockserverCapabilities.BackendMode.valueOf(response.getBackendMode().name()),
+					RockserverCapabilities.RawScanMode.valueOf(response.getRawScanMode().name()),
+					response.getMaximumRangePageKeys(), response.getMaximumRangePageBytes());
+		} catch (IllegalArgumentException invalid) {
+			throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
+					"The connected backend advertised invalid capability modes or limits", invalid);
+		}
 	}
 
 	private static void closeFailedConstruction(ManagedChannel channel,
@@ -501,7 +511,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public CompletableFuture<Void> closeFailedUpdateAsync(long updateId) throws RocksDBException {
 		var request = CloseFailedUpdateRequest.newBuilder()
 				.setUpdateId(updateId)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.closeFailedUpdate(request), _ -> null);
 	}
@@ -849,6 +858,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public Publisher<SerializedKVBatch> scanRawAsync(long columnId, int shardIndex, int shardCount) {
+		capabilities.requirePhysicalSst();
 		return toResponse(reactiveStubWithRequestDeadline().scanRaw(ScanRawRequest.newBuilder()
 						.setColumnId(columnId)
 						.setShardIndex(shardIndex)
@@ -863,6 +873,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			int shardIndex,
 			int shardCount,
 			Set<RawSstToken> completedSsts) {
+		capabilities.requirePhysicalSst();
 		var request = ScanRawRequest.newBuilder()
 				.setColumnId(columnId)
 				.setShardIndex(shardIndex)
@@ -1035,7 +1046,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public CompletableFuture<Void> closeIteratorAsync(long iteratorId) throws RocksDBException {
 		var request = CloseIteratorRequest.newBuilder()
 				.setIteratorId(iteratorId)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.closeIterator(request), _ -> null);
 	}
@@ -1164,6 +1174,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			@Nullable Keys resumeAfter,
 			@NotNull RequestType.RequestGetRange<? super it.cavallium.rockserver.core.common.KV, T> requestType,
 			@NotNull it.cavallium.rockserver.core.common.RangeBudget budget) throws RocksDBException {
+		capabilities.requireRangeBudget(budget);
 		var requestBuilder = GetRangePageRequest.newBuilder()
 				.setTransactionId(transactionId)
 				.setColumnId(columnId)
@@ -1244,8 +1255,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			@Nullable Boolean resolvedValues,
 			@NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
 		var builder = CdcCreateRequest.newBuilder()
-				.setId(id)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+				.setId(id);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         if (columnIds != null) builder.addAllColumnIds(columnIds);
         if (resolvedValues != null) builder.setResolvedValues(resolvedValues);
@@ -1261,7 +1271,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
     public CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
 		return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder()
 				.setId(id)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build()), _ -> null);
     }
 
@@ -1269,7 +1278,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() throws RocksDBException {
 		return toResponse(futureStub.cdcGetEarliestAvailableSequence(
 				CdcGetEarliestAvailableSequenceRequest.newBuilder()
-						.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 						.build()),
 				CdcGetEarliestAvailableSequenceResponse::getSequence);
 	}
@@ -1278,7 +1286,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
     public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(@NotNull String id) throws RocksDBException {
 		var request = CdcGetLastCommittedSequenceRequest.newBuilder()
 				.setId(id)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
         return toResponse(futureStub.cdcGetLastCommittedSequence(request), response ->
                 response.hasLastCommittedSeq()
@@ -1290,7 +1297,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
     public CompletableFuture<Void> cdcCommitAsync(@NotNull String id, long seq) throws RocksDBException {
 		return toResponse(futureStub.cdcCommit(CdcCommitRequest.newBuilder()
 				.setId(id).setSeq(seq)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build()), _ -> null);
     }
 
@@ -1299,8 +1305,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		var builder = CdcPollRequest.newBuilder()
 				.setId(id)
 				.setMaxEvents(maxEvents)
-				.setMaxResponseBytes(maxInboundMessageSize)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+				.setMaxResponseBytes(maxInboundMessageSize);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
         return toResponse(reactiveStub.cdcPoll(builder.build()))
                 .map(GrpcConnectionDelegate::mapCDCEvent);
@@ -1319,8 +1324,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		var builder = CdcPollRequest.newBuilder()
 				.setId(id)
 				.setMaxEvents(maxEvents)
-				.setMaxResponseBytes(maxInboundMessageSize)
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+				.setMaxResponseBytes(maxInboundMessageSize);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
 		return toResponse(reactiveStub.cdcPollBatch(builder.build()))
 				.map(response -> new CdcBatch(
@@ -1341,7 +1345,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@Override
 	public CompletableFuture<Void> flushAsync() {
 		var request = FlushRequest.newBuilder()
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.flush(request), _ -> null);
 	}
@@ -1399,7 +1402,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
     public CompletableFuture<SstMaintenance.Result> compactFilesAsync(SstMaintenance.Request request) {
         // Deliberately excluded from the automatic-retry allowlist, like compact().
         var wireRequest = CompactFilesRequest.newBuilder()
-                .setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
                 .setColumnId(request.columnId()).setSession(request.session()).addAllFiles(request.files())
                 .setLevel(request.level()).setOutputPathId(request.outputPathId())
                 .setOutputFileSizeLimit(request.outputFileSizeLimit()).setMaxInputBytes(request.maxInputBytes())
@@ -1412,7 +1414,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	@Override
 	public CompletableFuture<Void> compactAsync() {
 		var request = CompactRequest.newBuilder()
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.compact(request), _ -> null);
 	}
@@ -1488,7 +1489,6 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		}
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfileValue(context.profile().wireValue())
-				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.setTimeoutNanos(remainingNanos)
 				.build();
 	}

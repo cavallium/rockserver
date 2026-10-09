@@ -56,7 +56,7 @@ class RangePageContractTest {
 
 	private static final long TIMEOUT_MS = 10_000L;
 	private static final int LATENCY_MAX_ITEMS = 2;
-	private static final long LATENCY_MAX_BYTES = 64;
+	private static final long LATENCY_MAX_BYTES = 76;
 	private static final RangeBudget TWO_ITEMS = new RangeBudget(LATENCY_MAX_ITEMS, LATENCY_MAX_BYTES);
 
 	private EmbeddedConnection embedded;
@@ -296,13 +296,12 @@ class RangePageContractTest {
 	}
 
 	@Test
-	void grpcConstructionRejectsAnIncompatibleWorkloadContract() throws Exception {
+	void grpcConstructionRejectsIncompleteCapabilityMetadata() throws Exception {
 		var server = ServerBuilder.forPort(0)
 				.addService(new ReactorRocksDBServiceGrpc.RocksDBServiceImplBase() {
 					@Override
 					public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
 						return Mono.just(CapabilitiesResponse.newBuilder()
-								.setWorkloadContractVersion(1)
 								.build());
 					}
 				})
@@ -310,7 +309,7 @@ class RangePageContractTest {
 				.start();
 		try {
 			var error = assertThrows(RocksDBException.class, () -> GrpcConnection.forHostAndPort(
-					"incompatible-range-contract",
+					"incomplete-range-capabilities",
 					new Utils.HostAndPort("127.0.0.1", server.getPort())));
 			assertEquals(RocksDBErrorType.NOT_IMPLEMENTED, error.getErrorUniqueId());
 		} finally {

@@ -67,7 +67,6 @@ Example metadata request JSON:
   "level": 6,
   "context": {
     "profile": "BATCH",
-    "workloadContractVersion": 3,
     "timeoutNanos": "30000000000"
   }
 }
@@ -78,7 +77,6 @@ with current metadata:
 
 ```json
 {
-  "workloadContractVersion": 3,
   "columnId": "123",
   "session": "SESSION_FROM_METADATA",
   "files": ["000123.sst", "000124.sst"],

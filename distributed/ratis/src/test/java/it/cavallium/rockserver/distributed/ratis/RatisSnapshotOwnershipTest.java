@@ -25,7 +25,7 @@ class RatisSnapshotOwnershipTest {
             var lease=client.open(root.resolve("read.bin"),snapshotIdentity(f,1),scope(f),RatisSnapshotClientTest.TTL,RequestContext.batch()); ready(lease);
             var cursor=lease.openCursor(74,null,null,false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var once=new AtomicBoolean();
             f.beforeSnapshotRead=() -> { if (once.compareAndSet(false,true)) { entered.countDown(); await(release); } };
-            var first=cursor.nextPage(new RangeBudget(1,32),RequestContext.batch());
+            var first=cursor.nextPage(new RangeBudget(1,64),RequestContext.batch());
             try {
                 assertTrue(entered.await(5,TimeUnit.SECONDS)); var views=new ArrayList<CompletableFuture<RangePage<KV>>>(); views.add(first);
                 for (int n=1;n<RatisSnapshotClient.MAX_WAITERS;n++) views.add(cursor.pendingPage());
@@ -47,11 +47,11 @@ class RatisSnapshotOwnershipTest {
                 ready(lease); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var once=new AtomicBoolean();
                 f.beforeSnapshotRead=() -> { if (once.compareAndSet(false,true)) { entered.countDown(); await(release); } };
                 try (var cursor=lease.openCursor(74,null,null,false)) {
-                    var page=cursor.nextPage(new RangeBudget(1,32),RequestContext.batch(Duration.ofSeconds(1))); assertTrue(entered.await(5,TimeUnit.SECONDS));
+                    var page=cursor.nextPage(new RangeBudget(1,64),RequestContext.batch(Duration.ofSeconds(1))); assertTrue(entered.await(5,TimeUnit.SECONDS));
                     try { assertFalse(release.await(1100,TimeUnit.MILLISECONDS)); } finally { release.countDown(); }
                     assertThrows(ExecutionException.class,() -> page.get(5,TimeUnit.SECONDS));
-                    assertEquals(member(2,"alpha"),cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().getFirst().keys());
-                    var second=cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS); assertEquals(member(2,"beta"),second.items().getFirst().keys());
+                    assertEquals(member(2,"alpha"),cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().getFirst().keys());
+                    var second=cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS); assertEquals(member(2,"beta"),second.items().getFirst().keys());
                     int rpcs=f.rpcs.get(); assertEquals(second,cursor.pendingPage().get(5,TimeUnit.SECONDS)); assertEquals(rpcs,f.rpcs.get());
                 } finally { release.countDown(); }
                 lease.release(RequestContext.batch()).get(10,TimeUnit.SECONDS); pinsClosed(f);
@@ -106,11 +106,11 @@ class RatisSnapshotOwnershipTest {
             try (var lease=client.open(root.resolve("copy.bin"),snapshotIdentity(f,1),scope(f),RatisSnapshotClientTest.TTL,RequestContext.batch())) {
                 ready(lease);
                 try (var cursor=lease.openCursor(74,null,null,false)) {
-                    var first=cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS);
+                    var first=cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS);
                     first.items().getFirst().keys().keys()[1]=it.cavallium.buffer.Buf.wrap(new byte[]{99}); first.resumeAfter().keys()[1]=it.cavallium.buffer.Buf.wrap(new byte[]{98});
                     int rpcs=f.rpcs.get(); var replay=cursor.pendingPage().get(5,TimeUnit.SECONDS);
                     assertEquals(member(2,"alpha"),replay.items().getFirst().keys()); assertEquals(member(2,"alpha"),replay.resumeAfter()); assertEquals(rpcs,f.rpcs.get());
-                    assertEquals(member(2,"beta"),cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().getFirst().keys());
+                    assertEquals(member(2,"beta"),cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().getFirst().keys());
                 }
                 lease.release(RequestContext.batch()).get(10,TimeUnit.SECONDS); pinsClosed(f);
             }

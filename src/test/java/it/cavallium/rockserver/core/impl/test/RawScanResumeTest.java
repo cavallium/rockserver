@@ -479,7 +479,6 @@ class RawScanResumeTest {
 			try {
 				var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 						.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-						.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE)
 						.build();
 				var request = ScanRawRequest.newBuilder()
@@ -545,7 +544,6 @@ class RawScanResumeTest {
 
 				var validContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 						.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-						.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE)
 						.build();
 				var invalidToken = missingContext.toBuilder()
@@ -586,8 +584,8 @@ class RawScanResumeTest {
 					proxy.start();
 					try (var downstream = GrpcConnection.forHostAndPort("raw-resume-downstream",
 							new Utils.HostAndPort("127.0.0.1", proxy.getPort()))) {
-						assertEquals(3, upstreamClient.getCapabilities().workloadContractVersion());
-						assertEquals(3, downstream.getCapabilities().workloadContractVersion());
+						assertEquals(it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE, upstreamClient.getCapabilities());
+						assertEquals(it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE, downstream.getCapabilities());
 						assertEquals((long) SST_COUNT * KEYS_PER_SST,
 								decodedRows(scan(downstream.getSyncApi(RequestContext.batch()), columnId, Set.of())));
 					}

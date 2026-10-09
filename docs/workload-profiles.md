@@ -5,13 +5,18 @@ describes the service guarantee the caller needs. It does not describe the datab
 operation or its cost: Rockserver derives and records the `OperationFamily` independently,
 then rejects an invalid pair before admission.
 
-Workload contract v3 stores a relative `timeoutNanos`, not an epoch timestamp. A reusable
+The request context stores a relative `timeoutNanos`. A reusable
 API view is a timeout policy: unary calls bind it at invocation, cold streams bind it at
 subscription, and client queueing consumes the resulting immutable monotonic budget.
 Transports send only the remaining nanoseconds; each server hop binds that remainder once
 and takes the minimum with its transport deadline. Retained continuations reuse the same
-bound deadline. Missing or non-v3 wire contexts are rejected, and protobuf field 2 remains
-reserved so a v2 epoch deadline cannot be reinterpreted as a duration.
+bound deadline. Missing profiles and non-positive timeout budgets are rejected.
+The unreleased product has one current contract; requests do not carry release numbers.
+Connection capabilities describe the effective backend mode, raw-scan mode, and maximum
+range-page items and bytes. Thrift advertises raw scans as unsupported. Distributed
+exports use immutable jobs rather than standalone physical SST tokens.
+Page byte budgets include conservative per-item and key-component framing. Effective
+transport limits also reserve the repeated continuation key and response envelope.
 
 The request context is the single execution deadline for range reduction, bounded pages,
 streaming ranges, and multi-existence reads. Those APIs no longer accept a second
@@ -72,7 +77,7 @@ contracts.
 Rollback, failed-update close, iterator close, CDC lifecycle/poll/acknowledgement, and
 physical flush/compaction remain server-owned. Their protected profile is derived from
 the concrete command and cannot be changed by the caller's view context. Their transport
-messages still carry the exact workload-contract version and reject v2 or missing values.
+messages contain only their operation inputs, without caller-selected profiles or release gates.
 CDC creation also requires an explicit atomic precondition: metadata must either be absent
 or have the supplied durable checkpoint. There is no unchecked create mode.
 

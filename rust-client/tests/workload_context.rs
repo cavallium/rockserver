@@ -4,14 +4,12 @@ use rockserver_client::proto::{
     WorkloadProfile,
 };
 use rockserver_client::RawSstToken;
-use rockserver_client::REQUIRED_WORKLOAD_CONTRACT_VERSION;
 use std::time::Duration;
 
 #[test]
 fn unary_request_retains_mandatory_workload_context() {
     let context = RequestContext {
         profile: 4,
-        workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         timeout_nanos: RequestContext::NO_TIMEOUT,
     };
     let request = PutRequest {
@@ -31,7 +29,6 @@ fn unary_request_retains_mandatory_workload_context() {
 fn streaming_initial_request_retains_workload_context() {
     let context = RequestContext {
         profile: 6,
-        workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
         timeout_nanos: RequestContext::NO_TIMEOUT,
     };
     let request = PutBatchRequest {
@@ -110,10 +107,6 @@ fn typed_context_constructor_uses_explicit_selectable_wire_values() {
         let timeout = (profile == WorkloadProfile::Latency).then(|| Duration::from_nanos(1));
         let context = RequestContext::for_profile(profile, timeout);
         assert_eq!(context.profile, expected);
-        assert_eq!(
-            context.workload_contract_version,
-            REQUIRED_WORKLOAD_CONTRACT_VERSION
-        );
     }
 }
 

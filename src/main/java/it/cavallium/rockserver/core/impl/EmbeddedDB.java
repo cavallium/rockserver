@@ -8616,7 +8616,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						if (next == null) {
 							break;
 						}
-						long nextBytes = decodedKVBytes(next);
+						long nextBytes = RangeBudget.itemBytes(next);
 						if (nextBytes > budget.maxBytes() - encodedBytes) {
 							if (results.isEmpty()) {
 								throw RocksDBException.of(RocksDBErrorType.RANGE_ITEM_TOO_LARGE,

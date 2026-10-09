@@ -137,7 +137,6 @@ class GrpcErrorMappingTest {
 		@Override
 		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
 			return Mono.just(CapabilitiesResponse.newBuilder()
-					.setWorkloadContractVersion(3)
 					.build());
 		}
 

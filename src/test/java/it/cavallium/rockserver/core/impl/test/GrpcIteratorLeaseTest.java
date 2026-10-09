@@ -153,7 +153,6 @@ class GrpcIteratorLeaseTest {
 					.setTakeCount(128L)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE))
 					.build();
 
@@ -223,7 +222,6 @@ class GrpcIteratorLeaseTest {
 					.setTakeCount(4_097L)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE))
 					.build();
 
@@ -258,7 +256,6 @@ class GrpcIteratorLeaseTest {
 					.setTakeCount(4_097L)
 					.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 							.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-							.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE))
 					.build();
 
@@ -381,7 +378,7 @@ class GrpcIteratorLeaseTest {
 
 	private static final class BlockingSubsequentConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE; }
 
 		private static final long ITERATOR_ID = 17;
 
@@ -477,7 +474,7 @@ class GrpcIteratorLeaseTest {
 	private static final class RecordingAsyncSubsequentConnection
 			implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE; }
 
 		private static final long ITERATOR_ID = 31L;
 		private static final String METRIC_DATABASE = "grpc-recording-subsequent";
@@ -641,7 +638,7 @@ class GrpcIteratorLeaseTest {
 
 	private static final class BlockingOpenIteratorConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE; }
 
 		private static final long ITERATOR_ID = 23;
 

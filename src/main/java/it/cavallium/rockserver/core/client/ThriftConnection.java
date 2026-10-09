@@ -173,7 +173,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		for (var profile : List.of(WorkloadProfile.ANALYTICAL, WorkloadProfile.INGEST, WorkloadProfile.BATCH)) {
 			contexts[profile.ordinal()] = new it.cavallium.rockserver.core.common.api.RequestContext(
 					it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(profile.wireValue()),
-					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION,
 					RequestContext.NO_TIMEOUT);
 		}
 		return contexts;
@@ -211,12 +210,17 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			availableClientSlots.add(slot);
 		}
 		// Retain the constructor's fail-fast connectivity check and make the
-		// workload v2/bounded-range contract mandatory. The remaining transports
+		// advertised capabilities available. The remaining transports
 		// are opened lazily as actual concurrency requires them.
 		try {
 			var capabilities = allClientSlots.getFirst().client().getCapabilities();
-			this.capabilities = new RockserverCapabilities(capabilities.getWorkloadContractVersion());
-			this.capabilities.requireCompatible();
+			this.capabilities = new RockserverCapabilities(
+					RockserverCapabilities.BackendMode.valueOf(
+							Objects.requireNonNull(capabilities.getBackendMode(), "backendMode").name()),
+					RockserverCapabilities.RawScanMode.valueOf(
+							Objects.requireNonNull(capabilities.getRawScanMode(), "rawScanMode").name()),
+					capabilities.getMaximumRangePageKeys(),
+					capabilities.getMaximumRangePageBytes()).withTransportLimit(maxFrameSize);
 		} catch (TException | RuntimeException | Error failure) {
 			for (var slot : allClientSlots) {
 				slot.close();
@@ -315,7 +319,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void closeFailedUpdate(long updateId) {
 		try {
-			client.closeFailedUpdate(updateId, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			client.closeFailedUpdate(updateId);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -685,7 +689,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void closeIterator(long iteratorId) {
 		try {
-			client.closeIterator(iteratorId, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			client.closeIterator(iteratorId);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -782,6 +786,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 				case RequestGetAllInRange<?> _ -> it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE;
 				case RequestGetAllInRangeNoCache<?> _ -> it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE_NO_CACHE;
 			};
+			capabilities.requireRangeBudget(budget);
 			var wireBudget = new it.cavallium.rockserver.core.common.api.RangeBudget(
 					budget.maxItems(), budget.maxBytes());
 			var page = client.getRangePage(transactionId,
@@ -809,7 +814,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void flush() {
 		try {
-			client.flush(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			client.flush();
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -831,7 +836,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void compact() {
 		try {
-			client.compact(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			client.compact();
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -867,7 +872,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			if (emitLatestValues != null) {
 				request.setEmitLatestValues(emitLatestValues);
 			}
-			request.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 			if (expectedLastCommitted.isPresent()) {
 				request.setExpectedLastCommittedSeq(expectedLastCommitted.getAsLong());
 			} else {
@@ -882,7 +886,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void cdcDelete(String id) {
 		try {
-			client.cdcDelete(id, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			client.cdcDelete(id);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -891,8 +895,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public long cdcGetEarliestAvailableSequence() {
 		try {
-			return client.cdcGetEarliestAvailableSequence(
-					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			return client.cdcGetEarliestAvailableSequence();
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -901,8 +904,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public OptionalLong cdcGetLastCommittedSequence(String id) {
 		try {
-			OptionalLongValue response = client.cdcGetLastCommittedSequence(id,
-					RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			OptionalLongValue response = client.cdcGetLastCommittedSequence(id);
 			return response.isSetValue()
 					? OptionalLong.of(response.getValue())
 					: OptionalLong.empty();
@@ -919,7 +921,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	@Override
 	public void cdcCommit(String id, long seq) {
 		try {
-			client.cdcCommit(id, seq, RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+			client.cdcCommit(id, seq);
 		} catch (TException e) {
 			throw wrap(e);
 		}
@@ -1201,9 +1203,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			var request = new it.cavallium.rockserver.core.common.api.CdcPollRequest()
 					.setId(id)
 					.setMaxEvents(maxEvents)
-					.setMaxResponseBytes(maxCdcResponseSize)
-					.setWorkloadContractVersion(
-							RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
+					.setMaxResponseBytes(maxCdcResponseSize);
 			if (fromSeq != null) {
 				request.setFromSeq(fromSeq);
 			}
@@ -1393,7 +1393,6 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		return new it.cavallium.rockserver.core.common.api.RequestContext(
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(
 						context.profile().wireValue()),
-				RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION,
 				remainingNanos);
 	}
 

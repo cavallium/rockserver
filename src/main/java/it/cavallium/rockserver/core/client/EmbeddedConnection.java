@@ -80,7 +80,7 @@ public final class EmbeddedConnection extends BaseConnection implements Internal
 
 	@Override
 	public RockserverCapabilities getCapabilities() {
-		return RockserverCapabilities.CURRENT;
+		return RockserverCapabilities.STANDALONE;
 	}
 
 	@Override
@@ -129,7 +129,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 
 	@Override
 	public RockserverCapabilities getCapabilities() {
-		return RockserverCapabilities.CURRENT;
+		return RockserverCapabilities.STANDALONE;
 	}
 	private final EmbeddedDB db;
 	private final BiPredicate<Executor, Runnable> queuedTaskRemover;

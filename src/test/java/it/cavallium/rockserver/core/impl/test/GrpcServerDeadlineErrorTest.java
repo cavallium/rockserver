@@ -140,7 +140,6 @@ class GrpcServerDeadlineErrorTest {
 									.setValue(com.google.protobuf.ByteString.copyFrom(new byte[] {2})))
 							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 									.setProfile(profile)
-									.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE))
 							.build();
 					var error = assertThrows(io.grpc.StatusRuntimeException.class,
@@ -441,7 +440,6 @@ class GrpcServerDeadlineErrorTest {
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireBatchContext() {
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-				.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE)
 				.build();
 	}
@@ -491,7 +489,7 @@ class GrpcServerDeadlineErrorTest {
 
 	private static final class SchedulerBackedConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE; }
 
 		private final RWScheduler scheduler;
 
@@ -532,7 +530,7 @@ class GrpcServerDeadlineErrorTest {
 	private static final class DeadlineBackendConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -577,7 +575,7 @@ class GrpcServerDeadlineErrorTest {
 	private static final class CountingBackendConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -618,7 +616,7 @@ class GrpcServerDeadlineErrorTest {
 	private static final class BlockingDeadlineBackendConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -682,7 +680,7 @@ class GrpcServerDeadlineErrorTest {
 	private static final class RecordingTimeoutBackendConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -731,7 +729,7 @@ class GrpcServerDeadlineErrorTest {
 	private static final class CancellableNeverCompletingBackendConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -786,7 +784,7 @@ class GrpcServerDeadlineErrorTest {
 	private static final class ProtectedOperationBackendConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -846,7 +844,7 @@ class GrpcServerDeadlineErrorTest {
 	private static final class GenericBlockingBackendConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 

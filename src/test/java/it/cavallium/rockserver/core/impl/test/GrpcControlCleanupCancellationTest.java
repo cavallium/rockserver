@@ -739,7 +739,7 @@ class GrpcControlCleanupCancellationTest {
 	private static final class BlockingCloseIteratorConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -809,7 +809,7 @@ class GrpcControlCleanupCancellationTest {
 	private static final class RecordingRollbackConnection implements RocksDBConnection, InternalConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 
@@ -866,7 +866,7 @@ class GrpcControlCleanupCancellationTest {
 
 	private static final class BlockingCdcCommitConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE; }
 
 		private final EmbeddedConnection delegate;
 		private final CountDownLatch commitsStarted = new CountDownLatch(2);

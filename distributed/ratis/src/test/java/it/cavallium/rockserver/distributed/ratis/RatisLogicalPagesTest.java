@@ -34,10 +34,10 @@ class RatisLogicalPagesTest {
                 session.ensureBinding(seed); session.execute(seed); session.acknowledge(seed);
                 try (var tx=session.openTransaction(scope(schema,new byte[]{1},new byte[]{6}),Duration.ofSeconds(5))) {
                     tx.stage(List.of(put(h.key(2),2),RatisLogicalClient.Change.delete(71,h.key(3),Mutation.ReturnMode.NONE)));
-                    var page=tx.getRangePage(71,h.key(1),h.key(6),false,null,new RangeBudget(2,4)); assertEquals(List.of(h.key(1),h.key(2)),keys(page)); assertTrue(page.hasMore());
-                    var next=tx.getRangePage(71,h.key(1),h.key(6),false,page.resumeAfter(),new RangeBudget(2,4)); assertEquals(List.of(h.key(5)),keys(next)); assertFalse(next.hasMore());
-                    var reverse=tx.getRangePage(71,h.key(1),h.key(6),true,null,new RangeBudget(2,4)); assertEquals(List.of(h.key(5),h.key(2)),keys(reverse)); assertTrue(reverse.hasMore());
-                    assertEquals(List.of(h.key(1)),keys(tx.getRangePage(71,h.key(1),h.key(6),true,reverse.resumeAfter(),new RangeBudget(2,4))));
+                    var page=tx.getRangePage(71,h.key(1),h.key(6),false,null,new RangeBudget(2,48)); assertEquals(List.of(h.key(1),h.key(2)),keys(page)); assertTrue(page.hasMore());
+                    var next=tx.getRangePage(71,h.key(1),h.key(6),false,page.resumeAfter(),new RangeBudget(2,48)); assertEquals(List.of(h.key(5)),keys(next)); assertFalse(next.hasMore());
+                    var reverse=tx.getRangePage(71,h.key(1),h.key(6),true,null,new RangeBudget(2,48)); assertEquals(List.of(h.key(5),h.key(2)),keys(reverse)); assertTrue(reverse.hasMore());
+                    assertEquals(List.of(h.key(1)),keys(tx.getRangePage(71,h.key(1),h.key(6),true,reverse.resumeAfter(),new RangeBudget(2,48))));
                     var tooSmall=assertThrows(RocksDBException.class,() -> tx.getRangePage(71,h.key(1),h.key(6),false,null,new RangeBudget(1,1)));
                     assertEquals(RocksDBException.RocksDBErrorType.RANGE_ITEM_TOO_LARGE,tooSmall.getErrorUniqueId());
                     assertThrows(IllegalArgumentException.class,() -> tx.getRangePage(71,h.key(1),h.key(6),false,h.key(6),RangeBudget.DEFAULT));
@@ -47,15 +47,15 @@ class RatisLogicalPagesTest {
                     assertThrows(IllegalArgumentException.class,() -> tx.openCursor(71,h.key(6),h.key(1),false));
                     Keys lower=h.key(1);
                     try (var cursor=tx.openCursor(71,lower,h.key(6),false)) {
-                        lower.keys()[0]=Buf.wrap(new byte[]{5}); var first=cursor.nextPage(new RangeBudget(1,2)); assertEquals(List.of(h.key(1)),keys(first));
+                        lower.keys()[0]=Buf.wrap(new byte[]{5}); var first=cursor.nextPage(new RangeBudget(1,24)); assertEquals(List.of(h.key(1)),keys(first));
                         first.resumeAfter().keys()[0]=Buf.wrap(new byte[]{99}); // Returned buffers cannot corrupt the cursor's private continuation.
                         var concurrent=session.preparePut(71,h.key(5),Buf.wrap(new byte[]{99}),Mutation.ReturnMode.NONE); session.execute(concurrent); session.acknowledge(concurrent);
-                        assertEquals(List.of(h.key(2)),keys(cursor.nextPage(new RangeBudget(1,2))));
-                        var last=cursor.nextPage(new RangeBudget(1,2)); assertEquals(List.of(h.key(5)),keys(last)); assertArrayEquals(new byte[]{5},last.items().getFirst().value().toByteArray()); assertFalse(last.hasMore());
+                        assertEquals(List.of(h.key(2)),keys(cursor.nextPage(new RangeBudget(1,24))));
+                        var last=cursor.nextPage(new RangeBudget(1,24)); assertEquals(List.of(h.key(5)),keys(last)); assertArrayEquals(new byte[]{5},last.items().getFirst().value().toByteArray()); assertFalse(last.hasMore());
                         assertTrue(cursor.nextPage(RangeBudget.DEFAULT).items().isEmpty());
                     }
                     try (var cursor=tx.openCursor(71,h.key(1),h.key(6),false)) {
-                        assertEquals(1,cursor.nextPage(new RangeBudget(1,2)).items().size()); tx.close();
+                        assertEquals(1,cursor.nextPage(new RangeBudget(1,24)).items().size()); tx.close();
                         assertThrows(IOException.class,() -> cursor.nextPage(RangeBudget.DEFAULT)); cursor.close(); assertTrue(cursor.nextPage(RangeBudget.DEFAULT).items().isEmpty());
                     }
                 }
@@ -86,7 +86,7 @@ class RatisLogicalPagesTest {
                     assertEquals(List.of(b.key(3),row8),keys(tx.getRangePage(71,lower,upper,false,between,new RangeBudget(2,1024))));
                     tx.stage(List.of(RatisLogicalClient.Change.put(71,b.key(0),values ? Buf.wrap(new byte[]{9}) : null,Mutation.ReturnMode.NONE)));
                     try (var cursor=tx.openCursor(71,lower,upper,false)) {
-                        assertEquals(List.of(b.key(0)),keys(cursor.nextPage(new RangeBudget(1,values ? 3 : 2))));
+                        assertEquals(List.of(b.key(0)),keys(cursor.nextPage(new RangeBudget(1,values ? 31 : 30))));
                         assertEquals(List.of(b.key(1),b.key(2),b.key(3),row8),keys(cursor.nextPage(RangeBudget.DEFAULT)));
                     }
                 }
@@ -101,7 +101,7 @@ class RatisLogicalPagesTest {
              var session=h.create(Files.createDirectory(root.resolve("loss")),f,schema,1000)) {
             session.advance(); var seed=session.prepare(List.of(put(h.key(1),1),put(h.key(2),2)),List.of()); session.ensureBinding(seed); session.execute(seed); session.acknowledge(seed);
             try (var tx=session.openTransaction(scope(schema,new byte[]{1},new byte[]{3}),Duration.ofSeconds(5)); var cursor=tx.openCursor(71,h.key(1),h.key(3),false)) {
-                assertTrue(cursor.nextPage(new RangeBudget(1,2)).hasMore()); var machine=f.machines.get(tx.descriptor().groupId()); machine.notifyNotLeader(List.of()); machine.expireTransactions();
+                assertTrue(cursor.nextPage(new RangeBudget(1,24)).hasMore()); var machine=f.machines.get(tx.descriptor().groupId()); machine.notifyNotLeader(List.of()); machine.expireTransactions();
                 assertThrows(IOException.class,() -> cursor.nextPage(RangeBudget.DEFAULT));
                 assertEquals(0,f.stores.get(tx.descriptor().groupId()).activeSnapshotPins());
             }

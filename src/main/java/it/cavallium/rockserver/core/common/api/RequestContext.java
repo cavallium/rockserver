@@ -11,8 +11,7 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
   private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("RequestContext");
 
   private static final org.apache.thrift.protocol.TField PROFILE_FIELD_DESC = new org.apache.thrift.protocol.TField("profile", org.apache.thrift.protocol.TType.I32, (short)1);
-  private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)3);
-  private static final org.apache.thrift.protocol.TField TIMEOUT_NANOS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutNanos", org.apache.thrift.protocol.TType.I64, (short)4);
+  private static final org.apache.thrift.protocol.TField TIMEOUT_NANOS_FIELD_DESC = new org.apache.thrift.protocol.TField("timeoutNanos", org.apache.thrift.protocol.TType.I64, (short)2);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new RequestContextStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new RequestContextTupleSchemeFactory();
@@ -22,7 +21,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
    * @see WorkloadProfile
    */
   public @org.apache.thrift.annotation.Nullable WorkloadProfile profile; // required
-  public int workloadContractVersion; // required
   public long timeoutNanos; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
@@ -32,8 +30,7 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
      * @see WorkloadProfile
      */
     PROFILE((short)1, "profile"),
-    WORKLOAD_CONTRACT_VERSION((short)3, "workloadContractVersion"),
-    TIMEOUT_NANOS((short)4, "timeoutNanos");
+    TIMEOUT_NANOS((short)2, "timeoutNanos");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -51,9 +48,7 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       switch(fieldId) {
         case 1: // PROFILE
           return PROFILE;
-        case 3: // WORKLOAD_CONTRACT_VERSION
-          return WORKLOAD_CONTRACT_VERSION;
-        case 4: // TIMEOUT_NANOS
+        case 2: // TIMEOUT_NANOS
           return TIMEOUT_NANOS;
         default:
           return null;
@@ -98,16 +93,13 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
   }
 
   // isset id assignments
-  private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
-  private static final int __TIMEOUTNANOS_ISSET_ID = 1;
+  private static final int __TIMEOUTNANOS_ISSET_ID = 0;
   private byte __isset_bitfield = 0;
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
     tmpMap.put(_Fields.PROFILE, new org.apache.thrift.meta_data.FieldMetaData("profile", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, WorkloadProfile.class)));
-    tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
-        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
     tmpMap.put(_Fields.TIMEOUT_NANOS, new org.apache.thrift.meta_data.FieldMetaData("timeoutNanos", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
@@ -119,13 +111,10 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
 
   public RequestContext(
     WorkloadProfile profile,
-    int workloadContractVersion,
     long timeoutNanos)
   {
     this();
     this.profile = profile;
-    this.workloadContractVersion = workloadContractVersion;
-    setWorkloadContractVersionIsSet(true);
     this.timeoutNanos = timeoutNanos;
     setTimeoutNanosIsSet(true);
   }
@@ -138,7 +127,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     if (other.isSetProfile()) {
       this.profile = other.profile;
     }
-    this.workloadContractVersion = other.workloadContractVersion;
     this.timeoutNanos = other.timeoutNanos;
   }
 
@@ -150,8 +138,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
   @Override
   public void clear() {
     this.profile = null;
-    setWorkloadContractVersionIsSet(false);
-    this.workloadContractVersion = 0;
     setTimeoutNanosIsSet(false);
     this.timeoutNanos = 0;
   }
@@ -189,29 +175,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     }
   }
 
-  public int getWorkloadContractVersion() {
-    return this.workloadContractVersion;
-  }
-
-  public RequestContext setWorkloadContractVersion(int workloadContractVersion) {
-    this.workloadContractVersion = workloadContractVersion;
-    setWorkloadContractVersionIsSet(true);
-    return this;
-  }
-
-  public void unsetWorkloadContractVersion() {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
-  }
-
-  /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
-  public boolean isSetWorkloadContractVersion() {
-    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
-  }
-
-  public void setWorkloadContractVersionIsSet(boolean value) {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
-  }
-
   public long getTimeoutNanos() {
     return this.timeoutNanos;
   }
@@ -246,14 +209,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       }
       break;
 
-    case WORKLOAD_CONTRACT_VERSION:
-      if (value == null) {
-        unsetWorkloadContractVersion();
-      } else {
-        setWorkloadContractVersion((java.lang.Integer)value);
-      }
-      break;
-
     case TIMEOUT_NANOS:
       if (value == null) {
         unsetTimeoutNanos();
@@ -272,9 +227,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     case PROFILE:
       return getProfile();
 
-    case WORKLOAD_CONTRACT_VERSION:
-      return getWorkloadContractVersion();
-
     case TIMEOUT_NANOS:
       return getTimeoutNanos();
 
@@ -292,8 +244,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     switch (field) {
     case PROFILE:
       return isSetProfile();
-    case WORKLOAD_CONTRACT_VERSION:
-      return isSetWorkloadContractVersion();
     case TIMEOUT_NANOS:
       return isSetTimeoutNanos();
     }
@@ -322,15 +272,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
         return false;
     }
 
-    boolean this_present_workloadContractVersion = true;
-    boolean that_present_workloadContractVersion = true;
-    if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
-      if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
-        return false;
-      if (this.workloadContractVersion != that.workloadContractVersion)
-        return false;
-    }
-
     boolean this_present_timeoutNanos = true;
     boolean that_present_timeoutNanos = true;
     if (this_present_timeoutNanos || that_present_timeoutNanos) {
@@ -351,8 +292,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     if (isSetProfile())
       hashCode = hashCode * 8191 + profile.getValue();
 
-    hashCode = hashCode * 8191 + workloadContractVersion;
-
     hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(timeoutNanos);
 
     return hashCode;
@@ -372,16 +311,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     }
     if (isSetProfile()) {
       lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.profile, other.profile);
-      if (lastComparison != 0) {
-        return lastComparison;
-      }
-    }
-    lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
-    if (lastComparison != 0) {
-      return lastComparison;
-    }
-    if (isSetWorkloadContractVersion()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -428,10 +357,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     }
     first = false;
     if (!first) sb.append(", ");
-    sb.append("workloadContractVersion:");
-    sb.append(this.workloadContractVersion);
-    first = false;
-    if (!first) sb.append(", ");
     sb.append("timeoutNanos:");
     sb.append(this.timeoutNanos);
     first = false;
@@ -444,7 +369,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     if (profile == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'profile' was not present! Struct: " + toString());
     }
-    // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
     // alas, we cannot check 'timeoutNanos' because it's a primitive and you chose the non-beans generator.
     // check for sub-struct validity
   }
@@ -495,15 +419,7 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
-          case 3: // WORKLOAD_CONTRACT_VERSION
-            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
-              struct.workloadContractVersion = iprot.readI32();
-              struct.setWorkloadContractVersionIsSet(true);
-            } else {
-              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
-            }
-            break;
-          case 4: // TIMEOUT_NANOS
+          case 2: // TIMEOUT_NANOS
             if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
               struct.timeoutNanos = iprot.readI64();
               struct.setTimeoutNanosIsSet(true);
@@ -519,9 +435,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       iprot.readStructEnd();
 
       // check for required fields of primitive type, which can't be checked in the validate method
-      if (!struct.isSetWorkloadContractVersion()) {
-        throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
-      }
       if (!struct.isSetTimeoutNanos()) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'timeoutNanos' was not found in serialized data! Struct: " + toString());
       }
@@ -538,9 +451,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
         oprot.writeI32(struct.profile.getValue());
         oprot.writeFieldEnd();
       }
-      oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
-      oprot.writeI32(struct.workloadContractVersion);
-      oprot.writeFieldEnd();
       oprot.writeFieldBegin(TIMEOUT_NANOS_FIELD_DESC);
       oprot.writeI64(struct.timeoutNanos);
       oprot.writeFieldEnd();
@@ -563,7 +473,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
     public void write(org.apache.thrift.protocol.TProtocol prot, RequestContext struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       oprot.writeI32(struct.profile.getValue());
-      oprot.writeI32(struct.workloadContractVersion);
       oprot.writeI64(struct.timeoutNanos);
     }
 
@@ -572,8 +481,6 @@ public class RequestContext implements org.apache.thrift.TBase<RequestContext, R
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       struct.profile = it.cavallium.rockserver.core.common.api.WorkloadProfile.findByValue(iprot.readI32());
       struct.setProfileIsSet(true);
-      struct.workloadContractVersion = iprot.readI32();
-      struct.setWorkloadContractVersionIsSet(true);
       struct.timeoutNanos = iprot.readI64();
       struct.setTimeoutNanosIsSet(true);
     }

@@ -16,7 +16,7 @@ public interface RocksDBConnection extends Closeable {
 	 */
 	URI getUrl();
 
-	/** Return the exact mandatory workload contract implemented by the ultimate backend. */
+	/** Return the effective backend features and limits supported through this connection. */
 	RockserverCapabilities getCapabilities();
 
 	/** Return a sync view permanently bound to the mandatory request context. */

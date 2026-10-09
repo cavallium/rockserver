@@ -54,7 +54,7 @@ final class RatisLogicalRangePages {
         var reader=new Reader(physicalReader,schema,binding,low,high,bounds.logicalLower(),bounds.logicalUpper(),reverse,continuation);
         var items=new ArrayList<KV>(); long bytes=0;
         for (KV next;(next=reader.next())!=null;) {
-            long size=next.value()==null ? 0 : next.value().size(); for (var key:next.keys().keys()) size+=key.size();
+            long size=RangeBudget.itemBytes(next);
             if (items.size()==budget.maxItems() || size>budget.maxBytes()-bytes) {
                 if (items.isEmpty()) throw RocksDBException.of(RocksDBException.RocksDBErrorType.RANGE_ITEM_TOO_LARGE,"Logical range item exceeds page byte budget");
                 return new RangePage<>(items,items.getLast().keys(),true);

@@ -10,7 +10,6 @@ import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RequestContext;
-import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.cavallium.rockserver.core.common.Utils;
@@ -216,13 +215,6 @@ public class ThriftServer extends Server {
 			throw it.cavallium.rockserver.core.common.RocksDBException.of(
 					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 					"Request context and workload profile are required");
-		}
-		if (wireContext.workloadContractVersion
-				!= RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Request context requires workload contract version "
-							+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		}
 		final it.cavallium.rockserver.core.common.WorkloadProfile profile;
 		try {
@@ -557,11 +549,19 @@ public class ThriftServer extends Server {
 			);
 		}
 
+		private it.cavallium.rockserver.core.common.RockserverCapabilities effectiveCapabilities() {
+			return client.getCapabilities().withoutRawScan().withTransportLimit(
+					(long) maxCdcResponseSize + ThriftTransportLimits.FRAME_ENVELOPE_RESERVE_BYTES);
+		}
+
 		@Override
 		public it.cavallium.rockserver.core.common.api.Capabilities getCapabilities() {
-			var capabilities = RockserverCapabilities.CURRENT;
+			var capabilities = effectiveCapabilities();
 			return new it.cavallium.rockserver.core.common.api.Capabilities(
-					capabilities.workloadContractVersion());
+					it.cavallium.rockserver.core.common.api.BackendMode.valueOf(capabilities.backendMode().name()),
+					it.cavallium.rockserver.core.common.api.RawScanMode.valueOf(capabilities.rawScanMode().name()),
+					capabilities.maximumRangePageKeys(),
+					capabilities.maximumRangePageBytes());
 		}
 
 		@Override
@@ -580,7 +580,6 @@ public class ThriftServer extends Server {
 				if (commit) {
 					return api(context).closeTransaction(transactionId, true);
 				}
-				requireV3(context == null ? 0 : context.workloadContractVersion);
 				return protectedApi().closeTransaction(transactionId, false);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -588,9 +587,8 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void closeFailedUpdate(long updateId, int workloadContractVersion) throws RocksDBThriftException {
+		public void closeFailedUpdate(long updateId) throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				protectedApi().closeFailedUpdate(updateId);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -976,9 +974,8 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void closeIterator(long iteratorId, int workloadContractVersion) throws RocksDBThriftException {
+		public void closeIterator(long iteratorId) throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				protectedApi().closeIterator(iteratorId);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1217,6 +1214,7 @@ public class ThriftServer extends Server {
 							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
 							invalid.getMessage(), invalid);
 				}
+				effectiveCapabilities().requireRangeBudget(mappedBudget);
 				var page = api(context).getRangePage(transactionId,
 						columnId,
 						keysToRecord(startKeysInclusive),
@@ -1296,9 +1294,8 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void flush(int workloadContractVersion) throws RocksDBThriftException {
+		public void flush() throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				protectedApi().flush();
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1306,9 +1303,8 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void compact(int workloadContractVersion) throws RocksDBThriftException {
+		public void compact() throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				protectedApi().compact();
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1332,7 +1328,6 @@ public class ThriftServer extends Server {
 		public long cdcCreate(it.cavallium.rockserver.core.common.api.CdcCreateRequest request)
 				throws RocksDBThriftException {
 			try {
-				requireV3(request.getWorkloadContractVersion());
 				if (request.isSetExpectAbsent() && request.isSetExpectedLastCommittedSeq()) {
 					throw it.cavallium.rockserver.core.common.RocksDBException.of(
 							it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NULL_ARGUMENT,
@@ -1364,9 +1359,8 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void cdcDelete(String id, int workloadContractVersion) throws RocksDBThriftException {
+		public void cdcDelete(String id) throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				protectedApi().cdcDelete(id);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1374,9 +1368,8 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public long cdcGetEarliestAvailableSequence(int workloadContractVersion) throws RocksDBThriftException {
+		public long cdcGetEarliestAvailableSequence() throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				return protectedApi().cdcGetEarliestAvailableSequence();
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
@@ -1384,10 +1377,9 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public OptionalLongValue cdcGetLastCommittedSequence(String id, int workloadContractVersion)
+		public OptionalLongValue cdcGetLastCommittedSequence(String id)
 				throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				var sequence = protectedApi().cdcGetLastCommittedSequence(id);
 				var response = new OptionalLongValue();
 				sequence.ifPresent(response::setValue);
@@ -1402,7 +1394,6 @@ public class ThriftServer extends Server {
 				it.cavallium.rockserver.core.common.api.CdcPollRequest request)
 				throws RocksDBThriftException {
 			try {
-				requireV3(request.getWorkloadContractVersion());
 				int requestedMaxResponseSize = request.getMaxResponseBytes();
 				if (requestedMaxResponseSize <= 0) {
 					throw it.cavallium.rockserver.core.common.RocksDBException.of(
@@ -1425,22 +1416,12 @@ public class ThriftServer extends Server {
 		}
 
 		@Override
-		public void cdcCommit(String id, long seq, int workloadContractVersion) throws RocksDBThriftException {
+		public void cdcCommit(String id, long seq) throws RocksDBThriftException {
 			try {
-				requireV3(workloadContractVersion);
 				protectedApi().cdcCommit(id, seq);
 			} catch (it.cavallium.rockserver.core.common.RocksDBException e) {
 				throw mapException(e);
 			}
-		}
-	}
-
-	private static void requireV3(int workloadContractVersion) {
-		if (workloadContractVersion != RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
-			throw it.cavallium.rockserver.core.common.RocksDBException.of(
-					it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
-					"Request requires workload contract version "
-							+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
 		}
 	}
 

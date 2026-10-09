@@ -73,13 +73,18 @@ class WorkloadWireContractTest {
 	}
 
 	@Test
-	void workloadV3CapabilitiesAndRangeRequestValuesAreExplicitAndStable() throws Exception {
+	void capabilitiesDescribeActualModesAndRangeLimits() throws Exception {
 		var capabilities = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.newBuilder()
-				.setWorkloadContractVersion(3)
+				.setBackendMode(it.cavallium.rockserver.core.common.api.proto.BackendMode.DISTRIBUTED)
+                .setRawScanMode(it.cavallium.rockserver.core.common.api.proto.RawScanMode.IMMUTABLE_EXPORT_JOBS)
+                .setMaximumRangePageKeys(4096).setMaximumRangePageBytes(8L*1024*1024)
 				.build();
 		var decoded = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.parseFrom(
 				capabilities.toByteArray());
-		assertEquals(3, decoded.getWorkloadContractVersion());
+		assertEquals(it.cavallium.rockserver.core.common.api.proto.BackendMode.DISTRIBUTED, decoded.getBackendMode());
+        assertEquals(it.cavallium.rockserver.core.common.api.proto.RawScanMode.IMMUTABLE_EXPORT_JOBS, decoded.getRawScanMode());
+        assertEquals(4096, decoded.getMaximumRangePageKeys());
+        assertEquals(8L*1024*1024, decoded.getMaximumRangePageBytes());
 
 		assertEquals(0, it.cavallium.rockserver.core.common.api.proto.RangeRequestType
 				.RANGE_REQUEST_TYPE_UNSPECIFIED.getNumber());
@@ -95,7 +100,6 @@ class WorkloadWireContractTest {
 	void protobufRetainsProfileAndAbsoluteDeadlineOnUnaryAndStreamInitialRequests() throws Exception {
 		var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.ANALYTICAL)
-				.setWorkloadContractVersion(3)
 				.setTimeoutNanos(123_456L)
 				.build();
 		var unary = PutRequest.newBuilder()
@@ -112,7 +116,7 @@ class WorkloadWireContractTest {
 	}
 
 	@Test
-	void thriftGenericMethodsRequireContextAndProtectedMethodsRequireV3() throws Exception {
+	void thriftGenericMethodsRequireContextAndProtectedMethodsAreContextFree() throws Exception {
 		assertNotNull(RocksDB.Iface.class.getMethod("getCapabilities"));
 		assertNotNull(RocksDB.Iface.class.getMethod("put",
 				long.class, long.class, List.class, ByteBuffer.class,
@@ -120,13 +124,13 @@ class WorkloadWireContractTest {
 		assertNotNull(RocksDB.Iface.class.getMethod("deleteRange",
 				long.class, List.class, List.class,
 				it.cavallium.rockserver.core.common.api.RequestContext.class));
-		assertNotNull(RocksDB.Iface.class.getMethod("closeIterator", long.class, int.class));
+		assertNotNull(RocksDB.Iface.class.getMethod("closeIterator", long.class));
 		assertNotNull(RocksDB.Iface.class.getMethod("getRangePage",
 				long.class, long.class, List.class, List.class, boolean.class, List.class,
 				it.cavallium.rockserver.core.common.api.RangeRequestType.class,
 				it.cavallium.rockserver.core.common.api.RangeBudget.class,
 				it.cavallium.rockserver.core.common.api.RequestContext.class));
-		assertNotNull(RocksDB.Iface.class.getMethod("flush", int.class));
+		assertNotNull(RocksDB.Iface.class.getMethod("flush"));
 	}
 
 	@Test
@@ -202,7 +206,7 @@ class WorkloadWireContractTest {
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.PHYSICAL_MAINTENANCE)) {
 			var wire = new it.cavallium.rockserver.core.common.api.RequestContext(
 					profile,
-					3,
+
 					Long.MAX_VALUE);
 			var invocation = assertThrows(InvocationTargetException.class,
 					() -> mapper.invoke(null, wire));
@@ -214,7 +218,7 @@ class WorkloadWireContractTest {
 
 		var invalidTimeout = new it.cavallium.rockserver.core.common.api.RequestContext(
 				it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH,
-				3,
+
 				0L);
 		var invocation = assertThrows(InvocationTargetException.class,
 				() -> mapper.invoke(null, invalidTimeout));
@@ -224,32 +228,22 @@ class WorkloadWireContractTest {
 				failure.getErrorUniqueId());
 	}
 
-	@Test
-	void thriftServerRejectsMissingAndNonV3Contexts() throws Exception {
-		var mapper = ThriftServer.class.getDeclaredMethod("parseRequestContext",
-				it.cavallium.rockserver.core.common.api.RequestContext.class);
-		mapper.setAccessible(true);
-		for (int version : List.of(0, 2, 4)) {
-			var wire = new it.cavallium.rockserver.core.common.api.RequestContext()
-					.setProfile(it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH)
-					.setTimeoutNanos(Long.MAX_VALUE);
-			if (version != 0) {
-				wire.setWorkloadContractVersion(version);
-			}
-			var invocation = assertThrows(InvocationTargetException.class,
-					() -> mapper.invoke(null, wire));
-			var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(
-					RocksDBException.class, invocation.getCause());
-			assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,
-					failure.getErrorUniqueId());
-		}
-	}
+    @Test
+    void thriftServerRejectsMissingProfile() throws Exception {
+        var mapper = ThriftServer.class.getDeclaredMethod("parseRequestContext",
+                it.cavallium.rockserver.core.common.api.RequestContext.class);
+        mapper.setAccessible(true);
+        var wire = new it.cavallium.rockserver.core.common.api.RequestContext().setTimeoutNanos(Long.MAX_VALUE);
+        var invocation = assertThrows(InvocationTargetException.class, () -> mapper.invoke(null, wire));
+        var failure = org.junit.jupiter.api.Assertions.assertInstanceOf(RocksDBException.class, invocation.getCause());
+        assertEquals(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST, failure.getErrorUniqueId());
+    }
 
-	@Test
-	void protobufV2DeadlineFieldIsReservedRatherThanReused() {
-		var descriptor = it.cavallium.rockserver.core.common.api.proto.RequestContext.getDescriptor();
-		assertNull(descriptor.findFieldByNumber(2));
-		assertEquals("workloadContractVersion", descriptor.findFieldByNumber(3).getName());
-		assertEquals("timeoutNanos", descriptor.findFieldByNumber(4).getName());
-	}
+    @Test
+    void requestContextContainsOnlyProfileAndTimeout() {
+        var descriptor = it.cavallium.rockserver.core.common.api.proto.RequestContext.getDescriptor();
+        assertEquals(2, descriptor.getFields().size());
+        assertEquals("profile", descriptor.findFieldByNumber(1).getName());
+        assertEquals("timeoutNanos", descriptor.findFieldByNumber(2).getName());
+    }
 }

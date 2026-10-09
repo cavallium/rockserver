@@ -3,15 +3,93 @@ use rockserver_client::proto::{
     CapabilitiesResponse, GetRangePageRequest, Kv, RangeBudget, RangeKey, RangePage,
     RangeRequestType, RequestContext,
 };
-use rockserver_client::REQUIRED_WORKLOAD_CONTRACT_VERSION;
 
 #[test]
-fn workload_v3_capability_is_exact() {
+fn capabilities_preserve_backend_modes_and_range_limits() {
     let capability = CapabilitiesResponse {
-        workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+        backend_mode: rockserver_client::BackendMode::Distributed as i32,
+        raw_scan_mode: rockserver_client::RawScanMode::ImmutableExportJobs as i32,
+        maximum_range_page_keys: 4_096,
+        maximum_range_page_bytes: 8 * 1024 * 1024,
     };
     let decoded = CapabilitiesResponse::decode(capability.encode_to_vec().as_slice()).unwrap();
-    assert_eq!(decoded.workload_contract_version, 3);
+    assert_eq!(decoded, capability);
+    let typed = rockserver_client::Capabilities::try_from(decoded).unwrap();
+    assert_eq!(
+        typed.backend_mode,
+        rockserver_client::BackendMode::Distributed
+    );
+    assert_eq!(
+        typed.raw_scan_mode,
+        rockserver_client::RawScanMode::ImmutableExportJobs
+    );
+    assert_eq!(typed.maximum_range_page_keys, 4_096);
+    assert_eq!(typed.maximum_range_page_bytes, 8 * 1024 * 1024);
+}
+
+#[test]
+fn capabilities_reject_missing_unknown_modes_and_nonpositive_limits() {
+    let valid = CapabilitiesResponse {
+        backend_mode: rockserver_client::BackendMode::Standalone as i32,
+        raw_scan_mode: rockserver_client::RawScanMode::PhysicalSst as i32,
+        maximum_range_page_keys: 4_096,
+        maximum_range_page_bytes: 8 * 1024 * 1024,
+    };
+    for value in [0, -1, 99] {
+        assert!(
+            rockserver_client::Capabilities::try_from(CapabilitiesResponse {
+                backend_mode: value,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            rockserver_client::Capabilities::try_from(CapabilitiesResponse {
+                raw_scan_mode: value,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+    }
+    for value in [0, -1, i32::MIN] {
+        assert!(
+            rockserver_client::Capabilities::try_from(CapabilitiesResponse {
+                maximum_range_page_keys: value,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+    }
+    for value in [0, -1, i64::MIN] {
+        assert!(
+            rockserver_client::Capabilities::try_from(CapabilitiesResponse {
+                maximum_range_page_bytes: value,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+    }
+    assert!(
+        rockserver_client::Capabilities::try_from(CapabilitiesResponse {
+            raw_scan_mode: rockserver_client::RawScanMode::Unsupported as i32,
+            maximum_range_page_keys: i32::MAX,
+            maximum_range_page_bytes: i64::MAX,
+            ..valid
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn distributed_backend_rejects_physical_sst_capabilities() {
+    let error = rockserver_client::Capabilities::try_from(CapabilitiesResponse {
+        backend_mode: rockserver_client::BackendMode::Distributed as i32,
+        raw_scan_mode: rockserver_client::RawScanMode::PhysicalSst as i32,
+        maximum_range_page_keys: 4_096,
+        maximum_range_page_bytes: 8 * 1024 * 1024,
+    })
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 }
 
 #[test]
@@ -39,7 +117,6 @@ fn page_request_repeats_original_bounds_and_carries_an_exclusive_cursor() {
         }),
         context: Some(RequestContext {
             profile: 2,
-            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
             timeout_nanos: 123_456,
         }),
     };

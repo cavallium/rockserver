@@ -94,10 +94,10 @@ class RatisLogicalSnapshotPagesTest {
     @Test void fixedPagesClipEveryFrozenRouteAndResumeAcrossOwnersInEitherDirection() throws Exception {
         try (var f=new Fixture(false,1,new byte[]{(byte)128})) {
             for (int n:new int[]{1,3,129,140}) f.fixed(n);
-            var first=f.read(null,null,false,null,new RangeBudget(2,4)); assertEquals(List.of(key(1),key(3)),keys(first)); assertTrue(first.hasMore());
-            var rest=f.read(null,null,false,first.resumeAfter(),new RangeBudget(2,4)); assertEquals(List.of(key(129),key(140)),keys(rest)); assertFalse(rest.hasMore());
-            var reverse=f.read(null,null,true,null,new RangeBudget(2,4)); assertEquals(List.of(key(140),key(129)),keys(reverse));
-            assertEquals(List.of(key(3),key(1)),keys(f.read(null,null,true,reverse.resumeAfter(),new RangeBudget(2,4))));
+            var first=f.read(null,null,false,null,new RangeBudget(2,48)); assertEquals(List.of(key(1),key(3)),keys(first)); assertTrue(first.hasMore());
+            var rest=f.read(null,null,false,first.resumeAfter(),new RangeBudget(2,48)); assertEquals(List.of(key(129),key(140)),keys(rest)); assertFalse(rest.hasMore());
+            var reverse=f.read(null,null,true,null,new RangeBudget(2,48)); assertEquals(List.of(key(140),key(129)),keys(reverse));
+            assertEquals(List.of(key(3),key(1)),keys(f.read(null,null,true,reverse.resumeAfter(),new RangeBudget(2,48))));
             assertEquals(List.of(key(3),key(129)),keys(f.read(key(2),key(140),false,null,RangeBudget.DEFAULT)));
             assertEquals(List.of(key(129),key(140)),keys(f.read(null,null,false,key(128),RangeBudget.DEFAULT)));
             assertEquals(List.of(key(3),key(1)),keys(f.read(null,null,true,key(128),RangeBudget.DEFAULT)));

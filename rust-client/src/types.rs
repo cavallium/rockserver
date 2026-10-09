@@ -3,10 +3,186 @@ use std::time::Duration;
 
 // Re-export proto types that are part of the public API
 pub use crate::proto::{
-    CdcEvent, Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch, MergeBatchMode, Merged,
-    Operation, Previous, PreviousPresence, PutBatchMode, RequestContext, UpdateBegin,
-    WorkloadProfile,
+    BackendMode, CdcEvent, Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch,
+    MergeBatchMode, Merged, Operation, Previous, PreviousPresence, PutBatchMode, RawScanMode,
+    RequestContext, UpdateBegin, WorkloadProfile,
 };
+
+/// Backend behavior and bounded-page limits validated during the handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capabilities {
+    pub backend_mode: BackendMode,
+    pub raw_scan_mode: RawScanMode,
+    pub maximum_range_page_keys: i32,
+    pub maximum_range_page_bytes: i64,
+}
+
+impl TryFrom<proto::CapabilitiesResponse> for Capabilities {
+    type Error = tonic::Status;
+
+    fn try_from(response: proto::CapabilitiesResponse) -> Result<Self, Self::Error> {
+        let backend_mode = BackendMode::try_from(response.backend_mode)
+            .map_err(|_| tonic::Status::failed_precondition("unknown backend mode"))?;
+        if !matches!(
+            backend_mode,
+            BackendMode::Standalone | BackendMode::Distributed
+        ) {
+            return Err(tonic::Status::failed_precondition(
+                "backend mode is required",
+            ));
+        }
+        let raw_scan_mode = RawScanMode::try_from(response.raw_scan_mode)
+            .map_err(|_| tonic::Status::failed_precondition("unknown raw scan mode"))?;
+        if !matches!(
+            raw_scan_mode,
+            RawScanMode::Unsupported | RawScanMode::PhysicalSst | RawScanMode::ImmutableExportJobs
+        ) {
+            return Err(tonic::Status::failed_precondition(
+                "raw scan mode is required",
+            ));
+        }
+        if backend_mode == BackendMode::Distributed && raw_scan_mode == RawScanMode::PhysicalSst {
+            return Err(tonic::Status::failed_precondition(
+                "distributed backends cannot expose physical SST raw scans",
+            ));
+        }
+        if response.maximum_range_page_keys <= 0 || response.maximum_range_page_bytes <= 0 {
+            return Err(tonic::Status::failed_precondition(
+                "bounded range page limits must be positive",
+            ));
+        }
+        Ok(Self {
+            backend_mode,
+            raw_scan_mode,
+            maximum_range_page_keys: response.maximum_range_page_keys,
+            maximum_range_page_bytes: response.maximum_range_page_bytes,
+        })
+    }
+}
+
+impl Capabilities {
+    pub(crate) fn with_transport_limit(
+        mut self,
+        maximum_message_bytes: usize,
+    ) -> Result<Self, tonic::Status> {
+        let maximum_page_bytes = maximum_message_bytes
+            .checked_sub(64 * 1024)
+            .and_then(|available| i64::try_from(available / 2).ok())
+            .filter(|maximum| *maximum > 0)
+            .ok_or_else(|| {
+                tonic::Status::failed_precondition(
+                    "transport limit must permit a positive bounded range page",
+                )
+            })?;
+        self.maximum_range_page_bytes = self.maximum_range_page_bytes.min(maximum_page_bytes);
+        Ok(self)
+    }
+
+    pub(crate) fn validate_range_budget(
+        &self,
+        budget: &proto::RangeBudget,
+    ) -> Result<(), tonic::Status> {
+        if budget.max_items <= 0 || budget.max_items > self.maximum_range_page_keys {
+            return Err(tonic::Status::invalid_argument(
+                "range max_items must be positive and within the backend limit",
+            ));
+        }
+        if budget.max_bytes <= 0 || budget.max_bytes > self.maximum_range_page_bytes {
+            return Err(tonic::Status::invalid_argument(
+                "range max_bytes must be positive and within the backend limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn transport_limit_clamps_page_budget_with_response_headroom() {
+        let capabilities = Capabilities {
+            backend_mode: BackendMode::Standalone,
+            raw_scan_mode: RawScanMode::PhysicalSst,
+            maximum_range_page_keys: 4_096,
+            maximum_range_page_bytes: 8 * 1024 * 1024,
+        };
+        let clamped = capabilities.with_transport_limit(4 * 1024 * 1024).unwrap();
+        assert_eq!(
+            clamped.maximum_range_page_bytes,
+            (4 * 1024 * 1024 - 64 * 1024) / 2
+        );
+        assert_eq!(
+            clamped.maximum_range_page_keys,
+            capabilities.maximum_range_page_keys
+        );
+        assert_eq!(
+            capabilities.with_transport_limit(64 * 1024 * 1024).unwrap(),
+            capabilities
+        );
+        assert_eq!(
+            Capabilities {
+                maximum_range_page_bytes: i64::MAX,
+                ..capabilities
+            }
+            .with_transport_limit(64 * 1024 * 1024)
+            .unwrap()
+            .maximum_range_page_bytes,
+            (64 * 1024 * 1024 - 64 * 1024) / 2
+        );
+        for maximum in [0, 64 * 1024, 64 * 1024 + 1] {
+            assert_eq!(
+                capabilities
+                    .with_transport_limit(maximum)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+    }
+
+    #[test]
+    fn range_budget_respects_signed_limits_and_advertised_maxima() {
+        let capabilities = Capabilities {
+            backend_mode: BackendMode::Standalone,
+            raw_scan_mode: RawScanMode::PhysicalSst,
+            maximum_range_page_keys: 4_096,
+            maximum_range_page_bytes: 8 * 1024 * 1024,
+        };
+        for (max_items, max_bytes) in [(1, 1), (4_096, 8 * 1024 * 1024)] {
+            assert!(capabilities
+                .validate_range_budget(&proto::RangeBudget {
+                    max_items,
+                    max_bytes
+                })
+                .is_ok());
+        }
+        for (max_items, max_bytes) in [
+            (0, 1),
+            (-1, 1),
+            (i32::MIN, 1),
+            (4_097, 1),
+            (i32::MAX, 1),
+            (1, 0),
+            (1, -1),
+            (1, i64::MIN),
+            (1, 8 * 1024 * 1024 + 1),
+            (1, i64::MAX),
+        ] {
+            assert_eq!(
+                capabilities
+                    .validate_range_budget(&proto::RangeBudget {
+                        max_items,
+                        max_bytes
+                    })
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+}
 
 /// Opaque, database-scoped identity of an immutable RocksDB SST file.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -85,7 +261,6 @@ impl RequestContext {
         );
         Self {
             profile,
-            workload_contract_version: crate::REQUIRED_WORKLOAD_CONTRACT_VERSION,
             timeout_nanos,
         }
     }

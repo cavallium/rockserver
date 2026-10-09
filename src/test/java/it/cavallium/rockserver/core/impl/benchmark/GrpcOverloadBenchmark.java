@@ -591,18 +591,16 @@ public final class GrpcOverloadBenchmark {
 					.setId(cdcSubscription(worker))
 					.addColumnIds(columnId)
 					.setExpectAbsent(Empty.getDefaultInstance())
-					.setWorkloadContractVersion(3)
 					.build());
 		}
 		client.blockingWithDeadline().flush(
-				FlushRequest.newBuilder().setWorkloadContractVersion(3).build());
+				FlushRequest.newBuilder().build());
 	}
 
 	private static it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext(
 			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(profile)
-				.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE - 1L)
 				.build();
 	}
@@ -946,7 +944,6 @@ public final class GrpcOverloadBenchmark {
 				.setId(cdcSubscription(worker))
 				.setMaxEvents(256L)
 				.setMaxResponseBytes(4 * 1024 * 1024)
-				.setWorkloadContractVersion(3)
 				.build();
 		control.ready.countDown();
 		control.start.await();
@@ -962,7 +959,6 @@ public final class GrpcOverloadBenchmark {
 					client.blockingWithDeadline().cdcCommit(CdcCommitRequest.newBuilder()
 							.setId(cdcSubscription(worker))
 							.setSeq(committed)
-							.setWorkloadContractVersion(3)
 							.build());
 				}
 				outcome = Outcome.SUCCESS;
@@ -993,7 +989,7 @@ public final class GrpcOverloadBenchmark {
 			String detail = null;
 			try {
 				client.blockingWithDeadline().flush(
-						FlushRequest.newBuilder().setWorkloadContractVersion(3).build());
+						FlushRequest.newBuilder().build());
 				outcome = Outcome.SUCCESS;
 			} catch (Throwable failure) {
 				outcome = classify(failure);
@@ -2742,12 +2738,10 @@ public final class GrpcOverloadBenchmark {
 		private static Requests create(long columnId, Options options) {
 			var latencyContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
-					.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE - 1L)
 					.build();
 			var analyticalContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.ANALYTICAL)
-					.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE - 1L)
 					.build();
 			GetRequest[] points = new GetRequest[Math.min(options.pointRequestCount(), options.preloadKeys())];
@@ -2818,7 +2812,6 @@ public final class GrpcOverloadBenchmark {
 									.setValue(ByteString.copyFrom(valueBytes(valueBytes, key))))
 							.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 									.setProfile(profile)
-									.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Long.MAX_VALUE))
 							.build();
 				}

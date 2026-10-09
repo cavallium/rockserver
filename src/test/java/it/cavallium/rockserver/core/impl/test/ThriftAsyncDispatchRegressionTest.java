@@ -65,6 +65,109 @@ import reactor.core.publisher.Mono;
 
 @Timeout(30)
 class ThriftAsyncDispatchRegressionTest {
+	@Test
+	void thriftCapabilitiesPreserveBackendLimitsAndDisableRawScans() throws Exception {
+		var backend = new RockserverCapabilities(RockserverCapabilities.BackendMode.DISTRIBUTED,
+				RockserverCapabilities.RawScanMode.IMMUTABLE_EXPORT_JOBS, 123, 456L);
+		var connection = (RocksDBConnection) java.lang.reflect.Proxy.newProxyInstance(
+				RocksDBConnection.class.getClassLoader(), new Class<?>[] { RocksDBConnection.class },
+				(proxy, method, args) -> {
+					if (method.getName().equals("getCapabilities")) return backend;
+					throw new AssertionError("Unexpected backend call: " + method.getName());
+				});
+		var handlerClass = Class.forName(ThriftServer.class.getName() + "$ThriftHandler");
+		var constructor = handlerClass.getDeclaredConstructor(RocksDBConnection.class, RWScheduler.class,
+				int.class);
+		constructor.setAccessible(true);
+		var handler = (it.cavallium.rockserver.core.common.api.RocksDB.Iface)
+				constructor.newInstance(connection, null, 1024);
+		var wire = handler.getCapabilities();
+		var decoded = new it.cavallium.rockserver.core.common.api.Capabilities();
+		new org.apache.thrift.TDeserializer(new TBinaryProtocol.Factory()).deserialize(decoded,
+				new org.apache.thrift.TSerializer(new TBinaryProtocol.Factory()).serialize(wire));
+		assertEquals(it.cavallium.rockserver.core.common.api.BackendMode.DISTRIBUTED, decoded.getBackendMode());
+		assertEquals(it.cavallium.rockserver.core.common.api.RawScanMode.UNSUPPORTED, decoded.getRawScanMode());
+		assertEquals(123, decoded.getMaximumRangePageKeys());
+		assertEquals(456L, decoded.getMaximumRangePageBytes());
+	}
+
+	@Test
+	void thriftFrameLimitBoundsLargeCompositeKeyPageAndRejectsLargerBudgets() throws Exception {
+		int maximumFrame = it.cavallium.rockserver.core.common.ThriftTransportLimits.MIN_MAX_FRAME_SIZE;
+		long maximumPageBytes = (maximumFrame - 64 * 1024L) / 2;
+		var keyParts = new Buf[1024];
+		java.util.Arrays.fill(keyParts, Buf.wrap(new byte[0]));
+		keyParts[0] = Buf.wrap(new byte[400_000]);
+		var item = new it.cavallium.rockserver.core.common.KV(new Keys(keyParts),
+				Buf.wrap(new byte[(int) (maximumPageBytes - 400_000 - 16 - 6L * keyParts.length)]));
+		assertEquals(maximumPageBytes, it.cavallium.rockserver.core.common.RangeBudget.itemBytes(item));
+		var page = new it.cavallium.rockserver.core.common.RangePage<>(List.of(item), item.keys(), true);
+		var calls = new AtomicInteger();
+		var sync = (RocksDBSyncAPI) java.lang.reflect.Proxy.newProxyInstance(
+				RocksDBSyncAPI.class.getClassLoader(), new Class<?>[] {RocksDBSyncAPI.class},
+				(proxy, method, args) -> { throw new AssertionError("Unexpected sync call"); });
+		var async = (RocksDBAsyncAPI) java.lang.reflect.Proxy.newProxyInstance(
+				RocksDBAsyncAPI.class.getClassLoader(), new Class<?>[] {RocksDBAsyncAPI.class},
+				(proxy, method, args) -> {
+					assertEquals("requestAsync", method.getName());
+					calls.incrementAndGet();
+					return CompletableFuture.completedFuture(page);
+				});
+		var connection = (RocksDBConnection) java.lang.reflect.Proxy.newProxyInstance(
+				RocksDBConnection.class.getClassLoader(), new Class<?>[] {RocksDBConnection.class},
+				(proxy, method, args) -> switch (method.getName()) {
+					case "getCapabilities" -> RockserverCapabilities.STANDALONE;
+					case "getSyncApi" -> sync;
+					case "getAsyncApi" -> async;
+					default -> throw new AssertionError("Unexpected backend call: " + method.getName());
+				});
+		var handlerClass = Class.forName(ThriftServer.class.getName() + "$ThriftHandler");
+		var constructor = handlerClass.getDeclaredConstructor(RocksDBConnection.class, RWScheduler.class,
+				int.class);
+		constructor.setAccessible(true);
+		var handler = (it.cavallium.rockserver.core.common.api.RocksDB.Iface) constructor.newInstance(
+				connection, null, maximumFrame - 64 * 1024);
+		assertEquals(maximumPageBytes, handler.getCapabilities().getMaximumRangePageBytes());
+		var context = new it.cavallium.rockserver.core.common.api.RequestContext(
+				it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH, Long.MAX_VALUE);
+		var wire = handler.getRangePage(0L, 1L, null, null, false, null,
+				it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE,
+				new it.cavallium.rockserver.core.common.api.RangeBudget(1, maximumPageBytes), context);
+		var result = new it.cavallium.rockserver.core.common.api.RocksDB.getRangePage_result().setSuccess(wire);
+		byte[] encoded = new org.apache.thrift.TSerializer(new TBinaryProtocol.Factory()).serialize(result);
+		assertTrue(encoded.length <= 2 * maximumPageBytes + 64 * 1024L);
+		assertTrue(encoded.length <= maximumFrame);
+		assertEquals(1, calls.get());
+		var rejected = assertThrows(it.cavallium.rockserver.core.common.api.RocksDBThriftException.class,
+				() -> handler.getRangePage(0L, 1L, null, null, false, null,
+						it.cavallium.rockserver.core.common.api.RangeRequestType.ALL_IN_RANGE,
+						new it.cavallium.rockserver.core.common.api.RangeBudget(1, maximumPageBytes + 1), context));
+		assertEquals(it.cavallium.rockserver.core.common.api.RocksDBErrorType.PUT_INVALID_REQUEST,
+				rejected.getErrorType());
+		assertEquals(1, calls.get());
+	}
+
+	@Test
+	void thriftCapabilitiesRejectMissingAndUnknownEnums() throws Exception {
+		var missing = new it.cavallium.rockserver.core.common.api.Capabilities();
+		assertThrows(org.apache.thrift.protocol.TProtocolException.class, missing::validate);
+		var transport = new org.apache.thrift.transport.TMemoryBuffer(128);
+		var protocol = new TBinaryProtocol(transport);
+		protocol.writeStructBegin(new org.apache.thrift.protocol.TStruct("Capabilities"));
+		for (short field : new short[] {1, 2, 3}) {
+			protocol.writeFieldBegin(new org.apache.thrift.protocol.TField("", org.apache.thrift.protocol.TType.I32, field));
+			protocol.writeI32(field == 1 ? 999 : 1);
+			protocol.writeFieldEnd();
+		}
+		protocol.writeFieldBegin(new org.apache.thrift.protocol.TField("", org.apache.thrift.protocol.TType.I64, (short) 4));
+		protocol.writeI64(1L);
+		protocol.writeFieldEnd();
+		protocol.writeFieldStop();
+		protocol.writeStructEnd();
+		assertThrows(org.apache.thrift.protocol.TProtocolException.class,
+				() -> missing.read(protocol));
+	}
+
 	private static void awaitUninterruptibly(CountDownLatch latch) {
 		boolean interrupted = false;
 		while (true) {
@@ -202,7 +305,7 @@ class ThriftAsyncDispatchRegressionTest {
 	}
 
 	@Test
-	void v2ThriftRollbackIsRejectedBeforeProtectedBackendDispatch() throws Exception {
+	void thriftRollbackUsesProtectedBackendDispatch() throws Exception {
 		var connection = new TrackingConnection();
 		int port = freePort();
 		try (var server = new ThriftServer(connection, "127.0.0.1", port)) {
@@ -213,17 +316,13 @@ class ThriftAsyncDispatchRegressionTest {
 				transport.open();
 				var rawClient = new it.cavallium.rockserver.core.common.api.RocksDB.Client(
 						new TBinaryProtocol(transport));
-				var v2Context = new it.cavallium.rockserver.core.common.api.RequestContext(
+				var context = new it.cavallium.rockserver.core.common.api.RequestContext(
 						it.cavallium.rockserver.core.common.api.WorkloadProfile.BATCH,
-						2,
 						Long.MAX_VALUE);
-				var failure = assertThrows(
-						it.cavallium.rockserver.core.common.api.RocksDBThriftException.class,
-						() -> rawClient.closeTransaction(72L, false, v2Context));
-				assertEquals(it.cavallium.rockserver.core.common.api.RocksDBErrorType.PUT_INVALID_REQUEST,
-						failure.getErrorType());
-				assertTrue(connection.asyncRequests.isEmpty(),
-						"v2 rollback reached the protected backend");
+				assertTrue(rawClient.closeTransaction(72L, false, context));
+				assertEquals(List.of(RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction.class),
+						connection.asyncRequests);
+				assertEquals(Long.MAX_VALUE, connection.lastApiContextDeadline.get());
 			}
 		}
 	}
@@ -546,7 +645,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 	private static final class BoundaryJumpConnection implements RocksDBConnection, InternalConnection {
 		@Override
-		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT; }
+		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() { return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE; }
 
 		private final RWScheduler scheduler;
 		private final MutableClock clock;
@@ -603,7 +702,7 @@ class ThriftAsyncDispatchRegressionTest {
 
 		@Override
 		public RockserverCapabilities getCapabilities() {
-			return RockserverCapabilities.CURRENT;
+			return RockserverCapabilities.STANDALONE;
 		}
 
 		@Override
@@ -647,7 +746,7 @@ class ThriftAsyncDispatchRegressionTest {
 	private static final class TrackingConnection implements RocksDBConnection {
 
 		public it.cavallium.rockserver.core.common.RockserverCapabilities getCapabilities() {
-			return it.cavallium.rockserver.core.common.RockserverCapabilities.CURRENT;
+			return it.cavallium.rockserver.core.common.RockserverCapabilities.STANDALONE;
 		}
 
 

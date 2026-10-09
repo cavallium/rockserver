@@ -100,7 +100,6 @@ class GrpcCommandPreAdmissionTest {
 			var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
 			var context = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.LATENCY)
-					.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Duration.ofSeconds(10).toNanos())
 					.build();
 
@@ -469,7 +468,6 @@ class GrpcCommandPreAdmissionTest {
 						.addKeys(ByteString.copyFrom(new byte[] {1}))
 						.setContext(it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 								.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.BATCH)
-								.setWorkloadContractVersion(3)
 				.setTimeoutNanos(deadline))
 						.build());
 				listener.onHalfClose();
@@ -679,7 +677,6 @@ class GrpcCommandPreAdmissionTest {
 			it.cavallium.rockserver.core.common.api.proto.WorkloadProfile profile) {
 		return it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
 				.setProfile(profile)
-				.setWorkloadContractVersion(3)
 				.setTimeoutNanos(Duration.ofSeconds(10).toNanos())
 				.build();
 	}

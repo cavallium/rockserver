@@ -947,12 +947,6 @@ public class GrpcServer extends Server {
 				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 						"Request context and workload profile are required");
 			}
-			if (wireContext.getWorkloadContractVersion()
-					!= RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Request context requires workload contract version "
-								+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-			}
 			final WorkloadProfile profile;
 			try {
 				profile = WorkloadProfile.fromWireValue(wireContext.getProfileValue());
@@ -1146,7 +1140,10 @@ public class GrpcServer extends Server {
 		public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
 			var capabilities = client.getCapabilities();
 			return Mono.just(CapabilitiesResponse.newBuilder()
-					.setWorkloadContractVersion(capabilities.workloadContractVersion())
+					.setBackendMode(it.cavallium.rockserver.core.common.api.proto.BackendMode.valueOf(capabilities.backendMode().name()))
+                    .setRawScanMode(it.cavallium.rockserver.core.common.api.proto.RawScanMode.valueOf(capabilities.rawScanMode().name()))
+                    .setMaximumRangePageKeys(capabilities.maximumRangePageKeys())
+                    .setMaximumRangePageBytes(capabilities.maximumRangePageBytes())
 					.build());
 		}
 
@@ -1168,7 +1165,6 @@ public class GrpcServer extends Server {
 						return CloseTransactionResponse.newBuilder().setSuccessful(committed).build();
 					});
 				}
-				requireV3(request.getContext().getWorkloadContractVersion());
 				return executeMustComplete("rollback",
 						() -> {
 							var rolledBack = protectedApi().closeTransaction(request.getTransactionId(), false);
@@ -1181,7 +1177,6 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> closeFailedUpdate(CloseFailedUpdateRequest request) {
-			requireV3(request.getWorkloadContractVersion());
 			return executeMustComplete("closeFailedUpdate", () -> {
 				protectedApi().closeFailedUpdate(request.getUpdateId());
 				return Empty.getDefaultInstance();
@@ -2217,7 +2212,6 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> closeIterator(CloseIteratorRequest request) {
-			requireV3(request.getWorkloadContractVersion());
 			return executeMustComplete("closeIterator", () -> {
 					protectedApi().closeIterator(request.getIteratorId());
 					return Empty.getDefaultInstance();
@@ -2361,6 +2355,7 @@ public class GrpcServer extends Server {
 					return Mono.error(RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
 							invalid.getMessage(), invalid));
 				}
+				client.getCapabilities().requireRangeBudget(budget);
 				var requestType = switch (request.getRequestTypeValue()) {
 					case 1 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRange();
 					case 2 -> RequestType.<it.cavallium.rockserver.core.common.KV>allInRangeNoCache();
@@ -2414,6 +2409,7 @@ public class GrpcServer extends Server {
 		@Override
 		public Flux<it.cavallium.rockserver.core.common.api.proto.ScanRawResponse> scanRaw(ScanRawRequest request) {
 			return Flux.defer(() -> {
+				client.getCapabilities().requirePhysicalSst();
 				var api = asyncApi(request.getContext());
 				if (request.getResumable()) {
 					final Set<RawSstToken> completedSsts;
@@ -2479,7 +2475,6 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> flush(FlushRequest request) {
-			requireV3(request.getWorkloadContractVersion());
 			return executeScheduled(() -> {
 				protectedApi().flush();
 				return Empty.getDefaultInstance();
@@ -2512,7 +2507,6 @@ public class GrpcServer extends Server {
 
         @Override
         public Mono<CompactFilesResponse> compactFiles(CompactFilesRequest request) {
-            requireV3(request.getWorkloadContractVersion());
             return Mono.defer(() -> {
                 var decoded = new SstMaintenance.Request(request.getColumnId(), request.getSession(),
                         request.getFilesList(), request.getLevel(), request.getOutputPathId(),
@@ -2531,7 +2525,6 @@ public class GrpcServer extends Server {
 
 		@Override
 		public Mono<Empty> compact(CompactRequest request) {
-			requireV3(request.getWorkloadContractVersion());
 			return executeScheduled(() -> {
 				protectedApi().compact();
 				return Empty.getDefaultInstance();
@@ -2575,7 +2568,6 @@ public class GrpcServer extends Server {
 
 			@Override
 			public Mono<CdcCreateResponse> cdcCreate(CdcCreateRequest request) {
-				requireV3(request.getWorkloadContractVersion());
 				Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
 				OptionalLong expectedLastCommitted = switch (request.getExpectedLastCommittedCase()) {
 					case EXPECTABSENT -> OptionalLong.empty();
@@ -2597,7 +2589,6 @@ public class GrpcServer extends Server {
 
             @Override
 			public Mono<Empty> cdcDelete(CdcDeleteRequest request) {
-				requireV3(request.getWorkloadContractVersion());
 				return executeScheduled(() -> {
 					protectedApi().cdcDelete(request.getId());
 					return Empty.getDefaultInstance();
@@ -2609,7 +2600,6 @@ public class GrpcServer extends Server {
 			@Override
 			public Mono<CdcGetEarliestAvailableSequenceResponse> cdcGetEarliestAvailableSequence(
 					CdcGetEarliestAvailableSequenceRequest request) {
-				requireV3(request.getWorkloadContractVersion());
 				return executeScheduled(() -> CdcGetEarliestAvailableSequenceResponse.newBuilder()
 						.setSequence(protectedApi().cdcGetEarliestAvailableSequence())
 						.build(), scheduler.scheduler(WorkloadProfile.CDC, OperationFamily.WAL_PAGE, Long.MAX_VALUE))
@@ -2620,7 +2610,6 @@ public class GrpcServer extends Server {
             @Override
 			public Mono<CdcGetLastCommittedSequenceResponse> cdcGetLastCommittedSequence(
 					CdcGetLastCommittedSequenceRequest request) {
-				requireV3(request.getWorkloadContractVersion());
 				return executeScheduled(() -> {
 					var sequence = protectedApi().cdcGetLastCommittedSequence(request.getId());
                     var response = CdcGetLastCommittedSequenceResponse.newBuilder();
@@ -2633,7 +2622,6 @@ public class GrpcServer extends Server {
 
             @Override
 			public Flux<it.cavallium.rockserver.core.common.api.proto.CDCEvent> cdcPoll(CdcPollRequest request) {
-				requireV3(request.getWorkloadContractVersion());
                 return Flux.defer(() -> {
                             long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
                             Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
@@ -2646,7 +2634,6 @@ public class GrpcServer extends Server {
 
             @Override
 			public Mono<CdcPollResponse> cdcPollBatch(CdcPollRequest request) {
-				requireV3(request.getWorkloadContractVersion());
                 return Mono.defer(() -> {
                             long maxEvents = request.getMaxEvents() > 0 ? request.getMaxEvents() : 10_000L;
                             Long fromSeq = request.hasFromSeq() ? request.getFromSeq() : null;
@@ -2670,7 +2657,6 @@ public class GrpcServer extends Server {
 
 			@Override
 			public Mono<Empty> cdcCommit(CdcCommitRequest request) {
-				requireV3(request.getWorkloadContractVersion());
 				return executeMustComplete("cdcCommit", () -> {
 					protectedApi().cdcCommit(request.getId(), request.getSeq());
 					return Empty.getDefaultInstance();
@@ -2681,13 +2667,6 @@ public class GrpcServer extends Server {
 
 		// utils
 
-		private static void requireV3(int workloadContractVersion) {
-			if (workloadContractVersion != RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION) {
-				throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST,
-						"Request requires workload contract version "
-								+ RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION);
-			}
-		}
 
 		private <T> Mono<T> executeSync(
 				it.cavallium.rockserver.core.common.api.proto.RequestContext wireContext,

@@ -49,7 +49,7 @@ class RatisSnapshotClientTest {
     static List<Keys> scan(RatisSnapshotClient.Lease lease,long column,boolean reverse) throws Exception {
         var keys=new ArrayList<Keys>(); Keys continuation=null;
         for (int n=0;n<16;n++) {
-            var page=lease.page(column,null,null,reverse,continuation,new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS);
+            var page=lease.page(column,null,null,reverse,continuation,new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS);
             assertTrue(page.items().size()<=1);
             if (!page.items().isEmpty()) { assertEquals(page.items().getLast().keys(),page.resumeAfter()); keys.add(page.items().getLast().keys()); }
             if (!page.hasMore()) return keys;
@@ -80,22 +80,22 @@ class RatisSnapshotClientTest {
                 assertEquals(List.of(key(2),key(200)),scan(lease,71,false)); assertEquals(List.of(key(200),key(2)),scan(lease,71,true));
                 var forward=List.of(member(2,"alpha"),member(2,"beta"),member(200,"alpha"),member(200,"beta"));
                 assertEquals(forward,scan(lease,74,false)); var reverse=new ArrayList<>(forward); Collections.reverse(reverse); assertEquals(reverse,scan(lease,74,true));
-                var bounded=lease.page(74,member(2,"beta"),member(200,"beta"),false,null,new RangeBudget(8,128),RequestContext.batch()).get(5,TimeUnit.SECONDS);
+                var bounded=lease.page(74,member(2,"beta"),member(200,"beta"),false,null,new RangeBudget(8,256),RequestContext.batch()).get(5,TimeUnit.SECONDS);
                 assertEquals(List.of(member(2,"beta"),member(200,"alpha")),bounded.items().stream().map(KV::keys).toList());
                 assertFalse(bounded.hasMore()); assertFalse(lease.snapshot().observedHome().consumed());
                 var closedCursor=lease.openCursor(74,null,null,false);
-                assertEquals(member(2,"alpha"),closedCursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS).resumeAfter());
+                assertEquals(member(2,"alpha"),closedCursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS).resumeAfter());
                 closedCursor.close(); assertEquals(0,snapshots.stats().cursors());
-                assertThrows(ExecutionException.class,() -> closedCursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS));
+                assertThrows(ExecutionException.class,() -> closedCursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS));
                 try (var cursor=lease.openCursor(74,null,null,false)) {
                     assertEquals(1,snapshots.stats().cursors());
-                    for (var expected:forward) assertEquals(List.of(expected),cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().stream().map(KV::keys).toList());
-                    assertTrue(cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().isEmpty());
+                    for (var expected:forward) assertEquals(List.of(expected),cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().stream().map(KV::keys).toList());
+                    assertTrue(cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().isEmpty());
                 }
                 assertEquals(0,snapshots.stats().cursors());
                 var releasedCursor=lease.openCursor(71,null,null,false);
                 lease.release(RequestContext.batch()).get(10,TimeUnit.SECONDS); assertTrue(lease.snapshot().observedHome().consumed());
-                assertEquals(0,snapshots.stats().cursors()); lost(releasedCursor.nextPage(new RangeBudget(1,32),RequestContext.batch()));
+                assertEquals(0,snapshots.stats().cursors()); lost(releasedCursor.nextPage(new RangeBudget(1,64),RequestContext.batch()));
                 for (var group:f.groups) assertEquals(0,f.machines.get(group).snapshotPinStats().pins());
                 lost(lease.get(71,key(2),RequestContext.batch()));
             }
@@ -115,17 +115,17 @@ class RatisSnapshotClientTest {
                 var expected=List.of(member(2,"alpha"),member(2,"beta"),member(200,"alpha"),member(200,"beta"));
                 for (boolean reverse:new boolean[]{false,true}) {
                     var ordered=new ArrayList<>(expected); if (reverse) Collections.reverse(ordered);
-                    var page=lease.page(74,lower,upper,reverse,null,new RangeBudget(8,128),RequestContext.batch()).get(5,TimeUnit.SECONDS);
+                    var page=lease.page(74,lower,upper,reverse,null,new RangeBudget(8,256),RequestContext.batch()).get(5,TimeUnit.SECONDS);
                     assertEquals(ordered,page.items().stream().map(KV::keys).toList()); assertFalse(page.hasMore());
                     Keys continuation=null;
                     for (int n=0;n<ordered.size();n++) {
-                        var one=lease.page(74,lower,upper,reverse,continuation,new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS);
+                        var one=lease.page(74,lower,upper,reverse,continuation,new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS);
                         assertEquals(List.of(ordered.get(n)),one.items().stream().map(KV::keys).toList());
                         assertEquals(n+1<ordered.size(),one.hasMore()); continuation=one.resumeAfter();
                     }
                     try (var cursor=lease.openCursor(74,lower,upper,reverse)) {
-                        for (var item:ordered) assertEquals(List.of(item),cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().stream().map(KV::keys).toList());
-                        assertTrue(cursor.nextPage(new RangeBudget(1,32),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().isEmpty());
+                        for (var item:ordered) assertEquals(List.of(item),cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().stream().map(KV::keys).toList());
+                        assertTrue(cursor.nextPage(new RangeBudget(1,64),RequestContext.batch()).get(5,TimeUnit.SECONDS).items().isEmpty());
                     }
                 }
                 assertArrayEquals(new byte[]{7},lease.get(74,member(200,"beta"),RequestContext.batch()).get(5,TimeUnit.SECONDS).toByteArray());

@@ -10,16 +10,41 @@ package it.cavallium.rockserver.core.common.api;
 public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capabilities._Fields>, java.io.Serializable, Cloneable, Comparable<Capabilities> {
   private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("Capabilities");
 
-  private static final org.apache.thrift.protocol.TField WORKLOAD_CONTRACT_VERSION_FIELD_DESC = new org.apache.thrift.protocol.TField("workloadContractVersion", org.apache.thrift.protocol.TType.I32, (short)1);
+  private static final org.apache.thrift.protocol.TField BACKEND_MODE_FIELD_DESC = new org.apache.thrift.protocol.TField("backendMode", org.apache.thrift.protocol.TType.I32, (short)1);
+  private static final org.apache.thrift.protocol.TField RAW_SCAN_MODE_FIELD_DESC = new org.apache.thrift.protocol.TField("rawScanMode", org.apache.thrift.protocol.TType.I32, (short)2);
+  private static final org.apache.thrift.protocol.TField MAXIMUM_RANGE_PAGE_KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("maximumRangePageKeys", org.apache.thrift.protocol.TType.I32, (short)3);
+  private static final org.apache.thrift.protocol.TField MAXIMUM_RANGE_PAGE_BYTES_FIELD_DESC = new org.apache.thrift.protocol.TField("maximumRangePageBytes", org.apache.thrift.protocol.TType.I64, (short)4);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new CapabilitiesStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new CapabilitiesTupleSchemeFactory();
 
-  public int workloadContractVersion; // required
+  /**
+   *
+   * @see BackendMode
+   */
+  public @org.apache.thrift.annotation.Nullable BackendMode backendMode; // required
+  /**
+   *
+   * @see RawScanMode
+   */
+  public @org.apache.thrift.annotation.Nullable RawScanMode rawScanMode; // required
+  public int maximumRangePageKeys; // required
+  public long maximumRangePageBytes; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
-    WORKLOAD_CONTRACT_VERSION((short)1, "workloadContractVersion");
+    /**
+     *
+     * @see BackendMode
+     */
+    BACKEND_MODE((short)1, "backendMode"),
+    /**
+     *
+     * @see RawScanMode
+     */
+    RAW_SCAN_MODE((short)2, "rawScanMode"),
+    MAXIMUM_RANGE_PAGE_KEYS((short)3, "maximumRangePageKeys"),
+    MAXIMUM_RANGE_PAGE_BYTES((short)4, "maximumRangePageBytes");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -35,8 +60,14 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     @org.apache.thrift.annotation.Nullable
     public static _Fields findByThriftId(int fieldId) {
       switch(fieldId) {
-        case 1: // WORKLOAD_CONTRACT_VERSION
-          return WORKLOAD_CONTRACT_VERSION;
+        case 1: // BACKEND_MODE
+          return BACKEND_MODE;
+        case 2: // RAW_SCAN_MODE
+          return RAW_SCAN_MODE;
+        case 3: // MAXIMUM_RANGE_PAGE_KEYS
+          return MAXIMUM_RANGE_PAGE_KEYS;
+        case 4: // MAXIMUM_RANGE_PAGE_BYTES
+          return MAXIMUM_RANGE_PAGE_BYTES;
         default:
           return null;
       }
@@ -80,13 +111,20 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   }
 
   // isset id assignments
-  private static final int __WORKLOADCONTRACTVERSION_ISSET_ID = 0;
+  private static final int __MAXIMUMRANGEPAGEKEYS_ISSET_ID = 0;
+  private static final int __MAXIMUMRANGEPAGEBYTES_ISSET_ID = 1;
   private byte __isset_bitfield = 0;
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
-    tmpMap.put(_Fields.WORKLOAD_CONTRACT_VERSION, new org.apache.thrift.meta_data.FieldMetaData("workloadContractVersion", org.apache.thrift.TFieldRequirementType.REQUIRED,
+    tmpMap.put(_Fields.BACKEND_MODE, new org.apache.thrift.meta_data.FieldMetaData("backendMode", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, BackendMode.class)));
+    tmpMap.put(_Fields.RAW_SCAN_MODE, new org.apache.thrift.meta_data.FieldMetaData("rawScanMode", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, RawScanMode.class)));
+    tmpMap.put(_Fields.MAXIMUM_RANGE_PAGE_KEYS, new org.apache.thrift.meta_data.FieldMetaData("maximumRangePageKeys", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
+    tmpMap.put(_Fields.MAXIMUM_RANGE_PAGE_BYTES, new org.apache.thrift.meta_data.FieldMetaData("maximumRangePageBytes", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(Capabilities.class, metaDataMap);
   }
@@ -95,11 +133,18 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   }
 
   public Capabilities(
-    int workloadContractVersion)
+    BackendMode backendMode,
+    RawScanMode rawScanMode,
+    int maximumRangePageKeys,
+    long maximumRangePageBytes)
   {
     this();
-    this.workloadContractVersion = workloadContractVersion;
-    setWorkloadContractVersionIsSet(true);
+    this.backendMode = backendMode;
+    this.rawScanMode = rawScanMode;
+    this.maximumRangePageKeys = maximumRangePageKeys;
+    setMaximumRangePageKeysIsSet(true);
+    this.maximumRangePageBytes = maximumRangePageBytes;
+    setMaximumRangePageBytesIsSet(true);
   }
 
   /**
@@ -107,7 +152,14 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
    */
   public Capabilities(Capabilities other) {
     __isset_bitfield = other.__isset_bitfield;
-    this.workloadContractVersion = other.workloadContractVersion;
+    if (other.isSetBackendMode()) {
+      this.backendMode = other.backendMode;
+    }
+    if (other.isSetRawScanMode()) {
+      this.rawScanMode = other.rawScanMode;
+    }
+    this.maximumRangePageKeys = other.maximumRangePageKeys;
+    this.maximumRangePageBytes = other.maximumRangePageBytes;
   }
 
   @Override
@@ -117,41 +169,158 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
 
   @Override
   public void clear() {
-    setWorkloadContractVersionIsSet(false);
-    this.workloadContractVersion = 0;
+    this.backendMode = null;
+    this.rawScanMode = null;
+    setMaximumRangePageKeysIsSet(false);
+    this.maximumRangePageKeys = 0;
+    setMaximumRangePageBytesIsSet(false);
+    this.maximumRangePageBytes = 0;
   }
 
-  public int getWorkloadContractVersion() {
-    return this.workloadContractVersion;
+  /**
+   *
+   * @see BackendMode
+   */
+  @org.apache.thrift.annotation.Nullable
+  public BackendMode getBackendMode() {
+    return this.backendMode;
   }
 
-  public Capabilities setWorkloadContractVersion(int workloadContractVersion) {
-    this.workloadContractVersion = workloadContractVersion;
-    setWorkloadContractVersionIsSet(true);
+  /**
+   *
+   * @see BackendMode
+   */
+  public Capabilities setBackendMode(@org.apache.thrift.annotation.Nullable BackendMode backendMode) {
+    this.backendMode = backendMode;
     return this;
   }
 
-  public void unsetWorkloadContractVersion() {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+  public void unsetBackendMode() {
+    this.backendMode = null;
   }
 
-  /** Returns true if field workloadContractVersion is set (has been assigned a value) and false otherwise */
-  public boolean isSetWorkloadContractVersion() {
-    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID);
+  /** Returns true if field backendMode is set (has been assigned a value) and false otherwise */
+  public boolean isSetBackendMode() {
+    return this.backendMode != null;
   }
 
-  public void setWorkloadContractVersionIsSet(boolean value) {
-    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __WORKLOADCONTRACTVERSION_ISSET_ID, value);
+  public void setBackendModeIsSet(boolean value) {
+    if (!value) {
+      this.backendMode = null;
+    }
+  }
+
+  /**
+   *
+   * @see RawScanMode
+   */
+  @org.apache.thrift.annotation.Nullable
+  public RawScanMode getRawScanMode() {
+    return this.rawScanMode;
+  }
+
+  /**
+   *
+   * @see RawScanMode
+   */
+  public Capabilities setRawScanMode(@org.apache.thrift.annotation.Nullable RawScanMode rawScanMode) {
+    this.rawScanMode = rawScanMode;
+    return this;
+  }
+
+  public void unsetRawScanMode() {
+    this.rawScanMode = null;
+  }
+
+  /** Returns true if field rawScanMode is set (has been assigned a value) and false otherwise */
+  public boolean isSetRawScanMode() {
+    return this.rawScanMode != null;
+  }
+
+  public void setRawScanModeIsSet(boolean value) {
+    if (!value) {
+      this.rawScanMode = null;
+    }
+  }
+
+  public int getMaximumRangePageKeys() {
+    return this.maximumRangePageKeys;
+  }
+
+  public Capabilities setMaximumRangePageKeys(int maximumRangePageKeys) {
+    this.maximumRangePageKeys = maximumRangePageKeys;
+    setMaximumRangePageKeysIsSet(true);
+    return this;
+  }
+
+  public void unsetMaximumRangePageKeys() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __MAXIMUMRANGEPAGEKEYS_ISSET_ID);
+  }
+
+  /** Returns true if field maximumRangePageKeys is set (has been assigned a value) and false otherwise */
+  public boolean isSetMaximumRangePageKeys() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __MAXIMUMRANGEPAGEKEYS_ISSET_ID);
+  }
+
+  public void setMaximumRangePageKeysIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __MAXIMUMRANGEPAGEKEYS_ISSET_ID, value);
+  }
+
+  public long getMaximumRangePageBytes() {
+    return this.maximumRangePageBytes;
+  }
+
+  public Capabilities setMaximumRangePageBytes(long maximumRangePageBytes) {
+    this.maximumRangePageBytes = maximumRangePageBytes;
+    setMaximumRangePageBytesIsSet(true);
+    return this;
+  }
+
+  public void unsetMaximumRangePageBytes() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __MAXIMUMRANGEPAGEBYTES_ISSET_ID);
+  }
+
+  /** Returns true if field maximumRangePageBytes is set (has been assigned a value) and false otherwise */
+  public boolean isSetMaximumRangePageBytes() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __MAXIMUMRANGEPAGEBYTES_ISSET_ID);
+  }
+
+  public void setMaximumRangePageBytesIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __MAXIMUMRANGEPAGEBYTES_ISSET_ID, value);
   }
 
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
-    case WORKLOAD_CONTRACT_VERSION:
+    case BACKEND_MODE:
       if (value == null) {
-        unsetWorkloadContractVersion();
+        unsetBackendMode();
       } else {
-        setWorkloadContractVersion((java.lang.Integer)value);
+        setBackendMode((BackendMode)value);
+      }
+      break;
+
+    case RAW_SCAN_MODE:
+      if (value == null) {
+        unsetRawScanMode();
+      } else {
+        setRawScanMode((RawScanMode)value);
+      }
+      break;
+
+    case MAXIMUM_RANGE_PAGE_KEYS:
+      if (value == null) {
+        unsetMaximumRangePageKeys();
+      } else {
+        setMaximumRangePageKeys((java.lang.Integer)value);
+      }
+      break;
+
+    case MAXIMUM_RANGE_PAGE_BYTES:
+      if (value == null) {
+        unsetMaximumRangePageBytes();
+      } else {
+        setMaximumRangePageBytes((java.lang.Long)value);
       }
       break;
 
@@ -162,8 +331,17 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   @Override
   public java.lang.Object getFieldValue(_Fields field) {
     switch (field) {
-    case WORKLOAD_CONTRACT_VERSION:
-      return getWorkloadContractVersion();
+    case BACKEND_MODE:
+      return getBackendMode();
+
+    case RAW_SCAN_MODE:
+      return getRawScanMode();
+
+    case MAXIMUM_RANGE_PAGE_KEYS:
+      return getMaximumRangePageKeys();
+
+    case MAXIMUM_RANGE_PAGE_BYTES:
+      return getMaximumRangePageBytes();
 
     }
     throw new java.lang.IllegalStateException();
@@ -177,8 +355,14 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     }
 
     switch (field) {
-    case WORKLOAD_CONTRACT_VERSION:
-      return isSetWorkloadContractVersion();
+    case BACKEND_MODE:
+      return isSetBackendMode();
+    case RAW_SCAN_MODE:
+      return isSetRawScanMode();
+    case MAXIMUM_RANGE_PAGE_KEYS:
+      return isSetMaximumRangePageKeys();
+    case MAXIMUM_RANGE_PAGE_BYTES:
+      return isSetMaximumRangePageBytes();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -196,12 +380,39 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     if (this == that)
       return true;
 
-    boolean this_present_workloadContractVersion = true;
-    boolean that_present_workloadContractVersion = true;
-    if (this_present_workloadContractVersion || that_present_workloadContractVersion) {
-      if (!(this_present_workloadContractVersion && that_present_workloadContractVersion))
+    boolean this_present_backendMode = true && this.isSetBackendMode();
+    boolean that_present_backendMode = true && that.isSetBackendMode();
+    if (this_present_backendMode || that_present_backendMode) {
+      if (!(this_present_backendMode && that_present_backendMode))
         return false;
-      if (this.workloadContractVersion != that.workloadContractVersion)
+      if (!this.backendMode.equals(that.backendMode))
+        return false;
+    }
+
+    boolean this_present_rawScanMode = true && this.isSetRawScanMode();
+    boolean that_present_rawScanMode = true && that.isSetRawScanMode();
+    if (this_present_rawScanMode || that_present_rawScanMode) {
+      if (!(this_present_rawScanMode && that_present_rawScanMode))
+        return false;
+      if (!this.rawScanMode.equals(that.rawScanMode))
+        return false;
+    }
+
+    boolean this_present_maximumRangePageKeys = true;
+    boolean that_present_maximumRangePageKeys = true;
+    if (this_present_maximumRangePageKeys || that_present_maximumRangePageKeys) {
+      if (!(this_present_maximumRangePageKeys && that_present_maximumRangePageKeys))
+        return false;
+      if (this.maximumRangePageKeys != that.maximumRangePageKeys)
+        return false;
+    }
+
+    boolean this_present_maximumRangePageBytes = true;
+    boolean that_present_maximumRangePageBytes = true;
+    if (this_present_maximumRangePageBytes || that_present_maximumRangePageBytes) {
+      if (!(this_present_maximumRangePageBytes && that_present_maximumRangePageBytes))
+        return false;
+      if (this.maximumRangePageBytes != that.maximumRangePageBytes)
         return false;
     }
 
@@ -212,7 +423,17 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   public int hashCode() {
     int hashCode = 1;
 
-    hashCode = hashCode * 8191 + workloadContractVersion;
+    hashCode = hashCode * 8191 + ((isSetBackendMode()) ? 131071 : 524287);
+    if (isSetBackendMode())
+      hashCode = hashCode * 8191 + backendMode.getValue();
+
+    hashCode = hashCode * 8191 + ((isSetRawScanMode()) ? 131071 : 524287);
+    if (isSetRawScanMode())
+      hashCode = hashCode * 8191 + rawScanMode.getValue();
+
+    hashCode = hashCode * 8191 + maximumRangePageKeys;
+
+    hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(maximumRangePageBytes);
 
     return hashCode;
   }
@@ -225,12 +446,42 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
 
     int lastComparison = 0;
 
-    lastComparison = java.lang.Boolean.compare(isSetWorkloadContractVersion(), other.isSetWorkloadContractVersion());
+    lastComparison = java.lang.Boolean.compare(isSetBackendMode(), other.isSetBackendMode());
     if (lastComparison != 0) {
       return lastComparison;
     }
-    if (isSetWorkloadContractVersion()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.workloadContractVersion, other.workloadContractVersion);
+    if (isSetBackendMode()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.backendMode, other.backendMode);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetRawScanMode(), other.isSetRawScanMode());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetRawScanMode()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.rawScanMode, other.rawScanMode);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetMaximumRangePageKeys(), other.isSetMaximumRangePageKeys());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetMaximumRangePageKeys()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.maximumRangePageKeys, other.maximumRangePageKeys);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetMaximumRangePageBytes(), other.isSetMaximumRangePageBytes());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetMaximumRangePageBytes()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.maximumRangePageBytes, other.maximumRangePageBytes);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -259,8 +510,28 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     java.lang.StringBuilder sb = new java.lang.StringBuilder("Capabilities(");
     boolean first = true;
 
-    sb.append("workloadContractVersion:");
-    sb.append(this.workloadContractVersion);
+    sb.append("backendMode:");
+    if (this.backendMode == null) {
+      sb.append("null");
+    } else {
+      sb.append(this.backendMode);
+    }
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("rawScanMode:");
+    if (this.rawScanMode == null) {
+      sb.append("null");
+    } else {
+      sb.append(this.rawScanMode);
+    }
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("maximumRangePageKeys:");
+    sb.append(this.maximumRangePageKeys);
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("maximumRangePageBytes:");
+    sb.append(this.maximumRangePageBytes);
     first = false;
     sb.append(")");
     return sb.toString();
@@ -268,7 +539,14 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
 
   public void validate() throws org.apache.thrift.TException {
     // check for required fields
-    // alas, we cannot check 'workloadContractVersion' because it's a primitive and you chose the non-beans generator.
+    if (backendMode == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'backendMode' was not present! Struct: " + toString());
+    }
+    if (rawScanMode == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'rawScanMode' was not present! Struct: " + toString());
+    }
+    // alas, we cannot check 'maximumRangePageKeys' because it's a primitive and you chose the non-beans generator.
+    // alas, we cannot check 'maximumRangePageBytes' because it's a primitive and you chose the non-beans generator.
     // check for sub-struct validity
   }
 
@@ -310,10 +588,34 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
           break;
         }
         switch (schemeField.id) {
-          case 1: // WORKLOAD_CONTRACT_VERSION
+          case 1: // BACKEND_MODE
             if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
-              struct.workloadContractVersion = iprot.readI32();
-              struct.setWorkloadContractVersionIsSet(true);
+              struct.backendMode = it.cavallium.rockserver.core.common.api.BackendMode.findByValue(iprot.readI32());
+              struct.setBackendModeIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 2: // RAW_SCAN_MODE
+            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+              struct.rawScanMode = it.cavallium.rockserver.core.common.api.RawScanMode.findByValue(iprot.readI32());
+              struct.setRawScanModeIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 3: // MAXIMUM_RANGE_PAGE_KEYS
+            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+              struct.maximumRangePageKeys = iprot.readI32();
+              struct.setMaximumRangePageKeysIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 4: // MAXIMUM_RANGE_PAGE_BYTES
+            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+              struct.maximumRangePageBytes = iprot.readI64();
+              struct.setMaximumRangePageBytesIsSet(true);
             } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
@@ -326,8 +628,11 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       iprot.readStructEnd();
 
       // check for required fields of primitive type, which can't be checked in the validate method
-      if (!struct.isSetWorkloadContractVersion()) {
-        throw new org.apache.thrift.protocol.TProtocolException("Required field 'workloadContractVersion' was not found in serialized data! Struct: " + toString());
+      if (!struct.isSetMaximumRangePageKeys()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'maximumRangePageKeys' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetMaximumRangePageBytes()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'maximumRangePageBytes' was not found in serialized data! Struct: " + toString());
       }
       struct.validate();
     }
@@ -337,8 +642,21 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       struct.validate();
 
       oprot.writeStructBegin(STRUCT_DESC);
-      oprot.writeFieldBegin(WORKLOAD_CONTRACT_VERSION_FIELD_DESC);
-      oprot.writeI32(struct.workloadContractVersion);
+      if (struct.backendMode != null) {
+        oprot.writeFieldBegin(BACKEND_MODE_FIELD_DESC);
+        oprot.writeI32(struct.backendMode.getValue());
+        oprot.writeFieldEnd();
+      }
+      if (struct.rawScanMode != null) {
+        oprot.writeFieldBegin(RAW_SCAN_MODE_FIELD_DESC);
+        oprot.writeI32(struct.rawScanMode.getValue());
+        oprot.writeFieldEnd();
+      }
+      oprot.writeFieldBegin(MAXIMUM_RANGE_PAGE_KEYS_FIELD_DESC);
+      oprot.writeI32(struct.maximumRangePageKeys);
+      oprot.writeFieldEnd();
+      oprot.writeFieldBegin(MAXIMUM_RANGE_PAGE_BYTES_FIELD_DESC);
+      oprot.writeI64(struct.maximumRangePageBytes);
       oprot.writeFieldEnd();
       oprot.writeFieldStop();
       oprot.writeStructEnd();
@@ -358,14 +676,23 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     @Override
     public void write(org.apache.thrift.protocol.TProtocol prot, Capabilities struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
-      oprot.writeI32(struct.workloadContractVersion);
+      oprot.writeI32(struct.backendMode.getValue());
+      oprot.writeI32(struct.rawScanMode.getValue());
+      oprot.writeI32(struct.maximumRangePageKeys);
+      oprot.writeI64(struct.maximumRangePageBytes);
     }
 
     @Override
     public void read(org.apache.thrift.protocol.TProtocol prot, Capabilities struct) throws org.apache.thrift.TException {
       org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
-      struct.workloadContractVersion = iprot.readI32();
-      struct.setWorkloadContractVersionIsSet(true);
+      struct.backendMode = it.cavallium.rockserver.core.common.api.BackendMode.findByValue(iprot.readI32());
+      struct.setBackendModeIsSet(true);
+      struct.rawScanMode = it.cavallium.rockserver.core.common.api.RawScanMode.findByValue(iprot.readI32());
+      struct.setRawScanModeIsSet(true);
+      struct.maximumRangePageKeys = iprot.readI32();
+      struct.setMaximumRangePageKeysIsSet(true);
+      struct.maximumRangePageBytes = iprot.readI64();
+      struct.setMaximumRangePageBytesIsSet(true);
     }
   }
 
