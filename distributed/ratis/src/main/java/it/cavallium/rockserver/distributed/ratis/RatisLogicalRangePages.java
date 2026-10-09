@@ -83,6 +83,19 @@ final class RatisLogicalRangePages {
     static void validateBounds(TransactionScope scope,DistributedSchema schema,long column,Keys lower,Keys upper) {
         bounds(scope,schema,column,lower,upper);
     }
+    static void validateContainedBounds(DistributedSchema schema,long column,Keys originalLower,Keys originalUpper,Keys lower,Keys upper) {
+        var binding=RatisLogicalClient.supported(schema,column); UUID id=binding.columnId();
+        var scope=new TransactionScope(List.of(TransactionScope.Span.range(id,bound(schema,id,originalLower),upperBound(schema,id,originalUpper))));
+        var original=bounds(scope,schema,column,originalLower,originalUpper);
+        var requested=bounds(scope,schema,column,lower,upper);
+        if (original.logicalLower()!=null && (requested.logicalLower()!=null
+                    ? compare(requested.logicalLower(),original.logicalLower())<0
+                    : requested.lower()==null || Arrays.compareUnsigned(requested.lower(),original.logicalLower().physicalKey())<=0)
+                || original.logicalUpper()!=null && (requested.logicalUpper()!=null
+                    ? compare(requested.logicalUpper(),original.logicalUpper())>0
+                    : requested.upper()==null || Arrays.compareUnsigned(requested.upper(),original.logicalUpper().physicalKey())>0))
+            throw new IllegalArgumentException("Logical range widens its original capture");
+    }
     private record Element(DistributedBucket.Member member,List<byte[]> tails) {}
     private static int compare(List<byte[]> a,List<byte[]> b) {
         for (int i=0;i<a.size();i++) { int order=Arrays.compareUnsigned(a.get(i),b.get(i)); if (order!=0) return order; } return 0;

@@ -56,7 +56,7 @@ class RatisRocksDBAdapterTest {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(200),value(3),1901);
             seed(f,73,key(2),Buf.wrap(new byte[0]),1902); seed(f,74,member(2,"alpha"),value(4),1903);
             var allocations=new Allocations(f);
-            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations)) {
+            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
                 var api=adapter.api(CONTEXT); long id=await(api.openTransactionAsync(TTL));
                 var update=await(api.getAsync(id,71,key(2),RequestType.<Buf>forUpdate())); assertEquals(id,update.updateId()); bytes(1,update.previous());
                 assertTrue(await(api.getAsync(id,73,key(2),RequestType.<Buf>exists()))); assertEquals(0,await(api.getAsync(id,73,key(2),RequestType.<Buf>current())).size());
@@ -97,7 +97,7 @@ class RatisRocksDBAdapterTest {
     @Test void conflictRetainsOriginalIdAndUnknownPrepareReplyRetriesOriginalJournal() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("retry"),true); var transactions=client(f,f.data)) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(200),value(3),1901); var allocations=new Allocations(f);
-            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations)) {
+            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
                 var api=adapter.api(CONTEXT); long rejected=await(api.openTransactionAsync(TTL));
                 await(api.putAsync(rejected,71,key(2),value(7),RequestType.<Buf>none())); seed(f,71,key(200),value(4),1902);
                 assertFalse(await(api.closeTransactionAsync(rejected,true))); int captures=f.captureRequests.get();
@@ -135,7 +135,7 @@ class RatisRocksDBAdapterTest {
             };
             try (var data=new RatisRoutedClient(f.directory,transport); var transactions=client(f,data)) {
                 var allocations=new Allocations(f);
-                try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations)) {
+                try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
                     var api=adapter.api(CONTEXT); long id=await(api.openTransactionAsync(TTL)); byte[] rawKey={2},rawValue={7};
                     var keys=new ArrayList<>(List.of(new Keys(Buf.wrap(rawKey)))); var values=new ArrayList<>(List.of(Buf.wrap(rawValue)));
                     var write=api.putMultiAsync(id,71,keys,values,RequestType.<Buf>delta());
@@ -156,7 +156,7 @@ class RatisRocksDBAdapterTest {
             var original=f.schema.column(71);
             var schema=new DistributedSchema(f.schema.clusterId(),f.schema.databaseId(),f.schema.domainId(),f.schema.schemaEpoch(),1,List.of(new DistributedSchema.Column(71,original.columnId(),original.name(),ColumnSchema.of(IntArrayList.of(1),new ObjectArrayList<>(),false),null)));
             var directory=new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),0,schema.columnIds(),1,f.directory.ranges()); var allocations=new Allocations(f);
-            try (var adapter=new RatisRocksDBAdapter(schema,directory,transactions,allocations)) {
+            try (var adapter=new RatisRocksDBAdapter(schema,directory,transactions,allocations,null,null)) {
                 int rpcs=f.rpcs.get(); error(RocksDBException.RocksDBErrorType.VALUE_MUST_BE_NULL,adapter.api(CONTEXT).getAsync(1,71,key(2),RequestType.<Buf>current()));
                 assertEquals(0,allocations.count.get()); assertEquals(rpcs,f.rpcs.get());
             }

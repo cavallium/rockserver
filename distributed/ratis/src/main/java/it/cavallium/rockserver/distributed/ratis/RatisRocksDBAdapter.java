@@ -27,6 +27,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private final RatisTransactionClient transactions;
     private final AllocationSource allocations;
     private final RatisRocksDBDirect direct;
+    private final RatisRocksDBRanges ranges;
+    private final RatisRocksDBIterators iterators;
     private final Map<Long,Entry> entries=new LinkedHashMap<>();
     private boolean closing;
     private enum Mode { EXPLICIT, UPDATE }
@@ -38,7 +40,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         Op active;
         WriteCall pending;
         List<RatisLogicalClient.Change> prefix=List.of();
-        int returned;
+        int returned; long revision;
         RatisAtomicClient.Operation commit;
         CommandResult.Status outcome;
         boolean consumed,needsReread,updateStaged;
@@ -79,11 +81,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             return new RequestContext(context.profile(),remaining);
         }
     }
-    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations) {
-        this(schema,directory,transactions,allocations,null);
-    }
-    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct) {
-        this.direct=direct; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); schema.requireMatches(directory);
+    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges) {
+        this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); schema.requireMatches(directory); iterators=new RatisRocksDBIterators(schema);
     }
     public RocksDBAsyncAPI api(RequestContext context) {
         Objects.requireNonNull(context);
@@ -92,6 +91,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
                 var deadline=new Deadline(context);
                 try {
                     WorkloadAdmission.resolve(context,request);
+                    if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> range) return (RA)range(range.transactionId(),range.columnId(),range.startKeysInclusive(),range.endKeysExclusive(),range.reverse(),range.requestType().getRequestTypeId(),context);
                     if (request instanceof RocksDBAPICommand.RocksDBAPICommandStream<?>) return (RA)Flux.error(unsupported());
                     return (RA)dispatch(request,deadline);
                 } catch (Throwable failure) { return (RA)(request instanceof RocksDBAPICommand.RocksDBAPICommandStream<?> ? Flux.error(failure) : CompletableFuture.failedFuture(failure)); }
@@ -117,10 +117,77 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti<?> delete) return write(delete.transactionOrUpdateId(),delete.columnId(),delete.keys(),Collections.nCopies(delete.keys().size(),null),delete.requestType().getRequestTypeId(),true,true,deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<?> page) {
             var type=page.requestType().getRequestTypeId(); if (type!=RequestType.RequestTypeId.ALL_IN_RANGE && type!=RequestType.RequestTypeId.ALL_IN_RANGE_NO_CACHE) throw unsupported();
-            var entry=entry(page.transactionId()); schema.column(page.columnId()); var bounds=new PageBounds(copy(page.startKeysInclusive()),copy(page.endKeysExclusive()),page.reverse(),copy(page.resumeAfter()),page.budget());
+            schema.column(page.columnId()); var bounds=new PageBounds(copy(page.startKeysInclusive()),copy(page.endKeysExclusive()),page.reverse(),copy(page.resumeAfter()),page.budget());
+            validateBudget(bounds.budget());
+            if (page.transactionId()==0) { if (ranges==null) throw unsupported(); return ranges.page(page.columnId(),bounds.lower(),bounds.upper(),bounds.reverse(),bounds.resume(),bounds.budget(),deadline.remaining()); }
+            var entry=entry(page.transactionId());
             return invoke(entry,new ReadCall("page",page.columnId(),List.of(),type,bounds),() -> entry.lease.page(page.columnId(),bounds.lower(),bounds.upper(),bounds.reverse(),bounds.resume(),bounds.budget(),deadline.remaining()).thenApply(value -> { deadline.remaining(); return value; }));
         }
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator iterator) {
+            schema.column(iterator.columnId()); Keys lower=copy(iterator.startKeysInclusive()),upper=copy(iterator.endKeysExclusive());
+            return iterators.open(iterator.transactionId(),iterator.columnId(),lower,upper,iterator.reverse(),iterator.iteratorLeaseTtl(),() -> resource(iterator.transactionId(),iterator.columnId(),lower,upper,iterator.reverse(),iterator.iteratorLeaseTtl(),deadline,false),deadline.remaining());
+        }
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseIterator iterator) return iterators.close(iterator.iteratorId(),deadline.remaining());
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo seek) return iteratorOperation(seek.iterationId(),new ReadCall("seek",seek.iterationId(),List.of(copy(seek.keys())),RequestType.RequestTypeId.NOTHING,null),() -> iterators.seek(seek.iterationId(),seek.keys(),deadline.remaining()));
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?> next) return iteratorOperation(next.iterationId(),new ReadCall("next",next.iterationId(),List.of(),next.requestType().getRequestTypeId(),List.of(next.skipCount(),next.takeCount())),() -> iterators.subsequent(next.iterationId(),next.skipCount(),next.takeCount(),next.requestType().getRequestTypeId(),deadline.remaining()));
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> reduce) {
+            var type=reduce.requestType().getRequestTypeId();
+            if (type==RequestType.RequestTypeId.FIRST_AND_LAST) {
+                Keys lower=copy(reduce.startKeysInclusive()),upper=copy(reduce.endKeysExclusive());
+                if (reduce.transactionId()==0) { if (ranges==null) throw unsupported(); return ranges.firstAndLast(reduce.columnId(),lower,upper,reduce.reverse(),deadline.remaining()); }
+                var entry=entry(reduce.transactionId()); var budget=new RangeBudget(1,RangeBudget.DEFAULT_MAX_BYTES);
+                return invoke(entry,new ReadCall("first-last",reduce.columnId(),List.of(),type,new PageBounds(lower,upper,reduce.reverse(),null,budget)),
+                        () -> entry.lease.page(reduce.columnId(),lower,upper,reduce.reverse(),null,budget,deadline.remaining()).thenCompose(first -> {
+                            deadline.remaining();
+                            return first.items().isEmpty() ? CompletableFuture.completedFuture(new FirstAndLast<KV>(null,null))
+                                    : entry.lease.page(reduce.columnId(),lower,upper,!reduce.reverse(),null,budget,deadline.remaining()).thenApply(last -> {
+                                        deadline.remaining(); return new FirstAndLast<>(first.items().getFirst(),last.items().getFirst());
+                                    });
+                        }));
+            }
+            if (type==RequestType.RequestTypeId.ENTRIES_COUNT) return range(reduce.transactionId(),reduce.columnId(),reduce.startKeysInclusive(),reduce.endKeysExclusive(),reduce.reverse(),RequestType.RequestTypeId.ALL_IN_RANGE,deadline.remaining()).count().toFuture();
+            throw unsupported();
+        }
         throw unsupported();
+    }
+    private CompletableFuture<?> iteratorOperation(long iterator,Object key,Supplier<CompletableFuture<?>> work) {
+        long transaction=iterators.transaction(iterator); return transaction==0 ? work.get() : invoke(entry(transaction),key,work);
+    }
+    private static void validateBudget(RangeBudget budget) {
+        if (budget.maxItems()>RangeBudget.DEFAULT_MAX_ITEMS || budget.maxBytes()>RangeBudget.DEFAULT_MAX_BYTES) throw RocksDBException.of(PUT_INVALID_REQUEST,"Range budget exceeds server maximum");
+    }
+    private CompletableFuture<RatisRocksDBIterators.Resource> resource(long transaction,long column,Keys lower,Keys upper,boolean reverse,Duration ttl,Deadline deadline,boolean guard) {
+        if (transaction==0) {
+            if (ranges==null) return CompletableFuture.failedFuture(unsupported());
+            return ranges.open(column,lower,upper,reverse,ttl,deadline.remaining()).thenApply(owner -> new RatisRocksDBIterators.Resource() {
+                public CompletableFuture<RangePage<KV>> page(Keys low,Keys high,boolean back,Keys resume,RangeBudget budget,RequestContext context) { return owner.page(low,high,back,resume,budget,context); }
+                public CompletableFuture<Void> release(RequestContext context) { return owner.release(context); }
+                public void closeLocal() throws IOException { owner.closeLocal(); }
+            });
+        }
+        try {
+            var entry=entry(transaction); final long revision;
+            synchronized (entry) { if (entry.active!=null || entry.pending!=null || entry.commit!=null || entry.needsReread) throw new IOException("Transaction range ownership busy or unavailable"); revision=entry.revision; }
+            RatisLogicalRangePages.validateBounds(RatisSnapshotPlan.scope(entry.lease.snapshot().initial().fence()),schema,column,lower,upper);
+            return CompletableFuture.completedFuture(new RatisRocksDBIterators.Resource() {
+                public CompletableFuture<RangePage<KV>> page(Keys low,Keys high,boolean back,Keys resume,RangeBudget budget,RequestContext context) {
+                    synchronized (entry) { if (entry.revision!=revision) return CompletableFuture.failedFuture(RocksDBException.of(TX_NOT_FOUND,"Iterator staged revision changed")); }
+                    Supplier<CompletableFuture<?>> reading=() -> entry.lease.page(column,low,high,back,resume,budget,context);
+                    @SuppressWarnings("unchecked") CompletableFuture<RangePage<KV>> result=guard ? (CompletableFuture<RangePage<KV>>)(CompletableFuture<?>)invoke(entry,new ReadCall("stream-page",column,List.of(),RequestType.RequestTypeId.ALL_IN_RANGE,new PageBounds(low,high,back,resume,budget)),reading) : entry.lease.page(column,low,high,back,resume,budget,context);
+                    return result.thenApply(value -> { synchronized (entry) { if (entry.revision!=revision) throw RocksDBException.of(TX_NOT_FOUND,"Iterator staged revision changed"); } return value; });
+                }
+                public CompletableFuture<Void> release(RequestContext context) { return CompletableFuture.completedFuture(null); }
+                public void closeLocal() {}
+            });
+        } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+    }
+    private Flux<KV> range(long transaction,long column,Keys lower,Keys upper,boolean reverse,RequestType.RequestTypeId type,RequestContext context) {
+        if (type!=RequestType.RequestTypeId.ALL_IN_RANGE && type!=RequestType.RequestTypeId.ALL_IN_RANGE_NO_CACHE) return Flux.error(unsupported());
+        schema.column(column); Keys low=copy(lower),high=copy(upper);
+        return Flux.defer(() -> {
+            var deadline=new Deadline(context);
+            return iterators.stream(transaction,column,low,high,reverse,() -> resource(transaction,column,low,high,reverse,Duration.ofSeconds(60),deadline,true),deadline.remaining());
+        });
     }
     private CompletableFuture<Long> open(Duration ttl,Deadline deadline) { return open(ttl,deadline,Mode.EXPLICIT); }
     private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode) {
@@ -283,7 +350,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             if (entry.mode==Mode.UPDATE && entry.updateStaged) return finishUpdate(entry,request,deadline);
             synchronized (entry) { if (entry.pending==null) entry.pending=request; }
             var pending=entry.pending;
-            return entry.lease.stage(pending.prefix,List.of(),deadline.remaining()).thenApply(results -> {
+            return iterators.invalidateTransaction(entry.id,deadline.remaining()).thenCompose(ignored -> entry.lease.stage(pending.prefix,List.of(),deadline.remaining())).thenApply(results -> {
                 deadline.remaining();
                 var logical=RatisLogicalClient.plan(schema,pending.prefix,List.of(),RatisTransactionPlan.MAX_BYTES); final RatisTransactionPlan plan;
                 try { plan=RatisTransactionPlan.captured(directory,entry.lease.identity().commit().business(),logical.mutations(),logical.predicates(),entry.lease.snapshot()); }
@@ -296,7 +363,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
                     returned.add(switch (pending.type) { case PREVIOUS -> previous; case PREVIOUS_PRESENCE -> raw!=null; case DELTA -> new Delta<>(previous,current); case CHANGED -> !Utils.valueEquals(previous,current); default -> null; });
                 }
                 deadline.remaining();
-                synchronized (entry) { entry.prefix=pending.prefix; entry.returned=pending.firstResult+(returns ? pending.keys.size() : 0); entry.pending=null; }
+                synchronized (entry) { entry.prefix=pending.prefix; entry.returned=pending.firstResult+(returns ? pending.keys.size() : 0); entry.pending=null; entry.revision++; }
                 var result=pending.multi ? returns ? Collections.unmodifiableList(returned) : List.of() : returned.isEmpty() ? null : returned.getFirst();
                 if (entry.mode==Mode.UPDATE) { synchronized (entry) { entry.updateStaged=true; entry.updateReturn=result; } }
                 return result;
@@ -311,14 +378,16 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             deadline.remaining();
             if (entry.needsReread && entry.lease==null) { if (commit) return CompletableFuture.failedFuture(new RocksDBRetryException()); synchronized (this) { entries.remove(entry.id,entry); } return CompletableFuture.completedFuture(true); }
             if (!commit) {
-                CompletableFuture<Void> observed=entry.commit!=null && (entry.consumed || entry.commit.terminalReady()) ? consume(entry,deadline) : CompletableFuture.completedFuture(null);
-                return observed.thenCompose(ignored -> entry.lease.rollback(deadline.remaining())).thenApply(ignored -> { finish(entry); return true; });
+                return iterators.invalidateTransaction(entry.id,deadline.remaining()).thenCompose(ignored -> entry.commit!=null && (entry.consumed || entry.commit.terminalReady()) ? consume(entry,deadline) : CompletableFuture.completedFuture(null)).thenCompose(ignored -> entry.lease.rollback(deadline.remaining())).thenApply(ignored -> { finish(entry); return true; });
             }
             return commitAttempt(entry,deadline);
 
         });
     }
     private CompletableFuture<Boolean> commitAttempt(Entry entry,Deadline deadline) {
+        return iterators.invalidateTransaction(entry.id,deadline.remaining()).thenCompose(ignored -> commitAfterRangeDrain(entry,deadline));
+    }
+    private CompletableFuture<Boolean> commitAfterRangeDrain(Entry entry,Deadline deadline) {
         if (entry.outcome==CommandResult.Status.CONFLICT) return CompletableFuture.completedFuture(false);
         try { if (entry.commit==null) entry.commit=entry.lease.commit(deadline.remaining()); }
         catch (IOException failure) { return CompletableFuture.failedFuture(failure); }
@@ -337,8 +406,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         });
     }
     private CompletableFuture<Void> cleanupAttempt(Entry entry,Deadline deadline,boolean remove) {
-        CompletableFuture<Void> consumed=entry.commit==null ? CompletableFuture.completedFuture(null) : consume(entry,deadline);
-        return consumed.thenCompose(ignored -> entry.lease.rollback(deadline.remaining())).thenRun(() -> {
+        return iterators.invalidateTransaction(entry.id,deadline.remaining()).thenCompose(ignored -> entry.commit==null ? CompletableFuture.completedFuture(null) : consume(entry,deadline)).thenCompose(ignored -> entry.lease.rollback(deadline.remaining())).thenRun(() -> {
             try { entry.lease.close(); } catch (IOException failure) { throw new CompletionException(failure); }
             if (remove) { synchronized (this) { entries.remove(entry.id,entry); } }
             else synchronized (entry) { entry.lease=null; entry.commit=null; entry.outcome=null; entry.consumed=false; entry.prefix=List.of(); entry.returned=0; entry.pending=null; entry.updateWrite=null; entry.updateReturn=null; entry.updateStaged=false; entry.needsReread=true; }
@@ -355,11 +423,14 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         return entry.commit.consume(deadline.remaining()).thenRun(() -> entry.consumed=true);
     }
     private void finish(Entry entry) {
+        var drained=iterators.invalidateTransaction(entry.id,RequestContext.batch());
+        if (!drained.isDone()) throw new CompletionException(new IOException("Transaction range retirement still active")); drained.join();
         try { entry.lease.close(); } catch (IOException failure) { throw new CompletionException(failure); }
         synchronized (this) { entries.remove(entry.id,entry); }
     }
     private static Object expose(Object value) {
         if (value instanceof Buf buf) return Buf.wrap(buf.toByteArray());
+        if (value instanceof FirstAndLast<?> ends) return new FirstAndLast<>(expose(ends.first()),expose(ends.last()));
         if (value instanceof Delta<?> delta) return new Delta<>(expose(delta.previous()),expose(delta.current()));
         if (value instanceof UpdateContext<?> update) return new UpdateContext<>(expose(update.previous()),update.updateId());
         if (value instanceof KV row) return new KV(copy(row.keys()),row.value()==null ? null : Buf.wrap(row.value().toByteArray()));
@@ -372,6 +443,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private static RocksDBException unsupported() { return RocksDBException.of(NOT_IMPLEMENTED,"Distributed adapter operation is not implemented"); }
     @Override public void close() throws IOException {
         List<Entry> owners; synchronized (this) { closing=true; owners=List.copyOf(entries.values()); }
+        var draining=iterators.closeAll(RequestContext.batch()); if (!draining.isDone()) throw new IOException("Range/iterator actual drain still active");
+        try { draining.join(); } catch (CompletionException failure) { throw new IOException("Range/iterator cleanup failed",unwrap(failure)); }
         for (var entry:owners) { synchronized (entry) { if (entry.acquiring || entry.active!=null) throw new IOException("Adapter work active; ownership retained"); } orphanCleanup(entry); }
         synchronized (this) { if (!entries.isEmpty()) throw new IOException("Adapter cleanup pending; retry close after actual drain"); }
     }

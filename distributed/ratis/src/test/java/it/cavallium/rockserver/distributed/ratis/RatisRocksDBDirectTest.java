@@ -44,7 +44,7 @@ class RatisRocksDBDirectTest {
             });
             window=root.resolve("direct-window.bin"); session=RatisDurableSessionClient.create(window,routed,ledger,grant,RatisSessionClient.Limits.defaults());
             journal=root.resolve("direct-request.bin"); direct=new RatisRocksDBDirect(f.schema,routed,session,f.scheduler,journal); transactions=RatisRocksDBAdapterTest.client(f,f.data);
-            adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new RatisRocksDBAdapterTest.Allocations(f),direct);
+            adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,new RatisRocksDBAdapterTest.Allocations(f),direct,null);
         }
         public void close() throws Exception { if (!abandoned) adapter.close(); direct.close(); session.close(); routed.close(); transactions.close(); f.close(); }
     }
@@ -71,7 +71,7 @@ class RatisRocksDBDirectTest {
             var retained=x.session.pending().getFirst().command().operationId();
             x.abandoned=true; x.direct.close(); x.session.close();
             try (var reopened=RatisDurableSessionClient.reopen(x.window,x.f.data); var direct=new RatisRocksDBDirect(x.f.schema,x.f.data,reopened,x.f.scheduler,x.journal);
-                 var adapter=new RatisRocksDBAdapter(x.f.schema,x.f.directory,x.transactions,new RatisRocksDBAdapterTest.Allocations(x.f),direct)) {
+                 var adapter=new RatisRocksDBAdapter(x.f.schema,x.f.directory,x.transactions,new RatisRocksDBAdapterTest.Allocations(x.f),direct,null)) {
             var result=adapter.api(RequestContext.batch()).putMultiAsync(0,71,keys,values,RequestType.<Buf>previous()).get(5,TimeUnit.SECONDS);
             assertArrayEquals(new byte[]{1},result.get(0).toByteArray()); assertNull(result.get(1));
             synchronized (x.writes) { assertEquals(1,Collections.frequency(x.writes,retained)); assertEquals(3,x.writes.size(),"Seed plus two individual effects; restart reuses only the unresolved receipt"); }

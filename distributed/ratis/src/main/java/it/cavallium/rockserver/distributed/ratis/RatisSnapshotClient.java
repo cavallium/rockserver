@@ -121,7 +121,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         private void requireIdleControl() throws IOException { if (closed || closeRequested) throw new IOException("Snapshot lease closing/closed"); if (control!=null || !reading.isEmpty()) throw new IOException("Snapshot work active; ownership retained"); }
         private <T> void submitControl(Task<T> task,RequestContext context) {
-            try { requireOpen(); requireIdleControl(); control=task; scheduler.executor(context.profile(),task.family,task.deadline).execute(task,Math.min(bytes+task.bytes,WorkloadCost.MAX_ESTIMATED_BYTES)); }
+            try { if (task.kind==Kind.RELEASE) { synchronized (RatisSnapshotClient.this) { if (closed) throw new IOException("Snapshot client closed"); } } else requireOpen(); requireIdleControl(); control=task; scheduler.executor(context.profile(),task.family,task.deadline).execute(task,Math.min(bytes+task.bytes,WorkloadCost.MAX_ESTIMATED_BYTES)); }
             catch (Exception failure) { task.fail(failure); }
         }
         private <T> CompletableFuture<T> read(Kind kind,OperationFamily family,long cost,RequestContext context,long deadline,Work<T> work,Cursor cursor) {
@@ -129,6 +129,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
         }
         private <T> Task<T> startRead(Kind kind,OperationFamily family,long cost,RequestContext context,long deadline,Work<T> work,Cursor cursor) throws IOException {
+            requireOpen();
             Task<T> task;
             synchronized (this) {
                 owners(); if (control!=null || reading.size()>=16) throw new IOException("Snapshot control or reader capacity busy"); reserve(cost,true,false);

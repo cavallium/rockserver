@@ -21,7 +21,7 @@ class RatisImplicitUpdateTest {
     @Test void singlePutAndDeleteCommitAutomaticallyAndRejectReturningWriteModes() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("success"),true); var transactions=client(f,f.data)) {
             seed(f,71,key(2),value(1),1900); var allocations=new Allocations(f);
-            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations)) {
+            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
                 var api=adapter.api(CONTEXT); var update=await(api.getAsync(0,71,key(2),RequestType.<Buf>forUpdate()));
                 assertTrue(update.updateId()>0); bytes(1,update.previous()); long id=update.updateId();
                 error(RocksDBException.RocksDBErrorType.PUT_INVALID_REQUEST,api.putAsync(id,71,key(2),value(8),RequestType.<Buf>previous()));
@@ -43,7 +43,7 @@ class RatisImplicitUpdateTest {
     @Test void singleConflictKeepsAliasUntilExplicitFreshReadAndCertifiesReadOnlyColumns() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("single-conflict"),true); var transactions=client(f,f.data)) {
             seed(f,71,key(2),value(1),1900); var allocations=new Allocations(f);
-            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations)) {
+            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
                 var api=adapter.api(CONTEXT); var initial=await(api.getAsync(0,71,key(2),RequestType.<Buf>forUpdate())); long id=initial.updateId();
                 bytes(1,initial.previous()); seed(f,72,key(200),value(9),1901);
                 error(RocksDBException.RocksDBErrorType.UPDATE_RETRY,api.putAsync(id,71,key(2),value(6),RequestType.<Buf>none()));
@@ -63,7 +63,7 @@ class RatisImplicitUpdateTest {
     @Test void multiConflictRollsBackEveryGroupAndClosesAliasBeforeRetrySignal() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("multi-conflict"),true); var transactions=client(f,f.data)) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(200),value(3),1901); var allocations=new Allocations(f);
-            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations)) {
+            try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
                 var api=adapter.api(CONTEXT); var update=await(api.getAsync(0,71,key(2),RequestType.<Buf>forUpdate())); seed(f,72,key(200),value(9),1902);
                 error(RocksDBException.RocksDBErrorType.UPDATE_RETRY,api.putMultiAsync(update.updateId(),71,List.of(key(2),key(200)),List.of(value(7),value(8)),RequestType.<Buf>none()));
                 assertEquals(0,adapter.stats().transactions()); assertEquals(1,allocations.count.get());
@@ -91,7 +91,7 @@ class RatisImplicitUpdateTest {
             };
             try (var data=new RatisRoutedClient(f.directory,transport); var transactions=client(f,data)) {
                 var allocations=new Allocations(f);
-                try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations)) {
+                try (var adapter=new RatisRocksDBAdapter(f.schema,f.directory,transactions,allocations,null,null)) {
                     var api=adapter.api(CONTEXT); long id=await(api.getAsync(0,71,key(2),RequestType.<Buf>forUpdate())).updateId();
                     f.losePrepareGroup=f.groups.getLast(); assertThrows(ExecutionException.class,() -> await(api.putAsync(id,71,key(2),value(8),RequestType.<Buf>none())));
                     int staged=stages.get(),captures=f.captureRequests.get(); var first=allocations.issued.getFirst();
