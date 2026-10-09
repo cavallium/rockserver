@@ -37,11 +37,23 @@ class RatisNodeManifestTest {
     }
     private static RatisNodeRuntime.Settings settings() {
         return new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,8L*1024*1024,2),
-                new RatisRangeStateMachine.RetentionLimits(4096,16L*1024*1024,16,64*1024),Duration.ofMillis(1500),3,17,Duration.ofSeconds(25));
+                new RatisRangeStateMachine.RetentionLimits(4096,16L*1024*1024,16,64*1024),Duration.ofMillis(1500),3,17,Duration.ofSeconds(25),RatisNodeRuntime.ExportResources.defaults());
     }
     private static RatisNodeManifest manifest(boolean bucket) {
         var schema=schema(bucket,false); var bindings=new LinkedHashMap<UUID,String>(); bindings.put(B,"physical-beta"); bindings.put(A,"physical-alpha");
         return new RatisNodeManifest(schema,plan(schema,bindings,Set.of()),settings(),3,5);
+    }
+    @Test void configuredPoolAndExportResourcesSurviveCanonicalManifestRoundTrip() {
+        var original=manifest(false); var base=original.settings();
+        var resources=new RatisNodeRuntime.ExportResources(
+                new it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits(2,16L*1024*1024,Duration.ofSeconds(30),4096),
+                new RatisExportSourceRegistry.Budgets(8,64,16L*1024*1024,16L*1024*1024,8L*1024*1024,1),
+                new RatisExportSourceService.IoLimits(8192,1024*1024,1024*1024));
+        var configured=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),
+                base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),resources);
+        var manifest=new RatisNodeManifest(original.schema(),original.plan(),configured,3,5);
+        byte[] encoded=RatisNodeManifest.encode(manifest); var reopened=RatisNodeManifest.decode(encoded);
+        assertEquals(resources,reopened.settings().exports()); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
     }
 
     @Test void canonicalRoundTripRetainsSchemaPlanSettingsAndImmutableBindings() {
@@ -76,7 +88,7 @@ class RatisNodeManifestTest {
         }
         var oneColumn=new DistributedSchema(CLUSTER,DATABASE,DOMAIN,1,0,List.of(plain.schema().columns().getFirst()));
         var oneImageColumn=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,1),settings().retention(),
-                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout());
+                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(oneColumn,plan(oneColumn,Map.of(A,"a"),Set.of()),oneImageColumn,3,3),
                 "A local catalogue needs two snapshot columns even when data has one");
         var threeColumns=new ArrayList<>(plain.schema().columns()); UUID third=new UUID(9,9);
@@ -86,9 +98,9 @@ class RatisNodeManifestTest {
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(wider,widerPlan,settings(),3,3),
                 "A local data group needs its complete logical-column snapshot scope");
         var threeImageColumns=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,3),settings().retention(),
-                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout());
+                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
         assertDoesNotThrow(() -> new RatisNodeManifest(wider,widerPlan,threeImageColumns,3,3));
-        var tooLong=new RatisNodeRuntime.Settings(settings().images(),settings().retention(),Duration.ofSeconds(Long.MAX_VALUE),1,1,Duration.ofSeconds(1));
+        var tooLong=new RatisNodeRuntime.Settings(settings().images(),settings().retention(),Duration.ofSeconds(Long.MAX_VALUE),1,1,Duration.ofSeconds(1),RatisNodeRuntime.ExportResources.defaults());
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(plain.schema(),plain.plan(),tooLong,3,3));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(plain.schema(),plan(plain.schema(),Map.of(A,"a".repeat(4097),B,"b"),Set.of()),settings(),3,3));
     }
@@ -108,8 +120,8 @@ class RatisNodeManifestTest {
         byte[] reversed=valid.clone(); System.arraycopy(valid,bindings,reversed,second,16); System.arraycopy(valid,second,reversed,bindings,16);
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(reversed));
         byte[] groupBudget=valid.clone(); ByteBuffer.wrap(groupBudget).putInt(tail+64,3); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(groupBudget));
-        for (int offset:new int[] {valid.length-8,valid.length-4}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
-        byte[] duration=valid.clone(); ByteBuffer.wrap(duration).putLong(valid.length-32,0); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(duration));
+        for (int offset:new int[] {valid.length-92,valid.length-88}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
+        byte[] duration=valid.clone(); ByteBuffer.wrap(duration).putLong(valid.length-116,0); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(duration));
     }
 
     @Test void syntheticCatalogueMustRemainExactlyTheDeclaredMetadataRange() {
@@ -178,7 +190,7 @@ class RatisNodeManifestTest {
         var data=new RangeDirectory(CLUSTER,DATABASE,DOMAIN,1,original.schema().digest(),5,original.schema().columnIds(),0,List.of(range));
         var catalogue=new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(remote));
         var plan=new RatisNodePlan(NODE,INCARNATION,data,catalogue,base.columns(),Set.of(),List.of(home(RatisNodePlan.Role.TRANSACTION_HOME,1)),1);
-        var one=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,1),settings().retention(),settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout());
+        var one=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,1),settings().retention(),settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
         var manifest=new RatisNodeManifest(original.schema(),plan,one,3,5); assertEquals(1,manifest.plan().localGroups().size());
         assertEquals(RatisNodePlan.Role.TRANSACTION_HOME,plan.role(plan.localGroups().getFirst().getGroupId().getUuid()));
         assertArrayEquals(RatisNodeManifest.encode(manifest),RatisNodeManifest.encode(RatisNodeManifest.decode(RatisNodeManifest.encode(manifest))));

@@ -186,6 +186,8 @@ public final class ReplicatedRangeStore {
     private final ReentrantReadWriteLock nativeLifecycle = new ReentrantReadWriteLock();
     private volatile boolean closing;
     private volatile ApplyPosition applied;
+    private PoolSnapshotAdmission snapshotAdmission;
+    private volatile Throwable snapshotReleaseFailure;
     private final AtomicInteger snapshotPins = new AtomicInteger();
     private final AtomicInteger trackedSnapshotPins=new AtomicInteger();
     private final AtomicLong trackedSnapshotScopeBytes=new AtomicLong();
@@ -244,8 +246,13 @@ public final class ReplicatedRangeStore {
         }
     }
 
+    // Called by the pool factory before publishing the store; standalone stores remain unconfigured.
+    void configureSnapshotAdmission(PoolSnapshotAdmission guard) { this.snapshotAdmission = guard; }
+
     /** Null means no log entry has yet completed. This is not a durable snapshot watermark. */
     public ApplyPosition applied() { return applied; }
+    /** Process-only failure; native release outcome is unknown and requires pool replacement. */
+    public Throwable snapshotReleaseFailure() { return snapshotReleaseFailure; }
     public int activeSnapshotPins() { return snapshotPins.get(); }
     public int activeTrackedSnapshotPins() { return trackedSnapshotPins.get(); }
     public long trackedSnapshotScopeBytes() { return trackedSnapshotScopeBytes.get(); }
@@ -1824,6 +1831,21 @@ public final class ReplicatedRangeStore {
         finally { applyLane.unlock(); leaveNative(); }
     }
 
+    /** Fresh atomic point read after completed apply; no retained snapshot or retention quota is acquired. */
+    public byte[] readCurrentPoint(UUID column, byte[] key) throws RocksDBException {
+        byte[] physicalKey = Objects.requireNonNull(key).clone();
+        var scope = new TransactionScope(List.of(TransactionScope.Span.point(column, physicalKey)));
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); validateSnapshotScope(scope); requireUnlocked(scope);
+            ensureReceiptUsage();
+            byte[] marker = db.get(state, markerKey);
+            ApplyPosition cut = marker == null ? null : decodePosition(marker);
+            if (!Objects.equals(cut, applied)) throw new IllegalStateException("Current point marker differs from completed apply");
+            return db.get(columns.get(column), physicalKey);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+
     /** Evaluates autocommit return values in committed order, preserving native merge operands. */
     public byte[] apply(ApplyPosition position, DistributedCommand command) throws RocksDBException {
         return applyInternal(position, command, null);
@@ -2738,16 +2760,30 @@ public final class ReplicatedRangeStore {
         try {
             requireActive();
             ensureReceiptUsage();
-            Snapshot snapshot = db.getSnapshot();
-            try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
-                byte[] marker = db.get(state, options, markerKey);
-                ApplyPosition cut = marker == null ? null : decodePosition(marker);
-                if (!Objects.equals(cut, applied)) throw new IllegalStateException("Snapshot marker differs from completed apply");
-                var pin = new SnapshotPin(snapshot, cut);
+            PoolSnapshotAdmission.Lease lease = snapshotAdmission == null ? null : snapshotAdmission.reserve();
+            Snapshot snapshot;
+            try { snapshot = Objects.requireNonNull(db.getSnapshot(), "Native snapshot creation failed"); }
+            catch (Throwable failure) { if (lease != null) lease.close(); throw failure; }
+            try {
+                ApplyPosition cut;
+                try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
+                    byte[] marker = db.get(state, options, markerKey);
+                    cut = marker == null ? null : decodePosition(marker);
+                    if (!Objects.equals(cut, applied)) throw new IllegalStateException("Snapshot marker differs from completed apply");
+                }
+                var pin = new SnapshotPin(snapshot, cut, lease);
                 snapshotPins.incrementAndGet();
                 return pin;
             } catch (Throwable failure) {
-                db.releaseSnapshot(snapshot);
+                try { db.releaseSnapshot(snapshot); }
+                catch (Throwable releaseFailure) {
+                    recordSnapshotReleaseFailure(releaseFailure);
+                    // No published pin exists, but the uncertain native owner must still block pool close.
+                    snapshotPins.incrementAndGet();
+                    if (releaseFailure != failure) releaseFailure.addSuppressed(failure);
+                    throw releaseFailure;
+                }
+                if (lease != null) lease.close();
                 throw failure;
             }
         } finally {
@@ -2756,8 +2792,11 @@ public final class ReplicatedRangeStore {
     }
 
     private void enterNative() {
+        requireSnapshotReleaseHealthy();
         if (closing) throw new IllegalStateException("Range admission is closed");
         nativeLifecycle.readLock().lock();
+        try { requireSnapshotReleaseHealthy(); }
+        catch (RuntimeException failure) { nativeLifecycle.readLock().unlock(); throw failure; }
         if (closing) {
             nativeLifecycle.readLock().unlock();
             throw new IllegalStateException("Range admission is closed");
@@ -2772,6 +2811,7 @@ public final class ReplicatedRangeStore {
      * this method never closes their database or forcibly releases a native user.
      */
     public boolean close(Duration timeout) throws InterruptedException {
+        requireSnapshotReleaseHealthy();
         Objects.requireNonNull(timeout);
         if (timeout.isNegative()) throw new IllegalArgumentException("Negative close timeout");
         long nanos = timeout.toNanos();
@@ -2783,15 +2823,28 @@ public final class ReplicatedRangeStore {
         } finally { nativeLifecycle.writeLock().unlock(); }
     }
 
+    private void recordSnapshotReleaseFailure(Throwable failure) {
+        snapshotReleaseFailure = failure;
+        if (snapshotAdmission != null) snapshotAdmission.failRelease(failure);
+    }
+
+    private void requireSnapshotReleaseHealthy() {
+        Throwable failure = snapshotReleaseFailure;
+        if (failure == null && snapshotAdmission != null) failure = snapshotAdmission.releaseFailure();
+        if (failure != null) throw new IllegalStateException("Native snapshot release outcome unknown; pool retained", failure);
+    }
+
     public final class SnapshotPin implements AutoCloseable {
         private final Snapshot snapshot;
         private final ApplyPosition position;
+        private final PoolSnapshotAdmission.Lease admissionLease;
         private boolean closed;
         private int nativeUsers;
         private long historyScopeBytes; private volatile boolean historyTracked;
-        private SnapshotPin(Snapshot snapshot, ApplyPosition position) {
+        private SnapshotPin(Snapshot snapshot, ApplyPosition position, PoolSnapshotAdmission.Lease lease) {
             this.snapshot = snapshot;
             this.position = position;
+            this.admissionLease = lease;
         }
         public ApplyPosition position() { return position; }
         public UUID groupId() { return groupId; }
@@ -3007,11 +3060,18 @@ public final class ReplicatedRangeStore {
             }
         }
         private synchronized void requireOpen() {
+            requireSnapshotReleaseHealthy();
             if (closed) throw new IllegalStateException("Snapshot pin closed");
+            if (admissionLease != null) admissionLease.checkAge();
         }
-        private synchronized void acquireUse() {
-            if (closed) throw new IllegalStateException("Snapshot pin closed");
-            nativeUsers++;
+        private void acquireUse() {
+            synchronized (this) {
+                requireOpen();
+                nativeUsers++;
+            }
+            // The borrowed use keeps DB/CF owners live while pressure metrics are sampled.
+            try { if (admissionLease != null) admissionLease.checkUse(); }
+            catch (Throwable failure) { releaseUse(); throw failure; }
         }
         private void releaseUse() {
             boolean release;
@@ -3021,7 +3081,7 @@ public final class ReplicatedRangeStore {
         @Override public void close() {
             boolean release;
             synchronized (this) {
-                if (closed) return;
+                if (closed) { requireSnapshotReleaseHealthy(); return; }
                 closed = true;
                 release = nativeUsers == 0;
             }
@@ -3029,10 +3089,10 @@ public final class ReplicatedRangeStore {
         }
         private void releaseNative() {
             try { db.releaseSnapshot(snapshot); }
-            finally {
-                if (historyTracked) { trackedSnapshotScopeBytes.addAndGet(-historyScopeBytes); trackedSnapshotPins.decrementAndGet(); }
-                snapshotPins.decrementAndGet();
-            }
+            catch (Throwable failure) { recordSnapshotReleaseFailure(failure); throw failure; }
+            if (admissionLease != null) admissionLease.close();
+            if (historyTracked) { trackedSnapshotScopeBytes.addAndGet(-historyScopeBytes); trackedSnapshotPins.decrementAndGet(); }
+            snapshotPins.decrementAndGet();
         }
     }
 

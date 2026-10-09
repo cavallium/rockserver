@@ -100,7 +100,8 @@ class RatisRemoteExportSourceTest {
     @Test void completeFourColumnNativeServiceWorkflowRetriesLostReleaseThenRoutesAcknowledgesAndReopensOffline() throws Exception {
         var sourceScheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,1,1,8,8,"remote-export-service");
         var directory=Files.createDirectory(root.resolve("complete-job")); var path=directory.resolve("export.log"); var destinationPath=root.resolve("destination"); List<RatisExportJournal.Chunk> chunks;
-        try (var f=new Fixture(root.resolve("complete-source"),true,Map.of(73L,ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(),false))); var source=snapshots(f)) {
+        try (var f=new Fixture(root.resolve("complete-source"),true,Map.of(73L,ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),new it.unimi.dsi.fastutil.objects.ObjectArrayList<>(),false)),
+                new it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits(2,1L<<40,Duration.ofSeconds(60),0)); var source=snapshots(f)) {
             seed(f); RatisRocksDBAdapterTest.seed(f,73,key(2),null,1904); RatisRocksDBAdapterTest.seed(f,73,key(200),null,1905);
             RatisRocksDBAdapterTest.seed(f,74,member(2,"first"),value(4),1906); RatisRocksDBAdapterTest.seed(f,74,member(200,"second"),value(5),1907);
             var id=RatisExportWorkflowTest.identity(f); var spans=new ArrayList<TransactionScope.Span>();
@@ -120,7 +121,7 @@ class RatisRemoteExportSourceTest {
                 }
                 public boolean tokenUsable(RatisExportSourceRpc.JobDefinition d) throws Exception { try { f.machines.get(d.group()).requireExportPin(d); return true; } catch (RatisSnapshotLostException lost) { return false; } }
             };
-            var service=new RatisExportSourceService(root.resolve("service-artifacts"),RatisExportSourceRegistry.Budgets.defaults(),builder,sourceScheduler);
+            var service=new RatisExportSourceService(root.resolve("service-artifacts"),RatisExportSourceRegistry.Budgets.defaults(),RatisExportSourceService.IoLimits.defaults(),builder,sourceScheduler);
             var releases=new ArrayList<byte[]>(); var loseRelease=new java.util.concurrent.atomic.AtomicBoolean(true);
             try (var routed=new RatisRoutedClient(f.directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
@@ -139,11 +140,12 @@ class RatisRemoteExportSourceTest {
                 }
             }); var client=new RatisExportClient(source,f.scheduler,new RatisRemoteExportSource(source,routed),RatisExportClient.Limits.defaults()); var job=client.create(path,definition,RequestContext.batch()); var destination=new Destination(destinationPath,true,definition.columns())) {
                 await(job.completion()); await(job.step(RequestContext.batch())); int captures=f.captureRequests.get();
+                assertEquals(2,f.catalogue.pool.snapshotAdmissionStats().pins());
                 RatisRocksDBAdapterTest.seed(f,71,key(4),value(9),1903);
                 while (job.snapshot().phase()==RatisExportJournal.Phase.EXPORTING) { for (var group:f.groups) assertEquals(1,f.machines.get(group).snapshotPinStats().pins()); await(job.step(RequestContext.batch())); }
                 assertEquals(RatisExportJournal.Phase.MATERIALIZED,job.snapshot().phase()); assertEquals(9,builds.get()); assertTrue(releases.isEmpty()); for (var group:f.groups) assertEquals(1,f.machines.get(group).snapshotPinStats().pins());
                 assertThrows(ExecutionException.class,() -> await(job.step(RequestContext.batch()))); assertEquals(RatisExportJournal.Phase.MATERIALIZED,job.snapshot().phase()); assertFalse(job.snapshot().sourceCleanup().isEmpty());
-                await(job.step(RequestContext.batch())); assertEquals(RatisExportJournal.Phase.READY,job.snapshot().phase()); assertTrue(job.snapshot().sourceCleanup().isEmpty()); assertEquals(captures,f.captureRequests.get()); assertEquals(3,releases.size()); assertArrayEquals(releases.get(0),releases.get(1));
+                await(job.step(RequestContext.batch())); assertEquals(RatisExportJournal.Phase.READY,job.snapshot().phase()); assertTrue(job.snapshot().sourceCleanup().isEmpty()); assertEquals(captures,f.captureRequests.get()); assertEquals(0,f.catalogue.pool.snapshotAdmissionStats().pins()); assertEquals(3,releases.size()); assertArrayEquals(releases.get(0),releases.get(1));
                 chunks=job.snapshot().chunks(); assertEquals(4,chunks.stream().map(RatisExportJournal.Chunk::column).distinct().count()); assertEquals(2,chunks.stream().filter(chunk -> chunk.column().equals(f.schema.column(72).columnId()) && chunk.rows()==0).count()); assertEquals(2,chunks.stream().map(RatisExportJournal.Chunk::group).distinct().count());
                 var manifest=await(job.manifest(0,128,65536,RequestContext.batch())); assertEquals(chunks,manifest.chunks()); assertFalse(manifest.hasMore());
                 for (var chunk:chunks) {
@@ -180,7 +182,7 @@ class RatisRemoteExportSourceTest {
                 public NativeRangeSstExport.Chunk build(RatisExportSourceRpc.JobDefinition d,RatisExportJournal.ChunkIntent i,Path artifact,RatisExportSourceRegistry.Completion completion) throws Exception { builds.incrementAndGet(); return f.machines.get(d.group()).exportSnapshotPinChunk(d.capture(),pin -> { var chunk=f.catalogue.pool.exportSstChunk(artifact,pin,i.column(),i.scopeStart(),d.scope(i.column()).upperExclusive(),i.limits()); completion.persist(chunk); return chunk; }); }
                 public boolean tokenUsable(RatisExportSourceRpc.JobDefinition d) throws Exception { try { f.machines.get(d.group()).requireExportPin(d); return true; } catch (RatisSnapshotLostException lost) { return false; } }
             };
-            var service=new java.util.concurrent.atomic.AtomicReference<>(new RatisExportSourceService(artifacts,RatisExportSourceRegistry.Budgets.defaults(),builder,lane));
+            var service=new java.util.concurrent.atomic.AtomicReference<>(new RatisExportSourceService(artifacts,RatisExportSourceRegistry.Budgets.defaults(),RatisExportSourceService.IoLimits.defaults(),builder,lane));
             var loseBuild=new java.util.concurrent.atomic.AtomicBoolean(true); var loseRelease=new java.util.concurrent.atomic.AtomicBoolean(true); var releases=new ArrayList<byte[]>();
             try (var routed=new RatisRoutedClient(f.directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); } public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
@@ -200,7 +202,7 @@ class RatisRemoteExportSourceTest {
                     var intent=journal.freezeChunk(group); assertEquals(selected.getLast(),intent.column()); assertEquals(2,intent.ordinal());
                     assertThrows(ExecutionException.class,() -> await(remote.write(new RatisExportSourceRpc.BuildRequest(RatisExportJournal.sourceDefinition(journal.snapshot(),group),intent),journal.artifactPath(intent),RequestContext.batch()))); assertEquals(3,builds.get());
                 }
-                await(service.get().stop()); service.set(new RatisExportSourceService(artifacts,RatisExportSourceRegistry.Budgets.defaults(),builder,lane));
+                await(service.get().stop()); service.set(new RatisExportSourceService(artifacts,RatisExportSourceRegistry.Budgets.defaults(),RatisExportSourceService.IoLimits.defaults(),builder,lane));
                 try(var journal=RatisExportJournal.reopen(path)) {
                     var remote=new RatisRemoteExportSource(snapshots,routed); remote.bind(journal.snapshot()); remoteChunk(journal,remote,group); assertEquals(3,builds.get()); assertEquals(captures,f.captureRequests.get());
                     while(journal.snapshot().phase()==RatisExportJournal.Phase.EXPORTING) remoteChunk(journal,remote,journal.unfinishedGroup());
@@ -208,7 +210,7 @@ class RatisRemoteExportSourceTest {
                     await(lease.release(RequestContext.batch()));
                     assertThrows(ExecutionException.class,() -> await(remote.release(RatisExportJournal.sourceDefinition(journal.snapshot(),group),RequestContext.batch()))); assertTrue(journal.snapshot().sourceCleanup().contains(group));
                 }
-                await(service.get().stop()); service.set(new RatisExportSourceService(artifacts,RatisExportSourceRegistry.Budgets.defaults(),builder,lane));
+                await(service.get().stop()); service.set(new RatisExportSourceService(artifacts,RatisExportSourceRegistry.Budgets.defaults(),RatisExportSourceService.IoLimits.defaults(),builder,lane));
                 try(var journal=RatisExportJournal.reopen(path)) {
                     var remote=new RatisRemoteExportSource(snapshots,routed); remote.bind(journal.snapshot());
                     for(var participant:f.groups) if(journal.snapshot().sourceCleanup().contains(participant)) { await(remote.release(RatisExportJournal.sourceDefinition(journal.snapshot(),participant),RequestContext.batch())); journal.sourceReleased(participant); }

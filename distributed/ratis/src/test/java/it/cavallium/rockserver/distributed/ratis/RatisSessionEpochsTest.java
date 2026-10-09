@@ -202,8 +202,10 @@ class RatisSessionEpochsTest {
         final RatisSessionEpochs epochs;
         boolean unavailable, grpcUnavailable, schemaUnavailable, missingSchema;
         byte[] readOverride, writeOverride;
-        Fixture(Path path) throws Exception {
+        Fixture(Path path) throws Exception { this(path,null); }
+        Fixture(Path path,it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits pins) throws Exception {
             pool=DistributedStoragePool.open(path.resolve("catalogue"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
+            if (pins!=null) pool.configureSnapshotAdmission(pins);
             store=pool.openRange(new RangeOwnership.Owner(catalogue,1),new RangeOwnership.Interval(catalogue,Set.of(directoryColumn,sessions),null,null),
                     new byte[32],Map.of(directoryColumn,"directories",sessions,"session_epochs"),Set.of());
             var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args) -> {

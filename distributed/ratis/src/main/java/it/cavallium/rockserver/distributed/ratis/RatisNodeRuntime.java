@@ -31,12 +31,23 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     @FunctionalInterface interface HomeClientFactory { RatisRoutedClient connect(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) throws IOException; }
     public record Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,
-                           Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout) {
+                           Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout,
+                           ExportResources exports) {
         public Settings {
-            Objects.requireNonNull(images); Objects.requireNonNull(retention); Objects.requireNonNull(clockPeriod); Objects.requireNonNull(shutdownTimeout);
+            Objects.requireNonNull(images); Objects.requireNonNull(retention); Objects.requireNonNull(clockPeriod); Objects.requireNonNull(shutdownTimeout); Objects.requireNonNull(exports);
             if (clockPeriod.isNegative() || clockPeriod.isZero() || propagationVisits<1 || propagationVisits>32
                     || maxPropagationRanges<1 || maxPropagationRanges>1024 || shutdownTimeout.isNegative() || shutdownTimeout.isZero()
                     || shutdownTimeout.compareTo(Duration.ofMinutes(1))>0) throw new IllegalArgumentException("Invalid node resource/lifecycle settings");
+        }
+    }
+    public record ExportResources(PoolSnapshotAdmission.Limits pins,RatisExportSourceRegistry.Budgets sources,
+                                  RatisExportSourceService.IoLimits io) {
+        public ExportResources { Objects.requireNonNull(pins); Objects.requireNonNull(sources); Objects.requireNonNull(io); }
+        public static ExportResources defaults() {
+            var source=RatisExportSourceRegistry.Budgets.defaults();
+            return new ExportResources(PoolSnapshotAdmission.Limits.defaults(),
+                    new RatisExportSourceRegistry.Budgets(source.maximumJobs(),source.maximumChunks(),source.maximumDiskBytes(),
+                            source.maximumMetadataBytes(),source.maximumBufferBytes(),1),RatisExportSourceService.IoLimits.defaults());
         }
     }
     public record RecoverySettings(RatisTransactionStatuses homes,boolean takeover,RatisParticipantRecoveryRegistry.Limits limits,Duration period,int visits) {
@@ -177,6 +188,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         proofQueries=new RatisProofQueryService();
         if (transactionHomes!=null) snapshotHelp=new RatisSnapshotHelpService(scheduler);
         pool=DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class));
+        pool.configureSnapshotAdmission(settings.exports().pins());
         try {
             for (var group:plan.localGroups()) {
                 var id=group.getGroupId().getUuid(); RatisRangeStateMachine machine;
@@ -211,7 +223,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 machines.put(group.getGroupId(),machine);
             }
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
-        exportSources=new RatisExportSourceService(root.resolve("exports"),RatisExportSourceRegistry.Budgets.defaults(),
+        exportSources=new RatisExportSourceService(root.resolve("exports"),settings.exports().sources(),settings.exports().io(),
                 new RatisExportSourceRegistry.NativeBuilder() {
                     public it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport.Chunk build(
                             RatisExportSourceRpc.JobDefinition definition,RatisExportJournal.ChunkIntent intent,

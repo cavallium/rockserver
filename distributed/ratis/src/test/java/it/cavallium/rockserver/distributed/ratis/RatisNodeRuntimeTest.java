@@ -112,7 +112,7 @@ class RatisNodeRuntimeTest {
             // existing durable native groups and retirement journal under their original identities.
             f.server.storages.clear();
             var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),
-                    f.env.settings().retention(),f.env.settings().clockPeriod(),1,4,f.env.settings().shutdownTimeout());
+                    f.env.settings().retention(),f.env.settings().clockPeriod(),1,4,f.env.settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
             try (var reopened=RatisNodeRuntime.open(f.plan,f.env.nodeRoot,ConfigParser.parseDefault(),f.env.catalogue.epochs,f.data,
                     f.env.scheduler,f.env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.RECOVER,f.server::create,null,null,null,f::client)) {
                 assertEquals(0,reopened.pendingRetirements()); reopened.start(); assertEquals(3,f.env.timer.activePeriods());
@@ -223,7 +223,7 @@ class RatisNodeRuntimeTest {
                     public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { throw new AssertionError(); }
                     public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { throw new AssertionError(); }
                 })) {
-                    var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),Duration.ofSeconds(1),1,2,Duration.ofMillis(100));
+                    var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),Duration.ofSeconds(1),1,2,Duration.ofMillis(100),RatisNodeRuntime.ExportResources.defaults());
                     var fake=new FakeServer();
                     assertThrows(IOException.class,() -> RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routed,env.scheduler,env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.RECOVER,fake::create));
                     assertFalse(fake.created);
@@ -409,7 +409,7 @@ class RatisNodeRuntimeTest {
         }
         RatisNodeRuntime.Settings settings() {
             return new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),
-                    Duration.ofSeconds(1),1,2,Duration.ofMillis(100));
+                    Duration.ofSeconds(1),1,2,Duration.ofMillis(100),RatisNodeRuntime.ExportResources.defaults());
         }
         RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake) throws IOException { return open(startup,fake,null); }
         RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake,RatisSnapshotFences snapshotHomes) throws IOException {

@@ -15,7 +15,7 @@ import java.util.*;
 public final class RatisNodeManifest {
     /** Includes the file checksum; encoded bodies leave room for its 32 bytes. */
     public static final int MAX_BYTES=8*1024*1024;
-    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=80;
+    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=164;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
@@ -74,6 +74,11 @@ public final class RatisNodeManifest {
         output.putLong(retention.dataCount()).putLong(retention.dataBytes()).putLong(retention.maintenanceCount()).putLong(retention.maintenanceBytes());
         output.putLong(nanos(settings.clockPeriod())).putInt(settings.propagationVisits()).putInt(settings.maxPropagationRanges())
                 .putLong(nanos(settings.shutdownTimeout())).putInt(manifest.readThreads).putInt(manifest.writeThreads);
+        var exports=settings.exports(); var pins=exports.pins(); var source=exports.sources(); var io=exports.io();
+        output.putInt(pins.maximumPins()).putLong(pins.maximumEstimatedBytes()).putLong(nanos(pins.maximumAge())).putLong(pins.minimumFreeBytes());
+        output.putInt(source.maximumJobs()).putInt(source.maximumChunks()).putLong(source.maximumDiskBytes())
+                .putLong(source.maximumMetadataBytes()).putLong(source.maximumBufferBytes()).putInt(source.concurrentBuilds());
+        output.putLong(io.minimumFreeBytes()).putLong(io.readBytesPerSecond()).putInt(io.readBurstBytes());
         return output.array();
     }
     public static RatisNodeManifest decode(byte[] bytes) {
@@ -113,8 +118,11 @@ public final class RatisNodeManifest {
         catch (ArithmeticException overflow) { throw new IllegalArgumentException("Manifest retention limits overflow",overflow); }
         long clock=input.getLong(); int visits=input.getInt(), ranges=input.getInt(); long shutdown=input.getLong();
         int reads=input.getInt(), writes=input.getInt();
+        var pins=new it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits(input.getInt(),input.getLong(),Duration.ofNanos(input.getLong()),input.getLong());
+        var source=new RatisExportSourceRegistry.Budgets(input.getInt(),input.getInt(),input.getLong(),input.getLong(),input.getLong(),input.getInt());
+        var io=new RatisExportSourceService.IoLimits(input.getLong(),input.getLong(),input.getInt());
         if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
-        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown));
+        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io));
         var recovered=catalogue(catalogue,directory,directoryColumn,sessionsColumn);
         var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,Set.of(),homes,groups);
         if (plan.localGroups().size()!=groups) throw new IllegalArgumentException("Manifest group budget is not canonical");

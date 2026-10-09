@@ -5,10 +5,12 @@ import it.cavallium.rockserver.core.config.GlobalDatabaseConfig;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -42,6 +44,9 @@ public final class DistributedStoragePool implements AutoCloseable {
     private final Map<UUID, Binding> bindings = new HashMap<>();
     private final List<ColumnFamilyHandle> newHandles = new ArrayList<>();
     private final List<ReplicatedRangeStore> ranges = new ArrayList<>();
+    private volatile PoolSnapshotAdmission snapshotAdmission;
+    private volatile List<ColumnFamilyHandle> pressureColumns = List.of();
+    private List<Path> storageVolumes = List.of();
     private boolean closing;
     private boolean closed;
 
@@ -72,6 +77,52 @@ public final class DistributedStoragePool implements AutoCloseable {
         }
         return new DistributedStoragePool(RocksDBLoader.load(persistentPath, config, logger,
                 null, null, INTERNAL_COLUMNS), globalConfig, logger);
+    }
+
+    /** Configure once, before opening any range. Every native snapshot in this pool shares the guard. */
+    public void configureSnapshotAdmission(PoolSnapshotAdmission.Limits limits) {
+        Objects.requireNonNull(limits);
+        nativeMutation.acquireUninterruptibly();
+        try {
+            synchronized (admission) {
+                if (closing || !ranges.isEmpty() || snapshotAdmission != null) {
+                    throw new IllegalStateException("Snapshot admission must be configured before opening ranges");
+                }
+            }
+            var volumes = new HashSet<Path>();
+            volumes.add(loaded.definitiveDbPath());
+            try {
+                for (var volume : RocksDBLoader.getVolumeConfigs(loaded.definitiveDbPath(), globalConfig.fallbackColumnOptions())) volumes.add(volume.path());
+                for (var column : globalConfig.columnOptions()) {
+                    for (var volume : RocksDBLoader.getVolumeConfigs(loaded.definitiveDbPath(), column)) volumes.add(volume.path());
+                }
+            } catch (GestaltException failure) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(
+                        it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR,
+                        "Cannot resolve snapshot storage volumes", failure);
+            }
+            storageVolumes = List.copyOf(volumes);
+            pressureColumns = List.copyOf(handles.values());
+            snapshotAdmission = new PoolSnapshotAdmission(limits, this::sampleSnapshotPressure, System::nanoTime);
+        } finally { nativeMutation.release(); }
+    }
+
+    /** Metadata only; estimated bytes do not measure exact physical SST retention. */
+    public PoolSnapshotAdmission.Stats snapshotAdmissionStats() {
+        var guard = snapshotAdmission;
+        return guard == null ? new PoolSnapshotAdmission.Stats(0, 0, Duration.ZERO) : guard.stats();
+    }
+
+    private PoolSnapshotAdmission.Sample sampleSnapshotPressure() throws IOException, RocksDBException {
+        long sampledAt = System.nanoTime(), bytes = 0, free = Long.MAX_VALUE;
+        for (var column : pressureColumns) {
+            long sst = loaded.db().get().getLongProperty(column, "rocksdb.total-sst-files-size");
+            long memtable = loaded.db().get().getLongProperty(column, "rocksdb.size-all-mem-tables");
+            if (sst < 0 || memtable < 0) throw new IOException("Negative native snapshot pressure metric");
+            bytes = Math.addExact(bytes, Math.addExact(sst, memtable));
+        }
+        for (Path volume : storageVolumes) free = Math.min(free, Files.getFileStore(volume).getUsableSpace());
+        return new PoolSnapshotAdmission.Sample(bytes, free, sampledAt);
     }
 
     /** Bind the supplied pool-schema names; admission is supplied by the qualified range adapter. */
@@ -137,10 +188,12 @@ public final class DistributedStoragePool implements AutoCloseable {
                 }
                 rangeColumns.put(entry.getKey(), handle);
             }
+            pressureColumns = List.copyOf(handles.values());
             ownership.register(owner, interval, RangeOwnership.State.ACTIVE);
             try {
                 var store = new ReplicatedRangeStore(loaded.db().get(), ownership, owner, schema, rangeColumns,
                         handles.get(STATE_COLUMN), handles.get(RECEIPTS_COLUMN), merges);
+                store.configureSnapshotAdmission(snapshotAdmission);
                 names.forEach((id, name) -> bindings.putIfAbsent(id, new Binding(name, schema, merges.contains(id))));
                 ranges.add(store);
                 return store;

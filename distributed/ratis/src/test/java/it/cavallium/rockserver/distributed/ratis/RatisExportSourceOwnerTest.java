@@ -25,7 +25,7 @@ class RatisExportSourceOwnerTest {
         var owner=new AtomicReference<RatisSnapshotPinsTest.Fixture>();
         var builds=new AtomicInteger(); var loseReply=new AtomicBoolean(true);
         var scheduler=RWScheduler.forTesting(1,1,1,4,1,"source-owner-fixture");
-        var service=new RatisExportSourceService(root.resolve("exports"),RatisExportSourceRegistry.Budgets.defaults(),
+        var service=new RatisExportSourceService(root.resolve("exports"),RatisExportSourceRegistry.Budgets.defaults(),RatisExportSourceService.IoLimits.defaults(),
                 new RatisExportSourceRegistry.NativeBuilder() {
                     public NativeRangeSstExport.Chunk build(RatisExportSourceRpc.JobDefinition definition,
                             RatisExportJournal.ChunkIntent intent,Path artifact,RatisExportSourceRegistry.Completion completion) throws Exception {

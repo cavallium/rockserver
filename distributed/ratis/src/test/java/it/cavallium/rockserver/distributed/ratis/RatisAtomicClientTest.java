@@ -65,7 +65,10 @@ class RatisAtomicClientTest {
         Fixture(Path root) throws Exception { this(root,false); }
         Fixture(Path root,boolean snapshotHome) throws Exception { this(root,snapshotHome,Map.of()); }
         Fixture(Path root,boolean snapshotHome,Map<Long,ColumnSchema> schemaOverrides) throws Exception {
-            this.root=root; Files.createDirectories(root); catalogue=outer.new Fixture(root.resolve("catalogue"));
+            this(root,snapshotHome,schemaOverrides,null);
+        }
+        Fixture(Path root,boolean snapshotHome,Map<Long,ColumnSchema> schemaOverrides,it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits pins) throws Exception {
+            this.root=root; Files.createDirectories(root); catalogue=outer.new Fixture(root.resolve("catalogue"),pins);
             snapshotHelp=snapshotHome ? new RatisSnapshotHelpService(scheduler) : null;
             try {
             var initial=SessionEpochLedger.initial(outer.cluster,outer.database,10);

@@ -7,10 +7,17 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.LongSupplier;
 import static it.cavallium.rockserver.distributed.ratis.RatisExportSourceRpc.*;
 
 /** Bounded observer views around actual scheduler-owned source work. */
 public final class RatisExportSourceService {
+    public record IoLimits(long minimumFreeBytes,long readBytesPerSecond,int readBurstBytes) {
+        public IoLimits {if(minimumFreeBytes<0 || minimumFreeBytes>Long.MAX_VALUE/2 || readBytesPerSecond<1 || readBytesPerSecond>1024L*1024*1024 || readBurstBytes<MAX_READ_BYTES || readBurstBytes>64*1024*1024)throw new IllegalArgumentException("Invalid source I/O limits");}
+        public static IoLimits defaults(){return new IoLimits(1024L*1024*1024,32L*1024*1024,MAX_READ_BYTES);}
+    }
+    interface Wakeup extends AutoCloseable {Runnable schedule(Runnable task,long delayNanos);void close();}
+    private static Wakeup timer(){var timer=new ScheduledThreadPoolExecutor(1,task->{var thread=new Thread(task,"rockserver-export-rate");thread.setDaemon(true);return thread;});timer.setRemoveOnCancelPolicy(true);return new Wakeup(){public Runnable schedule(Runnable task,long delay){var future=timer.schedule(task,delay,TimeUnit.NANOSECONDS);return ()->future.cancel(false);}public void close(){timer.shutdown();}};}
     public static final int BUILD=52,READ=53,RELEASE=54;
     private record Key(int kind,String digest) {}
     private final class Work implements Runnable,RWScheduler.RejectionAwareTask {
@@ -21,10 +28,12 @@ public final class RatisExportSourceService {
         @Override public void reject(RuntimeException failure){synchronized(RatisExportSourceService.this){if(finished)return;if(rejection==null)rejection=failure;if(started)return;}finish(this,null,failure,true);}
     }
     private final RatisExportSourceRegistry registry;private final RatisExportSourceRegistry.Budgets budgets;private final RWScheduler.WorkloadExecutor executor;
+    private final SourceReadRate rate;private final Wakeup wakeup;private Runnable cancelWakeup;private long wakeupGeneration;
     private final ThreadPoolExecutor cleanup;private boolean sweepPending;
     private final Map<Key,Work> work=new LinkedHashMap<>();private final Set<String> releasing=new HashSet<>();private long bytes,releaseBytes;private int releaseCount,runningBuilds;private boolean stopping,closing;private final CompletableFuture<Void> stopped=new CompletableFuture<>();
-    public RatisExportSourceService(Path root,RatisExportSourceRegistry.Budgets budgets,RatisExportSourceRegistry.NativeBuilder builder,RWScheduler scheduler)throws IOException {this(new RatisExportSourceRegistry(root,budgets,builder),budgets,scheduler);}
-    public RatisExportSourceService(RatisExportSourceRegistry registry,RatisExportSourceRegistry.Budgets budgets,RWScheduler scheduler){this.registry=Objects.requireNonNull(registry);this.budgets=Objects.requireNonNull(budgets);executor=Objects.requireNonNull(scheduler).executor(RequestContext.batch(),OperationFamily.FULL_SCAN_AGGREGATE);cleanup=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(budgets.maximumJobs()+1),task->{var thread=new Thread(task,"rockserver-export-cleanup");thread.setDaemon(true);return thread;},new ThreadPoolExecutor.AbortPolicy());}
+    public RatisExportSourceService(Path root,RatisExportSourceRegistry.Budgets budgets,IoLimits ioLimits,RatisExportSourceRegistry.NativeBuilder builder,RWScheduler scheduler)throws IOException {this(new RatisExportSourceRegistry(root,budgets,ioLimits,builder),budgets,ioLimits,scheduler);}
+    public RatisExportSourceService(RatisExportSourceRegistry registry,RatisExportSourceRegistry.Budgets budgets,IoLimits ioLimits,RWScheduler scheduler){this(registry,budgets,ioLimits,scheduler,System::nanoTime,timer());}
+    RatisExportSourceService(RatisExportSourceRegistry registry,RatisExportSourceRegistry.Budgets budgets,IoLimits ioLimits,RWScheduler scheduler,LongSupplier clock,Wakeup wakeup){this.rate=new SourceReadRate(ioLimits,clock);this.wakeup=Objects.requireNonNull(wakeup);this.registry=Objects.requireNonNull(registry);this.budgets=Objects.requireNonNull(budgets);executor=Objects.requireNonNull(scheduler).executor(RequestContext.batch(),OperationFamily.FULL_SCAN_AGGREGATE);cleanup=new ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(budgets.maximumJobs()+1),task->{var thread=new Thread(task,"rockserver-export-cleanup");thread.setDaemon(true);return thread;},new ThreadPoolExecutor.AbortPolicy());}
     private ReleaseRequest release(ReleaseRequest request)throws Exception{registry.release(request);return request;}
     public CompletableFuture<byte[]> submit(UUID addressedGroup,int kind,byte[] body){
         try{
@@ -51,17 +60,18 @@ public final class RatisExportSourceService {
         }catch(Throwable failure){return CompletableFuture.failedFuture(failure);}
     }
     private void fenceQueued(String job){List<Work> cancelled;synchronized(this){cancelled=work.values().stream().filter(w->w.kind!=RELEASE && w.job.equals(job) && !w.started).toList();}for(Work queued:cancelled)finish(queued,null,new IOException("Source job released before execution"),true);}
-    private void dispatch(){List<Work> dispatch=new ArrayList<>();synchronized(this){for(Work next:work.values()){if(next.scheduled || next.kind!=RELEASE && releasing.contains(next.job))continue;
+    private void dispatch(){List<Work> dispatch=new ArrayList<>();synchronized(this){boolean readWaiting=false;long delay=0;for(Work next:work.values()){if(next.scheduled || stopping && next.kind!=RELEASE || next.kind!=RELEASE && releasing.contains(next.job))continue;
             if(next.kind==RELEASE && work.values().stream().anyMatch(w->w!=next && w.job.equals(next.job) && w.kind!=RELEASE))continue;
             if(next.kind!=RELEASE && work.values().stream().anyMatch(w->w!=next && w.job.equals(next.job) && w.scheduled && w.kind!=RELEASE))continue;
             if(next.kind==BUILD && runningBuilds>=budgets.concurrentBuilds())continue;
+            if(next.kind==READ){if(readWaiting)continue;long wait=rate.delay(next.cost);if(wait!=0){readWaiting=true;delay=wait;continue;}rate.consume(next.cost);}
             next.scheduled=true;if(next.kind==BUILD)runningBuilds++;dispatch.add(next);
-        }}for(Work next:dispatch)try{if(next.kind==RELEASE)cleanup.execute(next);else executor.execute(next,next.cost);}catch(RuntimeException failure){next.reject(failure);}}
+        }if(cancelWakeup!=null){cancelWakeup.run();cancelWakeup=null;}long generation=++wakeupGeneration;if(delay!=0 && !stopping)cancelWakeup=wakeup.schedule(()->{synchronized(this){if(generation!=wakeupGeneration)return;cancelWakeup=null;}dispatch();},delay); }for(Work next:dispatch)try{if(next.kind==RELEASE)cleanup.execute(next);else executor.execute(next,next.cost);}catch(RuntimeException failure){next.reject(failure);}}
     private void requestSweep(){synchronized(this){if(stopping || sweepPending)return;sweepPending=true;}try{cleanup.execute(()->{try{registry.sweepReleased(16);}catch(Exception ignored){/* Transient token failures retain the bounded cursor for the next admission. */}finally{synchronized(this){sweepPending=false;}checkStopped();}});}catch(RejectedExecutionException full){synchronized(this){sweepPending=false;}}}
     private void finish(Work task,byte[] result,Throwable failure){finish(task,result,failure,false);}
     private void finish(Work task,byte[] result,Throwable failure,boolean queuedOnly){synchronized(this){if(task.finished || queuedOnly && task.started)return;if(task.rejection!=null)failure=task.rejection;task.finished=true;task.request=null;work.remove(task.key);if(task.kind==BUILD && task.scheduled)runningBuilds--;if(task.kind==RELEASE){releaseCount--;releaseBytes-=task.charge;if(failure==null)releasing.remove(task.job);}else {bytes-=task.charge;registry.freeBuffer(task.charge);}}
         if(failure==null)task.actual.complete(result);else task.actual.completeExceptionally(failure);dispatch();checkStopped();}
     /** Fence submissions, drain actual work, and release the stable registry owner without cancelling it. */
-    public CompletableFuture<Void> stop(){synchronized(this){stopping=true;}dispatch();checkStopped();return stopped.copy();}
-    private void checkStopped(){synchronized(this){if(!stopping || !work.isEmpty() || sweepPending || closing)return;closing=true;}try{registry.close();cleanup.shutdown();stopped.complete(null);}catch(Throwable failure){cleanup.shutdown();stopped.completeExceptionally(failure);}}
+    public CompletableFuture<Void> stop(){List<Work> queued;synchronized(this){stopping=true;wakeupGeneration++;if(cancelWakeup!=null){cancelWakeup.run();cancelWakeup=null;}queued=work.values().stream().filter(w->w.kind!=RELEASE && !w.started).toList();}for(Work task:queued)finish(task,null,new IOException("Source stopped before execution"),true);dispatch();checkStopped();return stopped.copy();}
+    private void checkStopped(){synchronized(this){if(!stopping || !work.isEmpty() || sweepPending || closing)return;closing=true;}try{registry.close();wakeup.close();cleanup.shutdown();stopped.complete(null);}catch(Throwable failure){wakeup.close();cleanup.shutdown();stopped.completeExceptionally(failure);}}
 }

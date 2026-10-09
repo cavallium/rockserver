@@ -676,8 +676,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized (gate) { requireHealthy(); return store.capture(); }
     }
 
-    private ReplicatedRangeStore.ScopedSnapshot readablePoint(UUID column,byte[] key) throws Exception {
-        synchronized (gate) { requireHealthy(); return store.captureReadable(new TransactionScope(java.util.List.of(TransactionScope.Span.point(column,key)))); }
+    private byte[] readablePoint(UUID column,byte[] key) throws Exception {
+        synchronized (gate) { requireHealthy(); return store.readCurrentPoint(column,key); }
     }
 
     @Override public void pause() {
@@ -2687,7 +2687,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             case ScopedTransactionRpc.POINT -> {
                 var column=ScopedTransactionRpc.uuid(input); var key=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES-16,false); end(input);
-                try (var pin=readablePoint(column,key)) { var value=pin.get(column,key); reply=valueBlob(value); }
+                reply=valueBlob(readablePoint(column,key));
             }
             case ScopedTransactionRpc.STATE -> { end(input); try (var pin=snapshotPin()) { reply=pin.stateView().encode(); } }
             case ScopedTransactionRpc.OPEN -> {
