@@ -74,20 +74,35 @@ public class ThriftServer extends Server {
 			String http2Host,
 			int http2Port,
 			int maxFrameSize) throws IOException {
-		super(client);
-		int validatedMaxFrameSize = ThriftTransportLimits.validateServerMaxFrameSize(maxFrameSize);
+        this(client, http2Host, http2Port, maxFrameSize, null);
+    }
+
+    public ThriftServer(RocksDBConnection client, String host, int port,
+            it.cavallium.rockserver.core.common.export.ExportAsyncAPI exportBackend) throws IOException {
+        this(client, host, port, ThriftTransportLimits.configuredServerMaxFrameSize(), exportBackend);
+    }
+
+    public ThriftServer(RocksDBConnection client, String http2Host, int http2Port, int maxFrameSize,
+            it.cavallium.rockserver.core.common.export.ExportAsyncAPI exportBackend) throws IOException {
+        super(client);
+        int validatedMaxFrameSize = ThriftTransportLimits.validateServerMaxFrameSize(maxFrameSize);
 		var handler = new ThriftHandler(this.getClient(),
 				client instanceof InternalConnection internalConnection
 						? internalConnection.getScheduler()
 						: null,
 				ThriftTransportLimits.safeCdcResponseSize(validatedMaxFrameSize));
 
-		try {
-			var serverTransport = new ConfiguredNonblockingServerSocket(
+        var processor = new org.apache.thrift.TMultiplexedProcessor();
+        processor.registerDefault(new Processor<>(handler));
+        processor.registerProcessor(ExportThriftService.SERVICE_NAME,
+                new it.cavallium.rockserver.core.common.api.RocksDBExports.Processor<>(
+                        new ExportThriftService(exportBackend, validatedMaxFrameSize)));
+        try {
+            var serverTransport = new ConfiguredNonblockingServerSocket(
 					new InetSocketAddress(http2Host, http2Port),
 					validatedMaxFrameSize);
 			this.server = new TThreadedSelectorServer(new TThreadedSelectorServer.Args(serverTransport)
-					.processor(new Processor<>(handler))
+					.processor(processor)
 			);
 
 			this.thriftThread = Thread.ofPlatform().name("Thrift server thread").unstarted(server::serve);

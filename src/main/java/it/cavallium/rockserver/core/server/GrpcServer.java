@@ -318,6 +318,12 @@ public class GrpcServer extends Server {
 	}
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
+		this(client, socketAddress, null);
+	}
+
+	/** The optional export backend is borrowed and remains owned by the caller. */
+	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress,
+			it.cavallium.rockserver.core.common.export.ExportAsyncAPI exports) throws IOException {
 		super(client);
 		ExpectedGrpcStreamCloseLogFilter.install();
 		if (client instanceof InternalConnection internalConnection) {
@@ -359,6 +365,7 @@ public class GrpcServer extends Server {
 				.withChildOption(ChannelOption.SO_KEEPALIVE, false)
 				.maxInboundMessageSize(512 * 1024 * 1024)
 				.addService(service)
+				.addService(new ExportGrpcService(exports).bindBoundedService())
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new AdaptiveCompressionInterceptor())

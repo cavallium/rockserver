@@ -18,9 +18,10 @@ public final class RatisExportJournal implements AutoCloseable {
         public Limits { Objects.requireNonNull(chunk); if (maximumChunks<1 || maximumChunks>65536 || maximumJournalBytes<2L*MAX_RECORD+1024 || maximumJournalBytes>64L*1024*1024 || maximumDiskBytes<chunk.maximumFileBytes()) throw new IllegalArgumentException("Invalid export budgets"); }
         public static Limits defaults() { return new Limits(4096,64L*1024*1024,1024L*1024*1024,new NativeRangeSstExport.Limits(65536,16L*1024*1024,32L*1024*1024,Duration.ofSeconds(30))); }
     }
-    public record Definition(UUID jobId,SnapshotFence fence,List<UUID> columns,Path sourceJournal,byte[] sourceIdentity,Limits limits) {
+    public record Definition(UUID jobId,SnapshotFence fence,List<UUID> columns,Path sourceJournal,byte[] sourceIdentity,Limits limits,Duration snapshotTtl) {
         public Definition {
-            Objects.requireNonNull(jobId); Objects.requireNonNull(fence); columns=selectedColumns(fence,columns); Objects.requireNonNull(sourceJournal); Objects.requireNonNull(sourceIdentity); Objects.requireNonNull(limits);
+            Objects.requireNonNull(jobId); Objects.requireNonNull(fence); columns=selectedColumns(fence,columns); Objects.requireNonNull(sourceJournal); Objects.requireNonNull(sourceIdentity); Objects.requireNonNull(limits); Objects.requireNonNull(snapshotTtl);
+            if (snapshotTtl.isZero() || snapshotTtl.isNegative() || snapshotTtl.compareTo(Duration.ofSeconds(60))>0 || !snapshotTtl.equals(Duration.ofMillis(snapshotTtl.toMillis()))) throw new IllegalArgumentException("Export snapshot TTL must be 1..60000 whole milliseconds");
             sourceJournal=sourceJournal.toAbsolutePath().normalize(); if (sourceIdentity.length!=32 || sourceJournal.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>4096) throw new IllegalArgumentException("Invalid export source binding"); sourceIdentity=sourceIdentity.clone();
             long future=2L*(MAX_RECORD+FRAME)+fence.encode().length+sourceJournal.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length+8192+16L*columns.size();
             if (future>limits.maximumJournalBytes()) throw new IllegalArgumentException("Export lacks reserved first-chunk/capture/READY capacity");
@@ -51,8 +52,11 @@ public final class RatisExportJournal implements AutoCloseable {
     @FunctionalInterface public interface ChunkWriter { NativeRangeSstExport.Chunk write(Path artifact,ChunkIntent intent) throws Exception; }
     private static final class Progress { final List<UUID> columns; int columnIndex; byte[] next; long ordinal; boolean complete; Progress(List<UUID> columns,byte[] lower) { this.columns=columns; next=copy(lower); } UUID column() { return columns.get(columnIndex); } }
     private final Path path; private final FileChannel ownership,log; private final FileLock lock;
-    private Definition definition; private final Map<UUID,SnapshotFenceStatus.Capture> captures=new LinkedHashMap<>(); private final Map<UUID,ApplyPosition> sourceReleases=new LinkedHashMap<>(); private final Map<UUID,SourceOwner> owners=new LinkedHashMap<>(); private final Set<UUID> sourceCleanup=new LinkedHashSet<>(); private byte[] sourceDecision; private final Map<UUID,Progress> progress=new LinkedHashMap<>(); private final List<Chunk> chunks=new ArrayList<>(); private final Set<String> acknowledged=new HashSet<>();
-    private ChunkIntent pending; private byte[] chain=new byte[32]; private long disk,orphanBytes; private Phase phase=Phase.CAPTURING; private boolean active,closed,fenced,reclaiming,artifactsReclaimed;
+    private Definition definition; private byte[] frozenFenceDigest; private final Map<UUID,SnapshotFenceStatus.Capture> captures=new LinkedHashMap<>(); private final Map<UUID,ApplyPosition> sourceReleases=new LinkedHashMap<>(); private final Map<UUID,SourceOwner> owners=new LinkedHashMap<>(); private final Set<UUID> sourceCleanup=new LinkedHashSet<>(); private byte[] sourceDecision; private final Map<UUID,Progress> progress=new LinkedHashMap<>(); private final List<Chunk> chunks=new ArrayList<>(); private final Set<String> acknowledged=new HashSet<>();
+    private record ChunkKey(UUID group,long ordinal) {}
+    private record Published(Chunk chunk,byte[] digest,String id) {}
+    private final Map<ChunkKey,Published> chunkIndex=new HashMap<>();
+    private ChunkIntent pending; private byte[] chain=new byte[32]; private long disk,orphanBytes; private Phase phase=Phase.CAPTURING; private boolean active,closed,fenced,reclaiming,artifactsReclaimed,sourceSettled;
     public static RatisExportJournal create(Path path,Definition definition) throws IOException { return new RatisExportJournal(path,Objects.requireNonNull(definition)); }
     public static RatisExportJournal reopen(Path path) throws IOException { return new RatisExportJournal(path,null); }
     private RatisExportJournal(Path path,Definition initial) throws IOException {
@@ -65,22 +69,36 @@ public final class RatisExportJournal implements AutoCloseable {
             else { replay(); if (!reclaiming && !artifactsReclaimed) for (var chunk:chunks) verifyArtifact(chunk); log.force(true); }
         } catch (IOException | RuntimeException | Error failure) { if (opened!=null) try { opened.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } if (acquired!=null) try { acquired.release(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } try { ownership.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
-    private void define(Definition value) { definition=value; for (var group:value.groups()) { var columns=value.columnsForGroup(group); progress.put(group,new Progress(columns,value.groupScope(group,columns.getFirst()).lowerInclusive())); } }
+    private void define(Definition value) { definition=value; frozenFenceDigest=hash(value.fence().encode()); for (var group:value.groups()) { var columns=value.columnsForGroup(group); progress.put(group,new Progress(columns,value.groupScope(group,columns.getFirst()).lowerInclusive())); } }
     public synchronized Snapshot snapshot() throws IOException { open(); if (active) throw new IOException("Export journal work active"); return new Snapshot(definition,phase,captures,owners,sourceCleanup,pending,chunks,acknowledged,orphanBytes,reclaiming,artifactsReclaimed); }
+    public record Summary(Definition definition,Phase phase,int chunks,int acknowledged,long fileBytes,boolean cleanupPending) {}
+    /** Constant-size status view; does not copy retained manifests or capture vectors. */
+    public synchronized Summary summary() throws IOException {
+        open(); if (active) throw new IOException("Export journal work active");
+        return new Summary(definition,phase,chunks.size(),acknowledged.size(),disk,!sourceCleanup.isEmpty() || !sourceSettled && !captures.isEmpty() && (phase==Phase.CANCELLED || phase==Phase.SNAPSHOT_LOST || phase==Phase.RELEASED) || phase==Phase.CAPTURING || phase==Phase.EXPORTING || phase==Phase.MATERIALIZED);
+    }
+    /** Qualify one retained descriptor without copying its manifest or reading artifact bytes. */
+    public synchronized Chunk chunk(UUID group,long ordinal) throws IOException {
+        open(); if (active) throw new IOException("Export journal work active");
+        if (phase!=Phase.READY) throw new IOException("Export delivery requires READY immutable artifacts");
+        var chunk=chunkIndex.get(new ChunkKey(Objects.requireNonNull(group),ordinal));
+        if (chunk==null) throw new IllegalArgumentException("Unknown original export chunk");
+        return chunk.chunk();
+    }
     /** Freeze the original complete read-only cut and released native gates before any chunk build. */
     public void bindSource(RatisDurableSnapshot.Snapshot source) throws IOException {
         Objects.requireNonNull(source); admit();
         try {
-            if (!definition.fence().equals(source.initial().fence()) || source.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || source.observedHome()==null || source.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE) throw new IllegalArgumentException("Export source lacks matching read-only COMPLETE snapshot");
+            if (!definition.fence().equals(source.initial().fence()) || source.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !definition.snapshotTtl().equals(source.requestedTtl()) || source.observedHome()==null || source.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE) throw new IllegalArgumentException("Export source lacks matching read-only COMPLETE snapshot");
             var bindings=new LinkedHashMap<UUID,SourceOwner>(); var vector=new LinkedHashMap<UUID,SnapshotFenceStatus.Capture>(); var releases=new LinkedHashMap<UUID,ApplyPosition>();
+            byte[] decision=source.observedHome().terminalDecision().digest();
             for (var group:sourceGroups()) {
                 var participant=source.participant(group); var token=participant.captureToken();
-                if (participant.capture()==null || participant.capture().request().mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || token==null || !participant.capture().request().owner().equals(token.ownerIncarnation()) || !participant.capture().request().snapshotId().equals(token.snapshotId()) || !token.equals(source.observedHome().progress(group).capture())) throw new IllegalArgumentException("Export source lacks original capture vector");
+                if (participant.capture()==null || participant.capture().request().mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !definition.snapshotTtl().equals(participant.capture().request().ttl()) || token==null || !participant.capture().request().owner().equals(token.ownerIncarnation()) || !participant.capture().request().snapshotId().equals(token.snapshotId()) || !token.equals(source.observedHome().progress(group).capture())) throw new IllegalArgumentException("Export source lacks original capture vector");
                 if (captures.isEmpty() && (source.releaseRequested() || participant.captureReleased() || participant.captureReleaseLost())) throw new IllegalArgumentException("Original source pin already released before export binding");
                 var target=participant.capture().target(); bindings.put(group,new SourceOwner(target.descriptor(),target.replica()));
-                vector.put(group,token); releases.put(group,sourceRelease(source,group,token));
+                vector.put(group,token); releases.put(group,sourceRelease(source,group,token,decision));
             }
-            byte[] decision=source.observedHome().terminalDecision().digest();
             if (!captures.isEmpty()) {
                 if (!captures.equals(vector) || !owners.equals(bindings) || !Arrays.equals(sourceDecision,decision)) throw new IllegalArgumentException("Original export source cut changed");
                 for (var group:sourceGroups()) if (!atLeast(releases.get(group),sourceReleases.get(group))) throw new IllegalArgumentException("Original released gate proof regressed");
@@ -92,12 +110,12 @@ public final class RatisExportJournal implements AutoCloseable {
             append(2,bytes(out)); sourceDecision=decision; captures.putAll(vector); owners.putAll(bindings); sourceCleanup.addAll(progress.keySet()); sourceReleases.putAll(releases); phase=Phase.EXPORTING;
         } finally { finish(); }
     }
-    private ApplyPosition sourceRelease(RatisDurableSnapshot.Snapshot source,UUID group,SnapshotFenceStatus.Capture token) {
+    private ApplyPosition sourceRelease(RatisDurableSnapshot.Snapshot source,UUID group,SnapshotFenceStatus.Capture token,byte[] decision) {
         var participant=source.participant(group); ApplyPosition release=participant.releaseReceipt();
-        if (release==null || participant.nativeGate()==null || !release.equals(participant.nativeGate().released()) || !participant.nativeGate().fence().equals(definition.fence()) || !Arrays.equals(participant.nativeGate().decisionDigest(),source.observedHome().terminalDecision().digest())) {
+        if (release==null || participant.nativeGate()==null || !release.equals(participant.nativeGate().released()) || !participant.nativeGate().fence().equals(definition.fence()) || !Arrays.equals(participant.nativeGate().decisionDigest(),decision)) {
             var retired=participant.retirementProof(); if (retired==null || !retired.fence().equals(definition.fence()) || !retired.participantGroup().equals(group) || !source.observedHome().consumed()) throw new IllegalArgumentException("Export source lacks exact native gate release proof"); release=retired.position();
         }
-        if (release.index()<=token.position().index() || release.term()<token.position().term()) throw new IllegalArgumentException("Released gate proof precedes original capture"); return release;
+        if (token!=null && (release.index()<=token.position().index() || release.term()<token.position().term())) throw new IllegalArgumentException("Released gate proof precedes original capture"); return release;
     }
     private static boolean atLeast(ApplyPosition next,ApplyPosition previous) { return next.term()>=previous.term() && next.index()>=previous.index() && (next.index()!=previous.index() || next.term()==previous.term()); }
     public ChunkIntent freezeChunk(UUID group) throws IOException { admit(); try { return freeze(group); } finally { finish(); } }
@@ -133,24 +151,76 @@ public final class RatisExportJournal implements AutoCloseable {
     }
     private void commitChunk(Chunk chunk,byte[] descriptor) throws IOException { requireChunk(chunk); append(4,descriptor); applyChunk(chunk); }
     private void requireChunk(Chunk chunk) throws IOException { if (chunk.rows()>definition.limits().chunk().maximumRows() || chunk.payloadBytes()>definition.limits().chunk().maximumPayloadBytes() || chunk.fileBytes()>definition.limits().chunk().maximumFileBytes()) throw new IOException("Chunk exceeds frozen native budget"); if (pending==null || !chunk.jobId().equals(definition.jobId()) || !chunk.group().equals(pending.group()) || !chunk.column().equals(pending.column()) || !chunk.cut().equals(pending.cut()) || chunk.ordinal()!=pending.ordinal() || !Arrays.equals(chunk.lowerInclusive(),pending.scopeStart()) || chunk.rangeEpoch()!=definition.fence().participant(chunk.group()).rangeEpoch() || (chunk.hasMore() ? chunk.upperExclusive()==null || definition.groupScope(chunk.group(),chunk.column()).upperExclusive()!=null && Arrays.compareUnsigned(chunk.upperExclusive(),definition.groupScope(chunk.group(),chunk.column()).upperExclusive())>=0 : !Arrays.equals(chunk.upperExclusive(),definition.groupScope(chunk.group(),chunk.column()).upperExclusive()))) throw new IOException("Published export chunk differs from exact pending intent"); }
-    private void applyChunk(Chunk chunk) { chunks.add(chunk); disk+=chunk.fileBytes(); var state=progress.get(chunk.group()); state.ordinal++; if (chunk.hasMore()) state.next=chunk.upperExclusive(); else if (++state.columnIndex==state.columns.size()) state.complete=true; else state.next=definition.groupScope(chunk.group(),state.column()).lowerInclusive(); pending=null; if (progress.values().stream().allMatch(p -> p.complete)) phase=Phase.MATERIALIZED; }
+    private void applyChunk(Chunk chunk) { chunks.add(chunk); byte[] digest=hash(uncheckedChunkBytes(chunk)); chunkIndex.put(new ChunkKey(chunk.group(),chunk.ordinal()),new Published(chunk,digest,hex(digest))); disk+=chunk.fileBytes(); var state=progress.get(chunk.group()); state.ordinal++; if (chunk.hasMore()) state.next=chunk.upperExclusive(); else if (++state.columnIndex==state.columns.size()) state.complete=true; else state.next=definition.groupScope(chunk.group(),state.column()).lowerInclusive(); pending=null; if (progress.values().stream().allMatch(p -> p.complete)) phase=Phase.MATERIALIZED; }
     /** READY additionally certifies original gate release and explicit owner-pin settlement. */
     public void markReady(RatisDurableSnapshot.Snapshot source) throws IOException {
         Objects.requireNonNull(source); admit();
         try {
-            if (phase!=Phase.READY && phase!=Phase.MATERIALIZED || !sourceCleanup.isEmpty() || pending!=null || !definition.fence().equals(source.initial().fence()) || source.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !source.releaseRequested() || source.observedHome()==null || source.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE || !Arrays.equals(sourceDecision,source.observedHome().terminalDecision().digest())) throw new IllegalArgumentException("READY requires complete coverage and released original snapshot");
+            if (phase!=Phase.READY && phase!=Phase.MATERIALIZED || !sourceCleanup.isEmpty() || pending!=null || !definition.fence().equals(source.initial().fence()) || source.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !definition.snapshotTtl().equals(source.requestedTtl()) || !source.releaseRequested() || source.observedHome()==null || source.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE || !Arrays.equals(sourceDecision,source.observedHome().terminalDecision().digest())) throw new IllegalArgumentException("READY requires complete coverage and released original snapshot");
             for (var chunk:chunks) verifyArtifact(chunk);
-            var out=output(); out.write(source.observedHome().terminalDecision().digest()); out.writeInt(sourceGroups().size());
+            var out=output(); out.write(sourceDecision); out.writeInt(sourceGroups().size());
             for (var group:sourceGroups()) {
                 var participant=source.participant(group); var token=captures.get(group);
-                if (participant.capture()==null || participant.capture().request().mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !token.equals(participant.captureToken()) || !participant.captureReleased() && !participant.captureReleaseLost()) throw new IllegalArgumentException("READY lacks exact original released capture");
-                ApplyPosition released=sourceRelease(source,group,token); if (!atLeast(released,sourceReleases.get(group))) throw new IllegalArgumentException("Original gate release proof regressed");
+                if (participant.capture()==null || participant.capture().request().mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !definition.snapshotTtl().equals(participant.capture().request().ttl()) || !token.equals(participant.captureToken()) || !participant.captureReleased() && !participant.captureReleaseLost()) throw new IllegalArgumentException("READY lacks exact original released capture");
+                ApplyPosition released=sourceRelease(source,group,token,sourceDecision); if (!atLeast(released,sourceReleases.get(group))) throw new IllegalArgumentException("Original gate release proof regressed");
                 uuid(out,group); out.writeBoolean(participant.captureReleaseLost()); position(out,released);
             }
-            if (phase!=Phase.READY) { append(8,bytes(out)); phase=Phase.READY; }
+            if (phase!=Phase.READY) { append(8,bytes(out)); phase=Phase.READY; } sourceSettled=true;
         } finally { finish(); }
     }
-    public void acknowledge(Chunk chunk) throws IOException { admit(); try { if (phase!=Phase.READY) throw new IllegalStateException("Export ACK requires READY"); String id=hex(hash(chunkBytes(chunk))); if (chunks.stream().noneMatch(saved -> Arrays.equals(uncheckedChunkBytes(saved),uncheckedChunkBytes(chunk)))) throw new IllegalArgumentException("ACK lacks exact published export descriptor"); if (!acknowledged.contains(id)) { if (acknowledged.size()>=chunks.size() || !Arrays.equals(chunkBytes(chunks.get(acknowledged.size())),chunkBytes(chunk))) throw new IllegalStateException("Export acknowledgement must advance the exact published prefix"); append(5,hash(chunkBytes(chunk))); acknowledged.add(id); } } finally { finish(); } }
+    public synchronized boolean sourceSettled() throws IOException { open(); return sourceSettled; }
+    /** Force compact proof after the original read-only source has actually released every gate and pin. */
+    public void confirmSourceSettlement(RatisDurableSnapshot.Snapshot source) throws IOException {
+        Objects.requireNonNull(source); admit();
+        try {
+            if (sourceSettled) return;
+            if (phase!=Phase.CANCELLED && phase!=Phase.SNAPSHOT_LOST && phase!=Phase.RELEASED) throw new IllegalStateException("Source settlement requires terminal export cleanup");
+            var home=source.observedHome();
+            if (!definition.fence().equals(source.initial().fence()) || source.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !definition.snapshotTtl().equals(source.requestedTtl()) || !source.releaseRequested() || home==null || !home.terminal() || !home.consumed() || !home.fence().equals(definition.fence())) throw new IllegalArgumentException("Source settlement lacks original consumed read-only snapshot");
+            byte[] decision=home.terminalDecision().digest(); if (sourceDecision!=null && !Arrays.equals(sourceDecision,decision)) throw new IllegalArgumentException("Source settlement decision changed");
+            var out=output(); out.write(frozenFenceDigest); out.write(definition.sourceIdentity()); out.writeLong(definition.snapshotTtl().toNanos()); out.write(decision); out.writeBoolean(home.phase()==SnapshotFenceStatus.Phase.COMPLETE); out.writeInt(definition.fence().participants().size());
+            for (var frozen:definition.fence().participants()) {
+                var participant=source.participant(frozen.groupId()); var token=participant.captureToken(); var expected=captures.get(frozen.groupId());
+                if (expected!=null && !expected.equals(token)) throw new IllegalArgumentException("Settled original capture changed");
+                if (participant.capture()!=null) {
+                    var request=participant.capture().request();
+                    if (request.mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !definition.snapshotTtl().equals(request.ttl()) || !request.fence().equals(definition.fence()) || token!=null && (!request.owner().equals(token.ownerIncarnation()) || !request.snapshotId().equals(token.snapshotId()))) throw new IllegalArgumentException("Settled capture identity changed");
+                }
+                boolean existed=participant.capture()!=null || token!=null || home.progress(frozen.groupId()).capture()!=null;
+                if (existed && !participant.captureReleased() && !participant.captureReleaseLost()) throw new IllegalArgumentException("Original source pin settlement remains unresolved");
+                var released=sourceRelease(source,frozen.groupId(),token,decision); var previous=sourceReleases.get(frozen.groupId()); if (previous!=null && !atLeast(released,previous)) throw new IllegalArgumentException("Original gate release proof regressed");
+                uuid(out,frozen.groupId()); out.writeBoolean(token!=null); if (token!=null) { uuid(out,token.ownerIncarnation()); uuid(out,token.snapshotId()); position(out,token.position()); }
+                out.writeByte(!existed ? 0 : participant.captureReleaseLost() ? 2 : 1); position(out,released);
+            }
+            byte[] proof=bytes(out); validateSettlement(ByteBuffer.wrap(proof)); append(13,proof); sourceSettled=true;
+        } finally { finish(); }
+    }
+    private void validateSettlement(ByteBuffer in) throws IOException {
+        byte[] cut=new byte[32],identity=new byte[32],decision=new byte[32]; in.get(cut); in.get(identity); long ttl=in.getLong(); in.get(decision); int complete=in.get()&255;
+        if (!Arrays.equals(cut,frozenFenceDigest) || !Arrays.equals(identity,definition.sourceIdentity()) || ttl!=definition.snapshotTtl().toNanos() || complete>1 || sourceDecision!=null && (complete!=1 || !Arrays.equals(sourceDecision,decision)) || in.getInt()!=definition.fence().participants().size()) throw new IOException("Source settlement definition/decision changed");
+        for (var frozen:definition.fence().participants()) {
+            if (!uuid(in).equals(frozen.groupId())) throw new IOException("Source settlement participant changed"); int present=in.get()&255; if (present>1) throw new IOException("Invalid settled capture flag");
+            var token=present==0 ? null : new SnapshotFenceStatus.Capture(uuid(in),uuid(in),position(in)); int disposition=in.get()&255; var released=position(in); var expected=captures.get(frozen.groupId()); var previous=sourceReleases.get(frozen.groupId());
+            if (disposition>2 || disposition==0 && token!=null || disposition==1 && token==null || expected!=null && !expected.equals(token) || released.term()<1 || released.index()<1 || token!=null && (released.index()<=token.position().index() || released.term()<token.position().term()) || previous!=null && !atLeast(released,previous)) throw new IOException("Source settlement gate/pin proof changed");
+        }
+    }
+    public void acknowledge(Chunk chunk) throws IOException {
+        admit();
+        try {
+            if (phase!=Phase.READY) throw new IllegalStateException("Export ACK requires READY");
+            var published=chunkIndex.get(new ChunkKey(chunk.group(),chunk.ordinal()));
+            if (published==null || !sameChunk(published.chunk(),chunk)) throw new IllegalArgumentException("ACK lacks exact published export descriptor");
+            if (!acknowledged.contains(published.id())) {
+                if (acknowledged.size()>=chunks.size() || !sameChunk(chunks.get(acknowledged.size()),chunk)) throw new IllegalStateException("Export acknowledgement must advance the exact published prefix");
+                append(5,published.digest()); acknowledged.add(published.id());
+            }
+        } finally { finish(); }
+    }
+    private static boolean sameChunk(Chunk a,Chunk b) {
+        return a==b || a.jobId.equals(b.jobId) && a.group.equals(b.group) && a.rangeEpoch==b.rangeEpoch && a.cut.equals(b.cut) && a.ordinal==b.ordinal && a.column.equals(b.column)
+                && Arrays.equals(a.lowerInclusive,b.lowerInclusive) && Arrays.equals(a.upperExclusive,b.upperExclusive) && Arrays.equals(a.sha256,b.sha256)
+                && a.rows==b.rows && a.payloadBytes==b.payloadBytes && a.fileBytes==b.fileBytes && Objects.equals(a.file,b.file) && a.hasMore==b.hasMore;
+    }
     public void failSnapshotLost() throws IOException {
         admit();
         try {
@@ -255,12 +325,13 @@ public final class RatisExportJournal implements AutoCloseable {
             case 7 -> { if (phase!=Phase.READY && phase!=Phase.SNAPSHOT_LOST && phase!=Phase.CANCELLED || phase==Phase.READY && acknowledged.size()!=chunks.size()) throw new IOException("Invalid export release transition"); phase=Phase.RELEASED; }
             case 8 -> {
                 if (phase!=Phase.MATERIALIZED || !sourceCleanup.isEmpty() || pending!=null) throw new IOException("Export READY precedes complete materialization"); byte[] decision=new byte[32]; in.get(decision); if (!Arrays.equals(decision,sourceDecision) || in.getInt()!=sourceGroups().size()) throw new IOException("Export READY participant count differs");
-                for (var group:sourceGroups()) { if (!group.equals(uuid(in))) throw new IOException("Export READY participant changed"); int lost=in.get() & 255; var release=position(in); var token=captures.get(group); if (lost>1 || !atLeast(release,sourceReleases.get(group)) || release.index()<=token.position().index() || release.term()<token.position().term()) throw new IOException("Export READY release/capture proof differs"); } phase=Phase.READY;
+                for (var group:sourceGroups()) { if (!group.equals(uuid(in))) throw new IOException("Export READY participant changed"); int lost=in.get() & 255; var release=position(in); var token=captures.get(group); if (lost>1 || !atLeast(release,sourceReleases.get(group)) || release.index()<=token.position().index() || release.term()<token.position().term()) throw new IOException("Export READY release/capture proof differs"); } phase=Phase.READY; sourceSettled=true;
             }
             case 9 -> { if (phase==Phase.RELEASED || phase==Phase.CANCELLED || phase==Phase.SNAPSHOT_LOST) throw new IOException("Invalid export cancellation transition"); orphanBytes=in.getLong(); if (orphanBytes<0 || pending==null && orphanBytes!=0) throw new IOException("Invalid cancelled artifact accounting"); phase=Phase.CANCELLED; }
             case 10 -> { if (phase!=Phase.RELEASED || reclaiming || artifactsReclaimed) throw new IOException("Invalid export reclamation intent"); reclaiming=true; }
             case 11 -> { if (phase!=Phase.RELEASED || !reclaiming || artifactsReclaimed) throw new IOException("Invalid export reclamation completion"); reclaiming=false; artifactsReclaimed=true; disk=orphanBytes=0; }
             case 12 -> { if (phase==Phase.CAPTURING || phase==Phase.EXPORTING) throw new IOException("Source cleanup precedes materialization"); var group=uuid(in); if (!sourceCleanup.remove(group)) throw new IOException("Invalid export source cleanup receipt"); }
+            case 13 -> { if (sourceSettled || phase!=Phase.CANCELLED && phase!=Phase.SNAPSHOT_LOST && phase!=Phase.RELEASED) throw new IOException("Invalid source settlement transition"); validateSettlement(in); sourceSettled=true; }
             default -> throw new IOException("Unknown export record kind");
         }
     }
@@ -292,8 +363,8 @@ public final class RatisExportJournal implements AutoCloseable {
     private static NativeRangeSstExport.Limits limits(ByteBuffer in) { return new NativeRangeSstExport.Limits(in.getLong(),in.getLong(),in.getLong(),Duration.ofNanos(in.getLong())); }
     private static byte[] intentBytes(ChunkIntent intent) throws IOException { var out=output(); uuid(out,intent.group()); uuid(out,intent.column()); position(out,intent.cut()); bound(out,intent.scopeStart()); out.writeLong(intent.ordinal()); limits(out,intent.limits()); return bytes(out); }
     private ChunkIntent decodeIntent(ByteBuffer in) throws IOException { return new ChunkIntent(uuid(in),uuid(in),position(in),bound(in),in.getLong(),limits(in)); }
-    private static byte[] definitionBytes(Definition definition) throws IOException { var out=output(); out.writeInt(MAGIC); uuid(out,definition.jobId()); bound(out,definition.fence().encode()); out.writeInt(definition.columns().size()); for (var column:definition.columns()) uuid(out,column); bound(out,definition.sourceJournal().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); out.write(definition.sourceIdentity()); out.writeInt(definition.limits().maximumChunks()); out.writeLong(definition.limits().maximumJournalBytes()); out.writeLong(definition.limits().maximumDiskBytes()); limits(out,definition.limits().chunk()); return bytes(out); }
-    private static Definition decodeDefinition(ByteBuffer in) throws IOException { if (in.getInt()!=MAGIC) throw new IOException("Invalid export definition header"); UUID job=uuid(in); var fence=SnapshotFence.decode(blob(in,SnapshotFence.MAX_BYTES)); int count=in.getInt(); if (count<1 || count>RangeDirectoryCodec.MAX_COLUMNS) throw new IOException("Invalid export column count"); var columns=new ArrayList<UUID>(count); for (int n=0;n<count;n++) columns.add(uuid(in)); if (!columns.equals(selectedColumns(fence,columns))) throw new IOException("Noncanonical export columns"); String source=new String(blob(in,4096),java.nio.charset.StandardCharsets.UTF_8); byte[] identity=new byte[32]; in.get(identity); return new Definition(job,fence,columns,Path.of(source),identity,new Limits(in.getInt(),in.getLong(),in.getLong(),limits(in))); }
+    private static byte[] definitionBytes(Definition definition) throws IOException { var out=output(); out.writeInt(MAGIC); uuid(out,definition.jobId()); bound(out,definition.fence().encode()); out.writeInt(definition.columns().size()); for (var column:definition.columns()) uuid(out,column); bound(out,definition.sourceJournal().toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); out.write(definition.sourceIdentity()); out.writeInt(definition.limits().maximumChunks()); out.writeLong(definition.limits().maximumJournalBytes()); out.writeLong(definition.limits().maximumDiskBytes()); limits(out,definition.limits().chunk()); out.writeLong(definition.snapshotTtl().toNanos()); return bytes(out); }
+    private static Definition decodeDefinition(ByteBuffer in) throws IOException { if (in.getInt()!=MAGIC) throw new IOException("Invalid export definition header"); UUID job=uuid(in); var fence=SnapshotFence.decode(blob(in,SnapshotFence.MAX_BYTES)); int count=in.getInt(); if (count<1 || count>RangeDirectoryCodec.MAX_COLUMNS) throw new IOException("Invalid export column count"); var columns=new ArrayList<UUID>(count); for (int n=0;n<count;n++) columns.add(uuid(in)); if (!columns.equals(selectedColumns(fence,columns))) throw new IOException("Noncanonical export columns"); String source=new String(blob(in,4096),java.nio.charset.StandardCharsets.UTF_8); byte[] identity=new byte[32]; in.get(identity); return new Definition(job,fence,columns,Path.of(source),identity,new Limits(in.getInt(),in.getLong(),in.getLong(),limits(in)),Duration.ofNanos(in.getLong())); }
     private static byte[] chunkBytes(Chunk chunk) throws IOException { var out=output(); uuid(out,chunk.jobId()); uuid(out,chunk.group()); out.writeLong(chunk.rangeEpoch()); position(out,chunk.cut()); out.writeLong(chunk.ordinal()); uuid(out,chunk.column()); bound(out,chunk.lowerInclusive()); bound(out,chunk.upperExclusive()); out.write(chunk.sha256()); out.writeLong(chunk.rows()); out.writeLong(chunk.payloadBytes()); out.writeLong(chunk.fileBytes()); out.writeBoolean(chunk.hasMore()); return bytes(out); }
     private byte[] uncheckedChunkBytes(Chunk chunk) { try { return chunkBytes(chunk); } catch (IOException impossible) { throw new java.io.UncheckedIOException(impossible); } }
     private Chunk decodeChunk(ByteBuffer in) throws IOException { UUID job=uuid(in),group=uuid(in); long epoch=in.getLong(); var cut=position(in); long ordinal=in.getLong(); UUID column=uuid(in); byte[] lower=bound(in),upper=bound(in),hash=new byte[32]; in.get(hash); long rows=in.getLong(),payload=in.getLong(),file=in.getLong(); int more=in.get() & 255; if (more>1) throw new IOException("Invalid export continuation"); var intent=new ChunkIntent(group,column,cut,lower,ordinal,definition.limits().chunk()); return new Chunk(job,group,epoch,cut,ordinal,column,lower,upper,hash,rows,payload,file,rows==0 ? null : artifactPath(intent),more==1); }

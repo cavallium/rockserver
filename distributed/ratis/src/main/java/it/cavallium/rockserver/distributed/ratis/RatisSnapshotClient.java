@@ -73,10 +73,15 @@ public final class RatisSnapshotClient implements AutoCloseable {
         if (mode!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IOException("Mutable frontend cannot reopen its prefix");
         long deadline=scheduler.resolveMonotonicDeadline(context); var lease=admit(path,null,null,RatisDurableSnapshot.MAX_BYTES,expected); lease.beginAcquire(context,deadline); return lease;
     }
+    /** Plan only against cached placement; performs no journal I/O, allocation or RPC. */
+    public RatisSnapshotPlan plan(Identity identity,TransactionScope scope) {
+        Objects.requireNonNull(identity); Objects.requireNonNull(scope);
+        var home=homes.route(identity.fence());
+        return RatisSnapshotPlan.create(data.directory(),scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
+    }
     public Lease open(Path path,Identity identity,TransactionScope scope,Duration ttl,RequestContext context) throws IOException {
         long deadline=scheduler.resolveMonotonicDeadline(context); Objects.requireNonNull(identity); validateTtl(ttl);
-        var home=homes.route(identity.fence());
-        var plan=RatisSnapshotPlan.create(data.directory(),scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
+        var plan=plan(identity,scope);
         long bytes=64*1024L+3L*plan.fence().encode().length+128*1024L*plan.routes().size(); for (var route:plan.routes()) bytes+=2L*SessionWindowJournal.routeSize(route);
         if (bytes>RatisDurableSnapshot.MAX_BYTES) throw new IOException("Snapshot retained metadata exceeds journal capacity");
         var lease=admit(path,plan,ttl,bytes,null); lease.beginAcquire(context,deadline); return lease;

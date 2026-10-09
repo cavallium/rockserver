@@ -22,7 +22,7 @@ class RatisExportWorkflowTest {
         var scope=new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))); var home=f.snapshots.route(identity.fence());
         var plan=RatisSnapshotPlan.create(f.directory,scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
         var chunk=new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport.Limits(1,1024,1024*1024,Duration.ofSeconds(5));
-        return new RatisExportJournal.Definition(new UUID(250,1),plan.fence(),List.of(column),source,MessageDigest.getInstance("SHA-256").digest(plan.fence().encode()),new RatisExportJournal.Limits(16,16*1024*1024,16*1024*1024,chunk));
+        return new RatisExportJournal.Definition(new UUID(250,1),plan.fence(),List.of(column),source,MessageDigest.getInstance("SHA-256").digest(plan.fence().encode()),new RatisExportJournal.Limits(16,16*1024*1024,16*1024*1024,chunk),java.time.Duration.ofSeconds(60));
     }
     static RatisSnapshotClient.Identity identity(RatisAtomicClientTest.Fixture f) { return new RatisSnapshotClient.Identity(new UUID(250,2),new OperationId(f.session,1,0),new OperationId(f.session,1,1)); }
     static RatisExportJournal.Chunk export(RatisExportJournal journal,RatisAtomicClientTest.Fixture f,UUID group) throws Exception {
@@ -50,7 +50,7 @@ class RatisExportWorkflowTest {
         Path directory=Files.createDirectories(root.resolve("job")),source=directory.resolve("source.snapshot"),journalFile=directory.resolve("export.log"),target=root.resolve("destination");
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("source"),true); var snapshots=new RatisSnapshotClient(f.schema,f.snapshots,f.data,f.scheduler,RatisSnapshotClient.Limits.defaults()); var journal=RatisExportJournal.create(journalFile,definition(f,source))) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(4),value(2),1901); seed(f,71,key(200),value(3),1902);
-            var lease=snapshots.open(source,identity(f),RatisSnapshotPlan.scope(journal.snapshot().definition().fence()),Duration.ofSeconds(30),RequestContext.batch()); await(lease.completion()); journal.bindSource(lease.snapshot()); int captureRequests=f.captureRequests.get();
+            var lease=snapshots.open(source,identity(f),RatisSnapshotPlan.scope(journal.snapshot().definition().fence()),journal.snapshot().definition().snapshotTtl(),RequestContext.batch()); await(lease.completion()); journal.bindSource(lease.snapshot()); int captureRequests=f.captureRequests.get();
             seed(f,71,key(4),value(9),1903);
             for (var participant:journal.snapshot().definition().fence().participants()) {
                 RatisExportJournal.Chunk chunk; do { chunk=export(journal,f,participant.groupId()); } while (chunk.hasMore());
@@ -78,7 +78,7 @@ class RatisExportWorkflowTest {
         Path directory=Files.createDirectories(root.resolve("lost-job")),source=directory.resolve("source.snapshot"),journalFile=directory.resolve("export.log");
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("lost-source"),true); var snapshots=new RatisSnapshotClient(f.schema,f.snapshots,f.data,f.scheduler,RatisSnapshotClient.Limits.defaults()); var journal=RatisExportJournal.create(journalFile,definition(f,source))) {
             seed(f,71,key(2),value(1),1900); seed(f,71,key(4),value(2),1901); seed(f,71,key(200),value(3),1902);
-            var lease=snapshots.open(source,identity(f),RatisSnapshotPlan.scope(journal.snapshot().definition().fence()),Duration.ofSeconds(30),RequestContext.batch()); await(lease.completion()); journal.bindSource(lease.snapshot()); int captureRequests=f.captureRequests.get();
+            var lease=snapshots.open(source,identity(f),RatisSnapshotPlan.scope(journal.snapshot().definition().fence()),journal.snapshot().definition().snapshotTtl(),RequestContext.batch()); await(lease.completion()); journal.bindSource(lease.snapshot()); int captureRequests=f.captureRequests.get();
             UUID group=f.groups.getFirst(); assertTrue(export(journal,f,group).hasMore()); f.machines.get(group).releaseSnapshotPin(journal.snapshot().captures().get(group));
             assertThrows(RatisSnapshotLostException.class,() -> export(journal,f,group)); journal.failSnapshotLost();
             assertEquals(RatisExportJournal.Phase.SNAPSHOT_LOST,journal.snapshot().phase()); assertEquals(1,journal.snapshot().chunks().size()); assertEquals(captureRequests,f.captureRequests.get()); assertEquals(0,f.opens.get());

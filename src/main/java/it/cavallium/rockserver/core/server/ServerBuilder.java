@@ -14,6 +14,7 @@ public class ServerBuilder {
 	private HostAndPort http2Address;
 	private boolean useThrift;
 	private RocksDBConnection client;
+	private it.cavallium.rockserver.core.common.export.ExportAsyncAPI exports;
 
 	public void setUnixSocket(UnixDomainSocketAddress address) {
 		this.unixAddress = address;
@@ -35,15 +36,20 @@ public class ServerBuilder {
 		this.client = client;
 	}
 
+	/** Borrow an optional export route; this builder and the server do not close it. */
+	public void setExportAPI(it.cavallium.rockserver.core.common.export.ExportAsyncAPI exports) {
+		this.exports = exports;
+	}
+
 	public Server build() throws IOException {
 		if (http2Address != null) {
 			if (useThrift) {
-				return new ThriftServer(client, http2Address.host(), http2Address.port());
+				return new ThriftServer(client, http2Address.host(), http2Address.port(), exports);
 			} else {
-				return new GrpcServer(client, new InetSocketAddress(http2Address.host(), http2Address.port()));
+				return new GrpcServer(client, new InetSocketAddress(http2Address.host(), http2Address.port()), exports);
 			}
 		} else if (unixAddress != null) {
-			return new GrpcServer(client, new DomainSocketAddress(unixAddress.getPath().toFile()));
+			return new GrpcServer(client, new DomainSocketAddress(unixAddress.getPath().toFile()), exports);
 		} else if (iNetAddress != null) {
 			throw new UnsupportedOperationException("Not implemented: inet address");
 		} else {

@@ -1,0 +1,74 @@
+syntax = "proto3";
+package it.cavallium.rockserver.core.common.api.export.proto;
+option java_multiple_files = true;
+import "rocksdb.proto";
+import "google/protobuf/empty.proto";
+
+message ExportLimits {
+  int32 maximum_chunks = 1;
+  int64 maximum_journal_bytes = 2;
+  int64 maximum_disk_bytes = 3;
+  int32 maximum_rows = 4;
+  int64 maximum_payload_bytes = 5;
+  int64 maximum_file_bytes = 6;
+  int64 maximum_chunk_duration_nanos = 7;
+  int64 snapshot_ttl_millis = 8;
+}
+message ExportCreateRequest {
+  bytes request_id = 1;
+  repeated int64 columns = 2;
+  ExportLimits limits = 3;
+  it.cavallium.rockserver.core.common.api.proto.RequestContext context = 4;
+}
+message ExportJobRequest {
+  bytes job_id = 1;
+  it.cavallium.rockserver.core.common.api.proto.RequestContext context = 2;
+}
+enum ExportPhase { CAPTURING = 0; EXPORTING = 1; MATERIALIZED = 2; READY = 3; SNAPSHOT_LOST = 4; CANCELLED = 5; RELEASED = 6; }
+message ExportStatus {
+  bytes job_id = 1; ExportPhase phase = 2; repeated int64 columns = 3;
+  int32 participant_count = 4; int32 chunk_count = 5; int32 acknowledged_count = 6;
+  int64 file_bytes = 7; bool cleanup_pending = 8;
+}
+message ExportChunkId {
+  bytes job_id = 1; bytes group_id = 2; bytes range_lineage = 3;
+  int64 range_epoch = 4; int64 snapshot_term = 5; int64 snapshot_index = 6;
+  int64 ordinal = 7; bytes content_hash = 8;
+}
+message ExportChunk {
+  ExportChunkId id = 1; int64 column_id = 2;
+  optional bytes lower_inclusive = 3; optional bytes upper_exclusive = 4;
+  int64 rows = 5; int64 payload_bytes = 6; int64 file_bytes = 7; bool has_more = 8;
+}
+message ExportManifestRequest {
+  bytes job_id = 1; int32 offset = 2; int32 maximum_items = 3; int32 maximum_bytes = 4;
+  it.cavallium.rockserver.core.common.api.proto.RequestContext context = 5;
+}
+message ExportManifestPage { repeated ExportChunk chunks = 1; int32 next = 2; bool has_more = 3; }
+message ExportReadRequest {
+  ExportChunkId id = 1; int64 offset = 2; int32 maximum_bytes = 3;
+  it.cavallium.rockserver.core.common.api.proto.RequestContext context = 4;
+}
+message ExportFilePage { ExportChunkId id = 1; int64 offset = 2; bytes data = 3; bool has_more = 4; }
+message ExportAcknowledgeRequest {
+  ExportChunkId id = 1;
+  it.cavallium.rockserver.core.common.api.proto.RequestContext context = 2;
+}
+enum ExportRawScanMode { IMMUTABLE_EXPORT_JOBS = 0; }
+message ExportCapabilities {
+  bool available = 1; ExportRawScanMode raw_scan_mode = 2;
+  int32 maximum_columns = 3; int32 maximum_chunks = 4; int32 maximum_manifest_items = 5;
+  int32 maximum_manifest_bytes = 6; int32 maximum_file_page_bytes = 7;
+}
+service RocksDBExportService {
+  rpc CreateExport(ExportCreateRequest) returns (.it.cavallium.rockserver.core.common.api.export.proto.ExportStatus);
+  rpc RecoverExport(ExportJobRequest) returns (.it.cavallium.rockserver.core.common.api.export.proto.ExportStatus);
+  rpc StepExport(ExportJobRequest) returns (.it.cavallium.rockserver.core.common.api.export.proto.ExportStatus);
+  rpc ExportStatus(ExportJobRequest) returns (.it.cavallium.rockserver.core.common.api.export.proto.ExportStatus);
+  rpc ExportManifest(ExportManifestRequest) returns (ExportManifestPage);
+  rpc ReadExport(ExportReadRequest) returns (ExportFilePage);
+  rpc AcknowledgeExport(ExportAcknowledgeRequest) returns (google.protobuf.Empty);
+  rpc ReleaseExport(ExportJobRequest) returns (google.protobuf.Empty);
+  rpc CancelExport(ExportJobRequest) returns (google.protobuf.Empty);
+  rpc GetExportCapabilities(google.protobuf.Empty) returns (ExportCapabilities);
+}

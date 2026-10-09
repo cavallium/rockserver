@@ -40,11 +40,25 @@
 //! }
 //! ```
 
-pub mod proto {
-    #![allow(clippy::all)] // Suppress warnings in generated code
-    #![allow(non_camel_case_types)]
-    tonic::include_proto!("it.cavallium.rockserver.core.common.api.proto");
+// Preserve the protobuf package hierarchy for cross-package RequestContext references.
+mod generated {
+    pub mod api {
+        pub mod proto {
+            #![allow(clippy::all, non_camel_case_types)]
+            tonic::include_proto!("it.cavallium.rockserver.core.common.api.proto");
+        }
+        pub mod export {
+            pub mod proto {
+                #![allow(clippy::all, non_camel_case_types)]
+                tonic::include_proto!("it.cavallium.rockserver.core.common.api.export.proto");
+            }
+        }
+    }
 }
+pub use generated::api::export::proto as export_proto;
+pub use generated::api::proto;
+pub mod export;
+pub use export::ExportClient;
 
 mod client;
 mod types;

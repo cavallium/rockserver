@@ -25,7 +25,7 @@ class RatisExportClientTest {
         var id=RatisExportWorkflowTest.identity(f); var column=f.schema.column(71).columnId(); var home=f.snapshots.route(id.fence());
         var plan=RatisSnapshotPlan.create(f.directory,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
         var limits=new RatisExportJournal.Limits(16,16L*1024*1024,16L*1024*1024,new NativeRangeSstExport.Limits(1,1024,1024*1024,Duration.ofSeconds(5)));
-        return new RatisExportJournal.Definition(new UUID(270,1),plan.fence(),List.of(column),journal,source.identityDigest(),limits);
+        return new RatisExportJournal.Definition(new UUID(270,1),plan.fence(),List.of(column),journal,source.identityDigest(),limits,java.time.Duration.ofSeconds(60));
     }
     static void seed(Fixture f) throws Exception {
         RatisRocksDBAdapterTest.seed(f,71,key(2),value(1),1900); RatisRocksDBAdapterTest.seed(f,71,key(4),value(2),1901); RatisRocksDBAdapterTest.seed(f,71,key(200),value(3),1902);
@@ -156,7 +156,7 @@ class RatisExportClientTest {
             seed(f); var directory=Files.createDirectory(root.resolve("missing-job")); var sourcePath=directory.resolve("source.snapshot"); var path=directory.resolve("export.log"); var definition=definition(f,source,sourcePath);
             byte[] original;
             try (var journal=RatisExportJournal.create(path,definition)) {
-                var lease=source.openFrozen(sourcePath,definition.fence(),Duration.ofSeconds(30),RequestContext.batch()); await(lease.completion()); journal.bindSource(lease.snapshot());
+                var lease=source.openFrozen(sourcePath,definition.fence(),definition.snapshotTtl(),RequestContext.batch()); await(lease.completion()); journal.bindSource(lease.snapshot());
                 assertTrue(RatisExportWorkflowTest.export(journal,f,f.groups.getFirst()).hasMore()); original=Files.readAllBytes(sourcePath); lease.close();
             }
             Files.delete(sourcePath); int calls=f.rpcs.get(),captures=f.captureRequests.get();
@@ -174,9 +174,9 @@ class RatisExportClientTest {
             try (var first=client.create(one,definition,RequestContext.batch())) {
                 await(first.completion()); byte[] original=Files.readAllBytes(one);
                 assertThrows(IOException.class,() -> client.reopen(sourcePath,RequestContext.batch()));
-                var overlapping=new RatisExportJournal.Definition(new UUID(270,3),definition.fence(),definition.columns(),one,definition.sourceIdentity(),definition.limits());
+                var overlapping=new RatisExportJournal.Definition(new UUID(270,3),definition.fence(),definition.columns(),one,definition.sourceIdentity(),definition.limits(),java.time.Duration.ofSeconds(60));
                 assertThrows(IOException.class,() -> client.create(two,overlapping,RequestContext.batch())); assertFalse(Files.exists(two)); assertArrayEquals(original,Files.readAllBytes(one));
-                try (var saved=RatisExportJournal.create(two,new RatisExportJournal.Definition(new UUID(270,4),definition.fence(),definition.columns(),sourcePath,definition.sourceIdentity(),definition.limits()))) { }
+                try (var saved=RatisExportJournal.create(two,new RatisExportJournal.Definition(new UUID(270,4),definition.fence(),definition.columns(),sourcePath,definition.sourceIdentity(),definition.limits(),java.time.Duration.ofSeconds(60)))) { }
                 int calls=f.rpcs.get(); var failed=client.reopen(two,RequestContext.batch()); assertThrows(ExecutionException.class,() -> await(failed.completion()));
                 assertThrows(ExecutionException.class,() -> await(failed.step(RequestContext.batch()))); assertEquals(calls,f.rpcs.get()); failed.close(); assertEquals(1,client.stats().jobs());
             }
@@ -202,7 +202,7 @@ class RatisExportClientTest {
             seed(f); var directory=Files.createDirectory(root.resolve("exclusive-job")); var definition=definition(f,source,directory.resolve("source.snapshot"));
             try (var client=new RatisExportClient(source,f.scheduler,nativeWriter(f,definition,executor),RatisExportClient.Limits.defaults()); var job=client.create(directory.resolve("one.log"),definition,RequestContext.batch())) {
                 await(job.completion()); await(job.step(RequestContext.batch())); int calls=f.rpcs.get();
-                var duplicate=new RatisExportJournal.Definition(new UUID(270,2),definition.fence(),definition.columns(),definition.sourceJournal(),definition.sourceIdentity(),definition.limits());
+                var duplicate=new RatisExportJournal.Definition(new UUID(270,2),definition.fence(),definition.columns(),definition.sourceJournal(),definition.sourceIdentity(),definition.limits(),java.time.Duration.ofSeconds(60));
                 assertThrows(IOException.class,() -> client.create(directory.resolve("two.log"),duplicate,RequestContext.batch())); assertEquals(calls,f.rpcs.get()); assertEquals(1,client.stats().jobs());
                 assertArrayEquals(new byte[]{1},await(source.lease(definition.sourceJournal()).get(71,key(2),RequestContext.batch())).toByteArray()); await(job.cancel(RequestContext.batch()));
             }
