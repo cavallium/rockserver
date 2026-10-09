@@ -333,6 +333,65 @@ class CompactionIoIntegrationTest {
             assertNotNull(reopened.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10))));
         }
     }
+    @Test void realBulkSamplerAndCollectorPreserveIndependentKeys(@TempDir Path root) throws Exception {
+        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        try (var connection = new EmbeddedConnection(root.resolve("bulk-feedback"), "bulk-feedback", config(root, ""))) {
+            var internal = connection.getInternalDB();
+            ((io.micrometer.core.instrument.composite.CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
+            var api = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)));
+            var column = connection.getSyncApi(RequestContext.batch()).createColumn("bulk-data",
+                    ColumnSchema.of(IntList.of(2), ObjectList.of(), true));
+            var keys = new java.util.ArrayList<Keys>();
+            for (int i = 0; i < 72; i++) {
+                var key = new Keys(Buf.wrap(new byte[]{0, (byte) i})); keys.add(key);
+                api.put(0, column, key, Buf.wrap(new byte[]{(byte) i}), RequestType.none());
+            }
+            connection.getSyncApi(RequestContext.batch()).flush();
+            for (int i = 0; i < 64; i++) assertTrue(api.existsMulti(0, column, keys).stream().allMatch(Boolean::booleanValue));
+            var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
+            var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
+            var controller = controllerField.get(internal);
+            var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
+            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
+            var sampleMethod = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            sampleMethod.setAccessible(true);
+            var collectorField = internal.getClass().getDeclaredField("rocksDBStatistics"); collectorField.setAccessible(true);
+            var collector = collectorField.get(internal);
+            var threadField = collector.getClass().getDeclaredField("executor"); threadField.setAccessible(true);
+            var thread = (Thread) threadField.get(collector);
+            var counter = registry.get("rocksdb.statistics").tag("ticker_name", "NUMBER_MULTIGET_KEYS_READ").counter();
+            try (var statistics = ((org.rocksdb.DBOptions) optionsField.get(internal)).statistics()) {
+                var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
+                long nativeKeys = statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ);
+                assertEquals(64L * keys.size(), nativeKeys);
+                assertTrue(histogram.getCount() >= 64); assertTrue(histogram.getSum() > 0);
+                for (int cycle = 0; cycle < 2; cycle++) {
+                    thread.interrupt();
+                    assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                        while (counter.count() < nativeKeys) Thread.sleep(10);
+                    });
+                    assertEquals(nativeKeys, counter.count());
+                    assertEquals(nativeKeys, statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ));
+                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+                    assertEquals(nativeKeys, sample.bulkKeys()); assertEquals(histogram.getCount(), sample.bulkCount());
+                    assertTrue(sample.bulkMicros() > 0); assertTrue(sample.readWorkers() > 0);
+                    assertEquals(0, sample.latencyReadQueued());
+                    assertFalse(sample.bulkPending());
+                }
+            }
+            var activeField = internal.getClass().getDeclaredField("activeNativeMultiGets");
+            activeField.setAccessible(true);
+            var active = (java.util.concurrent.atomic.AtomicInteger) activeField.get(internal);
+            assertEquals(0, active.get());
+            internal.setExistsMultiChunkObserverForTesting(() -> { throw new IllegalStateException("after native batch"); });
+            try { assertThrows(RuntimeException.class, () -> api.existsMulti(0, column, keys)); }
+            finally { internal.setExistsMultiChunkObserverForTesting(null); }
+            assertEquals(0, active.get(), "exceptional batch cleanup must not retain native bulk ownership");
+            assertTrue(api.existsMulti(0, column, keys).stream().allMatch(Boolean::booleanValue));
+            assertEquals(0, active.get());
+        } finally { registry.close(); }
+    }
+
     @Test void effectiveDirectReadGateIgnoresGenericDirectWritesAndHonorsExplicitZero(@TempDir Path root) throws Exception {
         for (boolean direct : new boolean[]{false, true}) {
             for (String ceiling : new String[]{"0", "16MiB"}) {

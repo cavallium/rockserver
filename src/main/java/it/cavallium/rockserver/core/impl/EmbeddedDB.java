@@ -360,6 +360,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final NonBlockingHashMapLong<REntry<RocksIterator>> its;
 	private final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
 	private final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
+	private final AtomicInteger activeNativeMultiGets = new AtomicInteger();
 	private final RetainedQueryLimiter retainedQueryLimiter;
 	private final AtomicLong cdcPublishedTailSequence = new AtomicLong();
 	private final ConcurrentMap<String, CdcSubscriptionProgress> cdcSubscriptionProgress = new ConcurrentHashMap<>();
@@ -853,8 +854,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				} catch (org.github.gestalt.config.exceptions.GestaltException failure) {
 					throw new RuntimeException("Failed to read adaptive readahead ceiling", failure);
 				}
+				var readPoolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
 				compactionIoController = new CompactionIoController(name, loadedDb.compactionIoLimiter(),
-						() -> sampleCompactionIo(loadedDb.compactionIoLimiter()), metrics.getRegistry(),
+						() -> sampleCompactionIo(loadedDb.compactionIoLimiter(), readPoolTelemetry), metrics.getRegistry(),
 						readaheadCeiling, this::applyCompactionReadahead);
 			} catch (RuntimeException | Error failure) {
 				try { close(); } catch (Throwable cleanupFailure) { failure.addSuppressed(cleanupFailure); }
@@ -2212,7 +2214,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			observer.accept(nativeKeys.length, probeBytes);
 		}
-		return db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, nativeValues);
+		activeNativeMultiGets.incrementAndGet();
+		try {
+			return db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, nativeValues);
+		} finally { activeNativeMultiGets.decrementAndGet(); }
 	}
 
 	private static void setBucketDecision(BucketWriteElisionProbe group,
@@ -3111,6 +3116,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter) {
+		return sampleCompactionIo(limiter, new long[RWScheduler.POOL_TELEMETRY_LENGTH]);
+	}
+
+	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter, long[] readPoolTelemetry) {
 		ops.beginOp();
 		boolean stopped = false;
 		boolean pressure = false;
@@ -3145,6 +3154,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.READ_BLOCK_GET_MICROS);
 				var compactionReads = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_MICROS);
 				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
+				var bulk = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
+				scheduler.copyPoolTelemetry(RWScheduler.Pool.READ, readPoolTelemetry);
 				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
 						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
 				boolean foregroundPending = ops.getPendingOpsCount() > 1;
@@ -3157,7 +3168,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ)
 								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure,
 						statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES),
-						compactionReads.getSum(), compactionReads.getCount(), prefetch.getCount(), prefetch.getSum());
+						compactionReads.getSum(), compactionReads.getCount(), prefetch.getCount(), prefetch.getSum(),
+						bulk.getCount(), bulk.getSum(), statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ),
+						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT],
+						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS],
+						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
+						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS],
+						activeNativeMultiGets.get() > 0 || !activeExistsMultiRequests.isEmpty());
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {
@@ -6140,9 +6158,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var columnHandles = List.of(col.cfh());
 			var sample = sampleLatency ? existsMultiPerfSampler.begin(nativeDb) : null;
 			List<org.rocksdb.ByteBufferGetStatus> statuses;
+			activeNativeMultiGets.incrementAndGet();
 			try {
 				statuses = nativeDb.multiGetByteBuffers(readOptions, columnHandles, nativeKeys, emptyValues);
 			} finally {
+				activeNativeMultiGets.decrementAndGet();
 				if (sample != null) existsMultiPerfSampler.finish(sample);
 			}
 			var result = new ArrayList<Boolean>(statuses.size());
@@ -6172,13 +6192,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
 		var nativeKeys = calculatedKeys.stream().map(Buf::toByteArray).toList();
 		List<byte[]> values;
-		if (tx == null) {
-			values = db.get().multiGetAsList(readOptions,
-					Collections.nCopies(nativeKeys.size(), col.cfh()),
-					nativeKeys);
-		} else {
-			values = tx.val().multiGetAsList(readOptions, col.cfh(), nativeKeys);
-		}
+		activeNativeMultiGets.incrementAndGet();
+		try {
+			if (tx == null) {
+				values = db.get().multiGetAsList(readOptions,
+						Collections.nCopies(nativeKeys.size(), col.cfh()),
+						nativeKeys);
+			} else {
+				values = tx.val().multiGetAsList(readOptions, col.cfh(), nativeKeys);
+			}
+		} finally { activeNativeMultiGets.decrementAndGet(); }
 
 		var result = new ArrayList<Boolean>(values.size());
 		for (int i = 0; i < values.size(); i++) {
@@ -11752,11 +11775,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			resolutionObserver.run();
 		}
 		final List<byte[]> resolvedValues;
+		activeNativeMultiGets.incrementAndGet();
 		try {
 			resolvedValues = db.get().multiGetAsList(cfHandles, keysToResolve);
 		} catch (org.rocksdb.RocksDBException error) {
 			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, error);
-		}
+		} finally { activeNativeMultiGets.decrementAndGet(); }
 
 		int resolutionIndex = 0;
 		long transformedBytes = 0L;
