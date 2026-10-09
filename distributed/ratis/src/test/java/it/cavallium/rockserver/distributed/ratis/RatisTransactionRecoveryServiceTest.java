@@ -27,6 +27,56 @@ class RatisTransactionRecoveryServiceTest {
             assertThrows(ExecutionException.class,() -> service.tick().get(5,TimeUnit.SECONDS));
         } finally { release.countDown(); service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
     }
+    private static void rejected(CompletableFuture<?> view,String message) throws Exception {
+        var failure=assertThrows(ExecutionException.class,() -> view.get(5,TimeUnit.SECONDS));
+        assertInstanceOf(RejectedExecutionException.class,failure.getCause()); assertEquals(message,failure.getCause().getMessage());
+    }
+    @Test void blockedQuantumBoundsTickAndDrainViewsEvenWhenCallersCancelOrFloodTimers() throws Exception {
+        var scheduler=scheduler(); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var calls=new java.util.concurrent.atomic.AtomicInteger();
+        var service=new RatisTransactionRecoveryService(scheduler,() -> {
+            calls.incrementAndGet(); entered.countDown(); if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Fixture timeout");
+        });
+        try {
+            var views=new ArrayList<CompletableFuture<Void>>(); views.add(service.tick()); assertTrue(entered.await(5,TimeUnit.SECONDS));
+            for (int i=1;i<RatisTransactionRecoveryService.MAX_WAITERS;i++) views.add(service.tick());
+            var active=RatisTransactionRecoveryService.class.getDeclaredField("active"); active.setAccessible(true); var task=active.get(service);
+            var resultField=task.getClass().getDeclaredField("result"); resultField.setAccessible(true);
+            var result=(CompletableFuture<?>)resultField.get(task); int observers=result.getNumberOfDependents();
+            assertEquals(RatisTransactionRecoveryService.MAX_WAITERS,observers);
+            for (var view:views) assertTrue(view.cancel(false));
+            var timer=new RatisSessionClockServiceTest.ManualTimer(); service.start(timer,Duration.ofSeconds(1));
+            for (int i=0;i<100;i++) { timer.fire(); rejected(service.tick(),"Recovery tick waiter capacity exhausted"); }
+            assertEquals(observers,result.getNumberOfDependents()); assertEquals(0,scheduler.queuedTasks(WorkloadProfile.CONTROL));
+            for (int i=0;i<RatisTransactionRecoveryService.MAX_WAITERS;i++) {
+                var drain=service.stop(); assertFalse(drain.isDone()); assertTrue(drain.cancel(false));
+            }
+            for (int i=0;i<100;i++) rejected(service.stop(),"Recovery drain waiter capacity exhausted");
+            assertTrue(timer.cancelled); assertEquals(1,calls.get());
+            release.countDown(); idle(scheduler); service.stop().get(5,TimeUnit.SECONDS); assertNull(service.lastFailure());
+        } finally { release.countDown(); idle(scheduler); service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
+    }
+    @Test void resultAndStopCallbacksCanReenterWithoutDonatingActualTaskOwnership() throws Exception {
+        for (boolean stopBeforeReturn:new boolean[]{false,true}) {
+            var scheduler=scheduler(); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var calls=new java.util.concurrent.atomic.AtomicInteger();
+            var service=new RatisTransactionRecoveryService(scheduler,() -> {
+                calls.incrementAndGet(); entered.countDown(); if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Fixture timeout");
+            });
+            try {
+                var first=service.tick(); assertTrue(entered.await(5,TimeUnit.SECONDS));
+                var callback=first.thenRun(() -> {
+                    assertFalse(Thread.holdsLock(service));
+                    if (stopBeforeReturn) assertTrue(service.tick().isCompletedExceptionally());
+                    else service.tick().join(); // completion publication still coalesces into this actual task
+                    service.stop().thenRun(() -> { assertFalse(Thread.holdsLock(service)); service.stop().join(); }).join();
+                    assertEquals(1,calls.get());
+                });
+                var drainCallback=stopBeforeReturn ? service.stop().thenRun(() -> {
+                    assertFalse(Thread.holdsLock(service)); service.stop().join(); assertTrue(service.tick().isCompletedExceptionally());
+                }) : CompletableFuture.<Void>completedFuture(null);
+                release.countDown(); callback.get(5,TimeUnit.SECONDS); drainCallback.get(5,TimeUnit.SECONDS); idle(scheduler); assertEquals(1,calls.get());
+            } finally { release.countDown(); idle(scheduler); service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
+        }
+    }
     @Test void timerQuantaFinishRecoveryWithoutConsumingAndRetireCompletedPolling() throws Exception {
         var helper=new RatisTransactionRecoveryTest(); helper.root=root;
         try (var f=helper.new Fixture("timer"); var recovery=f.recovery()) {
@@ -75,8 +125,11 @@ class RatisTransactionRecoveryServiceTest {
         var scheduler=scheduler(); var service=new RatisTransactionRecoveryService(scheduler,List.of(),1); var release=new CountDownLatch(1); int workers=scheduler.poolSnapshot(RWScheduler.Pool.CONTROL).workerCount(); var entered=new CountDownLatch(workers);
         try {
             for (int n=0;n<workers;n++) scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,RequestContext.NO_TIMEOUT).execute(() -> { entered.countDown(); try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }); assertTrue(entered.await(5,TimeUnit.SECONDS));
-            var first=service.tick(); var second=service.tick(); assertEquals(1,scheduler.queuedTasks(WorkloadProfile.CONTROL)); service.stop().get(5,TimeUnit.SECONDS); assertEquals(0,scheduler.queuedTasks(WorkloadProfile.CONTROL));
-            assertThrows(ExecutionException.class,() -> first.get(5,TimeUnit.SECONDS)); assertThrows(ExecutionException.class,() -> second.get(5,TimeUnit.SECONDS));
+            var first=service.tick(); var second=service.tick();
+            for (int i=2;i<RatisTransactionRecoveryService.MAX_WAITERS;i++) assertFalse(service.tick().isDone());
+            assertTrue(first.cancel(false)); rejected(service.tick(),"Recovery tick waiter capacity exhausted");
+            assertEquals(1,scheduler.queuedTasks(WorkloadProfile.CONTROL)); service.stop().get(5,TimeUnit.SECONDS); assertEquals(0,scheduler.queuedTasks(WorkloadProfile.CONTROL));
+            assertThrows(CancellationException.class,() -> first.get(5,TimeUnit.SECONDS)); assertThrows(ExecutionException.class,() -> second.get(5,TimeUnit.SECONDS));
         } finally { release.countDown(); service.stop().get(5,TimeUnit.SECONDS); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); }
     }
 }

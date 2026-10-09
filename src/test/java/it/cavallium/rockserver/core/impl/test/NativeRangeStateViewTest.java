@@ -14,7 +14,7 @@ class NativeRangeStateViewTest {
             assertEquals(CommandResult.Status.SUCCESS,f.apply(NativeSessionBindingTest.bind(ledger,0)));
             try (var old=f.store.capture()) {
                 long sequence=f.db.getLatestSequenceNumber(); var before=old.stateView();
-                assertEquals(new ApplyPosition(1,0),before.applied()); assertEquals(SessionAuthority.from(ledger),before.sessionAuthority());
+                assertEquals(new ApplyPosition(1,0),before.applied()); assertEquals(1,before.minimumSessionEpoch()); assertEquals(SessionAuthority.from(ledger),before.sessionAuthority());
                 assertEquals(NativeSessionBindingTest.GROUP,before.groupId()); assertEquals(NativeSessionBindingTest.DOMAIN,before.domainId());
                 assertEquals(sequence,f.db.getLatestSequenceNumber());
                 var advanced=ledger.advanceTime(50);

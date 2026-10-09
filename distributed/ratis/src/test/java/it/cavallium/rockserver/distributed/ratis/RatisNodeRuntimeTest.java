@@ -58,6 +58,76 @@ class RatisNodeRuntimeTest {
         }
     }
 
+    @Test void defaultLocalHomeTimerRetiresConsumedUserOnlyAfterParticipantFenceExists() throws Exception {
+        var helper=new RatisHomeRolesTest(); helper.root=root;
+        try (var f=helper.new Fixture("automatic-retirement")) {
+            var home=f.plan.home(RatisNodePlan.Role.TRANSACTION_HOME);
+            var homes=new RatisTransactionStatuses(f.clients.get(home.role()),home.column());
+            var initial=f.transaction(); var participant=f.plan.directory().ranges().getFirst();
+            assertEquals(CommandResult.Status.SUCCESS,homes.execute(homes.prepare(new OperationId(helper.session,1,0),null,initial)).status());
+            var aborted=initial.decide(TransactionStatus.Phase.ABORT);
+            homes.execute(homes.prepare(new OperationId(helper.session,1,1),initial,aborted));
+            ParticipantFinalization finalization; ApplyPosition finalized;
+            try (var proposal=f.machine(participant.groupId()).prepareFinalization(homes,initial.transactionId(),new OperationId(new UUID(98,1),0,0))) {
+                finalization=proposal.finalization(); finalized=f.data.executeFinalization(f.data.prepareFinalization(finalization));
+            }
+            var acknowledged=aborted.finalized(participant.groupId());
+            homes.execute(homes.prepare(new OperationId(helper.session,1,2),aborted,acknowledged));
+            var consumed=acknowledged.consume(); homes.execute(homes.prepare(new OperationId(helper.session,1,3),acknowledged,consumed));
+            assertEquals(consumed,homes.read(initial.transactionId()));
+            assertEquals(3,f.env.timer.activePeriods(),"DATA expiry, participant recovery and local HOME retirement timers are activated");
+            var live=f.env.catalogue.epochs.read(); var expired=live.advanceTime(100);
+            f.env.catalogue.epochs.execute(f.env.catalogue.epochs.prepare(f.env.outer.operation(2),live,expired));
+            for (var directory:List.of(f.plan.directory(),home.directory())) {
+                var route=directory.ranges().getFirst();
+                var advance=f.env.catalogue.epochs.prepareAuthorityAdvance(directory,route.groupId(),new OperationId(helper.admin,2,100),-1);
+                f.append(route.groupId(),DistributedCommandCodec.encode(advance));
+            }
+            // This fixture's transport supplies no generic stateView. Seed the real native participant
+            // fence explicitly; automatic HOME retirement must discover and verify that durable proof.
+            f.data.retireParticipant(new ParticipantRetirement(finalization,finalized,consumed));
+            var identity=new ParticipantIdentity(home.directory().ranges().getFirst().groupId(),1,participant.groupId(),consumed);
+            assertNotNull(f.data.participantFence(identity)); assertNull(f.data.finalizedParticipant(participant.groupId(),initial.transactionId()));
+            var local=f.machine(home.directory().ranges().getFirst().groupId()).retirementCandidates(false,null,16);
+            assertNotNull(local,"Current HOME owner exposes a bounded retirement page"); assertEquals(2,local.minimumEpoch());
+            assertNotNull(local.candidate()); assertEquals(consumed,local.candidate().transaction());
+            var background=retirementService(f.node);
+            for (int n=0;n<12 && homes.read(initial.transactionId())!=null;n++) {
+                f.env.timer.fire(); background.tick().get(5,java.util.concurrent.TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler);
+            }
+            assertNull(f.node.retirementFailure()); assertNull(homes.read(initial.transactionId())); assertEquals(0,f.node.pendingRetirements());
+            assertNotNull(homes.fence(homes.identity(consumed,home.directory().ranges().getFirst())));
+            assertNotNull(f.data.participantFence(identity),"HOME retirement preserves the participant's original binding proof");
+        }
+    }
+    @Test void automaticRetirementTimerAndDurableOwnershipDrainBeforeRuntimeReopen() throws Exception {
+        var helper=new RatisHomeRolesTest(); helper.root=root;
+        try (var f=helper.new Fixture("retirement-reopen")) {
+            assertEquals(3,f.env.timer.activePeriods()); f.env.timer.fire(); retirementService(f.node).tick().get(5,java.util.concurrent.TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler);
+            assertNull(f.node.retirementFailure()); assertEquals(0,f.node.pendingRetirements());
+            assertTrue(Files.isDirectory(f.env.nodeRoot.resolve("retirement")));
+            f.node.close(); assertEquals(0,f.env.timer.activePeriods()); assertEquals(1,f.server.closes);
+            assertEquals(0,f.env.catalogue.closes.get()); assertFalse(f.env.timer.isDisposed());
+            // Reset only the controlled server's closed storage handles; the runtime reopens the
+            // existing durable native groups and retirement journal under their original identities.
+            f.server.storages.clear();
+            var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),
+                    f.env.settings().retention(),f.env.settings().clockPeriod(),1,4,f.env.settings().shutdownTimeout());
+            try (var reopened=RatisNodeRuntime.open(f.plan,f.env.nodeRoot,ConfigParser.parseDefault(),f.env.catalogue.epochs,f.data,
+                    f.env.scheduler,f.env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.RECOVER,f.server::create,null,null,null,f::client)) {
+                assertEquals(0,reopened.pendingRetirements()); reopened.start(); assertEquals(3,f.env.timer.activePeriods());
+                f.env.timer.fire(); retirementService(reopened).tick().get(5,java.util.concurrent.TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler);
+                assertNull(reopened.retirementFailure()); assertEquals(0,reopened.pendingRetirements());
+            }
+            assertEquals(0,f.env.timer.activePeriods()); assertEquals(2,f.server.closes); assertEquals(0,f.env.catalogue.closes.get());
+        }
+    }
+
+    private static RatisTransactionRecoveryService retirementService(RatisNodeRuntime node) throws Exception {
+        var field=RatisNodeRuntime.class.getDeclaredField("retirementService"); field.setAccessible(true);
+        return (RatisTransactionRecoveryService)field.get(node);
+    }
+
     @Test void foreignRecoveryHomesAreRejectedBeforeBootstrapWrites() throws Exception {
         try (var env=new Env(root); var homes=new TransactionHomeReader(env,UUID.randomUUID())) {
             var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);

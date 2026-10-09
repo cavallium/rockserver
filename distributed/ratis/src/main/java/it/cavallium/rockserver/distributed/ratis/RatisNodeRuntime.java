@@ -57,6 +57,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RecoverySettings recoverySettings;
     private RatisParticipantRecoveryRegistry participantRecoveries;
     private RatisTransactionRecoveryService participantRecoveryService;
+    private RatisRetirementCoordinator retirementCoordinator;
+    private RatisTransactionRecoveryService retirementService;
     private RatisNativeParticipantDiscovery nativeParticipantDiscovery;
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
@@ -208,6 +210,18 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 machines.put(group.getGroupId(),machine);
             }
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
+        var retirementSources=new ArrayList<RatisRetirementCoordinator.Source>();
+        for (var id:machines.keySet().stream().sorted(java.util.Comparator.comparing(RaftGroupId::toString)).toList()) {
+            var machine=machines.get(id); var role=plan.role(id.getUuid());
+            if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
+                retirementSources.add(new RatisRetirementCoordinator.Source(id.getUuid(),RatisRetirementCoordinator.Mode.TRANSACTION,(after,scans) -> machine.retirementCandidates(false,after,scans)));
+                retirementSources.add(new RatisRetirementCoordinator.Source(id.getUuid(),RatisRetirementCoordinator.Mode.ORPHAN,(after,scans) -> machine.retirementCandidates(true,after,scans)));
+            } else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) retirementSources.add(new RatisRetirementCoordinator.Source(id.getUuid(),RatisRetirementCoordinator.Mode.SNAPSHOT,(after,scans) -> machine.retirementCandidates(false,after,scans)));
+        }
+        if (!retirementSources.isEmpty()) {
+            retirementCoordinator=new RatisRetirementCoordinator(root.resolve("retirement"),transactionHomes,captureHomes,routed,retirementSources,RatisRetirementJournal.Limits.defaults());
+            retirementService=new RatisTransactionRecoveryService(scheduler,() -> retirementCoordinator.cycle(4));
+        }
         server=factory.create(plan,logs,Collections.unmodifiableMap(machines));
         transactionExpiry=new RatisTransactionExpiryService(scheduler,machines.entrySet().stream().filter(entry -> plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA).map(Map.Entry::getValue).toList(),32);
         var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (plan.role(id.getUuid())==RatisNodePlan.Role.DATA) local.add(id.getUuid());
@@ -250,6 +264,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (service!=null) service.start(timer,settings.clockPeriod());
             transactionExpiry.start(timer,Duration.ofMillis(100));
             if (participantRecoveryService!=null) participantRecoveryService.start(timer,recoverySettings.period());
+            if (retirementService!=null) retirementService.start(timer,Duration.ofSeconds(1));
             synchronized (this) { started=true; }
         } catch (IOException | RuntimeException | Error failure) {
             synchronized (this) { closeRequested=true; }
@@ -285,6 +300,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public synchronized boolean started() { return state()==State.RUNNING; }
     public RatisSessionClockService.Snapshot maintenanceStatus() { return service==null ? null : service.latest(); }
     public Throwable maintenanceFailure() { return service==null ? null : service.lastFailure(); }
+    public Throwable retirementFailure() { if (retirementCoordinator!=null && retirementCoordinator.lastFailure()!=null) return retirementCoordinator.lastFailure(); return retirementService==null ? null : retirementService.lastFailure(); }
+    public int pendingRetirements() throws IOException { return retirementCoordinator==null ? 0 : retirementCoordinator.stats().count(); }
     public Throwable participantRecoveryFailure() { return participantRecoveryService==null ? null : participantRecoveryService.lastFailure(); }
     /** Borrowed synchronous helper; callers invoke it within their existing CONTROL quantum. */
     public RatisSnapshotReadinessHelper.Recovery participantRecovery() { if (participantRecoveries==null) throw new IllegalStateException("Participant recovery is not configured"); return this::recoverParticipant; }
@@ -312,6 +329,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            if (retirementService!=null) {
+                try { retirementService.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Retirement drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Retirement did not drain",failure); }
+            }
+            if (retirementCoordinator!=null) retirementCoordinator.close();
             if (participantRecoveryService!=null) {
                 try { participantRecoveryService.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Participant recovery drain interrupted",interrupted); }

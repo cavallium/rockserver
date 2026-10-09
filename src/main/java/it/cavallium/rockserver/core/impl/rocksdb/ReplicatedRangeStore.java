@@ -464,6 +464,63 @@ public final class ReplicatedRangeStore {
         if (logical && (command.hasBucketData() || command.acceptance()!=null && logicalSchema!=null)) validateLogical(command);
     }
 
+    public record RetirementCandidate(TransactionStatus transaction,SnapshotFenceStatus snapshot,boolean orphan) {
+        public RetirementCandidate {
+            if ((transaction==null)==(snapshot==null) || orphan && transaction==null) throw new IllegalArgumentException("Retirement candidate requires one status");
+            if (transaction!=null) { if (orphan) transaction.requireInitial(); else if (!transaction.gcEligible()) throw new IllegalArgumentException("Transaction is not consumed"); }
+            if (snapshot!=null && !snapshot.consumed()) throw new IllegalArgumentException("Snapshot is not consumed");
+        }
+        public UUID id() { return transaction==null ? snapshot.fence().fenceId() : transaction.transactionId(); }
+        public OperationId business() { return transaction==null ? snapshot.fence().operation() : transaction.operation(); }
+    }
+    public record RetirementPage(UUID groupId,long rangeEpoch,byte[] schemaDigest,UUID columnId,ApplyPosition position,long minimumEpoch,byte[] next,boolean more,RetirementCandidate candidate) {
+        public RetirementPage { Objects.requireNonNull(groupId); Objects.requireNonNull(columnId); Objects.requireNonNull(position); if (rangeEpoch<0 || schemaDigest.length!=32 || minimumEpoch<0) throw new IllegalArgumentException("Invalid retirement page"); schemaDigest=schemaDigest.clone(); next=next==null ? null : next.clone(); }
+        @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
+        @Override public byte[] next() { return next==null ? null : next.clone(); }
+    }
+    /** Bounded, non-mutating discovery at one completed native cut. Cursor advances over ineligible rows. */
+    public RetirementPage retirementCandidates(boolean orphans,byte[] after,int scans) throws RocksDBException {
+        if (scans<1 || scans>16 || after!=null && after.length!=(orphans ? 32 : 16)) throw new IllegalArgumentException("Invalid retirement cursor/scan bound");
+        byte[] cursor=after==null ? null : after.clone(); enterNative(); applyLane.lock();
+        try {
+            requireActive(); var context=homeRecoveryContext!=null ? homeRecoveryContext : snapshotHomeContext;
+            if (context==null || orphans && homeRecoveryContext==null) throw new IllegalStateException("Retirement discovery requires a qualified HOME role");
+            if (applied==null) throw new IllegalStateException("Retirement discovery requires a completed cut");
+            long floor=minimumSessionEpoch(null); byte[] lower=orphans ? ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array() : interval.lowerInclusive();
+            byte[] upper=orphans ? ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array() : interval.upperExclusive();
+            try (var low=lower==null ? null : new org.rocksdb.Slice(lower); var high=upper==null ? null : new org.rocksdb.Slice(upper);
+                 var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(orphans ? state : columns.get(context.column()),options)) {
+                byte[] seek=cursor==null ? lower : orphans ? ByteBuffer.allocate(49).put(lower).put(cursor).array() : cursor;
+                if (seek==null) iterator.seekToFirst(); else { iterator.seek(seek); if (cursor!=null && iterator.isValid() && Arrays.equals(iterator.key(),seek)) iterator.next(); }
+                byte[] next=null; RetirementCandidate candidate=null; long bytes=0; int visited=0; var sizing=new byte[0];
+                while (iterator.isValid() && visited<scans) {
+                    int size=iterator.value(sizing); if (size>2*1024*1024) throw new IllegalStateException("Retirement row exceeds bounded discovery payload");
+                    if (size>2*1024*1024-bytes) break;
+                    byte[] key=iterator.key(); if (key.length!=(orphans ? 49 : 16)) throw new IllegalArgumentException("Retirement row key is malformed");
+                    byte[] value=iterator.value(); bytes+=size; visited++; next=orphans ? Arrays.copyOfRange(key,17,49) : key;
+                    if (orphans) {
+                        var receipt=HomeRecoveryReceipt.decode(value); var recovery=receipt.recovery(); requireHomeRecovery(recovery); receipt.requireCut(applied);
+                        if (!Arrays.equals(key,homeRecoveryKey(recovery.operation()))) throw new IllegalArgumentException("HOME recovery row key changed");
+                        requireHomeSuccessor(receipt,null);
+                        if (receipt.result().status()==CommandResult.Status.CONFLICT && recovery.before().operation().epoch()<floor) {
+                            var original=homeIdentity(recovery); var current=readHomeState(original,null,applied);
+                            if (!current.matching() && (current.credit()==null || !current.credit().current().operation().equals(original.business()))) candidate=new RetirementCandidate(recovery.before().asInitial(),null,true);
+                        }
+                    } else if (homeRecoveryContext!=null) {
+                        var transaction=TransactionStatus.decode(value); var original=new HomeIdentity(groupId,rangeEpoch,schemaDigest,context.column(),transaction);
+                        var current=readHomeState(original,null,applied);
+                        if (!Arrays.equals(key,uuidBytes(transaction.transactionId())) || !current.matching() || !transaction.equals(current.row())) throw new IllegalArgumentException("HOME discovery USER identity changed");
+                        if (transaction.gcEligible()) candidate=new RetirementCandidate(transaction,null,false);
+                    } else {
+                        var snapshot=SnapshotFenceStatus.decode(value); requireSnapshotHomeUser(context,key,snapshot);
+                        if (snapshot.consumed()) candidate=new RetirementCandidate(null,snapshot,false);
+                    }
+                    iterator.next(); if (candidate!=null) break;
+                }
+                iterator.status(); return new RetirementPage(groupId,rangeEpoch,schemaDigest,context.column(),applied,floor,next,iterator.isValid(),candidate);
+            }
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     public record HomeRecoveryCapacity(ApplyPosition position,int count,long bytes,int reservedCount,long reservedBytes) {
         public int effectiveCount() { return count+reservedCount; }
         public long effectiveBytes() { return bytes+reservedBytes; }
@@ -2724,7 +2781,7 @@ public final class ReplicatedRangeStore {
         public RangeStateView stateView() throws RocksDBException {
             acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) {
-                return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,columns.keySet(),interval.lowerInclusive(),interval.upperExclusive(),position,sessionAuthority(options));
+                return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,columns.keySet(),interval.lowerInclusive(),interval.upperExclusive(),position,minimumSessionEpoch(options),sessionAuthority(options));
             } finally { releaseUse(); }
         }
         public Configuration configuration() throws RocksDBException {

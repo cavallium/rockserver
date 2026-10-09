@@ -129,7 +129,7 @@ class RatisHomeRolesTest {
             }
             assertEquals(initial.transactionId(),machine.preparedRecoveries(null,1).records().getFirst().preparation().transactionId());
             var serviceField=RatisNodeRuntime.class.getDeclaredField("participantRecoveryService"); serviceField.setAccessible(true); var background=(RatisTransactionRecoveryService)serviceField.get(f.node);
-            assertEquals(2,f.env.timer.activePeriods()); assertEquals(0,f.node.participantRecoveryStatus().persistedFiles());
+            assertEquals(3,f.env.timer.activePeriods()); assertEquals(0,f.node.participantRecoveryStatus().persistedFiles());
             for (int n=0;n<4;n++) { f.env.timer.fire(); background.tick().get(5,TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler); }
             assertNull(f.node.participantRecoveryFailure()); assertEquals(TransactionStatus.Phase.PREPARING,homes.read(initial.transactionId()).phase()); assertNull(store.finalizedParticipant(initial.transactionId())); assertEquals(1,f.node.participantRecoveryStatus().persistedFiles());
             var ready=initial.prepared(route.groupId(),initial.participants().getFirst().planDigest(),vote.position()); homes.execute(homes.prepare(new OperationId(session,1,4),initial,ready));

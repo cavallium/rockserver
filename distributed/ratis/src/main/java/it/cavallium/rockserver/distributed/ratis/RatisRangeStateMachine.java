@@ -210,6 +210,25 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         requireDataRole(); requireHealthy(); var current=leadership(); var a=store.applied();
         if (!current.ready() || a==null || a.term()!=current.term() || !store.admissionOpen()) throw new IOException("Transaction leader changed or is not ready");
     }
+    /** Bounded local retirement hints. Mutation admission independently revalidates qualified HOME/DATA proofs. */
+    ReplicatedRangeStore.RetirementPage retirementCandidates(boolean orphans,byte[] after,int scans) throws IOException {
+        if (role!=RatisNodePlan.Role.TRANSACTION_HOME && role!=RatisNodePlan.Role.SNAPSHOT_HOME) return null;
+        if (storageFailure!=null) throw new IOException("Native retirement discovery requires repair",storageFailure);
+        if (getLifeCycleState()!=LifeCycle.State.RUNNING) return null;
+        var owner=leadership(); var applied=store.applied();
+        if (!owner.ready() || applied==null || applied.term()!=owner.term() || !store.admissionOpen()) return null;
+        long generation=admissionGeneration.get();
+        final ReplicatedRangeStore.RetirementPage page;
+        try { page=store.retirementCandidates(orphans,after,scans); }
+        catch (org.rocksdb.RocksDBException | RuntimeException changed) {
+            if (generation!=admissionGeneration.get() || getLifeCycleState()!=LifeCycle.State.RUNNING) return null;
+            throw new IOException("Native retirement discovery unavailable",changed);
+        }
+        var current=leadership();
+        if (storageFailure!=null) throw new IOException("Native retirement discovery requires repair",storageFailure);
+        if (getLifeCycleState()!=LifeCycle.State.RUNNING || generation!=admissionGeneration.get() || !current.ready() || page.position().term()!=current.term() || !store.admissionOpen()) return null;
+        return page;
+    }
     /** Null means this replica has no qualified current-term discovery owner. */
     ReplicatedRangeStore.PreparedRecoveryPage preparedRecoveries(UUID after,int limit) throws IOException {
         if (role!=RatisNodePlan.Role.DATA) return null;

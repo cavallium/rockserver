@@ -117,7 +117,8 @@ does not establish complete distributed API parity or production acceptance.
   ABORT is immutable, and finalization ACKs and explicit client consumption advance
   separately. Ordinary CAS cannot delete a HOME; protected retirement now reclaims
   an exact consumed record after every DATA family has retired and HOME's business
-  epoch floor has advanced. Automatic retirement discovery remains unfinished.
+  epoch floor has advanced. Local HOME leaders now drive bounded automatic retirement
+  discovery on the node's reserved CONTROL lane.
   Every changed image advances one generation and one vote/decision/ACK/consumption
   step. Replica validators reject accepted-command predicate bypass, extra effects,
   altered definitions and noncanonical bytes. Receipt ACK/GC is independent of
@@ -386,7 +387,19 @@ or newer same-UUID HOME families cannot trigger re-registration or recapture.
 A DATA fenced-absence query also settles obsolete never-appended INSTALL ownership,
 while active native gates remain protected and busy inputs keep their actual charges.
 Snapshot HOME GC shares 16 protected slots with a 16 MiB retained-input bound.
-Client-journal reclamation and automatic GC discovery remain unfinished.
+Local ready HOME leaders scan at most 16 rows and 2 MiB per discovery page, returning
+at most one consumed family or expired conflict-only orphan. These local hints do
+not grant authority: every cleanup RPC independently checks qualified native proofs.
+Each CONTROL visit sends at most one mutation, rotating sources and participant
+selection so unavailable peers do not monopolize discovery. Consumed active snapshot
+gates are RELEASEd before DATA retirement; HOME deletion still waits for all DATA
+families. The driver never consumes outcomes or chooses transaction decisions.
+Before dispatch it forces the exact current native request into a node journal,
+bounded to 16 unresolved target groups and 32 MiB. Lost replies retain that frame
+across restart; a newer proof cut cannot replace an unresolved request. Startup
+discards only bounded unpublished sidecars under the exclusive journal lock, and
+shutdown drains actual cleanup RPCs before closing journals, storage or clients.
+Client-journal reclamation remains unfinished.
 
 The native snapshot-gate kernel freezes the complete participant set, directory
 and schema identities, local physical scopes, and distinct install/release controls.
@@ -518,7 +531,7 @@ owner discovery retain their fresh-authority checks; arbitrary stale transaction
 queries and current-index constraints remain rejected.
 
 Durable multi-group capture orchestration, production home-role/CLI activation,
-frontend cursor binding and automatic retirement discovery remain unfinished. Clients
+frontend cursor binding remain unfinished. Clients
 must freeze owner/capture identity before RPC and must not recreate a missing pin.
 Owner transport is covered by controlled participant and SDK-call fixtures; no live
 network, process or quorum failover acceptance is claimed.

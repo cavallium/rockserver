@@ -16,7 +16,7 @@ import reactor.core.scheduler.Scheduler;
 
 /** Node-shared bounded recovery quanta through the existing reserved CONTROL lane. Supplied resources remain caller-owned. */
 public final class RatisTransactionRecoveryService {
-    public static final int MAX_RECOVERIES=4096;
+    public static final int MAX_RECOVERIES=4096,MAX_WAITERS=16;
     @FunctionalInterface public interface Quantum { void run() throws Exception; }
     private final Quantum quantum;
     private final RWScheduler scheduler;
@@ -62,7 +62,14 @@ public final class RatisTransactionRecoveryService {
     /** Returned views can be cancelled without releasing the actual quantum's ownership. */
     public CompletableFuture<Void> tick() {
         var task=request();
-        return task==null ? CompletableFuture.failedFuture(new RejectedExecutionException("Recovery service stopped")) : task.result.copy();
+        if (task==null) return CompletableFuture.failedFuture(new RejectedExecutionException("Recovery service stopped"));
+        synchronized (this) {
+            if (!task.result.isDone()) {
+                if (task.resultViews>=MAX_WAITERS) return CompletableFuture.failedFuture(new RejectedExecutionException("Recovery tick waiter capacity exhausted"));
+                task.resultViews++;
+            }
+            return task.result.copy();
+        }
     }
 
     // Periodic requests allocate no discarded dependent futures while a quantum is already queued/running.
@@ -86,11 +93,20 @@ public final class RatisTransactionRecoveryService {
 
     /** Remove queued admission and await running recovery before closing borrowed recoveries, journals or clients. */
     public CompletableFuture<Void> stop() {
-        final Disposable cancelTimer; final Task pending;
-        synchronized (this) { stopping=true; cancelTimer=timer; timer=null; pending=active; }
+        final Disposable cancelTimer; final Task pending; final CompletableFuture<Void> view;
+        synchronized (this) {
+            stopping=true; cancelTimer=timer; timer=null; pending=active;
+            if (pending==null) view=CompletableFuture.completedFuture(null);
+            else if (!pending.drained.isDone() && pending.drainViews>=MAX_WAITERS) {
+                view=CompletableFuture.failedFuture(new RejectedExecutionException("Recovery drain waiter capacity exhausted"));
+            } else {
+                if (!pending.drained.isDone()) pending.drainViews++;
+                view=pending.drained.copy();
+            }
+        }
         if (cancelTimer!=null) cancelTimer.dispose();
         if (pending!=null) scheduler.removeQueuedTask(executor,pending);
-        return pending==null ? CompletableFuture.completedFuture(null) : pending.drained.copy();
+        return view;
     }
 
     public synchronized int remaining() { if (visits==0) throw new IllegalStateException("Dynamic recovery status belongs to its registry"); return remaining; }
@@ -121,6 +137,7 @@ public final class RatisTransactionRecoveryService {
     private final class Task implements Runnable,RWScheduler.RejectionAwareTask {
         private final CompletableFuture<Void> result=new CompletableFuture<>();
         private final CompletableFuture<Void> drained=new CompletableFuture<>();
+        private int resultViews,drainViews; // public cancellation never refunds views before actual completion
         private final AtomicInteger phase=new AtomicInteger(); // queued, running, terminal
         private final AtomicReference<RuntimeException> rejection=new AtomicReference<>();
         @Override public void run() {

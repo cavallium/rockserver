@@ -49,7 +49,7 @@ class RatisRangeStateViewTest {
                 public RangeStateView stateView(RangeDescriptor descriptor) { return reply.get(); }
             })) {
                 assertEquals(good,client.stateView(f.outer.dataGroup));
-                reply.set(new RangeStateView(UUID.randomUUID(),good.rangeEpoch(),good.domainId(),good.schemaDigest(),good.columns(),good.lowerInclusive(),good.upperExclusive(),good.applied(),good.sessionAuthority()));
+                reply.set(new RangeStateView(UUID.randomUUID(),good.rangeEpoch(),good.domainId(),good.schemaDigest(),good.columns(),good.lowerInclusive(),good.upperExclusive(),good.applied(),good.minimumSessionEpoch(),good.sessionAuthority()));
                 assertThrows(IOException.class,() -> client.stateView(f.outer.dataGroup));
                 reply.set(null); assertThrows(IOException.class,() -> client.stateView(f.outer.dataGroup));
                 reply.set(good); for (int i=0;i<40;i++) assertEquals(good,client.stateView(f.outer.dataGroup));
