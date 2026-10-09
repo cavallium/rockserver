@@ -15,7 +15,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private static final int MAGIC=0x53534a4c;
     public record ParticipantProgress(RangeDescriptor route,boolean installFrozen,RatisSnapshotRecord.Result installReceipt,
             SnapshotGate nativeGate,ApplyPosition readyProof,RatisRoutedClient.PreparedSnapshotCapture capture,SnapshotFenceStatus.Capture captureToken,
-            boolean captureLost,boolean releaseFrozen,ApplyPosition releaseReceipt) {}
+            boolean captureLost,boolean releaseFrozen,ApplyPosition releaseReceipt,SnapshotFenceProof retirementProof) {}
     public record Snapshot(SnapshotFenceStatus initial,SnapshotFenceStatus observedHome,RatisRoutedClient.PreparedCommand pendingHome,
             CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,List<ParticipantProgress> participants) {
         public ParticipantProgress participant(UUID group) { return participants.stream().filter(p -> p.route().groupId().equals(group)).findFirst().orElseThrow(); }
@@ -28,8 +28,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         ApplyPosition ready,releaseReceipt;
         RatisRoutedClient.PreparedSnapshotCapture capture;
         SnapshotFenceStatus.Capture token;
+        SnapshotFenceProof retirementProof;
         Entry(RangeDescriptor route) { this.route=route; }
-        ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,captureLost,releaseFrozen,releaseReceipt); }
+        ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,captureLost,releaseFrozen,releaseReceipt,retirementProof); }
     }
     private final Path path;
     private final RatisSnapshotFences homes;
@@ -96,6 +97,12 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         } else { if (!observed.equals(before)) throw new IllegalArgumentException("Home CAS differs from observed expected image"); next.requireSuccessorOf(observed); requireEvidence(next); }
         advance(request.command().operationId()); pending=request; homeResult=null; homeSuperseded=false; persist();
     }
+    /** Queue explicit client consumption; execution remains a separate caller-driven quantum. */
+    public synchronized void consume(OperationId operation) throws IOException {
+        idle(); if (observed==null || !observed.terminal()) throw new IllegalStateException("Snapshot consumption requires observed terminal HOME");
+        if (observed.consumed() || pending!=null && homeResult==null && !homeSuperseded && next(pending).consumed()) return;
+        queueHome(homes.prepare(operation,observed,observed.consume()));
+    }
     public CommandResult executeHome() throws IOException {
         RatisRoutedClient.PreparedCommand request;
         synchronized (this) { idle(); if (homeResult!=null) return homeResult; if (homeSuperseded) throw new IllegalStateException("Snapshot home request semantically superseded; exact result unknown"); request=pending; active=true; }
@@ -133,7 +140,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         Entry entry;
         synchronized (this) {
             idle(); entry=entry(group);
-            if (!entry.installFrozen || entry.installReceipt!=null || entry.releaseReceipt!=null || entry.gate!=null && entry.gate.released()!=null) return;
+            if (!entry.installFrozen || entry.retirementProof!=null || entry.installReceipt!=null || entry.releaseReceipt!=null || entry.gate!=null && entry.gate.released()!=null) return;
             active=true;
         }
         try { data.cancelSnapshotGate(data.restoreSnapshotGate(RatisSnapshotRecord.install(initial.fence(),group),entry.route)); }
@@ -141,19 +148,25 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     public RatisSnapshotRecord.Result executeInstall(UUID group) throws IOException {
         Entry entry;
-        synchronized (this) { idle(); entry=entry(group); if (!entry.installFrozen) throw new IllegalStateException("INSTALL is not frozen"); active=true; }
+        synchronized (this) { idle(); entry=entry(group); if (!entry.installFrozen) throw new IllegalStateException("INSTALL is not frozen"); if (entry.retirementProof!=null) return entry.installReceipt==null ? RatisSnapshotRecord.Result.retired(entry.retirementProof) : entry.installReceipt; active=true; }
         try {
             if (entry.installReceipt==null) {
                 var receipt=data.executeSnapshotGate(data.restoreSnapshotGate(RatisSnapshotRecord.install(initial.fence(),group),entry.route));
+                if (receipt.retired()) { synchronized (this) { mergeRetirement(entry,receipt.retirement()); persist(); return receipt; } }
                 synchronized (this) { checkInstallReceipt(entry,receipt,entry.gate); entry.installReceipt=receipt; persist(); }
             }
-            var gate=data.snapshotGate(initial.fence(),group);
+            var nativeResult=readGateResult(group);
+            if (nativeResult!=null && nativeResult.retired()) { synchronized (this) { mergeRetirement(entry,nativeResult.retirement()); persist(); return entry.installReceipt==null ? RatisSnapshotRecord.Result.retired(entry.retirementProof) : entry.installReceipt; } }
+            var gate=nativeResult==null ? null : nativeResult.gate();
             synchronized (this) { if (gate==null) throw new IOException("INSTALL receipt has no native proof; retry lookup"); mergeGate(entry,gate); persist(); return entry.installReceipt; }
         } finally { end(); }
     }
     public SnapshotGate resolveGate(UUID group) throws IOException {
         Entry entry; synchronized (this) { idle(); entry=entry(group); active=true; }
-        try { var gate=data.snapshotGate(initial.fence(),group); synchronized (this) { if (!Objects.equals(entry.gate,gate)) { mergeGate(entry,gate); persist(); } return entry.gate; } }
+        try { var nativeResult=readGateResult(group);
+            if (nativeResult!=null && nativeResult.retired()) { synchronized (this) { mergeRetirement(entry,nativeResult.retirement()); persist(); return entry.gate; } }
+            var gate=nativeResult==null ? null : nativeResult.gate();
+            synchronized (this) { if (!Objects.equals(entry.gate,gate)) { mergeGate(entry,gate); persist(); } return entry.gate; } }
         finally { end(); }
     }
     public boolean verifyReady(UUID group) throws IOException {
@@ -162,6 +175,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             var ready=data.snapshotReadiness(initial.fence(),group);
             synchronized (this) {
                 if (!ready.binding().equals(binding()) || !ready.group().equals(group)) throw new IOException("Readiness binding changed");
+                if (ready.retired()) { mergeRetirement(entry,ready.retirement()); persist(); return false; }
                 if (!ready.ready()) return false;
                 if (entry.installReceipt==null || entry.installReceipt.suppressed() || entry.gate==null || !entry.gate.active()
                         || !entry.installReceipt.position().equals(entry.gate.installed()) || !entry.gate.installed().equals(ready.installed())) throw new IOException("Readiness has no matching forced INSTALL receipt/native proof");
@@ -208,16 +222,62 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         if (observed==null || !observed.terminal()) throw new IllegalStateException("RELEASE requires observed terminal home");
         data.restoreSnapshotGate(RatisSnapshotRecord.release(observed,group),entry.route); entry.releaseFrozen=true; persist();
     }
-    public ApplyPosition executeRelease(UUID group) throws IOException {
-        Entry entry; synchronized (this) { idle(); entry=entry(group); if (!entry.releaseFrozen) throw new IllegalStateException("RELEASE is not frozen"); active=true; }
+    /** Fresh native RELEASE or atomic fenced absence; neither lookup fabricates an append receipt. */
+    public RatisSnapshotRecord.Result resolveRelease(UUID group) throws IOException {
+        Entry entry; synchronized (this) { idle(); entry=entry(group); if (observed==null || !observed.terminal()) throw new IllegalStateException("RELEASE resolution requires terminal HOME"); active=true; }
+        try {
+            var nativeResult=readGateResult(group); var gate=nativeResult==null ? null : nativeResult.gate();
+            var retirement=nativeResult!=null ? nativeResult.retirement() : null;
+            synchronized (this) {
+                if (retirement!=null) { mergeRetirement(entry,retirement); persist(); return RatisSnapshotRecord.Result.retired(entry.retirementProof); }
+                if (!Objects.equals(gate,entry.gate)) { mergeGate(entry,gate); persist(); }
+                return RatisSnapshotRecord.release(observed,group).receipt(gate);
+            }
+        } finally { end(); }
+    }
+    public RatisSnapshotRecord.Result executeRelease(UUID group) throws IOException {
+        Entry entry; synchronized (this) {
+            idle(); entry=entry(group); if (!entry.releaseFrozen) throw new IllegalStateException("RELEASE is not frozen");
+            if (entry.retirementProof!=null) return entry.releaseReceipt==null ? RatisSnapshotRecord.Result.retired(entry.retirementProof) : new RatisSnapshotRecord.Result(entry.releaseReceipt);
+            active=true;
+        }
         try {
             if (entry.releaseReceipt==null) {
-                var receipt=data.executeSnapshotGate(data.restoreSnapshotGate(RatisSnapshotRecord.release(observed,group),entry.route)).position();
-                synchronized (this) { checkReleaseReceipt(entry,receipt); if (entry.gate!=null && entry.gate.released()!=null && !entry.gate.released().equals(receipt)) throw new IOException("RELEASE receipt differs from verified native proof"); entry.releaseReceipt=receipt; persist(); }
+                var result=data.executeSnapshotGate(data.restoreSnapshotGate(RatisSnapshotRecord.release(observed,group),entry.route));
+                synchronized (this) {
+                    if (result.retired()) { mergeRetirement(entry,result.retirement()); persist(); return result; }
+                    var receipt=result.position(); checkReleaseReceipt(entry,receipt);
+                    if (entry.gate!=null && entry.gate.released()!=null && !entry.gate.released().equals(receipt)) throw new IOException("RELEASE receipt differs from verified native proof");
+                    entry.releaseReceipt=receipt; persist();
+                }
             }
-            var gate=data.snapshotGate(initial.fence(),group);
-            synchronized (this) { if (gate==null || gate.released()==null) throw new IOException("RELEASE receipt has no native terminal proof; retry lookup"); mergeGate(entry,gate); persist(); return entry.releaseReceipt; }
+            var nativeResult=readGateResult(group);
+            if (nativeResult!=null && nativeResult.retired()) { synchronized (this) { mergeRetirement(entry,nativeResult.retirement()); persist(); return new RatisSnapshotRecord.Result(entry.releaseReceipt); } }
+            var gate=nativeResult==null ? null : nativeResult.gate();
+            synchronized (this) { if (gate==null || gate.released()==null) throw new IOException("RELEASE receipt has no native terminal proof; retry lookup"); mergeGate(entry,gate); persist(); return new RatisSnapshotRecord.Result(entry.releaseReceipt); }
         } finally { end(); }
+    }
+    private SnapshotGateResult readGateResult(UUID group) throws IOException {
+        final SnapshotGate gate;
+        try { gate=data.snapshotGate(initial.fence(),group); }
+        catch (IOException unavailableOrChanged) {
+            final SnapshotFenceProof proof;
+            try { proof=data.snapshotFence(initial.fence(),group); }
+            catch (IOException unavailableFence) { unavailableOrChanged.addSuppressed(unavailableFence); throw unavailableOrChanged; }
+            if (proof==null) throw unavailableOrChanged;
+            return SnapshotGateResult.retired(proof);
+        }
+        if (gate==null || !gate.fence().equals(initial.fence())) {
+            var proof=data.snapshotFence(initial.fence(),group); if (proof!=null) return SnapshotGateResult.retired(proof);
+            if (gate!=null) throw new IOException("Snapshot gate belongs to another unfenced business");
+        }
+        return gate==null ? null : SnapshotGateResult.retained(gate);
+    }
+    private void mergeRetirement(Entry entry,SnapshotFenceProof proof) throws IOException {
+        if (observed==null || !observed.terminal() || !observed.consumed() || !initial.fence().equals(proof.fence()) || !entry.route.groupId().equals(proof.participantGroup())
+                || entry.retirementProof!=null && !proof.covers(entry.retirementProof)
+                || entry.releaseReceipt!=null && !atLeast(proof.position(),entry.releaseReceipt)) throw new IOException("Snapshot retirement lacks consumed HOME or matching monotone DATA proof");
+        entry.retirementProof=proof;
     }
     private void mergeGate(Entry entry,SnapshotGate gate) throws IOException {
         if (gate==null) { if (entry.gate!=null) throw new IOException("Previously verified native gate disappeared"); return; }
@@ -245,6 +305,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     private static void checkInstallReceipt(Entry entry,RatisSnapshotRecord.Result receipt,SnapshotGate gate) throws IOException {
         if (receipt==null || gate==null) return;
+        if (receipt.retired()) throw new IOException("Retirement cannot be an INSTALL receipt");
         if (!Objects.equals(receipt.position(),gate.installed()) || receipt.suppressed() && gate.released()==null) throw new IOException("Native installation differs from saved append receipt");
     }
     private void requireEvidence(SnapshotFenceStatus next) {
@@ -252,7 +313,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             var before=observed.progress(proof.groupId()); var entry=entry(proof.groupId());
             if (before.ready()==null && proof.ready()!=null && !proof.ready().equals(entry.ready)) throw new IllegalArgumentException("Home READY lacks locally verified readiness");
             if (before.capture()==null && proof.capture()!=null && (entry.captureLost || !proof.capture().equals(entry.token))) throw new IllegalArgumentException("Home capture lacks original owner token");
-            if (next.phase()==SnapshotFenceStatus.Phase.COMPLETE && (entry.capture==null || entry.captureLost || entry.token==null || !entry.token.equals(proof.capture()) || !Objects.equals(entry.ready,proof.ready()))) throw new IllegalArgumentException("COMPLETE requires every matching local ready/capture proof");
+            if (!observed.terminal() && next.phase()==SnapshotFenceStatus.Phase.COMPLETE && (entry.capture==null || entry.captureLost || entry.token==null || !entry.token.equals(proof.capture()) || !Objects.equals(entry.ready,proof.ready()))) throw new IllegalArgumentException("COMPLETE requires every matching local ready/capture proof");
         }
     }
     private void observe(SnapshotFenceStatus status) throws IOException {
@@ -265,7 +326,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         observed=status;
     }
     private static void monotone(SnapshotFenceStatus before,SnapshotFenceStatus after) throws IOException {
-        if (!before.fence().equals(after.fence()) || after.generation()<before.generation() || before.terminal() && !before.equals(after)) throw new IOException("Snapshot home definition/decision/progress regressed");
+        if (!before.fence().equals(after.fence()) || after.generation()<before.generation() || before.consumed() && !after.consumed() || before.terminal() && (!after.terminal() || !before.terminalDecision().equals(after.terminalDecision()))) throw new IOException("Snapshot home definition/decision/progress regressed");
         for (var old:before.progress()) {
             var next=after.progress(old.groupId());
             if (old.ready()!=null && !old.ready().equals(next.ready()) || old.capture()!=null && !old.capture().equals(next.capture())) throw new IOException("Snapshot home proof changed");
@@ -276,6 +337,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         requireControl(operation); lastHome=operation;
     }
     private void requireControl(OperationId operation) {
+        if (initial.fence().operation().equals(operation)) throw new IllegalArgumentException("Snapshot HOME control overlaps business retention anchor");
         for (var participant:initial.fence().participants()) if (participant.installOperation().equals(operation) || participant.releaseOperation().equals(operation)) throw new IllegalArgumentException("Snapshot home identity overlaps frozen gate control");
     }
     private static void requireLineage(RangeDescriptor original,RangeDescriptor next) {
@@ -347,6 +409,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 out.writeInt(target.descriptor().replicas().indexOf(target.replica())); uuid(out,target.incarnation()); uuid(out,entry.capture.request().snapshotId()); out.writeLong(entry.capture.request().ttl().toMillis());
             }
             token(out,entry.token); out.writeBoolean(entry.captureLost); out.writeBoolean(entry.releaseFrozen); position(out,entry.releaseReceipt);
+            out.writeBoolean(entry.retirementProof!=null); if (entry.retirementProof!=null) { out.writeLong(entry.retirementProof.minimumEpoch()); positionValue(out,entry.retirementProof.position()); }
         }
         out.flush(); if (bytes.size()>MAX_BYTES-32) throw new IOException("Snapshot journal exceeds byte bound"); return bytes.toByteArray();
     }
@@ -373,7 +436,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                     if (member<0 || member>=captureRoute.replicas().size()) throw new IOException("Invalid frozen capture member"); var owner=uuid(in); var snapshot=uuid(in); long ttl=in.getLong();
                     var target=data.restoreSnapshotTarget(initial.fence(),captureRoute,captureRoute.replicas().get(member),owner); entry.capture=data.prepareSnapshotCapture(target,snapshot,Duration.ofMillis(ttl));
                 }
-                entry.token=token(in); entry.captureLost=flag(in); entry.releaseFrozen=flag(in); entry.releaseReceipt=position(in); validateEntry(entry);
+                entry.token=token(in); entry.captureLost=flag(in); entry.releaseFrozen=flag(in); entry.releaseReceipt=position(in);
+                if (flag(in)) mergeRetirement(entry,new SnapshotFenceProof(initial.fence(),entry.route.groupId(),in.getLong(),positionValue(in)));
+                validateEntry(entry);
             }
             if (in.hasRemaining() || !lastHome.equals(pending.command().operationId())) throw new IOException("Invalid trailing snapshot journal/home identity");
             if (before!=null) { if (observed==null) throw new IOException("Pending home CAS lacks observed expected image"); monotone(before,observed); }
@@ -408,17 +473,18 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     private void status(DataOutputStream out,SnapshotFenceStatus status) throws IOException {
         out.writeBoolean(status!=null); if (status==null) return;
-        if (!initial.fence().equals(status.fence())) throw new IOException("Snapshot status definition changed"); out.writeByte(status.phase().ordinal());
+        if (!initial.fence().equals(status.fence())) throw new IOException("Snapshot status definition changed"); out.writeByte(status.phase().ordinal()); out.writeBoolean(status.consumed());
         for (var progress:status.progress()) { position(out,progress.ready()); token(out,progress.capture()); }
     }
     private SnapshotFenceStatus status(ByteBuffer in) throws IOException {
-        if (!flag(in)) return null; int phase=in.get() & 255; if (phase>=SnapshotFenceStatus.Phase.values().length) throw new IOException("Invalid compact snapshot phase");
+        if (!flag(in)) return null; int phase=in.get() & 255; if (phase>=SnapshotFenceStatus.Phase.values().length) throw new IOException("Invalid compact snapshot phase"); boolean consumed=flag(in);
         var ready=new ArrayList<ApplyPosition>(); var tokens=new ArrayList<SnapshotFenceStatus.Capture>();
         for (int i=0;i<initial.fence().participants().size();i++) { ready.add(position(in)); tokens.add(token(in)); }
         var status=initial;
         for (int i=0;i<ready.size();i++) if (ready.get(i)!=null) status=status.ready(initial.fence().participants().get(i).groupId(),ready.get(i));
         for (int i=0;i<tokens.size();i++) if (tokens.get(i)!=null) status=status.capture(initial.fence().participants().get(i).groupId(),tokens.get(i));
-        return switch (SnapshotFenceStatus.Phase.values()[phase]) { case INSTALLING -> status; case COMPLETE -> status.complete(); case ABORT -> status.abort(); };
+        status=switch (SnapshotFenceStatus.Phase.values()[phase]) { case INSTALLING -> status; case COMPLETE -> status.complete(); case ABORT -> status.abort(); };
+        return consumed ? status.consume() : status;
     }
     private static void route(DataOutputStream out,RangeDescriptor route) throws IOException { var b=ByteBuffer.allocate(Math.toIntExact(SessionWindowJournal.routeSize(route))); SessionWindowJournal.route(b,route); out.write(b.array()); }
     private static void operation(DataOutputStream out,OperationId operation) throws IOException { uuid(out,operation.sessionId()); out.writeLong(operation.epoch()); out.writeLong(operation.sequence()); }

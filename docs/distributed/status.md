@@ -374,8 +374,7 @@ and old journals terminate explicitly as HOME_RETIRED while preserving previousl
 proven COMMIT or ABORT results. New businesses may reuse a transaction UUID without
 being adopted or deleted by old retries. HOME retirement shares the 16 protected
 slots and retains at most 1 MiB of input per group through actual RPC termination.
-Snapshot gates, pin tombstones, client journals and automatic GC discovery remain
-unfinished.
+Snapshot HOME rows, client journals and automatic GC discovery remain unfinished.
 
 The native snapshot-gate kernel freezes the complete participant set, directory
 and schema identities, local physical scopes, and distinct install/release controls.
@@ -442,8 +441,15 @@ PREPARING home and a reserved or installed gate at the claimed native cut. Exact
 retained negative outcomes remain retryable independently of expired grants.
 
 Per range, gates have an independent bound of 16 retained fence records and 16 MiB
-of reserved metadata, including future release growth. Released records retain their
-capacity and operation identities until a future fenced GC implementation. A fence
+of reserved metadata, including future release growth. Each fence now freezes an
+original business operation, independent of its INSTALL/RELEASE controls. Explicit
+terminal consumption permits retention cleanup but does not certify RELEASE ACKs
+or snapshot delivery. DATA gate retirement requires the exact released gate, a fresh
+matching consumed HOME status and a strictly newer durable business-epoch floor.
+It atomically deletes the gate and refunds capacity; late INSTALL/RELEASE and READY
+queries return bound retirement evidence without invented apply positions or a
+suppressed-INSTALL vote. Active expired gates remain retained and releasable.
+Consumption does not change the frozen RELEASE request or decision digest. A fence
 contains at most 64 participants and an aggregate definition below 2 MiB minus
 8 KiB, leaving bounded room for progress and envelopes. The ephemeral admission
 index can reserve a gate before earlier proposals drain, with independent protected
@@ -456,13 +462,16 @@ an expected owner incarnation and capture ID before invoking capture. An exact
 fence/ID/TTL retry returns the original token and native cut without another home
 read or deadline extension. Changed declarations are rejected. Released, expired
 or storage-invalidated captures retain small tombstones and return SNAPSHOT_LOST;
-they never reopen at the current cut. A new owner rejects an old expected incarnation
+they never reopen at the current cut. Closed tombstones can be reclaimed after the
+durable DATA floor fences their original business epoch. Unknown expired capture
+requests fail before entry allocation; live exact retries preserve their original
+cut and deadline even after the floor advances. A new owner rejects an old expected incarnation
 before allocating a native pin.
 
 The pin registry retains at most sixteen capture identities and sixteen MiB of
 accounted frozen definition/scope bytes. Actual native owners keep their complete
 charge through a busy capture/read and successful native close, then compact to a
-128-byte tombstone. Immutable reads and scoped forward/reverse pages survive
+136-byte tombstone. Immutable reads and scoped forward/reverse pages survive
 leadership loss on the same live owner. Storage pause invalidates these leases
 before the existing native-reader drain; old tokens stay lost after reload, while
 new fence/capture identities may proceed. Shutdown and expiry use the same deferred
@@ -497,7 +506,7 @@ owner discovery retain their fresh-authority checks; arbitrary stale transaction
 queries and current-index constraints remain rejected.
 
 Durable multi-group capture orchestration, production home-role/CLI activation,
-frontend cursor binding and safe tombstone reclamation remain unfinished. Clients
+frontend cursor binding and automatic retirement discovery remain unfinished. Clients
 must freeze owner/capture identity before RPC and must not recreate a missing pin.
 Owner transport is covered by controlled participant and SDK-call fixtures; no live
 network, process or quorum failover acceptance is claimed.

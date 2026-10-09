@@ -104,7 +104,7 @@ class NativeHomeRecoveryTest {
             var recovery=abort(initial,1); f.store.applyHomeRecovery(new ApplyPosition(1,3),recovery).receipt();
             assertThrows(IllegalArgumentException.class,() -> f.store.estimateReceiptRetention(recovery.command())); assertThrows(IllegalArgumentException.class,() -> f.store.apply(new ApplyPosition(1,4),recovery.command()));
             var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[16])));
-            var gate=new SnapshotFence(new UUID(0,20),new UUID(0,21),domain,new UUID(0,300),new UUID(0,301),1,0,1,new byte[32],List.of(new SnapshotFence.Participant(group,group,1,new byte[32],recovery.operation(),new OperationId(new UUID(0,302),0,0),scope)));
+            var gate=new SnapshotFence(new UUID(0,20),new UUID(0,21),domain,new UUID(0,300),new UUID(0,301),1,new OperationId(new UUID(0,300),1,0),0,1,new byte[32],List.of(new SnapshotFence.Participant(group,group,1,new byte[32],recovery.operation(),new OperationId(new UUID(0,302),0,0),scope)));
             assertThrows(IllegalArgumentException.class,() -> f.store.estimateGateInstall(gate));
             var business=new DistributedCommand(group,1,new byte[32],new OperationId(new UUID(0,700),1,0),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[16],new byte[]{9})));
             var accepted=DistributedCommand.acceptedTransaction(business,new TransactionAcceptance(f.store.applied(),0,new UUID(0,701),scope,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
@@ -117,8 +117,8 @@ class NativeHomeRecoveryTest {
         }
         try (var f=new Fixture(root.resolve("gate-first"))) {
             var recovery=abort(initial(3),0); var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[16])));
-            var gate=new SnapshotFence(new UUID(0,20),new UUID(0,21),domain,new UUID(0,300),new UUID(0,301),1,0,1,new byte[32],List.of(new SnapshotFence.Participant(group,group,1,new byte[32],recovery.operation(),new OperationId(new UUID(0,302),0,0),scope)));
-            f.store.applyGateInstall(new ApplyPosition(1,1),gate); assertThrows(IllegalArgumentException.class,() -> f.store.estimateHomeRecovery(recovery)); assertEquals(0,f.store.homeRecoveryCapacity().count());
+            var gate=new SnapshotFence(new UUID(0,20),new UUID(0,21),domain,new UUID(0,300),new UUID(0,301),1,new OperationId(new UUID(0,300),1,0),0,1,new byte[32],List.of(new SnapshotFence.Participant(group,group,1,new byte[32],recovery.operation(),new OperationId(new UUID(0,302),0,0),scope)));
+            f.store.applyGateInstall(new ApplyPosition(1,1),gate).gate(); assertThrows(IllegalArgumentException.class,() -> f.store.estimateHomeRecovery(recovery)); assertEquals(0,f.store.homeRecoveryCapacity().count());
         }
     }
     @Test void existingNativePreparedControlCannotBecomeProtectedHomeRecovery() throws Exception {

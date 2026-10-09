@@ -48,7 +48,7 @@ class RatisNodeRuntimeTest {
             try {
                 node.start(); var field=RatisNodeRuntime.class.getDeclaredField("snapshotHelp"); field.setAccessible(true); var help=(RatisSnapshotHelpService)field.get(node);
                 var directory=env.plan.directory(); var route=directory.ranges().getFirst();
-                var fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),directory.domainId(),new UUID(13,1),new UUID(13,2),1,directory.generation(),directory.schemaEpoch(),directory.schemaDigest(),List.of(
+                var fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),directory.domainId(),new UUID(13,1),new UUID(13,2),1,new OperationId(new UUID(13,1),1,0),directory.generation(),directory.schemaEpoch(),directory.schemaDigest(),List.of(
                         new SnapshotFence.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),new OperationId(new UUID(13,3),0,0),new OperationId(new UUID(13,3),0,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
                 var view=help.submit(route.groupId(),ScopedTransactionRpc.SnapshotBinding.of(fence),() -> { entered.countDown(); if (!release.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); return true; });
                 assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertTrue(view.cancel(false));

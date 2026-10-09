@@ -72,6 +72,8 @@ public final class RatisSnapshotFences {
             long envelope=DistributedCommandCodec.encodedSize(command)-nextBytes.length-(previousBytes==null ? 0 : previousBytes.length);
             long maximumStatus=next.fence().encode().length+SnapshotFenceStatus.HEADER_BYTES+81L*next.fence().participants().size();
             if (2*maximumStatus+envelope>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Snapshot home lacks capacity for future proof/decision CAS");
+            if (next.fence().operation().equals(command.operationId())) throw new IllegalArgumentException("Snapshot HOME CAS reused business retention identity");
+            if (next.fence().operation().equals(command.operationId())) throw new IllegalArgumentException("Snapshot home CAS reused its original business identity");
             for (var participant:next.fence().participants()) if (participant.installOperation().equals(command.operationId()) || participant.releaseOperation().equals(command.operationId())) throw new IllegalArgumentException("Snapshot home CAS reused participant control identity");
             if (previousBytes==null) {
                 if (next.phase()!=SnapshotFenceStatus.Phase.INSTALLING || next.generation()!=0) throw new IllegalArgumentException("Snapshot registration must freeze unproved INSTALLING definition");

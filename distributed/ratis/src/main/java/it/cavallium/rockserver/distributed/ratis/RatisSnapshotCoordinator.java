@@ -8,7 +8,7 @@ import java.util.function.*;
 
 /** Bounded forward policy over forced snapshot control. COMPLETE never promises a volatile lease remains live. */
 public final class RatisSnapshotCoordinator implements AutoCloseable {
-    public enum Action { RETRIED_HOME, REGISTERED, WAITING, INSTALLED, HELPED, READY, CAPTURED, CAPTURE_REPORTED, COMPLETED, ABORTED, RELEASED, COMPLETE }
+    public enum Action { RETRIED_HOME, REGISTERED, WAITING, INSTALLED, HELPED, READY, CAPTURED, CAPTURE_REPORTED, COMPLETED, ABORTED, RELEASED, RETIRED, COMPLETE }
     public record Step(Action action,UUID participant,boolean complete) {}
     private final RatisDurableSnapshot journal;
     private final RatisSnapshotFences homes;
@@ -39,11 +39,12 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
         var home=snapshot.observedHome();
         if (home==null) return transition(snapshot,snapshot.initial(),Action.REGISTERED,null);
         if (home.terminal()) {
-            UUID group=select(snapshot,p -> p.releaseReceipt()==null || p.nativeGate()==null || p.nativeGate().released()==null);
+            UUID group=select(snapshot,p -> p.retirementProof()==null && (p.releaseReceipt()==null || p.nativeGate()==null || p.nativeGate().released()==null));
             if (group==null) return result(Action.COMPLETE,null);
+            if (home.consumed()) { var resolved=journal.resolveRelease(group); if (resolved!=null && resolved.retired()) return result(Action.RETIRED,group); }
             journal.freezeRelease(group);
-            journal.executeRelease(group);
-            return result(Action.RELEASED,group);
+            var released=journal.executeRelease(group);
+            return result(released.retired() ? Action.RETIRED : Action.RELEASED,group);
         }
         for (var progress:snapshot.participants()) {
             UUID group=progress.route().groupId();
@@ -88,7 +89,7 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
     }
     private Step result(Action action,UUID group) throws IOException {
         var snapshot=journal.snapshot(); boolean complete=snapshot.observedHome()!=null && snapshot.observedHome().terminal()
-                && snapshot.participants().stream().allMatch(p -> p.releaseReceipt()!=null && p.nativeGate()!=null && p.nativeGate().released()!=null);
+                && snapshot.participants().stream().allMatch(p -> p.releaseReceipt()!=null && p.nativeGate()!=null && p.nativeGate().released()!=null || snapshot.observedHome().consumed() && p.retirementProof()!=null);
         return new Step(action,group,complete);
     }
     /** Borrowed clients, journal and captured pins remain open. Cancel only unreceipted INSTALL authority. */
@@ -100,7 +101,7 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
         try {
             var snapshot=journal.snapshot(); IOException failure=null;
             for (var progress:snapshot.participants()) {
-                if (!progress.installFrozen() || progress.installReceipt()!=null || progress.releaseReceipt()!=null || progress.nativeGate()!=null && progress.nativeGate().released()!=null) continue;
+                if (!progress.installFrozen() || progress.retirementProof()!=null || progress.installReceipt()!=null || progress.releaseReceipt()!=null || progress.nativeGate()!=null && progress.nativeGate().released()!=null) continue;
                 try { journal.cancelInstall(progress.route().groupId()); }
                 catch (IOException unavailable) { if (failure==null) failure=unavailable; else failure.addSuppressed(unavailable); }
             }

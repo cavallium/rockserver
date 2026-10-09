@@ -39,7 +39,7 @@ class RatisSnapshotCoordinatorTest {
             right=helper.helper.new Node(name+"-right",false,new RangeOwnership.Interval(domain,Set.of(column),split,null),home.homes,clock::get);
             var l=route(left,null,split); var r=route(right,split,null);
             directory=new RangeDirectory(helper.helper.cluster,helper.helper.database,domain,1,new byte[32],0,Set.of(column),0,List.of(l,r));
-            fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),domain,new UUID(0,9014),home.f.groupId,1,0,1,new byte[32],List.of(
+            fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),domain,new UUID(0,9014),home.f.groupId,1,new OperationId(new UUID(0,9014),1,0),0,1,new byte[32],List.of(
                     new SnapshotFence.Participant(l.rangeId(),l.groupId(),1,new byte[32],control(0),control(1),scope(1)),
                     new SnapshotFence.Participant(r.rangeId(),r.groupId(),1,new byte[32],control(2),control(3),new TransactionScope(List.of(TransactionScope.Span.range(column,new byte[]{(byte)130},new byte[]{(byte)134}))))));
             data=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {

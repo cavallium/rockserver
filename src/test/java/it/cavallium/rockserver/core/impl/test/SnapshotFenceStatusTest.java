@@ -46,7 +46,7 @@ class SnapshotFenceStatusTest {
         for (int n=0;n<bytes.length;n++) { byte[] truncated=Arrays.copyOf(bytes,n); assertThrows(IllegalArgumentException.class,() -> SnapshotFenceStatus.decode(truncated)); }
         assertThrows(IllegalArgumentException.class,() -> SnapshotFenceStatus.decode(Arrays.copyOf(bytes,bytes.length+1)));
         byte[] phase=bytes.clone(); phase[4+helper.fence().encode().length]=3; assertThrows(IllegalArgumentException.class,() -> SnapshotFenceStatus.decode(phase));
-        byte[] flags=bytes.clone(); flags[4+helper.fence().encode().length+5+16]=2; assertThrows(IllegalArgumentException.class,() -> SnapshotFenceStatus.decode(flags));
+        byte[] flags=bytes.clone(); flags[helper.fence().encode().length+SnapshotFenceStatus.HEADER_BYTES+16]=2; assertThrows(IllegalArgumentException.class,() -> SnapshotFenceStatus.decode(flags));
         byte[] length=bytes.clone(); ByteBuffer.wrap(length).putInt(0,Integer.MAX_VALUE); assertThrows(IllegalArgumentException.class,() -> SnapshotFenceStatus.decode(length));
     }
 }

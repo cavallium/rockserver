@@ -20,10 +20,10 @@ class RatisSnapshotFencesTest {
         var scope=new TransactionScope(List.of(TransactionScope.Span.range(dataColumn,new byte[]{1},new byte[]{8})));
         byte[] dataSchema=new byte[32]; dataSchema[0]=7;
         var participants=List.of(new SnapshotFence.Participant(a,a,1,dataSchema,control(0),control(1),scope),new SnapshotFence.Participant(b,b,1,dataSchema,control(2),control(3),scope));
-        return SnapshotFenceStatus.begin(new SnapshotFence(directory.clusterId(),directory.databaseId(),new UUID(0,30),new UUID(0,31),directory.ranges().getFirst().groupId(),1,2,3,dataSchema,participants));
+        return SnapshotFenceStatus.begin(new SnapshotFence(directory.clusterId(),directory.databaseId(),new UUID(0,30),new UUID(0,31),directory.ranges().getFirst().groupId(),1,new OperationId(new UUID(0,31),1,0),2,3,dataSchema,participants));
     }
     SnapshotFenceStatus withHome(SnapshotFenceStatus initial,UUID home,long epoch) {
-        var f=initial.fence(); return SnapshotFenceStatus.begin(new SnapshotFence(f.clusterId(),f.databaseId(),f.domainId(),f.fenceId(),home,epoch,f.directoryGeneration(),f.schemaEpoch(),f.schemaDigest(),f.participants()));
+        var f=initial.fence(); return SnapshotFenceStatus.begin(new SnapshotFence(f.clusterId(),f.databaseId(),f.domainId(),f.fenceId(),home,epoch,f.operation(),f.directoryGeneration(),f.schemaEpoch(),f.schemaDigest(),f.participants()));
     }
     SnapshotFenceStatus.Capture capture(long id,ApplyPosition position) { return new SnapshotFenceStatus.Capture(new UUID(0,id),new UUID(0,id+1),position); }
     RatisRoutedClient.Transport transport(RatisTransactionRpcTest.Controlled wire) {
@@ -77,7 +77,7 @@ class RatisSnapshotFencesTest {
             var ready=initial.ready(a,new ApplyPosition(1,1)).ready(b,new ApplyPosition(1,2));
             assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),initial,ready)); assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),null,initial.abort()));
             var abort=initial.abort(); assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),abort,abort));
-            var fence=initial.fence(); var changed=SnapshotFenceStatus.begin(new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),1,3,3,fence.schemaDigest(),fence.participants())).ready(a,new ApplyPosition(1,1));
+            var fence=initial.fence(); var changed=SnapshotFenceStatus.begin(new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),1,fence.operation(),3,3,fence.schemaDigest(),fence.participants())).ready(a,new ApplyPosition(1,1));
             assertThrows(IllegalArgumentException.class,() -> homes.prepare(operation(4),initial,changed));
         }
     }
@@ -107,7 +107,7 @@ class RatisSnapshotFencesTest {
             var directory=helper.directory(f); var base=initial(directory).fence();
             var scope=new TransactionScope(List.of(TransactionScope.Span.point(dataColumn,new byte[DistributedCommandCodec.MAX_ENCODED_BYTES/2])));
             var participant=new SnapshotFence.Participant(a,a,1,new byte[32],control(0),control(1),scope);
-            var oversized=SnapshotFenceStatus.begin(new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),base.fenceId(),base.homeGroup(),1,2,3,base.schemaDigest(),List.of(participant)));
+            var oversized=SnapshotFenceStatus.begin(new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),base.fenceId(),base.homeGroup(),1,base.operation(),2,3,base.schemaDigest(),List.of(participant)));
             var calls=new AtomicInteger(); var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { return null; }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { calls.incrementAndGet(); throw new AssertionError("Must reject before RPC"); }

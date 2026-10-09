@@ -11,13 +11,16 @@ import org.rocksdb.RocksDBException;
 
 /** Bounded owner-specific historical pins. Leadership changes do not retire them; deadlines and native ownership do. */
 final class RatisSnapshotPins implements AutoCloseable {
-    static final int MAX_CAPTURES=16, TOMBSTONE_BYTES=128, MAX_REPLY_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES;
+    static final int MAX_CAPTURES=16, TOMBSTONE_BYTES=136, MAX_REPLY_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES;
     static final long MAX_BYTES=16L*1024*1024;
     @FunctionalInterface interface CaptureFactory {
         ReplicatedRangeStore.ScopedSnapshot capture(RatisSnapshotFences homes,SnapshotFence fence) throws Exception;
     }
     @FunctionalInterface interface ValueReader {
         byte[] get(ReplicatedRangeStore.ScopedSnapshot pin,UUID column,byte[] key) throws Exception;
+    }
+    @FunctionalInterface interface PinCloser {
+        void close(ReplicatedRangeStore.ScopedSnapshot pin) throws Exception;
     }
     record Limits(int captures,long bytes,Duration maximumTtl) {
         Limits {
@@ -31,14 +34,14 @@ final class RatisSnapshotPins implements AutoCloseable {
     private static final class Entry {
         final UUID fenceId,snapshotId;
         final byte[] digest;
-        final long opened,ttl;
+        final long opened,ttl,anchorEpoch;
         SnapshotFence fence;
         ReplicatedRangeStore.ScopedSnapshot pin;
         SnapshotFenceStatus.Capture token;
         long bytes;
         boolean busy=true,closed,permanent,cleaning,compacted;
         Entry(SnapshotFence fence,UUID snapshotId,byte[] digest,long opened,long ttl,long bytes) {
-            this.fence=fence; fenceId=fence.fenceId(); this.snapshotId=snapshotId; this.digest=digest; this.opened=opened; this.ttl=ttl; this.bytes=bytes;
+            this.fence=fence; fenceId=fence.fenceId(); this.snapshotId=snapshotId; this.digest=digest; this.opened=opened; this.ttl=ttl; this.bytes=bytes; anchorEpoch=fence.operation().epoch();
         }
     }
     private final UUID owner,group;
@@ -46,8 +49,9 @@ final class RatisSnapshotPins implements AutoCloseable {
     private final LongSupplier nanos;
     private final CaptureFactory factory;
     private final ValueReader reader;
+    private final PinCloser closer;
     private final Map<UUID,Entry> entries=new HashMap<>(),snapshots=new HashMap<>();
-    private long chargedBytes;
+    private long chargedBytes,minimumEpoch;
     private int pins;
     private boolean closed;
 
@@ -55,25 +59,29 @@ final class RatisSnapshotPins implements AutoCloseable {
         this(owner,group,limits,nanos,factory,ReplicatedRangeStore.ScopedSnapshot::get);
     }
     RatisSnapshotPins(UUID owner,UUID group,Limits limits,LongSupplier nanos,CaptureFactory factory,ValueReader reader) {
-        this.owner=Objects.requireNonNull(owner); this.group=Objects.requireNonNull(group); this.limits=Objects.requireNonNull(limits);
-        this.nanos=Objects.requireNonNull(nanos); this.factory=Objects.requireNonNull(factory); this.reader=Objects.requireNonNull(reader);
+        this(owner,group,limits,nanos,factory,reader,ReplicatedRangeStore.ScopedSnapshot::close);
     }
-    SnapshotFenceStatus.Capture capture(RatisSnapshotFences homes,SnapshotFence fence,UUID expectedOwner,UUID snapshotId,Duration ttl) throws Exception {
-        requireOwner(expectedOwner); Objects.requireNonNull(homes); Objects.requireNonNull(fence); Objects.requireNonNull(snapshotId); Objects.requireNonNull(ttl);
+    RatisSnapshotPins(UUID owner,UUID group,Limits limits,LongSupplier nanos,CaptureFactory factory,ValueReader reader,PinCloser closer) {
+        this.owner=Objects.requireNonNull(owner); this.group=Objects.requireNonNull(group); this.limits=Objects.requireNonNull(limits);
+        this.nanos=Objects.requireNonNull(nanos); this.factory=Objects.requireNonNull(factory); this.reader=Objects.requireNonNull(reader); this.closer=Objects.requireNonNull(closer);
+    }
+    SnapshotFenceStatus.Capture capture(RatisSnapshotFences homes,SnapshotFence fence,UUID expectedOwner,UUID snapshotId,Duration ttl,LongSupplier floor) throws Exception {
+        requireOwner(expectedOwner); Objects.requireNonNull(homes); Objects.requireNonNull(fence); Objects.requireNonNull(snapshotId); Objects.requireNonNull(ttl); Objects.requireNonNull(floor);
         if (ttl.isNegative() || ttl.isZero() || ttl.compareTo(limits.maximumTtl())>0) throw new IllegalArgumentException("Snapshot pin TTL exceeds advertised limit");
         long duration=ttl.toNanos(); byte[] definition=fence.encode(),digest=hash(definition); var participant=fence.participant(group);
         long bytes=TOMBSTONE_BYTES+(long)definition.length+RangeMutationHistory.accountedScopeBytes(participant.scope());
-        expire(); final Entry entry;
         synchronized (this) {
             if (closed) throw lost("Registry is closed");
             var existing=entries.get(fence.fenceId());
-            if (existing!=null) {
-                if (!existing.snapshotId.equals(snapshotId) || existing.ttl!=duration || !Arrays.equals(existing.digest,digest)) throw new IllegalArgumentException("Snapshot capture retry changed ID, definition or TTL");
-                if (existing.busy) throw new IOException("Snapshot capture/operation is still running");
-                ensureLive(existing);
-                if (existing.token==null) throw lost("Capture has no historical pin");
-                return existing.token;
-            }
+            if (existing!=null) return retry(existing,snapshotId,duration,digest);
+        }
+        // The native floor may wait for the apply lane; never hold the registry monitor there.
+        expire(); retireBefore(floor.getAsLong()); final Entry entry;
+        synchronized (this) {
+            if (closed) throw lost("Registry is closed");
+            var existing=entries.get(fence.fenceId());
+            if (existing!=null) return retry(existing,snapshotId,duration,digest);
+            if (fence.operation().epoch()<minimumEpoch) throw lost("Snapshot business epoch was retired");
             if (snapshots.containsKey(snapshotId)) throw new IllegalArgumentException("Snapshot ID belongs to another fence");
             if (entries.size()>=limits.captures() || bytes>limits.bytes()-chargedBytes) throw new IOException("Snapshot pin entry/metadata admission exhausted");
             entry=new Entry(fence,snapshotId,digest,nanos.getAsLong(),duration,bytes);
@@ -93,6 +101,19 @@ final class RatisSnapshotPins implements AutoCloseable {
             throw (Exception)failure;
         } catch (Error problem) { failure=problem; throw problem; }
         finally { finish(entry,!success,failure); }
+    }
+    private SnapshotFenceStatus.Capture retry(Entry existing,UUID snapshotId,long ttl,byte[] digest) throws Exception {
+        if (!existing.snapshotId.equals(snapshotId) || existing.ttl!=ttl || !Arrays.equals(existing.digest,digest)) throw new IllegalArgumentException("Snapshot capture retry changed ID, definition or TTL");
+        if (existing.busy) throw new IOException("Snapshot capture/operation is still running");
+        ensureLive(existing);
+        if (existing.token==null) throw lost("Capture has no historical pin");
+        return existing.token;
+    }
+    /** The verified floor fences unknown old requests; live pins keep their original historical lease. */
+    void retireBefore(long floor) throws Exception {
+        if (floor<0) throw new IllegalArgumentException("Negative snapshot retention floor");
+        synchronized (this) { minimumEpoch=Math.max(minimumEpoch,floor); }
+        cleanup();
     }
     byte[] get(SnapshotFenceStatus.Capture token,UUID column,byte[] key) throws Exception {
         requireOwner(Objects.requireNonNull(token).ownerIncarnation()); Objects.requireNonNull(column); Objects.requireNonNull(key);
@@ -174,11 +195,16 @@ final class RatisSnapshotPins implements AutoCloseable {
     /** Busy operations and failed closes retain both the native owner and its complete charge. */
     private void cleanup() throws Exception {
         final List<Entry> release;
-        synchronized (this) { release=entries.values().stream().filter(e -> e.closed && !e.busy && !e.cleaning && !e.compacted).toList(); release.forEach(e -> e.cleaning=true); }
+        synchronized (this) {
+            for (var entry:List.copyOf(entries.values())) {
+                if (entry.closed && !entry.busy && !entry.cleaning && entry.compacted && entry.anchorEpoch<minimumEpoch) remove(entry);
+            }
+            release=entries.values().stream().filter(e -> e.closed && !e.busy && !e.cleaning && !e.compacted).toList(); release.forEach(e -> e.cleaning=true);
+        }
         Throwable failure=null;
         for (var entry:release) {
             boolean success=false;
-            try { if (entry.pin!=null) entry.pin.close(); success=true; }
+            try { if (entry.pin!=null) closer.close(entry.pin); success=true; }
             catch (Throwable problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
             finally {
                 synchronized (this) {
@@ -186,13 +212,16 @@ final class RatisSnapshotPins implements AutoCloseable {
                     if (success) {
                         if (entry.pin!=null) { entry.pin=null; pins--; }
                         entry.fence=null;
-                        if (entry.permanent) { chargedBytes+=TOMBSTONE_BYTES-entry.bytes; entry.bytes=TOMBSTONE_BYTES; entry.compacted=true; }
-                        else { entries.remove(entry.fenceId,entry); snapshots.remove(entry.snapshotId,entry); chargedBytes-=entry.bytes; }
+                        if (entry.permanent && entry.anchorEpoch>=minimumEpoch) { chargedBytes+=TOMBSTONE_BYTES-entry.bytes; entry.bytes=TOMBSTONE_BYTES; entry.compacted=true; }
+                        else remove(entry);
                     }
                 }
             }
         }
         if (failure instanceof Exception exception) throw exception; if (failure instanceof Error error) throw error;
+    }
+    private void remove(Entry entry) {
+        entries.remove(entry.fenceId,entry); snapshots.remove(entry.snapshotId,entry); chargedBytes-=entry.bytes;
     }
     @Override public void close() throws Exception {
         synchronized (this) { closed=true; for (var entry:entries.values()) entry.closed=true; }

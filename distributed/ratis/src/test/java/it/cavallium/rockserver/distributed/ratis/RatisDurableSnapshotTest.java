@@ -44,6 +44,124 @@ class RatisDurableSnapshotTest {
             assertArrayEquals(new byte[]{7},f.client.snapshotGet(progress.capture().target(),progress.captureToken(),f.data.f.column,new byte[]{2}));
         }
     }
+    void retireGate(RatisSnapshotCaptureRpcTest.Fixture f,SnapshotFenceStatus consumed,ApplyPosition released) throws Exception {
+        f.data.wire.command(f.data.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(f.data.f.groupId,1,new byte[32],new OperationId(f.data.f.admin,2,0),2));
+        f.data.f.store.applySnapshotGateRetirement(new ApplyPosition(1,++f.data.wire.index),new SnapshotGateRetirement(consumed,f.data.f.groupId,released));
+        assertNull(f.data.f.store.snapshotGate(f.fence.fenceId()));
+    }
+    @Test void explicitConsumptionThenGcReopensAnUnknownReleaseWithRetirementOnly() throws Exception {
+        Path path=root.resolve("retired-release.journal");
+        try (var f=fixture("retired-release")) {
+            var group=f.data.f.groupId; SnapshotFenceStatus consumed; byte[] releaseBytes; ApplyPosition installed;
+            try (var journal=create(path,f)) {
+                installed(journal,f); installed=journal.snapshot().participant(group).installReceipt().position();
+                transition(journal,f,journal.snapshot().observedHome().abort(),1); var terminal=journal.snapshot().observedHome(); journal.freezeRelease(group);
+                var operation=f.client.prepareSnapshotGate(RatisSnapshotRecord.release(terminal,group)); releaseBytes=operation.bytes();
+                var released=f.client.executeSnapshotGate(operation).position();
+                journal.consume(control(2)); assertFalse(journal.snapshot().observedHome().consumed());
+                var frozenConsumption=DistributedCommandCodec.encode(journal.snapshot().pendingHome().command()); journal.consume(control(3));
+                assertArrayEquals(frozenConsumption,DistributedCommandCodec.encode(journal.snapshot().pendingHome().command()));
+                journal.executeHome(); consumed=journal.snapshot().observedHome();
+                assertTrue(consumed.consumed()); assertArrayEquals(releaseBytes,RatisSnapshotRecord.release(consumed,group).encode());
+                long writes=f.home.wire.index+f.data.wire.index; var last=journal.snapshot().lastHome();
+                journal.consume(control(3)); journal.executeHome(); assertEquals(last,journal.snapshot().lastHome()); assertEquals(writes,f.home.wire.index+f.data.wire.index);
+                retireGate(f,consumed,released);
+            }
+            long writes=f.home.wire.index+f.data.wire.index;
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f)) {
+                var step=driver.step(); assertEquals(RatisSnapshotCoordinator.Action.RETIRED,step.action()); assertTrue(step.complete());
+                var progress=journal.snapshot().participant(group); assertNotNull(progress.retirementProof()); assertNull(progress.releaseReceipt());
+                assertEquals(installed,progress.installReceipt().position()); assertNull(progress.captureToken());
+                var retired=journal.executeRelease(group); assertTrue(retired.retired()); assertFalse(retired.suppressed()); assertNull(retired.position());
+                assertEquals(consumed,journal.snapshot().observedHome()); assertTrue(driver.step().complete());
+            }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f)) {
+                assertNotNull(journal.snapshot().participant(group).retirementProof()); assertNull(journal.snapshot().participant(group).releaseReceipt()); assertTrue(driver.step().complete());
+            }
+            for (var request:List.of(RatisSnapshotRecord.install(f.fence,group),RatisSnapshotRecord.release(consumed,group))) {
+                var result=f.client.executeSnapshotGate(f.client.prepareSnapshotGate(request)); assertTrue(result.retired()); assertFalse(result.suppressed()); assertNull(result.position());
+            }
+            var readiness=f.client.snapshotReadiness(f.fence,group); assertTrue(readiness.retired()); assertFalse(readiness.ready()); assertNull(readiness.installed());
+            assertEquals(writes,f.home.wire.index+f.data.wire.index); assertNull(f.data.f.store.snapshotGate(f.fence.fenceId()));
+        }
+    }
+    @Test void neverInstalledRetiredGateCannotInventReadyCaptureOrSuppressedInstall() throws Exception {
+        var admission=helper.helper; admission.root=root; admission.helper.root=root; var path=root.resolve("retired-never-installed.journal");
+        try (var home=admission.new Home("retired-never-installed-home");
+                var data=admission.helper.new Node("retired-never-installed-data",false,null,home.homes,System::nanoTime)) {
+            var fence=admission.fence(home,data,77,admission.scope(data,1,4)); var initial=SnapshotFenceStatus.begin(fence); var group=data.f.groupId;
+            try (var journal=RatisDurableSnapshot.create(path,home.homes,data.routed,initial,home.homes.prepare(control(0),null,initial),data.directory.ranges())) {
+                journal.executeHome(); journal.freezeInstall(group); var abort=initial.abort();
+                journal.queueHome(home.homes.prepare(control(1),initial,abort)); journal.executeHome();
+                var released=data.routed.executeSnapshotGate(data.routed.prepareSnapshotGate(RatisSnapshotRecord.release(abort,group))).position();
+                var consumed=abort.consume(); home.homes.execute(home.homes.prepare(control(2),abort,consumed));
+                data.wire.command(data.directory.ranges().getFirst(),DistributedCommand.advanceSessionEpochFloor(group,1,new byte[32],new OperationId(data.f.admin,2,0),2));
+                data.f.store.applySnapshotGateRetirement(new ApplyPosition(1,++data.wire.index),new SnapshotGateRetirement(consumed,group,released));
+                assertThrows(IOException.class,() -> journal.executeInstall(group)); assertNull(journal.snapshot().participant(group).retirementProof());
+                journal.refreshHome(); var resolved=journal.resolveRelease(group); assertTrue(resolved.retired()); assertNull(resolved.position());
+                var install=journal.executeInstall(group); assertTrue(install.retired()); assertFalse(install.suppressed()); assertNull(install.position());
+                journal.freezeRelease(group); assertTrue(journal.executeRelease(group).retired());
+                var progress=journal.snapshot().participant(group); assertNull(progress.installReceipt()); assertNull(progress.readyProof()); assertNull(progress.captureToken()); assertNull(progress.nativeGate()); assertNull(progress.releaseReceipt());
+            }
+            long writes=home.wire.index+data.wire.index;
+            try (var journal=RatisDurableSnapshot.reopen(path,home.homes,data.routed);
+                    var driver=new RatisSnapshotCoordinator(journal,home.homes,data.routed,last -> control(last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10))) {
+                assertTrue(driver.step().complete()); assertNotNull(journal.snapshot().participant(group).retirementProof());
+                assertTrue(journal.executeInstall(group).retired()); assertTrue(journal.executeRelease(group).retired());
+                assertEquals(writes,home.wire.index+data.wire.index); assertNull(data.f.store.snapshotGate(fence.fenceId()));
+            }
+        }
+    }
+    @Test void reusedFenceUuidRetiresOldJournalWithoutAdoptingOrChangingTheNewGate() throws Exception {
+        Path path=root.resolve("retired-reused-gate.journal");
+        try (var f=fixture("retired-reused-gate"); var newHome=helper.helper.new Home("reused-gate-home")) {
+            var group=f.data.f.groupId; SnapshotFenceStatus consumed;
+            try (var journal=create(path,f)) {
+                installed(journal,f); transition(journal,f,journal.snapshot().observedHome().abort(),1); journal.freezeRelease(group);
+                var released=f.client.executeSnapshotGate(f.client.prepareSnapshotGate(RatisSnapshotRecord.release(journal.snapshot().observedHome(),group))).position();
+                journal.consume(control(2)); journal.executeHome(); consumed=journal.snapshot().observedHome(); retireGate(f,consumed,released);
+            }
+            var old=f.fence; var participant=old.participant(group);
+            var newFence=new SnapshotFence(old.clusterId(),old.databaseId(),old.domainId(),old.fenceId(),newHome.f.groupId,1,
+                    new OperationId(old.operation().sessionId(),2,0),old.directoryGeneration(),old.schemaEpoch(),old.schemaDigest(),
+                    List.of(new SnapshotFence.Participant(participant.rangeId(),group,participant.rangeEpoch(),participant.schemaDigest(),
+                            new OperationId(participant.installOperation().sessionId(),2,0),new OperationId(participant.releaseOperation().sessionId(),2,1),participant.scope())));
+            var newStatus=newHome.register(newFence);
+            var newGate=f.data.f.store.applyGateInstall(new ApplyPosition(1,++f.data.wire.index),newFence).gate(); assertTrue(newGate.active());
+            long writes=f.home.wire.index+f.data.wire.index+newHome.wire.index;
+            for (int n=0;n<2;n++) try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f)) {
+                assertTrue(driver.step().complete()); assertEquals(consumed,journal.snapshot().observedHome());
+                var progress=journal.snapshot().participant(group); assertNotNull(progress.retirementProof()); assertNull(progress.releaseReceipt());
+                assertEquals(old,progress.nativeGate().fence()); assertTrue(journal.executeRelease(group).retired());
+            }
+            assertEquals(newGate,f.data.f.store.snapshotGate(old.fenceId())); assertEquals(newStatus,newHome.homes.read(old.fenceId()));
+            assertEquals(writes,f.home.wire.index+f.data.wire.index+newHome.wire.index);
+        }
+    }
+    @Test void consumedCompleteSnapshotKeepsOriginalReleaseAndLiveCaptureAcrossGcUntilOwnerExpiry() throws Exception {
+        Path path=root.resolve("retired-capture.journal");
+        try (var f=fixture("retired-capture")) {
+            var group=f.data.f.groupId; SnapshotFenceStatus.Capture token; ApplyPosition released;
+            try (var journal=create(path,f); var driver=coordinator(journal,f)) {
+                boolean complete=false; for (int n=0;n<20 && !complete;n++) complete=driver.step().complete(); assertTrue(complete);
+                token=journal.snapshot().participant(group).captureToken(); released=journal.snapshot().participant(group).releaseReceipt();
+                journal.consume(control(100)); journal.executeHome(); retireGate(f,journal.snapshot().observedHome(),released);
+            }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client); var driver=coordinator(journal,f)) {
+                var result=journal.executeRelease(group); assertFalse(result.retired()); assertEquals(released,result.position());
+                assertNotNull(journal.snapshot().participant(group).retirementProof()); assertEquals(released,journal.snapshot().participant(group).releaseReceipt());
+                assertEquals(token,journal.executeCapture(group));
+                assertArrayEquals(new byte[]{7},f.client.snapshotGet(journal.snapshot().participant(group).capture().target(),token,f.data.f.column,new byte[]{2}));
+                assertTrue(driver.step().complete());
+                f.clock.set(Duration.ofSeconds(10).toNanos()); f.data.f.machine.expireTransactions();
+                assertThrows(RatisSnapshotLostException.class,() -> journal.executeCapture(group)); assertEquals(0,f.data.f.store.activeSnapshotPins());
+            }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+                assertEquals(token,journal.snapshot().participant(group).captureToken()); assertTrue(journal.snapshot().participant(group).captureLost());
+                assertThrows(RatisSnapshotLostException.class,() -> journal.executeCapture(group)); assertNull(f.data.f.store.snapshotGate(f.fence.fenceId()));
+            }
+        }
+    }
     @Test void coordinatorRetainsUndrainedInstallAuthorityAcrossWaitSteps() throws Exception {
         try (var f=fixture("waiting")) {
             f.home.transition(f.initial,f.initial.abort());

@@ -203,7 +203,7 @@ class RatisTransactionCoordinatorTest {
         try (var f=fixtures.new Fixture("negative-gate"); var coordinator=coordinator(f)) {
             coordinator.step();
             var group=f.data.f.groupId;
-            var gate=new SnapshotFence(fixtures.helper.cluster,fixtures.helper.database,f.data.directory.domainId(),new UUID(0,3010),new UUID(0,3011),1,0,1,new byte[32],
+            var gate=new SnapshotFence(fixtures.helper.cluster,fixtures.helper.database,f.data.directory.domainId(),new UUID(0,3010),new UUID(0,3011),1,new OperationId(new UUID(0,3010),1,0),0,1,new byte[32],
                     List.of(new SnapshotFence.Participant(group,group,1,new byte[32],new OperationId(new UUID(0,3012),1,0),new OperationId(new UUID(0,3012),1,1),fixtures.helper.scope(f.data,1,4))));
             var install=RatisSnapshotRecord.install(gate,group);
             f.data.f.machine.applyTransaction(RatisSnapshotRecordTest.committed(f.data.f.machine,1,1,install)).get(5,TimeUnit.SECONDS); f.data.wire.index=1;

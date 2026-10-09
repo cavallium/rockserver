@@ -5,8 +5,8 @@ import java.util.*;
 
 /** Frozen complete snapshot participant set and physical scopes, independent of mutable capture progress. */
 public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fenceId,UUID homeGroup,
-                            long homeEpoch,long directoryGeneration,long schemaEpoch,byte[] schemaDigest,List<Participant> participants) {
-    public static final int MAX_PARTICIPANTS=64, HEADER_BYTES=140, MAX_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES-8192;
+                            long homeEpoch,OperationId operation,long directoryGeneration,long schemaEpoch,byte[] schemaDigest,List<Participant> participants) {
+    public static final int MAX_PARTICIPANTS=64, HEADER_BYTES=172, MAX_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES-8192;
     private static final int PARTICIPANT_HEADER_BYTES=140;
     static final Comparator<UUID> UUID_ORDER=(a,b) -> { int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits()); return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits()); };
     private static final Comparator<TransactionScope.Span> SPAN_ORDER=Comparator.comparing(TransactionScope.Span::columnId,UUID_ORDER)
@@ -25,10 +25,10 @@ public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fe
     }
     public SnapshotFence {
         Objects.requireNonNull(clusterId); Objects.requireNonNull(databaseId); Objects.requireNonNull(domainId); Objects.requireNonNull(fenceId); Objects.requireNonNull(homeGroup);
-        Objects.requireNonNull(schemaDigest); Objects.requireNonNull(participants);
+        Objects.requireNonNull(operation); Objects.requireNonNull(schemaDigest); Objects.requireNonNull(participants);
         if (homeEpoch<0 || directoryGeneration<0 || schemaEpoch<0 || schemaDigest.length!=32 || participants.isEmpty() || participants.size()>MAX_PARTICIPANTS) throw invalid("Invalid snapshot fence identity/bounds");
         schemaDigest=schemaDigest.clone(); participants=participants.stream().sorted(Comparator.comparing(Participant::groupId,UUID_ORDER)).toList();
-        var ranges=new HashSet<UUID>(); var groups=new HashSet<UUID>(); var operations=new HashSet<OperationId>(); long bytes=HEADER_BYTES;
+        var ranges=new HashSet<UUID>(); var groups=new HashSet<UUID>(); var operations=new HashSet<OperationId>(); operations.add(operation); long bytes=HEADER_BYTES;
         for (var p:participants) {
             if (!ranges.add(p.rangeId()) || !groups.add(p.groupId()) || !operations.add(p.installOperation()) || !operations.add(p.releaseOperation())) throw invalid("Duplicate snapshot participant/control identity");
             bytes+=participantSize(p); if (bytes>MAX_BYTES) throw invalid("Snapshot fence exceeds aggregate byte bound");
@@ -40,14 +40,14 @@ public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fe
         long size=HEADER_BYTES; for (var p:participants) size+=participantSize(p);
         if (size>MAX_BYTES) throw invalid("Snapshot fence exceeds aggregate byte bound");
         var b=ByteBuffer.allocate((int)size); uuid(b,clusterId); uuid(b,databaseId); uuid(b,domainId); uuid(b,fenceId); uuid(b,homeGroup);
-        b.putLong(homeEpoch).putLong(directoryGeneration).putLong(schemaEpoch).put(schemaDigest).putInt(participants.size());
+        b.putLong(homeEpoch); operation(b,operation); b.putLong(directoryGeneration).putLong(schemaEpoch).put(schemaDigest).putInt(participants.size());
         for (var p:participants) participant(b,p); return b.array();
     }
     public static SnapshotFence decode(byte[] bytes) {
         Objects.requireNonNull(bytes); if (bytes.length<HEADER_BYTES || bytes.length>MAX_BYTES) throw invalid("Invalid snapshot fence length");
         try {
             var b=ByteBuffer.wrap(bytes); UUID cluster=uuid(b),database=uuid(b),domain=uuid(b),fence=uuid(b),home=uuid(b);
-            long homeEpoch=b.getLong(),directory=b.getLong(),schemaEpoch=b.getLong(); byte[] schema=new byte[32]; b.get(schema); int count=b.getInt();
+            long homeEpoch=b.getLong(); var operation=operation(b); long directory=b.getLong(),schemaEpoch=b.getLong(); byte[] schema=new byte[32]; b.get(schema); int count=b.getInt();
             if (count<1 || count>MAX_PARTICIPANTS || (long)count*(PARTICIPANT_HEADER_BYTES+25)>b.remaining()) throw invalid("Invalid snapshot participant count");
             var participants=new ArrayList<Participant>(count);
             for (int i=0;i<count;i++) {
@@ -64,7 +64,7 @@ public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fe
                 participants.add(new Participant(range,group,epoch,digest,install,release,new TransactionScope(scope)));
             }
             if (b.hasRemaining()) throw invalid("Trailing snapshot fence bytes");
-            var result=new SnapshotFence(cluster,database,domain,fence,home,homeEpoch,directory,schemaEpoch,schema,participants);
+            var result=new SnapshotFence(cluster,database,domain,fence,home,homeEpoch,operation,directory,schemaEpoch,schema,participants);
             if (!Arrays.equals(bytes,result.encode())) throw invalid("Noncanonical snapshot fence"); return result;
         } catch (RuntimeException malformed) { if (malformed instanceof IllegalArgumentException invalid) throw invalid; throw new IllegalArgumentException("Invalid snapshot fence",malformed); }
     }

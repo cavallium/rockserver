@@ -124,7 +124,7 @@ class RatisSnapshotCaptureRpcTest {
                 f.clock.set(Duration.ofSeconds(10).toNanos()); f.data.f.machine.expireTransactions(); assertFalse(pending.isDone()); assertEquals(bytes,f.data.f.machine.snapshotPinStats().bytes());
             } finally { release.countDown(); }
             var failure=assertThrows(ExecutionException.class,() -> pending.get(5,TimeUnit.SECONDS)); assertInstanceOf(RatisSnapshotLostException.class,failure.getCause());
-            assertEquals(0,f.data.f.machine.snapshotPinStats().pins()); assertEquals(128,f.data.f.machine.snapshotPinStats().bytes()); assertEquals(0,f.data.f.store.activeSnapshotPins());
+            assertEquals(0,f.data.f.machine.snapshotPinStats().pins()); assertEquals(RatisSnapshotPins.TOMBSTONE_BYTES,f.data.f.machine.snapshotPinStats().bytes()); assertEquals(0,f.data.f.store.activeSnapshotPins());
             assertThrows(RatisSnapshotLostException.class,() -> f.client.executeSnapshotCapture(operation)); assertEquals(1,f.homes.get());
         }
     }

@@ -19,6 +19,10 @@ import it.cavallium.rockserver.core.common.distributed.RejectedParticipant;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus;
 import it.cavallium.rockserver.core.common.distributed.SnapshotGate;
+import it.cavallium.rockserver.core.common.distributed.SnapshotGateResult;
+import it.cavallium.rockserver.core.common.distributed.SnapshotFenceProof;
+import it.cavallium.rockserver.core.common.distributed.SnapshotGateRetirement;
+import it.cavallium.rockserver.core.common.distributed.SnapshotRetentionExpiredException;
 import it.cavallium.rockserver.core.common.distributed.CommittedParticipant;
 import it.cavallium.rockserver.core.common.distributed.ParticipantOutcome;
 import it.cavallium.rockserver.core.common.distributed.TransactionStatus;
@@ -1055,7 +1059,7 @@ public final class ReplicatedRangeStore {
         } finally { applyLane.unlock(); leaveNative(); }
     }
     public record GateCapacity(ApplyPosition position,int count,long bytes) {}
-    public record GateEstimate(GateCapacity capacity,SnapshotGate existing) {}
+    public record GateEstimate(GateCapacity capacity,SnapshotGate existing,SnapshotFenceProof retirement) {}
     private byte[] snapshotGateKey(UUID fence) { return ByteBuffer.allocate(33).put(markerKey).put((byte)0x24).putLong(fence.getMostSignificantBits()).putLong(fence.getLeastSignificantBits()).array(); }
     private void requireSnapshotFence(SnapshotFence fence) {
         var participant=fence.participant(groupId);
@@ -1090,7 +1094,7 @@ public final class ReplicatedRangeStore {
     }
     private void requireGateIdentity(SnapshotFence fence) throws RocksDBException {
         var participant=fence.participant(groupId);
-        for (var id:List.of(participant.installOperation(),participant.releaseOperation())) {
+        for (var id:List.of(fence.operation(),participant.installOperation(),participant.releaseOperation())) {
             requireHomeRecoveryFree(id);
             for (var prepared:preparedIndex.records()) if (prepared.preparation().ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to preparation");
             for (var rejected:rejectedIndex.values()) if (rejected.ownsOperation(id)) throw new IllegalArgumentException("Gate identity belongs to rejection");
@@ -1127,23 +1131,85 @@ public final class ReplicatedRangeStore {
         if (!record.fence().equals(fence) || !record.participantGroup().equals(groupId)) throw new IllegalArgumentException("Recovered snapshot gate binding changed");
         return record;
     }
+    /** Snapshot retention uses the same durable aggregate business epoch floor as native sessions. */
+    public long snapshotRetentionFloor() throws RocksDBException {
+        enterNative(); applyLane.lock(); try { requireActive(); return minimumSessionEpoch(null); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    private SnapshotGateResult readSnapshotGateResult(SnapshotFence fence,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        requireSnapshotFence(fence);
+        if (options==null && pendingInstallation!=null) throw new IllegalStateException("Snapshot gate metadata is being installed");
+        byte[] marker=stateRow(markerKey,options); var actual=marker==null ? null : decodePosition(marker);
+        if (!Objects.equals(cut,actual)) throw new IllegalStateException("Snapshot gate proof cut differs from completed native marker");
+        var authority=sessionAuthority(options);
+        if (authority!=null && (!authority.clusterId().equals(fence.clusterId()) || !authority.databaseId().equals(fence.databaseId()))) throw new IllegalArgumentException("Snapshot fence differs from native database authority");
+        byte[] bytes=stateRow(snapshotGateKey(fence.fenceId()),options);
+        if (bytes!=null) {
+            var retained=SnapshotGate.decode(bytes); retained.requireCompletedCut(cut); requireSnapshotFence(retained.fence());
+            if (!retained.participantGroup().equals(groupId)) throw new IllegalArgumentException("Snapshot gate participant changed");
+            if (retained.fence().operation().equals(fence.operation())) {
+                if (!retained.fence().equals(fence)) throw new IllegalArgumentException("Retained snapshot business definition changed");
+                return SnapshotGateResult.retained(retained);
+            }
+            if (fence.operation().epoch()>=minimumSessionEpoch(options)) throw new IllegalArgumentException("Snapshot UUID belongs to another live business anchor");
+        }
+        long floor=minimumSessionEpoch(options);
+        return fence.operation().epoch()<floor ? SnapshotGateResult.retired(new SnapshotFenceProof(fence,groupId,floor,cut)) : null;
+    }
+    public SnapshotGateResult snapshotGateResult(SnapshotFence fence) throws RocksDBException {
+        Objects.requireNonNull(fence); enterNative(); applyLane.lock();
+        try { return readSnapshotGateResult(fence,null,applied); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public SnapshotFenceProof snapshotFence(SnapshotFence fence) throws RocksDBException {
+        var result=snapshotGateResult(fence); return result!=null && result.retired() ? result.retirement() : null;
+    }
+    private boolean snapshotGateRetirementNeeded(SnapshotGateRetirement retirement) throws RocksDBException {
+        if (!retirement.participantGroup().equals(groupId)) throw new IllegalArgumentException("Snapshot retirement belongs to another participant");
+        var result=readSnapshotGateResult(retirement.fence(),null,applied);
+        if (result!=null && result.retired()) return false;
+        if (retirement.fence().operation().epoch()>=minimumSessionEpoch(null)) throw new IllegalStateException("Snapshot retirement requires a strictly newer native business floor");
+        var gate=result==null ? null : result.gate();
+        if (gate==null || gate.released()==null || !gate.released().equals(retirement.released()) || !Arrays.equals(gate.decisionDigest(),retirement.consumed().terminalDecision().digest())) throw new IllegalArgumentException("Snapshot retirement lacks exact released native proof");
+        return true;
+    }
+    public boolean estimateSnapshotGateRetirement(SnapshotGateRetirement retirement) throws RocksDBException {
+        Objects.requireNonNull(retirement); enterNative(); applyLane.lock();
+        try { requireActive(); return snapshotGateRetirementNeeded(retirement); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public void applySnapshotGateRetirement(ApplyPosition position,SnapshotGateRetirement retirement) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(retirement); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage();
+            if (!snapshotGateRetirementNeeded(retirement)) { advanceCompletedMarker(position); return; }
+            if (applied!=null && position.index()<=applied.index()) throw new IllegalStateException("Covered snapshot retirement still retains its original gate");
+            requireNext(position); var saved=snapshotGates.get(retirement.fence().fenceId());
+            if (saved==null || !saved.fence().equals(retirement.fence())) throw new IllegalStateException("Snapshot gate index differs from native retirement family");
+            var next=new HashMap<>(snapshotGates); next.remove(retirement.fence().fenceId()); var published=Map.copyOf(next); long bytes=retainedGateBytes-snapshotGateBytes(saved.fence());
+            var history=prepareScopedWrites(false,List.of(),Map.of());
+            try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                batch.delete(state,snapshotGateKey(retirement.fence().fenceId())); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            snapshotGates=published; retainedGateBytes=bytes; publishScoped(position,history,false); applied=position;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
     public GateEstimate estimateGateInstall(SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(fence); enterNative(); applyLane.lock();
         try {
-            requireActive(); requireSnapshotFence(fence); var saved=snapshotGates.get(fence.fenceId());
-            if (saved!=null) { if (!saved.fence().equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed"); }
-            else { requireGateIdentity(fence); requireUngated(fence.participant(groupId).scope()); requireGateCapacity(fence); }
-            return new GateEstimate(gateCapacityUnderLane(),saved);
+            requireActive(); var result=readSnapshotGateResult(fence,null,applied);
+            if (result!=null && result.retired()) return new GateEstimate(gateCapacityUnderLane(),null,result.retirement());
+            var saved=result==null ? null : result.gate();
+            if (saved==null) { requireGateIdentity(fence); requireUngated(fence.participant(groupId).scope()); requireGateCapacity(fence); }
+            return new GateEstimate(gateCapacityUnderLane(),saved,null);
         } finally { applyLane.unlock(); leaveNative(); }
     }
     /** Trusted committed gate seam; the adapter must drain its pre-gate proposal owners before append. */
-    public SnapshotGate applyGateInstall(ApplyPosition position,SnapshotFence fence) throws RocksDBException {
+    public SnapshotGateResult applyGateInstall(ApplyPosition position,SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(fence); enterNative(); applyLane.lock();
         try {
-            var estimate=estimateGateInstall(fence); var saved=estimate.existing();
-            if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied gate installation lacks receipt"); return saved; }
+            requireActive(); ensureReceiptUsage(); var estimate=estimateGateInstall(fence); var saved=estimate.existing();
+            if (estimate.retirement()!=null) { advanceCompletedMarker(position); return readSnapshotGateResult(fence,null,applied); }
+            if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied gate installation lacks receipt"); return SnapshotGateResult.retained(saved); }
             requireNext(position); var result=saved==null ? SnapshotGate.install(fence,groupId,position) : saved;
-            publishGate(position,result); return result;
+            publishGate(position,result); return SnapshotGateResult.retained(result);
         } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
     public GateEstimate estimateGateRelease(SnapshotFenceStatus terminal) throws RocksDBException {
@@ -1151,23 +1217,25 @@ public final class ReplicatedRangeStore {
         try {
             requireActive(); requireSnapshotFence(terminal.fence());
             if (!terminal.terminal()) throw new IllegalArgumentException("Snapshot gate release requires a terminal home decision");
-            var saved=snapshotGates.get(terminal.fence().fenceId());
-            if (saved!=null) { if (!saved.fence().equals(terminal.fence())) throw new IllegalArgumentException("Snapshot fence definition changed"); }
-            else { requireGateIdentity(terminal.fence()); requireGateCapacity(terminal.fence()); }
+            var result=readSnapshotGateResult(terminal.fence(),null,applied);
+            if (result!=null && result.retired()) return new GateEstimate(gateCapacityUnderLane(),null,result.retirement());
+            var saved=result==null ? null : result.gate();
+            if (saved==null) { requireGateIdentity(terminal.fence()); requireGateCapacity(terminal.fence()); }
             if (applied==null || applied.index()==Long.MAX_VALUE) throw new IllegalStateException("Completed prefix unavailable/exhausted");
             var next=new ApplyPosition(Math.max(1,applied.term()),applied.index()+1);
             if (saved==null) SnapshotGate.released(terminal,groupId,next); else saved.release(terminal,next);
-            return new GateEstimate(gateCapacityUnderLane(),saved);
+            return new GateEstimate(gateCapacityUnderLane(),saved,null);
         } finally { applyLane.unlock(); leaveNative(); }
     }
     /** Home read provenance is verified by the adapter; timers never authorize this release. */
-    public SnapshotGate applyGateRelease(ApplyPosition position,SnapshotFenceStatus terminal) throws RocksDBException {
+    public SnapshotGateResult applyGateRelease(ApplyPosition position,SnapshotFenceStatus terminal) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(terminal); enterNative(); applyLane.lock();
         try {
-            var estimate=estimateGateRelease(terminal); var saved=estimate.existing();
-            if (applied!=null && position.index()<=applied.index()) { if (saved==null || saved.released()==null) throw new IllegalStateException("Applied gate release lacks receipt"); return saved; }
+            requireActive(); ensureReceiptUsage(); var estimate=estimateGateRelease(terminal); var saved=estimate.existing();
+            if (estimate.retirement()!=null) { advanceCompletedMarker(position); return readSnapshotGateResult(terminal.fence(),null,applied); }
+            if (applied!=null && position.index()<=applied.index()) { if (saved==null || saved.released()==null) throw new IllegalStateException("Applied gate release lacks receipt"); return SnapshotGateResult.retained(saved); }
             requireNext(position); var result=saved==null ? SnapshotGate.released(terminal,groupId,position) : saved.release(terminal,position);
-            publishGate(position,result); return result;
+            publishGate(position,result); return SnapshotGateResult.retained(result);
         } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
     private void publishGate(ApplyPosition position,SnapshotGate gate) throws RocksDBException {
@@ -1225,7 +1293,7 @@ public final class ReplicatedRangeStore {
     }
     public ScopedSnapshot captureGate(SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(fence); enterNative(); applyLane.lock();
-        try { requireActive(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
+        try { requireActive(); requireSnapshotFence(fence); if (fence.operation().epoch()<minimumSessionEpoch(null)) throw new SnapshotRetentionExpiredException(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
         finally { applyLane.unlock(); leaveNative(); }
     }
     public record GateConflict(ApplyPosition position,boolean blocked) {}
@@ -2623,6 +2691,13 @@ public final class ReplicatedRangeStore {
         public HomeRecoveryResult homeRecoveryResult(HomeRecovery recovery) throws RocksDBException {
             Objects.requireNonNull(recovery); acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) { return readHomeRecovery(recovery,options,position); } finally { releaseUse(); }
+        }
+        public SnapshotGateResult snapshotGateResult(SnapshotFence fence) throws RocksDBException {
+            Objects.requireNonNull(fence); acquireUse();
+            try (var options=new ReadOptions().setSnapshot(snapshot)) { return readSnapshotGateResult(fence,options,position); } finally { releaseUse(); }
+        }
+        public SnapshotFenceProof snapshotFence(SnapshotFence fence) throws RocksDBException {
+            var result=snapshotGateResult(fence); return result!=null && result.retired() ? result.retirement() : null;
         }
         public SnapshotGate snapshotGate(SnapshotFence fence) throws RocksDBException {
             Objects.requireNonNull(fence); acquireUse();

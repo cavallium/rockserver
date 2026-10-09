@@ -19,7 +19,7 @@ public record SnapshotGate(SnapshotFence fence,UUID participantGroup,ApplyPositi
     public static SnapshotGate released(SnapshotFenceStatus terminal,UUID group,ApplyPosition position) {
         Objects.requireNonNull(terminal);
         if (terminal.phase()!=SnapshotFenceStatus.Phase.ABORT || terminal.progress(group).ready()!=null) throw SnapshotFence.invalid("Release before install requires unready ABORT");
-        return new SnapshotGate(terminal.fence(),group,null,position,terminal.digest());
+        return new SnapshotGate(terminal.fence(),group,null,position,terminal.terminalDecision().digest());
     }
     /** The completed prefix has exactly one term at its final index. Earlier receipt indexes may use older terms. */
     public void requireCompletedCut(ApplyPosition cut) {
@@ -29,17 +29,17 @@ public record SnapshotGate(SnapshotFence fence,UUID participantGroup,ApplyPositi
         return position!=null && (position.index()>cut.index() || position.term()>cut.term() || position.index()==cut.index() && position.term()!=cut.term());
     }
     public boolean active() { return installed!=null && released==null; }
-    public boolean ownsOperation(OperationId operation) { var participant=fence.participant(participantGroup); return participant.installOperation().equals(operation) || participant.releaseOperation().equals(operation); }
+    public boolean ownsOperation(OperationId operation) { var participant=fence.participant(participantGroup); return fence.operation().equals(operation) || participant.installOperation().equals(operation) || participant.releaseOperation().equals(operation); }
     public SnapshotGate release(SnapshotFenceStatus terminal,ApplyPosition position) {
         Objects.requireNonNull(terminal); SnapshotFenceStatus.positive(position);
         if (!terminal.terminal() || !fence.equals(terminal.fence())) throw SnapshotFence.invalid("Snapshot release lacks bound terminal decision");
         var progress=terminal.progress(participantGroup);
         if (progress.ready()!=null && !progress.ready().equals(installed)) throw SnapshotFence.invalid("Home ready proof differs from native gate");
-        if (released!=null) { if (!Arrays.equals(decisionDigest,terminal.digest())) throw SnapshotFence.invalid("Snapshot release decision changed"); return this; }
+        if (released!=null) { if (!Arrays.equals(decisionDigest,terminal.terminalDecision().digest())) throw SnapshotFence.invalid("Snapshot release decision changed"); return this; }
         if (terminal.phase()==SnapshotFenceStatus.Phase.COMPLETE
                 && (installed==null || !installed.equals(progress.ready()) || progress.capture()==null || !SnapshotFenceStatus.atLeast(progress.capture().position(),installed)
                 || !SnapshotFenceStatus.atLeast(position,progress.capture().position()) || position.index()<=progress.capture().position().index())) throw SnapshotFence.invalid("Completed snapshot release lacks ordered capture proof");
-        return new SnapshotGate(fence,participantGroup,installed,position,terminal.digest());
+        return new SnapshotGate(fence,participantGroup,installed,position,terminal.terminalDecision().digest());
     }
     public byte[] encode() {
         byte[] definition=fence.encode(); int size=HEADER_BYTES+definition.length+(installed==null ? 0 : 16)+(released==null ? 0 : 48);

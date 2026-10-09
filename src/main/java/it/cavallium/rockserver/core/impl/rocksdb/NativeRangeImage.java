@@ -663,7 +663,7 @@ public final class NativeRangeImage {
 
             for (var gate:gates.values()) {
                 var participant=gate.fence().participant(gate.participantGroup());
-                for (var id:List.of(participant.installOperation(),participant.releaseOperation())) {
+                for (var id:List.of(gate.fence().operation(),participant.installOperation(),participant.releaseOperation())) {
                     for (var p:prepared) if (p.preparation().ownsOperation(id)) throw new IOException("Gate/preparation image identity reused");
                     for (var r:rejected.values()) if (r.ownsOperation(id)) throw new IOException("Gate/rejection image identity reused");
                     for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("Gate/ABORT image identity reused");

@@ -41,7 +41,7 @@ class RatisSnapshotAdmissionTest {
     }
     TransactionScope scope(RatisParticipantPrepareTest.Node data,int lower,int upper) { return helper.scope(data,lower,upper); }
     SnapshotFence fence(Home home,RatisParticipantPrepareTest.Node data,int id,TransactionScope scope) {
-        return new SnapshotFence(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,2200+id),home.f.groupId,1,data.directory.generation(),1,new byte[32],
+        return new SnapshotFence(helper.cluster,helper.database,data.directory.domainId(),new UUID(0,2200+id),home.f.groupId,1,new OperationId(new UUID(0,32000+id),1,0),data.directory.generation(),1,new byte[32],
                 List.of(new SnapshotFence.Participant(data.f.groupId,data.f.groupId,1,new byte[32],new OperationId(new UUID(0,2300+id),1,0),new OperationId(new UUID(0,2300+id),1,1),scope)));
     }
     RatisSnapshotRecord.Result append(RatisParticipantPrepareTest.Node data,RatisRangeStateMachine.SnapshotProposal proposal) throws Exception {
@@ -77,7 +77,7 @@ class RatisSnapshotAdmissionTest {
         helper.root=root;
         try (var home=new Home("authority-home"); var data=helper.new Node("authority-data",false)) {
             var fence=fence(home,data,1,scope(data,1,4)); var initial=home.register(fence);
-            var changed=new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),1,1,1,new byte[32],fence.participants());
+            var changed=new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),fence.homeGroup(),1,fence.operation(),1,1,new byte[32],fence.participants());
             assertThrows(IllegalStateException.class,() -> data.f.machine.prepareSnapshotInstall(home.homes,changed)); released(data);
             assertThrows(IllegalStateException.class,() -> data.f.machine.prepareSnapshotRelease(home.homes,fence)); released(data);
             byte[] bytes;
@@ -124,7 +124,7 @@ class RatisSnapshotAdmissionTest {
         try (var home=new Home("all-ready-home"); var data=helper.new Node("all-ready-data",false)) {
             var base=fence(home,data,7,scope(data,1,4)); var other=new UUID(0,2700);
             var participants=List.of(base.participant(data.f.groupId),new SnapshotFence.Participant(other,other,1,new byte[32],new OperationId(other,1,0),new OperationId(other,1,1),scope(data,4,8)));
-            var fence=new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),base.fenceId(),base.homeGroup(),base.homeEpoch(),base.directoryGeneration(),base.schemaEpoch(),base.schemaDigest(),participants);
+            var fence=new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),base.fenceId(),base.homeGroup(),base.homeEpoch(),base.operation(),base.directoryGeneration(),base.schemaEpoch(),base.schemaDigest(),participants);
             var initial=home.register(fence); ApplyPosition installed;
             try (var install=data.f.machine.prepareSnapshotInstall(home.homes,fence)) { installed=append(data,install).position(); }
             var local=initial.ready(data.f.groupId,installed); home.transition(initial,local);

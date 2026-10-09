@@ -76,7 +76,7 @@ class RatisHomeRolesTest {
         }
         SnapshotFence fence() {
             var data=plan.directory().ranges().getFirst(); var home=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME).directory().ranges().getFirst();
-            return new SnapshotFence(env.outer.cluster,env.outer.database,plan.directory().domainId(),new UUID(95,1),home.groupId(),home.rangeEpoch(),plan.directory().generation(),plan.directory().schemaEpoch(),plan.directory().schemaDigest(),List.of(new SnapshotFence.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.directory().schemaDigest(),new OperationId(new UUID(95,2),1,0),new OperationId(new UUID(95,2),1,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
+            return new SnapshotFence(env.outer.cluster,env.outer.database,plan.directory().domainId(),new UUID(95,1),home.groupId(),home.rangeEpoch(),new OperationId(new UUID(95,1),1,0),plan.directory().generation(),plan.directory().schemaEpoch(),plan.directory().schemaDigest(),List.of(new SnapshotFence.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.directory().schemaDigest(),new OperationId(new UUID(95,2),1,0),new OperationId(new UUID(95,2),1,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
         }
         @Override public void close() throws Exception { node.close(); data.close(); env.close(); }
     }

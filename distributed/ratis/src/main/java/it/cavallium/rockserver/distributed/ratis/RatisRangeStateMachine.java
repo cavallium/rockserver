@@ -22,6 +22,9 @@ import it.cavallium.rockserver.core.common.distributed.ProposalFootprints;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus;
 import it.cavallium.rockserver.core.common.distributed.SnapshotGate;
+import it.cavallium.rockserver.core.common.distributed.SnapshotGateResult;
+import it.cavallium.rockserver.core.common.distributed.SnapshotFenceProof;
+import it.cavallium.rockserver.core.common.distributed.SnapshotGateRetirement;
 import it.cavallium.rockserver.core.common.distributed.TransactionScope;
 import it.cavallium.rockserver.core.common.distributed.Mutation;
 import java.util.ArrayList;
@@ -145,6 +148,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || !identity.columnId().equals(homeColumn)) throw new IllegalArgumentException("HOME retirement requires the configured transaction HOME context");
     }
     private void requireRoleRecord(byte[] encoded) {
+        if (RatisSnapshotRetirementRecord.isRetirement(encoded)) { requireDataRole(); return; }
         if (RatisHomeRetirementRecord.isRetirement(encoded)) { requireHomeRetirement(RatisHomeRetirementRecord.decode(encoded)); return; }
         if (HomeRecovery.isRecovery(encoded)) { requireHomeRecovery(HomeRecovery.decode(encoded)); return; }
         if (role==RatisNodePlan.Role.DATA) return;
@@ -220,7 +224,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     void expireTransactions() throws Exception {
         Exception failure=null;
         try { scopedTransactions.expire(); } catch (Exception problem) { failure=problem; }
-        try { capturedSnapshots.expire(); } catch (Exception problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
+        try { capturedSnapshots.retireBefore(store.snapshotRetentionFloor()); capturedSnapshots.expire(); } catch (Exception problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
         if (failure!=null) throw failure;
     }
     private RatisSnapshotPins newSnapshotPins(java.util.function.LongSupplier nanos) {
@@ -229,7 +233,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     /** Qualified coordinator seam; the caller freezes this incarnation before its first capture request. */
     public UUID snapshotCaptureOwner() throws IOException { checkTransactionOwner(); return transactionIncarnation; }
     public SnapshotFenceStatus.Capture captureSnapshotPin(RatisSnapshotFences homes,SnapshotFence fence,UUID owner,UUID snapshot,java.time.Duration ttl) throws Exception { requireDataRole();
-        return capturedSnapshots.capture(homes,fence,owner,snapshot,ttl);
+        return capturedSnapshots.capture(homes,fence,owner,snapshot,ttl,this::snapshotRetentionFloor);
+    }
+    private long snapshotRetentionFloor() {
+        try { return store.snapshotRetentionFloor(); } catch (org.rocksdb.RocksDBException unavailable) { throw new IllegalStateException("Cannot read snapshot retention floor",unavailable); }
     }
     /** Immutable pin reads do not acquire new leader authority or substitute a current native cut. */
     public byte[] snapshotPinGet(SnapshotFenceStatus.Capture token,UUID column,byte[] key) throws Exception { requireDataRole(); return capturedSnapshots.get(token,column,key); }
@@ -257,6 +264,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         ParticipantRetirement retirement;
         ParticipantFinalization finalization;
         FinalizationHold finalizationHold;
+        SnapshotGateRetirement snapshotRetirement;
         HomeRetirement homeRetirement;
         HomeRecovery homeRecovery;
         HomeHold homeHold;
@@ -321,6 +329,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final HashMap<OperationId,HomeRetirementHold> preparingHomeRetirements=new HashMap<>(),preparedHomeRetirements=new HashMap<>();
     private int homeRetirementSlots;
     private long homeRetirementInputBytes;
+    private record SnapshotRetirementHold(SnapshotGateRetirement retirement,long term,long generation,int bytes) {}
+    private final HashMap<OperationId,SnapshotRetirementHold> preparingSnapshotRetirements=new HashMap<>(),preparedSnapshotRetirements=new HashMap<>();
+    private int snapshotRetirementSlots;
+    private long snapshotRetirementInputBytes;
     private int retirementSlots;
     private long retirementInputBytes;
     private long reservedFinalizationCount,reservedFinalizationBytes;
@@ -845,6 +857,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray(); requireRoleRecord(encoded);
+            if (RatisSnapshotRetirementRecord.isRetirement(encoded)) return startSnapshotRetirement(transaction,RatisSnapshotRetirementRecord.decode(encoded),encoded,generation,leadership);
             if (RatisHomeRetirementRecord.isRetirement(encoded)) return startHomeRetirement(transaction,RatisHomeRetirementRecord.decode(encoded),encoded,generation,leadership);
             if (HomeRecovery.isRecovery(encoded)) return startHomeRecovery(transaction,encoded,generation,leadership);
             if (RatisSnapshotRecord.isSnapshot(encoded)) return startSnapshot(transaction,encoded,generation,leadership);
@@ -911,7 +924,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         if (estimate.newReceipt() && (command.acceptance()==null || reject) && estimate.maintenance() && proposalFootprints.stats().candidates()>0) throw new IllegalStateException("Transaction reservations hold session metadata stable");
                         boolean maintenance = estimate.newReceipt() && estimate.maintenance();
                         boolean protectedControl = estimate.maintenance() && command.mutations().isEmpty() && command.predicates().isEmpty();
-                        if (protectedControl ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots >= 16
+                        if (protectedControl ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots >= 16
                                 : dataAdmissions >= 1024 || dataProposalBytes + encoded.length > 16L * 1024 * 1024) {
                             throw new IllegalStateException("Range proposal budget exhausted");
                         }
@@ -985,7 +998,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var footprint=install ? proposalFootprints.prepare(participant.scope()) : null; long storageBytes=ReplicatedRangeStore.snapshotGateBytes(fence);
         SnapshotHold hold=null;
         for (int attempt=0;attempt<3 && hold==null;attempt++) {
-            var capacity=store.gateCapacity(); var existing=store.recoveredSnapshotGate(fence);
+            var capacity=store.gateCapacity(); var outcome=store.snapshotGateResult(fence); if (outcome!=null && outcome.retired()) throw new RatisSnapshotRetiredException(outcome.retirement()); var existing=outcome==null ? null : outcome.gate();
             synchronized (admissions) {
                 requireHealthy(); var a=store.applied();
                 if (generation!=admissionGeneration.get() || a==null || a.term()!=leader.term() || !store.admissionOpen()) throw new IllegalStateException("Snapshot gate has no current native owner");
@@ -999,12 +1012,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (known!=null) throw new IllegalStateException("Previous snapshot control is still settling");
                 if (preparingSnapshots.containsKey(operation)) throw new IllegalStateException("Snapshot control is still preparing");
-                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes
                         || install && (snapshotInstallOwners+snapshotAdmittedInstalls>=8 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-snapshotInstallBytes-snapshotInstallAdmittedBytes)) throw new IllegalStateException("Snapshot protected input budget exhausted");
                 var charge=snapshotCharges.get(fence.fenceId());
                 if (charge!=null && !charge.fence.equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed");
                 if (charge==null) {
-                    for (var id:List.of(participant.installOperation(),participant.releaseOperation())) if (participantIdentityBusy(id)) {
+                    for (var id:List.of(fence.operation(),participant.installOperation(),participant.releaseOperation())) if (participantIdentityBusy(id)) {
                         var other=admissions.get(id);
                         if (other==null || other.snapshot==null || !other.snapshot.fence().equals(fence)) throw new IllegalStateException("Snapshot control identity belongs to other work");
                     }
@@ -1018,7 +1031,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if (lease==null) throw new IllegalStateException("Snapshot gate overlaps another reservation");
                 }
                 if (!snapshotCharges.containsKey(fence.fenceId())) {
-                    snapshotCharges.put(fence.fenceId(),charge); snapshotControlCharges.put(participant.installOperation(),charge); snapshotControlCharges.put(participant.releaseOperation(),charge);
+                    snapshotCharges.put(fence.fenceId(),charge); snapshotControlCharges.put(fence.operation(),charge); snapshotControlCharges.put(participant.installOperation(),charge); snapshotControlCharges.put(participant.releaseOperation(),charge);
                     if (charge.reserved) { reservedSnapshotCount++; reservedSnapshotBytes+=charge.bytes; }
                 }
                 if (existing!=null) materializeSnapshotCharge(fence);
@@ -1066,8 +1079,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (--charge.references==0) {
             if (charge.reserved) { charge.reserved=false; reservedSnapshotCount--; reservedSnapshotBytes-=charge.bytes; }
             snapshotCharges.remove(charge.fence.fenceId(),charge); var participant=charge.fence.participant(store.ownership().owner().groupId());
-            snapshotControlCharges.remove(participant.installOperation(),charge); snapshotControlCharges.remove(participant.releaseOperation(),charge);
+            snapshotControlCharges.remove(charge.fence.operation(),charge); snapshotControlCharges.remove(participant.installOperation(),charge); snapshotControlCharges.remove(participant.releaseOperation(),charge);
         }
+    }
+    private void retireSnapshotOwners(SnapshotGateResult result) {
+        if (!result.retired()) { retireSnapshotOwners(result.gate()); return; }
+        var fence=result.retirement().fence(); snapshotHelpers.remove(fence.fenceId()); materializeSnapshotCharge(fence);
+        for (var plan:List.copyOf(preparedSnapshots.values())) if (plan.request.fence().equals(fence)) plan.close();
+        for (var hold:preparingSnapshots.values()) if (hold.charge.fence.equals(fence)) { hold.invalidated=true; if (hold.lease!=null) proposalFootprints.release(hold.lease); }
+        for (var admission:List.copyOf(admissions.values())) if (admission.snapshot!=null && admission.snapshot.fence().equals(fence)) settleAdmission(admission);
     }
     private void retireSnapshotOwners(SnapshotGate record) {
         if (record.released()!=null) snapshotHelpers.remove(record.fence().fenceId());
@@ -1098,19 +1118,29 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return ready;
     }
     public ReplicatedRangeStore.ScopedSnapshot captureSnapshotGate(RatisSnapshotFences homes,SnapshotFence fence) throws Exception { requireDataRole();
-        checkTransactionOwner(); long generation=admissionGeneration.get(); var read=homes.readRegistration(fence.fenceId()); var status=read.status();
-        if (status==null || !status.fence().equals(fence) || status.phase()!=SnapshotFenceStatus.Phase.INSTALLING || !status.allReady()) throw new IllegalStateException("Snapshot capture requires every home ready proof");
-        var gate=store.snapshotGate(fence.fenceId());
-        if (gate==null || !gate.active() || !gate.fence().equals(fence) || !gate.installed().equals(status.progress(store.ownership().owner().groupId()).ready())) throw new IllegalStateException("Home ready proof differs from native gate");
-        if (!snapshotGateReady(fence)) throw new IllegalStateException("Snapshot gate is not ready");
-        var pin=store.captureGate(fence); boolean retained=false;
+        checkTransactionOwner(); long generation=admissionGeneration.get();
+        if (store.snapshotFence(fence)!=null) throw new RatisSnapshotLostException("Snapshot gate has retired");
+        var read=homes.readRegistration(fence.fenceId()); var status=read.status();
+        if (status!=null && status.fence().equals(fence) && status.consumed()) throw new RatisSnapshotLostException("Snapshot was consumed");
+        try {
+            if (status==null || !status.fence().equals(fence) || status.phase()!=SnapshotFenceStatus.Phase.INSTALLING || !status.allReady()) throw new IllegalStateException("Snapshot capture requires every home ready proof");
+            var gate=store.snapshotGate(fence.fenceId());
+            if (gate==null || !gate.active() || !gate.fence().equals(fence) || !gate.installed().equals(status.progress(store.ownership().owner().groupId()).ready())) throw new IllegalStateException("Home ready proof differs from native gate");
+            if (!snapshotGateReady(fence)) throw new IllegalStateException("Snapshot gate is not ready");
+        } catch (IllegalStateException | IllegalArgumentException unavailable) {
+            if (store.snapshotFence(fence)!=null) throw new RatisSnapshotLostException("Snapshot gate retired during capture",unavailable);
+            throw unavailable;
+        }
+        final ReplicatedRangeStore.ScopedSnapshot pin;
+        try { pin=store.captureGate(fence); } catch (it.cavallium.rockserver.core.common.distributed.SnapshotRetentionExpiredException expired) { throw new RatisSnapshotLostException("Snapshot business epoch expired",expired); }
+        boolean retained=false;
         try { checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot capture lost leadership"); retained=true; return pin; }
         finally { if (!retained) pin.close(); }
     }
 
     private boolean snapshotRetryIdentityBusy(OperationId operation,SnapshotFence fence) {
         var charge=snapshotControlCharges.get(operation);
-        return charge!=null && !charge.fence.equals(fence) || finalizationOwners.containsKey(operation) || participantOwners.containsKey(operation)
+        return charge!=null && !charge.fence.equals(fence) || retirementIdentityBusy(operation) || homeOwners.containsKey(operation) || finalizationOwners.containsKey(operation) || participantOwners.containsKey(operation)
                 || admissions.containsKey(operation) || preparedCommits.containsKey(operation) || preparingCommits.containsKey(operation);
     }
     private void requireSnapshotParticipant(RatisSnapshotRecord request) {
@@ -1121,7 +1151,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request); byte[] digest=request.digest();
         for (int attempt=0;attempt<3;attempt++) {
             var estimate=request.isRelease() ? store.estimateGateRelease(request.terminal()) : store.estimateGateInstall(request.fence());
-            var observed=estimate.capacity().position(); var receipt=request.receipt(estimate.existing());
+            var observed=estimate.capacity().position(); var receipt=estimate.retirement()==null ? request.receipt(estimate.existing()) : RatisSnapshotRecord.Result.retired(estimate.retirement());
             if (observed==null || observed.term()!=leader.term()) throw new IllegalStateException("Snapshot gate native prefix is not ready");
             synchronized (admissions) {
                 requireHealthy(); if (generation!=admissionGeneration.get() || !store.admissionOpen()) throw new IllegalStateException("Snapshot gate retry owner changed");
@@ -1137,7 +1167,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (receipt==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Snapshot gate has no fresh home admission authority");
                 if (accepted!=null && !accepted.drained()) throw new IllegalStateException("Snapshot gate predecessors are still settling");
                 if (accepted==null && snapshotRetryIdentityBusy(request.operation(),request.fence())) throw new IllegalStateException("Snapshot control identity belongs to other work");
-                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
                 long transferred=accepted==null ? 0 : accepted.hold.bytes;
                 if (encoded.length>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes+transferred
                         || !request.isRelease() && (snapshotInstallOwners+snapshotAdmittedInstalls-(accepted==null ? 0 : 1)>=8
@@ -1194,6 +1224,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private record AppliedRecord(OperationId operation,byte[] result) {}
     private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
+        if (RatisSnapshotRetirementRecord.isRetirement(encoded)) {
+            var retirement=RatisSnapshotRetirementRecord.decode(encoded); store.applySnapshotGateRetirement(positionArg,retirement);
+            synchronized (admissions) { retireSnapshotOwners(SnapshotGateResult.retired(store.snapshotFence(retirement.fence()))); }
+            return new AppliedRecord(RatisSnapshotRetirementRecord.operation(retirement),new it.cavallium.rockserver.core.common.distributed.CommandResult(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,List.of()).encode());
+        }
         if (RatisHomeRetirementRecord.isRetirement(encoded)) {
             var retirement=RatisHomeRetirementRecord.decode(encoded); store.applyHomeRetirement(positionArg,retirement);
             return new AppliedRecord(RatisHomeRetirementRecord.operation(retirement),new it.cavallium.rockserver.core.common.distributed.CommandResult(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,List.of()).encode());
@@ -1229,6 +1264,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
+        if (RatisSnapshotRetirementRecord.isRetirement(encoded)) {
+            var retirement=RatisSnapshotRetirementRecord.decode(encoded);
+            return new AppliedRecord(RatisSnapshotRetirementRecord.operation(retirement),store.snapshotFence(retirement.fence())!=null ? new it.cavallium.rockserver.core.common.distributed.CommandResult(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,List.of()).encode() : null);
+        }
         if (RatisHomeRetirementRecord.isRetirement(encoded)) {
             var retirement=RatisHomeRetirementRecord.decode(encoded);
             return new AppliedRecord(RatisHomeRetirementRecord.operation(retirement),store.homeRetired(retirement) ? new it.cavallium.rockserver.core.common.distributed.CommandResult(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,List.of()).encode() : null);
@@ -1239,7 +1278,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         if (RatisSnapshotRecord.isSnapshot(encoded)) {
             var request=RatisSnapshotRecord.decode(encoded); requireSnapshotParticipant(request);
-            var receipt=request.receipt(store.recoveredSnapshotGate(request.fence()));
+            var receipt=request.receipt(store.snapshotGateResult(request.fence()));
             return new AppliedRecord(request.operation(),receipt==null ? null : receipt.encode());
         }
         if (RatisParticipantRecord.isRetirement(encoded)) {
@@ -1336,6 +1375,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         admittedBytes-=admission.bytes;
         if (admission.homeRecovery!=null) homeRecoveryInputBytes-=admission.bytes;
         if (admission.homeRetirement!=null) homeRetirementInputBytes-=admission.bytes;
+        if (admission.snapshotRetirement!=null) snapshotRetirementInputBytes-=admission.bytes;
         if (admission.retirement!=null) retirementInputBytes-=admission.bytes;
         if (admission.negativePayload!=null) releaseNegativePayload(admission.negativePayload);
         if (admission.snapshot!=null) { snapshotAdmittedBytes-=admission.bytes; if (!admission.snapshot.isRelease()) { snapshotAdmittedInstalls--; snapshotInstallAdmittedBytes-=admission.bytes; } }
@@ -1380,10 +1420,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try (var pin=store.capture()) {
             for (var admission:pending) {
                 try {
-                    if (admission.homeRetirement!=null) { if (pin.homeRetired(admission.homeRetirement)) verified.add(admission); }
+                    if (admission.snapshotRetirement!=null) { if (pin.snapshotFence(admission.snapshotRetirement.fence())!=null) verified.add(admission); }
+                    else if (admission.homeRetirement!=null) { if (pin.homeRetired(admission.homeRetirement)) verified.add(admission); }
                     else if (admission.retirement!=null) { if (pin.participantFence(admission.retirement.identity())!=null) verified.add(admission); }
                     else if (admission.homeRecovery!=null) { if (pin.homeRecoveryResult(admission.homeRecovery)!=null) verified.add(admission); }
-                    else if (admission.snapshot!=null) { if (admission.snapshot.receipt(pin.snapshotGate(admission.snapshot.fence()))!=null) verified.add(admission); }
+                    else if (admission.snapshot!=null) { if (admission.snapshot.receipt(pin.snapshotGateResult(admission.snapshot.fence()))!=null) verified.add(admission); }
                     else if (admission.finalization!=null) { if (pin.finalizationResult(admission.finalization)!=null) verified.add(admission); }
                     else if (admission.participant==null) { if (pin.operationResult(admission.id,admission.digest)!=null) verified.add(admission); }
                     else { var vote=pin.preparationVote(admission.participant); if (admission.participantNegative && vote!=null && vote.prepared()) throw new IllegalArgumentException("Negative preparation contradicts positive proof"); if (vote!=null) verified.add(admission); else if (pin.finalizedPreparation(admission.participant)) terminalScopes.add(admission); }
@@ -1397,6 +1438,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void invalidateProposalCandidates() { synchronized (admissions) { invalidateUnsubmitted(); } }
     private void invalidateUnsubmitted() {
         snapshotHelpers.clear();
+        for (var hold:preparedSnapshotRetirements.values()) { snapshotRetirementSlots--; snapshotRetirementInputBytes-=hold.bytes(); }
+        preparedSnapshotRetirements.clear();
         for (var hold:preparedHomeRetirements.values()) { homeRetirementSlots--; homeRetirementInputBytes-=hold.bytes; proposalFootprints.release(hold.scope); }
         preparedHomeRetirements.clear();
         for (var hold:preparingHomeRetirements.values()) { hold.invalidated=true; proposalFootprints.release(hold.scope); }
@@ -1548,7 +1591,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
     private void requireHomeInput(int bytes) {
-        if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16
+        if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16
                 || bytes>16L*1024*1024-homeRecoveryInputBytes) throw new IllegalStateException("Protected HOME input budget exhausted");
     }
     private void requireHomeHold(HomeHold hold) throws IOException {
@@ -1670,7 +1713,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (ready!=null && ready.finalization.transactionId().equals(transaction) && ready.authorized()) return borrowedFinalization(ready.hold,ready.finalization);
             var known=admissions.get(recovery);
             if (known!=null && known.finalization!=null && known.finalization.transactionId().equals(transaction) && known.term==leader.term() && known.generation==generation) return borrowedFinalization(known.finalizationHold,known.finalization);
-            if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+            if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
             if (participantIdentityBusy(recovery) || finalizingTransactions.containsKey(transaction)) throw new IllegalStateException("Finalization identity/transaction is already owned");
             hold=new FinalizationHold(transaction,recovery,leader.term(),generation); preparingFinalizations.put(recovery,hold); finalizingTransactions.put(transaction,hold); finalizationOwners.put(recovery,hold); protectedFinalizationSlots++;
         }
@@ -1725,7 +1768,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 var accepted=estimate.existing()==null && !estimate.retired() ? preparedFinalizations.get(finalization.operation()) : null;
                 if (estimate.existing()==null && !estimate.retired() && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Finalization has no fresh home acceptance authority");
-                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                if (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
                 var admission=new Admission(finalization.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,true,null,null,null);
                 admission.finalization=finalization; admission.finalizationHold=accepted==null ? null : accepted.hold; admissions.put(admission.id,admission);
                 if (accepted!=null) { accepted.claimed=true; preparedFinalizations.remove(admission.id,accepted); protectedFinalizationSlots--; }
@@ -1749,6 +1792,45 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             // Submitted unknown work retains scope, input and capacity until verified native settlement.
         }
     }
+    private boolean prepareSnapshotRetirement(SnapshotGateRetirement retirement) throws Exception {
+        requireDataRole(); checkTransactionOwner(); long generation=admissionGeneration.get(); var leader=leadership();
+        if (!store.estimateSnapshotGateRetirement(retirement)) return true;
+        var operation=RatisSnapshotRetirementRecord.operation(retirement); var hold=new SnapshotRetirementHold(retirement,leader.term(),generation,RatisSnapshotRetirementRecord.encode(retirement).length);
+        synchronized (admissions) {
+            checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot retirement owner changed"); reconcileOlderProposalTerms(leader.term());
+            var ready=preparedSnapshotRetirements.get(operation); if (ready!=null && ready.term()==leader.term() && ready.generation()==generation && ready.retirement().equals(retirement)) return false;
+            var known=admissions.get(operation); if (known!=null) { if (retirement.equals(known.snapshotRetirement) && known.term==leader.term() && known.generation==generation) return false; throw new IOException("Snapshot retirement identity is still owned"); }
+            if (participantIdentityBusy(operation) || snapshotRetirementSlots>=8 || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16 || hold.bytes()>16L*1024*1024-snapshotRetirementInputBytes) throw new IOException("Protected snapshot retirement input budget exhausted");
+            preparingSnapshotRetirements.put(operation,hold); snapshotRetirementSlots++; snapshotRetirementInputBytes+=hold.bytes();
+        }
+        boolean retained=false;
+        try {
+            var homes=snapshotHomes; if (homes==null) throw new IOException("Qualified snapshot HOME reader is not configured"); var read=homes.readRegistration(retirement.fence().fenceId());
+            if (!read.descriptor().groupId().equals(retirement.fence().homeGroup()) || read.descriptor().rangeEpoch()!=retirement.fence().homeEpoch() || !retirement.consumed().equals(read.status())) throw new IOException("Snapshot retirement differs from fresh consumed HOME authority");
+            boolean needed=store.estimateSnapshotGateRetirement(retirement);
+            synchronized (admissions) { checkTransactionOwner(); if (generation!=admissionGeneration.get() || leadership().term()!=hold.term()) throw new IOException("Snapshot retirement lost its owner"); if (!needed) return true; preparingSnapshotRetirements.remove(operation,hold); preparedSnapshotRetirements.put(operation,hold); retained=true; return false; }
+        } finally { synchronized (admissions) { if (!retained && preparingSnapshotRetirements.remove(operation,hold)) { snapshotRetirementSlots--; snapshotRetirementInputBytes-=hold.bytes(); } } }
+    }
+    private void cancelSnapshotRetirement(SnapshotGateRetirement retirement) throws IOException {
+        var operation=RatisSnapshotRetirementRecord.operation(retirement);
+        synchronized (admissions) {
+            if (preparingSnapshotRetirements.containsKey(operation)) throw new IOException("Snapshot retirement HOME read is still active");
+            var hold=preparedSnapshotRetirements.get(operation); if (hold!=null) { if (!hold.retirement().equals(retirement)) throw new IOException("Snapshot retirement identity changed"); preparedSnapshotRetirements.remove(operation,hold); snapshotRetirementSlots--; snapshotRetirementInputBytes-=hold.bytes(); }
+            var admitted=admissions.get(operation); if (admitted!=null && !retirement.equals(admitted.snapshotRetirement)) throw new IOException("Snapshot retirement identity changed");
+        }
+    }
+    private TransactionContext startSnapshotRetirement(TransactionContext transaction,SnapshotGateRetirement retirement,byte[] encoded,long generation,Leadership leader) throws Exception {
+        requireDataRole(); boolean needed=store.estimateSnapshotGateRetirement(retirement); var operation=RatisSnapshotRetirementRecord.operation(retirement);
+        synchronized (admissions) {
+            checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot retirement owner changed"); reconcileOlderProposalTerms(leader.term()); var known=admissions.get(operation);
+            if (known!=null) { if (!retirement.equals(known.snapshotRetirement) || known.term!=leader.term() || known.generation!=generation) throw new IOException("Snapshot retirement is still settling"); known.owners++; transaction.setStateMachineContext(known); return transaction; }
+            var accepted=preparedSnapshotRetirements.get(operation); if (needed && (accepted==null || accepted.term()!=leader.term() || accepted.generation()!=generation || !accepted.retirement().equals(retirement))) throw new IOException("Snapshot retirement lacks fresh HOME authority");
+            if (accepted==null && (participantIdentityBusy(operation) || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16 || encoded.length>16L*1024*1024-snapshotRetirementInputBytes)) throw new IOException("Protected snapshot retirement input budget exhausted");
+            var admission=new Admission(operation,retirement.digest(),encoded.length,leader.term(),generation,0,0,false,true,null,null,null); admission.snapshotRetirement=retirement;
+            if (accepted!=null) { preparedSnapshotRetirements.remove(operation,accepted); snapshotRetirementSlots--; } else snapshotRetirementInputBytes+=encoded.length;
+            admissions.put(operation,admission); protectedAdmissions++; admittedBytes+=encoded.length; transaction.setStateMachineContext(admission); return transaction;
+        }
+    }
     private boolean prepareHomeRetirement(HomeRetirement retirement) throws Exception {
         requireHomeRetirement(retirement); checkHomeRecoveryOwner(); long generation=admissionGeneration.get(); var leader=leadership();
         if (!store.estimateHomeRetirement(retirement)) return true;
@@ -1763,7 +1845,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 throw new IOException("HOME retirement identity is still owned");
             }
             int bytes=RatisHomeRetirementRecord.encode(retirement).length;
-            if (participantIdentityBusy(operation) || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16
+            if (participantIdentityBusy(operation) || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16
                     || bytes>1024L*1024-homeRetirementInputBytes) throw new IOException("Protected HOME retirement input budget exhausted");
             var id=retirement.identity(); byte[] key=ByteBuffer.allocate(16).putLong(id.transactionId().getMostSignificantBits()).putLong(id.transactionId().getLeastSignificantBits()).array();
             var scope=proposalFootprints.reserveCandidate(proposalFootprints.prepare(List.of(TransactionScope.Span.point(id.columnId(),key))),leader.term(),generation);
@@ -1804,7 +1886,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             var accepted=preparedHomeRetirements.get(operation);
             if (needed && (accepted==null || accepted.invalidated || accepted.term!=leader.term() || accepted.generation!=generation || !accepted.retirement.equals(retirement) || !accepted.scope.active())) throw new IOException("HOME retirement lacks fresh DATA authority");
-            if (accepted==null && (participantIdentityBusy(operation) || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16 || encoded.length>1024L*1024-homeRetirementInputBytes)) throw new IOException("Protected HOME retirement input budget exhausted");
+            if (accepted==null && (participantIdentityBusy(operation) || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16 || encoded.length>1024L*1024-homeRetirementInputBytes)) throw new IOException("Protected HOME retirement input budget exhausted");
             var admission=new Admission(operation,retirement.digest(),encoded.length,leader.term(),generation,0,0,false,true,null,accepted==null ? null : accepted.scope,null); admission.homeRetirement=retirement;
             if (accepted!=null) { proposalFootprints.submit(accepted.scope); preparedHomeRetirements.remove(operation,accepted); homeRetirementSlots--; } else homeRetirementInputBytes+=encoded.length;
             admissions.put(operation,admission); protectedAdmissions++; admittedBytes+=encoded.length; transaction.setStateMachineContext(admission); return transaction;
@@ -1826,7 +1908,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (retirement.equals(known.retirement) && known.term==leader.term() && known.generation==generation) return false;
                 throw new IOException("Retirement identity is still owned");
             }
-            if (participantIdentityBusy(operation) || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16
+            if (participantIdentityBusy(operation) || protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16
                     || hold.bytes()>1024L*1024-retirementInputBytes) throw new IOException("Protected retirement input budget exhausted");
             preparingRetirements.put(operation,hold); retirementSlots++; retirementInputBytes+=hold.bytes();
         }
@@ -1867,7 +1949,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             var accepted=preparedRetirements.get(operation);
             if (needed && (accepted==null || accepted.term()!=leader.term() || accepted.generation()!=generation || !accepted.retirement().equals(retirement))) throw new IOException("Retirement has no fresh HOME authority");
-            if (accepted==null && (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16 || encoded.length>1024L*1024-retirementInputBytes)) throw new IOException("Protected retirement input budget exhausted");
+            if (accepted==null && (protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16 || encoded.length>1024L*1024-retirementInputBytes)) throw new IOException("Protected retirement input budget exhausted");
             var admission=new Admission(operation,RatisParticipantRecord.digest(retirement),encoded.length,leader.term(),generation,0,0,false,true,null,null,null);
             admission.retirement=retirement;
             if (accepted!=null) { preparedRetirements.remove(operation,accepted); retirementSlots--; } else retirementInputBytes+=encoded.length;
@@ -1924,7 +2006,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (hold.capacity) { reservedFinalizationCount--; reservedFinalizationBytes-=ReplicatedRangeStore.FINALIZATION_RESERVATION; }
         if (hold.shared!=null) { var shared=hold.shared; hold.shared=null; shared.finalizers--; if (shared.payload!=null) releaseNegativePayload(shared.payload); finishParticipantHold(shared,covered); }
     }
-    private boolean retirementIdentityBusy(OperationId id) { return preparedRetirements.containsKey(id) || preparingRetirements.containsKey(id) || preparedHomeRetirements.containsKey(id) || preparingHomeRetirements.containsKey(id); }
+    private boolean retirementIdentityBusy(OperationId id) { return preparedSnapshotRetirements.containsKey(id) || preparingSnapshotRetirements.containsKey(id) || preparedRetirements.containsKey(id) || preparingRetirements.containsKey(id) || preparedHomeRetirements.containsKey(id) || preparingHomeRetirements.containsKey(id); }
     private boolean participantIdentityBusy(OperationId id) {
         return retirementIdentityBusy(id) || homeOwners.containsKey(id) || snapshotControlCharges.containsKey(id) || finalizationOwners.containsKey(id) || participantOwners.containsKey(id) || admissions.containsKey(id) || preparedCommits.containsKey(id) || preparingCommits.containsKey(id);
     }
@@ -1984,7 +2066,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 long ownedScope=negative ? 0 : scopeBytes;
                 if (reserve && (capacity.count()+reservedParticipantCount+reservedFinalizationCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || bytes>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes-reservedFinalizationBytes)
                         || ownedScope>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.scopeBytes()-reservedParticipantScopeBytes) throw new IllegalStateException("Participant staged capacity exhausted");
-                if (negative ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-negativeInputBytes
+                if (negative ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-negativeInputBytes
                         : DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Participant input budget exhausted");
                 ProposalReservation reservation=null;
                 if (!negative) { var lease=proposalFootprints.reserveCandidate(footprint,leader.term(),generation); if (lease==null) throw new IllegalStateException("Participant scope overlaps in-flight work"); reservation=new ProposalReservation(lease); }
@@ -2075,7 +2157,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 var accepted=existing==null ? preparedParticipants.get(preparation.operation()) : null;
                 if (existing==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Prepare has no current acceptance authority; resolve through its home");
-                if (negative ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots-(accepted==null ? 0 : 1)>=16 || accepted==null && encoded.length>8L*1024*1024-negativeInputBytes
+                if (negative ? protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots-(accepted==null ? 0 : 1)>=16 || accepted==null && encoded.length>8L*1024*1024-negativeInputBytes
                         : dataAdmissions>=1024 || encoded.length>16L*1024*1024-dataProposalBytes) throw new IllegalStateException("Participant input budget exhausted");
                 var admission=new Admission(preparation.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,negative,null,accepted==null || accepted.reservation==null ? null : accepted.reservation.lease,null);
                 admission.participant=preparation; admission.participantNegative=negative; admission.participantHold=accepted==null ? null : accepted.hold;
@@ -2244,7 +2326,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
             if (!ScopedTransactionRpc.ownerSnapshot(kind)) requireHealthy();
             if (kind==ScopedTransactionRpc.SNAPSHOT_HELP) return snapshotHelpQuery(encoded,freshBarrier);
-            if (kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
+            if (kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
                 // Reject before coalescing: a stale request must never borrow a fresh request's authority.
                 if (!freshBarrier) throw new IOException("Proof preparation requires a fresh linearizable barrier");
                 if (kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE) {
@@ -2252,7 +2334,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 } else requireDataRole();
             }
             if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) requireDataRole();
-            if (kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
+            if (kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
                 var executor=proofQueries; if (executor==null) throw new IOException("Bounded proof query dispatcher is not configured");
                 long generation=admissionGeneration.get();
                 return executor.submit(store.ownership().owner().groupId(),encoded,kind!=ScopedTransactionRpc.SNAPSHOT_CAPTURE,ownedRequest -> {
@@ -2340,12 +2422,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var request=RatisSnapshotRecord.decode(packet.body()); requireSnapshotParticipant(request);
                 if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL) { cancelSnapshotGate(request); reply=request.digest(); }
                 else {
-                    var receipt=request.receipt(store.recoveredSnapshotGate(request.fence())); boolean drained=true;
+                    var receipt=request.receipt(store.snapshotGateResult(request.fence())); boolean drained=true;
                     if (receipt==null) {
                         if (snapshotHomes==null) throw new IOException("Qualified snapshot HOME reader is not configured");
                         var proposal=request.isRelease() ? prepareSnapshotRelease(snapshotHomes,request.fence()) : prepareSnapshotInstall(snapshotHomes,request.fence());
                         if (!proposal.request().equals(request)) { proposal.close(); throw new IOException("Fresh snapshot HOME authority differs from frozen request"); }
-                        receipt=request.receipt(store.recoveredSnapshotGate(request.fence()));
+                        receipt=request.receipt(store.snapshotGateResult(request.fence()));
                         if (receipt!=null) proposal.close(); else drained=proposal.drained();
                     }
                     byte[] retained=receipt==null ? null : receipt.encode(); var output=ByteBuffer.allocate(41+(retained==null ? 0 : retained.length));
@@ -2469,6 +2551,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var id=ScopedTransactionRpc.uuid(input); end(input); checkTransactionOwner(); var outcome=store.finalizedParticipant(id);
                 byte[] bytes=outcome==null ? null : outcome.encode(); var output=ByteBuffer.allocate(4+(bytes==null ? 0 : bytes.length)); ScopedTransactionRpc.putBlob(output,bytes); reply=output.array();
             }
+            case ScopedTransactionRpc.SNAPSHOT_FENCE -> {
+                if (!freshBarrier) throw new IOException("Snapshot retirement proof requires a fresh linearizable barrier"); requireDataRole(); checkTransactionOwner();
+                var fence=SnapshotFence.decode(packet.body()); var proof=store.snapshotFence(fence); byte[] bytes=proof==null ? null : proof.encode(); var output=ByteBuffer.allocate(52+(bytes==null ? 0 : bytes.length));
+                ScopedTransactionRpc.snapshotBinding(output,ScopedTransactionRpc.SnapshotBinding.of(fence)); ScopedTransactionRpc.putBlob(output,bytes); reply=output.array();
+            }
+            case ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE, ScopedTransactionRpc.SNAPSHOT_RETIRE_CANCEL -> {
+                if (!freshBarrier) throw new IOException("Snapshot retirement requires a fresh linearizable barrier"); requireDataRole(); checkTransactionOwner(); long generation=admissionGeneration.get(); var retirement=RatisSnapshotRetirementRecord.decode(packet.body());
+                boolean retired; if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_RETIRE_CANCEL) { cancelSnapshotRetirement(retirement); retired=false; } else retired=prepareSnapshotRetirement(retirement);
+                checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot retirement query lost its owner"); reply=ByteBuffer.allocate(33).put(retirement.digest()).put((byte)(retired ? 1 : 0)).array();
+            }
             case ScopedTransactionRpc.SNAPSHOT_GATE_STATE -> {
                 if (!freshBarrier) throw new IOException("Snapshot gate state requires a fresh linearizable barrier");
                 var id=ScopedTransactionRpc.uuid(input); end(input); checkTransactionOwner(); var record=store.snapshotGate(id);
@@ -2483,9 +2575,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             case ScopedTransactionRpc.SNAPSHOT_READY -> {
                 if (!freshBarrier) throw new IOException("Snapshot readiness requires a fresh linearizable barrier");
                 byte[] definition=new byte[input.remaining()]; input.get(definition); var fence=SnapshotFence.decode(definition); checkTransactionOwner();
-                var record=store.recoveredSnapshotGate(fence); boolean ready=record!=null && record.active() && snapshotGateReady(fence);
+                var outcome=store.snapshotGateResult(fence); var record=outcome==null ? null : outcome.gate(); boolean ready=record!=null && record.active() && snapshotGateReady(fence);
                 var binding=ScopedTransactionRpc.SnapshotBinding.of(fence);
-                reply=new RatisSnapshotReadiness(binding,store.ownership().owner().groupId(),record==null ? null : record.installed(),ready).encode();
+                reply=outcome!=null && outcome.retired() ? RatisSnapshotReadiness.retired(outcome.retirement()).encode() : new RatisSnapshotReadiness(binding,store.ownership().owner().groupId(),record==null ? null : record.installed(),ready).encode();
             }
             case ScopedTransactionRpc.SNAPSHOT_BLOCKERS -> {
                 if (!freshBarrier) throw new IOException("Snapshot blockers require a fresh linearizable barrier");
