@@ -159,11 +159,11 @@ public class MergeOperatorRegistry implements Closeable {
 
     /** Exact immutable artifact/schema identity; SHA-256 is canonical lowercase hexadecimal. */
     public record DistributedOperatorDescriptor(String name, long version, String artifactSha256,
-                                               String className, int codecVersion,
+                                               String className, int valueCodecVersion, int operandCodecVersion,
                                                DeterministicContract contract) {
         public DistributedOperatorDescriptor {
             if (name == null || name.isBlank() || className == null || className.isBlank()
-                    || version <= 0 || codecVersion <= 0) {
+                    || version < 0 || valueCodecVersion <= 0 || operandCodecVersion <= 0) {
                 throw new IllegalArgumentException("Distributed operator requires exact name, version, class and codec version");
             }
             if (artifactSha256 == null || !artifactSha256.matches("[0-9a-f]{64}")) {
@@ -203,14 +203,7 @@ public class MergeOperatorRegistry implements Closeable {
                         || !descriptor.artifactSha256().equals(HexFormat.of().formatHex(sha256(jar)))) {
                     throw new IllegalArgumentException("Distributed operator artifact/class mismatch");
                 }
-                var loader = new InMemoryClassLoader(jar, getClass().getClassLoader());
-                // Require the declared class from this exact artifact, even if a parent has the same name.
-                Class<?> type = loader.findClass(className);
-                if (!FFMAbstractMergeOperator.class.isAssignableFrom(type)) {
-                    throw new IllegalArgumentException("Operator class must extend FFMAbstractMergeOperator");
-                }
-                return (FFMAbstractMergeOperator) type.getConstructor(String.class)
-                        .newInstance(distributedConstructorIdentity(descriptor));
+                return instantiateDistributed(descriptor,jar);
             }
         } catch (RocksDBException | IllegalArgumentException e) {
             throw e;
@@ -220,6 +213,25 @@ public class MergeOperatorRegistry implements Closeable {
         }
     }
 
+    public static final int MAX_DISTRIBUTED_JAR_BYTES=8*1024*1024;
+    /** Exact admitted immutable artifact factory, usable before a database is opened. */
+    public static FFMAbstractMergeOperator instantiateDistributed(DistributedOperatorDescriptor descriptor,byte[] jar) {
+        Objects.requireNonNull(descriptor); Objects.requireNonNull(jar);
+        if(descriptor.contract()==null || !descriptor.contract().admitted()) throw new IllegalArgumentException("Distributed operator lacks trusted admission");
+        if(jar.length==0 || jar.length>MAX_DISTRIBUTED_JAR_BYTES) throw new IllegalArgumentException("Distributed operator artifact size mismatch");
+        jar=jar.clone();
+        if(!descriptor.artifactSha256().equals(HexFormat.of().formatHex(sha256(jar)))) throw new IllegalArgumentException("Distributed operator artifact digest/size mismatch");
+        try {
+            var loader=new InMemoryClassLoader(jar,MergeOperatorRegistry.class.getClassLoader(),true);
+            Class<?> type=loader.findClass(descriptor.className());
+            if(!FFMAbstractMergeOperator.class.isAssignableFrom(type)) throw new IllegalArgumentException("Operator must extend shared FFMAbstractMergeOperator");
+            try(var construction=FFMAbstractMergeOperator.trackConstruction()) {
+                var operator=(FFMAbstractMergeOperator)type.getConstructor(String.class).newInstance(distributedConstructorIdentity(descriptor));
+                construction.adopt(operator); return operator;
+            }
+        } catch(IllegalArgumentException rejected) { throw rejected; }
+        catch(Exception failure) { throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR,"Failed to instantiate exact distributed operator",failure); }
+    }
     private static byte[] sha256(byte[] bytes) {
         try {
             return MessageDigest.getInstance("SHA-256").digest(bytes);
@@ -231,16 +243,15 @@ public class MergeOperatorRegistry implements Closeable {
     private static String distributedConstructorIdentity(DistributedOperatorDescriptor descriptor) throws IOException {
         var bytes = new ByteArrayOutputStream();
         try (var output = new DataOutputStream(bytes)) {
-            output.writeInt(1); // identity encoding version
             output.writeUTF(descriptor.name());
             output.writeLong(descriptor.version());
             output.writeUTF(descriptor.artifactSha256());
             output.writeUTF(descriptor.className());
-            output.writeInt(descriptor.codecVersion());
+            output.writeInt(descriptor.valueCodecVersion()); output.writeInt(descriptor.operandCodecVersion());
             output.writeUTF(descriptor.contract().identifier());
             output.writeInt(descriptor.contract().version());
         }
-        return "DistributedOp-v1-" + HexFormat.of().formatHex(sha256(bytes.toByteArray()));
+        return "DistributedOp-" + HexFormat.of().formatHex(sha256(bytes.toByteArray()));
     }
 
     /**
@@ -404,27 +415,52 @@ public class MergeOperatorRegistry implements Closeable {
     }
 
     private static class InMemoryClassLoader extends SecureClassLoader {
-        private final Map<String, byte[]> classes = new ConcurrentHashMap<>();
-
-        public InMemoryClassLoader(byte[] jarData, ClassLoader parent) throws IOException {
-            super(parent);
-            try (JarInputStream jis = new JarInputStream(new ByteArrayInputStream(jarData))) {
-                JarEntry entry;
-                while ((entry = jis.getNextJarEntry()) != null) {
-                    if (entry.getName().endsWith(".class")) {
-                        String className = entry.getName().replace('/', '.').replace(".class", "");
-                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                        byte[] buffer = new byte[4096];
-                        int bytesRead;
-                        while ((bytesRead = jis.read(buffer)) != -1) {
-                            baos.write(buffer, 0, bytesRead);
+        private final Map<String,byte[]> classes=new ConcurrentHashMap<>();
+        private final boolean distributed;
+        public InMemoryClassLoader(byte[] jarData,ClassLoader parent) throws IOException { this(jarData,parent,false); }
+        public InMemoryClassLoader(byte[] jarData,ClassLoader parent,boolean distributed) throws IOException {
+            super(parent); this.distributed=distributed;
+            if(distributed) {
+                try(var input=new java.util.zip.ZipInputStream(new ByteArrayInputStream(jarData))) {
+                    java.util.zip.ZipEntry entry; long expanded=0; int entries=0;
+                    while((entry=input.getNextEntry())!=null) {
+                        if(++entries>4096 || entry.getName().length()>4096) throw new IOException("Distributed artifact entries exceed budget");
+                        boolean isClass=entry.getName().endsWith(".class"); String className=isClass ? entry.getName().substring(0,entry.getName().length()-6).replace('/','.') : null;
+                        if(isClass && (sharedApi(className) || classes.containsKey(className))) throw new IOException("Invalid distributed artifact class entry");
+                        var bytes=isClass ? new ByteArrayOutputStream() : null; byte[] buffer=new byte[4096]; int count; long entryBytes=0;
+                        while((count=input.read(buffer))!=-1) {
+                            expanded+=count; entryBytes+=count;
+                            if(expanded>64L*1024*1024 || entryBytes>8L*1024*1024) throw new IOException("Distributed artifact expanded bytes exceed budget");
+                            if(bytes!=null) bytes.write(buffer,0,count);
                         }
-                        classes.put(className, baos.toByteArray());
+                        if(bytes!=null) classes.put(className,bytes.toByteArray());
                     }
+                }
+            } else try(var input=new JarInputStream(new ByteArrayInputStream(jarData))) {
+                JarEntry entry;
+                while((entry=input.getNextJarEntry())!=null) if(entry.getName().endsWith(".class")) {
+                    String name=entry.getName().replace('/','.').replace(".class",""); var bytes=new ByteArrayOutputStream(); input.transferTo(bytes); classes.put(name,bytes.toByteArray());
                 }
             }
         }
 
+        private static boolean sharedApi(String name) {
+            return name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("jdk.") || name.startsWith("sun.") || name.startsWith("com.sun.")
+                    || name.startsWith("org.rocksdb.") || name.startsWith("org.slf4j.") || name.startsWith("org.jetbrains.annotations.")
+                    || name.startsWith("it.cavallium.buffer.") || name.startsWith("it.cavallium.rockserver.core.common.") || name.startsWith("it.unimi.dsi.fastutil.")
+                    || name.equals(FFMAbstractMergeOperator.class.getName()) || name.startsWith(FFMAbstractMergeOperator.class.getName()+"$")
+                    || name.equals(FFMByteArrayMergeOperator.class.getName()) || name.startsWith(FFMByteArrayMergeOperator.class.getName()+"$");
+        }
+        @Override protected synchronized Class<?> loadClass(String name,boolean resolve) throws ClassNotFoundException {
+            if(!distributed) return super.loadClass(name,resolve);
+            Class<?> type=findLoadedClass(name);
+            if(type==null) {
+                if(sharedApi(name)) type=getParent().loadClass(name);
+                else if(classes.containsKey(name)) type=findClass(name);
+                else throw new ClassNotFoundException("Dependency absent from exact operator artifact: "+name);
+            }
+            if(resolve) resolveClass(type); return type;
+        }
         @Override
         protected Class<?> findClass(String name) throws ClassNotFoundException {
             byte[] bytes = classes.get(name);

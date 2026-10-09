@@ -20,6 +20,116 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Native node lifecycle with controlled Ratis interfaces. Production server factory is compiled, never executed here. */
 class RatisNodeRuntimeTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    public static final class AppendOperator extends it.cavallium.rockserver.core.impl.FFMByteArrayMergeOperator {
+        public AppendOperator(String identity) { super(identity); }
+        @Override public byte[] merge(byte[] key,byte[] existing,List<byte[]> operands) {
+            var bytes=new java.io.ByteArrayOutputStream();
+            if (existing!=null) bytes.writeBytes(existing);
+            for (var operand:operands) bytes.writeBytes(operand);
+            return bytes.toByteArray();
+        }
+    }
+    private static byte[] appendArtifact() throws Exception {
+        var bytes=new java.io.ByteArrayOutputStream();
+        String entry=AppendOperator.class.getName().replace('.','/')+".class";
+        try (var jar=new java.util.jar.JarOutputStream(bytes)) {
+            jar.putNextEntry(new java.util.jar.JarEntry(entry));
+            try (var input=AppendOperator.class.getClassLoader().getResourceAsStream(entry)) { assertNotNull(input); input.transferTo(jar); }
+            jar.closeEntry();
+        }
+        return bytes.toByteArray();
+    }
+    @Test void qualifiedOperatorBootstrapAndReopenRetainExactArtifactAndMergeResults() throws Exception {
+        byte[] artifact=appendArtifact();
+        var operator=new DistributedSchema.Operator("append",1,AppendOperator.class.getName(),java.security.MessageDigest.getInstance("SHA-256").digest(artifact),1,1,"pure-append",1);
+        var shape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true,"append",1L,AppendOperator.class.getName());
+        UUID column=new UUID(2,3);
+        var schema=new DistributedSchema(new UUID(1,1),new UUID(1,2),new UUID(6,1),1,0,List.of(new DistributedSchema.Column(1,column,"data",shape,operator)));
+        try (var env=new Env(root,false,schema.digest(),Set.of(column))) {
+            var unqualified=new FakeServer();
+            assertThrows(IllegalArgumentException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,unqualified));
+            assertFalse(unqualified.created); assertFalse(Files.exists(env.nodeRoot.resolve("node.identity")));
+            DistributedStoragePool.stageOperator(env.nodeRoot.resolve("native"),operator,new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true),artifact);
+            var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
+            var group=RaftGroupId.valueOf(env.plan.directory().ranges().getFirst().groupId());
+            var command=new DistributedCommand(group.getUuid(),1,schema.digest(),new OperationId(new UUID(58,1),1,0),List.of(new Mutation(Mutation.Kind.MERGE,column,new byte[]{1},new byte[]{7})));
+            var first=new FakeServer();
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first::create,schema)) {
+                node.start(); var store=(ReplicatedRangeStore)storeField.get(first.machines.get(group));
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,1),command)).status());
+                assertArrayEquals(new byte[]{7},store.readCurrentPoint(column,new byte[]{1}));
+            }
+            byte[] identity=Files.readAllBytes(env.nodeRoot.resolve("node.identity"));
+            var recovered=new FakeServer();
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.RECOVER,recovered::create,schema)) {
+                node.start(); var store=(ReplicatedRangeStore)storeField.get(recovered.machines.get(group));
+                assertArrayEquals(new byte[]{7},store.readCurrentPoint(column,new byte[]{1}));
+                var next=new DistributedCommand(group.getUuid(),1,schema.digest(),new OperationId(new UUID(58,1),1,1),List.of(new Mutation(Mutation.Kind.MERGE,column,new byte[]{1},new byte[]{9})));
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(2,2),next)).status());
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(2,3),command)).status());
+                assertArrayEquals(new byte[]{7,9},store.readCurrentPoint(column,new byte[]{1}));
+            }
+            assertArrayEquals(identity,Files.readAllBytes(env.nodeRoot.resolve("node.identity")));
+        }
+    }
+    @Test void qualifiedPoolHostsAllMetadataRolesThroughOperatorInstallAndOriginalManifestReopen() throws Exception {
+        UUID column=new UUID(2,3),added=new UUID(2,4);
+        var plain=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true);
+        var source=new DistributedSchema(new UUID(1,1),new UUID(1,2),new UUID(6,1),1,0,List.of(new DistributedSchema.Column(1,column,"data",plain,null)));
+        byte[] artifact=appendArtifact();
+        var operator=new DistributedSchema.Operator("append",1,AppendOperator.class.getName(),java.security.MessageDigest.getInstance("SHA-256").digest(artifact),1,1,"pure-append",1);
+        var shape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true,"append",1L,AppendOperator.class.getName());
+        var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of(source.column(column),new DistributedSchema.Column(2,added,"append",shape,operator)));
+        try (var env=new Env(root,true,source.digest())) {
+            var plan=new RatisHomeRolesTest().plan(env);
+            var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),env.settings().retention(),env.settings().clockPeriod(),1,4,env.settings().shutdownTimeout(),env.settings().exports());
+            RatisNodeRuntime.HomeClientFactory homes=directory -> new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor route,UUID requested,byte[] key) { return null; }
+                public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError("Maintenance timer has not fired"); }
+            });
+            DistributedStoragePool.stageOperator(env.nodeRoot.resolve("native"),operator,new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true),artifact);
+            var definition=new SchemaChange.Definition(new UUID(59,1),new OperationId(new UUID(59,2),1,0),plan.directory(),source,target);
+            var poolField=RatisNodeRuntime.class.getDeclaredField("pool"); poolField.setAccessible(true);
+            var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
+            var first=new FakeServer(); NativeSchemaActivationProof activation=null;
+            try (var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first::create,source,null,null,homes)) {
+                node.start(); assertEquals(5,first.machines.size()); var pool=(DistributedStoragePool)poolField.get(node);
+                var data=new LinkedHashMap<UUID,ReplicatedRangeStore>();
+                for (var entry:first.machines.entrySet()) {
+                    var store=(ReplicatedRangeStore)storeField.get(entry.getValue());
+                    if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA) data.put(entry.getKey().getUuid(),store);
+                }
+                for (var store:data.values()) store.applySchemaFence(new ApplyPosition(1,1),definition.header());
+                var installations=new HashMap<UUID,NativeSchemaInstallProof>();
+                for (var entry:data.entrySet()) installations.put(entry.getKey(),pool.installSchema(entry.getValue(),new ApplyPosition(1,2),definition,Map.of(column,"data",added,"append-data"),Set.of(added)).proof());
+                for (var entry:data.entrySet()) {
+                    var store=entry.getValue();
+                    activation=store.applySchemaActivation(new ApplyPosition(1,3),installations.get(entry.getKey()),env.outer.catalogue,new ApplyPosition(1,20));
+                    byte[] key=store.ownership().interval().lowerInclusive()==null ? new byte[]{1} : new byte[]{(byte)129};
+                    var command=new DistributedCommand(entry.getKey(),1,target.digest(),new OperationId(new UUID(59,3),1,0),List.of(new Mutation(Mutation.Kind.MERGE,added,key,new byte[]{7})));
+                    assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,4),command)).status());
+                }
+                env.routed.refreshSchema(definition,activation);
+            }
+            byte[] identity=Files.readAllBytes(env.nodeRoot.resolve("node.identity")); var recovered=new FakeServer();
+            try (var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.RECOVER,recovered::create,source,null,null,homes)) {
+                node.start(); assertEquals(5,recovered.machines.size());
+                for (var entry:recovered.machines.entrySet()) {
+                    var store=(ReplicatedRangeStore)storeField.get(entry.getValue());
+                    switch (plan.role(entry.getKey().getUuid())) {
+                        case DATA -> {
+                            assertArrayEquals(target.digest(),store.schemaDigest());
+                            byte[] key=store.ownership().interval().lowerInclusive()==null ? new byte[]{1} : new byte[]{(byte)129};
+                            assertArrayEquals(new byte[]{7},store.readCurrentPoint(added,key));
+                        }
+                        case CATALOGUE -> assertEquals(Set.of(plan.catalogue().directoryColumn(),plan.catalogue().sessionsColumn()),store.ownership().interval().columns());
+                        case TRANSACTION_HOME, SNAPSHOT_HOME -> assertEquals(Set.of(plan.home(entry.getKey().getUuid()).column()),store.ownership().interval().columns());
+                    }
+                }
+            }
+            assertArrayEquals(identity,Files.readAllBytes(env.nodeRoot.resolve("node.identity")));
+        }
+    }
     @Test void activatedSchemasReopenFromOriginalManifestWithRefreshedBorrowedRouter() throws Exception {
         var source=new DistributedSchema(new UUID(1,1),new UUID(1,2),new UUID(6,1),1,0,List.of(
                 new DistributedSchema.Column(1,new UUID(2,3),"data",it.cavallium.rockserver.core.common.ColumnSchema.of(
@@ -469,6 +579,9 @@ class RatisNodeRuntimeTest {
         Env(Path root) throws Exception { this(root,false); }
         Env(Path root,boolean localCatalogue) throws Exception { this(root,localCatalogue,new byte[32]); }
         Env(Path root,boolean localCatalogue,byte[] schemaDigest) throws Exception {
+            this(root,localCatalogue,schemaDigest,Set.of());
+        }
+        Env(Path root,boolean localCatalogue,byte[] schemaDigest,Set<UUID> merges) throws Exception {
             catalogue=outer.new Fixture(root.resolve("catalogue")); var ledger=SessionEpochLedger.initial(outer.cluster,outer.database,10);
             catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,ledger));
             UUID local=new UUID(9,1), incarnation=new UUID(9,2); var ranges=new ArrayList<RangeDescriptor>();
@@ -481,7 +594,7 @@ class RatisNodeRuntimeTest {
             }
             var directory=new RangeDirectory(outer.cluster,outer.database,new UUID(6,1),1,schemaDigest,1,Set.of(outer.data),0,ranges);
             var remote=new ReplicaDescriptor(new UUID(8,1),new UUID(8,2),new UUID(8,8),"node8","127.0.0.1:4511",ReplicaDescriptor.Role.VOTER);
-            plan=new RatisNodePlan(local,incarnation,directory,new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,localCatalogue ? List.of(remote,new ReplicaDescriptor(local,incarnation,new UUID(9,8),"node9","127.0.0.1:4512",ReplicaDescriptor.Role.VOTER)) : List.of(remote)),Map.of(outer.data,"data"),Set.of(),localCatalogue ? 3 : 2);
+            plan=new RatisNodePlan(local,incarnation,directory,new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,localCatalogue ? List.of(remote,new ReplicaDescriptor(local,incarnation,new UUID(9,8),"node9","127.0.0.1:4512",ReplicaDescriptor.Role.VOTER)) : List.of(remote)),Map.of(outer.data,"data"),merges,localCatalogue ? 3 : 2);
             routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { throw new AssertionError(); }
                 public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { throw new AssertionError("Timer has not fired"); }

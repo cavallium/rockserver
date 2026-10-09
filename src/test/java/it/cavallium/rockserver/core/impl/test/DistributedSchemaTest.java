@@ -16,7 +16,7 @@ class DistributedSchemaTest {
     private static ColumnSchema fixed(int... widths) { return ColumnSchema.of(IntArrayList.of(widths),ObjectArrayList.of(),true); }
     private static DistributedSchema.Column column(long api,UUID id,String name,ColumnSchema shape) { return new DistributedSchema.Column(api,id,name,shape,null); }
     private static DistributedSchema schema(int prefix,DistributedSchema.Column... columns) { return new DistributedSchema(CLUSTER,DATABASE,DOMAIN,1,prefix,List.of(columns)); }
-    private static DistributedSchema.Operator operator(byte[] artifact) { return new DistributedSchema.Operator("sum",2,"example.Sum",artifact,3,4); }
+    private static DistributedSchema.Operator operator(byte[] artifact) { return new DistributedSchema.Operator("sum",2,"example.Sum",artifact,3,4,"pure-sum",1); }
     private static ColumnSchema merged() { return ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(),true,"sum",2L,"example.Sum"); }
 
     @Test void canonicalRoundTripDeepCopiesAndStableExplicitLookups() {
@@ -59,7 +59,7 @@ class DistributedSchemaTest {
             assertEquals(hash,copy.column(A).schema().variableTailKeys().getFirst()); hashDigests.add(HexFormat.of().formatHex(value.digest()));
         }
         assertEquals(4,hashDigests.size());
-        var differentCodec=new DistributedSchema.Operator("sum",2,"example.Sum",new byte[32],4,4);
+        var differentCodec=new DistributedSchema.Operator("sum",2,"example.Sum",new byte[32],4,4,"pure-sum",1);
         assertFalse(Arrays.equals(merged.digest(),schema(0,new DistributedSchema.Column(1,A,"data",merged(),differentCodec)).digest()));
     }
 
@@ -102,9 +102,9 @@ class DistributedSchemaTest {
         assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Column(1,A,"data",fixed(4),operator(new byte[32])));
         var partial=ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(),true,"sum",2L);
         assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Column(1,A,"data",partial,operator(new byte[32])));
-        assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Operator("sum",-1,"example.Sum",new byte[32],1,1));
-        assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Operator("sum",1,"example.Sum",new byte[31],1,1));
-        assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Operator("sum",1,"example.Sum",new byte[32],0,1));
+        assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Operator("sum",-1,"example.Sum",new byte[32],1,1,"pure-sum",1));
+        assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Operator("sum",1,"example.Sum",new byte[31],1,1,"pure-sum",1));
+        assertThrows(IllegalArgumentException.class,() -> new DistributedSchema.Operator("sum",1,"example.Sum",new byte[32],0,1,"pure-sum",1));
         assertDoesNotThrow(() -> schema(4,first,column(2,B,"variable",ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(ColumnHashType.XXHASH8),true))));
     }
 
@@ -131,7 +131,7 @@ class DistributedSchemaTest {
         assertArrayEquals(DistributedSchemaCodec.encode(empty),DistributedSchemaCodec.encode(DistributedSchemaCodec.decode(DistributedSchemaCodec.encode(empty))));
         var columns=new ArrayList<DistributedSchema.Column>();
         String operatorName="o".repeat(4096), className="c".repeat(4096);
-        var operator=new DistributedSchema.Operator(operatorName,1,className,new byte[32],1,1);
+        var operator=new DistributedSchema.Operator(operatorName,1,className,new byte[32],1,1,"pure-sum",1);
         var shape=ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(),true,operatorName,1L,className);
         for (int i=1;i<=RangeDirectoryCodec.MAX_COLUMNS;i++) {
             columns.add(new DistributedSchema.Column(i,new UUID(0,i),"n".repeat(4092)+String.format("%04d",i),shape,operator));

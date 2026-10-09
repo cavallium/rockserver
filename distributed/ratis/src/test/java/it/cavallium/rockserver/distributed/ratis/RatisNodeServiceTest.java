@@ -35,10 +35,17 @@ class RatisNodeServiceTest {
         var directory=new RatisCatalogue(env.catalogue.client,o.cluster,o.database,o.catalogue,1,new byte[32],o.directoryColumn);
         directory.execute(directory.prepare(o.operation(2),null,initial)); directory.execute(directory.prepare(o.operation(3),initial,d));
     }
+    void initialize(RatisNodeRuntimeTest.Env env,DistributedSchema schema) throws Exception {
+        var fake=new RatisNodeRuntimeTest.FakeServer();
+        try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,
+                env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,schema)) {
+            node.start();
+        }
+    }
     @Test void establishedNativeRecoveryOwnedCloseAndFreshCatalogueChecks() throws Exception {
         var schema=schema();
         try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
-            try (var initialized=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new RatisNodeRuntimeTest.FakeServer())) { initialized.start(); }
+            initialize(env,schema);
             publish(env,schema); var fake=new RatisNodeRuntimeTest.FakeServer(); var manifest=manifest(env,schema);
             try (var service=RatisNodeService.recover(manifest,env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
                 assertEquals(RatisNodeRuntime.State.OPEN,service.state()); assertThrows(IOException.class,service::verifyCatalogue);
@@ -54,7 +61,7 @@ class RatisNodeServiceTest {
     @Test void failedNativeDrainRetainsAllDependenciesUntilRetryableClose() throws Exception {
         var schema=schema();
         try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
-            try (var initialized=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new RatisNodeRuntimeTest.FakeServer())) { initialized.start(); }
+            initialize(env,schema);
             var fake=new RatisNodeRuntimeTest.FakeServer();
             try (var service=RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
                 service.start(); var field=RatisRangeStateMachine.class.getDeclaredField("store"); field.setAccessible(true);
@@ -82,7 +89,7 @@ class RatisNodeServiceTest {
     @Test void ownedLauncherRejectsPersistedIdentityBindingAndRetiresResources() throws Exception {
         var schema=schema();
         try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
-            try (var initialized=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new RatisNodeRuntimeTest.FakeServer())) { initialized.start(); }
+            initialize(env,schema);
             Path identity=env.nodeRoot.resolve("node.identity"); byte[] changed=SessionJournalFiles.read(identity,128); changed[5]^=1;
             SessionJournalFiles.write(identity,changed,128);
             var fake=new RatisNodeRuntimeTest.FakeServer();

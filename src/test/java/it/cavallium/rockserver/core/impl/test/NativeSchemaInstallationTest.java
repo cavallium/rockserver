@@ -297,7 +297,7 @@ class NativeSchemaInstallationTest {
                 assertThrows(java.io.IOException.class,() -> NativeRangeImage.write(image,store,limits),corruption);
                 assertFalse(java.nio.file.Files.exists(image),"Invalid metadata cannot publish a recovery image: "+corruption);
             }
-            try(var pool=open(path)) { assertThrows(RuntimeException.class,() -> store(pool,group,source,null,null),corruption); }
+            assertThrows(RuntimeException.class,() -> { try(var pool=open(path)) { store(pool,group,source,null,null); } },corruption);
         }
     }
 

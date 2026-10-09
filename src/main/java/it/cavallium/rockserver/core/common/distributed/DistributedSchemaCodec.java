@@ -31,7 +31,7 @@ public final class DistributedSchemaCodec {
             var operator=column.operator();
             if (operator!=null) {
                 text(output,operator.name()); output.putLong(operator.version()); text(output,operator.className());
-                output.put(operator.artifactSha256()).putInt(operator.valueCodecVersion()).putInt(operator.operandCodecVersion());
+                output.put(operator.artifactSha256()).putInt(operator.valueCodecVersion()).putInt(operator.operandCodecVersion()); text(output,operator.deterministicContract()); output.putInt(operator.deterministicContractVersion());
             }
         }
         return output.array();
@@ -78,7 +78,8 @@ public final class DistributedSchemaCodec {
             if (hasOperator) {
                 String operatorName=text(input); require(input,8); long version=input.getLong(); String className=text(input);
                 require(input,40); byte[] artifact=new byte[32]; input.get(artifact);
-                operator=new DistributedSchema.Operator(operatorName,version,className,artifact,input.getInt(),input.getInt());
+                int valueCodec=input.getInt(),operandCodec=input.getInt(); String contract=text(input); require(input,4);
+                operator=new DistributedSchema.Operator(operatorName,version,className,artifact,valueCodec,operandCodec,contract,input.getInt());
             }
             var shape=new ColumnSchema(keys,hashes,hasValue,operator==null ? null : operator.name(),
                     operator==null ? null : operator.version(),operator==null ? null : operator.className());
@@ -96,7 +97,7 @@ public final class DistributedSchemaCodec {
         for (var column:schema.columns()) {
             var shape=column.schema(); size+=38L+text(column.name()).length+4L*shape.keysCount()+shape.variableLengthKeysCount();
             var operator=column.operator();
-            if (operator!=null) size+=56L+text(operator.name()).length+text(operator.className()).length;
+            if (operator!=null) size+=64L+text(operator.name()).length+text(operator.className()).length+text(operator.deterministicContract()).length;
         }
         return size;
     }

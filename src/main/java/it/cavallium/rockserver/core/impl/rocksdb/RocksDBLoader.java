@@ -247,6 +247,18 @@ public class RocksDBLoader {
         RocksDBObjects refs,
         boolean inMemory,
         Map<String, Cache> caches) {
+        return getColumnOptions(name,path,definitiveDbPath,globalDatabaseConfig,logger,refs,inMemory,caches,null);
+    }
+    @FunctionalInterface public interface OperatorResolver { FFMAbstractMergeOperator resolve(String name) throws IOException; }
+
+    public static ColumnOptionsWithMerge getColumnOptions(String name,
+        @Nullable Path path,
+        @NotNull Path definitiveDbPath,
+        GlobalDatabaseConfig globalDatabaseConfig,
+        Logger logger,
+        RocksDBObjects refs,
+        boolean inMemory,
+        Map<String, Cache> caches, OperatorResolver resolver) {
         try {
             FallbackColumnConfig columnOptions = null;
             for (NamedColumnConfig namedColumnConfig : globalDatabaseConfig.columnOptions()) {
@@ -295,14 +307,18 @@ public class RocksDBLoader {
                 }
             }
 
-         			FFMAbstractMergeOperator mergeOperator = null;
-         			var mergeOperatorClass = columnOptions.mergeOperatorClass();
-         			if (mergeOperatorClass != null && !mergeOperatorClass.isBlank()) {
-         				var impl = instantiateMergeOperator(mergeOperatorClass);
-         				mergeOperator = new DelegatingMergeOperator("Delegating-" + impl.getClass().getSimpleName(), impl);
-         				refs.add(mergeOperator);
-         				columnFamilyOptions.setMergeOperator(mergeOperator);
-         			}
+            FFMAbstractMergeOperator mergeOperator = null;
+            if(resolver!=null) {
+                try { mergeOperator=resolver.resolve(name); }
+                catch(IOException failure) { throw new IllegalStateException("Cannot resolve qualified operator for "+name,failure); }
+            } else {
+                var mergeOperatorClass=columnOptions.mergeOperatorClass();
+                if(mergeOperatorClass!=null && !mergeOperatorClass.isBlank()) {
+                    var impl=instantiateMergeOperator(mergeOperatorClass);
+                    mergeOperator=new DelegatingMergeOperator("Delegating-"+impl.getClass().getSimpleName(),impl);
+                }
+            }
+            if(mergeOperator!=null) { refs.add(mergeOperator); columnFamilyOptions.setMergeOperator(mergeOperator); }
 
             //noinspection ConstantConditions
             if (columnOptions.memtableMemoryBudgetBytes() != null) {
@@ -624,6 +640,11 @@ public class RocksDBLoader {
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger,
             @Nullable MeterRegistry meterRegistry, @Nullable String databaseName,
             Set<String> extraInternalColumns) {
+        return load(path,config,logger,meterRegistry,databaseName,extraInternalColumns,null);
+    }
+    public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger,
+            @Nullable MeterRegistry meterRegistry, @Nullable String databaseName,
+            Set<String> extraInternalColumns, OperatorResolver resolver) {
         extraInternalColumns = Set.copyOf(extraInternalColumns);
         for (String name : extraInternalColumns) {
             if (name.isEmpty() || name.indexOf('\0') >= 0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name)) {
@@ -645,7 +666,7 @@ public class RocksDBLoader {
             }
             var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
             return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger,
-                    meterRegistry, databaseName, extraInternalColumns);
+                    meterRegistry, databaseName, extraInternalColumns, resolver);
         } catch (RuntimeException | Error failure) {
             try {
                 refs.close();
@@ -1016,6 +1037,21 @@ public class RocksDBLoader {
         return walSizeLimitMb;
     }
 
+    static DBOptions readOnlyOptions(Path path,DatabaseConfig config) throws IOException {
+        var options=new DBOptions();
+        try { getWalDir(path.toAbsolutePath(),config).map(Path::toString).ifPresent(options::setWalDir); return options; }
+        catch(GestaltException|RuntimeException failure) { options.close(); throw new IOException("Cannot resolve read-only native paths",failure); }
+    }
+    static ColumnFamilyOptions readOnlyColumnOptions(String name,Path path,DatabaseConfig config,RocksDBObjects refs) throws IOException {
+        try {
+            var global=config.global(); FallbackColumnConfig selected=global.fallbackColumnOptions();
+            if(!name.equals(DistributedStoragePool.STATE_COLUMN) && !name.equals(DistributedStoragePool.RECEIPTS_COLUMN)) for(var candidate:global.columnOptions()) if(candidate.name().equals(name)) { selected=candidate; break; }
+            var options=getCompatibilityColumnOptions(refs);
+            options.setCfPaths(mapList(getVolumeConfigs(path.toAbsolutePath(),selected),p -> new DbPath(p.path(),p.targetSize())));
+            return options;
+        } catch(GestaltException failure) { throw new IOException("Cannot resolve read-only CF paths",failure); }
+    }
+
     private static Optional<Path> getWalDir(Path definitiveDbPath, DatabaseConfig databaseOptions)
         throws GestaltException {
         return Optional.ofNullable(databaseOptions.global().walPath())
@@ -1048,7 +1084,7 @@ public class RocksDBLoader {
     private static LoadedDb loadDb(@Nullable Path path,
         @NotNull Path definitiveDbPath,
         DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger,
-        @Nullable MeterRegistry meterRegistry, @Nullable String databaseName, Set<String> extraInternalColumns) {
+        @Nullable MeterRegistry meterRegistry, @Nullable String databaseName, Set<String> extraInternalColumns, OperatorResolver resolver) {
         var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
         Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
@@ -1117,7 +1153,7 @@ public class RocksDBLoader {
                         && (name.equals("_column_schemas_") || name.equals("_merge_operators_") || name.equals("_cdc_meta_")))
                         ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs, path, definitiveDbPath, databaseOptions), null)
                         : getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
-                                logger, refs, path == null, optionsWithCache.caches());
+                                logger, refs, path == null, optionsWithCache.caches(), resolver);
 
                 // Create base directories
                 List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, entry.getValue());

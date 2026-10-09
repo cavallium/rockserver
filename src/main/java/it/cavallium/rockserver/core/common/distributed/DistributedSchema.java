@@ -9,10 +9,10 @@ import java.util.*;
 /** Immutable logical/API bindings and the existing physical key/operator content identity. */
 public final class DistributedSchema {
     public static final int PHYSICAL_KEY_CODEC_VERSION=1;
-    public record Operator(String name,long version,String className,byte[] artifactSha256,int valueCodecVersion,int operandCodecVersion) {
+    public record Operator(String name,long version,String className,byte[] artifactSha256,int valueCodecVersion,int operandCodecVersion,String deterministicContract,int deterministicContractVersion) {
         public Operator {
-            DistributedSchemaCodec.text(name); DistributedSchemaCodec.text(className);
-            if (version<0 || artifactSha256.length!=32 || valueCodecVersion<1 || operandCodecVersion<1) {
+            DistributedSchemaCodec.text(name); DistributedSchemaCodec.text(className); DistributedSchemaCodec.text(deterministicContract);
+            if (version<0 || artifactSha256.length!=32 || valueCodecVersion<1 || operandCodecVersion<1 || deterministicContractVersion<1) {
                 throw new IllegalArgumentException("Invalid distributed operator identity");
             }
             artifactSha256=artifactSha256.clone();
@@ -20,9 +20,9 @@ public final class DistributedSchema {
         @Override public byte[] artifactSha256() { return artifactSha256.clone(); }
         @Override public boolean equals(Object other) {
             return other instanceof Operator operator && name.equals(operator.name) && version==operator.version && className.equals(operator.className)
-                    && Arrays.equals(artifactSha256,operator.artifactSha256) && valueCodecVersion==operator.valueCodecVersion && operandCodecVersion==operator.operandCodecVersion;
+                    && Arrays.equals(artifactSha256,operator.artifactSha256) && valueCodecVersion==operator.valueCodecVersion && operandCodecVersion==operator.operandCodecVersion && deterministicContract.equals(operator.deterministicContract) && deterministicContractVersion==operator.deterministicContractVersion;
         }
-        @Override public int hashCode() { return Objects.hash(name,version,className,Arrays.hashCode(artifactSha256),valueCodecVersion,operandCodecVersion); }
+        @Override public int hashCode() { return Objects.hash(name,version,className,Arrays.hashCode(artifactSha256),valueCodecVersion,operandCodecVersion,deterministicContract,deterministicContractVersion); }
     }
     public record Column(long apiId,UUID columnId,String name,ColumnSchema schema,Operator operator) {
         public Column {

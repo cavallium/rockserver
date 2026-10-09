@@ -137,7 +137,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
             snapshotHomes.requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
             var home=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME); if (home!=null) snapshotHomes.requireDirectoryBinding(home.directory());
         }
-        if (schema!=null) schema.requireMatches(plan.directory());
+        if (schema!=null) {
+            schema.requireMatches(plan.directory());
+            var merges=new HashSet<UUID>();
+            for (var column:schema.columns()) if (column.operator()!=null) merges.add(column.columnId());
+            if (!plan.merges().equals(merges)) throw new IllegalArgumentException("Node merge bindings differ from qualified schema");
+        } else if (!plan.merges().isEmpty()) throw new IllegalArgumentException("Node merge bindings require a qualified schema");
         if (plan.localGroups().stream().anyMatch(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId()))
                 && plan.directory().ranges().size()+plan.homes().stream().mapToInt(home -> home.directory().ranges().size()).sum()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
         var catalogue=plan.catalogue(); epochs.requireCatalogueBinding(plan.directory().clusterId(),plan.directory().databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
@@ -191,7 +196,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         proofQueries=new RatisProofQueryService();
         if (transactionHomes!=null) snapshotHelp=new RatisSnapshotHelpService(scheduler);
-        pool=DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class));
+        var metadataBindings=new HashMap<UUID,String>();
+        for (var group:plan.localGroups()) switch (plan.role(group.getGroupId().getUuid())) {
+            case DATA -> {}
+            case CATALOGUE -> {
+                metadataBindings.put(plan.catalogue().directoryColumn(),"catalogue-directory");
+                metadataBindings.put(plan.catalogue().sessionsColumn(),"catalogue-sessions");
+            }
+            case TRANSACTION_HOME, SNAPSHOT_HOME -> {
+                var home=plan.home(group.getGroupId().getUuid()); metadataBindings.put(home.column(),home.physicalName());
+            }
+        }
+        pool=logicalSchema==null ? DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class))
+                : DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class),logicalSchema,plan.columns(),metadataBindings);
         pool.configureSnapshotAdmission(settings.exports().pins());
         try {
             for (var group:plan.localGroups()) {

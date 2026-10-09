@@ -212,8 +212,8 @@ class RatisSchemaCatalogueTest {
     @Test void validCoreSchemaLargerThanPublicationEnvelopeBudgetIsRejected() throws Exception {
         var outer=new RatisSessionEpochsTest();
         try (var f=outer.new Fixture(root.resolve("budget"))) {
-            String name="o".repeat(2048), className="c".repeat(1949);
-            var operator=new DistributedSchema.Operator(name,1,className,new byte[32],1,1);
+            String name="o".repeat(2048), className="c".repeat(1933);
+            var operator=new DistributedSchema.Operator(name,1,className,new byte[32],1,1,"pure-sum",1);
             var shape=ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(),true,name,1L,className);
             var columns=new ArrayList<DistributedSchema.Column>();
             for (int i=1;i<=256;i++) columns.add(new DistributedSchema.Column(i,new UUID(0,i),"n".repeat(4092)+String.format(Locale.ROOT,"%04d",i),shape,operator));

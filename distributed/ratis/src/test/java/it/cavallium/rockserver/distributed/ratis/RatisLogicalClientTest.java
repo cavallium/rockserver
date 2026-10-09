@@ -21,7 +21,7 @@ class RatisLogicalClientTest {
     final UUID domain=new UUID(6,1), keyOnly=new UUID(2,4), bucket=new UUID(2,5), operated=new UUID(2,6);
     ColumnSchema fixed(boolean values) { return ColumnSchema.of(IntArrayList.of(8,1),new ObjectArrayList<>(),values); }
     DistributedSchema schema() {
-        var op=new DistributedSchema.Operator("sum",1,"example.Sum",new byte[32],1,1);
+        var op=new DistributedSchema.Operator("sum",1,"example.Sum",new byte[32],1,1,"pure-sum",1);
         return new DistributedSchema(outer.cluster,outer.database,domain,1,0,List.of(
                 new DistributedSchema.Column(71,outer.data,"values",fixed(true),null),
                 new DistributedSchema.Column(91,keyOnly,"keys",fixed(false),null),

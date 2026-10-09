@@ -35,9 +35,11 @@ public final class DistributedStoragePool implements AutoCloseable {
     private static final Set<String> RESERVED_COLUMNS = Set.of("default", "_column_schemas_",
             "_merge_operators_", "_cdc_meta_", STATE_COLUMN, RECEIPTS_COLUMN);
 
+    static boolean isReservedColumn(String name) { return RESERVED_COLUMNS.contains(name); }
     private final RocksDBLoader.LoadedDb loaded;
     private final GlobalDatabaseConfig globalConfig;
     private final Logger logger;
+    private final DistributedOperatorArtifacts artifacts;
     private final RangeOwnership ownership = new RangeOwnership();
     // Serializes native schema mutation/close, without holding the admission metadata monitor.
     private final Semaphore nativeMutation = new Semaphore(1);
@@ -75,9 +77,10 @@ public final class DistributedStoragePool implements AutoCloseable {
     private final class PreparedColumn implements AutoCloseable {
         final String name; final RocksDBObjects resources=new RocksDBObjects(); final RocksDBLoader.ColumnOptionsWithMerge options;
         boolean adopted;
-        PreparedColumn(String name) {
+        PreparedColumn(String name) { this(name,artifacts.qualified() ? artifacts::resolve : null); }
+        PreparedColumn(String name,RocksDBLoader.OperatorResolver resolver) {
             this.name=name;
-            try { options=RocksDBLoader.getColumnOptions(name,loaded.path(),loaded.definitiveDbPath(),globalConfig,logger,resources,false,loaded.caches()); }
+            try { options=RocksDBLoader.getColumnOptions(name,loaded.path(),loaded.definitiveDbPath(),globalConfig,logger,resources,false,loaded.caches(),resolver); }
             catch(RuntimeException|Error failure) { resources.close(); throw failure; }
         }
         @Override public void close() { if(!adopted) resources.close(); }
@@ -90,25 +93,93 @@ public final class DistributedStoragePool implements AutoCloseable {
             loaded.definitiveColumnFamilyOptionsMap().put(prepared.name,prepared.options.options()); loaded.mergeOperators().put(prepared.name,prepared.options.mergeOperator()); return handle;
         } finally { handleLifetime.writeLock().unlock(); }
     }
+    private static Map<UUID,Binding> decodeBirths(byte[] encoded) throws IOException {
+        if(encoded.length>MAX_BINDING_BYTES) throw new IOException("Birth registry exceeds budget");
+        var result=new HashMap<UUID,Binding>(); var input=new DataInputStream(new ByteArrayInputStream(encoded)); int count=input.readInt();
+        if(count<0 || count>MAX_BINDINGS) throw new IOException("Birth registry count exceeds budget");
+        var names=new HashSet<String>();
+        for(int i=0;i<count;i++) {
+            var id=new UUID(input.readLong(),input.readLong()); var birth=new UUID(input.readLong(),input.readLong());
+            int kind=input.readUnsignedByte(); if(kind<1 || kind>BirthKind.values().length) throw new IOException("Invalid CF birth kind");
+            var birthKind=BirthKind.values()[kind-1]; boolean merge=input.readBoolean(); String name=input.readUTF();
+            if(name.isEmpty() || name.length()>4096 || RESERVED_COLUMNS.contains(name) || !StandardCharsets.US_ASCII.newEncoder().canEncode(name) || name.indexOf('\0')>=0 || !names.add(name) || result.put(id,new Binding(name,merge,birthKind,birth))!=null) throw new IOException("Invalid birth identity");
+        }
+        if(input.available()!=0) throw new IOException("Trailing birth registry bytes"); return result;
+    }
     private void recoverBirths() {
         try {
             var encoded=loaded.db().get().get(handles.get(STATE_COLUMN),BIRTHS_KEY); if(encoded==null) return;
-            if(encoded.length>MAX_BINDING_BYTES) throw new IOException("Birth registry exceeds budget");
-            var input=new DataInputStream(new ByteArrayInputStream(encoded)); int count=input.readInt();
-            if(count<0 || count>MAX_BINDINGS) throw new IOException("Birth registry count exceeds budget");
-            var names=new HashSet<String>();
-            for(int i=0;i<count;i++) {
-                var id=new UUID(input.readLong(),input.readLong()); var birth=new UUID(input.readLong(),input.readLong());
-                int kind=input.readUnsignedByte(); if(kind<1 || kind>BirthKind.values().length) throw new IOException("Invalid CF birth kind");
-                var birthKind=BirthKind.values()[kind-1];
-                boolean merge=input.readBoolean(); String name=input.readUTF();
-                if(name.isEmpty() || name.length()>4096 || RESERVED_COLUMNS.contains(name) || !StandardCharsets.US_ASCII.newEncoder().canEncode(name)
-                        || name.indexOf('\0')>=0 || !names.add(name) || bindings.put(id,new Binding(name,merge,birthKind,birth))!=null) throw new IOException("Invalid birth identity");
-            }
-            if(input.available()!=0) throw new IOException("Trailing birth registry bytes");
+            bindings.putAll(decodeBirths(encoded));
+            if(artifacts.qualified()) for(var entry:bindings.entrySet()) artifacts.requireBirth(entry.getKey(),entry.getValue().name(),entry.getValue().mergeAdmitted());
         } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot recover native CF births",failure); }
     }
-    private void reserveBirths(Map<UUID,String> names,Set<UUID> merges,UUID change,Set<UUID> fresh) throws RocksDBException {
+    /** Reads forced metadata, including WAL, without installing user callbacks or enabling native writes. */
+    private static void preflightNativeBindings(Path path,DatabaseConfig config,DistributedOperatorArtifacts artifacts) throws IOException,RocksDBException {
+        org.rocksdb.RocksDB.loadLibrary();
+        List<byte[]> names; try(var listing=new org.rocksdb.Options()) { names=org.rocksdb.RocksDB.listColumnFamilies(listing,path.toString()); }
+        if(names.size()>MAX_BINDINGS+RESERVED_COLUMNS.size()) throw new IOException("Native CF count exceeds budget");
+        boolean hasState=names.stream().anyMatch(name -> Arrays.equals(name,STATE_COLUMN.getBytes(StandardCharsets.US_ASCII)));
+        if(!hasState) { if(artifacts.qualified()) throw new IOException("Qualified native pool lacks STATE"); return; }
+        try(var refs=new RocksDBObjects(); var dbOptions=RocksDBLoader.readOnlyOptions(path,config)) {
+            var descriptors=new ArrayList<ColumnFamilyDescriptor>(); var nativeHandles=new ArrayList<ColumnFamilyHandle>();
+            for(var name:names) descriptors.add(new ColumnFamilyDescriptor(name,RocksDBLoader.readOnlyColumnOptions(new String(name,StandardCharsets.US_ASCII),path,config,refs)));
+            try(var db=org.rocksdb.RocksDB.openReadOnly(dbOptions,path.toString(),descriptors,nativeHandles)) {
+                try {
+                    ColumnFamilyHandle state=null; for(var handle:nativeHandles) if(Arrays.equals(handle.getName(),STATE_COLUMN.getBytes(StandardCharsets.US_ASCII))) state=handle;
+                    if(state==null) throw new IOException("Read-only native STATE missing");
+                    var births=new HashMap<UUID,Binding>();
+                    var buffer=new byte[Math.max(MAX_BINDING_BYTES,NativeSchemaInstallation.MAX_BYTES)];
+                    int birthLength=db.get(state,BIRTHS_KEY,buffer);
+                    if(birthLength!=org.rocksdb.RocksDB.NOT_FOUND) { if(birthLength>MAX_BINDING_BYTES) throw new IOException("Native birth metadata exceeds budget"); births.putAll(decodeBirths(Arrays.copyOf(buffer,birthLength))); }
+                    if(artifacts.qualified()) for(var entry:births.entrySet()) artifacts.requireBirth(entry.getKey(),entry.getValue().name(),entry.getValue().mergeAdmitted());
+                    var live=new HashSet<String>(); for(var name:names) live.add(new String(name,StandardCharsets.US_ASCII));
+                    var key=new byte[34];
+                    try(var iterator=db.newIterator(state)) {
+                        iterator.seekToFirst();
+                        while(iterator.isValid()) {
+                            int length=iterator.key(key); if(length<16) { iterator.next(); continue; }
+                            byte[] group=Arrays.copyOf(key,16); byte[] currentBytes=null; NativeSchemaInstallation current=null;
+                            for(int tag:List.of(0x28,0x29)) {
+                                byte[] nativeKey=Arrays.copyOf(group,17); nativeKey[16]=(byte)tag;
+                                int size=db.get(state,nativeKey,buffer); if(size==org.rocksdb.RocksDB.NOT_FOUND) continue;
+                                if(size>NativeSchemaInstallation.MAX_BYTES) throw new IOException("Native schema record exceeds budget");
+                                byte[] encoded=Arrays.copyOf(buffer,size); var record=NativeSchemaInstallation.decode(encoded);
+                                if(tag==0x28) { currentBytes=encoded; current=record; }
+                                if(!artifacts.qualified()) {
+                                    boolean neededOperator=record.definition().sourceSchema().columns().stream().anyMatch(column -> column.operator()!=null && live.contains(record.sourceNames().get(column.columnId())))
+                                            || record.definition().targetSchema().columns().stream().anyMatch(column -> column.operator()!=null);
+                                    if(neededOperator) throw new IOException("Operator-bearing native schema lacks trusted cache");
+                                } else {
+                                    artifacts.requireSchemaBindings(record.definition().sourceSchema(),record.sourceNames(),live);
+                                    artifacts.requireSchemaBindings(record.definition().targetSchema(),record.targetNames());
+                                    for(var column:record.definition().targetSchema().columns()) if(column.operator()!=null) artifacts.require(column.operator());
+                                }
+                            }
+                            byte[] historyPrefix=Arrays.copyOf(group,17); historyPrefix[16]=0x2a; iterator.seek(historyPrefix);
+                            if(iterator.isValid()) {
+                                int found=iterator.key(key);
+                                if(found>=17 && Arrays.equals(key,0,17,historyPrefix,0,17)) {
+                                    if(current==null) throw new IOException("Native schema history lacks current generation");
+                                    var change=current.definition().changeId(); byte[] original=ByteBuffer.allocate(33).put(historyPrefix).putLong(change.getMostSignificantBits()).putLong(change.getLeastSignificantBits()).array();
+                                    int size=db.get(state,original,buffer);
+                                    if(size==org.rocksdb.RocksDB.NOT_FOUND || size>NativeSchemaInstallation.MAX_BYTES || !Arrays.equals(currentBytes,Arrays.copyOf(buffer,size))) throw new IOException("Native current schema differs from immutable history");
+                                } else if(current!=null) throw new IOException("Native current schema lacks immutable history");
+                            } else if(current!=null) throw new IOException("Native current schema lacks immutable history");
+                            // Advance one UUID prefix, avoiding unrelated session/ACK/floor records.
+                            int offset=15; while(offset>=0 && (group[offset]&255)==255) group[offset--]=0;
+                            if(offset<0) break; group[offset]++; iterator.seek(group);
+                        }
+                        iterator.status();
+                    }
+                    if(artifacts.qualified()) for(var name:names) {
+                        String physical=new String(name,StandardCharsets.US_ASCII); if(RESERVED_COLUMNS.contains(physical)) continue;
+                        if(!artifacts.contains(physical) || births.values().stream().noneMatch(birth -> birth.name().equals(physical))) throw new IOException("Live native CF lacks exact birth binding");
+                    }
+                } finally { nativeHandles.forEach(ColumnFamilyHandle::close); }
+            }
+        }
+    }
+    private Map<UUID,Binding> proposedBirths(Map<UUID,String> names,Set<UUID> merges,UUID change,Set<UUID> fresh) {
         var next=new HashMap<>(bindings);
         for(var entry:names.entrySet()) {
             var old=next.get(entry.getKey()); var name=entry.getValue();
@@ -118,6 +189,11 @@ public final class DistributedStoragePool implements AutoCloseable {
             next.putIfAbsent(entry.getKey(),new Binding(name,merges.contains(entry.getKey()),fresh.contains(entry.getKey()) ? BirthKind.CREATE : BirthKind.BOOTSTRAP,fresh.contains(entry.getKey()) ? change : BOOTSTRAP_BIRTH));
         }
         if(next.size()>MAX_BINDINGS) throw new IllegalStateException("Native CF birth budget exhausted");
+        long bytes=4; for(var binding:next.values()) bytes+=36L+binding.name().length();
+        if(bytes>MAX_BINDING_BYTES) throw new IllegalStateException("Native CF birth byte budget exhausted"); return next;
+    }
+    private void reserveBirths(Map<UUID,String> names,Set<UUID> merges,UUID change,Set<UUID> fresh) throws RocksDBException {
+        var next=proposedBirths(names,merges,change,fresh);
         if(next.equals(bindings) && birthsDurable) return;
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes); output.writeInt(next.size());
@@ -133,8 +209,9 @@ public final class DistributedStoragePool implements AutoCloseable {
         } catch(IOException impossible) { throw new AssertionError(impossible); }
     }
 
-    private DistributedStoragePool(RocksDBLoader.LoadedDb loaded, GlobalDatabaseConfig globalConfig, Logger logger) {
+    private DistributedStoragePool(RocksDBLoader.LoadedDb loaded, GlobalDatabaseConfig globalConfig, Logger logger, DistributedOperatorArtifacts artifacts) {
         this.loaded = loaded;
+        this.artifacts=artifacts;
         this.globalConfig = globalConfig;
         this.logger = logger;
         loaded.db().getStartupColumns().forEach((descriptor, handle) ->
@@ -142,7 +219,15 @@ public final class DistributedStoragePool implements AutoCloseable {
         recoverBirths();
     }
 
+    public static void stageOperator(Path poolPath,DistributedSchema.Operator operator,
+            it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract contract,byte[] jar) throws IOException {
+        new DistributedOperatorArtifacts(poolPath).stage(operator,contract,jar);
+    }
     public static DistributedStoragePool open(Path persistentPath, DatabaseConfig config, Logger logger) {
+        return open(persistentPath,config,logger,null,null,Map.of());
+    }
+    public static DistributedStoragePool open(Path persistentPath, DatabaseConfig config, Logger logger,
+            DistributedSchema bootstrap,Map<UUID,String> bootstrapPhysicalColumns,Map<UUID,String> nonDATAPlainBindings) {
         Objects.requireNonNull(persistentPath, "persistentPath");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(logger, "logger");
@@ -157,8 +242,22 @@ public final class DistributedStoragePool implements AutoCloseable {
                     it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.CONFIG_ERROR,
                     "Failed to resolve distributed pool configuration", ex);
         }
-        var nativeLoaded=RocksDBLoader.load(persistentPath,config,logger,null,null,INTERNAL_COLUMNS);
-        try { return new DistributedStoragePool(nativeLoaded,globalConfig,logger); }
+        final DistributedOperatorArtifacts artifacts;
+        try {
+            artifacts=new DistributedOperatorArtifacts(persistentPath);
+            if(bootstrap!=null && !Files.exists(persistentPath.resolve("CURRENT"))) {
+                if(Files.exists(persistentPath)) {
+                    if(!Files.isDirectory(persistentPath)) throw new IOException("Native pool path is not a directory");
+                    try(var entries=Files.newDirectoryStream(persistentPath)) { if(entries.iterator().hasNext()) throw new IOException("Unidentified nonempty native pool cannot authorize bootstrap"); }
+                }
+                artifacts.qualifyBootstrap(bootstrap,Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),true);
+            }
+            if(bootstrap!=null && Files.exists(persistentPath.resolve("CURRENT"))) artifacts.qualifyBootstrap(bootstrap,Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),false);
+            if(Files.exists(persistentPath.resolve("CURRENT"))) preflightNativeBindings(persistentPath,config,artifacts);
+        } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot qualify native operator bindings",failure); }
+        RocksDBLoader.OperatorResolver resolver=artifacts.qualified() ? name -> RESERVED_COLUMNS.contains(name) ? null : artifacts.resolve(name) : null;
+        var nativeLoaded=RocksDBLoader.load(persistentPath,config,logger,null,null,INTERNAL_COLUMNS,resolver);
+        try { return new DistributedStoragePool(nativeLoaded,globalConfig,logger,artifacts); }
         catch(RuntimeException|Error failure) {
             try { nativeLoaded.db().close(); } catch(Exception cleanup) { failure.addSuppressed(cleanup); }
             if(!nativeLoaded.db().get().isOwningHandle()) try { nativeLoaded.refs().close(); } catch(RuntimeException cleanup) { failure.addSuppressed(cleanup); }
@@ -482,7 +581,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         if(saved!=null) return prepareSchemaInstallation(store,definition,saved.targetNames(),saved.targetMerges());
         var names=new HashMap<>(schemaPhysicalNames(store)); var merges=new HashSet<>(store.deterministicMergeColumns());
         names.keySet().retainAll(definition.targetSchema().columnIds()); merges.retainAll(definition.targetSchema().columnIds());
-        for(var id:definition.targetSchema().columnIds()) names.putIfAbsent(id,"distributed-"+id);
+        for(var id:definition.targetSchema().columnIds()) { names.putIfAbsent(id,"distributed-"+id); if(definition.targetSchema().column(id).operator()!=null) merges.add(id); }
         return prepareSchemaInstallation(store,definition,names,merges);
     }
     public SchemaInstallPlan prepareSchemaInstallation(ReplicatedRangeStore store,SchemaChange.Definition definition,Map<UUID,String> targetNames,Set<UUID> targetMerges) throws RocksDBException {
@@ -506,7 +605,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             synchronized(admission) { if(closing || schemaPlans.size()>=64 || held>16L*1024*1024-schemaPlanBytes) throw new IllegalStateException("Pool schema preparation capacity exhausted"); }
             prepareSchemaOptions(record,options);
             var fresh=new HashSet<>(definition.targetSchema().columnIds()); fresh.removeAll(definition.sourceSchema().columnIds());
-            reserveBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
+            proposedBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
             var plan=new SchemaInstallPlan(store,record,options); retained=true; return plan;
         } finally { if(!retained) options.values().forEach(PreparedColumn::close); nativeMutation.release(); }
     }
@@ -525,16 +624,29 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     private void prepareSchemaOptions(NativeSchemaInstallation record,Map<String,PreparedColumn> options) {
         var definition=record.definition();
+        var fresh=new HashSet<>(definition.targetSchema().columnIds()); fresh.removeAll(definition.sourceSchema().columnIds());
+        for(var name:record.targetNames().values()) if(RESERVED_COLUMNS.contains(name)) throw new IllegalArgumentException("Reserved target CF name");
+        proposedBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
+        for(var plan:schemaPlans) if(!plan.closed) for(var entry:record.targetNames().entrySet()) {
+            var previous=plan.targetNames.get(entry.getKey());
+            if(previous!=null && !previous.equals(entry.getValue()) || plan.targetNames.entrySet().stream().anyMatch(other -> !other.getKey().equals(entry.getKey()) && other.getValue().equals(entry.getValue()))) throw new IllegalArgumentException("Physical CF is reserved by another prepared INSTALL");
+        }
+        boolean qualified=artifacts.qualified() || definition.targetSchema().columns().stream().anyMatch(column -> column.operator()!=null);
+        if(qualified) {
+            if(!artifacts.qualified()) for(var name:record.sourceNames().values()) if(loaded.mergeOperators().get(name)!=null) throw new IllegalArgumentException("Configured operator requires qualified bootstrap before native open");
+            for(var column:definition.targetSchema().columns()) if(record.targetMerges().contains(column.columnId())!=(column.operator()!=null)) throw new IllegalArgumentException("Target merge admission differs from schema operator");
+            try { artifacts.validate(definition.sourceSchema(),record.sourceNames()); artifacts.validate(definition.targetSchema(),record.targetNames()); }
+            catch(IOException failure) { throw new IllegalStateException("Cannot qualify native INSTALL operators",failure); }
+        }
         for(var entry:record.targetNames().entrySet()) {
-            var name=entry.getValue(); if(RESERVED_COLUMNS.contains(name)) throw new IllegalArgumentException("Reserved target CF name"); var old=bindings.get(entry.getKey());
-            if(old!=null && (!old.name().equals(name) || old.mergeAdmitted()!=record.targetMerges().contains(entry.getKey()))) throw new IllegalArgumentException("Column identity rebound");
-            if(bindings.entrySet().stream().anyMatch(other -> !other.getKey().equals(entry.getKey()) && other.getValue().name().equals(name))) throw new IllegalArgumentException("Physical name belongs to another identity");
-            if(!definition.sourceSchema().columnIds().contains(entry.getKey()) && definition.targetSchema().column(entry.getKey()).operator()!=null) throw new UnsupportedOperationException("New merge column requires admitted operator artifact staging");
+            var name=entry.getValue();
             if(handles.containsKey(name) && record.targetMerges().contains(entry.getKey()) && loaded.mergeOperators().get(name)==null) throw new IllegalArgumentException("Missing merge operator");
             if(!handles.containsKey(name)) {
-                var prepared=new PreparedColumn(name); options.put(name,prepared);
-                if(prepared.options.mergeOperator()!=null) throw new UnsupportedOperationException("New configured merge CF requires operator background-work lifecycle");
-                if(record.targetMerges().contains(entry.getKey())) throw new IllegalArgumentException("Missing merge operator");
+                var operator=definition.targetSchema().column(entry.getKey()).operator();
+                RocksDBLoader.OperatorResolver resolver=qualified ? ignored -> operator==null ? null : artifacts.instantiate(artifacts.require(operator)) : null;
+                var prepared=new PreparedColumn(name,resolver); options.put(name,prepared);
+                if(!qualified && prepared.options.mergeOperator()!=null) throw new UnsupportedOperationException("New configured merge CF requires trusted artifact staging");
+                if(record.targetMerges().contains(entry.getKey()) && prepared.options.mergeOperator()==null) throw new IllegalArgumentException("Missing merge operator");
             }
         }
     }
@@ -570,8 +682,6 @@ public final class DistributedStoragePool implements AutoCloseable {
         try {
             var owner=store.ownership(); record.requireRange(owner.owner().groupId(),owner.owner().epoch(),owner.interval().domainId(),owner.interval().lowerInclusive(),owner.interval().upperExclusive());
             store.preflightSchemaInstallation(record); prepareSchemaOptions(record,options);
-            var fresh=new HashSet<>(record.definition().targetSchema().columnIds()); fresh.removeAll(record.definition().sourceSchema().columnIds());
-            reserveBirths(record.targetNames(),record.targetMerges(),record.definition().changeId(),fresh);
             return installPreparedSchema(store,record,observer,options);
         } finally { options.values().forEach(PreparedColumn::close); }
     }
@@ -619,7 +729,14 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     private NativeSchemaInstallation installPreparedSchema(ReplicatedRangeStore store,NativeSchemaInstallation record,SchemaInstallObserver observer,Map<String,PreparedColumn> options) throws RocksDBException {
         var definition=record.definition();
+        store.preflightSchemaInstallation(record);
         var transition=qualifiedSchemaTransition(definition);
+        var fresh=new HashSet<>(definition.targetSchema().columnIds()); fresh.removeAll(definition.sourceSchema().columnIds());
+        if(artifacts.qualified() || definition.targetSchema().columns().stream().anyMatch(column -> column.operator()!=null)) {
+            try { artifacts.bind(definition.sourceSchema(),record.sourceNames()); artifacts.bind(definition.targetSchema(),record.targetNames()); }
+            catch(IOException failure) { throw new IllegalStateException("Cannot publish committed native operator bindings",failure); }
+        }
+        reserveBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
         schemaOrigins.put(definition.sourceSchema().domainId(),definition);
         var result=store.installSchema(record,transition,observer,() -> {
             var target=new HashMap<UUID,ColumnFamilyHandle>();

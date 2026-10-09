@@ -132,7 +132,7 @@ class SchemaChangeTest {
         assertThrows(IllegalArgumentException.class,() -> SchemaChange.Status.decode(new byte[SchemaChange.MAX_STATUS_BYTES+1]));
     }
     @Test void combinedDefinitionBudgetRejectsIndividuallyValidLargeSchemas() {
-        var operator=new DistributedSchema.Operator("o".repeat(4096),1,"c".repeat(4096),new byte[32],1,1);
+        var operator=new DistributedSchema.Operator("o".repeat(4096),1,"c".repeat(4096),new byte[32],1,1,"pure-sum",1);
         var shape=ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(),true,operator.name(),operator.version(),operator.className());
         var columns=new ArrayList<DistributedSchema.Column>();
         for (int i=1;i<=128;i++) columns.add(new DistributedSchema.Column(i,id(i),"n".repeat(4090)+String.format("%06d",i),shape,operator));

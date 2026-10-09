@@ -25,7 +25,7 @@ class RatisNodeManifestTest {
         var first=ColumnSchema.of(IntArrayList.of(4),bucket ? ObjectArrayList.of(ColumnHashType.XXHASH8) : ObjectArrayList.of(),true);
         columns.add(new DistributedSchema.Column(7,A,"alpha",first,null));
         var second=ColumnSchema.of(IntArrayList.of(8),ObjectArrayList.of(),true,operator ? "sum" : null,operator ? 1L : null,operator ? "example.Sum" : null);
-        columns.add(new DistributedSchema.Column(9,B,"beta",second,operator ? new DistributedSchema.Operator("sum",1,"example.Sum",new byte[32],1,1) : null));
+        columns.add(new DistributedSchema.Column(9,B,"beta",second,operator ? new DistributedSchema.Operator("sum",1,"example.Sum",new byte[32],1,1,"pure-sum",1) : null));
         return new DistributedSchema(CLUSTER,DATABASE,DOMAIN,1,0,columns);
     }
     private static RatisNodePlan plan(DistributedSchema schema,Map<UUID,String> bindings,Set<UUID> merges) {
@@ -56,6 +56,20 @@ class RatisNodeManifestTest {
         assertEquals(resources,reopened.settings().exports()); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
     }
 
+    @Test void operatorBindingsAndEmptyUserSchemaSurviveCurrentManifestRoundTrip() {
+        var merged=schema(false,true);
+        var operatorManifest=new RatisNodeManifest(merged,plan(merged,Map.of(A,"a",B,"b"),Set.of(B)),settings(),3,3);
+        var encoded=RatisNodeManifest.encode(operatorManifest); var decoded=RatisNodeManifest.decode(encoded);
+        assertEquals(Set.of(B),decoded.plan().merges()); assertEquals(merged.column(B).operator(),decoded.schema().column(B).operator());
+        assertArrayEquals(operatorManifest.plan().identityDigest(),decoded.plan().identityDigest());
+        assertArrayEquals(encoded,RatisNodeManifest.encode(decoded));
+        var empty=new DistributedSchema(CLUSTER,DATABASE,DOMAIN,1,0,List.of());
+        var emptyManifest=new RatisNodeManifest(empty,plan(empty,Map.of(),Set.of()),settings(),3,3);
+        var reopened=RatisNodeManifest.decode(RatisNodeManifest.encode(emptyManifest));
+        assertTrue(reopened.plan().columns().isEmpty()); assertTrue(reopened.plan().merges().isEmpty());
+        assertEquals(emptyManifest.plan().localGroups().size(),reopened.plan().localGroups().size());
+    }
+
     @Test void canonicalRoundTripRetainsSchemaPlanSettingsAndImmutableBindings() {
         var original=manifest(false); byte[] encoded=RatisNodeManifest.encode(original); var copy=RatisNodeManifest.decode(encoded);
         assertEquals(DistributedSchemaCodec.encode(original.schema()).length,ByteBuffer.wrap(encoded).getInt(4));
@@ -75,11 +89,11 @@ class RatisNodeManifestTest {
         assertArrayEquals(RatisNodeManifest.encode(manifest(true)),RatisNodeManifest.encode(RatisNodeManifest.decode(RatisNodeManifest.encode(manifest(true)))));
     }
 
-    @Test void constructorRejectsScopeMismatchOperatorsMergesAndUnsafeResourceBudgets() {
+    @Test void constructorRejectsScopeMismatchMergeBindingsAndUnsafeResourceBudgets() {
         var plain=manifest(false); var changed=schema(true,false);
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(changed,plain.plan(),settings(),3,3));
         var merged=schema(false,true);
-        assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(merged,plan(merged,Map.of(A,"a",B,"b"),Set.of(B)),settings(),3,3));
+        assertDoesNotThrow(() -> new RatisNodeManifest(merged,plan(merged,Map.of(A,"a",B,"b"),Set.of(B)),settings(),3,3));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(merged,plan(merged,Map.of(A,"a",B,"b"),Set.of()),settings(),3,3));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(plain.schema(),plan(plain.schema(),Map.of(A,"a",B,"b"),Set.of(A)),settings(),3,3));
         for (int threads:new int[] {0,2,257}) {

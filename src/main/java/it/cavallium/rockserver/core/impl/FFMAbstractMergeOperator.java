@@ -110,6 +110,40 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                 new UnsatisfiedLinkError("Native symbol not found: " + name));
     }
 
+    private static final ThreadLocal<ConstructionScope> CONSTRUCTION=new ThreadLocal<>();
+    /** Owns native bridge allocations during one admitted reflective construction. */
+    public static final class ConstructionScope implements AutoCloseable {
+        private final ConstructionScope previous;
+        private final Thread thread=Thread.currentThread();
+        private final List<FFMAbstractMergeOperator> created=new ArrayList<>();
+        private final java.util.Set<FFMAbstractMergeOperator> adopted=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        private boolean closed;
+        private ConstructionScope() {
+            previous=CONSTRUCTION.get(); int depth=0;
+            for(var scope=previous;scope!=null;scope=scope.previous) if(++depth>=8) throw new IllegalStateException("Operator construction nesting exceeds budget");
+            CONSTRUCTION.set(this);
+        }
+        public List<FFMAbstractMergeOperator> created() { return List.copyOf(created); }
+        public void adopt(FFMAbstractMergeOperator operator) {
+            if(closed || thread!=Thread.currentThread() || created.size()!=1 || created.getFirst()!=operator) throw new IllegalArgumentException("Operator constructor created unexpected native owners");
+            if(!operator.isOwningHandle() || !operator.instanceArena.scope().isAlive() || operator.sharedPtrContainer.address()!=operator.nativeHandle_) throw new IllegalArgumentException("Operator constructor disposed its native bridge");
+            adopted.add(operator);
+        }
+        @Override public void close() {
+            if(closed) return;
+            if(thread!=Thread.currentThread() || CONSTRUCTION.get()!=this) throw new IllegalStateException("Operator construction scope ownership changed");
+            closed=true; CONSTRUCTION.set(previous);
+            for(var operator:created) if(!adopted.contains(operator)) operator.closeConstructionOwner();
+        }
+    }
+    public static ConstructionScope trackConstruction() { return new ConstructionScope(); }
+    private static void recordConstruction(FFMAbstractMergeOperator operator) {
+        for(var scope=CONSTRUCTION.get();scope!=null;scope=scope.previous) {
+            if(scope.created.size()>=16) throw new IllegalStateException("Operator construction allocations exceed budget"); scope.created.add(operator);
+        }
+    }
+    private void closeConstructionOwner() { owningHandle_.set(false); if(instanceArena.scope().isAlive()) disposeBridge(sharedPtrContainer.address()); }
+
     // --- Instance Members ---
     private final Arena instanceArena = Arena.ofShared();
     private final MemorySegment nameSegment;
@@ -124,7 +158,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
 
     public FFMAbstractMergeOperator(String name) {
         super(0);
-        
+        MemorySegment allocatedRaw=MemorySegment.NULL;
         try {
             this.nameSegment = instanceArena.allocateFrom(name);
 
@@ -143,6 +177,7 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
                     nameStub
             );
 
+            allocatedRaw=rawCpObject;
             if (rawCpObject.equals(MemorySegment.NULL)) {
                 throw new RuntimeException("rocksdb_mergeoperator_create returned NULL");
             }
@@ -151,9 +186,10 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             sharedPtrContainer.set(ValueLayout.ADDRESS, 0, rawCpObject); 
             sharedPtrContainer.set(ValueLayout.ADDRESS, 8, MemorySegment.NULL);
 
-            setNativeHandle(sharedPtrContainer.address());
-
-        } catch (Throwable t) {
+            setNativeHandle(sharedPtrContainer.address()); recordConstruction(this);
+        } catch(Throwable t) {
+            disOwnNativeHandle();
+            if(!allocatedRaw.equals(MemorySegment.NULL)) try { DESTROY_OP.invokeExact(allocatedRaw); } catch(Throwable cleanup) { t.addSuppressed(cleanup); }
             instanceArena.close();
             throw new RuntimeException("Failed to construct FFM MergeOperator", t);
         }
@@ -222,9 +258,10 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
     }
 
     @Override
-		public void disposeInternal(long handle) {
+		public void disposeInternal(long handle) { disposeBridge(handle); }
+    private void disposeBridge(long handle) {
         try {
-            if (sharedPtrContainer != null && sharedPtrContainer.address() == handle) {
+            if (sharedPtrContainer != null && instanceArena.scope().isAlive()) {
                 MemorySegment rawObj = sharedPtrContainer.get(ValueLayout.ADDRESS, 0);
                 if (!rawObj.equals(MemorySegment.NULL)) {
                     DESTROY_OP.invokeExact(rawObj);

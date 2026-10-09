@@ -28,11 +28,10 @@ public final class RatisNodeManifest {
     public RatisNodeManifest(DistributedSchema schema,RatisNodePlan plan,RatisNodeRuntime.Settings settings,int readThreads,int writeThreads) {
         this.schema=Objects.requireNonNull(schema); this.plan=Objects.requireNonNull(plan); this.settings=Objects.requireNonNull(settings);
         schema.requireMatches(plan.directory());
-        if (!plan.columns().keySet().equals(schema.columnIds()) || !plan.merges().isEmpty()
-                || schema.columns().stream().anyMatch(column -> column.operator()!=null)
+        if (!plan.columns().keySet().equals(schema.columnIds()) || !plan.merges().equals(mergeColumns(schema))
                 || readThreads<WorkloadSettings.MIN_PRODUCTION_DATA_THREADS || readThreads>256
                 || writeThreads<WorkloadSettings.MIN_PRODUCTION_DATA_THREADS || writeThreads>256) {
-            throw new IllegalArgumentException("Unsupported manifest schema/merge activation or scheduler budget");
+            throw new IllegalArgumentException("Manifest schema/merge bindings or scheduler budget differ");
         }
         int requiredColumns=plan.localGroups().stream().mapToInt(group -> switch (plan.role(group.getGroupId().getUuid())) {
             case DATA -> schema.columnIds().size(); case CATALOGUE -> 2; case TRANSACTION_HOME, SNAPSHOT_HOME -> 1;
@@ -48,6 +47,11 @@ public final class RatisNodeManifest {
     public RatisNodeRuntime.Settings settings() { return settings; }
     public int readThreads() { return readThreads; }
     public int writeThreads() { return writeThreads; }
+    private static Set<UUID> mergeColumns(DistributedSchema schema) {
+        var columns=new HashSet<UUID>();
+        for (var column:schema.columns()) if (column.operator()!=null) columns.add(column.columnId());
+        return Set.copyOf(columns);
+    }
 
     public static byte[] encode(RatisNodeManifest manifest) {
         Objects.requireNonNull(manifest);
@@ -92,7 +96,7 @@ public final class RatisNodeManifest {
         require(input,72+4+SETTINGS_BYTES);
         UUID directoryColumn=uuid(input), sessionsColumn=uuid(input), node=uuid(input), incarnation=uuid(input);
         int groups=input.getInt(), count=input.getInt();
-        if (groups<1 || groups>RatisNodePlan.MAX_LOCAL_GROUPS || count<1 || count>RangeDirectoryCodec.MAX_COLUMNS
+        if (groups<1 || groups>RatisNodePlan.MAX_LOCAL_GROUPS || count<0 || count>RangeDirectoryCodec.MAX_COLUMNS
                 || (long)count*21>input.remaining()-SETTINGS_BYTES-4) throw new IllegalArgumentException("Invalid node manifest group/column counts");
         var columns=new HashMap<UUID,String>(); UUID previous=null;
         for (int i=0;i<count;i++) {
@@ -124,7 +128,7 @@ public final class RatisNodeManifest {
         if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
         var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io));
         var recovered=catalogue(catalogue,directory,directoryColumn,sessionsColumn);
-        var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,Set.of(),homes,groups);
+        var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,mergeColumns(schema),homes,groups);
         if (plan.localGroups().size()!=groups) throw new IllegalArgumentException("Manifest group budget is not canonical");
         var manifest=new RatisNodeManifest(schema,plan,settings,reads,writes);
         if (!Arrays.equals(bytes,encode(manifest))) throw new IllegalArgumentException("Noncanonical node manifest encoding");
