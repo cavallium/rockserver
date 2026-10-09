@@ -14,7 +14,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import static it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.*;
 
-/** Bounded explicit-transaction bridge. Advanced and implicit/autocommit operations remain unsupported. */
+/** Bounded transaction/update bridge with optional direct point operations. Advanced operations remain unsupported. */
 public final class RatisRocksDBAdapter implements AutoCloseable {
     public static final int MAX_TRANSACTIONS=16,MAX_WAITERS=16;
     public record Allocation(Path snapshot,Path commit,RatisTransactionClient.Identity identity) {
@@ -26,10 +26,13 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private final RangeDirectory directory;
     private final RatisTransactionClient transactions;
     private final AllocationSource allocations;
+    private final RatisRocksDBDirect direct;
     private final Map<Long,Entry> entries=new LinkedHashMap<>();
     private boolean closing;
+    private enum Mode { EXPLICIT, UPDATE }
+    private static final Duration UPDATE_TTL=Duration.ofSeconds(10);
     private static final class Entry {
-        final long id;
+        final long id; final Mode mode;
         volatile RatisTransactionClient.Lease lease;
         volatile boolean acquiring=true,orphan;
         Op active;
@@ -38,8 +41,9 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         int returned;
         RatisAtomicClient.Operation commit;
         CommandResult.Status outcome;
-        boolean consumed;
-        Entry(long id) { this.id=id; }
+        boolean consumed,needsReread,updateStaged;
+        WriteCall updateWrite; Object updateReturn;
+        Entry(long id,Mode mode) { this.id=id; this.mode=mode; }
     }
     private static final class Op {
         final Object key;
@@ -76,7 +80,10 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         }
     }
     public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations) {
-        this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); schema.requireMatches(directory);
+        this(schema,directory,transactions,allocations,null);
+    }
+    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct) {
+        this.direct=direct; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); schema.requireMatches(directory);
     }
     public RocksDBAsyncAPI api(RequestContext context) {
         Objects.requireNonNull(context);
@@ -97,6 +104,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         synchronized (this) { if (closing) throw new IOException("Adapter closing"); }
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction open) return open(open.transactionLeaseTtl(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction close) return close(close.transactionId(),close.commit(),deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate close) return closeFailedUpdate(close.updateId(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.GetColumnId column) return CompletableFuture.completedFuture(schema.column(column.name()).apiId());
         if (request instanceof RocksDBAPICommand.GetAllColumnDefinitions) {
             var definitions=new LinkedHashMap<String,ColumnSchema>(); for (var column:schema.columns()) definitions.put(column.name(),column.schema()); return CompletableFuture.completedFuture(Collections.unmodifiableMap(definitions));
@@ -114,13 +122,14 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         }
         throw unsupported();
     }
-    private CompletableFuture<Long> open(Duration ttl,Deadline deadline) {
+    private CompletableFuture<Long> open(Duration ttl,Deadline deadline) { return open(ttl,deadline,Mode.EXPLICIT); }
+    private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode) {
         try {
             if (Objects.requireNonNull(ttl).isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Transaction TTL must be whole milliseconds up to60seconds");
             var scope=new TransactionScope(schema.columns().stream().map(column -> TransactionScope.Span.range(column.columnId(),null,null)).toList()); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
             final Entry entry;
             synchronized (this) { if (closing || entries.size()>=MAX_TRANSACTIONS) throw RocksDBException.of(SERVER_OVERLOADED,"Transaction ID capacity exhausted");
-                long id; do { id=ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE); } while (entries.containsKey(id)); entry=new Entry(id); entries.put(entry.id,entry); }
+                long id; do { id=ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE); } while (entries.containsKey(id)); entry=new Entry(id,mode); entries.put(entry.id,entry); }
             var view=new CompletableFuture<Long>();
             CompletableFuture<Allocation> allocation;
             try { allocation=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }
@@ -157,7 +166,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
                 if (Objects.equals(entry.active.key,key) || entry.active.key instanceof WriteCall old && key instanceof WriteCall next && old.same(next)) return entry.active.view();
                 return CompletableFuture.failedFuture(RocksDBException.of(SERVER_OVERLOADED,"Transaction operation already active"));
             }
-            if (key instanceof WriteCall write && entry.pending==null && entry.prefix!=write.basePrefix) return CompletableFuture.failedFuture(RocksDBException.of(SERVER_OVERLOADED,"Staged prefix advanced before admission; retry this request"));
+            if (key instanceof WriteCall write && entry.pending==null && !(entry.mode==Mode.UPDATE && entry.updateWrite==write) && entry.prefix!=write.basePrefix) return CompletableFuture.failedFuture(RocksDBException.of(SERVER_OVERLOADED,"Staged prefix advanced before admission; retry this request"));
             if (entry.pending!=null && (!(key instanceof WriteCall next) || !entry.pending.same(next)) && !key.equals("rollback")) return CompletableFuture.failedFuture(new IOException("Resume the exact uncertain staged request"));
             entry.active=operation=new Op(key);
         }
@@ -171,16 +180,60 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     }
     private CompletableFuture<?> get(long id,long column,Keys key,RequestType.RequestTypeId type,Deadline deadline) {
         if (type!=RequestType.RequestTypeId.CURRENT && type!=RequestType.RequestTypeId.EXISTS && type!=RequestType.RequestTypeId.FOR_UPDATE && type!=RequestType.RequestTypeId.NOTHING) throw unsupported();
+        if (id==0 && type==RequestType.RequestTypeId.FOR_UPDATE) return initialUpdate(column,key,deadline);
+        if (id==0 && direct!=null) {
+            var shape=schema.column(column); schema.encodeLogicalKey(shape.columnId(),Objects.requireNonNull(key));
+            return direct.get(column,copy(key),type,deadline.remaining()).thenApply(value -> { deadline.remaining(); return expose(value); });
+        }
         if (id<=0) throw unsupported(); var shape=schema.column(column); schema.encodeLogicalKey(shape.columnId(),Objects.requireNonNull(key)); var frozen=copy(key);
         if (!shape.schema().hasValue() && (type==RequestType.RequestTypeId.CURRENT || type==RequestType.RequestTypeId.FOR_UPDATE)) throw RocksDBException.of(VALUE_MUST_BE_NULL,"This callback requires a value-bearing column");
         var entry=entry(id);
         return invoke(entry,new ReadCall("get",column,List.of(frozen),type,null),() -> {
+            if (entry.mode==Mode.UPDATE && (entry.needsReread || entry.outcome==CommandResult.Status.CONFLICT)) {
+                if (type!=RequestType.RequestTypeId.FOR_UPDATE) throw new RocksDBRetryException();
+                return refreshUpdate(entry,column,frozen,deadline);
+            }
             if (entry.commit!=null) throw new CompletionException(new IOException("Transaction commit already frozen"));
             if (type==RequestType.RequestTypeId.NOTHING) { deadline.remaining(); return CompletableFuture.completedFuture(null); }
             return entry.lease.get(column,frozen,deadline.remaining()).thenApply(value -> { deadline.remaining(); return switch (type) { case EXISTS -> value!=null; case FOR_UPDATE -> new UpdateContext<>(value,id); default -> value; }; });
         });
     }
+    private CompletableFuture<?> initialUpdate(long column,Keys key,Deadline deadline) {
+        var shape=schema.column(column); schema.encodeLogicalKey(shape.columnId(),Objects.requireNonNull(key));
+        if (!shape.schema().hasValue()) throw RocksDBException.of(VALUE_MUST_BE_NULL,"FOR_UPDATE requires a value-bearing column");
+        var frozen=copy(key); var retained=new java.util.concurrent.atomic.AtomicReference<Entry>(); var view=new CompletableFuture<Object>();
+        open(UPDATE_TTL,deadline,Mode.UPDATE).thenCompose(id -> {
+            var entry=entry(id); retained.set(entry); return get(id,column,frozen,RequestType.RequestTypeId.FOR_UPDATE,deadline);
+        }).whenComplete((value,failure) -> {
+            var entry=retained.get();
+            if (failure!=null) view.completeExceptionally(unwrap(failure)); else view.complete(expose(value));
+            if (entry!=null && (view.isCancelled() || failure!=null)) { entry.orphan=true; orphanCleanup(entry); }
+        });
+        return view;
+    }
+    private CompletableFuture<?> refreshUpdate(Entry entry,long column,Keys key,Deadline deadline) {
+        CompletableFuture<Void> cleaned=entry.needsReread ? CompletableFuture.completedFuture(null) : cleanupAttempt(entry,deadline,false);
+        return cleaned.thenCompose(ignored -> {
+            if (entry.lease!=null) return entry.lease.resume(deadline.remaining());
+            var scope=new TransactionScope(schema.columns().stream().map(value -> TransactionScope.Span.range(value.columnId(),null,null)).toList()); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
+            return allocations.allocate(deadline.remaining()).thenCompose(saved -> {
+                try { entry.lease=transactions.open(saved.snapshot(),saved.commit(),saved.identity(),scope,UPDATE_TTL,deadline.remaining()); }
+                catch (IOException failure) { return CompletableFuture.failedFuture(failure); }
+                return entry.lease.completion();
+            });
+        }).thenCompose(ignored -> entry.lease.get(column,key,deadline.remaining())).thenApply(value -> {
+            deadline.remaining(); synchronized (entry) { entry.needsReread=false; }
+            return new UpdateContext<>(value,entry.id);
+        });
+    }
     private CompletableFuture<?> exists(long id,long column,List<Keys> keys,Deadline deadline) {
+        if (id==0 && direct!=null) {
+            if (keys.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Existence query exceeds item budget");
+            for (var key:keys) schema.encodeLogicalKey(schema.column(column).columnId(),key);
+            var frozen=keys.stream().map(RatisRocksDBAdapter::copy).toList(); CompletableFuture<List<Boolean>> result=CompletableFuture.completedFuture(new ArrayList<>());
+            for (var key:frozen) result=result.thenCompose(values -> direct.get(column,key,RequestType.RequestTypeId.EXISTS,deadline.remaining()).thenApply(value -> { values.add((Boolean)value); return values; }));
+            return result.thenApply(values -> { deadline.remaining(); return List.copyOf(values); });
+        }
         var entry=entry(id); if (keys.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Existence query exceeds item budget");
         for (var key:keys) schema.encodeLogicalKey(schema.column(column).columnId(),key);
         var frozen=keys.stream().map(RatisRocksDBAdapter::copy).toList();
@@ -192,7 +245,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     }
     private CompletableFuture<?> write(long id,long column,List<Keys> keys,List<Buf> values,RequestType.RequestTypeId type,boolean delete,boolean multi,Deadline deadline) throws Exception {
         if (!(type==RequestType.RequestTypeId.NOTHING || type==RequestType.RequestTypeId.PREVIOUS || type==RequestType.RequestTypeId.PREVIOUS_PRESENCE || !delete && (type==RequestType.RequestTypeId.DELTA || type==RequestType.RequestTypeId.CHANGED || type==RequestType.RequestTypeId.ENSURE))) throw unsupported();
-        var entry=entry(id); var shape=schema.column(column); if (values==null && !shape.schema().hasValue()) values=Collections.nCopies(keys.size(),null); if (keys.size()!=values.size()) throw new IllegalArgumentException("Keys and values differ in count");
+        var shape=schema.column(column); if (values==null && !shape.schema().hasValue()) values=Collections.nCopies(keys.size(),null); if (keys.size()!=values.size()) throw new IllegalArgumentException("Keys and values differ in count");
         if (keys.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Write exceeds item budget");
         long input=0; for (var key:keys) for (var component:key.keys()) { input+=Objects.requireNonNull(component).size(); if (input>RatisTransactionPlan.MAX_BYTES) throw new IllegalArgumentException("Write input exceeds prefix byte budget"); }
         for (var value:values) { input+=value==null ? 0 : value.size(); if (input>RatisTransactionPlan.MAX_BYTES) throw new IllegalArgumentException("Write input exceeds prefix byte budget"); }
@@ -204,16 +257,30 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             if (!delete && (shape.schema().hasValue() ? frozenValues.get(n)==null : frozenValues.get(n)!=null)) throw RocksDBException.of(shape.schema().hasValue() ? UNEXPECTED_NULL_VALUE : VALUE_MUST_BE_NULL,"Value differs from column shape");
         }
         boolean returns=type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE;
+        if (id==0 && direct!=null) return direct.writeSequence(column,frozenKeys,frozenValues,delete,type,multi,deadline.remaining()).thenApply(RatisRocksDBAdapter::expose);
+        var entry=entry(id);
         final WriteCall request;
         synchronized (entry) {
-            if (entry.commit!=null) throw new IOException("Transaction commit already frozen");
+            if (entry.mode==Mode.UPDATE && (type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE || delete && type!=RequestType.RequestTypeId.NOTHING)) throw RocksDBException.of(PUT_INVALID_REQUEST,"Implicit updates do not permit previous-value callbacks");
+            if (entry.mode==Mode.UPDATE && entry.needsReread) throw new RocksDBRetryException();
+            if (entry.commit!=null && entry.mode!=Mode.UPDATE) throw new IOException("Transaction commit already frozen");
             var changes=new ArrayList<>(entry.prefix);
             for (int n=0;n<frozenKeys.size();n++) changes.add(delete ? RatisLogicalClient.Change.delete(column,frozenKeys.get(n),returns ? Mutation.ReturnMode.PREVIOUS : Mutation.ReturnMode.NONE) : RatisLogicalClient.Change.put(column,frozenKeys.get(n),frozenValues.get(n),returns ? Mutation.ReturnMode.PREVIOUS : Mutation.ReturnMode.NONE));
-            request=new WriteCall(column,frozenKeys,frozenValues,type,delete,multi,List.copyOf(changes),entry.prefix,entry.returned);
+            var candidate=new WriteCall(column,frozenKeys,frozenValues,type,delete,multi,List.copyOf(changes),entry.prefix,entry.returned);
+            if (entry.mode==Mode.UPDATE && entry.updateWrite!=null) {
+                if (!entry.updateWrite.same(candidate)) throw new IOException("Resume the exact uncertain update write"); request=entry.updateWrite;
+            } else request=candidate;
             RatisLogicalClient.plan(schema,request.prefix,List.of(),RatisTransactionPlan.MAX_BYTES); // reject invalid full prefixes before claiming uncertain native ownership
         }
         return invoke(entry,request,() -> {
-            if (request.keys.isEmpty()) { deadline.remaining(); return CompletableFuture.completedFuture(multi ? List.of() : null); }
+            if (request.keys.isEmpty()) {
+                deadline.remaining();
+                if (entry.mode!=Mode.UPDATE) return CompletableFuture.completedFuture(multi ? List.of() : null);
+                synchronized (entry) { entry.updateWrite=request; entry.updateStaged=true; entry.updateReturn=multi ? List.of() : null; }
+                return finishUpdate(entry,request,deadline);
+            }
+            synchronized (entry) { if (entry.mode==Mode.UPDATE) entry.updateWrite=request; }
+            if (entry.mode==Mode.UPDATE && entry.updateStaged) return finishUpdate(entry,request,deadline);
             synchronized (entry) { if (entry.pending==null) entry.pending=request; }
             var pending=entry.pending;
             return entry.lease.stage(pending.prefix,List.of(),deadline.remaining()).thenApply(results -> {
@@ -230,8 +297,10 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
                 }
                 deadline.remaining();
                 synchronized (entry) { entry.prefix=pending.prefix; entry.returned=pending.firstResult+(returns ? pending.keys.size() : 0); entry.pending=null; }
-                return pending.multi ? returns ? Collections.unmodifiableList(returned) : List.of() : returned.isEmpty() ? null : returned.getFirst();
-            });
+                var result=pending.multi ? returns ? Collections.unmodifiableList(returned) : List.of() : returned.isEmpty() ? null : returned.getFirst();
+                if (entry.mode==Mode.UPDATE) { synchronized (entry) { entry.updateStaged=true; entry.updateReturn=result; } }
+                return result;
+            }).thenCompose(result -> entry.mode==Mode.UPDATE ? finishUpdate(entry,request,deadline) : CompletableFuture.completedFuture(result));
         });
     }
     private CompletableFuture<?> close(long id,boolean commit,Deadline deadline) {
@@ -240,21 +309,46 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         if (entry.acquiring) return CompletableFuture.failedFuture(new IOException("Transaction acquisition still active"));
         return invoke(entry,commit ? "commit" : "rollback",() -> {
             deadline.remaining();
+            if (entry.needsReread && entry.lease==null) { if (commit) return CompletableFuture.failedFuture(new RocksDBRetryException()); synchronized (this) { entries.remove(entry.id,entry); } return CompletableFuture.completedFuture(true); }
             if (!commit) {
                 CompletableFuture<Void> observed=entry.commit!=null && (entry.consumed || entry.commit.terminalReady()) ? consume(entry,deadline) : CompletableFuture.completedFuture(null);
                 return observed.thenCompose(ignored -> entry.lease.rollback(deadline.remaining())).thenApply(ignored -> { finish(entry); return true; });
             }
-            if (entry.outcome==CommandResult.Status.CONFLICT) return CompletableFuture.completedFuture(false);
-            try { if (entry.commit==null) entry.commit=entry.lease.commit(deadline.remaining()); }
-            catch (IOException failure) { return CompletableFuture.failedFuture(failure); }
-            CompletableFuture<CommandResult> result=entry.outcome==CommandResult.Status.SUCCESS ? CompletableFuture.completedFuture(new CommandResult(CommandResult.Status.SUCCESS,List.of())) : entry.commit.resume(deadline.remaining());
-            return result.thenCompose(outcome -> {
-                deadline.remaining(); entry.outcome=outcome.status();
-                if (outcome.status()==CommandResult.Status.CONFLICT) return CompletableFuture.completedFuture(false);
-                if (outcome.status()!=CommandResult.Status.SUCCESS) return CompletableFuture.failedFuture(RocksDBException.of(COMMIT_FAILED_TRY_AGAIN,"Transaction commit has no successful outcome"));
-                return consume(entry,deadline).thenCompose(ignored -> entry.lease.release(deadline.remaining())).thenApply(ignored -> { finish(entry); return true; });
-            });
+            return commitAttempt(entry,deadline);
+
         });
+    }
+    private CompletableFuture<Boolean> commitAttempt(Entry entry,Deadline deadline) {
+        if (entry.outcome==CommandResult.Status.CONFLICT) return CompletableFuture.completedFuture(false);
+        try { if (entry.commit==null) entry.commit=entry.lease.commit(deadline.remaining()); }
+        catch (IOException failure) { return CompletableFuture.failedFuture(failure); }
+        CompletableFuture<CommandResult> result=entry.outcome==CommandResult.Status.SUCCESS ? CompletableFuture.completedFuture(new CommandResult(CommandResult.Status.SUCCESS,List.of())) : entry.commit.resume(deadline.remaining());
+        return result.thenCompose(outcome -> {
+            deadline.remaining(); entry.outcome=outcome.status();
+            if (outcome.status()==CommandResult.Status.CONFLICT) return CompletableFuture.completedFuture(false);
+            if (outcome.status()!=CommandResult.Status.SUCCESS) return CompletableFuture.failedFuture(RocksDBException.of(COMMIT_FAILED_TRY_AGAIN,"Transaction commit has no successful outcome"));
+            return consume(entry,deadline).thenCompose(ignored -> entry.lease.release(deadline.remaining())).thenApply(ignored -> { finish(entry); return true; });
+        });
+    }
+    private CompletableFuture<Object> finishUpdate(Entry entry,WriteCall request,Deadline deadline) {
+        return commitAttempt(entry,deadline).thenCompose(committed -> {
+            if (committed) return CompletableFuture.completedFuture(entry.updateReturn);
+            return cleanupAttempt(entry,deadline,request.multi).thenCompose(ignored -> CompletableFuture.failedFuture(new RocksDBRetryException()));
+        });
+    }
+    private CompletableFuture<Void> cleanupAttempt(Entry entry,Deadline deadline,boolean remove) {
+        CompletableFuture<Void> consumed=entry.commit==null ? CompletableFuture.completedFuture(null) : consume(entry,deadline);
+        return consumed.thenCompose(ignored -> entry.lease.rollback(deadline.remaining())).thenRun(() -> {
+            try { entry.lease.close(); } catch (IOException failure) { throw new CompletionException(failure); }
+            if (remove) { synchronized (this) { entries.remove(entry.id,entry); } }
+            else synchronized (entry) { entry.lease=null; entry.commit=null; entry.outcome=null; entry.consumed=false; entry.prefix=List.of(); entry.returned=0; entry.pending=null; entry.updateWrite=null; entry.updateReturn=null; entry.updateStaged=false; entry.needsReread=true; }
+        });
+    }
+    private CompletableFuture<?> closeFailedUpdate(long id,Deadline deadline) {
+        Entry entry; synchronized (this) { entry=entries.get(id); }
+        if (entry==null) return CompletableFuture.completedFuture(null);
+        if (entry.commit!=null && entry.outcome==null) return close(id,true,deadline).thenCompose(committed -> Boolean.FALSE.equals(committed) ? close(id,false,deadline).thenApply(ignored -> null) : CompletableFuture.completedFuture(null));
+        return close(id,false,deadline).thenApply(ignored -> null);
     }
     private CompletableFuture<Void> consume(Entry entry,Deadline deadline) {
         if (entry.consumed) return CompletableFuture.completedFuture(null);
@@ -275,10 +369,10 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     }
     private static Keys copy(Keys keys) { return keys==null ? null : new Keys(Arrays.stream(keys.keys()).map(value -> Buf.wrap(Objects.requireNonNull(value).toByteArray())).toArray(Buf[]::new)); }
     private static Throwable unwrap(Throwable failure) { while ((failure instanceof CompletionException || failure instanceof ExecutionException) && failure.getCause()!=null) failure=failure.getCause(); return failure; }
-    private static RocksDBException unsupported() { return RocksDBException.of(NOT_IMPLEMENTED,"Distributed adapter currently supports explicit transaction operations only"); }
+    private static RocksDBException unsupported() { return RocksDBException.of(NOT_IMPLEMENTED,"Distributed adapter operation is not implemented"); }
     @Override public void close() throws IOException {
         List<Entry> owners; synchronized (this) { closing=true; owners=List.copyOf(entries.values()); }
         for (var entry:owners) { synchronized (entry) { if (entry.acquiring || entry.active!=null) throw new IOException("Adapter work active; ownership retained"); } orphanCleanup(entry); }
-        synchronized (this) { if (!entries.isEmpty()) throw new IOException("Adapter transaction cleanup pending; retry close after actual drain"); }
+        synchronized (this) { if (!entries.isEmpty()) throw new IOException("Adapter cleanup pending; retry close after actual drain"); }
     }
 }

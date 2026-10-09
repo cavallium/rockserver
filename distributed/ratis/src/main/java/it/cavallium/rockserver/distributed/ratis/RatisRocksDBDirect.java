@@ -1,0 +1,158 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.distributed.*;
+import it.cavallium.rockserver.core.impl.RWScheduler;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import static it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.*;
+
+/**
+ * Bounded direct reads and one exclusively owned durable ordered write request. Infrastructure is borrowed.
+ * Successful work is published at its final checked internal marker; cancelling an observer afterward
+ * does not undo it. A subsequent write is a new call, while consumeRetained recovers the saved outcome.
+ */
+public final class RatisRocksDBDirect implements AutoCloseable {
+    public static final int MAX_TASKS=32;
+    private static final long READ_BYTES=8L*1024*1024,WRITE_BYTES=88L*1024*1024,MAX_BYTES=128L*1024*1024;
+    private final DistributedSchema schema; private final RatisRoutedClient routed; private final RatisDurableSessionClient session; private final RWScheduler scheduler;
+    private final RatisDirectRequestJournal journal; private final ReentrantLock persistence=new ReentrantLock();
+    private boolean writing,closed; private volatile boolean published; private volatile Runnable acknowledgementHook; private int active; private long bytes;
+    public RatisRocksDBDirect(DistributedSchema schema,RatisRoutedClient routed,RatisDurableSessionClient session,RWScheduler scheduler,Path path) throws IOException {
+        this.schema=Objects.requireNonNull(schema); this.routed=Objects.requireNonNull(routed); this.session=Objects.requireNonNull(session); this.scheduler=Objects.requireNonNull(scheduler); schema.requireMatches(routed.directory());
+        var grant=session.grant(); byte[] binding;
+        try { var digest=java.security.MessageDigest.getInstance("SHA-256"); digest.update(schema.digest()); digest.update(routed.sessionIdentityDigest()); digest.update(ByteBuffer.allocate(40).putLong(grant.sessionId().getMostSignificantBits()).putLong(grant.sessionId().getLeastSignificantBits()).putLong(grant.epoch()).putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis()).array()); binding=digest.digest(); }
+        catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        journal=new RatisDirectRequestJournal(Objects.requireNonNull(path),binding);
+        try { if (journal.request()==null && !session.pristine()) throw new IOException("Missing direct request journal for a used session window"); var outstanding=session.pending().stream().filter(p -> !p.consumed()).toList(); if (outstanding.size()>1 || journal.request()==null && !outstanding.isEmpty()) throw new IOException("Direct session has no exclusively bound full request"); }
+        catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
+    }
+    public CompletableFuture<Object> get(long column,Keys keys,RequestType.RequestTypeId type,RequestContext context) {
+        try {
+            if (type!=RequestType.RequestTypeId.CURRENT && type!=RequestType.RequestTypeId.EXISTS && type!=RequestType.RequestTypeId.NOTHING) throw unsupported();
+            var binding=RatisLogicalClient.supported(schema,column); var encoded=schema.encodeLogicalKey(binding.columnId(),keys);
+            if (!binding.schema().hasValue() && type==RequestType.RequestTypeId.CURRENT) throw RocksDBException.of(VALUE_MUST_BE_NULL,"This callback requires a value-bearing column");
+            byte[] key=encoded.physicalKey(); var members=encoded.variableKeys();
+            return submit(context,OperationFamily.POINT_LOOKUP,false,task -> {
+                if (type==RequestType.RequestTypeId.NOTHING) return null;
+                byte[] value=routed.read(binding.columnId(),key); task.check(); if (binding.schema().variableLengthKeysCount()!=0) value=schema.decodeBucket(binding.columnId(),key,value).get(members);
+                if (!binding.schema().hasValue() && value!=null && value.length!=0) throw new IOException("Nonempty key-only value"); return type==RequestType.RequestTypeId.EXISTS ? value!=null : value==null ? null : Buf.wrap(value);
+            });
+        } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+    }
+    public CompletableFuture<Object> write(long column,Keys keys,Buf value,boolean delete,RequestType.RequestTypeId type,RequestContext context) {
+        return writeSequence(column,List.of(keys),delete ? List.of() : Collections.singletonList(value),delete,type,false,context);
+    }
+    public CompletableFuture<Object> writeSequence(long column,List<Keys> keys,List<Buf> values,boolean delete,RequestType.RequestTypeId type,boolean multi,RequestContext context) {
+        final Task task;
+        try { task=reserve(context,OperationFamily.MUTATION,true); } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+        try {
+            if (!(type==RequestType.RequestTypeId.NOTHING || type==RequestType.RequestTypeId.PREVIOUS || type==RequestType.RequestTypeId.PREVIOUS_PRESENCE || !delete && (type==RequestType.RequestTypeId.ENSURE || type==RequestType.RequestTypeId.DELTA || type==RequestType.RequestTypeId.CHANGED))) throw unsupported();
+            if (keys.isEmpty() || keys.size()>256 || !multi && keys.size()!=1 || !delete && keys.size()!=values.size()) throw new IllegalArgumentException("Invalid direct sequence count");
+            RatisLogicalClient.supported(schema,column); boolean returns=returns(type); var items=new ArrayList<DistributedCommand>(); long input=0;
+            var grant=session.grant(); var directory=routed.directory();
+            for (int n=0;n<keys.size();n++) {
+                var change=delete ? RatisLogicalClient.Change.delete(column,keys.get(n),returns ? Mutation.ReturnMode.PREVIOUS : Mutation.ReturnMode.NONE) : RatisLogicalClient.Change.put(column,keys.get(n),values.get(n),returns ? Mutation.ReturnMode.PREVIOUS : Mutation.ReturnMode.NONE);
+                var plan=RatisLogicalClient.plan(schema,List.of(change),List.of()); if (plan.mutations().size()!=1 || !plan.predicates().isEmpty()) throw new IllegalArgumentException("Direct sequence requires point effects");
+                var mutation=plan.mutations().getFirst(); var route=directory.route(mutation.columnId(),mutation.key()); var item=new DistributedCommand(route.groupId(),route.rangeEpoch(),directory.schemaDigest(),new OperationId(grant.sessionId(),grant.epoch(),0),List.of(mutation));
+                input+=DistributedCommandCodec.encodedSize(item); if (input>RatisDirectRequestJournal.MAX_INPUT) throw new IllegalArgumentException("Direct request exceeds aggregate input bound"); items.add(item);
+            }
+            var request=new RatisDirectRequestJournal.Request(type,multi,items); task.work=owner -> execute(request,owner); dispatch(task,context,OperationFamily.MUTATION);
+        } catch (Throwable failure) { task.fail(failure); if (failure instanceof Error fatal) throw fatal; }
+        return task.view;
+    }
+    /** Publish only a known complete outcome; unknown or incomplete work cannot be discarded. */
+    public CompletableFuture<Object> consumeRetained(RequestContext context) {
+        return submit(context,OperationFamily.MUTATION,true,task -> { persistence.lock(); try { var request=journal.request(); if (request==null || !request.terminal()) throw new IOException("Direct request is not definitively complete"); reconcileAcknowledgement(request); task.check(); return output(request,task); } finally { persistence.unlock(); } });
+    }
+    private Object execute(RatisDirectRequestJournal.Request candidate,Task task) throws Exception {
+        persistence.lock();
+        try {
+            var request=journal.request();
+            if (request==null || published) { journal.begin(candidate); published=false; request=candidate; }
+            else if (!request.same(candidate)) throw new IOException("Resolve the exact retained callback and full direct request before issuing another");
+            while (true) {
+                reconcileAcknowledgement(request); if (request.terminal()) { task.check(); return output(request,task); }
+                var pending=findPending(request.pending);
+                if (pending==null) {
+                    var unresolved=session.pending().stream().filter(p -> !p.consumed()).toList(); var item=request.items.get(request.cursor());
+                    if (request.pending!=null) throw new IOException("Original unresolved direct session identity disappeared");
+                    if (unresolved.size()>1) throw new IOException("Direct session is not exclusively owned");
+                    if (!unresolved.isEmpty()) { pending=unresolved.getFirst(); requireItem(item,pending); }
+                    else {
+                        task.check(); var route=routed.directory().route(item.mutations().getFirst().columnId(),item.mutations().getFirst().key());
+                        if (!route.groupId().equals(item.groupId()) || route.rangeEpoch()!=item.rangeEpoch()) throw new IOException("Frozen direct item route changed incarnation");
+                        pending=session.prepare(item.mutations(),List.of()); requireItem(item,pending);
+                    }
+                    journal.bind(pending.command().operationId());
+                }
+                requireItem(request.items.get(request.pendingIndex),pending); task.check(); var result=session.execute(pending);
+                journal.result(result); // Never ACK until raw result and cursor are forced in the full envelope.
+                session.acknowledge(pending); journal.acknowledged(); var hook=acknowledgementHook; if (hook!=null) hook.run(); task.check();
+            }
+        } finally { persistence.unlock(); }
+    }
+    private void reconcileAcknowledgement(RatisDirectRequestJournal.Request request) throws IOException {
+        if (request.pending==null || request.pendingIndex>=request.cursor()) return;
+        var pending=findPending(request.pending);
+        if (pending!=null) {
+            requireItem(request.items.get(request.pendingIndex),pending);
+            var saved=pending.savedResult(); if (saved==null || !Arrays.equals(saved.encode(),request.results.get(request.pendingIndex).encode())) throw new IOException("Direct/session saved outcome differs"); session.acknowledge(pending);
+        } else if (session.acknowledgedThrough()<request.pending.sequence()) throw new IOException("Direct saved result lacks original session ACK/identity");
+        journal.acknowledged();
+    }
+    private RatisDurableSessionClient.Pending findPending(OperationId operation) throws IOException { if (operation==null) return null; for (var pending:session.pending()) if (pending.command().operationId().equals(operation)) return pending; return null; }
+    private static void requireItem(DistributedCommand item,RatisDurableSessionClient.Pending pending) throws IOException {
+        var command=pending.command(); if (command.kind()!=DistributedCommand.Kind.DATA || pending.awaitingAcceptance() || !command.groupId().equals(item.groupId()) || command.rangeEpoch()!=item.rangeEpoch() || !Arrays.equals(command.schemaDigest(),item.schemaDigest()) || !command.mutations().equals(item.mutations()) || !command.predicates().isEmpty()) throw new IOException("Session pending item differs from frozen direct request");
+    }
+    private Object output(RatisDirectRequestJournal.Request request,Task task) {
+        if (request.overflow) { var failure=RocksDBException.of(SERVER_OVERLOADED,"Direct sequence retained its applied prefix but exceeds aggregate result budget"); task.definiteFailure=failure; throw failure; }
+        if (!request.results.isEmpty() && request.results.getLast().status()!=CommandResult.Status.SUCCESS) { var failure=RocksDBException.of(COMMIT_FAILED_TRY_AGAIN,"Direct sequence has retained terminal outcome "+request.results.getLast().status()); task.definiteFailure=failure; throw failure; }
+        if (!returns(request.type)) return request.multi ? List.of() : null;
+        var values=new ArrayList<Object>();
+        for (int n=0;n<request.results.size();n++) {
+            var result=request.results.get(n); byte[] raw=returns(request.type) ? result.value(0) : null; Buf previous=raw==null ? null : Buf.wrap(raw); byte[] currentBytes=request.type==RequestType.RequestTypeId.DELTA || request.type==RequestType.RequestTypeId.CHANGED ? request.items.get(n).mutations().getFirst().value() : null; Buf current=currentBytes==null ? null : Buf.wrap(currentBytes);
+            Object value=switch (request.type) { case PREVIOUS -> previous; case PREVIOUS_PRESENCE -> raw!=null; case DELTA -> new Delta<>(previous,current); case CHANGED -> !Utils.valueEquals(previous,current); default -> null; };
+            if (returns(request.type)) values.add(value);
+        }
+        return request.multi ? Collections.unmodifiableList(values) : values.isEmpty() ? null : values.getFirst();
+    }
+    private static boolean returns(RequestType.RequestTypeId type) { return type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE; }
+    @FunctionalInterface private interface Work { Object run(Task task) throws Exception; }
+    private Task reserve(RequestContext context,OperationFamily family,boolean write) {
+        long deadline=scheduler.resolveMonotonicDeadline(context); long charge=write ? WRITE_BYTES : READ_BYTES;
+        synchronized (this) { if (closed || active>=MAX_TASKS || charge>MAX_BYTES-RatisDirectRequestJournal.MAX_BYTES-bytes || write && writing) throw RocksDBException.of(SERVER_OVERLOADED,"Direct request capacity exhausted"); var task=new Task(deadline,write,charge); active++; bytes+=charge; if (write) writing=true; return task; }
+    }
+    private CompletableFuture<Object> submit(RequestContext context,OperationFamily family,boolean write,Work work) {
+        try { var task=reserve(context,family,write); task.work=work; dispatch(task,context,family); return task.view; } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+    }
+    private void dispatch(Task task,RequestContext context,OperationFamily family) { try { scheduler.executor(context.profile(),family,task.deadline).execute(task,Math.min(task.charge,WorkloadCost.MAX_ESTIMATED_BYTES)); } catch (RuntimeException rejected) { task.reject(rejected); } }
+    private static Object copyResult(Object value) {
+        if (value instanceof Buf buf) return Buf.wrap(buf.toByteArray()); if (value instanceof Delta<?> delta) return new Delta<>(copyResult(delta.previous()),copyResult(delta.current()));
+        if (value instanceof List<?> list) { var copy=new ArrayList<Object>(list.size()); list.forEach(item -> copy.add(copyResult(item))); return Collections.unmodifiableList(copy); } return value;
+    }
+    private final class Task implements Runnable,RWScheduler.RejectionAwareTask {
+        final long deadline,charge; final boolean write; Work work; Throwable definiteFailure; final AtomicInteger phase=new AtomicInteger(); final CompletableFuture<Object> result=new CompletableFuture<>(),view=result.copy();
+        Task(long deadline,boolean write,long charge) { this.deadline=deadline; this.write=write; this.charge=charge; }
+        void check() throws IOException { if (deadline!=Long.MAX_VALUE && scheduler.isMonotonicDeadlineExpired(deadline)) throw new IOException("Direct deadline expired; full durable request retained",new TimeoutException()); }
+        public void run() { if (!phase.compareAndSet(0,1)) return; Object value=null; Throwable failure=null; try { check(); value=copyResult(work.run(this)); check(); } catch (Throwable problem) { failure=problem; } work=null; phase.set(2); finish(value,failure); if (failure instanceof Error fatal) throw fatal; }
+        public void reject(RuntimeException failure) { fail(failure); }
+        void fail(Throwable failure) { if (phase.compareAndSet(0,2)) { work=null; finish(null,failure); } }
+        void finish(Object value,Throwable failure) {
+            boolean known=write && (failure==null || failure==definiteFailure);
+            synchronized (RatisRocksDBDirect.this) { if (known && !view.isCancelled()) published=true; active--; bytes-=charge; if (write) writing=false; }
+            if (failure==null) result.complete(value); else result.completeExceptionally(failure);
+        }
+    }
+    /** Controlled ownership/deadline seam; runs after both durable ACK checkpoints outside admission monitor. */
+    void afterAcknowledgement(Runnable hook) { acknowledgementHook=hook; }
+    public synchronized int activeRequests() { return active; }
+    @Override public void close() throws IOException { synchronized (this) { if (active!=0) throw new IOException("Direct work active; ownership retained"); closed=true; } journal.close(); }
+    private static RocksDBException unsupported() { return RocksDBException.of(NOT_IMPLEMENTED,"Unsupported direct request callback"); }
+}

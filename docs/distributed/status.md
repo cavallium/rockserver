@@ -141,9 +141,22 @@ does not establish complete distributed API parity or production acceptance.
   not wait on checkpoint I/O. Cancellation cannot recycle reserved identities, and
   missing used state cannot be recreated. Exhaustion requires a renewed exclusive
   grant rather than wrapping sequence IDs.
-  This adapter currently covers explicit transactions. Autocommit, implicit update
-  retry handles and advanced operations remain unfinished; it is not yet exposed as
-  a full-capability `RocksDBConnection` or registered with server transports.
+  Implicit FOR_UPDATE now creates a ten-second update attempt. UPDATE-ID writes
+  commit internally; prior-value callbacks keep their standalone restrictions.
+  A definite single-write conflict cleans the old attempt and retains the alias;
+  only the caller's next FOR_UPDATE reread opens a fresh cut and identity. Multi
+  conflicts close the alias. Unknown attempts retain the exact write and commit
+  journal, including CloseFailedUpdate cleanup.
+  The optional `RatisRocksDBDirect` path uses strong point reads and durable
+  single-group commands without snapshot fences or 2PC. Nontransactional lists
+  remain ordered individual operations. One current frontend journal freezes the
+  full request, callback, cursor and raw results before session acknowledgement;
+  reopen resumes the unresolved item without repeating acknowledged effects. Late
+  deadline failures preserve results, and known no-effects outcomes cannot wedge
+  the next request. Input/result/task reservations are bounded, while borrowed
+  sessions and infrastructure remain caller-owned.
+  Advanced operations and full-capability `RocksDBConnection`/server transport
+  registration remain unfinished.
 - Scoped OPEN/GET/PAGE/PLAN/CLOSE use one framed query protocol for data and catalogue
   groups. OPEN requires a proven fresh linearizable barrier and ready native owner.
   Later owned operations use the fixed snapshot cut, not a new current read. Stale
