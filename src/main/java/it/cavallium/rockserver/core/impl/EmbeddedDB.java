@@ -1912,6 +1912,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return ro;
 	}
 
+	private ReadOptions newPointReadOptions(String label) {
+		var ro = newReadOptions(label);
+		ro.setAsyncIo(false);
+		return ro;
+	}
+
 	private ReadOptions newWriteElisionReadOptions() {
 		var readOptions = newReadOptions("write-elision-cache-probe");
 		readOptions.setReadTier(ReadTier.BLOCK_CACHE_TIER);
@@ -4455,7 +4461,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var kb = col.calculateKey(b.getKey().keys()).toByteArray();
 			return Arrays.compareUnsigned(ka, kb);
 		});
-		try (var ro = newReadOptions(null)) {
+		try (var ro = newPointReadOptions(null)) {
 			for (var entry : entries) {
 				var keys = entry.getKey();
 				var value = entry.getValue();
@@ -4686,7 +4692,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (col.hasBuckets()) {
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-						try (var readOptions = newReadOptions(null)) {
+						try (var readOptions = newPointReadOptions(null)) {
 							var previousRawBucketByteArray
 									= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 							didGetForUpdateInternally = true;
@@ -4701,7 +4707,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					} else {
 						if (RequestType.requiresGettingPreviousValue(callback)) {
 							assert newTx instanceof Tx;
-							try (var readOptions = newReadOptions(null)) {
+							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray
 										= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
 								didGetForUpdateInternally = true;
@@ -4712,7 +4718,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
 							// todo: in the future this should be replaced with just keyExists
 							assert newTx instanceof Tx;
-							try (var readOptions = newReadOptions(null)) {
+							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray = ((Tx) newTx)
 										.val()
 										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
@@ -4848,7 +4854,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (col.hasBuckets()) {
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-						try (var readOptions = newReadOptions(null)) {
+						try (var readOptions = newPointReadOptions(null)) {
 							var previousRawBucketByteArray = ((Tx) newTx)
 									.val()
 									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
@@ -4864,7 +4870,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					} else {
 						if (RequestType.requiresGettingPreviousValue(callback)) {
 							assert newTx instanceof Tx;
-							try (var readOptions = newReadOptions(null)) {
+							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx)
 										.val()
@@ -4877,7 +4883,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						} else if (RequestType.requiresGettingPreviousPresence(callback)) {
 							// todo: in the future this should be replaced with just keyExists
 							assert newTx instanceof Tx;
-							try (var readOptions = newReadOptions(null)) {
+							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray;
 								previousValueByteArray = ((Tx) newTx)
 										.val()
@@ -5008,7 +5014,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					if (col.hasBuckets()) {
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
-						try (var readOptions = newReadOptions(null)) {
+						try (var readOptions = newPointReadOptions(null)) {
 							var previousRawBucketByteArray = ((Tx) newTx)
 									.val()
 									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
@@ -5050,7 +5056,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						}
 						if (callback instanceof RequestType.RequestMerged<?>) {
 							Buf merged;
-							try (var readOptions = newReadOptions(null)) {
+							try (var readOptions = newPointReadOptions(null)) {
 								merged = dbGet(newTx instanceof Tx ? (Tx) newTx : null, col, readOptions, calculatedKey);
 							}
 							result = RequestType.safeCast(merged);
@@ -10484,7 +10490,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		if (tx == null && fastGet) {
 			return dbGetFast(col.cfh(), calculatedKey);
 		}
-		try (var readOptions = newReadOptions(null)) {
+		try (var readOptions = newPointReadOptions(null)) {
 			return dbGet(tx, col, readOptions, calculatedKey, forUpdate);
 		}
 	}
