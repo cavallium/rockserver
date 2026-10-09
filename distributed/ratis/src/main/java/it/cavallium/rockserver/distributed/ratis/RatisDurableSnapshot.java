@@ -15,14 +15,14 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private static final int MAGIC=0x53534a4c;
     public record ParticipantProgress(RangeDescriptor route,boolean installFrozen,RatisSnapshotRecord.Result installReceipt,
             SnapshotGate nativeGate,ApplyPosition readyProof,RatisRoutedClient.PreparedSnapshotCapture capture,SnapshotFenceStatus.Capture captureToken,
-            boolean captureLost,boolean releaseFrozen,ApplyPosition releaseReceipt,SnapshotFenceProof retirementProof) {}
+            boolean captureLost,boolean captureReleased,boolean captureReleaseLost,boolean releaseFrozen,ApplyPosition releaseReceipt,SnapshotFenceProof retirementProof) {}
     public record Snapshot(SnapshotFenceStatus initial,SnapshotFenceStatus observedHome,RatisRoutedClient.PreparedCommand pendingHome,
             CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,List<ParticipantProgress> participants,SnapshotHomeFenceProof homeRetirementProof) {
         public ParticipantProgress participant(UUID group) { return participants.stream().filter(p -> p.route().groupId().equals(group)).findFirst().orElseThrow(); }
     }
     private static final class Entry {
         final RangeDescriptor route;
-        boolean installFrozen,captureLost,releaseFrozen;
+        boolean installFrozen,captureLost,captureReleaseFrozen,captureReleased,captureReleaseLost,releaseFrozen;
         RatisSnapshotRecord.Result installReceipt;
         SnapshotGate gate;
         ApplyPosition ready,releaseReceipt;
@@ -30,7 +30,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         SnapshotFenceStatus.Capture token;
         SnapshotFenceProof retirementProof;
         Entry(RangeDescriptor route) { this.route=route; }
-        ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,captureLost,releaseFrozen,releaseReceipt,retirementProof); }
+        ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,captureLost,captureReleased,captureReleaseLost,releaseFrozen,releaseReceipt,retirementProof); }
     }
     private final Path path;
     private final RatisSnapshotFences homes;
@@ -45,7 +45,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private OperationId lastHome;
     private CommandResult homeResult;
     private SnapshotHomeFenceProof homeRetirementProof;
-    private boolean homeSuperseded,active,closed,fenced;
+    private boolean homeSuperseded,active,closed,fenced,reclaimed;
 
     public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes) throws IOException {
@@ -197,7 +197,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     public synchronized void freezeCapture(RatisRoutedClient.PreparedSnapshotCapture operation) throws IOException {
         idle(); var target=operation.target(); var entry=entry(target.descriptor().groupId());
-        if (entry.captureLost) throw new RatisSnapshotLostException("Capture was irreversibly lost");
+        if (entry.captureLost || entry.captureReleaseFrozen) throw new RatisSnapshotLostException("Capture was lost or explicitly released");
         if (!initial.fence().equals(operation.request().fence()) || !initial.fence().equals(target.fence())) throw new IllegalArgumentException("Capture fence changed");
         requireLineage(entry.route,target.descriptor());
         var restoredTarget=data.restoreSnapshotTarget(initial.fence(),target.descriptor(),target.replica(),target.incarnation());
@@ -209,7 +209,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     public SnapshotFenceStatus.Capture executeCapture(UUID group) throws IOException {
         Entry entry;
-        synchronized (this) { idle(); entry=entry(group); if (entry.capture==null) throw new IllegalStateException("Capture is not frozen"); if (entry.captureLost) throw new RatisSnapshotLostException("Capture was irreversibly lost"); active=true; }
+        synchronized (this) { idle(); entry=entry(group); if (entry.capture==null) throw new IllegalStateException("Capture is not frozen"); if (entry.captureLost || entry.captureReleaseFrozen) throw new RatisSnapshotLostException("Capture was lost or explicitly released"); active=true; }
         try {
             final SnapshotFenceStatus.Capture token;
             try { token=data.executeSnapshotCapture(entry.capture); }
@@ -226,6 +226,55 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 if (entry.token==null) { entry.token=token; persist(); } return token;
             }
         } finally { end(); }
+    }
+    public enum CaptureReleaseProgress { RECOVERED, RELEASED, LOST }
+    /** One owner RPC per call: recover an unknown original token after HOME retirement, then explicitly release it. */
+    public CaptureReleaseProgress releaseCapture(UUID group) throws IOException {
+        Entry entry; boolean recover;
+        synchronized (this) {
+            requireOpen(); if (active) throw new IOException("Snapshot journal RPC already active"); entry=entry(group);
+            if (entry.captureReleased) return CaptureReleaseProgress.RELEASED;
+            if (entry.captureReleaseLost) return CaptureReleaseProgress.LOST;
+            if (observed!=null && !observed.terminal() && pending!=null && homeResult==null && !homeSuperseded && next(pending).phase()==SnapshotFenceStatus.Phase.COMPLETE) throw new IllegalStateException("Resolve pending COMPLETE before releasing its capture pin");
+            if (entry.capture==null && entry.token==null && (observed==null || observed.progress(group).capture()==null)) return CaptureReleaseProgress.RELEASED;
+            if (entry.capture==null) throw new IllegalStateException("Capture release requires its frozen original owner target");
+            recover=entry.token==null;
+            if (recover && homeRetirementProof==null) throw new IllegalStateException("Unknown capture token replay requires forced matching HOME retirement proof");
+            if (!entry.captureReleaseFrozen) { entry.captureReleaseFrozen=true; entry.captureLost=true; persist(); }
+            active=true;
+        }
+        try {
+            try {
+                if (recover) {
+                    var token=data.executeSnapshotCapture(entry.capture);
+                    synchronized (this) {
+                        var request=entry.capture.request(); var homeToken=observed==null ? null : observed.progress(group).capture();
+                        if (!token.ownerIncarnation().equals(request.owner()) || !token.snapshotId().equals(request.snapshotId()) || entry.ready==null || !atLeast(token.position(),entry.ready) || homeToken!=null && !homeToken.equals(token)) throw new IOException("Recovered capture token changed its original identity/cut");
+                        entry.token=token; persist(); return CaptureReleaseProgress.RECOVERED;
+                    }
+                }
+                data.releaseSnapshot(entry.capture.target(),entry.token);
+            } catch (RatisSnapshotLostException lost) {
+                synchronized (this) { entry.captureReleaseLost=true; entry.captureLost=true; persist(); }
+                return CaptureReleaseProgress.LOST;
+            }
+            synchronized (this) { entry.captureReleased=true; persist(); }
+            return CaptureReleaseProgress.RELEASED;
+        } finally { end(); }
+    }
+    /** Remove only a locally consumed, durably HOME-retired journal after every possible owner pin is settled. */
+    public void reclaimRetired() throws IOException {
+        final byte[] body;
+        synchronized (this) {
+            requireOpen(); if (active) throw new IOException("Snapshot journal RPC active; file ownership retained");
+            if (observed==null || !observed.terminal() || !observed.consumed() || homeRetirementProof==null
+                    || !homes.identity(initial.fence(),homeRoute).equals(homeRetirementProof.identity())) throw new IllegalStateException("Snapshot journal reclamation requires saved consumed HOME and matching retirement proof");
+            for (var entry:entries.values()) if ((entry.capture!=null || entry.token!=null || observed.progress(entry.route.groupId()).capture()!=null) && !entry.captureReleased && !entry.captureReleaseLost) throw new IllegalStateException("Snapshot capture pin is still owned or unresolved");
+            body=encode(); active=true;
+        }
+        try { SessionJournalFiles.remove(path,body,MAX_BYTES); synchronized (this) { reclaimed=true; } }
+        catch (IOException | RuntimeException failure) { synchronized (this) { fenced=true; } if (failure instanceof IOException io) throw io; throw new IOException("Snapshot journal reclamation failed; reopen it",failure); }
+        finally { end(); }
     }
     public synchronized void markCaptureLost(UUID group) throws IOException { idle(); var entry=entry(group); if (!entry.captureLost) { entry.captureLost=true; persist(); } }
     public synchronized void freezeRelease(UUID group) throws IOException {
@@ -367,7 +416,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         if (!homes.identity(initial.fence(),homeRoute).equals(proof.identity()) || homeRetirementProof!=null && !proof.covers(homeRetirementProof)) throw new IOException("Snapshot HOME retirement identity changed or regressed");
         homeRetirementProof=proof;
     }
-    private void requireOpen() throws IOException { if (closed || fenced || !lock.isValid()) throw new IOException("Snapshot journal closed/fenced; reopen it"); }
+    private void requireOpen() throws IOException { if (closed || reclaimed || fenced || !lock.isValid()) throw new IOException("Snapshot journal closed/fenced; reopen it"); }
     private void idle() throws IOException { requireOpen(); if (homeRetirementProof!=null) throw new RatisSnapshotHomeRetiredException(homeRetirementProof); if (active) throw new IOException("Snapshot journal RPC already active"); }
     private synchronized void end() { active=false; }
     private void persist() throws IOException {
@@ -424,7 +473,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 var target=entry.capture.target(); boolean original=entry.route.equals(target.descriptor()); out.writeByte(original ? 1 : 2); if (!original) route(out,target.descriptor());
                 out.writeInt(target.descriptor().replicas().indexOf(target.replica())); uuid(out,target.incarnation()); uuid(out,entry.capture.request().snapshotId()); out.writeLong(entry.capture.request().ttl().toMillis());
             }
-            token(out,entry.token); out.writeBoolean(entry.captureLost); out.writeBoolean(entry.releaseFrozen); position(out,entry.releaseReceipt);
+            token(out,entry.token); out.writeBoolean(entry.captureLost); out.writeBoolean(entry.captureReleaseFrozen); out.writeBoolean(entry.captureReleased); out.writeBoolean(entry.captureReleaseLost); out.writeBoolean(entry.releaseFrozen); position(out,entry.releaseReceipt);
             out.writeBoolean(entry.retirementProof!=null); if (entry.retirementProof!=null) { out.writeLong(entry.retirementProof.minimumEpoch()); positionValue(out,entry.retirementProof.position()); }
         }
         out.flush(); if (bytes.size()>MAX_BYTES-32) throw new IOException("Snapshot journal exceeds byte bound"); return bytes.toByteArray();
@@ -453,7 +502,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                     if (member<0 || member>=captureRoute.replicas().size()) throw new IOException("Invalid frozen capture member"); var owner=uuid(in); var snapshot=uuid(in); long ttl=in.getLong();
                     var target=data.restoreSnapshotTarget(initial.fence(),captureRoute,captureRoute.replicas().get(member),owner); entry.capture=data.prepareSnapshotCapture(target,snapshot,Duration.ofMillis(ttl));
                 }
-                entry.token=token(in); entry.captureLost=flag(in); entry.releaseFrozen=flag(in); entry.releaseReceipt=position(in);
+                entry.token=token(in); entry.captureLost=flag(in); entry.captureReleaseFrozen=flag(in); entry.captureReleased=flag(in); entry.captureReleaseLost=flag(in); entry.releaseFrozen=flag(in); entry.releaseReceipt=position(in);
                 if (flag(in)) mergeRetirement(entry,new SnapshotFenceProof(initial.fence(),entry.route.groupId(),in.getLong(),positionValue(in)));
                 validateEntry(entry);
             }
@@ -464,6 +513,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         } catch (RuntimeException invalid) { throw new IOException("Invalid snapshot journal",invalid); }
     }
     private void validateEntry(Entry entry) throws IOException {
+        if (entry.captureReleased && entry.captureReleaseLost || entry.captureReleaseLost && !entry.captureLost) throw new IOException("Contradictory capture release settlement");
+        if (entry.captureReleaseFrozen && (entry.capture==null || !entry.captureLost || entry.token==null && homeRetirementProof==null) || (entry.captureReleased || entry.captureReleaseLost) && !entry.captureReleaseFrozen || entry.captureReleased && entry.token==null) throw new IOException("Capture release lacks its exact frozen target/token");
         if (entry.installReceipt!=null && !entry.installFrozen) throw new IOException("INSTALL receipt lacks frozen request");
         if (entry.gate!=null) validateGate(entry,entry.gate);
         if (entry.ready!=null && (entry.installReceipt==null || entry.installReceipt.suppressed() || !entry.ready.equals(entry.installReceipt.position())

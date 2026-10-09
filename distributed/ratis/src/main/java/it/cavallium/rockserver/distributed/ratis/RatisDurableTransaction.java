@@ -81,7 +81,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery;
     private HomeRecoveryReceipt recoveryReceipt;
     private HomeFenceProof homeRetirementProof;
-    private boolean active,closed,fenced,homeSuperseded;
+    private boolean active,closed,fenced,homeSuperseded,reclaimed;
 
     public static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,
             TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents) throws IOException {
@@ -395,7 +395,24 @@ public final class RatisDurableTransaction implements AutoCloseable {
         if (!homes.identity(initial,homeRoute).equals(proof.identity()) || homeRetirementProof!=null && !proof.covers(homeRetirementProof)) throw new IOException("HOME retirement proof identity changed or regressed");
         homeRetirementProof=proof;
     }
-    private void requireOpen() throws IOException { if (closed || fenced || !lock.isValid()) throw new IOException("Transaction journal closed/fenced; reopen it"); }
+    /** Explicitly discarding a consumed saved outcome additionally requires its already-forced HOME fence. */
+    public synchronized boolean reclaimable() throws IOException { requireOpen(); return !active && observed!=null && observed.gcEligible() && homeRetirementProof!=null; }
+    public void reclaimRetired() throws IOException { reclaimRetired(SessionJournalFiles.FILESYSTEM); }
+    void reclaimRetired(SessionJournalFiles.Removal io) throws IOException {
+        final byte[] body;
+        synchronized (this) {
+            requireOpen(); if (!reclaimable()) throw new IOException("Reclamation requires an idle consumed transaction and saved HOME retirement proof");
+            body=encode(); active=true;
+        }
+        try {
+            SessionJournalFiles.remove(path,body,MAX_BYTES,io);
+            synchronized (this) { reclaimed=true; }
+        } catch (IOException | RuntimeException failure) {
+            synchronized (this) { fenced=true; }
+            if (failure instanceof IOException ioFailure) throw ioFailure; throw new IOException("Transaction reclamation failed; ownership retained",failure);
+        } finally { synchronized (this) { active=false; } }
+    }
+    private void requireOpen() throws IOException { if (reclaimed) throw new IOException("Transaction journal reclaimed"); if (closed || fenced || !lock.isValid()) throw new IOException("Transaction journal closed/fenced; reopen it"); }
     private void idle() throws IOException { requireOpen(); if (homeRetirementProof!=null) throw new RatisHomeRetiredException(homeRetirementProof); if (active) throw new IOException("Transaction journal RPC already active"); }
     private void persist() throws IOException {
         try { SessionJournalFiles.write(path,encode(),MAX_BYTES); }

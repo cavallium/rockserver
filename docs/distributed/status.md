@@ -399,7 +399,25 @@ bounded to 16 unresolved target groups and 32 MiB. Lost replies retain that fram
 across restart; a newer proof cut cannot replace an unresolved request. Startup
 discards only bounded unpublished sidecars under the exclusive journal lock, and
 shutdown drains actual cleanup RPCs before closing journals, storage or clients.
-Client-journal reclamation remains unfinished.
+Client owners can explicitly reclaim a transaction journal only after saving both
+terminal consumption and a matching HOME retirement proof. Cached outcomes remain
+available through ordinary close/reopen until that explicit discard. Snapshot
+journals additionally require durable release ACK or typed owner loss for every
+possible captured pin; gate/HOME retirement and a failed capture do not establish
+pin release. `releaseCapture(group)` freezes the original release intent before
+its single owner RPC, preserves uncertain replies and works after HOME retirement.
+If the original capture reply was lost, a forced HOME retirement proof permits
+replaying only that frozen capture request to recover its existing token; the
+method returns RECOVERED, then a later call releases it. Retired DATA floors prevent
+creating a replacement pin. RELEASED and typed LOST are the settled outcomes.
+Explicit release invalidates future capture publication, and unresolved COMPLETE
+requests must settle before their pins can be released.
+Payload reclamation verifies the exact canonical file with bounded streaming,
+removes its bounded unpublished sidecar and payload, then forces the directory.
+The stable lock inode survives reclamation, and actual file/RPC work retains
+ownership until return. Missing reclaimed files cannot be reopened as fresh work.
+Unreachable capture owners, unconsumed outcomes, session/grant journals and global
+client-journal count bounds still require their remaining lifecycle contracts.
 
 The native snapshot-gate kernel freezes the complete participant set, directory
 and schema identities, local physical scopes, and distinct install/release controls.

@@ -1,0 +1,150 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+import it.cavallium.rockserver.core.common.distributed.*;
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.ratis.protocol.Message;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import static org.junit.jupiter.api.Assertions.*;
+
+/** Native owner pins and HOME retirement through controlled transports, without servers or network. */
+class RatisSnapshotJournalReclamationTest {
+    @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    final RatisDurableSnapshotTest helper=new RatisDurableSnapshotTest();
+    RatisSnapshotCaptureRpcTest.Fixture fixture(String name) throws Exception { helper.root=root; return helper.fixture(name); }
+    void complete(RatisDurableSnapshot journal,RatisSnapshotCaptureRpcTest.Fixture f) throws Exception {
+        try (var driver=helper.coordinator(journal,f)) { for (int n=0;n<20;n++) if (driver.step().complete()) return; }
+        fail("Snapshot driver did not complete");
+    }
+    void retire(RatisDurableSnapshot journal,RatisSnapshotCaptureRpcTest.Fixture f) throws Exception {
+        journal.consume(helper.control(100)); journal.executeHome(); var consumed=journal.snapshot().observedHome();
+        new RatisSnapshotHomeJournalRetirementTest().retire(f.home,f.data,consumed,journal.snapshot().participant(f.data.f.groupId).releaseReceipt());
+        assertThrows(RatisSnapshotHomeRetiredException.class,journal::refreshHome); assertNotNull(journal.snapshot().homeRetirementProof());
+    }
+    @Test void lostReleaseReplyReopensWithOriginalTokenAndOnlyExplicitSettledReclamationRemovesJournal() throws Exception {
+        var path=root.resolve("release.journal");
+        try (var f=fixture("release")) {
+            SnapshotFenceStatus.Capture token;
+            try (var journal=helper.create(path,f)) {
+                complete(journal,f); var group=f.data.f.groupId; token=journal.snapshot().participant(group).captureToken(); assertNotNull(token);
+                assertThrows(IllegalStateException.class,journal::reclaimRetired); retire(journal,f);
+                assertThrows(IllegalStateException.class,journal::reclaimRetired); // Gate/HOME GC leaves the immutable owner pin alive.
+                f.lose=true; assertThrows(IOException.class,() -> journal.releaseCapture(group)); assertFalse(journal.snapshot().participant(group).captureReleased());
+                assertThrows(RatisSnapshotHomeRetiredException.class,() -> journal.executeCapture(group)); assertTrue(Files.exists(path));
+            }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+                var group=f.data.f.groupId; assertEquals(token,journal.snapshot().participant(group).captureToken()); journal.releaseCapture(group); assertTrue(journal.snapshot().participant(group).captureReleased()); journal.releaseCapture(group);
+            }
+            try (var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+                assertTrue(journal.snapshot().participant(f.data.f.groupId).captureReleased()); journal.reclaimRetired(); assertFalse(Files.exists(path)); assertTrue(Files.exists(path.resolveSibling(path.getFileName()+".lock"))); assertThrows(IOException.class,journal::snapshot);
+                assertThrows(IOException.class,() -> helper.create(path,f));
+            }
+            assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,f.client));
+        }
+    }
+    @Test void lostInitialTokenRecoversOnlyTheFrozenPinAfterHomeRetirementAndExpiredPinsSettleLost() throws Exception {
+        for (boolean expired:new boolean[]{false,true}) {
+            var path=root.resolve("unknown-token-"+expired+".journal");
+            try (var f=fixture("unknown-token-"+expired)) {
+                var group=f.data.f.groupId; SnapshotFenceStatus.Capture token;
+                try (var journal=helper.create(path,f)) {
+                    helper.installed(journal,f); var ready=f.initial.ready(group,journal.snapshot().participant(group).readyProof()); helper.transition(journal,f,ready,1);
+                    var request=f.operation(); journal.freezeCapture(request); f.lose=true; assertThrows(IOException.class,() -> journal.executeCapture(group)); assertNull(journal.snapshot().participant(group).captureToken());
+                    assertThrows(IllegalStateException.class,() -> journal.releaseCapture(group)); token=f.client.executeSnapshotCapture(request);
+                    var captured=ready.capture(group,token); f.home.transition(ready,captured); var complete=captured.complete(); f.home.transition(captured,complete);
+                    var released=f.client.executeSnapshotGate(f.client.prepareSnapshotGate(RatisSnapshotRecord.release(complete,group))).position();
+                    var consumed=complete.consume(); f.home.transition(complete,consumed); assertEquals(consumed,journal.refreshHome());
+                    new RatisSnapshotHomeJournalRetirementTest().retire(f.home,f.data,consumed,released); assertThrows(RatisSnapshotHomeRetiredException.class,journal::refreshHome);
+                    if (expired) { f.clock.set(TimeUnit.SECONDS.toNanos(11)); f.data.f.machine.expireTransactions(); }
+                    assertEquals(expired ? RatisDurableSnapshot.CaptureReleaseProgress.LOST : RatisDurableSnapshot.CaptureReleaseProgress.RECOVERED,journal.releaseCapture(group));
+                    if (!expired) { assertEquals(token,journal.snapshot().participant(group).captureToken()); assertFalse(journal.snapshot().participant(group).captureReleased()); assertThrows(IllegalStateException.class,journal::reclaimRetired); }
+                }
+                try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)) {
+                    assertEquals(expired ? RatisDurableSnapshot.CaptureReleaseProgress.LOST : RatisDurableSnapshot.CaptureReleaseProgress.RELEASED,reopened.releaseCapture(group));
+                    reopened.reclaimRetired(); assertFalse(Files.exists(path));
+                }
+                assertEquals(0,f.data.f.machine.snapshotPinStats().pins());
+            }
+        }
+    }
+    @Test void explicitReleaseBeforeCompletePreventsCoordinatorPublishingAClosedPin() throws Exception {
+        var path=root.resolve("release-before-complete.journal");
+        try (var f=fixture("release-before-complete"); var journal=helper.create(path,f)) {
+            var group=f.data.f.groupId; helper.installed(journal,f); var ready=f.initial.ready(group,journal.snapshot().participant(group).readyProof()); helper.transition(journal,f,ready,1);
+            var request=f.operation(); journal.freezeCapture(request); var token=journal.executeCapture(group); var captured=ready.capture(group,token); helper.transition(journal,f,captured,2);
+            assertEquals(RatisDurableSnapshot.CaptureReleaseProgress.RELEASED,journal.releaseCapture(group)); assertTrue(journal.snapshot().participant(group).captureLost());
+            assertThrows(IllegalArgumentException.class,() -> journal.queueHome(f.home.homes.prepare(helper.control(3),captured,captured.complete())));
+            try (var driver=helper.coordinator(journal,f)) { assertEquals(RatisSnapshotCoordinator.Action.ABORTED,driver.step().action()); }
+            assertEquals(SnapshotFenceStatus.Phase.ABORT,journal.snapshot().observedHome().phase());
+        }
+    }
+    @Test void unresolvedCompleteRetainsThePinAndExactHomeRequestUntilItsResultIsResolved() throws Exception {
+        var path=root.resolve("pending-complete.journal");
+        try (var f=fixture("pending-complete"); var journal=helper.create(path,f)) {
+            var group=f.data.f.groupId; helper.installed(journal,f); var ready=f.initial.ready(group,journal.snapshot().participant(group).readyProof()); helper.transition(journal,f,ready,1);
+            var request=f.operation(); journal.freezeCapture(request); var token=journal.executeCapture(group); var captured=ready.capture(group,token); helper.transition(journal,f,captured,2);
+            journal.queueHome(f.home.homes.prepare(helper.control(3),captured,captured.complete())); var exact=DistributedCommandCodec.encode(journal.snapshot().pendingHome().command());
+            assertThrows(IllegalStateException.class,() -> journal.releaseCapture(group)); assertFalse(journal.snapshot().participant(group).captureLost()); assertEquals(1,f.data.f.machine.snapshotPinStats().pins());
+            assertArrayEquals(exact,DistributedCommandCodec.encode(journal.snapshot().pendingHome().command()));
+            assertEquals(CommandResult.Status.SUCCESS,journal.executeHome().status()); assertEquals(RatisDurableSnapshot.CaptureReleaseProgress.RELEASED,journal.releaseCapture(group));
+            assertEquals(0,f.data.f.machine.snapshotPinStats().pins());
+        }
+    }
+    @Test void semanticCaptureLossDoesNotSettleTheOriginalLivePin() throws Exception {
+        var path=root.resolve("semantic-loss.journal");
+        try (var f=fixture("semantic-loss"); var journal=helper.create(path,f)) {
+            complete(journal,f); var group=f.data.f.groupId; var original=journal.snapshot().participant(group);
+            journal.markCaptureLost(group); assertTrue(journal.snapshot().participant(group).captureLost());
+            assertArrayEquals(new byte[]{7},f.client.snapshotGet(original.capture().target(),original.captureToken(),f.data.f.column,new byte[]{2}));
+            retire(journal,f); assertThrows(IllegalStateException.class,journal::reclaimRetired);
+            assertFalse(journal.snapshot().participant(group).captureReleaseLost()); journal.releaseCapture(group);
+            assertTrue(journal.snapshot().participant(group).captureReleased()); journal.reclaimRetired(); assertFalse(Files.exists(path));
+        }
+    }
+    @Test void establishedOwnerLossIsForcedBeforeReclamation() throws Exception {
+        var path=root.resolve("lost.journal"); var lost=new AtomicBoolean();
+        try (var f=fixture("lost"); var data=new RatisRoutedClient(f.data.directory,new RatisRoutedClient.Transport() {
+            public byte[] read(RangeDescriptor route,java.util.UUID column,byte[] key) { throw new AssertionError(); }
+            public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
+            public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return f.data.wire.participant(route,record); }
+            public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException { return f.data.wire.transaction(route,request,fresh); }
+            public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
+                if (lost.get()) throw new RatisSnapshotLostException("Controlled original owner is gone");
+                try { return f.data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
+                catch (Exception failure) { throw new IOException(failure); }
+            }
+        }); var journal=RatisDurableSnapshot.create(path,f.home.homes,data,f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
+            complete(journal,f); retire(journal,f); lost.set(true); journal.releaseCapture(f.data.f.groupId);
+            assertTrue(journal.snapshot().participant(f.data.f.groupId).captureLost()); assertTrue(journal.snapshot().participant(f.data.f.groupId).captureReleaseLost()); assertFalse(journal.snapshot().participant(f.data.f.groupId).captureReleased());
+            journal.close(); try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,data)) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureLost()); assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureReleaseLost()); reopened.reclaimRetired(); }
+            assertFalse(Files.exists(path));
+        }
+    }
+    @Test void blockedOwnerReleaseRetainsJournalOwnershipUntilActualTransportReturn() throws Exception {
+        var path=root.resolve("blocked.journal"); var entered=new CountDownLatch(1); var resume=new CountDownLatch(1); var block=new AtomicBoolean();
+        try (var f=fixture("blocked"); var data=new RatisRoutedClient(f.data.directory,new RatisRoutedClient.Transport() {
+            public byte[] read(RangeDescriptor route,java.util.UUID column,byte[] key) { throw new AssertionError(); }
+            public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
+            public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return f.data.wire.participant(route,record); }
+            public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException { return f.data.wire.transaction(route,request,fresh); }
+            public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
+                try {
+                    if (block.get() && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.SNAPSHOT_RELEASE) { entered.countDown(); if (!resume.await(5,TimeUnit.SECONDS)) throw new IOException("Release barrier timed out"); }
+                    return f.data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
+                } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
+            }
+        }); var journal=RatisDurableSnapshot.create(path,f.home.homes,data,f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
+            complete(journal,f); block.set(true);
+            var release=CompletableFuture.runAsync(() -> { try { journal.releaseCapture(f.data.f.groupId); } catch (IOException failure) { throw new CompletionException(failure); } });
+            try {
+                assertTrue(entered.await(5,TimeUnit.SECONDS)); assertThrows(IOException.class,journal::close); assertThrows(IOException.class,journal::reclaimRetired); assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,data));
+            } finally { resume.countDown(); }
+            release.get(5,TimeUnit.SECONDS); assertTrue(journal.snapshot().participant(f.data.f.groupId).captureReleased()); journal.close();
+            try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,data)) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).captureReleased()); }
+        } finally { resume.countDown(); }
+    }
+}
