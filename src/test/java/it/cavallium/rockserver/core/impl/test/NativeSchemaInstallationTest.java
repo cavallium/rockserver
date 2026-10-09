@@ -48,7 +48,7 @@ class NativeSchemaInstallationTest {
             assertFalse(columnOptions.isOwningHandle(),"Drained ordinary dynamic column options retire after DROP");
             if(loaded.cache()!=null) assertTrue(loaded.cache().isOwningHandle(),"Dropping one column must retain shared caches");
             store.validate(command); assertArrayEquals(result,store.apply(new ApplyPosition(1,3),command));
-            assertEquals(installed,pool.installSchema(store,new ApplyPosition(1,4),change,Map.of(),Set.of()));
+            assertArrayEquals(installed.encode(),pool.installSchema(store,new ApplyPosition(1,4),change,Map.of(),Set.of()).encode());
             assertEquals(fence,store.applySchemaFence(new ApplyPosition(1,5),change.header()));
             assertArrayEquals(source.digest(),closedPin.schemaDigest()); assertEquals(Set.of(column),closedPin.columns()); assertEquals(Set.of(column),closedPin.interval().columns());
             assertThrows(IllegalStateException.class,store::capture);

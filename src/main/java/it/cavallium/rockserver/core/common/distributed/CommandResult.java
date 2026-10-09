@@ -8,7 +8,7 @@ import java.util.List;
 /** Canonical saved outcome; values follow the order of non-NONE mutation return modes. */
 public final class CommandResult {
     public static final int MAX_BYTES = 2 * 1024 * 1024;
-    public enum Status { SUCCESS, RESULT_TOO_LARGE, CONFLICT, SESSION_EXPIRED }
+    public enum Status { SUCCESS, RESULT_TOO_LARGE, CONFLICT, SESSION_EXPIRED, STALE_SCHEMA }
     private final Status status;
     private final List<byte[]> values;
 
@@ -37,7 +37,7 @@ public final class CommandResult {
         int bytes = 8;
         for (byte[] value : values) bytes += 4 + (value == null ? 0 : value.length);
         int code = switch (status) {
-            case SUCCESS -> 0; case RESULT_TOO_LARGE -> 1; case CONFLICT -> 2; case SESSION_EXPIRED -> 3;
+            case SUCCESS -> 0; case RESULT_TOO_LARGE -> 1; case CONFLICT -> 2; case SESSION_EXPIRED -> 3; case STALE_SCHEMA -> 4;
         };
         var output = ByteBuffer.allocate(bytes).putInt(code).putInt(values.size());
         for (byte[] value : values) {
@@ -50,7 +50,7 @@ public final class CommandResult {
         if (encoded.length < 8 || encoded.length > MAX_BYTES) throw new IllegalArgumentException("Invalid result size");
         var input = ByteBuffer.wrap(encoded);
         var status = switch (input.getInt()) {
-            case 0 -> Status.SUCCESS; case 1 -> Status.RESULT_TOO_LARGE; case 2 -> Status.CONFLICT; case 3 -> Status.SESSION_EXPIRED;
+            case 0 -> Status.SUCCESS; case 1 -> Status.RESULT_TOO_LARGE; case 2 -> Status.CONFLICT; case 3 -> Status.SESSION_EXPIRED; case 4 -> Status.STALE_SCHEMA;
             default -> throw new IllegalArgumentException("Unknown result status");
         };
         int count = input.getInt();

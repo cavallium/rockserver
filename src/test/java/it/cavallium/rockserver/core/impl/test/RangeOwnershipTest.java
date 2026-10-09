@@ -21,6 +21,61 @@ class RangeOwnershipTest {
     private byte[] key(int value) { return new byte[]{(byte) value}; }
     private Interval interval(byte[] lower, byte[] upper) { return new Interval(DOMAIN, Set.of(COLUMN), lower, upper); }
 
+    @Test void recoveryRegistersExactBootstrapMiddleAndLatestNativeCheckpoints() {
+        var guard=new RangeOwnership(); var added=new UUID(0,3);
+        var bootstrap=interval(null,key(0x40));
+        var middle=new Interval(DOMAIN,Set.of(COLUMN,added),key(0x40),key(0x80));
+        var latest=new Interval(DOMAIN,Set.of(added),key(0x80),null);
+        var expected=new java.util.HashMap<Owner,Interval>(java.util.Map.of(owner(1),bootstrap,owner(2),middle,owner(3),latest));
+        var recovery=guard.prepareSchemaRecovery(DOMAIN,expected); expected.clear();
+        guard.registerRecoveredSchema(owner(3),latest,State.FENCED,recovery);
+        guard.registerRecoveredSchema(owner(1),bootstrap,State.FENCED,recovery);
+        guard.registerRecoveredSchema(owner(2),middle,State.FENCED,recovery);
+        assertThrows(IllegalArgumentException.class,() -> guard.registerRecoveredSchema(owner(4),latest,State.FENCED,recovery));
+        assertThrows(IllegalArgumentException.class,() -> guard.prepareSchemaRecovery(DOMAIN,java.util.Map.of(owner(1),bootstrap)));
+        var other=new RangeOwnership();
+        assertThrows(IllegalArgumentException.class,() -> other.registerRecoveredSchema(owner(1),bootstrap,State.FENCED,recovery));
+        assertThrows(IllegalArgumentException.class,() -> other.prepareSchemaRecovery(new UUID(0,9),java.util.Map.of(owner(1),bootstrap)));
+        guard.activate(owner(1));
+        assertThrows(IllegalArgumentException.class,() -> guard.register(owner(5),interval(key(0x90),key(0x91)),State.RETIRED));
+    }
+
+    @Test void transitionCompletionCanWaitWithoutClosingOrReleasingSourceOwners() {
+        var guard=new RangeOwnership(); var source=interval(null,null); var target=new Interval(DOMAIN,Set.of(),null,null);
+        guard.register(owner(1),source,State.FENCED);
+        var token=guard.beginSchemaTransition(new UUID(3,1),DOMAIN,source.columns(),target.columns());
+        assertFalse(guard.tryCompleteSchemaTransition(token)); assertEquals(source,guard.get(owner(1)).interval());
+        try (var lease=guard.claimSchemaReplacement(owner(1),source,target,token)) {
+            lease.publish(); assertFalse(guard.tryCompleteSchemaTransition(token));
+        }
+        assertTrue(guard.tryCompleteSchemaTransition(token));
+        assertThrows(IllegalStateException.class,() -> guard.tryCompleteSchemaTransition(token));
+    }
+
+    @Test void delayedOwnersCrossColumnSetCyclesWithoutCountingAheadOwnersAsOldSources() {
+        var guard=new RangeOwnership();
+        var a=new Interval(DOMAIN,Set.of(),null,key(0x40));
+        var b=new Interval(DOMAIN,Set.of(),key(0x40),key(0x80));
+        var c=new Interval(DOMAIN,Set.of(),key(0x80),null);
+        var initial=guard.prepareSchemaRecovery(DOMAIN,java.util.Map.of(owner(1),a,owner(2),b,owner(3),c));
+        for (var entry:java.util.Map.of(owner(1),a,owner(2),b,owner(3),c).entrySet()) guard.registerRecoveredSchema(entry.getKey(),entry.getValue(),State.FENCED,initial);
+        // Owner1 is logically two generations ahead with the same empty column set.
+        var create=guard.beginRecoveredSchemaTransition(new UUID(3,1),DOMAIN,Set.of(),Set.of(COLUMN),initial,Set.of(owner(2),owner(3)));
+        var createdB=new Interval(DOMAIN,Set.of(COLUMN),key(0x40),key(0x80));
+        try (var lease=guard.claimSchemaReplacement(owner(2),b,createdB,create)) { lease.publish(); }
+        assertFalse(guard.tryCompleteSchemaTransition(create));
+        var afterCreate=guard.prepareSchemaRecovery(DOMAIN,java.util.Map.of(owner(1),a,owner(2),createdB,owner(3),c));
+        var delete=guard.beginRecoveredSchemaTransition(new UUID(3,2),DOMAIN,Set.of(COLUMN),Set.of(),afterCreate,Set.of(owner(2)));
+        try (var lease=guard.claimSchemaReplacement(owner(2),createdB,b,delete)) { lease.publish(); }
+        assertTrue(guard.tryCompleteSchemaTransition(delete));
+        var afterDelete=guard.prepareSchemaRecovery(DOMAIN,java.util.Map.of(owner(1),a,owner(2),b,owner(3),c));
+        assertSame(create,guard.beginRecoveredSchemaTransition(new UUID(3,1),DOMAIN,Set.of(),Set.of(COLUMN),afterDelete,Set.of(owner(3))));
+        var createdC=new Interval(DOMAIN,Set.of(COLUMN),key(0x80),null);
+        try (var lease=guard.claimSchemaReplacement(owner(3),c,createdC,create)) { lease.publish(); }
+        assertTrue(guard.tryCompleteSchemaTransition(create));
+        assertEquals(Set.of(),guard.get(owner(1)).interval().columns()); assertEquals(Set.of(),guard.get(owner(2)).interval().columns());
+    }
+
     @Test void schemaDeletionMovesEachFencedOwnerWithoutRelaxingOrdinaryDomainChecks() {
         var guard=new RangeOwnership(); var left=owner(1); var right=owner(2);
         var a=interval(null,key(0x80)); var b=interval(key(0x80),null);

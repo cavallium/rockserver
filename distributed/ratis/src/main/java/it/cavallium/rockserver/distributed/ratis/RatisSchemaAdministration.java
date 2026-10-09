@@ -88,7 +88,7 @@ public final class RatisSchemaAdministration {
                         new KeyPredicate(column,RatisSchemaCatalogue.key(header.sourceSchemaDigest()),DistributedSchemaCodec.encode(definition.sourceSchema()))));
     }
     public DistributedCommand prepareAdvance(OperationId operation,Head previous,SchemaChange.Status next) {
-        if (next.phase()==SchemaChange.Phase.PUBLISHED) throw new IllegalArgumentException("Schema publication must atomically replace the directory");
+        if (next.phase()==SchemaChange.Phase.PUBLISHED && previous.status().phase()!=SchemaChange.Phase.PUBLISHED) throw new IllegalArgumentException("Schema publication must atomically replace the directory");
         var head=new Head(next,previous.allocatedThrough()); byte[] key=headKey(next.header().domainId());
         if (head.terminal()) return checked(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,head.encode()),
                         new Mutation(Mutation.Kind.PUT,column,outcomeKey(next.header().definitionDigest()),head.encode())),
@@ -139,7 +139,7 @@ public final class RatisSchemaAdministration {
             else {
                 if (previous==null || next.allocatedThrough()!=previous.allocatedThrough()) throw new IllegalArgumentException("Schema progress changed allocation ownership");
                 next.status().requireSuccessorOf(previous.status());
-                if (next.status().phase()==SchemaChange.Phase.PUBLISHED) validatePublication(command,next,previous,column);
+                if (next.status().phase()==SchemaChange.Phase.PUBLISHED && previous.status().phase()!=SchemaChange.Phase.PUBLISHED) validatePublication(command,next,previous,column);
                 else if (next.terminal()) {
                     if (command.mutations().size()!=2 || command.predicates().size()!=2) throw new IllegalArgumentException("Terminal schema progress requires retained outcome");
                     requirePair(command,1,outcomeKey(header.definitionDigest()),next.encode(),null);

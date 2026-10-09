@@ -20,6 +20,53 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Native node lifecycle with controlled Ratis interfaces. Production server factory is compiled, never executed here. */
 class RatisNodeRuntimeTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    @Test void activatedSchemasReopenFromOriginalManifestWithRefreshedBorrowedRouter() throws Exception {
+        var source=new DistributedSchema(new UUID(1,1),new UUID(1,2),new UUID(6,1),1,0,List.of(
+                new DistributedSchema.Column(1,new UUID(2,3),"data",it.cavallium.rockserver.core.common.ColumnSchema.of(
+                        it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
+        try (var env=new Env(root,false,source.digest())) {
+            var empty=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());
+            UUID recreatedColumn=new UUID(2,4);
+            var recreated=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),3,0,List.of(
+                    new DistributedSchema.Column(2,recreatedColumn,"data",source.columns().getFirst().schema(),null)));
+            var deletion=new SchemaChange.Definition(new UUID(56,1),new OperationId(new UUID(56,2),1,0),env.plan.directory(),source,empty);
+            var creation=new SchemaChange.Definition(new UUID(56,3),new OperationId(new UUID(56,2),1,1),deletion.targetDirectory(),empty,recreated);
+            var poolField=RatisNodeRuntime.class.getDeclaredField("pool"); poolField.setAccessible(true);
+            var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
+            var first=new FakeServer();
+            try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first)) {
+                node.start(); var pool=(DistributedStoragePool)poolField.get(node);
+                NativeSchemaActivationProof deleted=null,created=null;
+                for (var machine:first.machines.values()) {
+                    var store=(ReplicatedRangeStore)storeField.get(machine); store.enableLogicalSchema(source);
+                    assertEquals(0,machine.takeSnapshot());
+                    store.applySchemaFence(new ApplyPosition(1,1),deletion.header());
+                    var installed=pool.installSchema(store,new ApplyPosition(1,2),deletion,Map.of(),Set.of()).proof();
+                    deleted=store.applySchemaActivation(new ApplyPosition(1,3),installed,env.outer.catalogue,new ApplyPosition(1,20));
+                }
+                env.routed.refreshSchema(deletion,deleted);
+                for (var machine:first.machines.values()) {
+                    var store=(ReplicatedRangeStore)storeField.get(machine);
+                    store.applySchemaFence(new ApplyPosition(1,4),creation.header());
+                    var installed=pool.installSchema(store,new ApplyPosition(1,5),creation,Map.of(recreatedColumn,"data-recreated"),Set.of()).proof();
+                    created=store.applySchemaActivation(new ApplyPosition(1,6),installed,env.outer.catalogue,new ApplyPosition(1,30));
+                }
+                env.routed.refreshSchema(creation,created);
+            }
+            byte[] identity=Files.readAllBytes(env.nodeRoot.resolve("node.identity"));
+            var recovered=new FakeServer();
+            try (var node=env.open(RatisNodeRuntime.Startup.RECOVER,recovered)) {
+                node.start(); assertArrayEquals(recreated.digest(),env.routed.directory().schemaDigest());
+                for (var machine:recovered.machines.values()) {
+                    var store=(ReplicatedRangeStore)storeField.get(machine);
+                    assertArrayEquals(recreated.digest(),store.schemaDigest()); assertNull(store.schemaFence());
+                    assertEquals(2,store.activatedSchemas().size());
+                    try (var pin=store.capture()) { assertEquals(Set.of(recreatedColumn),pin.columns()); }
+                }
+            }
+            assertArrayEquals(identity,Files.readAllBytes(env.nodeRoot.resolve("node.identity")));
+        }
+    }
     @Test void installedEmptySchemaReopensUsingOriginalNodeManifestAndRemainsFenced() throws Exception {
         var schema=new DistributedSchema(new UUID(1,1),new UUID(1,2),new UUID(6,1),1,0,List.of(
                 new DistributedSchema.Column(1,new UUID(2,3),"data",it.cavallium.rockserver.core.common.ColumnSchema.of(

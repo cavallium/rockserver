@@ -61,7 +61,7 @@ class RatisSchemaFenceRpcTest {
         var status=SchemaChange.Status.begin(definition.header());
         var fencing=status.beginFencing();
         var fenced=fencing.fenced(id(9),new ApplyPosition(3,8)); var installed=fenced.installed(id(9),new ApplyPosition(3,9));
-        for (var phase:List.of(status,fencing,fenced,installed,installed.publish(),installed.publish().retire(),status.abort())) {
+        for (var phase:List.of(status,fencing,fenced,installed,installed.publish(),installed.publish().activated(id(9),new ApplyPosition(3,10)).retire(),status.abort())) {
             var head=new RatisSchemaAdministration.Head(phase,1);
             for (RangeDirectory directory:new RangeDirectory[]{null,definition.sourceDirectory(),definition.targetDirectory()}) {
                 var view=new RatisSchemaAuthority.View(request,id(20),new ApplyPosition(3,12),directory,head);

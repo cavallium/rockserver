@@ -54,6 +54,11 @@ public final class DistributedStoragePool implements AutoCloseable {
     private volatile PoolSnapshotAdmission snapshotAdmission;
     private volatile List<ColumnFamilyHandle> pressureColumns = List.of();
     private List<Path> storageVolumes = List.of();
+    private final Set<SchemaInstallPlan> schemaPlans=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private final Set<ReplicatedRangeStore.SchemaInstallCaptureGate> schemaCaptures=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private final Map<Object,java.util.concurrent.CompletableFuture<Void>> schemaCleanups=new java.util.IdentityHashMap<>();
+    private long schemaPlanBytes;
+    private java.util.concurrent.ThreadPoolExecutor schemaCleanupExecutor;
     private boolean closing;
     private boolean closed;
 
@@ -211,17 +216,63 @@ public final class DistributedStoragePool implements AutoCloseable {
         } finally { handleLifetime.readLock().unlock(); }
     }
 
+    private record RecoveredSchema(NativeSchemaInstallation current,List<NativeSchemaInstallation> chain,NativeSchemaFence pending) {}
+    private RecoveredSchema recoverSchema(UUID group) throws RocksDBException {
+        for(var range:ranges) if(range.ownership().owner().groupId().equals(group)) return range.readSchemaMetadata(() -> recoverSchemaUnderLane(group));
+        return recoverSchemaUnderLane(group);
+    }
+    private RecoveredSchema recoverSchemaUnderLane(UUID group) throws RocksDBException {
+        var state=handles.get(STATE_COLUMN); var db=loaded.db().get();
+        byte[] marker=ByteBuffer.allocate(16).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).array();
+        var markerBytes=db.get(state,marker); var cut=markerBytes==null ? null : ReplicatedRangeStore.decodePosition(markerBytes);
+        var currentBytes=db.get(state,groupSchemaKey(group,0x28)); var current=currentBytes==null ? null : NativeSchemaInstallation.decode(currentBytes);
+        var activationBytes=db.get(state,groupSchemaKey(group,0x2c)); var activation=activationBytes==null ? null : NativeSchemaActivationProof.decode(activationBytes);
+        var pendingBytes=db.get(state,groupSchemaKey(group,0x27)); var pending=pendingBytes==null ? null : NativeSchemaFence.decode(pendingBytes);
+        var history=new ArrayList<NativeSchemaInstallation>(); var activations=new HashMap<UUID,NativeSchemaActivationProof>();
+        long bytes=(currentBytes==null ? 0 : currentBytes.length)+(activationBytes==null ? 0 : activationBytes.length);
+        for(int tag:List.of(0x2a,0x2b)) try(var iterator=db.newIterator(state)) {
+            var prefix=groupSchemaKey(group,tag); iterator.seek(prefix);
+            while(iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length)) {
+                byte[] value=iterator.value(); if((bytes+=value.length)>16L*1024*1024) throw new IllegalStateException("Schema recovery metadata exceeds budget");
+                UUID id;
+                if(tag==0x2a) { var record=NativeSchemaInstallation.decode(value); if(history.size()>=64) throw new IllegalStateException("Schema history count exceeds budget"); history.add(record); id=record.definition().changeId(); }
+                else { var proof=NativeSchemaActivationProof.decode(value); if(activations.size()>=64) throw new IllegalStateException("Activation history count exceeds budget"); id=proof.installation().fence().changeId(); if(activations.put(id,proof)!=null) throw new IllegalStateException("Duplicate activation"); }
+                var expected=ByteBuffer.allocate(33).put(marker).put((byte)tag).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
+                if(!Arrays.equals(iterator.key(),expected)) throw new IllegalStateException("Schema recovery history key changed"); iterator.next();
+            }
+            iterator.status();
+        }
+        return new RecoveredSchema(current,NativeSchemaInstallation.validateLifecycle(current,history,activation,activations,pending,cut),pending);
+    }
+    private RangeOwnership.SchemaRecovery prepareSchemaRecovery(UUID domain,List<NativeSchemaInstallation> chain) throws RocksDBException {
+        var participants=new HashMap<UUID,RangeDescriptor>(); var baseSchemas=new HashMap<UUID,DistributedSchema>();
+        for(var record:chain) for(var descriptor:record.definition().sourceDirectory().ranges()) {
+            participants.put(descriptor.groupId(),descriptor); baseSchemas.putIfAbsent(descriptor.groupId(),record.definition().sourceSchema());
+        }
+        var expected=new HashMap<RangeOwnership.Owner,RangeOwnership.Interval>();
+        for(var descriptor:participants.values()) {
+            var group=descriptor.groupId(); var marker=ByteBuffer.allocate(16).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).array();
+            if(loaded.db().get().get(handles.get(STATE_COLUMN),marker)==null) continue;
+            var recovered=recoverSchema(group); var schema=recovered.current()==null ? baseSchemas.get(group) : recovered.current().definition().targetSchema();
+            var owner=new RangeOwnership.Owner(group,descriptor.rangeEpoch()); var interval=new RangeOwnership.Interval(domain,schema.columnIds(),descriptor.lowerInclusive(),descriptor.upperExclusive());
+            for(var record:recovered.chain()) record.requireRange(owner.groupId(),owner.epoch(),domain,interval.lowerInclusive(),interval.upperExclusive());
+            expected.put(owner,interval);
+        }
+        return ownership.prepareSchemaRecovery(domain,expected);
+    }
+
     /** Bind the supplied pool-schema names; admission is supplied by the qualified range adapter. */
     public ReplicatedRangeStore openRange(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
             byte[] schemaDigest, Map<UUID, String> physicalColumns, Set<UUID> admittedMergeColumns)
             throws RocksDBException {
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(interval, "interval");
-        byte[] schema = schemaDigest.clone();
-        var names = Map.copyOf(physicalColumns);
-        var merges = Set.copyOf(admittedMergeColumns);
+        final byte[] bootstrapSchema=schemaDigest.clone();
+        final var bootstrapNames=Map.copyOf(physicalColumns); final var bootstrapMerges=Set.copyOf(admittedMergeColumns);
+        byte[] schema=bootstrapSchema.clone(); var names=bootstrapNames; var merges=bootstrapMerges;
         NativeSchemaInstallation recovered=null;
         RangeOwnership.SchemaTransition recoveryTransition=null;
+        RangeOwnership.SchemaRecovery recoveryOwnership=null;
         if (schema.length != 32 || !names.keySet().equals(interval.columns())
                 || !names.keySet().containsAll(merges) || Set.copyOf(names.values()).size() != names.size()) {
             throw new IllegalArgumentException("Invalid range schema, column coverage or aliases");
@@ -237,17 +288,33 @@ public final class DistributedStoragePool implements AutoCloseable {
             synchronized (admission) {
                 if (closing) throw new IllegalStateException("Pool is closing");
             }
-            var installed=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x28));
-            if(installed!=null) {
-                recovered=NativeSchemaInstallation.decode(installed);
-                recovered.requireRange(owner.groupId(),owner.epoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
+            var checkpoint=recoverSchema(owner.groupId());
+            if(checkpoint.current()!=null) {
+                recovered=checkpoint.current(); recovered.requireRange(owner.groupId(),owner.epoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
+                boolean original=false;
+                for(var historical:checkpoint.chain()) {
+                    historical.requireRange(owner.groupId(),owner.epoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
+                    if(Arrays.equals(schema,historical.definition().sourceSchema().digest()) && names.equals(historical.sourceNames()) && merges.equals(historical.sourceMerges())
+                            || Arrays.equals(schema,historical.definition().targetSchema().digest()) && names.equals(historical.targetNames()) && merges.equals(historical.targetMerges())) original=true;
+                }
+                if(!original) throw new IllegalArgumentException("Bootstrap differs from verified schema lifecycle");
                 var definition=recovered.definition(); schemaOrigins.put(definition.sourceSchema().domainId(),definition);
-                if(!definition.sourceSchema().domainId().equals(interval.domainId())
-                        || !recovered.fence().participant().groupId().equals(owner.groupId()) || recovered.fence().participant().rangeEpoch()!=owner.epoch()
-                        || !Arrays.equals(schema,definition.sourceSchema().digest()) && !Arrays.equals(schema,definition.targetSchema().digest())) throw new IllegalArgumentException("Bootstrap differs from durable installed generation");
-                recoveryTransition=ownership.beginSchemaTransition(definition.changeId(),interval.domainId(),definition.sourceSchema().columnIds(),definition.targetSchema().columnIds());
+                recoveryOwnership=prepareSchemaRecovery(interval.domainId(),checkpoint.chain());
                 schema=definition.targetSchema().digest(); names=recovered.targetNames(); merges=recovered.targetMerges();
                 interval=new RangeOwnership.Interval(interval.domainId(),names.keySet(),interval.lowerInclusive(),interval.upperExclusive());
+            }
+            if(recoveryOwnership==null) for(var origin:schemaOrigins.values()) {
+                if(!origin.sourceSchema().domainId().equals(interval.domainId())) continue;
+                var descriptor=origin.sourceDirectory().ranges().stream().filter(participant -> participant.groupId().equals(owner.groupId()) && participant.rangeEpoch()==owner.epoch()).findFirst().orElse(null);
+                if(descriptor==null || !Arrays.equals(descriptor.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(descriptor.upperExclusive(),interval.upperExclusive())) continue;
+                for(var participant:origin.sourceDirectory().ranges()) {
+                    var other=recoverSchema(participant.groupId());
+                    if(other.current()==null) continue;
+                    boolean known=other.chain().stream().anyMatch(record -> Arrays.equals(record.definition().sourceSchema().digest(),bootstrapSchema) && record.sourceNames().equals(bootstrapNames) && record.sourceMerges().equals(bootstrapMerges));
+                    if(!known) throw new IllegalArgumentException("Source bootstrap differs from qualified local schema chain");
+                    recoveryOwnership=prepareSchemaRecovery(interval.domainId(),other.chain()); break;
+                }
+                if(recoveryOwnership!=null) break;
             }
             // No metadata monitor is held during loader calls, CF creation or store recovery.
             for (var entry : names.entrySet()) {
@@ -285,22 +352,23 @@ public final class DistributedStoragePool implements AutoCloseable {
                 rangeColumns.put(entry.getKey(), handle);
             }
             pressureColumns = List.copyOf(handles.values());
-            if(recoveryTransition==null) {
+            if(recoveryOwnership==null && recoveryTransition==null) {
                 for(var origin:schemaOrigins.values()) if(origin.sourceSchema().domainId().equals(interval.domainId())
                         && Arrays.equals(origin.sourceSchema().digest(),schema) && origin.sourceSchema().columnIds().equals(interval.columns())
                         && origin.sourceDirectory().ranges().stream().anyMatch(participant -> participant.groupId().equals(owner.groupId()) && participant.rangeEpoch()==owner.epoch())) {
                     recoveryTransition=ownership.beginSchemaTransition(origin.changeId(),interval.domainId(),origin.sourceSchema().columnIds(),origin.targetSchema().columnIds()); break;
                 }
             }
-            if(recoveryTransition==null) ownership.register(owner, interval, RangeOwnership.State.ACTIVE);
+            if(recoveryOwnership!=null) ownership.registerRecoveredSchema(owner,interval,RangeOwnership.State.FENCED,recoveryOwnership);
+            else if(recoveryTransition==null) ownership.register(owner, interval, RangeOwnership.State.ACTIVE);
             else ownership.registerSchema(owner,interval,RangeOwnership.State.FENCED,recoveryTransition);
             try {
                 var store = new ReplicatedRangeStore(loaded.db().get(), ownership, owner, schema, rangeColumns,
                         handles.get(STATE_COLUMN), handles.get(RECEIPTS_COLUMN), merges);
-                store.configureSnapshotAdmission(snapshotAdmission);
+                store.configureSnapshotAdmission(snapshotAdmission); store.configureSchemaPreparationPool(this);
                 for(var entry:names.entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),merges.contains(entry.getKey())));
                 ranges.add(store);
-                if(recoveryTransition!=null) ownership.activate(owner);
+                if(recoveryOwnership!=null || recoveryTransition!=null) ownership.activate(owner);
                 if(recovered!=null) {
                     for(var entry:recovered.sourceNames().entrySet()) if(!recovered.targetNames().containsKey(entry.getKey())) {
                         bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),recovered.sourceMerges().contains(entry.getKey()))); deferredDrops.add(entry.getKey()); deletionOrigins.put(entry.getKey(),recovered.definition());
@@ -326,6 +394,151 @@ public final class DistributedStoragePool implements AutoCloseable {
         }
     }
 
+    public Map<UUID,String> schemaPhysicalNames(ReplicatedRangeStore store) {
+        nativeMutation.acquireUninterruptibly();
+        try {
+            if(!ranges.contains(store)) throw new IllegalArgumentException("Foreign range store");
+            var names=new HashMap<UUID,String>(); for(var id:store.ownership().interval().columns()) names.put(id,Objects.requireNonNull(bindings.get(id)).name()); return Map.copyOf(names);
+        } finally { nativeMutation.release(); }
+    }
+    public final class SchemaInstallPlan implements AutoCloseable {
+        private final DistributedStoragePool pool=DistributedStoragePool.this;
+        private final ReplicatedRangeStore store;
+        private final SchemaChange.Definition definition;
+        private final Map<UUID,String> sourceNames,targetNames;
+        private final Set<UUID> sourceMerges,targetMerges;
+        private final NativeSchemaFence fence;
+        private final Map<String,PreparedColumn> options;
+        private volatile boolean closed;
+        private final long heldBytes;
+        private SchemaInstallPlan(ReplicatedRangeStore store,NativeSchemaInstallation record,Map<String,PreparedColumn> options) {
+            this.store=store; definition=record.definition(); sourceNames=record.sourceNames(); targetNames=record.targetNames(); sourceMerges=record.sourceMerges(); targetMerges=record.targetMerges(); fence=record.fence(); this.options=Map.copyOf(options); heldBytes=record.encode().length;
+            synchronized(admission) {
+                if(closing || schemaPlans.size()>=64 || heldBytes>16L*1024*1024-schemaPlanBytes) throw new IllegalStateException("Pool schema preparation capacity exhausted");
+                schemaPlans.add(this); schemaPlanBytes+=heldBytes;
+            }
+        }
+        public SchemaChange.Definition definition() { return definition; }
+        public Map<UUID,String> targetNames() { return targetNames; }
+        public Set<UUID> targetMerges() { return targetMerges; }
+        public long heldBytes() { return heldBytes; }
+        public java.util.concurrent.CompletionStage<Void> closeAsync() { return submitSchemaCleanup(this,null); }
+        @Override public void close() {
+            nativeMutation.acquireUninterruptibly();
+            try {
+                if(closed) return; options.values().forEach(PreparedColumn::close); closed=true;
+                synchronized(admission) { if(schemaPlans.remove(this)) schemaPlanBytes-=heldBytes; admission.notifyAll(); }
+            } finally { nativeMutation.release(); }
+        }
+    }
+    void registerSchemaCapture(ReplicatedRangeStore.SchemaInstallCaptureGate capture) {
+        synchronized(admission) {
+            if(closing || schemaCaptures.size()>=64) throw new IllegalStateException("Pool schema capture capacity exhausted"); schemaCaptures.add(capture);
+        }
+    }
+    void unregisterSchemaCapture(ReplicatedRangeStore.SchemaInstallCaptureGate capture) {
+        synchronized(admission) { schemaCaptures.remove(capture); admission.notifyAll(); }
+    }
+    /** Enqueues ownership cleanup only; completion follows actual releases outside pool locks. */
+    public java.util.concurrent.CompletionStage<Void> submitSchemaCleanup(SchemaInstallPlan plan,ReplicatedRangeStore.SchemaInstallCaptureGate capture) {
+        if(plan!=null && plan.pool!=this || capture!=null && !capture.belongsToPool(this)) throw new IllegalArgumentException("Foreign schema preparation owner");
+        var pending=new ArrayList<java.util.concurrent.CompletableFuture<Void>>(); var owners=new ArrayList<Object>();
+        java.util.concurrent.CompletableFuture<Void> completion=null;
+        java.util.concurrent.RejectedExecutionException rejected=null;
+        synchronized(admission) {
+            for(var owner:new Object[]{plan,capture}) {
+                if(owner==null || owner instanceof SchemaInstallPlan p && p.closed || owner instanceof ReplicatedRangeStore.SchemaInstallCaptureGate c && c.closed()) continue;
+                var existing=schemaCleanups.get(owner);
+                if(existing!=null) pending.add(existing); else owners.add(owner);
+            }
+            if(!owners.isEmpty()) {
+                completion=new java.util.concurrent.CompletableFuture<>(); var finished=completion; owners.forEach(owner -> schemaCleanups.put(owner,finished)); pending.add(finished);
+                if(schemaCleanupExecutor==null) {
+                    schemaCleanupExecutor=new java.util.concurrent.ThreadPoolExecutor(1,1,30,TimeUnit.SECONDS,new java.util.concurrent.ArrayBlockingQueue<>(128),task -> { var thread=new Thread(task,"rockserver-schema-cleanup"); thread.setDaemon(true); return thread; });
+                    schemaCleanupExecutor.allowCoreThreadTimeOut(true);
+                }
+                try {
+                    schemaCleanupExecutor.execute(() -> {
+                        Throwable failure=null;
+                        try {
+                            for(var owner:owners) if(owner instanceof ReplicatedRangeStore.SchemaInstallCaptureGate c) c.close();
+                            for(var owner:owners) if(owner instanceof SchemaInstallPlan p) p.close();
+                        } catch(Throwable thrown) { failure=thrown; }
+                        synchronized(admission) { owners.forEach(schemaCleanups::remove); admission.notifyAll(); }
+                        if(failure==null) finished.complete(null); else finished.completeExceptionally(failure);
+                    });
+                } catch(java.util.concurrent.RejectedExecutionException rejection) {
+                    owners.forEach(schemaCleanups::remove);
+                    // The owners remain registered and charged, allowing an explicit retry.
+                    rejected=rejection;
+                }
+            }
+        }
+        if(rejected!=null) completion.completeExceptionally(rejected);
+        return java.util.concurrent.CompletableFuture.allOf(pending.toArray(java.util.concurrent.CompletableFuture[]::new)).minimalCompletionStage();
+    }
+    public SchemaInstallPlan prepareSchemaInstallation(ReplicatedRangeStore store,SchemaChange.Definition definition) throws RocksDBException {
+        var saved=store.lookupSchemaInstallationRecord(definition.header());
+        if(saved!=null) return prepareSchemaInstallation(store,definition,saved.targetNames(),saved.targetMerges());
+        var names=new HashMap<>(schemaPhysicalNames(store)); var merges=new HashSet<>(store.deterministicMergeColumns());
+        names.keySet().retainAll(definition.targetSchema().columnIds()); merges.retainAll(definition.targetSchema().columnIds());
+        for(var id:definition.targetSchema().columnIds()) names.putIfAbsent(id,"distributed-"+id);
+        return prepareSchemaInstallation(store,definition,names,merges);
+    }
+    public SchemaInstallPlan prepareSchemaInstallation(ReplicatedRangeStore store,SchemaChange.Definition definition,Map<UUID,String> targetNames,Set<UUID> targetMerges) throws RocksDBException {
+        nativeMutation.acquireUninterruptibly(); var options=new HashMap<String,PreparedColumn>(); boolean retained=false;
+        try {
+            synchronized(admission) { if(closing) throw new IllegalStateException("Pool is closing"); }
+            if(!ranges.contains(store)) throw new IllegalArgumentException("Foreign range store");
+            var saved=store.lookupSchemaInstallationRecord(definition.header());
+            if(saved!=null) {
+                saved.requireDefinition(definition); if(!saved.targetNames().equals(targetNames) || !saved.targetMerges().equals(targetMerges)) throw new IllegalArgumentException("Original INSTALL binding changed");
+                var plan=new SchemaInstallPlan(store,saved,options); retained=true; return plan;
+            }
+            if(!Arrays.equals(store.schemaDigest(),definition.sourceSchema().digest())) throw new IllegalArgumentException("INSTALL source generation changed");
+            var sourceNames=new HashMap<UUID,String>(); for(var id:definition.sourceSchema().columnIds()) sourceNames.put(id,Objects.requireNonNull(bindings.get(id)).name());
+            var fence=store.lookupSchemaFence(definition.header()); if(fence==null) throw new IllegalStateException("Native FENCE missing");
+            var cut=store.applied(); if(cut==null || cut.index()==Long.MAX_VALUE) throw new IllegalStateException("Native prefix unavailable");
+            var record=new NativeSchemaInstallation(definition,fence,new ApplyPosition(Math.max(1,cut.term()),cut.index()+1),sourceNames,targetNames,store.deterministicMergeColumns(),targetMerges);
+            var owner=store.ownership(); record.requireRange(owner.owner().groupId(),owner.owner().epoch(),owner.interval().domainId(),owner.interval().lowerInclusive(),owner.interval().upperExclusive());
+            store.preflightSchemaInstallation(record);
+            long held=record.encode().length;
+            synchronized(admission) { if(closing || schemaPlans.size()>=64 || held>16L*1024*1024-schemaPlanBytes) throw new IllegalStateException("Pool schema preparation capacity exhausted"); }
+            prepareSchemaOptions(record,options);
+            var fresh=new HashSet<>(definition.targetSchema().columnIds()); fresh.removeAll(definition.sourceSchema().columnIds());
+            reserveBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
+            var plan=new SchemaInstallPlan(store,record,options); retained=true; return plan;
+        } finally { if(!retained) options.values().forEach(PreparedColumn::close); nativeMutation.release(); }
+    }
+    public NativeSchemaInstallation installSchema(ReplicatedRangeStore store,ApplyPosition position,SchemaInstallPlan plan) throws RocksDBException {
+        Objects.requireNonNull(plan); nativeMutation.acquireUninterruptibly();
+        try {
+            if(plan.store!=store || plan.closed) throw new IllegalArgumentException("Foreign or closed INSTALL plan");
+            var saved=store.lookupSchemaInstallationRecord(plan.definition.header());
+            if(saved!=null) {
+                if(!saved.sourceNames().equals(plan.sourceNames) || !saved.targetNames().equals(plan.targetNames) || !saved.sourceMerges().equals(plan.sourceMerges) || !saved.targetMerges().equals(plan.targetMerges)) throw new IllegalArgumentException("Original INSTALL plan changed");
+                store.applyNoop(position); return saved;
+            }
+            var record=new NativeSchemaInstallation(plan.definition,plan.fence,position,plan.sourceNames,plan.targetNames,plan.sourceMerges,plan.targetMerges);
+            return installPreparedSchema(store,record,stage -> {},plan.options);
+        } finally { nativeMutation.release(); }
+    }
+    private void prepareSchemaOptions(NativeSchemaInstallation record,Map<String,PreparedColumn> options) {
+        var definition=record.definition();
+        for(var entry:record.targetNames().entrySet()) {
+            var name=entry.getValue(); if(RESERVED_COLUMNS.contains(name)) throw new IllegalArgumentException("Reserved target CF name"); var old=bindings.get(entry.getKey());
+            if(old!=null && (!old.name().equals(name) || old.mergeAdmitted()!=record.targetMerges().contains(entry.getKey()))) throw new IllegalArgumentException("Column identity rebound");
+            if(bindings.entrySet().stream().anyMatch(other -> !other.getKey().equals(entry.getKey()) && other.getValue().name().equals(name))) throw new IllegalArgumentException("Physical name belongs to another identity");
+            if(!definition.sourceSchema().columnIds().contains(entry.getKey()) && definition.targetSchema().column(entry.getKey()).operator()!=null) throw new UnsupportedOperationException("New merge column requires admitted operator artifact staging");
+            if(handles.containsKey(name) && record.targetMerges().contains(entry.getKey()) && loaded.mergeOperators().get(name)==null) throw new IllegalArgumentException("Missing merge operator");
+            if(!handles.containsKey(name)) {
+                var prepared=new PreparedColumn(name); options.put(name,prepared);
+                if(prepared.options.mergeOperator()!=null) throw new UnsupportedOperationException("New configured merge CF requires operator background-work lifecycle");
+                if(record.targetMerges().contains(entry.getKey())) throw new IllegalArgumentException("Missing merge operator");
+            }
+        }
+    }
+
     public enum SchemaInstallStage { INTENT, COLUMN_FAMILIES, COMMITTED }
     @FunctionalInterface public interface SchemaInstallObserver { void after(SchemaInstallStage stage) throws RocksDBException; }
     /** Applies one committed, source-qualified schema transition; target DATA admission stays fenced. */
@@ -339,8 +552,9 @@ public final class DistributedStoragePool implements AutoCloseable {
         try {
             synchronized(admission) { if(closing) throw new IllegalStateException("Pool is closing"); }
             if(!ranges.contains(store)) throw new IllegalArgumentException("Store belongs to another pool");
-            if(store.schemaInstallation()!=null && store.schemaInstallation().definition().changeId().equals(definition.changeId())) {
-                var previous=store.schemaInstallation(); previous.requireDefinition(definition);
+            var previous=store.lookupSchemaInstallationRecord(definition.header());
+            if(previous!=null) {
+                previous.requireDefinition(definition);
                 if(!previous.targetNames().equals(targetNames) || !previous.targetMerges().equals(targetMerges)) throw new IllegalArgumentException("Install binding changed");
                 store.applyNoop(position); return previous;
             }
@@ -352,37 +566,67 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     private NativeSchemaInstallation installSchemaUnderLock(ReplicatedRangeStore store,NativeSchemaInstallation record) throws RocksDBException { return installSchemaUnderLock(store,record,stage -> {}); }
     private NativeSchemaInstallation installSchemaUnderLock(ReplicatedRangeStore store,NativeSchemaInstallation record,SchemaInstallObserver observer) throws RocksDBException {
-        var definition=record.definition();
-        var nativeOwner=store.ownership();
-        record.requireRange(nativeOwner.owner().groupId(),nativeOwner.owner().epoch(),nativeOwner.interval().domainId(),nativeOwner.interval().lowerInclusive(),nativeOwner.interval().upperExclusive());
-        var transition=ownership.beginSchemaTransition(definition.changeId(),definition.sourceSchema().domainId(),definition.sourceSchema().columnIds(),definition.targetSchema().columnIds());
-        schemaOrigins.put(definition.sourceSchema().domainId(),definition);
-        var preparedOptions=new HashMap<String,PreparedColumn>();
+        var options=new HashMap<String,PreparedColumn>();
         try {
-        // All binding and merge checks occur before the forced intent and native DDL.
-        for(var entry:record.targetNames().entrySet()) {
-            var name=entry.getValue();
-            if(RESERVED_COLUMNS.contains(name)) throw new IllegalArgumentException("Reserved target CF name");
-            var old=bindings.get(entry.getKey());
-            if(old!=null && (!old.name().equals(name) || old.mergeAdmitted()!=record.targetMerges().contains(entry.getKey()))) throw new IllegalArgumentException("Column identity rebound");
-            if(bindings.entrySet().stream().anyMatch(other -> !other.getKey().equals(entry.getKey()) && other.getValue().name().equals(name))) throw new IllegalArgumentException("Physical name belongs to another identity");
-            if(!definition.sourceSchema().columnIds().contains(entry.getKey()) && definition.targetSchema().column(entry.getKey()).operator()!=null)
-                throw new UnsupportedOperationException("New merge column requires admitted operator artifact staging");
-            if(handles.containsKey(name) && record.targetMerges().contains(entry.getKey()) && loaded.mergeOperators().get(name)==null) throw new IllegalArgumentException("Missing merge operator");
-            if(!handles.containsKey(name)) {
-                var prepared=new PreparedColumn(name); preparedOptions.put(name,prepared);
-                if(prepared.options.mergeOperator()!=null) throw new UnsupportedOperationException("New configured merge CF requires operator background-work lifecycle");
-                if(record.targetMerges().contains(entry.getKey()) && prepared.options.mergeOperator()==null) throw new IllegalArgumentException("Missing merge operator");
-            }
+            var owner=store.ownership(); record.requireRange(owner.owner().groupId(),owner.owner().epoch(),owner.interval().domainId(),owner.interval().lowerInclusive(),owner.interval().upperExclusive());
+            store.preflightSchemaInstallation(record); prepareSchemaOptions(record,options);
+            var fresh=new HashSet<>(record.definition().targetSchema().columnIds()); fresh.removeAll(record.definition().sourceSchema().columnIds());
+            reserveBirths(record.targetNames(),record.targetMerges(),record.definition().changeId(),fresh);
+            return installPreparedSchema(store,record,observer,options);
+        } finally { options.values().forEach(PreparedColumn::close); }
+    }
+    private RangeOwnership.SchemaTransition qualifiedSchemaTransition(SchemaChange.Definition definition) throws RocksDBException {
+        UUID domain=definition.sourceSchema().domainId();
+        var descriptors=new HashMap<UUID,RangeDescriptor>(); for(var descriptor:definition.sourceDirectory().ranges()) descriptors.put(descriptor.groupId(),descriptor);
+        var checkpoints=new HashMap<UUID,RecoveredSchema>(); var known=new ArrayList<NativeSchemaInstallation>();
+        for(var descriptor:definition.sourceDirectory().ranges()) {
+            var group=descriptor.groupId(); var marker=ByteBuffer.allocate(16).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).array();
+            if(loaded.db().get().get(handles.get(STATE_COLUMN),marker)==null) continue;
+            var checkpoint=recoverSchema(group); checkpoints.put(group,checkpoint); known.addAll(checkpoint.chain());
         }
-        var fresh=new HashSet<>(definition.targetSchema().columnIds()); fresh.removeAll(definition.sourceSchema().columnIds());
-        reserveBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
+        known.sort(java.util.Comparator.comparingLong(record -> record.definition().sourceSchema().schemaEpoch()));
+        var expected=new HashMap<RangeOwnership.Owner,RangeOwnership.Interval>(); var actualSchemas=new HashMap<UUID,DistributedSchema>();
+        for(var range:ranges) {
+            var owner=range.ownership(); if(owner.state()==RangeOwnership.State.RETIRED || !owner.interval().domainId().equals(domain)) continue;
+            expected.put(owner.owner(),owner.interval());
+            var actual=range.installedSchema(); if(actual!=null) actualSchemas.put(owner.owner().groupId(),actual);
+        }
+        for(var entry:checkpoints.entrySet()) {
+            var descriptor=descriptors.get(entry.getKey()); var checkpoint=entry.getValue(); var schema=actualSchemas.get(entry.getKey());
+            if(schema==null && checkpoint.current()!=null) schema=checkpoint.current().definition().targetSchema();
+            if(schema==null) {
+                for(var record:known) if(record.definition().sourceDirectory().ranges().stream().anyMatch(member -> member.groupId().equals(entry.getKey()))) { schema=record.definition().sourceSchema(); break; }
+            }
+            if(schema==null) schema=definition.sourceSchema();
+            if(checkpoint.pending()!=null && checkpoint.current()==null && !Arrays.equals(checkpoint.pending().sourceSchemaDigest(),schema.digest())) throw new IllegalStateException("Unopened source checkpoint differs from verified logical schema");
+            var owner=new RangeOwnership.Owner(entry.getKey(),descriptor.rangeEpoch()); var interval=new RangeOwnership.Interval(domain,schema.columnIds(),descriptor.lowerInclusive(),descriptor.upperExclusive());
+            for(var record:checkpoint.chain()) record.requireRange(owner.groupId(),owner.epoch(),domain,interval.lowerInclusive(),interval.upperExclusive());
+            var previous=expected.putIfAbsent(owner,interval); if(previous!=null && !previous.equals(interval)) throw new IllegalStateException("Logical checkpoint differs from live geometry"); actualSchemas.put(entry.getKey(),schema);
+        }
+        var members=new HashSet<RangeOwnership.Owner>();
+        for(var descriptor:definition.sourceDirectory().ranges()) {
+            var schema=actualSchemas.get(descriptor.groupId()); if(schema==null) continue;
+            boolean source=Arrays.equals(schema.digest(),definition.sourceSchema().digest()),target=Arrays.equals(schema.digest(),definition.targetSchema().digest());
+            if(!source && !target) continue;
+            if(target) {
+                var checkpoint=checkpoints.get(descriptor.groupId()); var original=checkpoint==null ? null : checkpoint.chain().stream().filter(record -> record.definition().changeId().equals(definition.changeId())).findFirst().orElse(null);
+                if(original==null) throw new IllegalStateException("Target checkpoint lacks original schema INSTALL"); original.requireDefinition(definition);
+            }
+            members.add(new RangeOwnership.Owner(descriptor.groupId(),descriptor.rangeEpoch()));
+        }
+        var recovery=ownership.prepareSchemaRecovery(domain,expected);
+        return ownership.beginRecoveredSchemaTransition(definition.changeId(),domain,definition.sourceSchema().columnIds(),definition.targetSchema().columnIds(),recovery,members);
+    }
+    private NativeSchemaInstallation installPreparedSchema(ReplicatedRangeStore store,NativeSchemaInstallation record,SchemaInstallObserver observer,Map<String,PreparedColumn> options) throws RocksDBException {
+        var definition=record.definition();
+        var transition=qualifiedSchemaTransition(definition);
+        schemaOrigins.put(definition.sourceSchema().domainId(),definition);
         var result=store.installSchema(record,transition,observer,() -> {
             var target=new HashMap<UUID,ColumnFamilyHandle>();
             for(var entry:record.targetNames().entrySet()) {
                 var handle=handles.get(entry.getValue());
                 if(handle==null) {
-                    handle=createColumn(Objects.requireNonNull(preparedOptions.get(entry.getValue())));
+                    handle=createColumn(Objects.requireNonNull(options.get(entry.getValue())));
                 }
                 target.put(entry.getKey(),handle);
             }
@@ -390,9 +634,8 @@ public final class DistributedStoragePool implements AutoCloseable {
         });
         for(var entry:record.targetNames().entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),record.targetMerges().contains(entry.getKey())));
         for(var id:record.sourceNames().keySet()) if(!record.targetNames().containsKey(id)) { deferredDrops.add(id); deletionOrigins.put(id,definition); }
-        drainDeferredDrops(); pressureColumns=List.copyOf(handles.values());
+        drainDeferredDrops(); pressureColumns=List.copyOf(handles.values()); ownership.tryCompleteSchemaTransition(transition);
         return result;
-        } finally { preparedOptions.values().forEach(PreparedColumn::close); }
     }
     private void drainDeferredDrops() throws RocksDBException {
         var iterator=deferredDrops.iterator();
@@ -474,7 +717,15 @@ public final class DistributedStoragePool implements AutoCloseable {
             if (closed) return true;
             closing = true;
         }
-        if (!nativeMutation.tryAcquire(budget, TimeUnit.NANOSECONDS)) return false;
+        List<SchemaInstallPlan> plans; List<ReplicatedRangeStore.SchemaInstallCaptureGate> captures;
+        synchronized(admission) { plans=List.copyOf(schemaPlans); captures=List.copyOf(schemaCaptures); }
+        var cleanup=new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+        for(var plan:plans) cleanup.add(submitSchemaCleanup(plan,null).toCompletableFuture());
+        for(var capture:captures) cleanup.add(submitSchemaCleanup(null,capture).toCompletableFuture());
+        try { java.util.concurrent.CompletableFuture.allOf(cleanup.toArray(java.util.concurrent.CompletableFuture[]::new)).get(Math.max(0,budget-(System.nanoTime()-started)),TimeUnit.NANOSECONDS); }
+        catch(java.util.concurrent.TimeoutException timeoutFailure) { return false; }
+        catch(java.util.concurrent.ExecutionException failure) { throw new IOException("Schema preparation cleanup did not release its owners",failure.getCause()); }
+        if(!nativeMutation.tryAcquire(Math.max(0,budget-(System.nanoTime()-started)),TimeUnit.NANOSECONDS)) return false;
         try {
             synchronized (admission) { if (closed) return true; }
             boolean drained = true;
@@ -499,7 +750,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             var quarantinedIterator=quarantinedColumnResources.iterator();
             while(quarantinedIterator.hasNext()) try { quarantinedIterator.next().close(); quarantinedIterator.remove(); } catch(RuntimeException ex) { failure=append(failure,ex); }
             try { loaded.refs().close(); } catch (RuntimeException ex) { failure = append(failure, ex); }
-            synchronized (admission) { closed = failure==null; }
+            synchronized(admission) { closed=failure==null; if(closed && schemaCleanupExecutor!=null) schemaCleanupExecutor.shutdown(); }
             if (failure != null) throw failure;
             return true;
             } finally { handleLifetime.writeLock().unlock(); }

@@ -174,26 +174,33 @@ public final class SchemaChange {
     public static final class Status {
         private final Header header;
         private final Phase phase;
-        private final Map<UUID,ApplyPosition> fenced,installed;
-        private Status(Header header,Phase phase,Map<UUID,ApplyPosition> fenced,Map<UUID,ApplyPosition> installed) {
-            this.header=Objects.requireNonNull(header); this.phase=Objects.requireNonNull(phase); this.fenced=Map.copyOf(fenced); this.installed=Map.copyOf(installed);
+        private final Map<UUID,ApplyPosition> fenced,installed,activated;
+        private Status(Header header,Phase phase,Map<UUID,ApplyPosition> fenced,Map<UUID,ApplyPosition> installed,Map<UUID,ApplyPosition> activated) {
+            this.header=Objects.requireNonNull(header); this.phase=Objects.requireNonNull(phase); this.fenced=Map.copyOf(fenced); this.installed=Map.copyOf(installed); this.activated=Map.copyOf(activated);
             for (var group:this.fenced.keySet()) participant(group);
             for (var entry:this.installed.entrySet()) {
                 participant(entry.getKey()); var fence=this.fenced.get(entry.getKey());
                 if (fence==null || !follows(entry.getValue(),fence)) throw new IllegalArgumentException("Install does not follow fence");
+            }
+            for (var entry:this.activated.entrySet()) {
+                participant(entry.getKey()); var install=this.installed.get(entry.getKey());
+                if (install==null || !follows(entry.getValue(),install)) throw new IllegalArgumentException("Activation does not follow install");
             }
             int count=header.participants.size(); boolean allFenced=fenced.size()==count,allInstalled=installed.size()==count;
             if (!installed.isEmpty() && !allFenced || phase==Phase.PREPARED && (!fenced.isEmpty() || !installed.isEmpty())
                     || phase==Phase.FENCING && (allFenced || !installed.isEmpty())
                     || phase==Phase.FENCED && (!allFenced || allInstalled)
                     || (phase==Phase.INSTALLED || phase==Phase.PUBLISHED || phase==Phase.RETIRED) && !allInstalled
-                    || phase==Phase.ABORTED && (!fenced.isEmpty() || !installed.isEmpty())) throw new IllegalArgumentException("Proofs differ from schema change phase");
+                    || phase==Phase.ABORTED && (!fenced.isEmpty() || !installed.isEmpty())
+                    || !activated.isEmpty() && phase!=Phase.PUBLISHED && phase!=Phase.RETIRED
+                    || phase==Phase.RETIRED && activated.size()!=count) throw new IllegalArgumentException("Proofs differ from schema change phase");
         }
-        public static Status begin(Header header) { return new Status(header,Phase.PREPARED,Map.of(),Map.of()); }
+        public static Status begin(Header header) { return new Status(header,Phase.PREPARED,Map.of(),Map.of(),Map.of()); }
         public Header header() { return header; }
         public Phase phase() { return phase; }
         public Map<UUID,ApplyPosition> fenced() { return fenced; }
         public Map<UUID,ApplyPosition> installed() { return installed; }
+        public Map<UUID,ApplyPosition> activated() { return activated; }
         private void participant(UUID group) {
             if (header.participants.stream().noneMatch(p -> p.groupId().equals(group))) throw new IllegalArgumentException("Group is outside original schema change membership");
         }
@@ -202,28 +209,38 @@ public final class SchemaChange {
             if (prior!=null) { if (!prior.equals(position)) throw new IllegalArgumentException("Conflicting fence proof"); return this; }
             if (phase!=Phase.FENCING) throw new IllegalStateException("Fence requires irrevocable fencing intent");
             var next=new HashMap<>(fenced); next.put(group,position);
-            return new Status(header,next.size()==header.participants.size() ? Phase.FENCED : Phase.FENCING,next,installed);
+            return new Status(header,next.size()==header.participants.size() ? Phase.FENCED : Phase.FENCING,next,installed,activated);
         }
         public Status installed(UUID group,ApplyPosition position) {
             participant(group); Objects.requireNonNull(position); var prior=installed.get(group);
             if (prior!=null) { if (!prior.equals(position)) throw new IllegalArgumentException("Conflicting install proof"); return this; }
             if (phase!=Phase.FENCED) throw new IllegalStateException("Install requires every participant fenced");
             var next=new HashMap<>(installed); next.put(group,position);
-            return new Status(header,next.size()==header.participants.size() ? Phase.INSTALLED : Phase.FENCED,fenced,next);
+            return new Status(header,next.size()==header.participants.size() ? Phase.INSTALLED : Phase.FENCED,fenced,next,activated);
+        }
+        public Status activated(UUID group,ApplyPosition position) {
+            participant(group); Objects.requireNonNull(position); var prior=activated.get(group);
+            if (prior!=null) { if (!prior.equals(position)) throw new IllegalArgumentException("Conflicting activation proof"); return this; }
+            if (phase!=Phase.PUBLISHED) throw new IllegalStateException("Activation requires published target directory");
+            var next=new HashMap<>(activated); next.put(group,position);
+            return new Status(header,Phase.PUBLISHED,fenced,installed,next);
         }
         /** Catalogue CAS must choose this irrevocable path before any data-group fence is submitted. */
         public Status beginFencing() { return advance(Phase.PREPARED,Phase.FENCING); }
         public Status publish() { return advance(Phase.INSTALLED,Phase.PUBLISHED); }
-        public Status retire() { return advance(Phase.PUBLISHED,Phase.RETIRED); }
+        public Status retire() {
+            if (activated.size()!=header.participants.size()) throw new IllegalStateException("Retirement requires every participant activated");
+            return advance(Phase.PUBLISHED,Phase.RETIRED);
+        }
         public Status abort() {
             if (phase==Phase.ABORTED) return this;
             if (phase!=Phase.PREPARED || !fenced.isEmpty()) throw new IllegalStateException("Abort requires prepared intent before fencing begins");
-            return new Status(header,Phase.ABORTED,fenced,installed);
+            return new Status(header,Phase.ABORTED,fenced,installed,activated);
         }
         private Status advance(Phase from,Phase to) {
             if (phase==to) return this;
             if (phase!=from) throw new IllegalStateException("Invalid schema change phase transition");
-            return new Status(header,to,fenced,installed);
+            return new Status(header,to,fenced,installed,activated);
         }
         /** Require one legal proof/phase advancement, or an identical retry. */
         public void requireSuccessorOf(Status previous) {
@@ -236,18 +253,19 @@ public final class SchemaChange {
             Status expected=null; int additions=0;
             for (var e:fenced.entrySet()) if (!previous.fenced.containsKey(e.getKey())) { expected=previous.fenced(e.getKey(),e.getValue()); additions++; }
             for (var e:installed.entrySet()) if (!previous.installed.containsKey(e.getKey())) { expected=previous.installed(e.getKey(),e.getValue()); additions++; }
+            for (var e:activated.entrySet()) if (!previous.activated.containsKey(e.getKey())) { expected=previous.activated(e.getKey(),e.getValue()); additions++; }
             if (additions==0) expected=switch(phase) { case FENCING -> previous.beginFencing(); case PUBLISHED -> previous.publish(); case RETIRED -> previous.retire(); case ABORTED -> previous.abort(); default -> null; };
             if (additions>1 || expected==null || !Arrays.equals(encode(),expected.encode())) throw new IllegalArgumentException("Not a single monotone schema change successor");
         }
         public byte[] encode() {
-            byte[] content=header.encode(); var out=ByteBuffer.allocate(17+content.length+32*(fenced.size()+installed.size())).putInt(STATUS_MAGIC);
-            blob(out,content); out.put((byte)(phase.ordinal()+1)); proofs(out,fenced); proofs(out,installed); return out.array();
+            byte[] content=header.encode(); var out=ByteBuffer.allocate(21+content.length+32*(fenced.size()+installed.size()+activated.size())).putInt(STATUS_MAGIC);
+            blob(out,content); out.put((byte)(phase.ordinal()+1)); proofs(out,fenced); proofs(out,installed); proofs(out,activated); return out.array();
         }
         public static Status decode(byte[] bytes) {
-            var in=input(bytes,MAX_STATUS_BYTES,17,STATUS_MAGIC); var header=Header.decode(blob(in));
-            if (in.remaining()<9) throw new IllegalArgumentException("Truncated schema change status");
-            var phase=wire(Phase.values(),in.get()); var fenced=proofs(in); var installed=proofs(in); end(in);
-            var result=new Status(header,phase,fenced,installed); canonical(bytes,result.encode()); return result;
+            var in=input(bytes,MAX_STATUS_BYTES,21,STATUS_MAGIC); var header=Header.decode(blob(in));
+            if (in.remaining()<13) throw new IllegalArgumentException("Truncated schema change status");
+            var phase=wire(Phase.values(),in.get()); var fenced=proofs(in); var installed=proofs(in); var activated=proofs(in); end(in);
+            var result=new Status(header,phase,fenced,installed,activated); canonical(bytes,result.encode()); return result;
         }
         private static void proofs(ByteBuffer out,Map<UUID,ApplyPosition> proofs) {
             out.putInt(proofs.size()); for (var group:proofs.keySet().stream().sorted(RangeDirectoryCodec.UUID_ORDER).toList()) {

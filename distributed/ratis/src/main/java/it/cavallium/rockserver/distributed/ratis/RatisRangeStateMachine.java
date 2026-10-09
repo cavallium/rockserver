@@ -3,6 +3,9 @@ package it.cavallium.rockserver.distributed.ratis;
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
+import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallProof;
+import it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof;
+import it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec;
 import it.cavallium.rockserver.core.common.distributed.HomeRecovery;
 import it.cavallium.rockserver.core.common.distributed.HomeIdentity;
@@ -74,7 +77,10 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.impl.LinearizableQueryStateMachine {
     private final ReplicatedRangeStore store;
     private final Consumer<DistributedCommand> commandValidator;
-    private final Consumer<DistributedCommand> epochFloorAdmission;
+    private volatile Consumer<DistributedCommand> epochFloorAdmission;
+    private RatisSessionEpochs sessionEpochs;
+    private java.util.function.BiConsumer<SchemaChange.Definition,NativeSchemaActivationProof> schemaActivationObserver;
+    private volatile Throwable schemaActivationObserverFailure;
     private volatile Throwable storageFailure;
     private final HashMap<OperationId, Admission> admissions = new HashMap<>();
     private long admittedBytes, dataProposalBytes;
@@ -134,19 +140,59 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private it.cavallium.rockserver.core.common.distributed.RangeDescriptor schemaDescriptor;
     private UUID schemaCluster,schemaDatabase,schemaColumn;
     private SchemaHold schemaHold;
+    private DistributedStoragePool schemaStorage;
     private int schemaSlots;
     // Queue-time schema authority invalidation; ordinary DATA generation changes only on native apply.
     private long schemaConfigurationStamp; // guarded by admissions
     private volatile boolean schemaConfigurationPending;
     private static final class SchemaHold {
-        final RatisSchemaFenceRecord record;
+        final Object record;
+        ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
+        DistributedStoragePool.SchemaInstallPlan installPlan;
+        RatisSchemaActivateRecord activation;
         final long term,generation,configurationStamp;
         final ProposalFootprints.GateLease lease;
-        boolean reading=true,qualified,submitted,maybeAppended,invalidated,released;
+        boolean reading=true,qualified,submitted,maybeAppended,invalidated,released,nativeReady,cleaning;
+        final CompletableFuture<Void> cleanup=new CompletableFuture<>();
         int owners;
-        SchemaHold(RatisSchemaFenceRecord record,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease) {
+        SchemaHold(Object record,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease) {
             this.record=record; this.term=term; this.generation=generation; this.configurationStamp=configurationStamp; this.lease=lease;
         }
+    }
+    List<ReplicatedRangeStore.ActivatedSchema> schemaRoutingHistory() throws org.rocksdb.RocksDBException {
+        requireDataRole(); return store.activatedSchemas();
+    }
+    void schemaActivated(java.util.function.BiConsumer<SchemaChange.Definition,NativeSchemaActivationProof> observer) {
+        requireDataRole();
+        if (getLifeCycleState()!=LifeCycle.State.NEW || schemaActivationObserver!=null) throw new IllegalStateException("Schema observer is fixed before initialization");
+        schemaActivationObserver=java.util.Objects.requireNonNull(observer);
+    }
+    Throwable schemaActivationObserverFailure() { return schemaActivationObserverFailure; }
+    private void refreshSessionAdmission(RangeDirectory directory) {
+        if (sessionEpochs==null) return;
+        UUID group=store.ownership().owner().groupId();
+        var floor=sessionEpochs.floorAdmission(directory,group); var control=sessionEpochs.sessionControlAdmission(directory,group);
+        var installed=store.schemaInstallation();
+        var sourceControl=installed==null ? null : sessionEpochs.sessionControlAdmission(installed.definition().sourceDirectory(),group);
+        epochFloorAdmission=command -> {
+            if (command.sessionControl()==null) { floor.accept(command); return; }
+            if (sourceControl!=null && store.pendingSchemaControl(command)) sourceControl.accept(command);
+            else control.accept(command);
+        };
+    }
+    private void publishSchemaActivation(AppliedRecord applied) {
+        if (applied==null || applied.activation()==null || schemaActivationObserver==null) return;
+        try { schemaActivationObserver.accept(applied.definition(),applied.activation()); }
+        catch (Throwable failure) { schemaActivationObserverFailure=failure; }
+    }
+    void schemaStorage(DistributedStoragePool pool) {
+        requireDataRole();
+        if (getLifeCycleState()!=LifeCycle.State.NEW || schemaStorage!=null) throw new IllegalStateException("Schema storage is fixed before initialization");
+        schemaStorage=java.util.Objects.requireNonNull(pool);
+    }
+    private void requireSchemaGroup(UUID group) {
+        requireDataRole();
+        if (!group.equals(store.ownership().owner().groupId())) throw new IllegalArgumentException("Schema operation addresses another DATA group");
     }
     void schemaAuthority(SchemaAuthorityReader reader) {
         requireDataRole();
@@ -163,11 +209,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         schemaCluster=java.util.Objects.requireNonNull(cluster); schemaDatabase=java.util.Objects.requireNonNull(database); schemaColumn=java.util.Objects.requireNonNull(column);
     }
     private void requireSchemaRecord(RatisSchemaFenceRecord record) {
-        requireDataRole();
-        if (!record.groupId().equals(store.ownership().owner().groupId())) throw new IllegalArgumentException("Schema fence addresses another DATA group");
+        requireSchemaGroup(record.groupId());
     }
     private NativeSchemaFence schemaProof(RatisSchemaFenceRecord record) {
-        requireSchemaRecord(record); var proof=store.schemaFence();
+        requireSchemaRecord(record); var proof=store.lookupSchemaFence(record.header());
         if (proof!=null) {
             proof.requireHeader(record.header());
             if (!proof.participant().groupId().equals(record.groupId())) throw new IllegalArgumentException("Schema proof group changed");
@@ -178,7 +223,24 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     // A pending authority lookup keeps its bounded input charged until the lookup exits.
     private void releaseSchemaHold(SchemaHold hold) {
         hold.released=true; if (hold.lease!=null) proposalFootprints.release(hold.lease);
-        if (!hold.reading && schemaHold==hold) { schemaHold=null; schemaSlots--; }
+        if (hold.reading || hold.cleaning) return;
+        var plan=hold.installPlan; var capture=hold.captureGate;
+        if (plan==null && capture==null) {
+            if (schemaHold==hold) { schemaHold=null; schemaSlots--; }
+            hold.cleanup.complete(null); return;
+        }
+        hold.cleaning=true; hold.installPlan=null; hold.captureGate=null;
+        // Enqueue only: pool-owned actual cleanup never acquires native mutation while Raft monitors are held.
+        schemaStorage.submitSchemaCleanup(plan,capture).whenComplete((unused,failure) -> {
+            synchronized (admissions) {
+                if (failure==null) { if (schemaHold==hold) { schemaHold=null; schemaSlots--; } }
+                else storageFailure=failure;
+            }
+            if (failure==null) hold.cleanup.complete(null); else hold.cleanup.completeExceptionally(failure);
+        });
+    }
+    CompletableFuture<Void> schemaCleanup() {
+        synchronized (admissions) { return schemaHold!=null && schemaHold.released ? schemaHold.cleanup.copy() : CompletableFuture.completedFuture(null); }
     }
     private void requireSchemaSource(RatisSchemaFenceRecord record,RatisSchemaAuthority.View view) throws Exception {
         var header=record.header(); var directory=view.directory(); var head=view.head();
@@ -191,7 +253,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             return high!=0 ? high : Long.compareUnsigned(first.getLeastSignificantBits(),second.getLeastSignificantBits());
         })).toList();
         if (!lineage.equals(header.participants())) throw new IllegalArgumentException("Schema source participant lineage changed");
-        var descriptor=directory.ranges().stream().filter(r -> r.groupId().equals(record.groupId())).findFirst().orElseThrow();
+        requireSchemaOwnership(directory,record.groupId());
+    }
+    private void requireSchemaOwnership(RangeDirectory directory,UUID group) throws Exception {
+        var descriptor=directory.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow();
         var ownership=store.ownership(); var interval=ownership.interval(); var cfg=store.configuration();
         if (cfg!=null) {
             var nativeConfiguration=RaftConfigurationProto.parseFrom(cfg.data());
@@ -270,6 +335,132 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             return transaction;
         }
     }
+    private NativeSchemaInstallProof schemaInstallProof(RatisSchemaInstallRecord record) throws org.rocksdb.RocksDBException {
+        requireSchemaGroup(record.groupId());
+        var retained=store.lookupSchemaInstallationRecord(record.header());
+        if (retained==null) return null;
+        retained.requireDefinition(record.definition());
+        if (!retained.fence().position().equals(record.expectedFencePosition())
+                || record.header().kind()==SchemaChange.Kind.CREATE_COLUMN
+                && (!record.changedPhysicalName().equals(retained.targetNames().get(record.header().changedColumnId()))
+                || record.mergeAdmission()!=retained.targetMerges().contains(record.header().changedColumnId())))
+            throw new IllegalArgumentException("Original installation binding changed");
+        return retained.proof();
+    }
+    private NativeSchemaActivationProof schemaActivationProof(RatisSchemaActivateRpc.Request request) {
+        requireSchemaGroup(request.groupId());
+        var proof=store.lookupSchemaActivation(request.header());
+        if (proof!=null && !proof.installation().position().equals(request.expectedInstallPosition())) throw new IllegalArgumentException("Original activation installation changed");
+        return proof;
+    }
+    private byte[] schemaRecovered(Object record) throws org.rocksdb.RocksDBException {
+        byte[] result;
+        if (record instanceof RatisSchemaFenceRecord fence) { var proof=schemaProof(fence); result=proof==null ? null : proof.encode(); }
+        else if (record instanceof RatisSchemaInstallRecord install) { var proof=schemaInstallProof(install); result=proof==null ? null : proof.encode(); }
+        else {
+            var activate=record instanceof RatisSchemaActivateRecord a ? a : null;
+            var request=activate==null ? (RatisSchemaActivateRpc.Request)record : new RatisSchemaActivateRpc.Request(activate.header(),activate.groupId(),activate.expectedInstallPosition());
+            var proof=schemaActivationProof(request);
+            if (proof!=null && activate!=null && (!proof.catalogueGroup().equals(activate.catalogueGroup()) || !proof.cataloguePosition().equals(activate.cataloguePosition()))) throw new IllegalArgumentException("Original activation publication changed");
+            result=proof==null ? null : proof.encode();
+        }
+        if (result!=null) synchronized (admissions) {
+            if (schemaHold!=null && (schemaHold.record.equals(record) || schemaHold.activation!=null && schemaHold.activation.equals(record))) releaseSchemaHold(schemaHold);
+        }
+        return result;
+    }
+    private SchemaHold reserveSchemaLifecycle(Object record,Leadership owner,long generation) throws IOException {
+        synchronized (admissions) {
+            reconcileOlderProposalTerms(owner.term());
+            if (schemaConfigurationPending) throw new IOException("Schema operation waits for queued configuration apply");
+            if (schemaHold!=null) {
+                var hold=schemaHold;
+                if (!hold.record.equals(record) || hold.invalidated || hold.released || hold.term!=owner.term() || hold.generation!=generation || hold.configurationStamp!=schemaConfigurationStamp || hold.reading || !hold.qualified)
+                    throw new IOException("Schema preparation already owns protected input");
+                if (hold.lease!=null && !proposalFootprints.drained(hold.lease) || hold.captureGate!=null && !hold.captureGate.ready()) throw new IOException("Schema predecessors have not drained");
+                hold.nativeReady=true; return hold;
+            }
+            if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
+            var spans=store.ownership().interval().columns().stream().map(c -> TransactionScope.Span.range(c,null,null)).toList();
+            var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),owner.term(),generation);
+            if (lease==null) throw new IOException("Conflicting DATA gate owns schema admission");
+            var hold=new SchemaHold(record,owner.term(),generation,schemaConfigurationStamp,lease); schemaHold=hold; schemaSlots++; return hold;
+        }
+    }
+    private void requireSchemaLifecycleOwner(SchemaHold hold) throws IOException {
+        if (schemaHold!=hold || hold.invalidated || hold.released || hold.generation!=admissionGeneration.get() || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp)
+            throw new IOException("Schema preparation lost its authority owner");
+    }
+    private void prepareSchemaInstall(RatisSchemaInstallRecord record) throws Exception {
+        requireSchemaGroup(record.groupId()); checkTransactionOwner(); if (schemaRecovered(record)!=null) return;
+        if (schemaStorage==null || schemaAuthority==null) throw new IOException("Schema installation is not configured");
+        var hold=reserveSchemaLifecycle(record,leadership(),admissionGeneration.get());
+        if (!hold.reading) return;
+        boolean qualified=false;
+        try {
+            hold.captureGate=store.prepareSchemaInstallation(record.header());
+            var names=new java.util.HashMap<>(schemaStorage.schemaPhysicalNames(store));
+            var merges=new java.util.HashSet<>(store.deterministicMergeColumns());
+            if (record.header().kind()==SchemaChange.Kind.CREATE_COLUMN) {
+                names.put(record.header().changedColumnId(),record.changedPhysicalName());
+                if (record.mergeAdmission()) merges.add(record.header().changedColumnId());
+            } else { names.remove(record.header().changedColumnId()); merges.remove(record.header().changedColumnId()); }
+            hold.installPlan=schemaStorage.prepareSchemaInstallation(store,record.definition(),names,merges);
+            var authority=schemaAuthority.read(record.header());
+            if (authority.head()==null || authority.head().status().phase()!=SchemaChange.Phase.FENCED && authority.head().status().phase()!=SchemaChange.Phase.INSTALLED) throw new IllegalArgumentException("INSTALL lacks fenced catalogue authority");
+            requireSchemaSource(new RatisSchemaFenceRecord(record.header(),record.groupId()),authority);
+            var fence=store.lookupSchemaFence(record.header());
+            if (fence==null || !fence.position().equals(record.expectedFencePosition())) throw new IllegalArgumentException("INSTALL original native fence changed");
+            checkTransactionOwner();
+            synchronized (admissions) {
+                requireSchemaLifecycleOwner(hold); hold.qualified=true; qualified=true;
+                if (!proposalFootprints.drained(hold.lease) || !hold.captureGate.ready()) throw new IOException("Schema installation predecessors have not drained");
+                hold.nativeReady=true;
+            }
+        } finally { synchronized (admissions) { hold.reading=false; if (!qualified || hold.invalidated || hold.released) releaseSchemaHold(hold); } }
+    }
+    private RatisSchemaActivateRecord prepareSchemaActivate(RatisSchemaActivateRpc.Request request) throws Exception {
+        requireSchemaGroup(request.groupId()); checkTransactionOwner();
+        var saved=schemaActivationProof(request);
+        if (saved!=null) return new RatisSchemaActivateRecord(request.header(),request.groupId(),request.expectedInstallPosition(),saved.catalogueGroup(),saved.cataloguePosition());
+        if (schemaAuthority==null) throw new IOException("Schema activation is not configured");
+        var hold=reserveSchemaLifecycle(request,leadership(),admissionGeneration.get());
+        if (!hold.reading) return hold.activation;
+        boolean qualified=false;
+        try {
+            var install=store.lookupSchemaInstallationRecord(request.header());
+            if (install==null || !install.position().equals(request.expectedInstallPosition())) throw new IllegalArgumentException("ACTIVATE original installation changed");
+            var authority=schemaAuthority.read(request.header()); var directory=authority.directory(); var head=authority.head();
+            if (!authority.request().equals(new RatisSchemaAuthority.Request(request.header().clusterId(),request.header().databaseId(),request.header().domainId()))
+                    || head==null || head.status().phase()!=SchemaChange.Phase.PUBLISHED
+                    || !Arrays.equals(head.status().header().encode(),request.header().encode()) || directory==null
+                    || !Arrays.equals(directory.payloadDigest(),request.header().targetDirectoryDigest())
+                    || !Arrays.equals(directory.payloadDigest(),install.definition().targetDirectory().payloadDigest())) throw new IllegalArgumentException("ACTIVATE lacks exact published catalogue authority");
+            requireSchemaOwnership(directory,request.groupId());
+            var record=new RatisSchemaActivateRecord(request.header(),request.groupId(),request.expectedInstallPosition(),authority.catalogueGroup(),authority.position());
+            checkTransactionOwner();
+            synchronized (admissions) { requireSchemaLifecycleOwner(hold); hold.activation=record; hold.qualified=true; qualified=true; }
+            return record;
+        } finally { synchronized (admissions) { hold.reading=false; if (!qualified || hold.invalidated || hold.released) releaseSchemaHold(hold); } }
+    }
+    private void cancelSchemaLifecycle(Object record) {
+        synchronized (admissions) { var hold=schemaHold; if (hold!=null && hold.record.equals(record) && !hold.submitted) { hold.invalidated=true; releaseSchemaHold(hold); } }
+    }
+    private TransactionContext startSchemaLifecycle(TransactionContext transaction,Object record,long generation,Leadership leader) throws Exception {
+        var saved=schemaRecovered(record);
+        synchronized (admissions) {
+            if (schemaConfigurationPending) throw new IOException("Schema append waits for queued configuration apply");
+            if (saved!=null && schemaHold==null) {
+                if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
+                schemaHold=new SchemaHold(record,leader.term(),generation,schemaConfigurationStamp,null); schemaHold.reading=false; schemaHold.qualified=true; schemaSlots++;
+            }
+            var hold=schemaHold;
+            if (hold==null || !(hold.record.equals(record) || hold.activation!=null && hold.activation.equals(record)) || hold.reading || !hold.qualified || hold.invalidated || hold.released
+                    || hold.term!=leader.term() || hold.generation!=generation || hold.configurationStamp!=schemaConfigurationStamp || generation!=admissionGeneration.get()
+                    || hold.lease!=null && !proposalFootprints.drained(hold.lease) || hold.captureGate!=null && !hold.nativeReady) throw new IOException("Schema operation lacks drained current-owner preparation");
+            hold.submitted=true; hold.owners++; transaction.setStateMachineContext(hold); return transaction;
+        }
+    }
     private void requireDataRole() { if (role!=RatisNodePlan.Role.DATA) throw new IllegalStateException("Range role does not support DATA transaction/snapshot operations"); }
     void homeRecoveryData(RatisRoutedClient data) {
         java.util.Objects.requireNonNull(data);
@@ -313,6 +504,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private void requireRoleRecord(byte[] encoded) {
         if (RatisSchemaFenceRecord.isFence(encoded)) { requireSchemaRecord(RatisSchemaFenceRecord.decode(encoded)); return; }
+        if (RatisSchemaInstallRecord.isInstall(encoded)) { requireSchemaGroup(RatisSchemaInstallRecord.decode(encoded).groupId()); return; }
+        if (RatisSchemaActivateRecord.isActivate(encoded)) { requireSchemaGroup(RatisSchemaActivateRecord.decode(encoded).groupId()); return; }
         if (RatisSnapshotHomeRetirementRecord.isRetirement(encoded)) { requireSnapshotHomeIdentity(RatisSnapshotHomeRetirementRecord.decode(encoded).identity()); return; }
         if (RatisSnapshotRetirementRecord.isRetirement(encoded)) { requireDataRole(); return; }
         if (RatisHomeRetirementRecord.isRetirement(encoded)) { requireHomeRetirement(RatisHomeRetirementRecord.decode(encoded)); return; }
@@ -597,6 +790,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final TreeMap<Long, ConfigurationEntry> configurations = new TreeMap<>();
     private final TreeMap<Long, Long> pendingNoops = new TreeMap<>();
     private long deferredBytes;
+    private SchemaApply schemaApply;
+    private static final class SchemaApply {
+        final long index; final Deferred deferred; final RatisSchemaInstallRecord record;
+        ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
+        DistributedStoragePool.SchemaInstallPlan plan; boolean running,suspended,stageReady,cancelled;
+        byte[] coveredResult;
+        SchemaApply(long index,Deferred deferred,RatisSchemaInstallRecord record) { this.index=index; this.deferred=deferred; this.record=record; }
+        void close() { if (plan!=null) plan.close(); if (captureGate!=null) captureGate.close(); }
+    }
     private final Object durabilityGate = new Object();
     private Path raftRoot;
     private Path snapshotTmp;
@@ -644,9 +846,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || !Arrays.equals(store.schemaDigest(),directory.schemaDigest())
                 || !Arrays.equals(interval.lowerInclusive(),descriptor.lowerInclusive())
                 || !Arrays.equals(interval.upperExclusive(),descriptor.upperExclusive())) throw new IllegalArgumentException("Session directory differs from native range");
-        return new RatisRangeStateMachine(store,group,limits,validator,
+        var machine=new RatisRangeStateMachine(store,group,limits,validator,
                 command -> { if (command.sessionControl()!=null) control.accept(command); else floor.accept(command); },
                 retentionLimits,leadershipSource,true);
+        machine.sessionEpochs=epochs; machine.refreshSessionAdmission(directory); return machine;
     }
 
     // Explicit view injection is only for ordinary in-process fixtures without a running Raft division.
@@ -744,7 +947,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var a = store.applied();
         if (a != null && (cfg.index() > a.index() || cfg.term() > a.term())) throw new IOException("Native configuration exceeds completed marker");
         validateConfiguration(cfg.data());
-        if (schemaHold!=null && store.schemaFence()!=null) schemaProof(schemaHold.record);
+        if (schemaHold!=null) schemaRecovered(schemaHold.record);
         setLastAppliedTermIndex(a == null ? TermIndex.INITIAL_VALUE : TermIndex.valueOf(a.term(), a.index()));
     }
 
@@ -755,7 +958,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private NativeRangeImage.Manifest validateImage(Path image, TermIndex position) throws IOException {
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         NativeRangeImage.RowVisitor visitor = (section, column, key, value) -> {
-            if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x27 && (key[16]&255)<=0x2a) throw new IllegalArgumentException("Non-DATA image contains schema transition state");
+            if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x27 && (key[16]&255)<=0x2b) throw new IllegalArgumentException("Non-DATA image contains schema transition state");
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x20 && (key[16]&255)<=0x24) throw new IllegalArgumentException("Non-DATA image contains participant/snapshot state");
             if (role!=RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && ((key[16]&255)==0x25 || (key[16]&255)==0x26)) throw new IllegalArgumentException("Image role rejects protected HOME recovery receipts");
             if (role==RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)==0x25) {
@@ -782,18 +985,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         boolean currentSchema=manifest.interval().equals(store.ownership().interval())
                 && Arrays.equals(manifest.schemaDigest(),store.schemaDigest())
                 && manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns());
-        var installed=store.schemaInstallation();
-        boolean precedingSchema=false;
-        if (installed!=null && manifest.position().index()<installed.position().index()
-                && manifest.position().term()<=installed.position().term()) {
-            var source=installed.definition().sourceSchema();
-            var descriptor=installed.definition().sourceDirectory().ranges().stream()
-                    .filter(range -> range.groupId().equals(manifest.owner().groupId())).findFirst().orElseThrow();
-            precedingSchema=manifest.owner().epoch()==descriptor.rangeEpoch()
-                    && manifest.interval().equals(new RangeOwnership.Interval(source.domainId(),source.columnIds(),descriptor.lowerInclusive(),descriptor.upperExclusive()))
-                    && Arrays.equals(manifest.schemaDigest(),source.digest())
-                    && manifest.deterministicMergeColumns().equals(installed.sourceMerges());
-        }
+        boolean precedingSchema=store.qualifiedHistoricalImage(manifest);
         if (!manifest.owner().equals(store.ownership().owner())
                 || !currentSchema && !precedingSchema
                 || manifest.position().term() != position.getTerm() || manifest.position().index() != position.getIndex()) {
@@ -867,7 +1059,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
         try { capturedSnapshots.close(); } catch (Exception failure) { storageFailure=failure; }
         IOException failure = new IOException("Range is shutting down");
-        synchronized (gate) { storageFailure = failure; store.fence(); }
+        SchemaApply abandoned=null;
+        synchronized (gate) {
+            storageFailure = failure; store.fence();
+            if (schemaApply!=null) { schemaApply.cancelled=true; if (!schemaApply.running) abandoned=schemaApply; schemaApply=null; }
+        }
+        if (abandoned!=null) abandoned.close();
         failDeferred(failure);
     }
 
@@ -1006,7 +1203,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates(); store.invalidateScopedSnapshots();
         var completions = new java.util.ArrayList<Completion>();
         var coveredOperations = new java.util.ArrayList<OperationId>();
-        IOException failure = null;
+        IOException failure = null; SchemaApply covered=null; boolean closeCovered=false;
         synchronized (gate) {
             getLifeCycle().transition(LifeCycle.State.STARTING);
             try {
@@ -1049,6 +1246,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         if (admission != null) settleAdmission(admission);
                     }
                 }
+                var installed=store.schemaInstallation();
+                if (installed!=null) refreshSessionAdmission(installed.definition().targetDirectory());
+                if (schemaApply!=null && schemaApply.index<=a.index()) {
+                    var original=schemaInstallProof(schemaApply.record);
+                    if (original==null) throw new IOException("Covered INSTALL lacks original native proof");
+                    covered=schemaApply; covered.coveredResult=original.encode(); closeCovered=!covered.running; schemaApply=null;
+                }
                 getLifeCycle().transition(LifeCycle.State.RUNNING);
             } catch (Exception problem) { failure = failRecovery(problem); }
         }
@@ -1059,6 +1263,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             throw failure;
         }
         for (var completion : completions) completion.future().complete(completion.result());
+        SchemaApply resume;
+        synchronized (gate) { resume=schemaApply; }
+        if (covered!=null && closeCovered) covered.close();
+        if (resume!=null && resume.suspended) scheduleSchemaApply(resume,resume.stageReady);
     }
 
     private IOException failRecovery(Exception failure) {
@@ -1092,6 +1300,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray(); requireRoleRecord(encoded);
             if (RatisSchemaFenceRecord.isFence(encoded)) return startSchemaFence(transaction,RatisSchemaFenceRecord.decode(encoded),generation,leadership);
+            if (RatisSchemaInstallRecord.isInstall(encoded)) return startSchemaLifecycle(transaction,RatisSchemaInstallRecord.decode(encoded),generation,leadership);
+            if (RatisSchemaActivateRecord.isActivate(encoded)) return startSchemaLifecycle(transaction,RatisSchemaActivateRecord.decode(encoded),generation,leadership);
             if (RatisSnapshotHomeRetirementRecord.isRetirement(encoded)) return startSnapshotHomeRetirement(transaction,RatisSnapshotHomeRetirementRecord.decode(encoded),encoded,generation,leadership);
             if (RatisSnapshotRetirementRecord.isRetirement(encoded)) return startSnapshotRetirement(transaction,RatisSnapshotRetirementRecord.decode(encoded),encoded,generation,leadership);
             if (RatisHomeRetirementRecord.isRetirement(encoded)) return startHomeRetirement(transaction,RatisHomeRetirementRecord.decode(encoded),encoded,generation,leadership);
@@ -1126,7 +1336,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     throw new IllegalStateException("Current-term startup prefix has not completed native apply");
                 }
                 // Previously committed outcomes and expired identities cannot advance the fence.
-                if (originalEstimate.newReceipt() && command.minimumSessionEpoch() >= 0) epochFloorAdmission.accept(command);
+                if (originalEstimate.newReceipt() && command.minimumSessionEpoch() >= 0 && !store.canonicalStaleSchemaControl(command)) epochFloorAdmission.accept(command);
                 synchronized (admissions) {
                     var estimate=originalEstimate;
                     requireHealthy();
@@ -1455,7 +1665,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                             || !current.ready() || hold.term!=current.term() || hold.generation!=admissionGeneration.get()
                             || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp
                             || nativePosition==null || nativePosition.term()!=current.term() || !store.admissionOpen()
-                            || hold.lease!=null && !proposalFootprints.drained(hold.lease)) throw new IOException("Schema fence lost append owner");
+                            || hold.lease!=null && !proposalFootprints.drained(hold.lease)
+                            || hold.captureGate!=null && !hold.nativeReady) throw new IOException("Schema operation lost append owner");
                     return super.preAppendTransaction(transaction);
                 }
                 if (!(transaction.getStateMachineContext() instanceof Admission admission)
@@ -1476,12 +1687,29 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
 
-    private record AppliedRecord(OperationId operation,byte[] result) {}
+    private record AppliedRecord(OperationId operation,byte[] result,SchemaChange.Definition definition,NativeSchemaActivationProof activation) {
+        AppliedRecord(OperationId operation,byte[] result) { this(operation,result,null,null); }
+    }
     private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
         if (RatisSchemaFenceRecord.isFence(encoded)) {
             var record=RatisSchemaFenceRecord.decode(encoded); var proof=store.applySchemaFence(positionArg,record.header()); schemaProof(record);
             return new AppliedRecord(null,proof.encode());
+        }
+        if (RatisSchemaActivateRecord.isActivate(encoded)) {
+            var record=RatisSchemaActivateRecord.decode(encoded);
+            var install=store.lookupSchemaInstallation(record.header());
+            if (install==null || !install.position().equals(record.expectedInstallPosition())) throw new IllegalArgumentException("Activation original installation changed");
+            boolean fresh=store.lookupSchemaActivation(record.header())==null;
+            var proof=store.applySchemaActivation(positionArg,install,record.catalogueGroup(),record.cataloguePosition());
+            var current=store.schemaInstallation();
+            if (current!=null && current.definition().changeId().equals(record.header().changeId())) {
+                var directory=current.definition().targetDirectory();
+                schemaDescriptor=directory.ranges().stream().filter(r -> r.groupId().equals(record.groupId())).findFirst().orElseThrow();
+                refreshSessionAdmission(directory);
+            }
+            boolean notify=fresh && current!=null && current.definition().changeId().equals(record.header().changeId());
+            schemaRecovered(record); return new AppliedRecord(null,proof.encode(),notify ? current.definition() : null,notify ? proof : null);
         }
         if (RatisSnapshotHomeRetirementRecord.isRetirement(encoded)) {
             var retirement=RatisSnapshotHomeRetirementRecord.decode(encoded); store.applySnapshotHomeRetirement(positionArg,retirement);
@@ -1528,6 +1756,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
         if (RatisSchemaFenceRecord.isFence(encoded)) { var proof=schemaProof(RatisSchemaFenceRecord.decode(encoded)); return new AppliedRecord(null,proof==null ? null : proof.encode()); }
+        if (RatisSchemaInstallRecord.isInstall(encoded)) return new AppliedRecord(null,schemaRecovered(RatisSchemaInstallRecord.decode(encoded)));
+        if (RatisSchemaActivateRecord.isActivate(encoded)) return new AppliedRecord(null,schemaRecovered(RatisSchemaActivateRecord.decode(encoded)));
         if (RatisSnapshotHomeRetirementRecord.isRetirement(encoded)) {
             var retirement=RatisSnapshotHomeRetirementRecord.decode(encoded);
             return new AppliedRecord(RatisSnapshotHomeRetirementRecord.operation(retirement),store.snapshotHomeRetired(retirement) ? new it.cavallium.rockserver.core.common.distributed.CommandResult(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,List.of()).encode() : null);
@@ -1569,6 +1799,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         Deferred completion = null;
         Message result = null;
         Throwable failure = null;
+        SchemaApply schedule=null; CompletableFuture<Message> waiting=null; AppliedRecord appliedRecord=null;
         synchronized (gate) {
             try {
                 if (storageFailure != null) requireHealthy();
@@ -1581,17 +1812,18 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (pending != null && (pending.term() != entry.getTerm() || !Arrays.equals(pending.encoded(), encoded))) {
                     throw new IllegalStateException("Deferred/replayed log identity changed");
                 }
-                if (getLifeCycleState() != LifeCycle.State.RUNNING) {
+                if (getLifeCycleState() != LifeCycle.State.RUNNING || schemaApply!=null || RatisSchemaInstallRecord.isInstall(encoded)) {
                     if (pending == null) {
-                        if (deferred.size() >= 1024 || deferredBytes + encoded.length > 16L * 1024 * 1024) {
-                            throw new IllegalStateException("Paused apply budget exhausted");
-                        }
+                        if (deferred.size() >= 1024 || deferredBytes + encoded.length > 16L * 1024 * 1024) throw new IllegalStateException("Deferred apply budget exhausted");
                         pending = new Deferred(entry.getTerm(), encoded, new CompletableFuture<>());
                         deferred.put(entry.getIndex(), pending); deferredBytes += encoded.length;
                     }
-                    return pending.future().whenComplete((message, problem) -> releaseAdmission(transaction));
-                }
-                var applied=applyRecord(new ApplyPosition(entry.getTerm(),entry.getIndex()),encoded);
+                    waiting=pending.future().whenComplete((message, problem) -> releaseAdmission(transaction));
+                    if (schemaApply==null && getLifeCycleState()==LifeCycle.State.RUNNING && deferred.firstKey()==entry.getIndex()) {
+                        schemaApply=new SchemaApply(entry.getIndex(),pending,RatisSchemaInstallRecord.decode(encoded)); schedule=schemaApply;
+                    }
+                } else {
+                var applied=applyRecord(new ApplyPosition(entry.getTerm(),entry.getIndex()),encoded); appliedRecord=applied;
                 byte[] bytes=applied.result();
                 synchronized (admissions) {
                     var admitted = admissions.get(applied.operation());
@@ -1603,18 +1835,115 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     deferred.remove(entry.getIndex()); deferredBytes -= pending.encoded().length;
                     completion = pending;
                 }
+                }
             } catch (Throwable problem) {
                 storageFailure = problem;
                 failure = problem;
             }
         }
+        if (waiting!=null && failure==null) { if (schedule!=null) scheduleSchemaApply(schedule,false); return waiting; }
         releaseAdmission(transaction);
         if (failure != null) {
             failDeferred(failure);
             return CompletableFuture.failedFuture(failure);
         }
+        publishSchemaActivation(appliedRecord);
         if (completion != null) completion.future().complete(result);
         return CompletableFuture.completedFuture(result);
+    }
+
+    private void scheduleSchemaApply(SchemaApply work,boolean ready) {
+        var executor=proofQueries;
+        if (executor==null) { failSchemaApply(work,new IOException("Bounded schema apply dispatcher is not configured")); return; }
+        byte[] input=ByteBuffer.allocate(17+work.deferred.encoded().length).putLong(work.deferred.term()).putLong(work.index).put((byte)(ready ? 1 : 0)).put(work.deferred.encoded()).array();
+        executor.submit(store.ownership().owner().groupId(),input,false,ignored -> {
+            synchronized (gate) {
+                if (schemaApply!=work || work.cancelled) return Message.EMPTY;
+                if (storageFailure!=null) requireHealthy();
+                if (getLifeCycleState()!=LifeCycle.State.RUNNING) { work.suspended=true; work.stageReady=ready; return Message.EMPTY; }
+                work.running=true; work.suspended=false;
+            }
+            try {
+            if (!ready) {
+                var saved=schemaInstallProof(work.record);
+                if (saved!=null) { store.applyNoop(new ApplyPosition(work.deferred.term(),work.index)); return finishSchemaApply(work,saved.encode()); }
+                if (schemaStorage==null) throw new IOException("Schema installation storage is not configured");
+                synchronized (admissions) {
+                    if (schemaHold!=null && schemaHold.record.equals(work.record) && schemaHold.installPlan!=null) {
+                        work.plan=schemaHold.installPlan; work.captureGate=schemaHold.captureGate;
+                        schemaHold.installPlan=null; schemaHold.captureGate=null;
+                    }
+                }
+                if (work.captureGate==null) work.captureGate=store.prepareSchemaInstallation(work.record.header());
+                if (work.plan==null) {
+                    var names=new java.util.HashMap<>(schemaStorage.schemaPhysicalNames(store)); var merges=new java.util.HashSet<>(store.deterministicMergeColumns());
+                    if (work.record.header().kind()==SchemaChange.Kind.CREATE_COLUMN) {
+                        names.put(work.record.header().changedColumnId(),work.record.changedPhysicalName());
+                        if (work.record.mergeAdmission()) merges.add(work.record.header().changedColumnId());
+                    } else { names.remove(work.record.header().changedColumnId()); merges.remove(work.record.header().changedColumnId()); }
+                    work.plan=schemaStorage.prepareSchemaInstallation(store,work.record.definition(),names,merges);
+                }
+                var fence=store.lookupSchemaFence(work.record.header());
+                if (fence==null || !fence.position().equals(work.record.expectedFencePosition())) throw new IllegalArgumentException("Committed installation original fence changed");
+                if (!work.captureGate.ready()) {
+                    work.captureGate.readyFuture().whenComplete((unused,failure) -> { if (failure!=null) failSchemaApply(work,failure); else scheduleSchemaApply(work,true); });
+                    return Message.EMPTY;
+                }
+            }
+            // No Ratis gate or admission monitor owns JNI schema mutation or waits for retained pins.
+            var installed=schemaStorage.installSchema(store,new ApplyPosition(work.deferred.term(),work.index),work.plan);
+            return finishSchemaApply(work,installed.proof().encode());
+            } finally { boolean close; synchronized (gate) { work.running=false; close=work.cancelled || work.coveredResult!=null; } if (close) work.close(); }
+        }).whenComplete((ignored,failure) -> { if (failure!=null) failSchemaApply(work,failure); });
+    }
+    private Message finishSchemaApply(SchemaApply work,byte[] bytes) throws Exception {
+        var completions=new java.util.ArrayList<Completion>(); var activations=new java.util.ArrayList<AppliedRecord>(); SchemaApply next=null;
+        var result=Message.valueOf(ByteString.copyFrom(bytes));
+        try {
+        synchronized (gate) {
+            if (schemaApply!=work || deferred.get(work.index)!=work.deferred) {
+                var cut=store.applied(); var original=schemaInstallProof(work.record);
+                if (work.coveredResult!=null && original!=null && Arrays.equals(work.coveredResult,bytes) && Arrays.equals(original.encode(),bytes)
+                        && cut!=null && cut.index()>=work.index && cut.term()>=work.deferred.term()
+                        && (cut.index()!=work.index || cut.term()==work.deferred.term())) return result;
+                throw new IOException("Schema apply lost native ordered owner");
+            }
+            var current=store.schemaInstallation();
+            if (current!=null && current.definition().changeId().equals(work.record.header().changeId())) refreshSessionAdmission(current.definition().targetDirectory());
+            schemaRecovered(work.record); advance(work.deferred.term(),work.index);
+            deferred.remove(work.index); deferredBytes-=work.deferred.encoded().length; schemaApply=null;
+            completions.add(new Completion(work.deferred.future(),result));
+            while (getLifeCycleState()==LifeCycle.State.RUNNING && (!deferred.isEmpty() || !pendingNoops.isEmpty())) {
+                long data=deferred.isEmpty() ? Long.MAX_VALUE : deferred.firstKey(); long metadata=pendingNoops.isEmpty() ? Long.MAX_VALUE : pendingNoops.firstKey();
+                if (metadata<data) {
+                    long term=pendingNoops.remove(metadata); var cfg=configurations.remove(metadata);
+                    if (cfg!=null && cfg.term()!=term) throw new IOException("Deferred configuration term changed");
+                    if (cfg!=null) { admissionGeneration.incrementAndGet(); invalidateProposalCandidates(); }
+                    store.applyNoop(new ApplyPosition(term,metadata),cfg==null ? null : cfg.bytes()); schemaConfigurationPending=!configurations.isEmpty(); advance(term,metadata); continue;
+                }
+                var pending=deferred.get(data);
+                if (RatisSchemaInstallRecord.isInstall(pending.encoded())) { next=new SchemaApply(data,pending,RatisSchemaInstallRecord.decode(pending.encoded())); schemaApply=next; break; }
+                var applied=applyRecord(new ApplyPosition(pending.term(),data),pending.encoded());
+                if (applied.activation()!=null) activations.add(applied);
+                synchronized (admissions) { var admission=admissions.get(applied.operation()); if (admission!=null) settleAdmission(admission); }
+                advance(pending.term(),data); deferred.remove(data); deferredBytes-=pending.encoded().length;
+                completions.add(new Completion(pending.future(),Message.valueOf(ByteString.copyFrom(applied.result()))));
+            }
+        }
+        work.close(); activations.forEach(this::publishSchemaActivation); for (var completion:completions) completion.future().complete(completion.result());
+        if (next!=null) scheduleSchemaApply(next,false); return result;
+        } catch (Exception failure) {
+            synchronized (gate) { storageFailure=failure; }
+            work.close();
+            // Native INSTALL and any successfully drained records retain their original receipts.
+            activations.forEach(this::publishSchemaActivation);
+            for (var completion:completions) completion.future().complete(completion.result());
+            work.deferred.future().completeExceptionally(failure); failDeferred(failure); throw failure;
+        }
+    }
+    private void failSchemaApply(SchemaApply work,Throwable failure) {
+        synchronized (gate) { if (schemaApply!=work) return; storageFailure=failure; schemaApply=null; }
+        work.close(); failDeferred(failure);
     }
 
     @Override public TransactionContext cancelTransaction(TransactionContext transaction) throws IOException {
@@ -2646,7 +2975,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (deferred.containsKey(index)) throw new IllegalStateException("Log entry changed from data to metadata");
                 var pending = pendingNoops.get(index);
                 if (pending != null && pending != term) throw new IllegalStateException("Metadata log identity changed");
-                if (getLifeCycleState() != LifeCycle.State.RUNNING) {
+                if (getLifeCycleState() != LifeCycle.State.RUNNING || schemaApply!=null) {
                     if (pending == null && pendingNoops.size() >= 1024) throw new IllegalStateException("Paused metadata budget exhausted");
                     pendingNoops.put(index, term);
                     return;
@@ -2699,7 +3028,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,payload))));
             }
             if (kind==ScopedTransactionRpc.SNAPSHOT_HELP) return snapshotHelpQuery(encoded,freshBarrier);
-            if (kind==ScopedTransactionRpc.SCHEMA_FENCE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
+            if (kind==ScopedTransactionRpc.SCHEMA_FENCE_PREPARE || kind==ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE || kind==ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {
                 // Reject before coalescing: a stale request must never borrow a fresh request's authority.
                 if (!freshBarrier) throw new IOException("Proof preparation requires a fresh linearizable barrier");
                 if (kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE) { if (role!=RatisNodePlan.Role.SNAPSHOT_HOME) throw new IOException("Only snapshot HOME prepares retirement"); }
@@ -2708,10 +3037,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 } else requireDataRole();
             }
             if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) requireDataRole();
-            if (kind==ScopedTransactionRpc.SCHEMA_FENCE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
+            if (kind==ScopedTransactionRpc.SCHEMA_FENCE_PREPARE || kind==ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE || kind==ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
                 var executor=proofQueries; if (executor==null) throw new IOException("Bounded proof query dispatcher is not configured");
                 long generation=admissionGeneration.get();
-                return executor.submit(store.ownership().owner().groupId(),encoded,kind!=ScopedTransactionRpc.SNAPSHOT_CAPTURE && kind!=ScopedTransactionRpc.SCHEMA_FENCE_PREPARE,ownedRequest -> {
+                return executor.submit(store.ownership().owner().groupId(),encoded,kind!=ScopedTransactionRpc.SNAPSHOT_CAPTURE && kind!=ScopedTransactionRpc.SCHEMA_FENCE_PREPARE && kind!=ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE && kind!=ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,ownedRequest -> {
                     // Owner-specific retained captures deliberately survive leader changes.
                     if (kind!=ScopedTransactionRpc.SNAPSHOT_CAPTURE && generation!=admissionGeneration.get()) throw new IOException("Proof query lost its read-barrier owner");
                     return framedQuery(ownedRequest,freshBarrier);
@@ -2898,9 +3227,31 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 else if (packet.kind()==ScopedTransactionRpc.SCHEMA_FENCE_CANCEL) cancelSchemaFence(record);
                 checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Schema query lost its owner");
                 if (packet.kind()!=ScopedTransactionRpc.SCHEMA_FENCE_STATE) return Message.valueOf(ByteString.copyFrom(RatisSchemaFenceRpc.preparedReply(packet.kind(),record)));
-                schemaProof(record); var state=store.schemaFenceReady();
+                var proof=schemaProof(record); var state=store.schemaFenceReady();
+                boolean historical=proof!=null && store.lookupSchemaInstallation(record.header())!=null;
                 checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Schema readiness lost its owner");
-                return Message.valueOf(ByteString.copyFrom(RatisSchemaFenceRpc.reply(packet.kind(),new RatisSchemaFenceRpc.State(record,state.fence(),state.snapshotPins(),state.preparedParticipants(),state.snapshotGates(),state.ready()))));
+                return Message.valueOf(ByteString.copyFrom(RatisSchemaFenceRpc.reply(packet.kind(),new RatisSchemaFenceRpc.State(record,proof,historical ? 0 : state.snapshotPins(),historical ? 0 : state.preparedParticipants(),historical ? 0 : state.snapshotGates(),historical || state.ready()))));
+            }
+            case ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE, ScopedTransactionRpc.SCHEMA_INSTALL_CANCEL, ScopedTransactionRpc.SCHEMA_INSTALL_STATE -> {
+                if (!freshBarrier) throw new IOException("Schema installation requires fresh linearizable barrier");
+                var record=RatisSchemaInstallRecord.decode(packet.body()); requireSchemaGroup(record.groupId()); checkTransactionOwner(); long generation=admissionGeneration.get();
+                if (packet.kind()==ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE) prepareSchemaInstall(record);
+                else if (packet.kind()==ScopedTransactionRpc.SCHEMA_INSTALL_CANCEL) cancelSchemaLifecycle(record);
+                checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Installation query lost its owner");
+                if (packet.kind()!=ScopedTransactionRpc.SCHEMA_INSTALL_STATE) return Message.valueOf(ByteString.copyFrom(RatisSchemaInstallRpc.preparedReply(packet.kind(),record)));
+                var proof=schemaInstallProof(record);
+                return Message.valueOf(ByteString.copyFrom(RatisSchemaInstallRpc.reply(packet.kind(),new RatisSchemaInstallRpc.State(record,proof,proof!=null))));
+            }
+            case ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE, ScopedTransactionRpc.SCHEMA_ACTIVATE_CANCEL, ScopedTransactionRpc.SCHEMA_ACTIVATE_STATE -> {
+                if (!freshBarrier) throw new IOException("Schema activation requires fresh linearizable barrier");
+                var request=RatisSchemaActivateRpc.Request.decode(packet.body()); requireSchemaGroup(request.groupId()); checkTransactionOwner(); long generation=admissionGeneration.get();
+                RatisSchemaActivateRecord record=null;
+                if (packet.kind()==ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE) record=prepareSchemaActivate(request);
+                else if (packet.kind()==ScopedTransactionRpc.SCHEMA_ACTIVATE_CANCEL) cancelSchemaLifecycle(request);
+                checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Activation query lost its owner");
+                if (packet.kind()!=ScopedTransactionRpc.SCHEMA_ACTIVATE_STATE) return Message.valueOf(ByteString.copyFrom(RatisSchemaActivateRpc.preparedReply(packet.kind(),request,record)));
+                var proof=schemaActivationProof(request);
+                return Message.valueOf(ByteString.copyFrom(RatisSchemaActivateRpc.reply(packet.kind(),new RatisSchemaActivateRpc.State(request,proof,proof!=null))));
             }
             case ScopedTransactionRpc.POINT -> {
                 var column=ScopedTransactionRpc.uuid(input); var key=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES-16,false); end(input);

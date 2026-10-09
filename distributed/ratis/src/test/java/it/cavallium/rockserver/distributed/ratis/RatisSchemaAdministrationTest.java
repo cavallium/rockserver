@@ -70,6 +70,7 @@ class RatisSchemaAdministrationTest {
         admin.execute(admin.prepareAdvance(operation(),head,head.status().fenced(group,new ApplyPosition(1,10)))); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.prepareAdvance(operation(),head,head.status().installed(group,new ApplyPosition(1,11)))); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.preparePublication(operation(),head,definition)); head=admin.readHead(head.status().header().domainId());
+        admin.execute(admin.prepareAdvance(operation(),head,head.status().activated(group,new ApplyPosition(1,12)))); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.prepareAdvance(operation(),head,head.status().retire())); return admin.readHead(head.status().header().domainId());
     }
 
@@ -92,6 +93,57 @@ class RatisSchemaAdministrationTest {
             var published=definition.targetDirectory(); var later=directory(target,published.generation()+1);
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepareAfterAdministration(operation(),published,later,closed)).status());
             assertEquals(0,f.closes.get());
+        }
+    }
+    @Test void publicationKeepsNextSchemaAndTopologyBlockedUntilEveryActivationIsRecorded() throws Exception {
+        try (var f=outer.new Fixture(root)) {
+            var client=client(f); var catalogue=catalogue(client); var admin=admin(client); var source=initial();
+            var first=outer.directory(outer.cluster).ranges().getFirst(); UUID secondGroup=new UUID(16,1);
+            var ranges=List.of(new RangeDescriptor(first.rangeId(),first.groupId(),first.rangeEpoch(),first.configurationVersion(),
+                            null,new byte[]{1},RangeDescriptor.TopologyState.ACTIVE,first.replicas()),
+                    new RangeDescriptor(new UUID(16,2),secondGroup,first.rangeEpoch(),first.configurationVersion(),
+                            new byte[]{1},null,RangeDescriptor.TopologyState.ACTIVE,first.replicas()));
+            var original=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.digest(),
+                    0,source.columnIds(),0,ranges);
+            publishSchema(f,source); catalogue.execute(catalogue.prepare(operation(),null,original));
+            var target=next(source,List.of(source.column(7),column(8,new UUID(16,3),"added"))); publishSchema(f,target);
+            var definition=new SchemaChange.Definition(new UUID(16,4),operation(),original,source,target);
+            var head=begin(admin,definition,null);
+            var progress=List.of(head.status().beginFencing(),head.status().beginFencing().fenced(first.groupId(),new ApplyPosition(1,10)),
+                    head.status().beginFencing().fenced(first.groupId(),new ApplyPosition(1,10)).fenced(secondGroup,new ApplyPosition(1,10)));
+            for (var status:progress) {
+                assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.prepareAdvance(operation(),head,status)).status());
+                head=admin.readHead(source.domainId());
+            }
+            for (var group:List.of(first.groupId(),secondGroup)) {
+                assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.prepareAdvance(operation(),head,head.status().installed(group,new ApplyPosition(1,11)))).status());
+                head=admin.readHead(source.domainId());
+            }
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.preparePublication(operation(),head,definition)).status());
+            var published=admin.readHead(source.domainId());
+            var firstActivation=admin.prepareAdvance(operation(),published,published.status().activated(first.groupId(),new ApplyPosition(1,12)));
+            var competing=admin.prepareAdvance(operation(),published,published.status().activated(first.groupId(),new ApplyPosition(1,13)));
+            assertEquals(1,firstActivation.mutations().size()); assertEquals(1,firstActivation.predicates().size());
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(firstActivation).status());
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(firstActivation).status());
+            assertEquals(CommandResult.Status.CONFLICT,admin.execute(competing).status());
+            var partial=admin.readHead(source.domainId());
+            assertEquals(SchemaChange.Phase.PUBLISHED,partial.status().phase()); assertFalse(partial.terminal());
+            assertEquals(Map.of(first.groupId(),new ApplyPosition(1,12)),partial.status().activated());
+            assertThrows(IllegalStateException.class,partial.status()::retire);
+            assertArrayEquals(RangeDirectoryCodec.encode(definition.targetDirectory()),RangeDirectoryCodec.encode(catalogue.read(source.domainId())));
+            var laterSchema=next(target,List.of(target.column(7),target.column(8),column(9,new UUID(16,5),"later")));
+            var laterChange=new SchemaChange.Definition(new UUID(16,6),operation(),definition.targetDirectory(),target,laterSchema);
+            assertThrows(IllegalArgumentException.class,() -> admin.prepareBegin(laterChange,partial,null,null));
+            var laterDirectory=new RangeDirectory(target.clusterId(),target.databaseId(),target.domainId(),target.schemaEpoch(),target.digest(),
+                    definition.targetDirectory().generation()+1,target.columnIds(),0,ranges);
+            assertThrows(IllegalArgumentException.class,() -> catalogue.prepareAfterAdministration(operation(),definition.targetDirectory(),laterDirectory,partial));
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.prepareAdvance(operation(),partial,partial.status().activated(secondGroup,new ApplyPosition(2,12)))).status());
+            var activated=admin.readHead(source.domainId()); assertFalse(activated.terminal());
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.prepareAdvance(operation(),activated,activated.status().retire())).status());
+            var retired=admin.readHead(source.domainId()); assertTrue(retired.terminal());
+            assertEquals(2,admin.readOutcome(source.domainId(),definition.digest()).status().activated().size());
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepareAfterAdministration(operation(),definition.targetDirectory(),laterDirectory,retired)).status());
         }
     }
     @Test void deletedColumnIncarnationAndApiIdCannotBeReissuedAndEmptyDomainRemainsRoutableMetadata() throws Exception {
@@ -143,7 +195,7 @@ class RatisSchemaAdministrationTest {
             var source=initial(); var target=next(source,List.of(source.column(7),column(8,new UUID(12,1),"added")));
             var definition=new SchemaChange.Definition(new UUID(12,2),operation(),directory(source,0),source,target);
             var status=SchemaChange.Status.begin(definition.header()).beginFencing().fenced(outer.dataGroup,new ApplyPosition(1,1))
-                    .installed(outer.dataGroup,new ApplyPosition(1,2)).publish().retire();
+                    .installed(outer.dataGroup,new ApplyPosition(1,2)).publish().activated(outer.dataGroup,new ApplyPosition(1,3)).retire();
             var head=new RatisSchemaAdministration.Head(status,8); var catalogue=catalogue(client(f));
             int low=1,high=RangeDirectoryCodec.MAX_ENCODED_BYTES/4;
             while (low<high) {

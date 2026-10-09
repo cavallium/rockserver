@@ -32,6 +32,7 @@ public final class NativeSchemaInstallation {
     public SchemaChange.Definition definition() { return definition; }
     public NativeSchemaFence fence() { return fence; }
     public ApplyPosition position() { return position; }
+    public NativeSchemaInstallProof proof() { return new NativeSchemaInstallProof(fence,definition.targetSchema().digest(),position); }
     public void requireRange(UUID group,long epoch,UUID domain,byte[] lowerInclusive,byte[] upperExclusive) {
         var participant=fence.participant();
         var descriptor=definition.sourceDirectory().ranges().stream().filter(range -> range.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Install group is outside source directory"));
@@ -47,6 +48,46 @@ public final class NativeSchemaInstallation {
     public Set<UUID> sourceMerges() { return sourceMerges; }
     public Set<UUID> targetMerges() { return targetMerges; }
     public void requireDefinition(SchemaChange.Definition expected) { if (!Arrays.equals(definition.encode(),expected.encode())) throw new IllegalArgumentException("Install definition changed"); }
+    /** Validates the single current lifecycle, including retained original proofs from predecessors. */
+    public static List<NativeSchemaInstallation> validateLifecycle(NativeSchemaInstallation current,Collection<NativeSchemaInstallation> history,
+            NativeSchemaActivationProof currentActivation,Map<UUID,NativeSchemaActivationProof> activations,NativeSchemaFence pending,ApplyPosition cut) {
+        var ordered=history.stream().sorted(Comparator.comparingLong(record -> record.position().index())).toList();
+        if(current==null) {
+            if(!ordered.isEmpty() || currentActivation!=null || !activations.isEmpty()) throw new IllegalArgumentException("Schema history lacks current generation");
+            if(pending!=null) pending.requireCut(cut);
+            return ordered;
+        }
+        current.requireCut(cut);
+        if(ordered.isEmpty() || !Arrays.equals(current.encode(),ordered.getLast().encode())) throw new IllegalArgumentException("Current installation differs from latest immutable history");
+        var records=new HashMap<UUID,NativeSchemaInstallation>(); NativeSchemaInstallation previous=null;
+        for(var record:ordered) {
+            record.requireCut(current.position()); var id=record.definition().changeId();
+            if(records.put(id,record)!=null) throw new IllegalArgumentException("Duplicate schema history identity");
+            if(previous!=null) {
+                var activation=activations.get(previous.definition().changeId());
+                if(activation==null || activation.position().index()>=record.fence().position().index() || activation.position().term()>record.fence().position().term()
+                        || !Arrays.equals(previous.definition().targetSchema().digest(),record.definition().sourceSchema().digest())
+                        || !previous.targetNames().equals(record.sourceNames()) || !previous.targetMerges().equals(record.sourceMerges())) throw new IllegalArgumentException("Schema lifecycle predecessor is missing or changed");
+            }
+            previous=record;
+        }
+        for(var entry:activations.entrySet()) {
+            var activation=entry.getValue(); activation.requireCut(cut); var record=records.get(entry.getKey());
+            if(record==null || !entry.getKey().equals(activation.installation().fence().changeId()) || !activation.installation().equals(record.proof())) throw new IllegalArgumentException("Activation differs from immutable INSTALL");
+        }
+        var savedActivation=activations.get(current.definition().changeId());
+        if(!Objects.equals(currentActivation,savedActivation)) throw new IllegalArgumentException("Current activation differs from immutable history");
+        if(currentActivation==null) {
+            if(!current.fence().equals(pending)) throw new IllegalArgumentException("Unactivated installation lacks original pending fence");
+        } else if(pending!=null) {
+            var target=current.definition().targetSchema(); pending.requireCut(cut);
+            if(records.containsKey(pending.changeId()) || !pending.clusterId().equals(target.clusterId()) || !pending.databaseId().equals(target.databaseId())
+                    || !pending.domainId().equals(target.domainId()) || pending.sourceSchemaEpoch()!=target.schemaEpoch() || !Arrays.equals(pending.sourceSchemaDigest(),target.digest())
+                    || !pending.participant().groupId().equals(current.fence().participant().groupId()) || pending.participant().rangeEpoch()!=current.fence().participant().rangeEpoch()
+                    || pending.position().index()<=currentActivation.position().index() || pending.position().term()<currentActivation.position().term()) throw new IllegalArgumentException("Pending fence differs from activated generation");
+        }
+        return ordered;
+    }
     public byte[] encode() {
         try {
             var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes);

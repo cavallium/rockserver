@@ -114,6 +114,14 @@ public final class RatisSessionClockService {
         return pending==null ? CompletableFuture.completedFuture(null) : pending.drained.copy();
     }
     private Snapshot cycle() throws Exception {
+        if (propagations.stream().anyMatch(RatisSessionPropagation::schemaRefreshPending)) {
+            int work=0,visited=0;
+            while (work<visits && visited++<propagations.size()) {
+                var scope=propagations.get(scopeCursor); scopeCursor=(scopeCursor+1)%propagations.size();
+                if (scope.schemaRefreshPending()) { scope.reconcileSchemaRefresh(1); work++; }
+            }
+            return snapshot(null);
+        }
         var obligation=clock.observed();
         if (obligation!=null) beginMissing(obligation);
         RatisCatalogueClock.Tick time=null;

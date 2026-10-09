@@ -45,20 +45,22 @@ public final class RatisRoutedClient implements AutoCloseable {
     public static final class SchemaTarget {
         private final RangeDescriptor descriptor;
         private final RatisSchemaFenceRecord record;
-        private SchemaTarget(RangeDescriptor descriptor,RatisSchemaFenceRecord record) { this.descriptor=descriptor; this.record=record; }
+        private final SchemaChange.Definition definition;
+        private SchemaTarget(RangeDescriptor descriptor,RatisSchemaFenceRecord record,SchemaChange.Definition definition) { this.descriptor=descriptor; this.record=record; this.definition=definition; }
         public RangeDescriptor descriptor() { return descriptor; }
         public RatisSchemaFenceRecord record() { return record; }
     }
     public SchemaTarget schemaTarget(SchemaChange.Definition definition,UUID group) {
         Objects.requireNonNull(definition); var observed=current(); var original=definition.sourceDirectory();
+        requireNamespace(original);
         if (!observed.clusterId().equals(original.clusterId()) || !observed.databaseId().equals(original.databaseId()) || !observed.domainId().equals(original.domainId()))
             throw new IllegalArgumentException("Schema change belongs to another routed database/domain");
         var descriptor=original.ranges().stream().filter(range -> range.groupId().equals(group)).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("Schema group is outside original participant set"));
-        return new SchemaTarget(descriptor,new RatisSchemaFenceRecord(definition.header(),group));
+        return new SchemaTarget(descriptor,new RatisSchemaFenceRecord(definition.header(),group),definition);
     }
     public NativeSchemaFence fenceSchema(SchemaTarget target) throws IOException {
-        Objects.requireNonNull(target); beginCall();
+        Objects.requireNonNull(target); requireNamespace(target.definition.sourceDirectory()); beginCall();
         try {
             RatisSchemaFenceRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaFenceRpc.prepareRequest(target.record),true),ScopedTransactionRpc.SCHEMA_FENCE_PREPARE,target.record);
             var proof=NativeSchemaFence.decode(transport.participant(target.descriptor,target.record.encode()));
@@ -69,15 +71,94 @@ public final class RatisRoutedClient implements AutoCloseable {
         finally { endCall(); }
     }
     public RatisSchemaFenceRpc.State schemaFenceState(SchemaTarget target) throws IOException {
-        Objects.requireNonNull(target); beginCall();
+        Objects.requireNonNull(target); requireNamespace(target.definition.sourceDirectory()); beginCall();
         try { return RatisSchemaFenceRpc.stateReply(transport.transaction(target.descriptor,RatisSchemaFenceRpc.stateRequest(target.record),true),ScopedTransactionRpc.SCHEMA_FENCE_STATE,target.record); }
         catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema FENCE state reply",invalid); }
         finally { endCall(); }
     }
     public void cancelSchemaPreparation(SchemaTarget target) throws IOException {
-        Objects.requireNonNull(target); beginCall();
+        Objects.requireNonNull(target); requireNamespace(target.definition.sourceDirectory()); beginCall();
         try { RatisSchemaFenceRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaFenceRpc.cancelRequest(target.record),true),ScopedTransactionRpc.SCHEMA_FENCE_CANCEL,target.record); }
         catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema preparation cancellation reply",invalid); }
+        finally { endCall(); }
+    }
+
+    public static final class SchemaInstallTarget {
+        private final RangeDescriptor descriptor;
+        private final RatisSchemaInstallRecord record;
+        private SchemaInstallTarget(RangeDescriptor descriptor,RatisSchemaInstallRecord record) { this.descriptor=descriptor; this.record=record; }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public RatisSchemaInstallRecord record() { return record; }
+    }
+    public SchemaInstallTarget schemaInstallTarget(SchemaTarget target,NativeSchemaFence fence,String physicalName,boolean mergeAdmission) {
+        Objects.requireNonNull(target); requireNamespace(target.definition.sourceDirectory()); Objects.requireNonNull(fence); fence.requireHeader(target.record.header());
+        if (!fence.participant().groupId().equals(target.descriptor.groupId())) throw new IllegalArgumentException("Schema fence belongs to another group");
+        return new SchemaInstallTarget(target.descriptor,new RatisSchemaInstallRecord(target.definition,target.descriptor.groupId(),fence.position(),physicalName,mergeAdmission));
+    }
+    public NativeSchemaInstallProof installSchema(SchemaInstallTarget target) throws IOException {
+        Objects.requireNonNull(target); requireNamespace(target.record.definition().sourceDirectory()); beginCall();
+        try {
+            RatisSchemaInstallRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaInstallRpc.prepareRequest(target.record),true),ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE,target.record);
+            var proof=NativeSchemaInstallProof.decode(transport.participant(target.descriptor,target.record.encode()));
+            requireInstallProof(target,proof); return proof;
+        } catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema INSTALL reply",invalid); }
+        finally { endCall(); }
+    }
+    private static void requireInstallProof(SchemaInstallTarget target,NativeSchemaInstallProof proof) {
+        proof.requireHeader(target.record.header());
+        if (!proof.fence().participant().groupId().equals(target.descriptor.groupId()) || !proof.fence().position().equals(target.record.expectedFencePosition()))
+            throw new IllegalArgumentException("Schema installation differs from original fence");
+    }
+    public RatisSchemaInstallRpc.State schemaInstallationState(SchemaInstallTarget target) throws IOException {
+        Objects.requireNonNull(target); requireNamespace(target.record.definition().sourceDirectory()); beginCall();
+        try { return RatisSchemaInstallRpc.stateReply(transport.transaction(target.descriptor,RatisSchemaInstallRpc.stateRequest(target.record),true),ScopedTransactionRpc.SCHEMA_INSTALL_STATE,target.record); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema installation state",invalid); }
+        finally { endCall(); }
+    }
+    public void cancelSchemaInstallation(SchemaInstallTarget target) throws IOException {
+        Objects.requireNonNull(target); requireNamespace(target.record.definition().sourceDirectory()); beginCall();
+        try { RatisSchemaInstallRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaInstallRpc.cancelRequest(target.record),true),ScopedTransactionRpc.SCHEMA_INSTALL_CANCEL,target.record); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema installation cancellation",invalid); }
+        finally { endCall(); }
+    }
+
+    public static final class SchemaActivationTarget {
+        private final RangeDescriptor descriptor;
+        private final RatisSchemaActivateRpc.Request request;
+        private final RangeDirectory source;
+        private SchemaActivationTarget(RangeDescriptor descriptor,RatisSchemaActivateRpc.Request request,RangeDirectory source) { this.descriptor=descriptor; this.request=request; this.source=source; }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public RatisSchemaActivateRpc.Request request() { return request; }
+    }
+    public SchemaActivationTarget schemaActivationTarget(SchemaTarget target,NativeSchemaInstallProof installation) {
+        Objects.requireNonNull(target); requireNamespace(target.definition.sourceDirectory()); Objects.requireNonNull(installation); installation.requireHeader(target.record.header());
+        if (!installation.fence().participant().groupId().equals(target.descriptor.groupId())) throw new IllegalArgumentException("Schema installation belongs to another group");
+        return new SchemaActivationTarget(target.descriptor,new RatisSchemaActivateRpc.Request(target.record.header(),target.descriptor.groupId(),installation.position()),target.definition.sourceDirectory());
+    }
+    public NativeSchemaActivationProof activateSchema(SchemaActivationTarget target) throws IOException {
+        Objects.requireNonNull(target); requireNamespace(target.source); beginCall();
+        try {
+            var record=RatisSchemaActivateRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaActivateRpc.prepareRequest(target.request),true),ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,target.request);
+            var proof=NativeSchemaActivationProof.decode(transport.participant(target.descriptor,record.encode()));
+            proof.requireHeader(target.request.header());
+            if (!proof.installation().fence().participant().groupId().equals(target.descriptor.groupId())
+                    || !proof.installation().position().equals(target.request.expectedInstallPosition())
+                    || !proof.catalogueGroup().equals(record.catalogueGroup()) || !proof.cataloguePosition().equals(record.cataloguePosition()))
+                throw new IllegalArgumentException("Schema activation differs from frozen publication qualification");
+            return proof;
+        } catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema ACTIVATE reply",invalid); }
+        finally { endCall(); }
+    }
+    public RatisSchemaActivateRpc.State schemaActivationState(SchemaActivationTarget target) throws IOException {
+        Objects.requireNonNull(target); requireNamespace(target.source); beginCall();
+        try { return RatisSchemaActivateRpc.stateReply(transport.transaction(target.descriptor,RatisSchemaActivateRpc.stateRequest(target.request),true),ScopedTransactionRpc.SCHEMA_ACTIVATE_STATE,target.request); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema activation state",invalid); }
+        finally { endCall(); }
+    }
+    public void cancelSchemaActivation(SchemaActivationTarget target) throws IOException {
+        Objects.requireNonNull(target); requireNamespace(target.source); beginCall();
+        try { RatisSchemaActivateRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaActivateRpc.cancelRequest(target.request),true),ScopedTransactionRpc.SCHEMA_ACTIVATE_CANCEL,target.request); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema activation cancellation",invalid); }
         finally { endCall(); }
     }
 
@@ -654,6 +735,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid participant fence reply",malformed); }
     }
     private final RangeDirectory identity;
+    private volatile List<RangeDirectory> acceptedSchemas;
     private final Transport transport;
     private RangeDirectory directory;
     private int activeCalls;
@@ -662,6 +744,7 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     public RatisRoutedClient(RangeDirectory directory, Transport transport) {
         this.identity = this.directory = Objects.requireNonNull(directory, "directory");
+        acceptedSchemas=List.of(directory);
         this.transport = Objects.requireNonNull(transport, "transport");
     }
 
@@ -801,16 +884,31 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
 
     public synchronized RangeDirectory directory() { return directory; }
+    RangeDirectory bootstrapDirectory() { return identity; }
 
     public synchronized void refresh(RangeDirectory next) {
         requireOpen();
         Objects.requireNonNull(next, "next");
         requireIdentity(next);
+        if (!sameSchema(directory,next)) throw new IllegalArgumentException("Schema refresh requires a native activation proof");
         if (next.generation() < directory.generation()
                 || (next.generation() == directory.generation() && !Arrays.equals(next.payloadDigest(), directory.payloadDigest()))) {
             throw new IllegalArgumentException("Stale or conflicting directory generation");
         }
         directory = next;
+    }
+
+    /** Published directory qualified by an original native ACTIVATE result; owned retries retain their schemas. */
+    public synchronized void refreshSchema(SchemaChange.Definition definition,NativeSchemaActivationProof activation) {
+        requireOpen(); Objects.requireNonNull(definition); Objects.requireNonNull(activation);
+        requireNamespace(definition.sourceDirectory()); activation.requireHeader(definition.header());
+        var target=definition.targetDirectory();
+        if (acceptedSchemas.stream().anyMatch(known -> sameSchema(known,target)) && directory.generation()>=target.generation()) return;
+        if (!sameSchema(directory,definition.sourceDirectory()) || directory.generation()>definition.sourceDirectory().generation()
+                || target.generation()<=directory.generation()) throw new IllegalArgumentException("Schema activation does not follow current routing");
+        if (acceptedSchemas.size()>=65) throw new IllegalStateException("Routed schema history budget exhausted");
+        var schemas=new java.util.ArrayList<>(acceptedSchemas); schemas.add(target); acceptedSchemas=List.copyOf(schemas);
+        directory=target;
     }
 
     record RoutedRead(RangeDescriptor descriptor,byte[] value) {}
@@ -923,17 +1021,17 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     // Journal recovery preserves the exact original peer route even after a directory refresh.
     PreparedCommand restoreSessionControl(DistributedCommand command,RangeDescriptor descriptor) {
-        var observed=current(); var control=command.sessionControl();
+        var observed=schemaView(command.schemaDigest()); var control=command.sessionControl();
         if (control==null || !control.authority().clusterId().equals(observed.clusterId())
                 || !control.authority().databaseId().equals(observed.databaseId())
                 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Invalid recovered control route");
-        return new PreparedCommand(identity,descriptor,command);
+        return new PreparedCommand(observed,descriptor,command);
     }
     /** Restore an immutable user retry route without rebasing it onto the current topology. */
     PreparedCommand restoreSessionCommand(DistributedCommand command,RangeDescriptor descriptor) {
-        Objects.requireNonNull(command); Objects.requireNonNull(descriptor); var observed=current();
+        Objects.requireNonNull(command); Objects.requireNonNull(descriptor); var observed=schemaView(command.schemaDigest());
         if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
@@ -963,7 +1061,7 @@ public final class RatisRoutedClient implements AutoCloseable {
                 throw new IllegalArgumentException("Recovered transaction scope crosses frozen route");
             }
         }
-        return new PreparedCommand(identity,descriptor,command);
+        return new PreparedCommand(observed,descriptor,command);
     }
     private static byte[] projectRecovered(RangeDirectory directory,byte[] key) {
         int prefix=directory.routingPrefixBytes();
@@ -988,6 +1086,22 @@ public final class RatisRoutedClient implements AutoCloseable {
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
 
+    byte[] maintenanceIdentityDigest() {
+        var output=ByteBuffer.allocate(52);
+        for (var id:List.of(identity.clusterId(),identity.databaseId(),identity.domainId())) output.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());
+        output.putInt(identity.routingPrefixBytes());
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(output.array()); }
+        catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+    }
+    boolean registeredSchema(long epoch,byte[] digest) {
+        return acceptedSchemas.stream().anyMatch(known -> known.schemaEpoch()==epoch && Arrays.equals(known.schemaDigest(),digest));
+    }
+    private RangeDirectory schemaView(byte[] digest) {
+        current(); var schemas=acceptedSchemas;
+        for (int i=schemas.size()-1;i>=0;i--) if (Arrays.equals(schemas.get(i).schemaDigest(),digest)) return schemas.get(i);
+        throw new IllegalArgumentException("Recovered schema has not been qualified for this client");
+    }
+
     public CommandResult execute(PreparedCommand prepared) throws IOException {
         Objects.requireNonNull(prepared, "prepared");
         requireIdentity(prepared.source);
@@ -1002,12 +1116,20 @@ public final class RatisRoutedClient implements AutoCloseable {
     private synchronized RangeDirectory current() { requireOpen(); return directory; }
     private void requireOpen() { if (closing) throw new IllegalStateException("Routed client is closing"); }
     private void requireIdentity(RangeDirectory other) {
+        requireNamespace(other);
+        var schemas=acceptedSchemas;
+        for (int i=schemas.size()-1;i>=0;i--) if (sameSchema(schemas.get(i),other)) return;
+        throw new IllegalArgumentException("Directory schema has not been qualified for this client");
+    }
+    private void requireNamespace(RangeDirectory other) {
         if (!identity.clusterId().equals(other.clusterId()) || !identity.databaseId().equals(other.databaseId())
-                || !identity.domainId().equals(other.domainId()) || identity.schemaEpoch() != other.schemaEpoch()
-                || !Arrays.equals(identity.schemaDigest(), other.schemaDigest()) || !identity.columns().equals(other.columns())
-                || identity.routingPrefixBytes() != other.routingPrefixBytes()) {
-            throw new IllegalArgumentException("Directory belongs to another cluster/database/domain/schema");
+                || !identity.domainId().equals(other.domainId()) || identity.routingPrefixBytes()!=other.routingPrefixBytes()) {
+            throw new IllegalArgumentException("Directory belongs to another cluster/database/domain/projection");
         }
+    }
+    private static boolean sameSchema(RangeDirectory first,RangeDirectory second) {
+        return first.schemaEpoch()==second.schemaEpoch() && Arrays.equals(first.schemaDigest(),second.schemaDigest())
+                && first.columns().equals(second.columns()) && first.routingPrefixBytes()==second.routingPrefixBytes();
     }
     private static RangeDescriptor sameRange(RangeDescriptor target, RangeDescriptor next) {
         if (target != null && (!target.groupId().equals(next.groupId()) || target.rangeEpoch() != next.rangeEpoch())) {

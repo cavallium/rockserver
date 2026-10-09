@@ -19,6 +19,9 @@ public final class ScopedTransactionRpc {
     public static final int MAX_REPLY_BYTES = PhysicalRangePage.MAX_BYTES + 128;
     public static final int EXPORT_BUILD=52, EXPORT_READ=53, EXPORT_RELEASE=54;
     public static final int SCHEMA_FENCE_PREPARE=55, SCHEMA_FENCE_CANCEL=56, SCHEMA_FENCE_STATE=57, SCHEMA_AUTHORITY=58;
+    public static final int SCHEMA_INSTALL_PREPARE=59, SCHEMA_INSTALL_CANCEL=60, SCHEMA_INSTALL_STATE=61, SCHEMA_ACTIVATE_PREPARE=62, SCHEMA_ACTIVATE_CANCEL=63, SCHEMA_ACTIVATE_STATE=64;
+    public static boolean schemaInstall(int kind) { return kind==SCHEMA_INSTALL_PREPARE || kind==SCHEMA_INSTALL_CANCEL || kind==SCHEMA_INSTALL_STATE; }
+    public static boolean schemaActivate(int kind) { return kind==SCHEMA_ACTIVATE_PREPARE || kind==SCHEMA_ACTIVATE_CANCEL || kind==SCHEMA_ACTIVATE_STATE; }
     public static boolean schemaFence(int kind) { return kind==SCHEMA_FENCE_PREPARE || kind==SCHEMA_FENCE_CANCEL || kind==SCHEMA_FENCE_STATE; }
     public static boolean ownerExport(int kind) { return kind==EXPORT_BUILD || kind==EXPORT_READ || kind==EXPORT_RELEASE; }
     private static final Comparator<TransactionScope.Span> SPAN_ORDER = Comparator
@@ -255,7 +258,7 @@ public final class ScopedTransactionRpc {
     }
     public static boolean homeRecovery(int kind) { return kind==HOME_RECOVERY_PREPARE || kind==HOME_RECOVERY_RESULT || kind==HOME_RECOVERY_CANCEL; }
     private static void requireKind(int kind) {
-        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_AUTHORIZE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != PARTICIPANT_FENCE && kind != PARTICIPANT_RETIRE_PREPARE && kind != PARTICIPANT_RETIRE_CANCEL && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_FENCE && kind != SNAPSHOT_RETIRE_PREPARE && kind != SNAPSHOT_RETIRE_CANCEL && kind != FINALIZATION_PREPARE && kind != FINALIZATION_CANCEL && kind != HOME_FENCE && kind != HOME_RETIRE_PREPARE && kind != HOME_RETIRE_CANCEL && kind != SNAPSHOT_HOME_FENCE && kind != SNAPSHOT_HOME_RETIRE_PREPARE && kind != SNAPSHOT_HOME_RETIRE_CANCEL && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && kind != SNAPSHOT_BLOCKERS && kind != SNAPSHOT_HELP && kind != SNAPSHOT_GATE_PREPARE && kind != SNAPSHOT_GATE_CANCEL && !homeRecovery(kind) && !ownerSnapshot(kind) && !ownerExport(kind) && !schemaFence(kind) && kind!=SCHEMA_AUTHORITY) {
+        if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_AUTHORIZE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != PARTICIPANT_FENCE && kind != PARTICIPANT_RETIRE_PREPARE && kind != PARTICIPANT_RETIRE_CANCEL && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_FENCE && kind != SNAPSHOT_RETIRE_PREPARE && kind != SNAPSHOT_RETIRE_CANCEL && kind != FINALIZATION_PREPARE && kind != FINALIZATION_CANCEL && kind != HOME_FENCE && kind != HOME_RETIRE_PREPARE && kind != HOME_RETIRE_CANCEL && kind != SNAPSHOT_HOME_FENCE && kind != SNAPSHOT_HOME_RETIRE_PREPARE && kind != SNAPSHOT_HOME_RETIRE_CANCEL && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && kind != SNAPSHOT_BLOCKERS && kind != SNAPSHOT_HELP && kind != SNAPSHOT_GATE_PREPARE && kind != SNAPSHOT_GATE_CANCEL && !homeRecovery(kind) && !ownerSnapshot(kind) && !ownerExport(kind) && !schemaFence(kind) && !schemaInstall(kind) && !schemaActivate(kind) && kind!=SCHEMA_AUTHORITY) {
             throw invalid("Unknown read frame kind");
         }
     }

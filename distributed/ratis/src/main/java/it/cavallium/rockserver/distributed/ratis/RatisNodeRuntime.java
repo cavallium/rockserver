@@ -2,6 +2,9 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.config.DatabaseConfig;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
+import it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof;
+import it.cavallium.rockserver.core.common.distributed.RangeDirectory;
+import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
 import java.io.IOException;
@@ -61,6 +64,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final RWScheduler scheduler; private final Scheduler timer; private final LongSupplier time;
     private final Map<RaftGroupId,RatisRangeStateMachine> machines=new LinkedHashMap<>();
     private DistributedStoragePool pool; private RaftServer server; private RatisCatalogueClock clock;
+    private RangeDirectory startupDirectory;
     private RatisSessionPropagation propagation; private RatisSessionClockService service;
     private final List<RatisSessionPropagation> propagations=new ArrayList<>();
     private final Map<RatisNodePlan.Role,RatisRoutedClient> homeClients=new EnumMap<>(RatisNodePlan.Role.class);
@@ -137,7 +141,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (plan.localGroups().stream().anyMatch(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId()))
                 && plan.directory().ranges().size()+plan.homes().stream().mapToInt(home -> home.directory().ranges().size()).sum()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
         var catalogue=plan.catalogue(); epochs.requireCatalogueBinding(plan.directory().clusterId(),plan.directory().databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
-        if (!Arrays.equals(routed.directory().payloadDigest(),plan.directory().payloadDigest())) throw new IllegalArgumentException("Node routed directory differs from placement plan");
+        if (!Arrays.equals(routed.bootstrapDirectory().payloadDigest(),plan.directory().payloadDigest())) throw new IllegalArgumentException("Node routed bootstrap directory differs from placement plan");
     }
     private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory) throws IOException {
         Objects.requireNonNull(startup); Objects.requireNonNull(factory);
@@ -223,11 +227,14 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
                     }
-                    else { machine.role(role); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),effectiveDirectory); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
+                    else { machine.role(role); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),effectiveDirectory); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
                 }
                 machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
             }
+            for (var entry:machines.entrySet()) if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA)
+                for (var schema:entry.getValue().schemaRoutingHistory()) routed.refreshSchema(schema.definition(),schema.proof());
+            startupDirectory=routed.directory();
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
         exportSources=new RatisExportSourceService(root.resolve("exports"),settings.exports().sources(),settings.exports().io(),
                 new RatisExportSourceRegistry.NativeBuilder() {
@@ -290,7 +297,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (starting || started || closeRequested || closed) throw new IllegalStateException("Node cannot start"); starting=true;
         }
         try {
-            if (!Arrays.equals(routed.directory().payloadDigest(),plan.directory().payloadDigest())) throw new IOException("Node placement changed before start");
+            if (!Arrays.equals(routed.directory().payloadDigest(),startupDirectory.payloadDigest())) throw new IOException("Node placement changed before start");
             // Persist before the first possible network/voting exposure, including a start attempt that later fails.
             SessionJournalFiles.write(root.resolve("node.identity"),identity(true),128);
             server.start(); var existing=new HashSet<RaftGroupId>(); server.getGroupIds().forEach(existing::add);
@@ -315,6 +322,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     private byte[] identity(boolean exposed) {
         return ByteBuffer.allocate(33).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
+    }
+    private void observeSchemaActivation(SchemaChange.Definition definition,NativeSchemaActivationProof proof) {
+        routed.refreshSchema(definition,proof);
     }
     private boolean identityExposed(byte[] bytes) throws IOException {
         if (bytes.length!=33) throw new IOException("Invalid node identity shape");

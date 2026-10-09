@@ -26,7 +26,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
     /** Parent directory must already exist on durable storage. Journal and stable .lock/.pending files belong to this owner. */
     public RatisSessionMaintenance(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group) throws IOException {
         this.journal=journal.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs); this.routed=Objects.requireNonNull(routed);
-        this.group=Objects.requireNonNull(group); identity=routed.sessionIdentityDigest();
+        this.group=Objects.requireNonNull(group); identity=routed.maintenanceIdentityDigest();
         if (!Files.isDirectory(this.journal.getParent())) throw new IOException("Maintenance journal parent is absent");
         lockChannel=FileChannel.open(this.journal.resolveSibling(this.journal.getFileName()+".lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
         FileLock acquired=null;
@@ -37,8 +37,8 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             lock=acquired;
             if (Files.exists(this.journal)) {
                 byte[] bytes=readJournal(); var input=new DataInputStream(new ByteArrayInputStream(bytes));
-                if (input.readInt()!=MAGIC || input.readInt()!=1 || !Arrays.equals(input.readNBytes(32),identity) || !uuid(input).equals(group)) {
-                    throw new IOException("Wrong maintenance journal identity/version");
+                if (input.readInt()!=MAGIC || !Arrays.equals(input.readNBytes(32),identity) || !uuid(input).equals(group)) {
+                    throw new IOException("Wrong maintenance journal identity");
                 }
                 rangeEpoch=input.readLong();
                 state=decode(input);
@@ -126,7 +126,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
     private void persist(State next) throws IOException {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
-            output.writeInt(MAGIC); output.writeInt(1); output.write(identity); uuid(output,group); output.writeLong(rangeEpoch);
+            output.writeInt(MAGIC); output.write(identity); uuid(output,group); output.writeLong(rangeEpoch);
             uuid(output,next.session()); output.writeLong(next.epoch()); output.writeLong(next.nextSequence()); output.writeLong(next.acknowledgedThrough());
             blob(output,next.propagated()==null ? null : new RangeSessionControl(next.propagated(),null,0).encode());
             blob(output,next.pending()==null ? null : DistributedCommandCodec.encode(next.pending().command()));

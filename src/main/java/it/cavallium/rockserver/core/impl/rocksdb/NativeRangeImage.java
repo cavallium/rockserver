@@ -219,7 +219,7 @@ public final class NativeRangeImage {
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
                 if (snapshotHome!=null) {
-                    if (section==Section.STATE && key.length>16 && (key[16]==0x25 || key[16]==0x26 || key[16]==0x27)) throw new IOException("Snapshot HOME image contains TX HOME state");
+                    if (section==Section.STATE && key.length>16 && (key[16]==0x25 || key[16]==0x26 || (key[16]&255)>=0x27 && (key[16]&255)<=0x2c)) throw new IOException("Snapshot HOME image contains TX HOME state");
                     if (section==Section.USER) {
                         try {
                             if (key.length!=16 || value.length>it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.MAX_BYTES) throw new IllegalArgumentException("Invalid snapshot HOME row size");
@@ -385,6 +385,9 @@ public final class NativeRangeImage {
         private final List<byte[]> referencedSchemas=new ArrayList<>();
         private long schemaBytes; private int schemaRecords;
         private boolean currentSchemaHistorySeen;
+        private final List<it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation> schemaInstallations=new ArrayList<>();
+        private final Map<UUID,it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof> schemaActivations=new HashMap<>();
+        private it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof currentSchemaActivation;
         private boolean acceptSchema(byte[] digest) { referencedSchemas.add(digest.clone()); return true; }
         private int homeCreditCount;
         private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
@@ -426,7 +429,7 @@ public final class NativeRangeImage {
                         if(key[16]==0x28) {
                             if(key.length!=17 || schemaInstallation!=null || !Arrays.equals(definition.targetSchema().digest(),header.schema())
                                     || !definition.targetSchema().columnIds().equals(header.interval().columns()) || !installation.targetMerges().equals(header.mergeColumns())) throw new IllegalArgumentException("Installed image generation differs");
-                            schemaInstallation=installation;
+                            schemaInstallation=installation; schemaBytes+=value.length;
                         } else {
                             if(schemaInstallation==null) throw new IllegalArgumentException("Completed schema history lacks current installed generation");
                             installation.requireCut(schemaInstallation.position());
@@ -436,10 +439,23 @@ public final class NativeRangeImage {
                                 if(!Arrays.equals(value,schemaInstallation.encode())) throw new IllegalArgumentException("Current schema install differs from immutable history");
                                 currentSchemaHistorySeen=true;
                             }
+                            schemaInstallations.add(installation);
                             schemaHistory.put(java.util.HexFormat.of().formatHex(definition.sourceSchema().digest()),definition.sourceSchema());
                             schemaHistory.put(java.util.HexFormat.of().formatHex(definition.targetSchema().digest()),definition.targetSchema());
                         }
                     } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema generation",failure); }
+                }
+                if(section==Section.STATE && key.length>16 && (key[16]==0x2b || key[16]==0x2c)) {
+                    try {
+                        var activation=it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof.decode(value); activation.requireCut(header.position());
+                        if((schemaBytes+=value.length)>16L*1024*1024) throw new IllegalArgumentException("Schema lifecycle bytes exceed budget");
+                        if(key[16]==0x2c) {
+                            if(key.length!=17 || currentSchemaActivation!=null) throw new IllegalArgumentException("Invalid current activation key/count"); currentSchemaActivation=activation;
+                        } else {
+                            var id=activation.installation().fence().changeId(); var expected=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2b).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
+                            if(!Arrays.equals(key,expected) || schemaActivations.size()>=64 || schemaActivations.put(id,activation)!=null) throw new IllegalArgumentException("Invalid activation history key/count");
+                        }
+                    } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema activation",failure); }
                 }
                 if(section==Section.STATE && key.length>16 && key[16]==0x29) throw new IOException("Uncompleted schema install cannot be exported");
                 if (section==Section.STATE && key.length>16 && key[16]==0x27) {
@@ -649,7 +665,7 @@ public final class NativeRangeImage {
                 if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
             }
             if (context!=null) {
-                if (schemaFence!=null) throw new IOException("HOME image contains DATA schema fence");
+                if(schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null) throw new IOException("HOME image contains DATA schema lifecycle");
                 if (!header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership");
                 for (var receipt:homeRecoveries.values()) if (!receipt.recovery().before().clusterId().equals(context.cluster()) || !receipt.recovery().before().databaseId().equals(context.database()) || !receipt.recovery().command().mutations().getFirst().columnId().equals(context.column())) throw new IOException("Qualified HOME receipt database differs");
             }
@@ -690,10 +706,12 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            if(schemaInstallation==null && (!schemaActivations.isEmpty() || currentSchemaActivation!=null)) throw new IOException("Activation history lacks installed generation");
             for(var digest:referencedSchemas) if(!Arrays.equals(digest,header.schema()) && !schemaHistory.containsKey(java.util.HexFormat.of().formatHex(digest))) throw new IOException("Historical schema metadata missing");
             if(schemaInstallation!=null) {
                 if(!currentSchemaHistorySeen) throw new IOException("Current schema install lacks immutable history");
-                if(schemaFence==null || !Arrays.equals(schemaInstallation.fence().encode(),schemaFence.encode())) throw new IOException("Installed generation lacks original fence");
+                try { it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation.validateLifecycle(schemaInstallation,schemaInstallations,currentSchemaActivation,schemaActivations,schemaFence,header.position()); }
+                catch(IllegalArgumentException invalid) { throw new IOException("Invalid native schema lifecycle",invalid); }
                 for(var gate:gates.values()) {
                     var participant=gate.fence().participant(header.owner().groupId());
                     if(!Arrays.equals(participant.schemaDigest(),header.schema())) {
