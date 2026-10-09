@@ -12,7 +12,7 @@ class RatisSchemaLifecycleClientTest {
         final SchemaChange.Definition definition=helper.definition();
         final NativeSchemaInstallProof install=new NativeSchemaInstallProof(definition.header(),helper.group,new ApplyPosition(1,5),new ApplyPosition(1,6));
         final NativeSchemaActivationProof activation=new NativeSchemaActivationProof(install,new UUID(8,1),new ApplyPosition(1,20),new ApplyPosition(1,7));
-        int writes; boolean wrongCut; final List<DistributedCommand> commands=new ArrayList<>();
+        int writes; boolean wrongCut,wrongAdmission; final List<DistributedCommand> commands=new ArrayList<>();
         public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { return new byte[]{7}; }
         public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { commands.add(command); return new CommandResult(CommandResult.Status.SUCCESS,List.of()); }
         public byte[] transaction(RangeDescriptor descriptor,byte[] bytes,boolean fresh) {
@@ -30,10 +30,12 @@ class RatisSchemaLifecycleClientTest {
         }
         public byte[] participant(RangeDescriptor descriptor,byte[] bytes) {
             assertEquals(definition.sourceDirectory().ranges().getFirst(),descriptor); writes++;
-            if (RatisSchemaInstallRecord.isInstall(bytes)) { var record=RatisSchemaInstallRecord.decode(bytes); assertEquals("added",record.changedPhysicalName()); return install.encode(); }
+            if (RatisSchemaInstallRecord.isInstall(bytes)) { var record=RatisSchemaInstallRecord.decode(bytes); assertEquals("added",record.changedPhysicalName()); return (wrongAdmission ? changedInstallation() : install).encode(); }
             var record=RatisSchemaActivateRecord.decode(bytes); assertEquals(activation.cataloguePosition(),record.cataloguePosition());
+            if (wrongAdmission) return new NativeSchemaActivationProof(changedInstallation(),activation.catalogueGroup(),activation.cataloguePosition(),activation.position()).encode();
             return wrongCut ? new NativeSchemaActivationProof(install,activation.catalogueGroup(),new ApplyPosition(1,21),activation.position()).encode() : activation.encode();
         }
+        NativeSchemaInstallProof changedInstallation() { return new NativeSchemaInstallProof(new NativeSchemaFence(definition.header(),helper.group,install.fence().position(),new byte[32]),definition.targetSchema().digest(),install.position()); }
     }
 
     @Test void qualifiedInstallActivationAndSchemaRefreshKeepOriginalOwnedCommands() throws Exception {
@@ -61,6 +63,17 @@ class RatisSchemaLifecycleClientTest {
             var target=client.schemaActivationTarget(client.schemaTarget(wire.definition,helper.group),wire.install);
             assertThrows(IOException.class,() -> client.activateSchema(target));
             assertEquals(1,wire.writes); assertArrayEquals(wire.definition.sourceDirectory().payloadDigest(),client.directory().payloadDigest());
+        }
+    }
+    @Test void installationAndActivationRepliesRetainTheOriginalAdmission() throws Exception {
+        var wire=new Transport(); wire.wrongAdmission=true;
+        try (var client=new RatisRoutedClient(wire.definition.sourceDirectory(),wire)) {
+            var source=client.schemaTarget(wire.definition,helper.group);
+            var install=client.schemaInstallTarget(source,wire.install.fence(),"added",false);
+            assertThrows(IOException.class,() -> client.installSchema(install));
+            var activate=client.schemaActivationTarget(source,wire.install);
+            assertThrows(IOException.class,() -> client.activateSchema(activate));
+            assertArrayEquals(wire.definition.sourceDirectory().payloadDigest(),client.directory().payloadDigest());
         }
     }
 

@@ -15,6 +15,7 @@ public final class NativeSchemaInstallProof {
         if(targetSchemaDigest.length!=32 || position.index()<=fence.position().index()) throw new IllegalArgumentException("Invalid schema INSTALL proof");
         fence.requireCut(position); this.targetSchemaDigest=targetSchemaDigest.clone();
     }
+    /** Explicit unqualified fixture proof; qualified installation must embed its actual manifest-bound native fence. */
     public NativeSchemaInstallProof(SchemaChange.Header header,UUID group,ApplyPosition fencePosition,ApplyPosition installPosition) {
         this(new NativeSchemaFence(header,group,fencePosition),header.targetSchemaDigest(),installPosition);
     }

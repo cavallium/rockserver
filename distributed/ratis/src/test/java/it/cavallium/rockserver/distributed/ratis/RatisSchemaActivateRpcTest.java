@@ -30,6 +30,16 @@ class RatisSchemaActivateRpcTest {
         assertThrows(IllegalArgumentException.class,() -> new RatisSchemaActivateRecord(request.header(),id(99),request.expectedInstallPosition(),id(20),new ApplyPosition(2,4)));
         assertThrows(IllegalArgumentException.class,() -> new RatisSchemaActivateRecord(request.header(),request.groupId(),request.expectedInstallPosition(),request.groupId(),new ApplyPosition(2,4)));
     }
+    @Test void frozenPreparationRetainsTheExactOriginalCatalogueCut() {
+        var original=request(11); var record=frozen(original);
+        var frozen=new RatisSchemaActivateRpc.Request(original.header(),original.groupId(),original.expectedInstallPosition(),record);
+        assertEquals(frozen,RatisSchemaActivateRpc.request(RatisSchemaActivateRpc.prepareRequest(frozen)));
+        assertEquals(record,RatisSchemaActivateRpc.decodePreparedReply(RatisSchemaActivateRpc.preparedReply(ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,frozen,record),ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,frozen));
+        var rebased=new RatisSchemaActivateRecord(original.header(),original.groupId(),original.expectedInstallPosition(),record.catalogueGroup(),new ApplyPosition(2,5));
+        assertThrows(IllegalArgumentException.class,() -> RatisSchemaActivateRpc.preparedReply(ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,frozen,rebased));
+        var install=new NativeSchemaInstallProof(original.header(),original.groupId(),new ApplyPosition(3,8),original.expectedInstallPosition());
+        assertThrows(IllegalArgumentException.class,() -> new RatisSchemaActivateRpc.State(frozen,new NativeSchemaActivationProof(install,record.catalogueGroup(),rebased.cataloguePosition(),new ApplyPosition(3,10)),true));
+    }
     @Test void activationStateBindsNativeInstallationAndSeparatesReadiness() {
         var request=request(11); var install=new NativeSchemaInstallProof(request.header(),request.groupId(),new ApplyPosition(3,8),request.expectedInstallPosition());
         var proof=new NativeSchemaActivationProof(install,id(20),new ApplyPosition(2,4),new ApplyPosition(3,10));

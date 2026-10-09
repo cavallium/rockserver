@@ -12,8 +12,14 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     public static final long MAX_BYTES=32L*1024*1024;
     public record Stats(int jobs,long bytes,int threads) {}
     private record Key(UUID group,String digest) {}
-    private final ThreadPoolExecutor executor=new ThreadPoolExecutor(THREADS,THREADS,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(MAX_JOBS),
-            Thread.ofPlatform().daemon(true).name("ratis-proof-query-",0).factory(),new ThreadPoolExecutor.AbortPolicy());
+    private final ThreadPoolExecutor executor;
+    public RatisProofQueryService() { this(THREADS,"ratis-proof-query-"); }
+    /** Independent bounded catalogue reads, so DATA proof dependencies never compete for their own response budget. */
+    public static RatisProofQueryService authorityLane() { return new RatisProofQueryService(1,"ratis-schema-authority-"); }
+    private RatisProofQueryService(int threads,String name) {
+        executor=new ThreadPoolExecutor(threads,threads,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(MAX_JOBS),
+                Thread.ofPlatform().daemon(true).name(name,0).factory(),new ThreadPoolExecutor.AbortPolicy());
+    }
     private final Map<Key,Task> tasks=new HashMap<>();
     private long bytes;
     private boolean stopping;
@@ -22,9 +28,10 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     private boolean sweeping;
     private final List<Publication> deferred=new ArrayList<>();
     private record Publication(Task task,Message message,Throwable failure) {}
-    @Override public CompletableFuture<Message> submit(UUID group,byte[] encoded,boolean coalesce,RatisRangeStateMachine.ProofQueryAction action) {
+    @Override public CompletableFuture<Message> submit(UUID group,byte[] encoded,long estimatedBytes,boolean coalesce,RatisRangeStateMachine.ProofQueryAction action) {
         Objects.requireNonNull(group); Objects.requireNonNull(encoded); Objects.requireNonNull(action);
-        if (encoded.length>MAX_BYTES) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query input exceeds byte bound"));
+        long weight=Math.max(encoded.length,estimatedBytes);
+        if (estimatedBytes<0 || weight>MAX_BYTES) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query estimated ownership exceeds byte bound"));
         final Key key;
         try { key=new Key(group,HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(encoded))); }
         catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
@@ -33,12 +40,13 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
             if (stopping) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof queries are stopping"));
             var existing=tasks.get(key);
             if (existing!=null) {
+                if (weight>existing.weight) return CompletableFuture.failedFuture(new RejectedExecutionException("Coalesced proof query exceeds original ownership estimate"));
                 if (!coalesce) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query is already active"));
                 if (existing.waiters>=MAX_WAITERS) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query waiter capacity exhausted"));
                 existing.waiters++; return existing.result.copy();
             }
-            if (tasks.size()>=MAX_JOBS || encoded.length>MAX_BYTES-bytes) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query capacity exhausted"));
-            task=new Task(key,encoded.clone(),action); tasks.put(key,task); bytes+=task.weight;
+            if (tasks.size()>=MAX_JOBS || weight>MAX_BYTES-bytes) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query capacity exhausted"));
+            task=new Task(key,encoded.clone(),weight,action); tasks.put(key,task); bytes+=task.weight;
         }
         try { executor.execute(task); } catch (RuntimeException rejected) { task.reject(rejected); }
         boolean stopped; synchronized (this) { stopped=stopping; }
@@ -83,12 +91,12 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
         final Key key;
         byte[] input;
         RatisRangeStateMachine.ProofQueryAction action;
-        final int weight;
+        final long weight;
         int waiters=1;
         final CompletableFuture<Message> result=new CompletableFuture<>();
         final CompletableFuture<Void> drained=new CompletableFuture<>();
         final AtomicInteger phase=new AtomicInteger();
-        Task(Key key,byte[] input,RatisRangeStateMachine.ProofQueryAction action) { this.key=key; this.input=input; this.action=action; weight=input.length; }
+        Task(Key key,byte[] input,long weight,RatisRangeStateMachine.ProofQueryAction action) { this.key=key; this.input=input; this.action=action; this.weight=weight; }
         @Override public void run() {
             if (!phase.compareAndSet(0,1)) return;
             Message message=null; Throwable failure=null;

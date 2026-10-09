@@ -12,7 +12,8 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 /** Replicated administrative intent and publication CAS. Native fencing and installation remain separate duties. */
 public final class RatisSchemaAdministration {
     public static final int MAX_HEAD_BYTES=SchemaChange.MAX_STATUS_BYTES+12;
-    private static final byte DEFINITION=0x43,HEAD=0x41,OUTCOME=0x4f;
+    private static final byte DEFINITION=0x43,HEAD=0x41,OUTCOME=0x4f,ADMISSION=0x4d;
+    @FunctionalInterface public interface ImmutableReader { byte[] read(byte[] key); }
     private final RaftClient client;
     private final UUID cluster,database,group,column;
     private final long epoch;
@@ -40,7 +41,7 @@ public final class RatisSchemaAdministration {
         this.client=Objects.requireNonNull(client); this.cluster=Objects.requireNonNull(cluster); this.database=Objects.requireNonNull(database);
         this.group=Objects.requireNonNull(group); this.column=Objects.requireNonNull(column);
         if (epoch<0 || schema.length!=32 || !client.getGroupId().getUuid().equals(group)) throw new IllegalArgumentException("Invalid schema administration binding");
-        this.epoch=epoch; this.schema=schema.clone(); validator=validator(cluster,database,group,epoch,schema,column);
+        this.epoch=epoch; this.schema=schema.clone(); validator=structuralValidator(cluster,database,group,epoch,schema,column);
     }
 
     public SchemaChange.Definition readDefinition(byte[] digest) throws IOException {
@@ -83,13 +84,41 @@ public final class RatisSchemaAdministration {
         return checked(definition.beginOperation(),List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),
                 List.of(new KeyPredicate(column,key,previous==null ? null : previous.encode()),
                         new KeyPredicate(column,directoryKey(header.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),
-                        new KeyPredicate(column,definitionKey(header.definitionDigest()),definition.encode()),
                         new KeyPredicate(column,RatisColumnIdentities.columnKey(header.changedColumnId()),previousColumn==null ? expected : previousColumn),
-                        new KeyPredicate(column,RatisColumnIdentities.apiKey(header.changedApiId()),previousApi==null ? expected : previousApi),
-                        new KeyPredicate(column,RatisSchemaCatalogue.key(header.targetSchemaDigest()),DistributedSchemaCodec.encode(definition.targetSchema())),
-                        new KeyPredicate(column,RatisSchemaCatalogue.key(header.sourceSchemaDigest()),DistributedSchemaCodec.encode(definition.sourceSchema()))));
+                        new KeyPredicate(column,RatisColumnIdentities.apiKey(header.changedApiId()),previousApi==null ? expected : previousApi)));
+    }
+    public SchemaAdmissionManifest readAdmissions(SchemaChange.Definition definition,byte[] digest) throws IOException {
+        byte[] value=read(admissionKey(digest),SchemaAdmissionManifest.MAX_BYTES); if (value==null) return null;
+        try { var manifest=SchemaAdmissionManifest.decode(value,definition); if (!Arrays.equals(manifest.digest(),digest)) throw new IllegalArgumentException("Admission digest changed"); return manifest; }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid immutable admissions",invalid); }
+    }
+    public DistributedCommand prepareAdmissions(OperationId operation,Head prepared,SchemaChange.Definition definition,SchemaAdmissionManifest manifest) {
+        manifest.requireDefinition(definition);
+        if (prepared.status().phase()!=SchemaChange.Phase.PREPARED || !sameHeader(prepared.status().header(),definition.header())) throw new IllegalArgumentException("Admissions require original PREPARED head");
+        byte[] key=admissionKey(manifest.digest());
+        return checked(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,manifest.encode())),
+                List.of(new KeyPredicate(column,headKey(definition.header().domainId()),prepared.encode()),new KeyPredicate(column,key,null)));
+    }
+    public DistributedCommand prepareFencing(OperationId operation,Head prepared,SchemaChange.Definition definition,SchemaAdmissionManifest manifest) {
+        manifest.requireDefinition(definition);
+        if (prepared.status().phase()!=SchemaChange.Phase.PREPARED || !sameHeader(prepared.status().header(),definition.header())) throw new IllegalArgumentException("Fencing requires original PREPARED head");
+        var next=new Head(prepared.status().beginFencing(manifest.digest()),prepared.allocatedThrough());
+        byte[] key=headKey(definition.header().domainId());
+        return checked(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),
+                List.of(new KeyPredicate(column,key,prepared.encode()),new KeyPredicate(column,directoryKey(definition.header().domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory()))));
+    }
+    public CommandResult executeFencing(DistributedCommand command) throws IOException {
+        validator.accept(command); if (!isFencing(command)) throw new IllegalArgumentException("Expected exact fencing transition");
+        byte[] encoded=DistributedCommandCodec.encode(command);
+        RatisSchemaFencingRpc.decodePreparedReply(content(RatisRoutedClient.rpc(() -> client.io().sendReadOnly(message(RatisSchemaFencingRpc.prepareRequest(command)))),RatisSchemaFencingRpc.MAX_BYTES),ScopedTransactionRpc.SCHEMA_FENCING_PREPARE,command);
+        return executePrepared(command,encoded);
+    }
+    public void cancelFencing(DistributedCommand command) throws IOException {
+        validator.accept(command); if (!isFencing(command)) throw new IllegalArgumentException("Expected exact fencing transition");
+        RatisSchemaFencingRpc.decodePreparedReply(content(RatisRoutedClient.rpc(() -> client.io().sendReadOnly(message(RatisSchemaFencingRpc.cancelRequest(command)))),RatisSchemaFencingRpc.MAX_BYTES),ScopedTransactionRpc.SCHEMA_FENCING_CANCEL,command);
     }
     public DistributedCommand prepareAdvance(OperationId operation,Head previous,SchemaChange.Status next) {
+        if (previous.status().phase()==SchemaChange.Phase.PREPARED && next.phase()==SchemaChange.Phase.FENCING) throw new IllegalArgumentException("Fencing requires immutable admission preparation");
         if (next.phase()==SchemaChange.Phase.PUBLISHED && previous.status().phase()!=SchemaChange.Phase.PUBLISHED) throw new IllegalArgumentException("Schema publication must atomically replace the directory");
         var head=new Head(next,previous.allocatedThrough()); byte[] key=headKey(next.header().domainId());
         if (head.terminal()) return checked(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,head.encode()),
@@ -109,9 +138,12 @@ public final class RatisSchemaAdministration {
         DistributedCommandCodec.encode(command); return command;
     }
     public CommandResult execute(DistributedCommand command) throws IOException {
-        validator.accept(command);
+        validator.accept(command); if (isFencing(command)) throw new IllegalArgumentException("Fencing requires fresh catalogue preparation");
+        return executePrepared(command,DistributedCommandCodec.encode(command));
+    }
+    private CommandResult executePrepared(DistributedCommand command,byte[] encoded) throws IOException {
         try {
-            var result=CommandResult.decode(content(RatisRoutedClient.rpc(() -> client.io().send(message(DistributedCommandCodec.encode(command)))),CommandResult.MAX_BYTES));
+            var result=CommandResult.decode(content(RatisRoutedClient.rpc(() -> client.io().send(message(encoded))),CommandResult.MAX_BYTES));
             if (result.valueCount()!=0 || result.status()==CommandResult.Status.RESULT_TOO_LARGE) throw new IOException("Unexpected schema administration result");
             return result;
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema administration reply",invalid); }
@@ -119,9 +151,23 @@ public final class RatisSchemaAdministration {
 
     public static boolean isCommand(DistributedCommand command) {
         if (command.mutations().isEmpty()) return false;
-        byte[] key=command.mutations().getFirst().key(); return key.length>0 && (key[0]==HEAD || key[0]==DEFINITION) && key.length!=16;
+        byte[] key=command.mutations().getFirst().key(); return key.length>0 && (key[0]==HEAD || key[0]==DEFINITION || key[0]==ADMISSION) && key.length!=16;
+    }
+    public static boolean isFencing(DistributedCommand command) {
+        if (command.mutations().size()!=1 || command.predicates().isEmpty() || command.mutations().getFirst().key().length!=17 || command.mutations().getFirst().key()[0]!=HEAD) return false;
+        var next=Head.decode(command.mutations().getFirst().value()); byte[] old=command.predicates().getFirst().expectedValue();
+        return old!=null && Head.decode(old).status().phase()==SchemaChange.Phase.PREPARED && next.status().phase()==SchemaChange.Phase.FENCING;
     }
     public static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column) {
+        return validator(cluster,database,group,epoch,schema,column,null,false);
+    }
+    public static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,ImmutableReader reader) {
+        return validator(cluster,database,group,epoch,schema,column,Objects.requireNonNull(reader),false);
+    }
+    static Consumer<DistributedCommand> structuralValidator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column) {
+        return validator(cluster,database,group,epoch,schema,column,null,true);
+    }
+    private static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,ImmutableReader reader,boolean structural) {
         byte[] expected=Objects.requireNonNull(schema).clone();
         return command -> {
             if (command.hasBucketData() || command.acceptance()!=null || command.transactionRejection() || command.kind()!=DistributedCommand.Kind.DATA || !command.groupId().equals(group) || command.rangeEpoch()!=epoch
@@ -133,15 +179,30 @@ public final class RatisSchemaAdministration {
                 if (command.mutations().size()!=1 || command.predicates().size()!=1 || !Arrays.equals(key,command.predicates().getFirst().key()) || command.predicates().getFirst().expectedValue()!=null) throw new IllegalArgumentException("Definition requires immutable absent-content CAS");
                 requireDefinition(SchemaChange.Definition.decode(first.value()),cluster,database,key); return;
             }
+            if (key.length==33 && key[0]==ADMISSION) {
+                if (command.mutations().size()!=1 || command.predicates().size()!=2 || !Arrays.equals(key,command.predicates().get(1).key()) || command.predicates().get(1).expectedValue()!=null) throw new IllegalArgumentException("Admissions require immutable absent-content CAS");
+                var header=manifestHeader(first.value()); requireHeader(header,cluster,database,header.domainId());
+                var prepared=Head.decode(command.predicates().getFirst().expectedValue());
+                if (prepared.status().phase()!=SchemaChange.Phase.PREPARED || !sameHeader(prepared.status().header(),header) || !Arrays.equals(command.predicates().getFirst().key(),headKey(header.domainId()))
+                        || !Arrays.equals(key,admissionKey(OperatorUpload.sha256(first.value())))) throw new IllegalArgumentException("Admission publication differs from original PREPARED intent");
+                if (!structural) {
+                    var definition=committedDefinition(reader,header,cluster,database);
+                    SchemaAdmissionManifest.decode(first.value(),definition);
+                    byte[] directory=reader.read(directoryKey(header.domainId()));
+                    if (directory==null || !Arrays.equals(RangeDirectoryCodec.decode(directory).payloadDigest(),header.sourceDirectoryDigest())) throw new IllegalArgumentException("Admission source directory changed");
+                }
+                return;
+            }
             var next=Head.decode(first.value()); var header=next.status().header(); UUID domain=header.domainId(); requireHeader(header,cluster,database,domain);
             if (!Arrays.equals(key,headKey(domain)) || command.predicates().isEmpty() || !Arrays.equals(command.predicates().getFirst().key(),key)) throw new IllegalArgumentException("Invalid domain administration head");
             byte[] previousBytes=command.predicates().getFirst().expectedValue(); Head previous=previousBytes==null ? null : Head.decode(previousBytes);
             if (next.status().phase()==SchemaChange.Phase.PREPARED && next.status().fenced().isEmpty() && next.status().installed().isEmpty()
-                    && (previous==null || !sameHeader(previous.status().header(),header))) validateBegin(command,next,previous,cluster,database,column);
+                    && (previous==null || !sameHeader(previous.status().header(),header))) validateBegin(command,next,previous,cluster,database,reader,structural);
             else {
                 if (previous==null || next.allocatedThrough()!=previous.allocatedThrough()) throw new IllegalArgumentException("Schema progress changed allocation ownership");
                 next.status().requireSuccessorOf(previous.status());
-                if (next.status().phase()==SchemaChange.Phase.PUBLISHED && previous.status().phase()!=SchemaChange.Phase.PUBLISHED) validatePublication(command,next,previous,column);
+                if (previous.status().phase()==SchemaChange.Phase.PREPARED && next.status().phase()==SchemaChange.Phase.FENCING) validateFencing(command,next,previous,cluster,database,reader,structural);
+                else if (next.status().phase()==SchemaChange.Phase.PUBLISHED && previous.status().phase()!=SchemaChange.Phase.PUBLISHED) validatePublication(command,next,previous,column);
                 else if (next.terminal()) {
                     if (command.mutations().size()!=2 || command.predicates().size()!=2) throw new IllegalArgumentException("Terminal schema progress requires retained outcome");
                     requirePair(command,1,outcomeKey(header.definitionDigest()),next.encode(),null);
@@ -149,25 +210,48 @@ public final class RatisSchemaAdministration {
             }
         };
     }
-    private static void validateBegin(DistributedCommand command,Head next,Head previous,UUID cluster,UUID database,UUID column) {
-        if (previous!=null && !previous.terminal() || command.mutations().size()!=1 || command.predicates().size()!=7) throw new IllegalArgumentException("Schema administration already active or invalid begin shape");
+    private static SchemaChange.Header manifestHeader(byte[] bytes) {
+        if (bytes==null || bytes.length<8 || bytes.length>SchemaAdmissionManifest.MAX_BYTES) throw new IllegalArgumentException("Invalid admission manifest budget");
+        var in=ByteBuffer.wrap(bytes); in.getInt(); int length=in.getInt();
+        if (length<1 || length>16*1024 || length>in.remaining()) throw new IllegalArgumentException("Invalid admission header");
+        byte[] encoded=new byte[length]; in.get(encoded); return SchemaChange.Header.decode(encoded);
+    }
+    private static SchemaChange.Definition committedDefinition(ImmutableReader reader,SchemaChange.Header header,UUID cluster,UUID database) {
+        if (reader==null) throw new IllegalArgumentException("Committed schema metadata reader is not configured");
+        byte[] value=reader.read(definitionKey(header.definitionDigest()));
+        if (value==null || value.length>SchemaChange.MAX_DEFINITION_BYTES) throw new IllegalArgumentException("Original committed schema definition missing");
+        var definition=SchemaChange.Definition.decode(value); requireDefinition(definition,cluster,database,definitionKey(header.definitionDigest()));
+        if (!sameHeader(definition.header(),header)) throw new IllegalArgumentException("Committed schema definition changed"); return definition;
+    }
+    private static void validateFencing(DistributedCommand command,Head next,Head previous,UUID cluster,UUID database,ImmutableReader reader,boolean structural) {
+        var header=next.status().header();
+        if (command.mutations().size()!=1 || command.predicates().size()!=2 || !Arrays.equals(command.predicates().get(1).key(),directoryKey(header.domainId()))) throw new IllegalArgumentException("Fencing requires exact source directory CAS");
+        var source=RangeDirectoryCodec.decode(command.predicates().get(1).expectedValue());
+        if (!Arrays.equals(source.payloadDigest(),header.sourceDirectoryDigest())) throw new IllegalArgumentException("Fencing source directory changed");
+        if (!structural) {
+            var definition=committedDefinition(reader,header,cluster,database);
+            byte[] bytes=reader.read(admissionKey(next.status().admissionDigest()));
+            if (bytes==null || !Arrays.equals(OperatorUpload.sha256(bytes),next.status().admissionDigest())) throw new IllegalArgumentException("Original committed admissions missing");
+            SchemaAdmissionManifest.decode(bytes,definition);
+        }
+    }
+    private static void validateBegin(DistributedCommand command,Head next,Head previous,UUID cluster,UUID database,ImmutableReader reader,boolean structural) {
+        if (previous!=null && !previous.terminal() || command.mutations().size()!=1 || command.predicates().size()!=4) throw new IllegalArgumentException("Schema administration already active or invalid begin shape");
         var header=next.status().header(); var source=RangeDirectoryCodec.decode(command.predicates().get(1).expectedValue());
-        var definition=SchemaChange.Definition.decode(command.predicates().get(2).expectedValue());
-        requireDefinition(definition,cluster,database,definitionKey(header.definitionDigest()));
-        if (!sameHeader(header,definition.header()) || !command.operationId().equals(definition.beginOperation())
-                || !Arrays.equals(command.predicates().get(1).key(),directoryKey(header.domainId()))
-                || !Arrays.equals(command.predicates().get(2).key(),definitionKey(header.definitionDigest()))
-                || !Arrays.equals(RangeDirectoryCodec.encode(source),RangeDirectoryCodec.encode(definition.sourceDirectory()))
-                || !Arrays.equals(command.predicates().get(5).key(),RatisSchemaCatalogue.key(header.targetSchemaDigest()))
-                || !Arrays.equals(command.predicates().get(5).expectedValue(),DistributedSchemaCodec.encode(definition.targetSchema()))
-                || !Arrays.equals(command.predicates().get(6).key(),RatisSchemaCatalogue.key(header.sourceSchemaDigest()))
-                || !Arrays.equals(command.predicates().get(6).expectedValue(),DistributedSchemaCodec.encode(definition.sourceSchema()))) throw new IllegalArgumentException("Schema begin changed original definition/directory/schema");
+        if (!Arrays.equals(command.predicates().get(1).key(),directoryKey(header.domainId())) || !Arrays.equals(source.payloadDigest(),header.sourceDirectoryDigest())
+                || !source.clusterId().equals(header.clusterId()) || !source.databaseId().equals(header.databaseId()) || !source.domainId().equals(header.domainId())) throw new IllegalArgumentException("Schema begin changed original source directory");
+        if (!structural) {
+            var definition=committedDefinition(reader,header,cluster,database);
+            if (!command.operationId().equals(definition.beginOperation()) || !Arrays.equals(RangeDirectoryCodec.encode(source),RangeDirectoryCodec.encode(definition.sourceDirectory()))) throw new IllegalArgumentException("Schema begin changed original immutable definition");
+            byte[] publishedSource=reader.read(RatisSchemaCatalogue.key(header.sourceSchemaDigest())),publishedTarget=reader.read(RatisSchemaCatalogue.key(header.targetSchemaDigest()));
+            if (!Arrays.equals(publishedSource,DistributedSchemaCodec.encode(definition.sourceSchema())) || !Arrays.equals(publishedTarget,DistributedSchemaCodec.encode(definition.targetSchema()))) throw new IllegalArgumentException("Schema begin lacks original committed source/target schemas");
+        }
         long prior=Math.max(previous==null ? 0 : previous.allocatedThrough(),header.sourceMaximumApiId());
         if (header.kind()==SchemaChange.Kind.CREATE_COLUMN && header.changedApiId()<=prior || next.allocatedThrough()!=Math.max(prior,header.targetMaximumApiId())) throw new IllegalArgumentException("Schema begin reuses or changes allocated column ID");
         byte[] issued=null;
         for (int i=0;i<2;i++) {
             byte[] key=i==0 ? RatisColumnIdentities.columnKey(header.changedColumnId()) : RatisColumnIdentities.apiKey(header.changedApiId());
-            var predicate=command.predicates().get(i+3); byte[] old=predicate.expectedValue();
+            var predicate=command.predicates().get(i+2); byte[] old=predicate.expectedValue();
             if (!Arrays.equals(predicate.key(),key)) throw new IllegalArgumentException("Wrong column issuance key");
             byte[] first=RatisColumnIdentities.requireOwned(old,header.domainId(),header.changedColumnId(),header.changedApiId());
             if (issued!=null && !Arrays.equals(issued,first) || header.kind()==SchemaChange.Kind.CREATE_COLUMN && !Arrays.equals(first,header.targetSchemaDigest())) throw new IllegalArgumentException("Schema column incarnation was issued for a different definition");
@@ -215,6 +299,7 @@ public final class RatisSchemaAdministration {
     private static boolean sameHeader(SchemaChange.Header a,SchemaChange.Header b) { return Arrays.equals(a.encode(),b.encode()); }
     public static byte[] headKey(UUID domain) { return taggedUuid(HEAD,domain); }
     public static byte[] definitionKey(byte[] digest) { return taggedDigest(DEFINITION,digest); }
+    public static byte[] admissionKey(byte[] digest) { return taggedDigest(ADMISSION,digest); }
     public static byte[] outcomeKey(byte[] digest) { return taggedDigest(OUTCOME,digest); }
     private static byte[] taggedUuid(byte tag,UUID id) { return ByteBuffer.allocate(17).put(tag).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array(); }
     private static byte[] directoryKey(UUID id) { return ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array(); }

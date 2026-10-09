@@ -71,7 +71,7 @@ class NativeSchemaCapacityTest {
             var changedDefinition=new SchemaChange.Definition(change.changeId(),new OperationId(UUID.randomUUID(),1,0),change.sourceDirectory(),source,target);
             assertThrows(IllegalArgumentException.class,() -> pool.lookupSchemaCapacityStatus(store,changedDefinition,"future",false));
             assertThrows(IllegalArgumentException.class,() -> pool.requireSchemaFenceCapacity(store,changedDefinition.header()));
-            var retired=SchemaChange.Status.begin(change.header()).beginFencing().fenced(fixture.group,installed.fence().position()).installed(fixture.group,installed.position()).publish().activated(fixture.group,new ApplyPosition(2,4)).retire();
+            var retired=SchemaChange.Status.begin(change.header()).beginFencing(new byte[32]).fenced(fixture.group,installed.fence().position()).installed(fixture.group,installed.position()).publish().activated(fixture.group,new ApplyPosition(2,4)).retire();
             pool.releaseSchemaCapacity(store,proof,SchemaCapacityRelease.retired(retired,catalogue,new ApplyPosition(2,20)));
             var status=pool.lookupSchemaCapacityStatus(store,change,"future",false); assertEquals(DistributedStoragePool.SchemaCapacityState.RETIRED,status.state()); assertFalse(status.ready());
             assertEquals(proof,pool.reserveSchemaCapacity(store,change,Map.of(fixture.column,"future"),Set.of()));
@@ -297,6 +297,90 @@ class NativeSchemaCapacityTest {
         try(var pool=DistributedStoragePool.open(root.resolve("configured-bootstrap"),config,LoggerFactory.getLogger(getClass()))) {
             var store=pool.openRange(new RangeOwnership.Owner(fixture.group,1),new RangeOwnership.Interval(fixture.domain,target.columnIds(),null,null),target.digest(),Map.of(fixture.column,"future"),Set.of(fixture.column));
             assertNotNull(loaded(pool).mergeOperators().get("future")); store.applyNoop(new ApplyPosition(1,0));
+        }
+    }
+
+    SchemaAdmissionManifest manifest(SchemaChange.Definition definition,NativeSchemaCapacityReservation proof,String name) {
+        var descriptor=definition.sourceDirectory().ranges().getFirst(); var replica=descriptor.replicas().getFirst();
+        return new SchemaAdmissionManifest(definition,List.of(new SchemaAdmissionManifest.Binding(descriptor.groupId(),name,false)),
+                List.of(new SchemaAdmissionManifest.ReplicaAdmission(descriptor.groupId(),replica.replicaId(),proof)));
+    }
+    @Test void manifestAdmissionRejectsMissingClaimWrongOwnerBindingAndLocalProof() throws Exception {
+        var source=empty(fixture.domain,0); var definition=change(source,populated(source,fixture.column),fixture.group);
+        var owner=definition.sourceDirectory().ranges().getFirst().replicas().getFirst();
+        try(var pool=fixture.open(root.resolve("manifest-validation"))) {
+            var store=range(pool,fixture.group,source,Map.of()); store.applyNoop(new ApplyPosition(1,0));
+            var fake=new NativeSchemaCapacityReservation(definition.header(),fixture.group,new byte[32],1);
+            assertThrows(IllegalStateException.class,() -> pool.requireSchemaFencingAdmission(store,definition.header(),manifest(definition,fake,"future").encode(),owner));
+            var proof=pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of()); var manifest=manifest(definition,proof,"future");
+            assertEquals(172,proof.encode().length); assertEquals(proof,pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner));
+            var wrongOwner=new ReplicaDescriptor(owner.nodeId(),UUID.randomUUID(),owner.replicaId(),owner.peerId(),owner.address(),owner.role());
+            assertThrows(IllegalArgumentException.class,() -> pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),wrongOwner));
+            assertThrows(IllegalArgumentException.class,() -> pool.requireSchemaFencingAdmission(store,definition.header(),manifest(definition,proof,"changed").encode(),owner));
+            assertThrows(IllegalArgumentException.class,() -> pool.requireSchemaFencingAdmission(store,definition.header(),manifest(definition,fake,"future").encode(),owner));
+            assertNull(store.schemaFence()); assertTrue(store.admissionOpen());
+        }
+    }
+    @Test void manifestAdmissionCannotCertifyAnUnresolvedCapacityForce() throws Exception {
+        var source=empty(fixture.domain,0); var definition=change(source,populated(source,fixture.column),fixture.group);
+        var owner=definition.sourceDirectory().ranges().getFirst().replicas().getFirst();
+        try(var pool=fixture.open(root.resolve("manifest-force"))) {
+            var store=range(pool,fixture.group,source,Map.of()); store.applyNoop(new ApplyPosition(1,0));
+            pool.schemaCapacityForceObserver(after -> { if(after) throw new org.rocksdb.RocksDBException("Controlled lost force acknowledgement"); });
+            assertThrows(org.rocksdb.RocksDBException.class,() -> pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of()));
+            var proof=pool.lookupSchemaCapacity(store,definition.header()); assertNotNull(proof); var manifest=manifest(definition,proof,"future");
+            assertThrows(IllegalStateException.class,() -> pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner));
+            pool.schemaCapacityForceObserver(after -> {}); assertEquals(proof,pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of()));
+            assertEquals(proof,pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner));
+        }
+    }
+    @Test void manifestDigestSurvivesFenceReopenInstallHistoryAndPortableImage() throws Exception {
+        var source=empty(fixture.domain,0); var definition=change(source,populated(source,fixture.column),fixture.group);
+        var owner=definition.sourceDirectory().ranges().getFirst().replicas().getFirst(); Path sourcePath=root.resolve("manifest-source"),image=root.resolve("manifest-image");
+        var limits=new NativeRangeImage.Limits(3*1024*1024,32*1024*1024,256); NativeSchemaCapacityReservation proof; SchemaAdmissionManifest manifest; NativeSchemaInstallation installed;
+        try(var pool=fixture.open(sourcePath)) {
+            var store=range(pool,fixture.group,source,Map.of()); store.applyNoop(new ApplyPosition(1,0));
+            proof=pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of()); manifest=manifest(definition,proof,"future");
+            pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner);
+            var fence=pool.applySchemaFence(store,new ApplyPosition(1,1),definition.header(),proof,manifest.digest());
+            assertArrayEquals(manifest.digest(),fence.admissionDigest()); assertEquals(proof,pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner));
+            byte[] changed=manifest.digest(); changed[0]^=1;
+            assertThrows(IllegalArgumentException.class,() -> pool.applySchemaFence(store,new ApplyPosition(1,2),definition.header(),proof,changed));
+            assertEquals(new ApplyPosition(1,1),store.applied());
+        }
+        try(var pool=fixture.open(sourcePath)) {
+            var store=range(pool,fixture.group,source,Map.of()); assertArrayEquals(manifest.digest(),store.schemaFence().admissionDigest());
+            assertEquals(proof,pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner));
+            installed=pool.installSchema(store,new ApplyPosition(1,2),definition,Map.of(fixture.column,"future"),Set.of());
+            assertArrayEquals(manifest.digest(),installed.proof().fence().admissionDigest());
+            var state=pool.lookupSchemaCapacityStatus(store,definition,"future",false); assertEquals(DistributedStoragePool.SchemaCapacityState.CONSUMED,state.state());
+            assertEquals(proof,pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner));
+            assertEquals(installed.fence(),pool.applySchemaFence(store,new ApplyPosition(1,3),definition.header(),proof,manifest.digest()));
+            byte[] changed=manifest.digest(); changed[0]^=1;
+            assertThrows(IllegalArgumentException.class,() -> store.applySchemaFence(new ApplyPosition(1,4),definition.header(),changed));
+            assertThrows(IllegalArgumentException.class,() -> store.applySchemaFence(new ApplyPosition(1,4),definition.header()));
+            assertEquals(new ApplyPosition(1,3),store.applied()); NativeRangeImage.write(image,store,limits);
+        }
+        try(var pool=fixture.open(sourcePath)) {
+            var store=range(pool,fixture.group,source,Map.of()); assertArrayEquals(manifest.digest(),store.lookupSchemaFence(definition.header()).admissionDigest());
+            assertEquals(proof,pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner));
+        }
+        try(var pool=fixture.open(root.resolve("manifest-target"))) {
+            var store=range(pool,fixture.group,definition.targetSchema(),Map.of(fixture.column,"future")); store.fence(); store.installSnapshot(image,limits); store.activate();
+            assertEquals(installed.proof(),store.lookupSchemaInstallation(definition.header())); assertArrayEquals(manifest.digest(),store.lookupSchemaFence(definition.header()).admissionDigest());
+            byte[] changed=manifest.digest(); changed[0]^=1;
+            assertThrows(IllegalArgumentException.class,() -> store.applySchemaFence(new ApplyPosition(1,4),definition.header(),changed));
+            assertEquals(installed.fence(),store.applySchemaFence(new ApplyPosition(1,4),definition.header(),manifest.digest()));
+        }
+    }
+    @Test void abortedCapacityClaimIsNeverFreshManifestAdmission() throws Exception {
+        var source=empty(fixture.domain,0); var definition=change(source,populated(source,fixture.column),fixture.group);
+        var owner=definition.sourceDirectory().ranges().getFirst().replicas().getFirst();
+        try(var pool=fixture.open(root.resolve("manifest-aborted"))) {
+            var store=range(pool,fixture.group,source,Map.of()); store.applyNoop(new ApplyPosition(1,0));
+            var proof=pool.reserveSchemaCapacity(store,definition,Map.of(fixture.column,"future"),Set.of()); var manifest=manifest(definition,proof,"future");
+            pool.releaseSchemaCapacity(store,proof,abort(definition));
+            assertThrows(IllegalStateException.class,() -> pool.requireSchemaFencingAdmission(store,definition.header(),manifest.encode(),owner)); assertNull(store.schemaFence());
         }
     }
 

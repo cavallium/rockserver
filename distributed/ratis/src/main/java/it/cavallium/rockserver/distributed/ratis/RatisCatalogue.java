@@ -144,12 +144,17 @@ public final class RatisCatalogue {
     /** Operator publication uses a configured trusted policy and committed native chunk reader. */
     public static Consumer<DistributedCommand> validator(UUID clusterId, UUID databaseId, UUID groupId,
             long rangeEpoch, byte[] schemaDigest, UUID directoryColumn, UUID sessionColumn,Consumer<DistributedCommand> operators) {
+        return validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,sessionColumn,operators,null);
+    }
+    public static Consumer<DistributedCommand> validator(UUID clusterId,UUID databaseId,UUID groupId,long rangeEpoch,byte[] schemaDigest,
+            UUID directoryColumn,UUID sessionColumn,Consumer<DistributedCommand> operators,RatisSchemaAdministration.ImmutableReader immutable) {
         if (directoryColumn.equals(sessionColumn)) throw new IllegalArgumentException("Catalogue columns must be distinct");
         Objects.requireNonNull(operators);
         var directory = validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         var sessions = RatisSessionEpochs.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,sessionColumn);
         var schemas = RatisSchemaCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
-        var administration = RatisSchemaAdministration.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
+        var administration = immutable==null ? RatisSchemaAdministration.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn)
+                : RatisSchemaAdministration.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,immutable);
         var allocation=RatisColumnAllocation.validator(groupId,rangeEpoch,schemaDigest,directoryColumn);
         return command -> {
             if (RatisOperatorCatalogue.isCommand(command)) operators.accept(command);

@@ -60,12 +60,12 @@ class SchemaChangeTest {
     @Test void durableLifecycleRequiresAllFencesThenStrictInstallThenPublicationActivationAndRetirement() {
         var definition=definition(schema(1,column(1)),schema(2,column(1),column(2)),2);
         var initial=SchemaChange.Status.begin(definition.header()); UUID first=id(400), second=id(401);
-        var fencing=initial.beginFencing(); fencing.requireSuccessorOf(initial);
-        assertSame(fencing,fencing.beginFencing());
+        var fencing=initial.beginFencing(new byte[32]); fencing.requireSuccessorOf(initial);
+        assertSame(fencing,fencing.beginFencing(new byte[32]));
         assertThrows(IllegalStateException.class,() -> initial.fenced(first,new ApplyPosition(2,10)));
         assertThrows(IllegalStateException.class,fencing::abort);
         var aborted=initial.abort(); aborted.requireSuccessorOf(initial);
-        assertThrows(IllegalStateException.class,aborted::beginFencing);
+        assertThrows(IllegalStateException.class,() -> aborted.beginFencing(new byte[32]));
         assertThrows(IllegalArgumentException.class,() -> fencing.requireSuccessorOf(aborted));
         assertThrows(IllegalArgumentException.class,() -> aborted.requireSuccessorOf(fencing));
         var partial=fencing.fenced(first,new ApplyPosition(2,10)); partial.requireSuccessorOf(fencing);
@@ -112,15 +112,30 @@ class SchemaChangeTest {
         assertThrows(IllegalArgumentException.class,() -> published.activated(id(999),new ApplyPosition(4,30)));
         assertThrows(IllegalArgumentException.class,() -> initial.fenced(id(999),new ApplyPosition(0,1)));
     }
+    @Test void admissionDigestIsRequiredImmutableAndCannotChangeAcrossSuccessors() {
+        var definition=definition(schema(1),schema(2,column(1)),1); var initial=SchemaChange.Status.begin(definition.header()); byte[] commitment=new byte[32]; commitment[0]=7;
+        assertNull(initial.admissionDigest()); assertNull(initial.abort().admissionDigest());
+        assertThrows(IllegalArgumentException.class,() -> initial.beginFencing(null)); assertThrows(IllegalArgumentException.class,() -> initial.beginFencing(new byte[31]));
+        var fencing=initial.beginFencing(commitment); commitment[0]=9; assertEquals(7,fencing.admissionDigest()[0]); var exposed=fencing.admissionDigest(); exposed[0]=1; assertEquals(7,fencing.admissionDigest()[0]);
+        assertThrows(IllegalArgumentException.class,() -> fencing.beginFencing(commitment));
+        var foreign=initial.beginFencing(commitment); assertThrows(IllegalArgumentException.class,() -> foreign.requireSuccessorOf(fencing));
+        UUID group=id(400); var fenced=fencing.fenced(group,new ApplyPosition(1,1)); var installed=fenced.installed(group,new ApplyPosition(1,2)); var published=installed.publish(); var activated=published.activated(group,new ApplyPosition(1,3)); var retired=activated.retire();
+        for(var status:List.of(fencing,fenced,installed,published,activated,retired)) { assertArrayEquals(fencing.admissionDigest(),status.admissionDigest()); assertArrayEquals(status.encode(),SchemaChange.Status.decode(status.encode()).encode()); }
+        assertThrows(IllegalStateException.class,fencing::abort); assertThrows(IllegalStateException.class,retired::abort);
+        byte[] missing=initial.encode(); missing[8+definition.header().encode().length]=(byte)(SchemaChange.Phase.FENCING.ordinal()+1);
+        assertThrows(IllegalArgumentException.class,() -> SchemaChange.Status.decode(missing));
+        byte[] prepared=fencing.encode(); prepared[8+definition.header().encode().length]=(byte)(SchemaChange.Phase.PREPARED.ordinal()+1);
+        assertThrows(IllegalArgumentException.class,() -> SchemaChange.Status.decode(prepared));
+    }
     @Test void canonicalBoundsRejectTruncationTrailingDataAndMultiProofSuccessors() {
         var definition=definition(schema(1),schema(2,column(1)),64); var header=definition.header();
-        var status=SchemaChange.Status.begin(header).beginFencing();
+        var status=SchemaChange.Status.begin(header).beginFencing(new byte[32]);
         for (var participant:header.participants()) status=status.fenced(participant.groupId(),new ApplyPosition(0,1));
         for (var participant:header.participants()) status=status.installed(participant.groupId(),new ApplyPosition(1,2));
         status=status.publish();
         for (var participant:header.participants()) status=status.activated(participant.groupId(),new ApplyPosition(2,3));
         status=status.retire();
-        assertEquals(9542,status.encode().length);
+        assertEquals(9575,status.encode().length);
         assertTrue(status.encode().length<=SchemaChange.MAX_STATUS_BYTES);
         byte[][] payloads={definition.encode(),header.encode(),status.encode()};
         for (int type=0;type<3;type++) {

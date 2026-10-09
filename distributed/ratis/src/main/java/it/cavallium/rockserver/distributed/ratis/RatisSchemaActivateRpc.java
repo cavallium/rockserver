@@ -6,26 +6,31 @@ import java.util.*;
 
 /** Activation preparation returns the exact append record qualified at a catalogue publication cut. */
 public final class RatisSchemaActivateRpc {
-    public static final int MAX_BYTES=ScopedTransactionRpc.HEADER_BYTES+8+2*RatisSchemaActivateRecord.MAX_BYTES+NativeSchemaActivationProof.BYTES+1;
+    public static final int MAX_REQUEST_BYTES=40+2*RatisSchemaActivateRecord.MAX_BYTES;
+    public static final int MAX_BYTES=ScopedTransactionRpc.HEADER_BYTES+9+MAX_REQUEST_BYTES+RatisSchemaActivateRecord.MAX_BYTES+NativeSchemaActivationProof.BYTES;
     private RatisSchemaActivateRpc() {}
-    public record Request(SchemaChange.Header header,UUID groupId,ApplyPosition expectedInstallPosition) {
+    public record Request(SchemaChange.Header header,UUID groupId,ApplyPosition expectedInstallPosition,RatisSchemaActivateRecord frozenRecord) {
+        public Request(SchemaChange.Header header,UUID groupId,ApplyPosition expectedInstallPosition) { this(header,groupId,expectedInstallPosition,null); }
         public Request {
             Objects.requireNonNull(header); Objects.requireNonNull(groupId); Objects.requireNonNull(expectedInstallPosition);
             if (expectedInstallPosition.term()==0 || header.participants().stream().noneMatch(p -> p.groupId().equals(groupId))) throw new IllegalArgumentException("Invalid activation request");
-            if (36L+header.encode().length>RatisSchemaActivateRecord.MAX_BYTES) throw new IllegalArgumentException("Activation request exceeds bound");
+            if (frozenRecord!=null && (!groupId.equals(frozenRecord.groupId()) || !expectedInstallPosition.equals(frozenRecord.expectedInstallPosition()) || !Arrays.equals(header.encode(),frozenRecord.header().encode()))) throw new IllegalArgumentException("Frozen activation differs from request");
+            if (40L+header.encode().length+(frozenRecord==null ? 0 : frozenRecord.encode().length)>MAX_REQUEST_BYTES) throw new IllegalArgumentException("Activation request exceeds bound");
         }
         public byte[] encode() {
-            byte[] bytes=header.encode(); var out=ByteBuffer.allocate(36+bytes.length);
-            ScopedTransactionRpc.uuid(out,groupId); out.putLong(expectedInstallPosition.term()).putLong(expectedInstallPosition.index()); ScopedTransactionRpc.putBlob(out,bytes); return out.array();
+            byte[] bytes=header.encode(),frozen=frozenRecord==null ? null : frozenRecord.encode(); var out=ByteBuffer.allocate(40+bytes.length+(frozen==null ? 0 : frozen.length));
+            ScopedTransactionRpc.uuid(out,groupId); out.putLong(expectedInstallPosition.term()).putLong(expectedInstallPosition.index()); ScopedTransactionRpc.putBlob(out,bytes); ScopedTransactionRpc.putBlob(out,frozen); return out.array();
         }
         public static Request decode(byte[] bytes) {
-            if (bytes==null || bytes.length<36 || bytes.length>RatisSchemaActivateRecord.MAX_BYTES) throw new IllegalArgumentException("Invalid activation request size");
+            if (bytes==null || bytes.length<40 || bytes.length>MAX_REQUEST_BYTES) throw new IllegalArgumentException("Invalid activation request size");
             var in=ByteBuffer.wrap(bytes); UUID group=ScopedTransactionRpc.uuid(in); var install=new ApplyPosition(in.getLong(),in.getLong());
             var header=SchemaChange.Header.decode(ScopedTransactionRpc.blob(in,RatisSchemaActivateRecord.MAX_BYTES-36,false));
-            if (in.hasRemaining()) throw new IllegalArgumentException("Trailing activation request"); return new Request(header,group,install);
+            byte[] frozen=ScopedTransactionRpc.blob(in,RatisSchemaActivateRecord.MAX_BYTES,true);
+            if (in.hasRemaining()) throw new IllegalArgumentException("Trailing activation request"); return new Request(header,group,install,frozen==null ? null : RatisSchemaActivateRecord.decode(frozen));
         }
         public void requireRecord(RatisSchemaActivateRecord record) {
             if (!groupId.equals(record.groupId()) || !expectedInstallPosition.equals(record.expectedInstallPosition()) || !Arrays.equals(header.encode(),record.header().encode())) throw new IllegalArgumentException("Activation record differs from original request");
+            if (frozenRecord!=null && !frozenRecord.equals(record)) throw new IllegalArgumentException("Frozen activation qualification changed");
         }
         @Override public boolean equals(Object other) { return other instanceof Request r && Arrays.equals(encode(),r.encode()); }
         @Override public int hashCode() { return Arrays.hashCode(encode()); }
@@ -38,6 +43,7 @@ public final class RatisSchemaActivateRpc {
                 activation.requireHeader(request.header());
                 if (!activation.installation().fence().participant().groupId().equals(request.groupId())
                         || !activation.installation().position().equals(request.expectedInstallPosition())) throw new IllegalArgumentException("Activation proof differs from original installation");
+                if (request.frozenRecord()!=null && (!activation.catalogueGroup().equals(request.frozenRecord().catalogueGroup()) || !activation.cataloguePosition().equals(request.frozenRecord().cataloguePosition()))) throw new IllegalArgumentException("Activation proof changed frozen catalogue qualification");
             }
         }
     }
@@ -59,7 +65,7 @@ public final class RatisSchemaActivateRpc {
     public static RatisSchemaActivateRecord decodePreparedReply(byte[] bytes,int expectedKind,Request expected) {
         requirePreparedKind(expectedKind); var packet=ScopedTransactionRpc.parse(bytes,MAX_BYTES);
         if (packet.kind()!=expectedKind) throw new IllegalArgumentException("Crossed activation preparation reply");
-        var in=ByteBuffer.wrap(packet.body()); var request=Request.decode(ScopedTransactionRpc.blob(in,RatisSchemaActivateRecord.MAX_BYTES,false));
+        var in=ByteBuffer.wrap(packet.body()); var request=Request.decode(ScopedTransactionRpc.blob(in,MAX_REQUEST_BYTES,false));
         if (!request.equals(expected)) throw new IllegalArgumentException("Activation preparation identity changed");
         byte[] frozen=ScopedTransactionRpc.blob(in,RatisSchemaActivateRecord.MAX_BYTES,true);
         if (in.hasRemaining() || expectedKind==ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE && frozen==null || expectedKind==ScopedTransactionRpc.SCHEMA_ACTIVATE_CANCEL && frozen!=null) throw new IllegalArgumentException("Invalid activation preparation reply");
@@ -73,7 +79,7 @@ public final class RatisSchemaActivateRpc {
     public static State stateReply(byte[] bytes,int expectedKind,Request expected) {
         requireStateKind(expectedKind); var packet=ScopedTransactionRpc.parse(bytes,MAX_BYTES);
         if (packet.kind()!=expectedKind) throw new IllegalArgumentException("Crossed activation state reply");
-        var in=ByteBuffer.wrap(packet.body()); var request=Request.decode(ScopedTransactionRpc.blob(in,RatisSchemaActivateRecord.MAX_BYTES,false));
+        var in=ByteBuffer.wrap(packet.body()); var request=Request.decode(ScopedTransactionRpc.blob(in,MAX_REQUEST_BYTES,false));
         if (!request.equals(expected)) throw new IllegalArgumentException("Activation state identity changed");
         byte[] proof=ScopedTransactionRpc.blob(in,NativeSchemaActivationProof.BYTES,true);
         if (in.remaining()!=1) throw new IllegalArgumentException("Invalid activation state tail"); int ready=in.get() & 255;

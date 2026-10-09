@@ -32,6 +32,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     @FunctionalInterface interface ServerFactory {
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException;
     }
+    @FunctionalInterface interface SchemaReplicaClientFactory { RatisSchemaReplicaClient create() throws IOException; }
     @FunctionalInterface interface HomeClientFactory { RatisRoutedClient connect(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) throws IOException; }
     public record Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,
                            Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout,
@@ -85,8 +86,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisNativeParticipantDiscovery nativeParticipantDiscovery;
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
+    private RatisProofQueryService authorityQueries;
     private RatisExportSourceService exportSources;
     private RatisSchemaReplicaService schemaReplicas;
+    private RatisSchemaReplicaClient schemaFencingReplicas;
+    private boolean schemaFencingReplicasClosed;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
 
@@ -134,8 +138,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,recoveries,homeFactory,replicas,() -> new RatisSchemaReplicaClient(RatisSchemaReplicaClient.MAX_CALLS));
+    }
+    static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
+            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas,SchemaReplicaClientFactory replicaFactory) throws IOException {
         var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes,recoveries,replicas);
-        try { node.initialize(config,startup,factory,homeFactory); return node; }
+        try { node.initialize(config,startup,factory,homeFactory,replicaFactory); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
@@ -165,7 +173,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         var catalogue=plan.catalogue(); epochs.requireCatalogueBinding(plan.directory().clusterId(),plan.directory().databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
         if (!Arrays.equals(routed.bootstrapDirectory().payloadDigest(),plan.directory().payloadDigest())) throw new IllegalArgumentException("Node routed bootstrap directory differs from placement plan");
     }
-    private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory) throws IOException {
+    private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory,SchemaReplicaClientFactory replicaFactory) throws IOException {
         Objects.requireNonNull(startup); Objects.requireNonNull(factory);
         if (!Files.isDirectory(root)) throw new IOException("Node root must already exist on durable storage");
         for (var home:plan.homes()) {
@@ -212,6 +220,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
         proofQueries=new RatisProofQueryService();
+        if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE))
+            authorityQueries=RatisProofQueryService.authorityLane();
         if (transactionHomes!=null) snapshotHelp=new RatisSnapshotHelpService(scheduler);
         var metadataBindings=new HashMap<UUID,String>();
         for (var group:plan.localGroups()) switch (plan.role(group.getGroupId().getUuid())) {
@@ -229,6 +239,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
         pool.configureSnapshotAdmission(settings.exports().pins());
         if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.DATA))
             schemaReplicas=new RatisSchemaReplicaService(nativePath,root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());
+        if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE))
+            schemaFencingReplicas=Objects.requireNonNull(replicaFactory.create());
         try {
             for (var group:plan.localGroups()) {
                 var id=group.getGroupId().getUuid(); RatisRangeStateMachine machine;
@@ -237,9 +249,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     var c=plan.catalogue();
                     var store=pool.openRange(new RangeOwnership.Owner(id,c.epoch()),new RangeOwnership.Interval(id,Set.of(c.directoryColumn(),c.sessionsColumn()),null,null),
                             c.schemaDigest(),Map.of(c.directoryColumn(),"catalogue-directory",c.sessionsColumn(),"catalogue-sessions"),Set.of());
-                    machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn()));
+                    var operatorLimits=new RatisOperatorCatalogue.Limits(schemaReplicaConfig.limits().maximumUploads(),schemaReplicaConfig.limits().maximumDiskBytes());
+                    var operators=RatisOperatorCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),operatorLimits,this::requireOperatorAdmission,key -> committedCatalogueValue(store,c.directoryColumn(),key));
+                    machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn(),operators,key -> committedCatalogueValue(store,c.directoryColumn(),key)));
                     machine.role(role);
                     machine.schemaCatalogue(plan.directory().clusterId(),plan.directory().databaseId(),c.directoryColumn());
+                    machine.schemaFencingReplicaClient(schemaFencingReplicas);
+                    machine.schemaAuthorityQueries(authorityQueries);
                 } else {
                     var directory=plan.groupDirectory(id); var descriptor=plan.groupDescriptor(id); var home=plan.home(id);
                     var bindings=home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
@@ -263,7 +279,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
                     }
-                    else { machine.role(role); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),effectiveDirectory); machine.schemaReplicas(schemaReplicas,ownReplica(descriptor)); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
+                    else { machine.role(role); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority((header,digest) -> readSchemaAuthority(authority,header,digest),effectiveDirectory); machine.schemaReplicas(schemaReplicas,ownReplica(descriptor)); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
                 }
                 machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
@@ -356,6 +372,32 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for (var machine:machines.values()) machine.beginShutdown(); throw failure;
         } finally { synchronized (this) { starting=false; } }
     }
+    private static RatisSchemaAuthority.View readSchemaAuthority(RatisSchemaAuthority authority,SchemaChange.Header header,byte[] digest) throws IOException {
+        final IOException currentFailure;
+        try {
+            var current=authority.read(header,digest,false);
+            if (current.head()!=null && Arrays.equals(current.head().status().header().encode(),header.encode())) return current;
+            currentFailure=new IOException("Current schema head differs from the original operation");
+        } catch (IOException failure) {
+            return retainedSchemaOutcome(authority,header,digest,failure);
+        }
+        return retainedSchemaOutcome(authority,header,digest,currentFailure);
+    }
+    private static RatisSchemaAuthority.View retainedSchemaOutcome(RatisSchemaAuthority authority,SchemaChange.Header header,byte[] digest,IOException currentFailure) throws IOException {
+        try { return authority.read(header,digest,true); }
+        catch (IOException outcomeFailure) { if (outcomeFailure!=currentFailure) outcomeFailure.addSuppressed(currentFailure); throw outcomeFailure; }
+    }
+    private static byte[] committedCatalogueValue(ReplicatedRangeStore store,UUID column,byte[] key) {
+        try { return store.readCurrentPoint(column,key); }
+        catch (org.rocksdb.RocksDBException failure) { throw new IllegalStateException("Committed native catalogue read failed",failure); }
+    }
+    private void requireOperatorAdmission(it.cavallium.rockserver.core.common.distributed.OperatorUpload upload) {
+        var descriptor=upload.operator();
+        final it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract contract;
+        try { contract=schemaReplicaConfig.policy().admit(descriptor); }
+        catch (Exception failure) { throw new IllegalArgumentException("Node operator policy rejected the artifact",failure); }
+        if (contract==null || !contract.admitted() || !contract.identifier().equals(descriptor.deterministicContract()) || contract.version()!=descriptor.deterministicContractVersion()) throw new IllegalArgumentException("Node operator policy differs from the exact deterministic contract");
+    }
     private it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor ownReplica(it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor) {
         return descriptor.replicas().stream().filter(replica -> replica.nodeId().equals(plan.nodeId()) && replica.nodeIncarnation().equals(plan.nodeIncarnation())
                 && replica.peerId().equals(plan.peerId()) && replica.address().equals(plan.address())).findFirst().orElseThrow(() -> new IllegalArgumentException("DATA placement lacks this durable node replica identity"));
@@ -421,10 +463,21 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            // Ordinary proofs can await both catalogue authority and local replica preparation.
+            if (proofQueries!=null) {
+                try { proofQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Proof query drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Proof queries did not drain",failure); }
+            }
             if (schemaReplicas!=null) {
                 try { schemaReplicas.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Schema replica drain interrupted",interrupted); }
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Schema replica service did not drain",failure); }
+            }
+            if (authorityQueries!=null) {
+                try { authorityQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Schema authority drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Schema authority queries did not drain",failure); }
             }
             if (exportSources!=null) {
                 try { exportSources.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
@@ -447,11 +500,6 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Snapshot HELP drain interrupted",interrupted); }
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Snapshot HELP did not drain",failure); }
             }
-            if (proofQueries!=null) {
-                try { proofQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
-                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Proof query drain interrupted",interrupted); }
-                catch (ExecutionException | TimeoutException failure) { throw new IOException("Proof queries did not drain",failure); }
-            }
             if (participantRecoveries!=null) participantRecoveries.close();
             if (transactionExpiry!=null) {
                 try { transactionExpiry.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
@@ -467,6 +515,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for (var machine:machines.values()) machine.beginShutdown();
             if (server!=null && !serverClosed) { server.close(); serverClosed=true; }
             for (var machine:machines.values()) machine.awaitNativeReaders(settings.shutdownTimeout());
+            if (schemaFencingReplicas!=null && !schemaFencingReplicasClosed) { schemaFencingReplicas.close(); schemaFencingReplicasClosed=true; }
             if (pool!=null && !poolClosed) { pool.close(); poolClosed=true; }
             for (var client:homeClients.values()) client.close();
             if (lock!=null && lock.isValid()) lock.release(); if (lockChannel!=null) lockChannel.close();

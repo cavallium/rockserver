@@ -59,7 +59,7 @@ class RatisSchemaFenceRpcTest {
         var definition=definition(11); var request=new RatisSchemaAuthority.Request(id(1),id(2),id(3));
         assertEquals(request,RatisSchemaAuthority.request(RatisSchemaAuthority.request(request)));
         var status=SchemaChange.Status.begin(definition.header());
-        var fencing=status.beginFencing();
+        var fencing=status.beginFencing(new byte[32]);
         var fenced=fencing.fenced(id(9),new ApplyPosition(3,8)); var installed=fenced.installed(id(9),new ApplyPosition(3,9));
         for (var phase:List.of(status,fencing,fenced,installed,installed.publish(),installed.publish().activated(id(9),new ApplyPosition(3,10)).retire(),status.abort())) {
             var head=new RatisSchemaAdministration.Head(phase,1);
@@ -71,14 +71,16 @@ class RatisSchemaFenceRpcTest {
                 else assertArrayEquals(RangeDirectoryCodec.encode(directory),RangeDirectoryCodec.encode(decoded.directory()));
             }
         }
-        var absent=new RatisSchemaAuthority.View(request,id(20),new ApplyPosition(0,0),null,null); byte[] reply=RatisSchemaAuthority.reply(absent);
+        assertThrows(IllegalArgumentException.class,() -> new RatisSchemaAuthority.View(request,id(20),new ApplyPosition(0,0),null,null));
+        var absent=new RatisSchemaAuthority.View(request,id(20),new ApplyPosition(1,0),null,null); byte[] reply=RatisSchemaAuthority.reply(absent);
         assertEquals(absent,RatisSchemaAuthority.decodeReply(reply,request,id(20)));
         assertThrows(IllegalArgumentException.class,() -> RatisSchemaAuthority.decodeReply(reply,request,id(21)));
         assertThrows(IllegalArgumentException.class,() -> RatisSchemaAuthority.decodeReply(reply,new RatisSchemaAuthority.Request(id(1),id(2),id(99)),id(20)));
         assertThrows(IllegalArgumentException.class,() -> RatisSchemaAuthority.decodeReply(new byte[RatisSchemaAuthority.MAX_BYTES+1],request,id(20)));
-        byte[] negative=reply.clone(); ByteBuffer.wrap(negative).putLong(ScopedTransactionRpc.HEADER_BYTES+64,-1);
+        int cutOffset=4+RatisSchemaAuthority.request(request).length+16;
+        byte[] negative=reply.clone(); ByteBuffer.wrap(negative).putLong(cutOffset,-1);
         assertThrows(IllegalArgumentException.class,() -> RatisSchemaAuthority.decodeReply(negative,request,id(20)));
-        byte[] blob=reply.clone(); ByteBuffer.wrap(blob).putInt(ScopedTransactionRpc.HEADER_BYTES+80,Integer.MAX_VALUE);
+        byte[] blob=reply.clone(); ByteBuffer.wrap(blob).putInt(cutOffset+16,Integer.MAX_VALUE);
         assertThrows(IllegalArgumentException.class,() -> RatisSchemaAuthority.decodeReply(blob,request,id(20)));
         assertThrows(IllegalArgumentException.class,() -> RatisSchemaAuthority.decodeReply(ScopedTransactionRpc.frame(ScopedTransactionRpc.SCHEMA_FENCE_STATE,Arrays.copyOfRange(reply,12,reply.length)),request,id(20)));
     }

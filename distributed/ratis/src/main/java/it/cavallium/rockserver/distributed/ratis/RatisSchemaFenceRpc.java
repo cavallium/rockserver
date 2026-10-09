@@ -16,7 +16,8 @@ public final class RatisSchemaFenceRpc {
             if (fence!=null) {
                 fence.requireHeader(record.header());
                 var expected=record.header().participants().stream().filter(p -> p.groupId().equals(record.groupId())).findFirst().orElseThrow();
-                if (!expected.equals(fence.participant()) || !new NativeSchemaFence(record.header(),record.groupId(),fence.position()).equals(fence)) throw new IllegalArgumentException("Schema fence proof participant changed");
+                fence.requireAdmissionDigest(record.admissionDigest());
+                if (!expected.equals(fence.participant())) throw new IllegalArgumentException("Schema fence proof participant changed");
             }
         }
     }

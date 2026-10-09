@@ -153,7 +153,13 @@ public final class RatisSchemaReplicaService {
             else { names.remove(binding.header().changedColumnId()); merges.remove(binding.header().changedColumnId()); }
             pool.reserveSchemaCapacity(local.store(),binding.definition(),names,merges);
         } else if (request.kind()==ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE) {
-            if (status.reservation()==null) throw new IOException("Capacity release lacks retained original reservation");
+            if (status.reservation()==null) {
+                var view=local.authority().read(binding.header()); requireAuthority(binding,view);
+                if (view.head().status().phase()!=SchemaChange.Phase.ABORTED) throw new IOException("Unreserved capacity cleanup requires exact ABORTED catalogue authority");
+                requireStamp(local.validator().validate(request.target(),false),stamp);
+                registry.release(request.target());
+                return RatisSchemaReplicaRpc.reply(request,new BitSet(),false,null,CapacityState.NONE,false);
+            }
             if (status.forcedDurable() && (status.state()==DistributedStoragePool.SchemaCapacityState.ABORTED || status.state()==DistributedStoragePool.SchemaCapacityState.CONSUMED || status.state()==DistributedStoragePool.SchemaCapacityState.RETIRED)) {
                 registry.release(request.target());
                 return RatisSchemaReplicaRpc.reply(request,new BitSet(),false,status.reservation(),CapacityState.valueOf(status.state().name()),true);
@@ -183,7 +189,7 @@ public final class RatisSchemaReplicaService {
     }
     private static void requireAuthority(Binding binding,RatisSchemaAuthority.View view) throws IOException {
         var header=binding.header();
-        if (!view.request().equals(new RatisSchemaAuthority.Request(header.clusterId(),header.databaseId(),header.domainId())) || view.head()==null
+        if ((!view.request().clusterId().equals(header.clusterId()) || !view.request().databaseId().equals(header.databaseId()) || !view.request().domainId().equals(header.domainId())) || view.head()==null
                 || !Arrays.equals(view.head().status().header().encode(),header.encode())) throw new IOException("Replica catalogue authority changed");
     }
     private static void requirePolicy(DistributedSchema.Operator operator,DeterministicContract contract) throws IOException {

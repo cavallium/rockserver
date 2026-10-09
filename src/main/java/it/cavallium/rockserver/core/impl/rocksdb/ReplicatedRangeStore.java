@@ -95,6 +95,7 @@ import org.rocksdb.TransactionDB;
 public final class ReplicatedRangeStore {
     private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
+    public static final int MAX_SCHEMA_AUTHORITY_BYTES=5*1024*1024;
     /** Consensus bound for original bucket bytes plus retained staged bucket replacements. */
     public static final long MAX_BUCKET_PLAN_BYTES=16L*1024*1024;
     public static final int MAX_PREPARED_PARTICIPANTS=64;
@@ -488,22 +489,24 @@ public final class ReplicatedRangeStore {
             return new SchemaFenceReadiness(activeSchemaFence,activeSchemaFence!=null && pendingInstallation==null && pins==0 && prepared==0 && gates==0,pins,prepared,gates);
         } finally { applyLane.unlock(); leaveNative(); }
     }
-    /** Trusted committed seam; the adapter validates source directory/lineage and drains accepted predecessors before append. */
-    public NativeSchemaFence applySchemaFence(ApplyPosition position,SchemaChange.Header header) throws RocksDBException {
+    /** Explicit trusted fixture path without qualified replica admission. */
+    public NativeSchemaFence applySchemaFence(ApplyPosition position,SchemaChange.Header header) throws RocksDBException { return applySchemaFence(position,header,null); }
+    /** Trusted committed seam; the adapter validates manifest/source authority and drains accepted predecessors before append. */
+    public NativeSchemaFence applySchemaFence(ApplyPosition position,SchemaChange.Header header,byte[] admissionDigest) throws RocksDBException {
         Objects.requireNonNull(position); Objects.requireNonNull(header); enterNative(); applyLane.lock();
         try {
             requireActive(); ensureReceiptUsage();
             var historical=schemaInstallProofs.get(header.changeId());
-            if(historical!=null) { historical.requireHeader(header); historical.requireCut(applied); advanceCompletedMarker(position); return historical.fence(); }
-            if(schemaPreparationPool!=null) schemaPreparationPool.requireCapacityFence(groupId,header);
-            var proposed=new NativeSchemaFence(header,groupId,position);
+            if(historical!=null) { historical.requireHeader(header); historical.fence().requireAdmissionDigest(admissionDigest); historical.requireCut(applied); advanceCompletedMarker(position); return historical.fence(); }
+            var proposed=new NativeSchemaFence(header,groupId,position,admissionDigest);
             if (homeRecoveryContext!=null || snapshotHomeContext!=null || logicalSchema==null) throw new IllegalStateException("Schema fence requires qualified DATA schema");
             if (proposed.participant().rangeEpoch()!=rangeEpoch) throw new IllegalArgumentException("Schema fence participant epoch differs from ownership");
             if (activeSchemaFence!=null) {
-                activeSchemaFence.requireHeader(header);
+                activeSchemaFence.requireHeader(header); activeSchemaFence.requireAdmissionDigest(admissionDigest);
                 if (position.index()<activeSchemaFence.position().index() || position.index()==activeSchemaFence.position().index() && position.term()!=activeSchemaFence.position().term()) throw new IllegalArgumentException("Schema fence callback regresses or changes original position");
                 advanceCompletedMarker(position); return activeSchemaFence;
             }
+            if(schemaPreparationPool!=null) schemaPreparationPool.requireCapacityFence(groupId,header);
             requireSchemaFenceSchema(proposed,logicalSchema);
             requireNext(position); var history=prepareScopedWrites(false,List.of(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
@@ -2281,7 +2284,10 @@ public final class ReplicatedRangeStore {
         }
     }
     /** Small atomic metadata/user point read at one completed cut, without acquiring a native snapshot. */
-    public CurrentPoints readCurrentPoints(List<PhysicalPoint> points) throws RocksDBException {
+    public CurrentPoints readCurrentPoints(List<PhysicalPoint> points) throws RocksDBException { return readCurrentPoints(points,MAX_RESULT_BYTES); }
+    /** Explicit bounded schema-authority control read; ordinary foreground reads retain their smaller reply budget. */
+    public CurrentPoints readSchemaAuthorityPoints(List<PhysicalPoint> points) throws RocksDBException { return readCurrentPoints(points,MAX_SCHEMA_AUTHORITY_BYTES); }
+    private CurrentPoints readCurrentPoints(List<PhysicalPoint> points,int maximumBytes) throws RocksDBException {
         points=List.copyOf(points); if (points.isEmpty() || points.size()>4) throw new IllegalArgumentException("Atomic point read requires 1..4 points");
         long keyBytes=0; var spans=new ArrayList<TransactionScope.Span>(points.size());
         for (var point:points) { keyBytes+=point.key.length; if (keyBytes>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Atomic point keys exceed budget"); spans.add(TransactionScope.Span.point(point.column,point.key)); }
@@ -2294,7 +2300,7 @@ public final class ReplicatedRangeStore {
             for (var point:points) {
                 // Read size before allocating an arbitrary native value into Java memory.
                 var cf=columns.get(point.column); int length=db.get(cf,point.key,new byte[0]);
-                if (length!=RocksDB.NOT_FOUND) { valueBytes+=length; if (valueBytes>MAX_RESULT_BYTES) throw new IllegalStateException("Atomic point values exceed budget"); }
+                if (length!=RocksDB.NOT_FOUND) { valueBytes+=length; if (valueBytes>maximumBytes) throw new IllegalStateException("Atomic point values exceed budget"); }
                 values.add(length==RocksDB.NOT_FOUND ? null : db.get(cf,point.key));
             }
             return new CurrentPoints(cut,values);

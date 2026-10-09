@@ -606,6 +606,144 @@ class RatisNodeRuntimeTest {
             } finally { unblock.countDown(); node.close(); }
         }
     }
+    @Test void catalogueValidatorsReadCommittedDefinitionAndArtifactWithExactConfiguredPolicy() throws Exception {
+        var outer=new RatisSessionEpochsTest(); var shape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true);
+        var source=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",shape,null)));
+        var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());
+        byte[] jar=appendArtifact(); var descriptor=new DistributedSchema.Operator("append",0,AppendOperator.class.getName(),OperatorUpload.sha256(jar),1,1,"pure-append",1);
+        var policy=new java.util.concurrent.atomic.AtomicReference<it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract>();
+        try (var env=new Env(root,true,source.digest())) {
+            var config=new RatisNodeRuntime.SchemaReplicaConfig(RatisSchemaReplicaService.Limits.defaults(),operator -> { assertEquals(descriptor,operator); return policy.get(); }); var fake=new FakeServer();
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,source,null,null,RatisRoutedClient::connect,config)) {
+                node.start(); var c=env.plan.catalogue(); var machine=fake.machines.get(RaftGroupId.valueOf(c.groupId()));
+                var validatorField=RatisRangeStateMachine.class.getDeclaredField("commandValidator"); validatorField.setAccessible(true);
+                @SuppressWarnings("unchecked") var validator=(java.util.function.Consumer<DistributedCommand>)validatorField.get(machine);
+                var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true); var store=(ReplicatedRangeStore)storeField.get(machine);
+                var definition=new SchemaChange.Definition(new UUID(88,1),env.outer.operation(100),env.plan.directory(),source,target);
+                var administration=new RatisSchemaAdministration(env.catalogue.client,source.clusterId(),source.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
+                var begin=administration.prepareBegin(definition,null,null,null);
+                assertThrows(IllegalArgumentException.class,() -> validator.accept(begin));
+                var immutable=administration.prepareDefinition(env.outer.operation(101),definition,null,null,null); validator.accept(immutable);
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,1),immutable)).status());
+                var schemas=new RatisSchemaCatalogue(env.catalogue.client,source.clusterId(),source.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
+                var sourcePublication=schemas.prepare(env.outer.operation(110),source); validator.accept(sourcePublication); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,2),sourcePublication)).status());
+                var targetPublication=schemas.prepare(env.outer.operation(111),target,store.readCurrentPoint(c.directoryColumn(),RatisColumnAllocation.counterKey()),Map.of(),Map.of(),Map.of()); validator.accept(targetPublication); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,3),targetPublication)).status());
+                assertDoesNotThrow(() -> validator.accept(begin));
+                var io=(org.apache.ratis.client.api.BlockingApi)Proxy.newProxyInstance(org.apache.ratis.client.api.BlockingApi.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.api.BlockingApi.class},(proxy,method,args) -> {
+                    if (!method.getName().equals("sendReadOnly")) throw new AssertionError(method);
+                    var packet=ScopedTransactionRpc.parse(((Message)args[0]).getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES); assertEquals(ScopedTransactionRpc.POINT,packet.kind()); var input=java.nio.ByteBuffer.wrap(packet.body()); assertEquals(c.directoryColumn(),ScopedTransactionRpc.uuid(input)); var key=ScopedTransactionRpc.blob(input,2*1024*1024,false);
+                    byte[] value=store.readCurrentPoint(c.directoryColumn(),key); var body=value==null ? java.nio.ByteBuffer.allocate(4).putInt(-1).array() : java.nio.ByteBuffer.allocate(value.length+4).putInt(value.length).put(value).array();
+                    return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(env.plan.peerId())).setGroupId(RaftGroupId.valueOf(c.groupId())).setCallId(1).setSuccess(true).setMessage(Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,body)))).build();
+                });
+                var client=(org.apache.ratis.client.RaftClient)Proxy.newProxyInstance(org.apache.ratis.client.RaftClient.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.RaftClient.class},(proxy,method,args) -> switch (method.getName()) { case "getGroupId" -> RaftGroupId.valueOf(c.groupId()); case "io" -> io; default -> throw new AssertionError(method); });
+                var catalogue=new RatisOperatorCatalogue(client,source.clusterId(),source.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn(),new RatisOperatorCatalogue.Limits(config.limits().maximumUploads(),config.limits().maximumDiskBytes()),upload -> {});
+                var upload=OperatorUpload.create(new UUID(88,2),source.clusterId(),source.databaseId(),descriptor,jar); var operatorBegin=catalogue.prepareBegin(env.outer.operation(102),upload,null,null);
+                assertThrows(IllegalArgumentException.class,() -> validator.accept(operatorBegin));
+                policy.set(new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",2,true)); assertThrows(IllegalArgumentException.class,() -> validator.accept(operatorBegin));
+                policy.set(new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,false)); assertThrows(IllegalArgumentException.class,() -> validator.accept(operatorBegin));
+                policy.set(new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true)); validator.accept(operatorBegin);
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,4),operatorBegin)).status());
+                var chunk=catalogue.prepareChunk(env.outer.operation(103),upload,0,jar); validator.accept(chunk); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,5),chunk)).status());
+                var publication=catalogue.preparePublication(env.outer.operation(104),upload,null); validator.accept(publication); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,6),publication)).status());
+                assertArrayEquals(upload.encode(),store.readCurrentPoint(c.directoryColumn(),RatisOperatorCatalogue.publishedKey(descriptor.name(),descriptor.version())));
+                assertThrows(IOException.class,() -> RatisNodeRuntime.SchemaReplicaConfig.defaults().policy().admit(descriptor));
+            }
+        }
+    }
+    @Test void catalogueReplicaClientIsPreinitializedOnlyForCatalogueAndRetainedDuringActualOutboundCall() throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1); var unblock=new java.util.concurrent.CountDownLatch(1); var connections=new java.util.concurrent.atomic.AtomicInteger(); var closes=new java.util.concurrent.atomic.AtomicInteger();
+        try (var env=new Env(root,true); var executor=java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var clients=new RatisSchemaReplicaClient(32,(range,owner) -> {
+                connections.incrementAndGet();
+                var io=(org.apache.ratis.client.api.BlockingApi)Proxy.newProxyInstance(org.apache.ratis.client.api.BlockingApi.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.api.BlockingApi.class},(proxy,method,args) -> {
+                    if (!method.getName().equals("sendStaleRead")) throw new AssertionError(method); var request=RatisSchemaReplicaRpc.request(((Message)args[0]).getContent().toByteArray()); entered.countDown(); if (!unblock.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Outbound fixture timeout");
+                    return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(owner.peerId())).setGroupId(RaftGroupId.valueOf(range.groupId())).setCallId(1).setSuccess(true).setMessage(Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(RatisSchemaReplicaRpc.reply(request,new BitSet(),false,null,RatisSchemaReplicaRpc.CapacityState.NONE,false)))).build();
+                });
+                return (org.apache.ratis.client.RaftClient)Proxy.newProxyInstance(org.apache.ratis.client.RaftClient.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.RaftClient.class},(proxy,method,args) -> switch (method.getName()) { case "getGroupId" -> RaftGroupId.valueOf(range.groupId()); case "io" -> io; case "close" -> { closes.incrementAndGet(); yield null; } default -> throw new AssertionError(method); });
+            });
+            var fake=new FakeServer(); RatisNodeRuntime.ServerFactory factory=(plan,logs,machines) -> {
+                try { for (var entry:machines.entrySet()) { assertEquals("NEW",entry.getValue().getLifeCycleState().name()); assertSame(plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE ? clients : null,schemaFencingClient(entry.getValue())); var authority=proofLane(entry.getValue(),"schemaAuthorityQueries"); if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE) { assertNotNull(authority); assertEquals(1,configuredProofThreads(authority)); assertNotSame(proofLane(entry.getValue(),"proofQueries"),authority); } else assertNull(authority); } return fake.create(plan,logs,machines); }
+                catch (ReflectiveOperationException failure) { throw new IOException(failure); }
+            };
+            var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,factory,null,null,null,RatisRoutedClient::connect,RatisNodeRuntime.SchemaReplicaConfig.defaults(),() -> clients);
+            try {
+                assertEquals(0,connections.get()); node.start(); assertEquals(0,connections.get());
+                var source=new DistributedSchema(env.outer.cluster,env.outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,env.outer.data,"data",it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
+                var directory=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),1,source.digest(),1,source.columnIds(),0,env.plan.directory().ranges()); var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());
+                var definition=new SchemaChange.Definition(new UUID(89,1),env.outer.operation(100),directory,source,target); var route=directory.ranges().getLast(); var binding=new RatisSchemaReplicaRpc.Binding(definition,route.groupId(),null,false); var owner=route.replicas().stream().filter(replica -> replica.role()==ReplicaDescriptor.Role.LISTENER).findFirst().orElseThrow(); var request=RatisSchemaReplicaClient.capacity(ScopedTransactionRpc.SCHEMA_CAPACITY_STATE,new RatisSchemaReplicaRpc.Target(binding,owner));
+                var actual=executor.submit(() -> clients.execute(request)); assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertThrows(IOException.class,node::close); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(0,closes.get());
+                try (var ownerLock=java.nio.channels.FileChannel.open(env.nodeRoot.resolve("node.lock"),StandardOpenOption.WRITE)) { assertThrows(java.nio.channels.OverlappingFileLockException.class,ownerLock::tryLock); }
+                unblock.countDown(); assertEquals(RatisSchemaReplicaRpc.CapacityState.NONE,actual.get(5,java.util.concurrent.TimeUnit.SECONDS).capacityState()); node.close(); assertEquals(1,closes.get()); assertEquals(RatisNodeRuntime.State.CLOSED,node.state());
+            } finally { unblock.countDown(); node.close(); }
+        }
+        try (var env=new Env(root.resolve("data-only"))) {
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()::create,null,null,null,RatisRoutedClient::connect,RatisNodeRuntime.SchemaReplicaConfig.defaults(),() -> { throw new AssertionError("DATA-only node must not allocate catalogue outbound clients"); })) { assertEquals(RatisNodeRuntime.State.OPEN,node.state()); }
+        }
+    }
+    @Test void ordinaryProofDrainKeepsCatalogueAuthorityAliveForItsRunningNestedDependency() throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1); var continueNested=new java.util.concurrent.CountDownLatch(1);
+        try (var env=new Env(root,true)) {
+            var fake=new FakeServer(); var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake);
+            try {
+                node.start(); var catalogue=fake.machines.get(RaftGroupId.valueOf(env.plan.catalogue().groupId()));
+                var ordinary=proofLane(catalogue,"proofQueries"); var authority=proofLane(catalogue,"schemaAuthorityQueries"); assertNotSame(ordinary,authority); assertEquals(4,configuredProofThreads(ordinary)); assertEquals(1,configuredProofThreads(authority));
+                var query=ordinary.submit(env.plan.catalogue().groupId(),new byte[]{1},128,false,owned -> {
+                    entered.countDown(); if (!continueNested.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Nested fixture timeout");
+                    return authority.submit(env.plan.catalogue().groupId(),new byte[]{2},RatisProofQueryService.MAX_BYTES,false,request -> Message.EMPTY).get(5,java.util.concurrent.TimeUnit.SECONDS);
+                });
+                assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertThrows(IOException.class,node::close); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(0,fake.closes);
+                assertEquals(Message.EMPTY,authority.submit(env.plan.catalogue().groupId(),new byte[]{3},64,false,owned -> Message.EMPTY).get(5,java.util.concurrent.TimeUnit.SECONDS));
+                continueNested.countDown(); assertEquals(Message.EMPTY,query.get(5,java.util.concurrent.TimeUnit.SECONDS)); node.close(); assertEquals(RatisNodeRuntime.State.CLOSED,node.state()); assertEquals(1,fake.closes);
+                assertTrue(authority.submit(env.plan.catalogue().groupId(),new byte[]{4},64,false,owned -> Message.EMPTY).isCompletedExceptionally());
+            } finally { continueNested.countDown(); node.close(); }
+        }
+    }
+    @Test void runtimeAuthorityReaderRecoversExactAbortedOutcomeAfterAnotherCurrentHead() throws Exception {
+        var outer=new RatisSessionEpochsTest(); var source=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
+        var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());
+        try (var env=new Env(root,true,source.digest())) {
+            var fake=new FakeServer(); var reads=new ArrayList<RatisSchemaAuthority.Request>(); var c=env.plan.catalogue();
+            var io=(org.apache.ratis.client.api.BlockingApi)Proxy.newProxyInstance(org.apache.ratis.client.api.BlockingApi.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.api.BlockingApi.class},(proxy,method,args) -> {
+                if (!method.getName().equals("sendReadOnly") || ScopedTransactionRpc.parse(((Message)args[0]).getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()!=ScopedTransactionRpc.SCHEMA_AUTHORITY) {
+                    try { return method.invoke(env.catalogue.client.io(),args); } catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                }
+                var message=(Message)args[0]; reads.add(RatisSchemaAuthority.request(message.getContent().toByteArray()));
+                final Message reply;
+                try { reply=fake.machines.get(RaftGroupId.valueOf(c.groupId())).queryLinearizable(message).get(5,java.util.concurrent.TimeUnit.SECONDS); }
+                catch (java.util.concurrent.ExecutionException failure) { throw new IOException("Controlled authority cut rejected",failure.getCause()); }
+                return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(env.plan.peerId())).setGroupId(RaftGroupId.valueOf(c.groupId())).setCallId(1).setSuccess(true).setMessage(reply).build();
+            });
+            var client=(org.apache.ratis.client.RaftClient)Proxy.newProxyInstance(org.apache.ratis.client.RaftClient.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.RaftClient.class},(proxy,method,args) -> switch (method.getName()) { case "getGroupId" -> RaftGroupId.valueOf(c.groupId()); case "io" -> io; default -> throw new AssertionError(method); });
+            var epochs=new RatisSessionEpochs(client,source.clusterId(),source.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
+            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,source)) {
+                node.start(); var old=new SchemaChange.Definition(new UUID(90,1),env.outer.operation(100),env.plan.directory(),source,target); var newer=new SchemaChange.Definition(new UUID(90,2),env.outer.operation(101),env.plan.directory(),source,target);
+                var aborted=new RatisSchemaAdministration.Head(SchemaChange.Status.begin(old.header()).abort(),71); var current=new RatisSchemaAdministration.Head(SchemaChange.Status.begin(newer.header()),71);
+                var catalogue=fake.machines.get(RaftGroupId.valueOf(c.groupId())); var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true); var store=(ReplicatedRangeStore)storeField.get(catalogue);
+                var committed=new DistributedCommand(c.groupId(),c.epoch(),c.schemaDigest(),env.outer.operation(102),List.of(
+                        new Mutation(Mutation.Kind.PUT,c.directoryColumn(),java.nio.ByteBuffer.allocate(16).putLong(source.domainId().getMostSignificantBits()).putLong(source.domainId().getLeastSignificantBits()).array(),RangeDirectoryCodec.encode(env.plan.directory())),
+                        new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.definitionKey(old.digest()),old.encode()),
+                        new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.definitionKey(newer.digest()),newer.encode()),
+                        new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.outcomeKey(old.digest()),aborted.encode()),
+                        new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.headKey(source.domainId()),current.encode())));
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,1),committed)).status()); catalogue.notifyTermIndexUpdated(1,1);
+                var data=fake.machines.get(RaftGroupId.valueOf(env.plan.directory().ranges().getFirst().groupId())); var field=RatisRangeStateMachine.class.getDeclaredField("schemaAuthority"); field.setAccessible(true); var reader=(RatisRangeStateMachine.SchemaAuthorityReader)field.get(data);
+                var observed=reader.read(old.header(),null); assertEquals(SchemaChange.Phase.ABORTED,observed.head().status().phase()); assertArrayEquals(old.header().encode(),observed.head().status().header().encode());
+                assertEquals(2,reads.size()); assertFalse(reads.get(0).outcome()); assertTrue(reads.get(1).outcome()); for (var request:reads) { assertArrayEquals(old.header().encode(),request.expectedHeader().encode()); assertNull(request.admissionDigest()); }
+                var missing=new SchemaChange.Definition(new UUID(90,3),env.outer.operation(103),env.plan.directory(),source,target);
+                var failure=assertThrows(IOException.class,() -> reader.read(missing.header(),null)); assertEquals(1,failure.getSuppressed().length);
+            }
+        }
+    }
+    private static int configuredProofThreads(RatisProofQueryService service) throws ReflectiveOperationException {
+        var field=RatisProofQueryService.class.getDeclaredField("executor"); field.setAccessible(true); return ((java.util.concurrent.ThreadPoolExecutor)field.get(service)).getMaximumPoolSize();
+    }
+    private static RatisProofQueryService proofLane(RatisRangeStateMachine machine,String name) throws ReflectiveOperationException {
+        var field=RatisRangeStateMachine.class.getDeclaredField(name); field.setAccessible(true); return (RatisProofQueryService)field.get(machine);
+    }
+    private static Object schemaFencingClient(RatisRangeStateMachine machine) throws ReflectiveOperationException {
+        for (var field:RatisRangeStateMachine.class.getDeclaredFields()) if (field.getType()==RatisSchemaReplicaClient.class) { field.setAccessible(true); return field.get(machine); }
+        throw new NoSuchFieldException("Catalogue schema replica client");
+    }
     private static Object schemaReplicaService(RatisRangeStateMachine machine) throws ReflectiveOperationException {
         var field=RatisRangeStateMachine.class.getDeclaredField("schemaReplicas"); field.setAccessible(true); return field.get(machine);
     }

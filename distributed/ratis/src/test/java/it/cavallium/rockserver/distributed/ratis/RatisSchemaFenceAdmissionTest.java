@@ -36,7 +36,7 @@ class RatisSchemaFenceAdmissionTest {
         final SchemaChange.Definition definition=new SchemaChange.Definition(id(11),new OperationId(id(10),1,1),directory,schema,new DistributedSchema(id(1),id(2),id(3),2,0,List.of()));
         final RatisSchemaFenceRecord record=new RatisSchemaFenceRecord(definition.header(),groupId);
         final AtomicReference<RatisRangeStateMachine.Leadership> leader=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
-        final AtomicReference<SchemaChange.Status> status=new AtomicReference<>(SchemaChange.Status.begin(definition.header()).beginFencing());
+        final AtomicReference<SchemaChange.Status> status=new AtomicReference<>(SchemaChange.Status.begin(definition.header()).beginFencing(new byte[32]));
         final DistributedStoragePool pool; final RaftStorage storage; final ReplicatedRangeStore store; final RatisRangeStateMachine machine;
         final RatisProofQueryService queries=new RatisProofQueryService();
         volatile Runnable beforeRead=() -> {};
@@ -50,7 +50,7 @@ class RatisSchemaFenceAdmissionTest {
             machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),command -> {},command -> {},leader::get);
             machine.proofQueries(queries);
             if (catalogue) { machine.role(RatisNodePlan.Role.CATALOGUE); machine.schemaCatalogue(id(1),id(2),column); }
-            else machine.schemaAuthority(header -> { beforeRead.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3)),id(20),new ApplyPosition(1,1),authorityDirectory,new RatisSchemaAdministration.Head(status.get(),1)); },directory);
+            else machine.schemaAuthority((header,digest) -> { beforeRead.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3)),id(20),new ApplyPosition(1,1),authorityDirectory,new RatisSchemaAdministration.Head(status.get(),1)); },directory);
             var server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> { if (method.getName().equals("getId")) return peer.getId(); if (method.getName().equals("toString")) return "identity-fixture"; throw new AssertionError("Unexpected server access "+method); });
             machine.initialize(server,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
         }
@@ -73,13 +73,13 @@ class RatisSchemaFenceAdmissionTest {
             var tx=f.propose(DistributedCommandCodec.encode(initial)); assertNull(tx.getException()); f.machine.preAppendTransaction(tx); tx.initLogEntry(1,1);
             assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.machine.applyTransaction(tx).get(5,TimeUnit.SECONDS).getContent().toByteArray()).status());
             var request=new RatisSchemaAuthority.Request(id(1),id(2),id(3)); byte[] encoded=RatisSchemaAuthority.request(request);
-            assertEquals(ScopedTransactionRpc.HEADER_BYTES+48,encoded.length,"Wire request carries database/domain identity and no column selector");
+            assertEquals(ScopedTransactionRpc.HEADER_BYTES+57,encoded.length,"Wire request carries database/domain identity and no column selector");
             try (var pin=f.store.capture()) {
                 assertEquals(1,f.store.activeSnapshotPins()); assertThrows(RuntimeException.class,f.store::capture);
                 var view=RatisSchemaAuthority.decodeReply(f.machine.queryLinearizable(message(encoded)).get(5,TimeUnit.SECONDS).getContent().toByteArray(),request,f.groupId);
                 assertEquals(new ApplyPosition(1,1),view.position()); assertArrayEquals(RangeDirectoryCodec.encode(f.directory),RangeDirectoryCodec.encode(view.directory())); assertArrayEquals(prepared.encode(),view.head().encode());
                 assertEquals(1,f.store.activeSnapshotPins(),"Compound authority query allocates no native pin");
-                var fencing=new RatisSchemaAdministration.Head(prepared.status().beginFencing(),1);
+                var fencing=new RatisSchemaAdministration.Head(prepared.status().beginFencing(new byte[32]),1);
                 var update=new DistributedCommand(f.groupId,1,f.schema.digest(),new OperationId(id(30),1,1),List.of(new Mutation(Mutation.Kind.PUT,f.column,RatisSchemaAdministration.headKey(id(3)),fencing.encode())));
                 var next=f.propose(DistributedCommandCodec.encode(update)); assertNull(next.getException()); f.machine.preAppendTransaction(next); next.initLogEntry(1,2);
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.machine.applyTransaction(next).get(5,TimeUnit.SECONDS).getContent().toByteArray()).status());
@@ -113,8 +113,8 @@ class RatisSchemaFenceAdmissionTest {
             f.status.set(SchemaChange.Status.begin(f.definition.header())); assertThrows(ExecutionException.class,() -> f.prepare().get(5,TimeUnit.SECONDS));
             f.status.set(SchemaChange.Status.begin(f.definition.header()).abort()); assertThrows(ExecutionException.class,() -> f.prepare().get(5,TimeUnit.SECONDS));
             var wrongDefinition=new SchemaChange.Definition(id(99),new OperationId(id(10),1,2),f.directory,f.schema,f.definition.targetSchema());
-            f.status.set(SchemaChange.Status.begin(wrongDefinition.header()).beginFencing()); assertThrows(ExecutionException.class,() -> f.prepare().get(5,TimeUnit.SECONDS));
-            f.status.set(SchemaChange.Status.begin(f.definition.header()).beginFencing());
+            f.status.set(SchemaChange.Status.begin(wrongDefinition.header()).beginFencing(new byte[32])); assertThrows(ExecutionException.class,() -> f.prepare().get(5,TimeUnit.SECONDS));
+            f.status.set(SchemaChange.Status.begin(f.definition.header()).beginFencing(new byte[32]));
             f.authorityDirectory=new RangeDirectory(id(1),id(2),id(3),1,f.schema.digest(),2,Set.of(f.column),0,f.directory.ranges());
             assertThrows(ExecutionException.class,() -> f.prepare().get(5,TimeUnit.SECONDS)); f.authorityDirectory=f.directory;
             try (var pin=f.store.capture()) {

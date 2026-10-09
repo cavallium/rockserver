@@ -30,8 +30,22 @@ class RatisSchemaAdministrationTest {
     DistributedSchema next(DistributedSchema previous,List<DistributedSchema.Column> columns) { return new DistributedSchema(previous.clusterId(),previous.databaseId(),previous.domainId(),previous.schemaEpoch()+1,0,columns); }
     RangeDirectory directory(DistributedSchema schema,long generation) { return new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),generation,schema.columnIds(),0,outer.directory(outer.cluster).ranges()); }
     RaftClient client(RatisSessionEpochsTest.Fixture f) {
+        var configured=RatisCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,command -> { throw new IllegalArgumentException("No operator commands in this fixture"); },key -> {
+            try { return f.store.readCurrentPoint(outer.directoryColumn,key); } catch (org.rocksdb.RocksDBException failure) { throw new IllegalStateException(failure); }
+        });
         var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args) -> {
+            byte[] encoded=((Message)args[0]).getContent().toByteArray();
+            if (method.getName().equals("send")) {
+                var command=DistributedCommandCodec.decode(encoded); configured.accept(command);
+                byte[] result=f.store.apply(new ApplyPosition(1,f.next.getAndIncrement()),command); if (f.writeOverride!=null) result=f.writeOverride;
+                return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("fixture")).setGroupId(RaftGroupId.valueOf(outer.catalogue)).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(result))).build();
+            }
             if (!method.getName().equals("sendReadOnly")) return method.invoke(f.client.io(),args);
+            if (ScopedTransactionRpc.schemaFencing(ScopedTransactionRpc.kind(encoded,RatisSchemaFencingRpc.MAX_BYTES))) {
+                var command=RatisSchemaFencingRpc.request(encoded); configured.accept(command);
+                byte[] reply=RatisSchemaFencingRpc.preparedReply(ScopedTransactionRpc.kind(encoded,RatisSchemaFencingRpc.MAX_BYTES),command);
+                return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("fixture")).setGroupId(RaftGroupId.valueOf(outer.catalogue)).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(reply))).build();
+            }
             var packet=ScopedTransactionRpc.parse(((Message)args[0]).getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES);
             assertEquals(ScopedTransactionRpc.POINT,packet.kind()); var in=ByteBuffer.wrap(packet.body());
             var column=ScopedTransactionRpc.uuid(in); byte[] key=ScopedTransactionRpc.blob(in,2*1024*1024,false); assertFalse(in.hasRemaining());
@@ -64,9 +78,24 @@ class RatisSchemaAdministrationTest {
         assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.prepareBegin(definition,previous,oldColumn,oldApi)).status());
         return admin.readHead(definition.sourceSchema().domainId());
     }
+    SchemaAdmissionManifest admissions(SchemaChange.Definition definition) {
+        var bindings=new ArrayList<SchemaAdmissionManifest.Binding>(); var replicas=new ArrayList<SchemaAdmissionManifest.ReplicaAdmission>();
+        for (var range:definition.sourceDirectory().ranges()) {
+            String name=definition.kind()==SchemaChange.Kind.CREATE_COLUMN ? "new-"+range.groupId() : null;
+            bindings.add(new SchemaAdmissionManifest.Binding(range.groupId(),name,false));
+            var proof=new NativeSchemaCapacityReservation(definition.header(),range.groupId(),new byte[32],definition.encode().length);
+            for (var replica:range.replicas()) replicas.add(new SchemaAdmissionManifest.ReplicaAdmission(range.groupId(),replica.replicaId(),proof));
+        }
+        return new SchemaAdmissionManifest(definition,bindings,replicas);
+    }
+    RatisSchemaAdministration.Head fence(RatisSchemaAdministration admin,SchemaChange.Definition definition,RatisSchemaAdministration.Head head) throws Exception {
+        var manifest=admissions(definition); assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.prepareAdmissions(operation(),head,definition,manifest)).status());
+        assertEquals(CommandResult.Status.SUCCESS,admin.executeFencing(admin.prepareFencing(operation(),head,definition,manifest)).status());
+        return admin.readHead(head.status().header().domainId());
+    }
     RatisSchemaAdministration.Head complete(RatisSchemaAdministration admin,SchemaChange.Definition definition,RatisSchemaAdministration.Head head) throws Exception {
         var group=definition.sourceDirectory().ranges().getFirst().groupId();
-        admin.execute(admin.prepareAdvance(operation(),head,head.status().beginFencing())); head=admin.readHead(head.status().header().domainId());
+        head=fence(admin,definition,head);
         admin.execute(admin.prepareAdvance(operation(),head,head.status().fenced(group,new ApplyPosition(1,10)))); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.prepareAdvance(operation(),head,head.status().installed(group,new ApplyPosition(1,11)))); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.preparePublication(operation(),head,definition)); head=admin.readHead(head.status().header().domainId());
@@ -109,8 +138,8 @@ class RatisSchemaAdministrationTest {
             var target=next(source,List.of(source.column(7),column(8,new UUID(16,3),"added"))); publishSchema(f,target);
             var definition=new SchemaChange.Definition(new UUID(16,4),operation(),original,source,target);
             var head=begin(admin,definition,null);
-            var progress=List.of(head.status().beginFencing(),head.status().beginFencing().fenced(first.groupId(),new ApplyPosition(1,10)),
-                    head.status().beginFencing().fenced(first.groupId(),new ApplyPosition(1,10)).fenced(secondGroup,new ApplyPosition(1,10)));
+            head=fence(admin,definition,head);
+            var progress=List.of(head.status().fenced(first.groupId(),new ApplyPosition(1,10)),head.status().fenced(first.groupId(),new ApplyPosition(1,10)).fenced(secondGroup,new ApplyPosition(1,10)));
             for (var status:progress) {
                 assertEquals(CommandResult.Status.SUCCESS,admin.execute(admin.prepareAdvance(operation(),head,status)).status());
                 head=admin.readHead(source.domainId());
@@ -194,7 +223,7 @@ class RatisSchemaAdministrationTest {
         try (var f=outer.new Fixture(root)) {
             var source=initial(); var target=next(source,List.of(source.column(7),column(8,new UUID(12,1),"added")));
             var definition=new SchemaChange.Definition(new UUID(12,2),operation(),directory(source,0),source,target);
-            var status=SchemaChange.Status.begin(definition.header()).beginFencing().fenced(outer.dataGroup,new ApplyPosition(1,1))
+            var status=SchemaChange.Status.begin(definition.header()).beginFencing(admissions(definition).digest()).fenced(outer.dataGroup,new ApplyPosition(1,1))
                     .installed(outer.dataGroup,new ApplyPosition(1,2)).publish().activated(outer.dataGroup,new ApplyPosition(1,3)).retire();
             var head=new RatisSchemaAdministration.Head(status,8); var catalogue=catalogue(client(f));
             int low=1,high=RangeDirectoryCodec.MAX_ENCODED_BYTES/4;
@@ -219,6 +248,35 @@ class RatisSchemaAdministrationTest {
                 new RangeDescriptor(new UUID(13,3),new UUID(14,3),1,1,b,null,RangeDescriptor.TopologyState.ACTIVE,replicas));
         return new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),generation,schema.columnIds(),0,ranges);
     }
+    @Test void immutableAdmissionsFencingLostReplyAndSuccessorsRetainExactCommitment() throws Exception {
+        try (var f=outer.new Fixture(root)) {
+            var client=client(f); var admin=admin(client); var source=initial(); var original=directory(source,0); publishSchema(f,source); catalogue(client).execute(catalogue(client).prepare(operation(),null,original));
+            var target=next(source,List.of(source.column(7),column(8,new UUID(30,1),"added"))); publishSchema(f,target);
+            var definition=new SchemaChange.Definition(new UUID(30,2),operation(),original,source,target); var prepared=begin(admin,definition,null); var manifest=admissions(definition);
+            var publication=admin.prepareAdmissions(operation(),prepared,definition,manifest); byte[] published=DistributedCommandCodec.encode(publication);
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(publication).status()); assertArrayEquals(manifest.encode(),admin.readAdmissions(definition,manifest.digest()).encode());
+            var fencing=admin.prepareFencing(operation(),prepared,definition,manifest); byte[] frozen=DistributedCommandCodec.encode(fencing);
+            f.writeOverride=new byte[4]; assertThrows(IOException.class,() -> admin.executeFencing(fencing)); f.writeOverride=null;
+            assertEquals(CommandResult.Status.SUCCESS,admin.executeFencing(fencing).status()); assertArrayEquals(frozen,DistributedCommandCodec.encode(fencing));
+            var head=admin.readHead(source.domainId()); assertArrayEquals(manifest.digest(),head.status().admissionDigest());
+            var advance=admin.prepareAdvance(operation(),head,head.status().fenced(outer.dataGroup,new ApplyPosition(1,1))); admin.execute(advance);
+            assertArrayEquals(manifest.digest(),admin.readHead(source.domainId()).status().admissionDigest()); assertArrayEquals(published,DistributedCommandCodec.encode(publication));
+        }
+    }
+    @Test void nearMaximumDefinitionPublishesAndBeginsWithoutDuplicatedImmutablePayloads() throws Exception {
+        try (var f=outer.new Fixture(root)) {
+            f.store.enableCatalogueScopeCompaction(); var client=client(f); var admin=admin(client); var columns=new ArrayList<DistributedSchema.Column>();
+            for (int i=1;i<=255;i++) columns.add(column(i,new UUID(40,i),"n".repeat(3990)+String.format("%04d",i)));
+            var source=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,columns); var original=directory(source,0);
+            var next=new ArrayList<>(columns); next.add(column(256,new UUID(40,256),"n".repeat(3990)+"0256")); var target=new DistributedSchema(outer.cluster,outer.database,source.domainId(),2,0,next);
+            var definition=new SchemaChange.Definition(new UUID(40,0),operation(),original,source,target); assertTrue(definition.encode().length>1900*1024);
+            publishSchema(f,source); catalogue(client).execute(catalogue(client).prepare(operation(),null,original)); publishSchema(f,target);
+            var publish=admin.prepareDefinition(operation(),definition,null,null,null); assertTrue(DistributedCommandCodec.encode(publish).length<=DistributedCommandCodec.MAX_ENCODED_BYTES); admin.execute(publish);
+            var begin=admin.prepareBegin(definition,null,null,null); assertEquals(4,begin.predicates().size()); assertTrue(DistributedCommandCodec.encode(begin).length<16*1024);
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(begin).status()); var prepared=admin.readHead(source.domainId()); var manifest=admissions(definition);
+            admin.execute(admin.prepareAdmissions(operation(),prepared,definition,manifest)); assertEquals(CommandResult.Status.SUCCESS,admin.executeFencing(admin.prepareFencing(operation(),prepared,definition,manifest)).status());
+        }
+    }
     @Test void abortAndIrreversibleFencingDecisionRaceThroughOneNativeHeadCas() throws Exception {
         try (var f=outer.new Fixture(root)) {
             var client=client(f); var catalogue=catalogue(client); var admin=admin(client); var source=initial(); var original=directory(source,0);
@@ -226,13 +284,14 @@ class RatisSchemaAdministrationTest {
             var target=next(source,List.of(source.column(7),column(8,new UUID(15,1),"added"))); publishSchema(f,target);
             var definition=new SchemaChange.Definition(new UUID(15,2),operation(),original,source,target);
             var prepared=begin(admin,definition,null);
-            var fencing=admin.prepareAdvance(operation(),prepared,prepared.status().beginFencing());
+            var manifest=admissions(definition); admin.execute(admin.prepareAdmissions(operation(),prepared,definition,manifest));
+            var fencing=admin.prepareFencing(operation(),prepared,definition,manifest);
             var abort=admin.prepareAdvance(operation(),prepared,prepared.status().abort());
-            assertEquals(CommandResult.Status.SUCCESS,admin.execute(fencing).status());
+            assertEquals(CommandResult.Status.SUCCESS,admin.executeFencing(fencing).status());
             assertEquals(CommandResult.Status.CONFLICT,admin.execute(abort).status());
             var current=admin.readHead(source.domainId()); assertEquals(SchemaChange.Phase.FENCING,current.status().phase());
             assertThrows(IllegalStateException.class,current.status()::abort);
-            assertEquals(CommandResult.Status.SUCCESS,admin.execute(fencing).status());
+            assertEquals(CommandResult.Status.SUCCESS,admin.executeFencing(fencing).status());
         }
     }
 }

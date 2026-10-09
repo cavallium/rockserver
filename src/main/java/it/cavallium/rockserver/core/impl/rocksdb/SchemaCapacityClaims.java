@@ -15,7 +15,7 @@ final class SchemaCapacityClaims {
         Claim { sourceNames=Map.copyOf(sourceNames); targetNames=Map.copyOf(targetNames); sourceMerges=Set.copyOf(sourceMerges); targetMerges=Set.copyOf(targetMerges); groups=Map.copyOf(groups); }
         boolean outstanding() { return groups.values().stream().anyMatch(Group::outstanding); }
         byte[] bindingDigest() { return digest(bindingBytes(sourceNames,targetNames,sourceMerges,targetMerges)); }
-        int installBytes() { int size=Math.toIntExact(280L+definition.encode().length+namesSize(sourceNames)+namesSize(targetNames)); if(size>NativeSchemaInstallation.MAX_BYTES) throw new IllegalArgumentException("Reserved INSTALL metadata exceeds budget"); return size; }
+        int installBytes() { int size=Math.toIntExact(36L+NativeSchemaFence.BYTES+definition.encode().length+namesSize(sourceNames)+namesSize(targetNames)); if(size>NativeSchemaInstallation.MAX_BYTES) throw new IllegalArgumentException("Reserved INSTALL metadata exceeds budget"); return size; }
         long historyBytes() { return 3L*installBytes()+2L*NativeSchemaActivationProof.BYTES; }
         Claim group(UUID group,Group value) { var next=new HashMap<>(groups); next.put(group,value); return new Claim(definition,sourceNames,targetNames,sourceMerges,targetMerges,next); }
         void requireSame(Claim other) { if(!Arrays.equals(definition.encode(),other.definition.encode()) || !Arrays.equals(bindingDigest(),other.bindingDigest())) throw new IllegalArgumentException("Original schema capacity inputs changed"); }

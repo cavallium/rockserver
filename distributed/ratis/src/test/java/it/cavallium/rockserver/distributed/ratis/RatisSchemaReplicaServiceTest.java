@@ -69,8 +69,9 @@ class RatisSchemaReplicaServiceTest {
         volatile Runnable beforeAuthority=() -> {};
         volatile RatisSchemaReplicaService.OperatorPolicy policy;
         final Path poolPath,stagePath;
-        Fixture(Path path,boolean onListener) throws Exception {
-            local=onListener ? listener : voter; jar=artifact();
+        Fixture(Path path,boolean onListener) throws Exception { this(path,onListener,artifact()); }
+        Fixture(Path path,boolean onListener,byte[] sharedJar) throws Exception {
+            local=onListener ? listener : voter; jar=sharedJar;
             operator=new DistributedSchema.Operator("append",1,AppendOperator.class.getName(),OperatorUpload.sha256(jar),1,1,"append-contract",1);
             var shape=ColumnSchema.of(IntArrayList.of(1),ObjectArrayList.of(),true);
             var targetSchema=new DistributedSchema(id(1),id(2),id(3),1,0,List.of(new DistributedSchema.Column(1,column,"added",new ColumnSchema(shape.keys(),shape.variableTailKeys(),true,operator.name(),operator.version(),operator.className()),operator)));
@@ -88,11 +89,12 @@ class RatisSchemaReplicaServiceTest {
             server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> { if (method.getName().equals("getId")) return RaftPeerId.valueOf(local.peerId()); if (method.getName().equals("toString")) return "replica-identity-fixture"; throw new AssertionError("Unexpected server access "+method); });
             start(); machine.notifyTermIndexUpdated(1,0);
         }
+        volatile byte[] admissions;
         void start() throws Exception {
             service=new RatisSchemaReplicaService(poolPath,stagePath,pool,scheduler,operator -> policy.admit(operator),new RatisSchemaReplicaService.Limits(4,64L*1024*1024,192L*1024*1024,8,8,0));
             machine=new RatisRangeStateMachine(store,raftGroup,new NativeRangeImage.Limits(4*1024*1024,32*1024*1024,2),command -> {},command -> {},() -> new RatisRangeStateMachine.Leadership(1,false));
             machine.schemaStorage(pool); machine.proofQueries(queries);
-            machine.schemaAuthority(header -> { beforeAuthority.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3)),id(20),new ApplyPosition(1,10),directory,new RatisSchemaAdministration.Head(status.get(),1)); },directory);
+            machine.schemaAuthority((header,digest) -> { beforeAuthority.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3),header,digest,false),id(20),new ApplyPosition(1,10),directory,new RatisSchemaAdministration.Head(status.get(),1),digest==null ? null : admissions); },directory);
             machine.schemaReplicas(service,local); machine.initialize(server,raftGroup.getGroupId(),storage);
         }
         Request request(int kind) { return new Request(kind,target,kind<=ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE ? upload : null,-1,null); }
@@ -114,11 +116,32 @@ class RatisSchemaReplicaServiceTest {
             f.restart(); assertTrue(f.call(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE)).artifactReady());
             var reserve=f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RESERVE)); assertTrue(reserve.capacityActive()); assertTrue(reserve.forcedDurable()); assertNull(f.store.schemaFence());
             assertEquals(reserve.capacity(),f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_STATE)).capacity());
-            f.status.set(f.status.get().beginFencing()); assertThrows(ExecutionException.class,() -> f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)));
+            f.status.set(f.status.get().beginFencing(new byte[32])); assertThrows(ExecutionException.class,() -> f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)));
             f.status.set(SchemaChange.Status.begin(f.definition.header()).abort());
             var released=f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)); assertEquals(CapacityState.ABORTED,released.capacityState()); assertFalse(released.capacityActive());
             assertEquals(reserve.capacity(),released.capacity()); assertFalse(f.call(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE)).artifactReady());
             assertFalse(f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_STATE)).capacityActive());
+        }
+    }
+    @Test void authoritativeAbortCleansReservedAndUnreservedPartialOwnersAndReopens() throws Exception {
+        byte[] artifact=artifact();
+        try (var voter=new Fixture(root.resolve("voter"),false,artifact); var listener=new Fixture(root.resolve("listener"),true,artifact)) {
+            assertArrayEquals(voter.definition.encode(),listener.definition.encode());
+            voter.upload(); var reserved=voter.call(voter.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RESERVE));
+            listener.call(listener.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN)); listener.call(listener.chunk(0));
+            assertEquals(CapacityState.NONE,listener.call(listener.request(ScopedTransactionRpc.SCHEMA_CAPACITY_STATE)).capacityState());
+            assertThrows(ExecutionException.class,() -> listener.call(listener.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)));
+            listener.status.set(listener.status.get().beginFencing(new byte[32]));
+            assertThrows(ExecutionException.class,() -> listener.call(listener.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)));
+            voter.status.set(SchemaChange.Status.begin(voter.definition.header()).abort()); listener.status.set(SchemaChange.Status.begin(listener.definition.header()).abort());
+            var released=voter.call(voter.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)); assertEquals(CapacityState.ABORTED,released.capacityState()); assertEquals(reserved.capacity(),released.capacity());
+            var empty=listener.call(listener.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)); assertEquals(CapacityState.NONE,empty.capacityState()); assertFalse(empty.forcedDurable());
+            assertFalse(listener.call(listener.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE)).chunks().get(0));
+            voter.restart(); listener.restart();
+            assertEquals(CapacityState.ABORTED,voter.call(voter.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)).capacityState());
+            var reads=new AtomicInteger(); listener.beforeAuthority=reads::incrementAndGet;
+            assertEquals(CapacityState.NONE,listener.call(listener.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)).capacityState()); assertEquals(1,reads.get());
+            assertFalse(listener.call(listener.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE)).artifactReady());
         }
     }
     @Test void configuredPolicyAndExactReplicaIdentityCannotBeSelectedByRequest() throws Exception {
@@ -140,8 +163,10 @@ class RatisSchemaReplicaServiceTest {
     @Test void qualifiedCommittedFenceInstallActivationAndNativeMerge() throws Exception {
         try (var f=new Fixture(root,true)) {
             f.upload(); var capacity=f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RESERVE)); assertTrue(capacity.capacityActive());
-            f.status.set(f.status.get().beginFencing());
-            var record=new RatisSchemaFenceRecord(f.definition.header(),f.group);
+            var manifest=new SchemaAdmissionManifest(f.definition,List.of(new SchemaAdmissionManifest.Binding(f.group,"added-physical",true)),
+                    List.of(new SchemaAdmissionManifest.ReplicaAdmission(f.group,f.voter.replicaId(),capacity.capacity()),new SchemaAdmissionManifest.ReplicaAdmission(f.group,f.listener.replicaId(),capacity.capacity())));
+            f.admissions=manifest.encode(); f.status.set(f.status.get().beginFencing(manifest.digest()));
+            var record=new RatisSchemaFenceRecord(f.definition.header(),f.group,f.admissions);
             var fence=NativeSchemaFence.decode(apply(f,1,record.encode())); f.status.set(f.status.get().fenced(f.group,fence.position()));
             assertEquals(CapacityState.FENCED,f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_STATE)).capacityState());
             var installation=new RatisSchemaInstallRecord(f.definition,f.group,fence.position(),"added-physical",true);
@@ -152,6 +177,20 @@ class RatisSchemaReplicaServiceTest {
             assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(apply(f,4,DistributedCommandCodec.encode(merge))).status()); assertArrayEquals(new byte[]{7},f.store.readCurrentPoint(f.column,new byte[]{1}));
             assertEquals(capacity.capacity(),f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE)).capacity());
             assertEquals(fence,NativeSchemaFence.decode(apply(f,5,record.encode())));
+            byte[] changed=f.admissions.clone(); changed[changed.length-1]^=1;
+            var changedRecord=new RatisSchemaFenceRecord(f.definition.header(),f.group,changed);
+            assertThrows(ExecutionException.class,() -> f.machine.queryLinearizable(Message.valueOf(ByteString.copyFrom(RatisSchemaFenceRpc.prepareRequest(changedRecord)))).get(5,TimeUnit.SECONDS));
+            assertThrows(ExecutionException.class,() -> f.machine.queryLinearizable(Message.valueOf(ByteString.copyFrom(RatisSchemaFenceRpc.stateRequest(new RatisSchemaFenceRecord(f.definition.header(),f.group))))).get(5,TimeUnit.SECONDS));
+        }
+    }
+    @Test void followerRejectsManifestThatChangesItsOriginalLocalCapacityRow() throws Exception {
+        try (var f=new Fixture(root,true)) {
+            f.upload(); var retained=f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RESERVE)).capacity();
+            var changed=new NativeSchemaCapacityReservation(f.definition.header(),f.group,retained.bindingDigest(),retained.historyBytes()+1);
+            var manifest=new SchemaAdmissionManifest(f.definition,List.of(new SchemaAdmissionManifest.Binding(f.group,"added-physical",true)),List.of(
+                    new SchemaAdmissionManifest.ReplicaAdmission(f.group,f.voter.replicaId(),retained),new SchemaAdmissionManifest.ReplicaAdmission(f.group,f.listener.replicaId(),changed)));
+            var record=new RatisSchemaFenceRecord(f.definition.header(),f.group,manifest.encode());
+            assertThrows(ExecutionException.class,() -> apply(f,1,record.encode())); assertNull(f.store.lookupSchemaFence(f.definition.header()));
         }
     }
     static byte[] apply(Fixture f,long index,byte[] record) throws Exception {

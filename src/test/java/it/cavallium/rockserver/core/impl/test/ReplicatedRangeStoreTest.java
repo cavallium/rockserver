@@ -760,6 +760,30 @@ class ReplicatedRangeStoreTest {
         assertEquals(256,TransactionScope.MAX_SPANS);
     }
 
+    @Test void schemaAuthorityReadHasSeparateAggregateBudgetAtOneCutWithoutSnapshotRetention() throws Exception {
+        try(var pool=new Pool(path)) {
+            pool.store.applyNoop(new ApplyPosition(1,0));
+            byte[][] values={new byte[1_100_000],new byte[1_100_000],new byte[2_000_000],new byte[2_000_000]};
+            var points=new ArrayList<ReplicatedRangeStore.PhysicalPoint>();
+            for(int i=0;i<values.length;i++) {
+                java.util.Arrays.fill(values[i],(byte)(i+1)); byte[] key=bytes("authority-"+i);
+                pool.store.apply(new ApplyPosition(1,i+1),command(i,new Mutation(Mutation.Kind.PUT,B,key,values[i])));
+                points.add(new ReplicatedRangeStore.PhysicalPoint(B,key));
+            }
+            var usage=pool.store.receiptUsage(); int pins=pool.store.activeSnapshotPins();
+            assertThrows(IllegalStateException.class,() -> pool.store.readCurrentPoints(points.subList(0,2)));
+            assertArrayEquals(values[0],pool.store.readCurrentPoints(points.subList(0,1)).values().getFirst());
+            var authority=List.of(points.get(0),points.get(1),new ReplicatedRangeStore.PhysicalPoint(B,bytes("missing-definition")),new ReplicatedRangeStore.PhysicalPoint(B,bytes("missing-manifest")));
+            var read=pool.store.readSchemaAuthorityPoints(authority);
+            assertEquals(new ApplyPosition(1,4),read.position()); assertArrayEquals(values[0],read.values().getFirst()); assertArrayEquals(values[1],read.values().get(1));
+            assertNull(read.values().get(2)); assertNull(read.values().get(3));
+            assertThrows(IllegalStateException.class,() -> pool.store.readSchemaAuthorityPoints(points));
+            assertThrows(IllegalArgumentException.class,() -> pool.store.readSchemaAuthorityPoints(java.util.Collections.nCopies(5,points.getFirst())));
+            assertEquals(pins,pool.store.activeSnapshotPins()); assertEquals(usage,pool.store.receiptUsage());
+            assertEquals(new ApplyPosition(1,4),pool.store.applied());
+        }
+    }
+
     private static final class Pool implements AutoCloseable {
         final DBOptions options = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
         final ColumnFamilyOptions plain = new ColumnFamilyOptions();

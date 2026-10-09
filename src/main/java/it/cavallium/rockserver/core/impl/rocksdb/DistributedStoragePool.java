@@ -375,22 +375,59 @@ public final class DistributedStoragePool implements AutoCloseable {
             });
         } finally { nativeMutation.release(); }
     }
+    /** Validate the complete frozen admission against this pool's original forced claim and exact local owner. */
+    public NativeSchemaCapacityReservation requireSchemaFencingAdmission(ReplicatedRangeStore store,SchemaChange.Header header,
+                                                                         byte[] manifestBytes,ReplicaDescriptor local) throws RocksDBException {
+        Objects.requireNonNull(store); Objects.requireNonNull(header); Objects.requireNonNull(manifestBytes); Objects.requireNonNull(local);
+        nativeMutation.acquireUninterruptibly();
+        try {
+            if(!ranges.contains(store)) throw new IllegalArgumentException("Foreign range store");
+            return store.readSchemaMetadata(() -> {
+                var owner=store.ownership(); var group=owner.owner().groupId(); var claim=capacityClaims.get(header.changeId());
+                var member=claim==null ? null : claim.groups().get(group);
+                if(member==null) throw new IllegalStateException("Original forced capacity admission missing");
+                member.proof().requireHeader(header);
+                var manifest=SchemaAdmissionManifest.decode(manifestBytes,claim.definition());
+                var descriptor=claim.definition().sourceDirectory().ranges().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow();
+                if(member.proof().participant().rangeEpoch()!=owner.owner().epoch() || !claim.definition().sourceSchema().domainId().equals(owner.interval().domainId())
+                        || !Arrays.equals(descriptor.lowerInclusive(),owner.interval().lowerInclusive()) || !Arrays.equals(descriptor.upperExclusive(),owner.interval().upperExclusive())
+                        || !descriptor.replicas().contains(local) || !manifest.owner(group,local.replicaId()).equals(local)) throw new IllegalArgumentException("FENCE admission differs from source placement/local owner");
+                var binding=manifest.binding(group); var changed=header.changedColumnId();
+                if(!Objects.equals(binding.changedPhysicalName(),claim.targetNames().get(changed)) || binding.merge()!=claim.targetMerges().contains(changed)) throw new IllegalArgumentException("FENCE admission changes original local physical binding");
+                if(!manifest.replica(group,local.replicaId()).reservation().equals(member.proof())) throw new IllegalArgumentException("FENCE admission changes original local capacity proof");
+                if(!capacityDurable) throw new IllegalStateException("Schema capacity admission force is unresolved");
+                var retained=store.lookupSchemaFence(header);
+                if(retained!=null) {
+                    retained.requireAdmissionDigest(manifest.digest());
+                    if(member.state()==SchemaCapacityClaims.State.ABORTED) throw new IllegalStateException("Retained FENCE contradicts aborted admission");
+                } else {
+                    if(!member.outstanding()) throw new IllegalStateException("Fresh FENCE requires forced ACTIVE/FENCED admission");
+                    if(!Arrays.equals(store.schemaDigest(),claim.definition().sourceSchema().digest()) || !owner.interval().columns().equals(claim.definition().sourceSchema().columnIds())) throw new IllegalArgumentException("Fresh FENCE differs from original source schema/coverage");
+                }
+                return member.proof();
+            });
+        } finally { nativeMutation.release(); }
+    }
     public NativeSchemaCapacityReservation lookupSchemaCapacity(ReplicatedRangeStore store,SchemaChange.Header header) {
         if(!store.schemaPreparationBelongsTo(this)) throw new IllegalArgumentException("Foreign range store");
         var claim=capacityClaims.get(header.changeId()); if(claim==null) return null; var member=claim.groups().get(store.ownership().owner().groupId());
         if(member==null) return null; member.proof().requireHeader(header); return member.proof();
     }
-    public NativeSchemaFence applySchemaFence(ReplicatedRangeStore store,ApplyPosition position,SchemaChange.Header header,NativeSchemaCapacityReservation reservation) throws RocksDBException {
+    /** Explicit trusted fixture path without qualified replica admission. */
+    public NativeSchemaFence applySchemaFence(ReplicatedRangeStore store,ApplyPosition position,SchemaChange.Header header,NativeSchemaCapacityReservation reservation) throws RocksDBException { return applySchemaFence(store,position,header,reservation,null); }
+    public NativeSchemaFence applySchemaFence(ReplicatedRangeStore store,ApplyPosition position,SchemaChange.Header header,NativeSchemaCapacityReservation reservation,byte[] admissionDigest) throws RocksDBException {
         nativeMutation.acquireUninterruptibly();
         try {
             if(!ranges.contains(store)) throw new IllegalArgumentException("Foreign range store");
             return store.readSchemaMetadata(() -> {
                 var claim=capacityClaims.get(header.changeId()); var member=claim==null ? null : claim.groups().get(store.ownership().owner().groupId());
                 if(member==null || !member.proof().equals(reservation)) throw new IllegalArgumentException("Original forced capacity admission missing"); member.proof().requireHeader(header);
-                if(store.lookupSchemaInstallation(header)!=null) return store.applySchemaFence(position,header);
+                if(!capacityDurable) throw new IllegalStateException("Schema capacity admission force is unresolved");
+                var retained=store.lookupSchemaFence(header);
+                if(retained!=null) { if(member.state()==SchemaCapacityClaims.State.ABORTED) throw new IllegalStateException("Retained FENCE contradicts aborted admission"); retained.requireAdmissionDigest(admissionDigest); return store.applySchemaFence(position,header,admissionDigest); }
                 requireCapacityFence(member.proof().participant().groupId(),header);
                 if(member.state()==SchemaCapacityClaims.State.ACTIVE) { var next=new HashMap<>(capacityClaims); next.put(header.changeId(),claim.group(member.proof().participant().groupId(),new SchemaCapacityClaims.Group(member.proof(),SchemaCapacityClaims.State.FENCED))); forceCapacityClaims(next); }
-                return store.applySchemaFence(position,header);
+                return store.applySchemaFence(position,header,admissionDigest);
             });
         } finally { nativeMutation.release(); }
     }

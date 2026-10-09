@@ -39,10 +39,12 @@ class RatisSchemaLifecycleAdmissionTest {
         final DistributedSchema target=new DistributedSchema(id(1),id(2),id(3),2,0,List.of(column(1,column,"data"),column(2,added,"added")));
         final SchemaChange.Definition create=new SchemaChange.Definition(id(11),new OperationId(id(10),1,1),sourceDirectory,source,target);
         final AtomicReference<RatisRangeStateMachine.Leadership> leader=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
-        final AtomicReference<SchemaChange.Status> status=new AtomicReference<>(SchemaChange.Status.begin(create.header()).beginFencing());
+        final AtomicReference<SchemaChange.Status> status=new AtomicReference<>(SchemaChange.Status.begin(create.header()).beginFencing(new byte[32]));
         final AtomicReference<RangeDirectory> directory=new AtomicReference<>(sourceDirectory);
         final DistributedStoragePool pool; final ReplicatedRangeStore store; final RaftStorage storage; final RatisRangeStateMachine machine;
         final RatisProofQueryService queries=new RatisProofQueryService();
+        final AtomicReference<ApplyPosition> authorityPosition=new AtomicReference<>(new ApplyPosition(1,10));
+        volatile UUID authorityGroup=id(20);
         volatile Runnable beforeRead=() -> {};
         volatile Runnable onActivation=() -> {};
         final java.util.concurrent.atomic.AtomicInteger activations=new java.util.concurrent.atomic.AtomicInteger();
@@ -71,7 +73,7 @@ class RatisSchemaLifecycleAdmissionTest {
             } else machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),command -> {},command -> {},leader::get);
             machine.schemaStorage(storageView.apply(pool)); machine.proofQueries(queries);
             machine.schemaActivated((definition,proof) -> { activations.incrementAndGet(); onActivation.run(); });
-            machine.schemaAuthority(header -> { beforeRead.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3)),id(20),new ApplyPosition(1,10),directory.get(),new RatisSchemaAdministration.Head(status.get(),2)); },sourceDirectory);
+            machine.schemaAuthority((header,digest) -> { beforeRead.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3)),authorityGroup,authorityPosition.get(),directory.get(),new RatisSchemaAdministration.Head(status.get(),2)); },sourceDirectory);
             var server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> { if (method.getName().equals("getId")) return peer.getId(); if (method.getName().equals("toString")) return "identity-schema-fixture"; throw new AssertionError("Unexpected server access "+method); });
             machine.initialize(server,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
         }
@@ -104,6 +106,29 @@ class RatisSchemaLifecycleAdmissionTest {
         }
         public void close() throws Exception { queries.stop().get(10,TimeUnit.SECONDS); machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); storage.close(); pool.close(); }
     }
+    @Test void frozenActivationSurvivesLostPreparationReplyAndLaterAuthorityCutWithoutChangingBytes() throws Exception {
+        try (var f=new Fixture(root)) {
+            var fence=f.fence(f.create); var installed=f.install(f.installRecord(f.create,fence));
+            var original=f.activateRecord(f.create,installed); byte[] frozen=original.encode();
+            var base=new RatisSchemaActivateRpc.Request(f.create.header(),f.groupId,installed.position());
+            var exact=new RatisSchemaActivateRpc.Request(f.create.header(),f.groupId,installed.position(),original);
+            f.authorityPosition.set(new ApplyPosition(1,12));
+            byte[] compatible=f.machine.queryLinearizable(message(RatisSchemaActivateRpc.prepareRequest(exact))).get(10,TimeUnit.SECONDS).getContent().toByteArray();
+            assertArrayEquals(frozen,RatisSchemaActivateRpc.decodePreparedReply(compatible,ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,exact).encode());
+            f.query(RatisSchemaActivateRpc.cancelRequest(base)); f.machine.schemaCleanup().get(5,TimeUnit.SECONDS);
+            f.authorityGroup=id(99); assertThrows(ExecutionException.class,() -> f.query(RatisSchemaActivateRpc.prepareRequest(exact)));
+            f.authorityGroup=id(20); f.authorityPosition.set(new ApplyPosition(1,9)); assertThrows(ExecutionException.class,() -> f.query(RatisSchemaActivateRpc.prepareRequest(exact)));
+            f.authorityPosition.set(new ApplyPosition(1,12));
+            byte[] refreshed=f.machine.queryLinearizable(message(RatisSchemaActivateRpc.prepareRequest(exact))).get(10,TimeUnit.SECONDS).getContent().toByteArray();
+            assertArrayEquals(frozen,RatisSchemaActivateRpc.decodePreparedReply(refreshed,ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,exact).encode());
+            var proof=NativeSchemaActivationProof.decode(f.apply(frozen)); assertEquals(original.cataloguePosition(),proof.cataloguePosition());
+            f.beforeRead=() -> { throw new AssertionError("Retained activation must not fetch new authority"); };
+            f.query(RatisSchemaActivateRpc.prepareRequest(exact)); assertArrayEquals(proof.encode(),f.apply(frozen));
+            var changed=new RatisSchemaActivateRecord(f.create.header(),f.groupId,installed.position(),id(20),new ApplyPosition(1,12));
+            assertThrows(ExecutionException.class,() -> f.query(RatisSchemaActivateRpc.prepareRequest(new RatisSchemaActivateRpc.Request(f.create.header(),f.groupId,installed.position(),changed))));
+        }
+    }
+
     @Test void createActivateDeleteActivateAndExactOriginalRetries() throws Exception {
         try (var f=new Fixture(root)) {
             var original=f.put(f.source,f.column,0,4); byte[] receipt=f.apply(DistributedCommandCodec.encode(original));
@@ -115,7 +140,7 @@ class RatisSchemaLifecycleAdmissionTest {
             assertArrayEquals(receipt,f.apply(DistributedCommandCodec.encode(original)),"Original DATA outcome survives target activation");
             var deleteTarget=new DistributedSchema(id(1),id(2),id(3),3,0,List.of(column(1,f.column,"data")));
             var delete=new SchemaChange.Definition(id(12),new OperationId(id(10),1,2),f.create.targetDirectory(),f.target,deleteTarget);
-            f.status.set(SchemaChange.Status.begin(delete.header()).beginFencing());
+            f.status.set(SchemaChange.Status.begin(delete.header()).beginFencing(new byte[32]));
             var secondFence=f.fence(delete); var secondInstall=f.install(f.installRecord(delete,secondFence));
             var secondActivationRecord=f.activateRecord(delete,secondInstall); f.apply(secondActivationRecord.encode());
             assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.apply(DistributedCommandCodec.encode(f.put(deleteTarget,f.column,2,7)))).status());
@@ -208,7 +233,7 @@ class RatisSchemaLifecycleAdmissionTest {
         try (var f=new Fixture(root)) {
             var empty=new DistributedSchema(id(1),id(2),id(3),2,0,List.of());
             var delete=new SchemaChange.Definition(id(12),new OperationId(id(10),1,2),f.sourceDirectory,f.source,empty);
-            f.status.set(SchemaChange.Status.begin(delete.header()).beginFencing());
+            f.status.set(SchemaChange.Status.begin(delete.header()).beginFencing(new byte[32]));
             var fence=f.fence(delete); var installed=f.install(f.installRecord(delete,fence));
             f.apply(f.activateRecord(delete,installed).encode());
             assertTrue(f.store.ownership().interval().columns().isEmpty());
@@ -216,7 +241,7 @@ class RatisSchemaLifecycleAdmissionTest {
             f.query(ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]));
             var restored=new DistributedSchema(id(1),id(2),id(3),3,0,List.of(column(2,f.added,"added")));
             var create=new SchemaChange.Definition(id(13),new OperationId(id(10),1,3),delete.targetDirectory(),empty,restored);
-            f.status.set(SchemaChange.Status.begin(create.header()).beginFencing());
+            f.status.set(SchemaChange.Status.begin(create.header()).beginFencing(new byte[32]));
             var next=f.fence(create); var created=f.install(f.installRecord(create,next)); f.apply(f.activateRecord(create,created).encode());
             assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.apply(DistributedCommandCodec.encode(f.put(restored,f.added,0,5)))).status());
             assertArrayEquals(new byte[]{5},f.store.readCurrentPoint(f.added,new byte[]{1}));
