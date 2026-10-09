@@ -447,7 +447,7 @@ public final class RatisRoutedClient implements AutoCloseable {
             byte[] binding=new byte[48]; if (input.remaining()<52) throw new IllegalArgumentException("Truncated snapshot fence reply"); input.get(binding);
             if (!ScopedTransactionRpc.snapshotBinding(ByteBuffer.wrap(binding)).equals(ScopedTransactionRpc.SnapshotBinding.of(fence))) throw new IllegalArgumentException("Snapshot fence binding changed");
             byte[] bytes=ScopedTransactionRpc.blob(input,SnapshotFenceProof.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing snapshot fence reply");
-            if (bytes==null) return null; var proof=SnapshotFenceProof.decode(bytes); if (!proof.fence().equals(fence) || !proof.participantGroup().equals(group)) throw new IllegalArgumentException("Snapshot fence identity changed"); return proof;
+            if (bytes==null) return null; var proof=SnapshotFenceProof.decode(bytes); if (!proof.fence().equals(fence) || !proof.participantGroup().equals(group)) throw new IllegalArgumentException("Snapshot fence identity changed"); return new SnapshotFenceProof(fence,group,proof.minimumEpoch(),proof.position());
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot fence reply",malformed); } finally { endCall(); }
     }
     public void retireSnapshotGate(SnapshotGateRetirement retirement) throws IOException {
@@ -462,6 +462,34 @@ public final class RatisRoutedClient implements AutoCloseable {
         var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(retirement.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,retirement.fence(),retirement.participantGroup()); beginCall();
         try { byte[] reply=transactionReply(route,ScopedTransactionRpc.SNAPSHOT_RETIRE_CANCEL,RatisSnapshotRetirementRecord.encode(retirement),true);
             if (reply.length!=33 || !Arrays.equals(Arrays.copyOf(reply,32),retirement.digest()) || reply[32]!=0) throw new IOException("Invalid snapshot retirement cancellation reply");
+        } finally { endCall(); }
+    }
+    private RangeDescriptor snapshotHomeRoute(SnapshotHomeIdentity identity) {
+        var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(identity.groupId())).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot HOME route absent"));
+        if (route.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || route.rangeEpoch()!=identity.rangeEpoch() || !observed.columns().equals(java.util.Set.of(identity.columnId()))
+                || !observed.clusterId().equals(identity.fence().clusterId()) || !observed.databaseId().equals(identity.fence().databaseId()) || !Arrays.equals(observed.schemaDigest(),identity.schemaDigest())) throw new IllegalArgumentException("Snapshot HOME route differs from frozen identity"); return route;
+    }
+    public SnapshotHomeFenceProof snapshotHomeFence(SnapshotHomeIdentity identity) throws IOException {
+        Objects.requireNonNull(identity); var route=snapshotHomeRoute(identity); beginCall();
+        try {
+            var input=ByteBuffer.wrap(transactionReply(route,ScopedTransactionRpc.SNAPSHOT_HOME_FENCE,identity.encode(),true));
+            if (input.remaining()<36) throw new IllegalArgumentException("Truncated snapshot HOME proof"); byte[] digest=new byte[32]; input.get(digest); byte[] bytes=ScopedTransactionRpc.blob(input,SnapshotHomeFenceProof.MAX_BYTES,true);
+            if (!Arrays.equals(digest,identity.digest()) || input.hasRemaining()) throw new IllegalArgumentException("Snapshot HOME proof binding changed"); if (bytes==null) return null;
+            var proof=SnapshotHomeFenceProof.decode(bytes); if (!proof.identity().equals(identity)) throw new IllegalArgumentException("Snapshot HOME proof identity changed"); return new SnapshotHomeFenceProof(identity,proof.minimumEpoch(),proof.position());
+        } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot HOME proof reply",malformed); } finally { endCall(); }
+    }
+    public void retireSnapshotHome(SnapshotHomeRetirement retirement) throws IOException {
+        Objects.requireNonNull(retirement); var route=snapshotHomeRoute(retirement.identity()); beginCall();
+        try {
+            byte[] record=RatisSnapshotHomeRetirementRecord.encode(retirement); byte[] reply=transactionReply(route,ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE,record,true);
+            if (reply.length!=33 || !Arrays.equals(Arrays.copyOf(reply,32),retirement.digest()) || (reply[32]&255)>1) throw new IOException("Invalid snapshot HOME retirement authority reply"); if (reply[32]==1) return;
+            var result=CommandResult.decode(transport.participant(route,record)); if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=0) throw new IOException("Invalid snapshot HOME retirement applied reply");
+        } finally { endCall(); }
+    }
+    public void cancelSnapshotHomeRetirement(SnapshotHomeRetirement retirement) throws IOException {
+        Objects.requireNonNull(retirement); var route=snapshotHomeRoute(retirement.identity()); beginCall();
+        try { byte[] reply=transactionReply(route,ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_CANCEL,RatisSnapshotHomeRetirementRecord.encode(retirement),true);
+            if (reply.length!=33 || !Arrays.equals(Arrays.copyOf(reply,32),retirement.digest()) || reply[32]!=0) throw new IOException("Invalid snapshot HOME retirement cancellation reply");
         } finally { endCall(); }
     }
     private RangeDescriptor homeRoute(HomeIdentity identity) {

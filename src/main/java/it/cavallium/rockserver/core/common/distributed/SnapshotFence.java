@@ -68,7 +68,7 @@ public record SnapshotFence(UUID clusterId,UUID databaseId,UUID domainId,UUID fe
             if (!Arrays.equals(bytes,result.encode())) throw invalid("Noncanonical snapshot fence"); return result;
         } catch (RuntimeException malformed) { if (malformed instanceof IllegalArgumentException invalid) throw invalid; throw new IllegalArgumentException("Invalid snapshot fence",malformed); }
     }
-    @Override public boolean equals(Object other) { return other instanceof SnapshotFence fence && Arrays.equals(encode(),fence.encode()); }
+    @Override public boolean equals(Object other) { return this==other || other instanceof SnapshotFence fence && Arrays.equals(encode(),fence.encode()); }
     @Override public int hashCode() { return Arrays.hashCode(encode()); }
     private static long participantSize(Participant p) {
         long size=PARTICIPANT_HEADER_BYTES; for (var span:p.scope().spans()) size+=25L+(span.lowerInclusive()==null ? 0 : span.lowerInclusive().length)+(span.upperExclusive()==null ? 0 : span.upperExclusive().length); return size;

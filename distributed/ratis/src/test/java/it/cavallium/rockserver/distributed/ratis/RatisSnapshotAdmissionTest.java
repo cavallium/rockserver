@@ -25,7 +25,16 @@ class RatisSnapshotAdmissionTest {
         long sequence;
         Home(String name) throws Exception {
             var validation=new AtomicReference<Consumer<DistributedCommand>>(command -> {});
-            f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validation.get().accept(command));
+            UUID column=UUID.randomUUID();
+            var interval=new it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.Interval(UUID.randomUUID(),Set.of(column),null,null);
+            f=new RatisRetentionAdmissionTest.Fixture(root.resolve(name),RatisRangeStateMachine.RetentionLimits.defaults(),command -> validation.get().accept(command),System::nanoTime,interval,machine -> {
+                machine.role(RatisNodePlan.Role.SNAPSHOT_HOME,(key,value) -> RatisSnapshotFences.validateRecord(helper.cluster,helper.database,machine.getGroupId().getUuid(),1,key,value));
+                machine.snapshotHomeStorage(helper.cluster,helper.database,column);
+                machine.snapshotHomeProofs((fence,group) -> {
+                    var node=helper.nodes.get(group); if (node==null) throw new IOException("Unconfigured controlled snapshot DATA group");
+                    return node.routed.snapshotFence(fence,group);
+                });
+            });
             var peer=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"fixture","127.0.0.1:12345",ReplicaDescriptor.Role.VOTER);
             var route=new RangeDescriptor(f.groupId,f.groupId,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
             var directory=new RangeDirectory(helper.cluster,helper.database,f.store.ownership().interval().domainId(),1,new byte[32],0,Set.of(f.column),0,List.of(route));

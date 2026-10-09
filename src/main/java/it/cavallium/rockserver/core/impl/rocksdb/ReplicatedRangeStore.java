@@ -17,6 +17,9 @@ import it.cavallium.rockserver.core.common.distributed.ParticipantFinalizationRe
 import it.cavallium.rockserver.core.common.distributed.AbortedParticipant;
 import it.cavallium.rockserver.core.common.distributed.RejectedParticipant;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
+import it.cavallium.rockserver.core.common.distributed.SnapshotHomeIdentity;
+import it.cavallium.rockserver.core.common.distributed.SnapshotHomeFenceProof;
+import it.cavallium.rockserver.core.common.distributed.SnapshotHomeRetirement;
 import it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus;
 import it.cavallium.rockserver.core.common.distributed.SnapshotGate;
 import it.cavallium.rockserver.core.common.distributed.SnapshotGateResult;
@@ -106,6 +109,7 @@ public final class ReplicatedRangeStore {
     private int reservedHomeRecoveryCount;
     private volatile Map<UUID,HomeRecoveryCredit> homeRecoveryCredits=Map.of();
     private volatile HomeRecoveryContext homeRecoveryContext;
+    private volatile HomeRecoveryContext snapshotHomeContext;
     private record HomeRecoveryContext(UUID cluster,UUID database,UUID column) {}
     public record HomeRecoveryCredit(UUID group,long rangeEpoch,byte[] schema,UUID cluster,UUID database,UUID column,TransactionStatus initial,TransactionStatus current,ApplyPosition position) {
         public static final int MAX_BYTES=128+2*TransactionStatus.MAX_BYTES;
@@ -310,7 +314,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -439,6 +443,7 @@ public final class ReplicatedRangeStore {
             throw new IllegalArgumentException("Wrong group, epoch or schema");
         }
         for (var mutation : command.mutations()) {
+            if (snapshotHomeContext!=null && mutation.kind()==Mutation.Kind.PUT) requireSnapshotHomeUser(snapshotHomeContext,mutation.key(),SnapshotFenceStatus.decode(mutation.value()));
             if (!columns.containsKey(mutation.columnId())) throw new IllegalArgumentException("Unknown logical column");
             if (mutation.kind() == Mutation.Kind.MERGE && !deterministicMergeColumns.contains(mutation.columnId())) {
                 throw new IllegalArgumentException("Column has no admitted deterministic merge operator");
@@ -470,7 +475,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(column); enterNative(); applyLane.lock();
         try {
             var context=new HomeRecoveryContext(cluster,database,column);
-            if (!columns.keySet().equals(Set.of(column)) || homeRecoveryContext!=null && !homeRecoveryContext.equals(context)) throw new IllegalArgumentException("HOME reservation context changed or column is not dedicated");
+            if (snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column)) || homeRecoveryContext!=null && !homeRecoveryContext.equals(context)) throw new IllegalArgumentException("HOME reservation context changed or column is not dedicated");
             for (var credit:homeRecoveryCredits.values()) if (!credit.cluster().equals(cluster) || !credit.database().equals(database) || !credit.column().equals(column)) throw new IllegalArgumentException("HOME reservation context differs from stored promises");
             for (var receipt:homeRecoveries.values()) {
                 var recovery=receipt.recovery(); if (!recovery.before().clusterId().equals(cluster) || !recovery.before().databaseId().equals(database) || !recovery.command().mutations().getFirst().columnId().equals(column)) throw new IllegalArgumentException("HOME receipt differs from configured context");
@@ -614,11 +619,96 @@ public final class ReplicatedRangeStore {
         requireHomeRecoverySuccessor(receipt,bytes==null ? null : TransactionStatus.decode(bytes));
     }
     private boolean expiredHomeRegistration(DistributedCommand command) throws RocksDBException {
-        if (homeRecoveryContext==null || command.kind()!=DistributedCommand.Kind.DATA || command.mutations().size()!=1 || command.predicates().size()!=1 || command.predicates().getFirst().expectedValue()!=null) return false;
+        var context=homeRecoveryContext!=null ? homeRecoveryContext : snapshotHomeContext;
+        if (context==null || command.kind()!=DistributedCommand.Kind.DATA || command.mutations().size()!=1 || command.predicates().size()!=1 || command.predicates().getFirst().expectedValue()!=null) return false;
         var mutation=command.mutations().getFirst();
-        if (!mutation.columnId().equals(homeRecoveryContext.column()) || mutation.kind()!=Mutation.Kind.PUT) return false;
+        if (!mutation.columnId().equals(context.column()) || mutation.kind()!=Mutation.Kind.PUT) return false;
+        if (snapshotHomeContext!=null) {
+            var initial=SnapshotFenceStatus.decode(mutation.value());
+            requireSnapshotHomeUser(context,mutation.key(),initial);
+            if (initial.phase()!=SnapshotFenceStatus.Phase.INSTALLING || initial.generation()!=0) throw new IllegalArgumentException("Snapshot HOME registration is not initial");
+            return initial.fence().operation().epoch()<minimumSessionEpoch(null);
+        }
         var initial=TransactionStatus.decode(mutation.value()); initial.requireInitial();
         return initial.operation().epoch()<minimumSessionEpoch(null);
+    }
+    public void configureSnapshotHome(UUID cluster,UUID database,UUID column) {
+        var context=new HomeRecoveryContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column));
+        enterNative(); applyLane.lock();
+        try {
+            if (homeRecoveryContext!=null || !homeRecoveries.isEmpty() || !homeRecoveryCredits.isEmpty() || !columns.keySet().equals(Set.of(column)) || snapshotHomeContext!=null && !snapshotHomeContext.equals(context)) throw new IllegalArgumentException("Snapshot HOME role/column changed");
+            var authority=sessionAuthority(null); if (authority!=null && (!authority.clusterId().equals(cluster) || !authority.databaseId().equals(database))) throw new IllegalArgumentException("Snapshot HOME session authority differs");
+            validateSnapshotHomeUsers(null,context); snapshotHomeContext=context;
+        } catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate snapshot HOME",failure); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
+    private void requireSnapshotHomeUser(HomeRecoveryContext context,byte[] key,SnapshotFenceStatus status) {
+        var fence=status.fence();
+        if (key.length!=16 || !Arrays.equals(key,uuidBytes(fence.fenceId())) || !contains(key) || !fence.clusterId().equals(context.cluster()) || !fence.databaseId().equals(context.database()) || !fence.homeGroup().equals(groupId) || fence.homeEpoch()!=rangeEpoch) throw new IllegalArgumentException("Snapshot HOME USER identity differs from native role");
+    }
+    private void validateSnapshotHomeUsersUnchecked() {
+        try { validateSnapshotHomeUsers(null,snapshotHomeContext); } catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate snapshot HOME USER",failure); }
+    }
+    private void validateSnapshotHomeUsers(Snapshot snapshot,HomeRecoveryContext context) throws RocksDBException {
+        if (context==null) return;
+        try (var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false); var iterator=db.newIterator(columns.get(context.column()),options)) {
+            var authority=sessionAuthority(options);
+            if (authority!=null && (!authority.clusterId().equals(context.cluster()) || !authority.databaseId().equals(context.database()))) throw new IllegalArgumentException("Snapshot HOME session authority differs");
+            if (interval.lowerInclusive()==null) iterator.seekToFirst(); else iterator.seek(interval.lowerInclusive());
+            for (;iterator.isValid() && contains(iterator.key());iterator.next()) {
+                byte[] value=iterator.value(); if (value.length>SnapshotFenceStatus.MAX_BYTES) throw new IllegalArgumentException("Snapshot HOME row too large");
+                requireSnapshotHomeUser(context,iterator.key(),SnapshotFenceStatus.decode(value));
+            }
+            iterator.status();
+        }
+    }
+    private SnapshotFenceStatus readSnapshotHome(SnapshotHomeIdentity identity,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        var context=snapshotHomeContext; if (context==null) throw new IllegalStateException("Snapshot HOME capability is not configured");
+        if (!identity.groupId().equals(groupId) || identity.rangeEpoch()!=rangeEpoch || !Arrays.equals(identity.schemaDigest(),schemaDigest) || !identity.columnId().equals(context.column())) throw new IllegalArgumentException("Snapshot HOME identity differs from native ownership/schema");
+        requireSnapshotHomeUser(context,uuidBytes(identity.snapshotId()),SnapshotFenceStatus.begin(identity.fence()));
+        byte[] marker=stateRow(markerKey,options); if (marker==null || !Objects.equals(decodePosition(marker),cut)) throw new IllegalStateException("Snapshot HOME cut differs from completed marker");
+        var authority=sessionAuthority(options); if (authority!=null && (!authority.clusterId().equals(context.cluster()) || !authority.databaseId().equals(context.database()))) throw new IllegalArgumentException("Snapshot HOME session authority differs");
+        byte[] key=uuidBytes(identity.snapshotId()); byte[] value=options==null ? db.get(columns.get(context.column()),key) : db.get(columns.get(context.column()),options,key);
+        if (value==null) return null;
+        var status=SnapshotFenceStatus.decode(value); requireSnapshotHomeUser(context,key,status);
+        if (status.fence().operation().equals(identity.business())) {
+            if (!status.fence().equals(identity.fence())) throw new IllegalArgumentException("Retained snapshot HOME definition changed");
+            return status;
+        }
+        if (identity.business().epoch()>=minimumSessionEpoch(options)) throw new IllegalArgumentException("Snapshot UUID belongs to another live business");
+        return null;
+    }
+    private SnapshotHomeFenceProof readSnapshotHomeFence(SnapshotHomeIdentity identity,ReadOptions options,ApplyPosition cut) throws RocksDBException {
+        return readSnapshotHome(identity,options,cut)==null && identity.business().epoch()<minimumSessionEpoch(options) ? new SnapshotHomeFenceProof(identity,minimumSessionEpoch(options),cut) : null;
+    }
+    public SnapshotHomeFenceProof snapshotHomeFence(SnapshotHomeIdentity identity) throws RocksDBException {
+        enterNative(); applyLane.lock(); try { if (pendingInstallation!=null) throw new IllegalStateException("Snapshot HOME installation pending"); return readSnapshotHomeFence(identity,null,applied); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public boolean snapshotHomeRetired(SnapshotHomeRetirement retirement) throws RocksDBException { return snapshotHomeFence(retirement.identity())!=null; }
+    private boolean snapshotHomeRetirementNeeded(SnapshotHomeRetirement retirement) throws RocksDBException {
+        var status=readSnapshotHome(retirement.identity(),null,applied);
+        if (retirement.identity().business().epoch()>=minimumSessionEpoch(null)) throw new IllegalStateException("Snapshot HOME retirement requires a newer business floor");
+        if (status==null) return false;
+        if (!status.consumed() || !status.equals(retirement.consumed())) throw new IllegalArgumentException("Snapshot HOME retirement requires exact consumed USER");
+        return true;
+    }
+    public boolean estimateSnapshotHomeRetirement(SnapshotHomeRetirement retirement) throws RocksDBException {
+        enterNative(); applyLane.lock(); try { requireActive(); return snapshotHomeRetirementNeeded(retirement); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public void applySnapshotHomeRetirement(ApplyPosition position,SnapshotHomeRetirement retirement) throws RocksDBException {
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage(); if (!snapshotHomeRetirementNeeded(retirement)) { advanceCompletedMarker(position); return; }
+            if (applied!=null && position.index()<=applied.index()) throw new IllegalStateException("Covered snapshot HOME retirement retains USER");
+            requireNext(position); var identity=retirement.identity(); byte[] key=uuidBytes(identity.snapshotId());
+            var scope=new TransactionScope(List.of(TransactionScope.Span.point(identity.columnId(),key))); requireUnlocked(scope); requireUngated(scope);
+            var effects=List.of(new Mutation(Mutation.Kind.DELETE,identity.columnId(),key,null)); var history=prepareScopedWrites(true,effects,Map.of());
+            try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                batch.delete(columns.get(identity.columnId()),key); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            publishScoped(position,history,false); applied=position;
+        } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
+        finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
     private static HomeIdentity homeIdentity(HomeRecovery recovery) {
         var command=recovery.command(); return new HomeIdentity(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.mutations().getFirst().columnId(),recovery.before());
@@ -1890,6 +1980,7 @@ public final class ReplicatedRangeStore {
         Evaluation(CommandResult result,List<Mutation> effects) { this(result,effects,Map.of()); }
     }
     private Evaluation evaluate(DistributedCommand command) throws RocksDBException {
+        if (expiredHomeRegistration(command)) return new Evaluation(new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of()),List.of());
         if (!command.hasBucketData()) return new Evaluation(evaluateRaw(command),command.mutations());
         try { return evaluateBuckets(command); }
         catch (DistributedBucket.LimitExceededException limit) { return new Evaluation(new CommandResult(CommandResult.Status.RESULT_TOO_LARGE,List.of()),List.of()); }
@@ -2082,7 +2173,8 @@ public final class ReplicatedRangeStore {
     private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
             InstallationObserver observer) throws IOException, RocksDBException {
         var context=homeRecoveryContext;
-        var expected = context==null ? NativeRangeImage.inspect(image, limits) : NativeRangeImage.inspectHomeRecoveryReservations(image,limits,context.cluster(),context.database(),context.column());
+        var snapshotContext=snapshotHomeContext;
+        var expected = snapshotContext!=null ? NativeRangeImage.inspectSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column()) : context==null ? NativeRangeImage.inspect(image, limits) : NativeRangeImage.inspectHomeRecoveryReservations(image,limits,context.cluster(),context.database(),context.column());
         if (!expected.owner().equals(owner) || !expected.interval().equals(interval)
                 || !Arrays.equals(expected.schemaDigest(), schemaDigest)
                 || !expected.deterministicMergeColumns().equals(deterministicMergeColumns)) {
@@ -2123,7 +2215,7 @@ public final class ReplicatedRangeStore {
                     clearForInstall(state, markerKey, null, markerKey, writer);
                     clearForInstall(receipts, markerKey, null, markerKey, writer);
                     writer.flush();
-                    var actual = NativeRangeImage.visit(image, limits, (section, column, key, value) -> {
+                    NativeRangeImage.RowVisitor importer = (section, column, key, value) -> {
                         try {
                             switch (section) {
                                 case USER -> writer.put(columns.get(column), key, value);
@@ -2134,7 +2226,8 @@ public final class ReplicatedRangeStore {
                                 }
                             }
                         } catch (RocksDBException storage) { throw new IOException("Native snapshot import failed", storage); }
-                    });
+                    };
+                    var actual=snapshotContext==null ? NativeRangeImage.visit(image,limits,importer) : NativeRangeImage.visitSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column(),importer);
                     if (!Arrays.equals(expected.sha256(), actual.sha256())) throw new IOException("Snapshot changed during installation");
                     writer.flush();
                     // The current image supplies counters bound to its completed position; never normalize imported state.
@@ -2677,6 +2770,11 @@ public final class ReplicatedRangeStore {
                 validateHomeUserCredits(credits,context,snapshot);
             } finally { releaseUse(); }
         }
+        void validateSnapshotHomeImage() throws RocksDBException { acquireUse(); try { validateSnapshotHomeUsers(snapshot,snapshotHomeContext); } finally { releaseUse(); } }
+        public SnapshotHomeFenceProof snapshotHomeFence(SnapshotHomeIdentity identity) throws RocksDBException {
+            acquireUse(); try (var options=new ReadOptions().setSnapshot(snapshot)) { return readSnapshotHomeFence(identity,options,position); } finally { releaseUse(); }
+        }
+        public boolean snapshotHomeRetired(SnapshotHomeRetirement retirement) throws RocksDBException { return snapshotHomeFence(retirement.identity())!=null; }
         public HomeFenceProof homeFence(HomeIdentity identity) throws RocksDBException {
             Objects.requireNonNull(identity); acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) { return readHomeFence(identity,options,position); } finally { releaseUse(); }

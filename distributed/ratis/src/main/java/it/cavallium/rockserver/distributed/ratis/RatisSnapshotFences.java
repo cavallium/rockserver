@@ -26,6 +26,20 @@ public final class RatisSnapshotFences {
     RatisRoutedClient.PreparedCommand restore(DistributedCommand command,RangeDescriptor descriptor) {
         var restored=routed.restoreSessionCommand(command,descriptor); validate(restored); return restored;
     }
+    public SnapshotHomeIdentity identity(SnapshotFence fence,RangeDescriptor descriptor) {
+        requireDatabaseBinding(fence.clusterId(),fence.databaseId());
+        return new SnapshotHomeIdentity(descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,column,fence);
+    }
+    public SnapshotHomeFenceProof fence(SnapshotHomeIdentity identity) throws IOException {
+        requireDatabaseBinding(identity.fence().clusterId(),identity.fence().databaseId());
+        if (!identity.columnId().equals(column) || !Arrays.equals(identity.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Snapshot HOME fence context changed");
+        return routed.snapshotHomeFence(identity);
+    }
+    public void retire(SnapshotHomeRetirement retirement) throws IOException {
+        var identity=retirement.identity(); requireDatabaseBinding(identity.fence().clusterId(),identity.fence().databaseId());
+        if (!identity.columnId().equals(column) || !Arrays.equals(identity.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Snapshot HOME retirement context changed");
+        routed.retireSnapshotHome(retirement);
+    }
     void requireDatabaseBinding(UUID cluster,UUID database) {
         if (!this.cluster.equals(cluster) || !this.database.equals(database)) throw new IllegalArgumentException("Snapshot home reader belongs to another cluster/database");
     }
@@ -51,7 +65,7 @@ public final class RatisSnapshotFences {
     private void validate(RatisRoutedClient.PreparedCommand prepared) {
         var descriptor=prepared.descriptor(); validator(cluster,database,descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,column).accept(prepared.command());
     }
-    /** Install on every home replica. Native expected-image predicates order the proof/decision CAS; deletion is unsupported. */
+    /** Install on every home replica. Native expected-image predicates order the proof/decision CAS; protected retirement supplies deletion separately. */
     public static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long rangeEpoch,byte[] schemaDigest,UUID column) {
         Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(group); Objects.requireNonNull(column);
         if (rangeEpoch<0 || schemaDigest.length!=32) throw new IllegalArgumentException("Invalid snapshot home validator identity"); byte[] digest=schemaDigest.clone();

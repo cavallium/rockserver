@@ -8,7 +8,7 @@ import java.util.function.*;
 
 /** Bounded forward policy over forced snapshot control. COMPLETE never promises a volatile lease remains live. */
 public final class RatisSnapshotCoordinator implements AutoCloseable {
-    public enum Action { RETRIED_HOME, REGISTERED, WAITING, INSTALLED, HELPED, READY, CAPTURED, CAPTURE_REPORTED, COMPLETED, ABORTED, RELEASED, RETIRED, COMPLETE }
+    public enum Action { RETRIED_HOME, REGISTERED, WAITING, INSTALLED, HELPED, READY, CAPTURED, CAPTURE_REPORTED, COMPLETED, ABORTED, RELEASED, RETIRED, HOME_RETIRED, COMPLETE }
     public record Step(Action action,UUID participant,boolean complete) {}
     private final RatisDurableSnapshot journal;
     private final RatisSnapshotFences homes;
@@ -31,7 +31,8 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
     /** One active step and at most one state-changing RPC. Rotation happens before participant work. */
     public Step step() throws IOException {
         synchronized (this) { if (closed || active) throw new IOException("Snapshot coordinator closed or step active"); active=true; }
-        try { return advance(); } finally { synchronized (this) { active=false; } }
+        try { if (journal.snapshot().homeRetirementProof()!=null) return new Step(Action.HOME_RETIRED,null,true); return advance(); }
+        catch (RatisSnapshotHomeRetiredException retired) { return new Step(Action.HOME_RETIRED,null,true); } finally { synchronized (this) { active=false; } }
     }
     private Step advance() throws IOException {
         journal.refreshHome(); journal.resolveHomeFromObserved(); var snapshot=journal.snapshot();
@@ -99,7 +100,8 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
             if (cancelled) return; closed=true; active=true;
         }
         try {
-            var snapshot=journal.snapshot(); IOException failure=null;
+            var snapshot=journal.snapshot(); if (snapshot.homeRetirementProof()!=null) { synchronized (this) { cancelled=true; } return; }
+            IOException failure=null;
             for (var progress:snapshot.participants()) {
                 if (!progress.installFrozen() || progress.retirementProof()!=null || progress.installReceipt()!=null || progress.releaseReceipt()!=null || progress.nativeGate()!=null && progress.nativeGate().released()!=null) continue;
                 try { journal.cancelInstall(progress.route().groupId()); }

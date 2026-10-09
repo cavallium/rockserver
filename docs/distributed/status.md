@@ -374,7 +374,19 @@ and old journals terminate explicitly as HOME_RETIRED while preserving previousl
 proven COMMIT or ABORT results. New businesses may reuse a transaction UUID without
 being adopted or deleted by old retries. HOME retirement shares the 16 protected
 slots and retains at most 1 MiB of input per group through actual RPC termination.
-Snapshot HOME rows, client journals and automatic GC discovery remain unfinished.
+Snapshot HOME retirement now has a separate dedicated role context and fixed DATA
+proof reader. It requires the exact consumed USER status, a strictly newer HOME
+business floor and fresh covering gate-retirement evidence from every participant.
+Its request stores one shared fence definition and compact participant cuts; the
+native batch deletes only the old USER row and updates history/completed accounting.
+Ordinary CAS receipts remain historical. Qualified image checks validate USER shape,
+placement and catalogue authority, including empty images, before installation.
+Journals force HOME expiry separately from cached captures and RELEASE proofs; missing
+or newer same-UUID HOME families cannot trigger re-registration or recapture.
+A DATA fenced-absence query also settles obsolete never-appended INSTALL ownership,
+while active native gates remain protected and busy inputs keep their actual charges.
+Snapshot HOME GC shares 16 protected slots with a 16 MiB retained-input bound.
+Client-journal reclamation and automatic GC discovery remain unfinished.
 
 The native snapshot-gate kernel freezes the complete participant set, directory
 and schema identities, local physical scopes, and distinct install/release controls.

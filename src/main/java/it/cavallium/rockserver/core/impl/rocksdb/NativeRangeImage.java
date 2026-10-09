@@ -76,6 +76,7 @@ public final class NativeRangeImage {
     }
 
     private record HomeContext(UUID cluster,UUID database,UUID column) {}
+    private record SnapshotHomeContext(UUID cluster,UUID database,UUID column) {}
     private record Header(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
                           byte[] schema, ApplyPosition position, Set<UUID> mergeColumns) {}
 
@@ -133,7 +134,8 @@ public final class NativeRangeImage {
                 pin.visitState((key, value) -> append.accept(Section.STATE, null, key, value));
                 pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
                 tracker.finish();
-                try { pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries); }
+                try { pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
+                pin.validateSnapshotHomeImage(); }
                 catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("HOME image user/promise/recovery proof differs",invalid); }
                 output.writeByte(0);
                 output.writeLong(tracker.count);
@@ -164,16 +166,22 @@ public final class NativeRangeImage {
         return visitHomeRecoveryReservations(image,limits,cluster,database,column,(section,id,key,value) -> {});
     }
     public static Manifest visitHomeRecoveryReservations(Path image,Limits limits,UUID cluster,UUID database,UUID column,RowVisitor visitor) throws IOException {
-        return visit(image,limits,visitor,true,new HomeContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column)));
+        return visit(image,limits,visitor,true,new HomeContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column)),null);
     }
 
+    public static Manifest inspectSnapshotHome(Path image,Limits limits,UUID cluster,UUID database,UUID column) throws IOException {
+        return visitSnapshotHome(image,limits,cluster,database,column,(section,id,key,value) -> {});
+    }
+    public static Manifest visitSnapshotHome(Path image,Limits limits,UUID cluster,UUID database,UUID column,RowVisitor visitor) throws IOException {
+        return visit(image,limits,visitor,true,null,new SnapshotHomeContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column)));
+    }
     /**
      * Verifies all bytes, row order, ownership and marker identity. Rows are delivered before the final
      * checksum is verified: an installer must remain inactive until this method returns successfully.
      * Use inspect first for validation before effects, and still require visit success afterward.
      */
-    public static Manifest visit(Path image, Limits limits, RowVisitor visitor) throws IOException { return visit(image,limits,visitor,true,null); }
-    private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required) throws IOException {
+    public static Manifest visit(Path image, Limits limits, RowVisitor visitor) throws IOException { return visit(image,limits,visitor,true,null,null); }
+    private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required,SnapshotHomeContext snapshotHome) throws IOException {
         Objects.requireNonNull(limits, "limits");
         Objects.requireNonNull(visitor, "visitor");
         long size = Files.size(image);
@@ -185,6 +193,7 @@ public final class NativeRangeImage {
             var bodyInput = new DigestInputStream(counted, body);
             var input = new DataInputStream(bodyInput);
             Header header = readHeader(input, counted, limits);
+            if (snapshotHome!=null && !header.interval().columns().equals(Set.of(snapshotHome.column()))) throw new IOException("Snapshot HOME image column is not dedicated");
             var tracker = new Rows(header, limits);
             while (true) {
                 int tag = input.readUnsignedByte();
@@ -204,11 +213,23 @@ public final class NativeRangeImage {
                 input.readFully(key);
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
+                if (snapshotHome!=null) {
+                    if (section==Section.STATE && key.length>16 && (key[16]==0x25 || key[16]==0x26)) throw new IOException("Snapshot HOME image contains TX HOME state");
+                    if (section==Section.USER) {
+                        try {
+                            if (key.length!=16 || value.length>it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.MAX_BYTES) throw new IllegalArgumentException("Invalid snapshot HOME row size");
+                            var fence=it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.decode(value).fence();
+                            var id=ByteBuffer.wrap(key);
+                            if (!column.equals(snapshotHome.column()) || !new UUID(id.getLong(),id.getLong()).equals(fence.fenceId()) || !fence.clusterId().equals(snapshotHome.cluster()) || !fence.databaseId().equals(snapshotHome.database()) || !fence.homeGroup().equals(header.owner().groupId()) || fence.homeEpoch()!=header.owner().epoch()) throw new IllegalArgumentException("Snapshot HOME image USER identity differs");
+                        } catch (IllegalArgumentException failure) { throw new IOException("Invalid snapshot HOME image USER",failure); }
+                    }
+                }
                 visitor.accept(section, column, key, value);
             }
             long declaredRows = input.readLong();
             if (declaredRows != tracker.count) throw new IOException("Image row count mismatch");
             tracker.finish();
+            if (snapshotHome!=null && tracker.sessionAuthority!=null && (!tracker.sessionAuthority.clusterId().equals(snapshotHome.cluster()) || !tracker.sessionAuthority.databaseId().equals(snapshotHome.database()))) throw new IOException("Snapshot HOME image session authority differs");
             bodyInput.on(false);
             byte[] embedded = new byte[HASH_BYTES];
             input.readFully(embedded);
@@ -223,7 +244,7 @@ public final class NativeRangeImage {
                         if (homeContext!=null) tracker.requireHomeUser(homeContext,column,key,value,matched);
                         tracker.requireHomeSuccessor(column,key,value,successful);
                     }
-                },false,null);
+                },false,null,null);
                 if (matched.size()!=tracker.homeCredits.size() || successful.size()!=tracker.homeSuccessCount() || !Arrays.equals(manifest.sha256(),checked.sha256())) throw new IOException("HOME image promises/success receipts have missing USER rows or image changed between passes");
             }
             return manifest;
