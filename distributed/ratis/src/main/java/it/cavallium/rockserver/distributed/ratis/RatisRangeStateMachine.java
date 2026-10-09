@@ -266,7 +266,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (failure!=null) throw failure;
     }
     private RatisSnapshotPins newSnapshotPins(java.util.function.LongSupplier nanos) {
-        return new RatisSnapshotPins(transactionIncarnation,store.ownership().owner().groupId(),RatisSnapshotPins.Limits.defaults(),nanos,this::captureSnapshotGate);
+        return new RatisSnapshotPins(transactionIncarnation,store.ownership().owner().groupId(),RatisSnapshotPins.Limits.defaults(),nanos,this::captureSnapshotGate,
+                ReplicatedRangeStore.ScopedSnapshot::get,ReplicatedRangeStore.ScopedSnapshot::close,scopedTransactions::captureSnapshot,scopedTransactions::releaseAndDrain,scopedTransactions::snapshotLive);
     }
     /** Qualified coordinator seam; the caller freezes this incarnation before its first capture request. */
     public UUID snapshotCaptureOwner() throws IOException { checkTransactionOwner(); return transactionIncarnation; }
@@ -2759,13 +2760,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             case ScopedTransactionRpc.SNAPSHOT_CAPTURE -> {
                 var capture=RatisSnapshotCaptureRequest.decode(packet.body()); SnapshotFenceStatus.Capture token=null;
+                ScopedTransactionRpc.Handle handle=null;
                 if (capture.owner().equals(transactionIncarnation)) {
                     if (snapshotHomes==null) throw new IOException("Snapshot home reader is not configured");
                     snapshotHomes.requireDatabaseBinding(capture.fence().clusterId(),capture.fence().databaseId());
-                    try { token=captureSnapshotPin(snapshotHomes,capture.fence(),capture.owner(),capture.snapshotId(),capture.ttl()); }
+                    try {
+                        var captured=capturedSnapshots.capture(snapshotHomes,capture.fence(),capture.owner(),capture.snapshotId(),capture.ttl(),this::snapshotRetentionFloor,capture.mode());
+                        token=captured.token(); handle=captured.handle();
+                    }
                     catch (RatisSnapshotLostException lost) { /* Explicit loss cannot create a replacement pin. */ }
                 }
-                reply=capture.reply(token);
+                reply=capture.reply(token,handle);
             }
             case ScopedTransactionRpc.SNAPSHOT_GET, ScopedTransactionRpc.SNAPSHOT_PAGE, ScopedTransactionRpc.SNAPSHOT_RELEASE -> {
                 var binding=ScopedTransactionRpc.snapshotBinding(input); var token=ScopedTransactionRpc.snapshotToken(input); byte[] payload;

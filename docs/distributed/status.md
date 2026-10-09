@@ -93,8 +93,17 @@ does not establish complete distributed API parity or production acceptance.
   mutations. PREPARE certifies history before transferring the full scope to a
   durable read lock; COMMIT records success without user effects. Routed scoped
   handles authorize these participants only when no staged effects would be lost.
-  Public cross-group writable capture/adoption remains unfinished; immutable
-  snapshot leases cannot be promoted after capture.
+  Owner-directed WRITE_CERTIFIED capture reserves snapshot metadata and scoped
+  handle capacity before taking that cut. The scoped registry is its sole native
+  owner; the snapshot registry keeps the original token and refunds its charge only
+  after scoped work actually drains. Capture retries bind mode, fence, owner, nonce
+  and original TTL without another HOME read or snapshot. The reply retains the
+  original scoped handle, so routed GET/PAGE/STAGE/PREPARE reuse that cut and deadline.
+  Immutable snapshot operations reject writable tokens; immutable journals reject
+  writable requests before saving or dispatching them. Leadership/history loss
+  invalidates certification without opening a replacement cut.
+  Public cross-group writable coordination and its durable journal remain unfinished;
+  immutable snapshot leases cannot be promoted after capture.
 - Scoped OPEN/GET/PAGE/PLAN/CLOSE use one framed query protocol for data and catalogue
   groups. OPEN requires a proven fresh linearizable barrier and ready native owner.
   Later owned operations use the fixed snapshot cut, not a new current read. Stale

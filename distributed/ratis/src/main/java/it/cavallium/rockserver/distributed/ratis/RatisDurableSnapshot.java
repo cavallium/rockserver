@@ -208,6 +208,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         } finally { end(); }
     }
     public synchronized void freezeCapture(RatisRoutedClient.PreparedSnapshotCapture operation) throws IOException {
+        if (Objects.requireNonNull(operation).request().mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IllegalArgumentException("Immutable snapshot journal requires read-only capture");
         idle(); if (requestedTtl!=null && !requestedTtl.equals(operation.request().ttl())) throw new IllegalArgumentException("Capture lifetime differs from frozen requested TTL");
         var target=operation.target(); var entry=entry(target.descriptor().groupId());
         if (entry.captureLost || entry.captureReleaseFrozen) throw new RatisSnapshotLostException("Capture was lost or explicitly released");

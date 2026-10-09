@@ -12,6 +12,7 @@ final class RatisScopedTransactions implements AutoCloseable {
     static final long STAGING_BUILD_BYTES=64L*1024*1024, STAGING_RETAINED_BYTES=32L*1024*1024;
     @FunctionalInterface interface StageFactory { ReplicatedRangeStore.ScopedStaging stage(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command) throws Exception; }
     @FunctionalInterface interface PlanFactory { RatisRangeStateMachine.ScopedCommit prepare(ReplicatedRangeStore.ScopedHistoryPin pin,DistributedCommand command,RatisRangeStateMachine.ProposalDeadline deadline) throws Exception; }
+    @FunctionalInterface interface PinCloser { void close(ReplicatedRangeStore.ScopedHistoryPin pin) throws Exception; }
     record Limits(int handles,long scopeBytes,long planBytes,long stagingBytes,Duration maximumTtl) {
         Limits {
             if (handles<1 || handles>4096 || scopeBytes<1 || scopeBytes>256L*1024*1024 || planBytes<DistributedCommandCodec.MAX_ENCODED_BYTES
@@ -25,6 +26,7 @@ final class RatisScopedTransactions implements AutoCloseable {
     private final LongSupplier nanos;
     private final PlanFactory planner;
     private final StageFactory stager;
+    private final PinCloser pinCloser;
     private final Map<UUID,Entry> entries=new HashMap<>();
     private final Map<UUID,Entry> handles=new HashMap<>();
     private final Set<Entry> retired=new HashSet<>();
@@ -32,7 +34,7 @@ final class RatisScopedTransactions implements AutoCloseable {
     private long scopeBytes,planBytes,stagingBytes;
     private boolean closed;
     private static final class Entry {
-        final UUID id,leaseId=UUID.randomUUID(); final long generation,opened,ttl,scopeBytes; final TransactionScope scope;
+        final UUID id,leaseId=UUID.randomUUID(); final long generation,opened,ttl,scopeBytes; final TransactionScope scope; final SnapshotFence snapshotFence;
         ReplicatedRangeStore.ScopedHistoryPin pin;
         ScopedTransactionRpc.Handle handle;
         RatisRangeStateMachine.ScopedCommit plan;
@@ -43,8 +45,8 @@ final class RatisScopedTransactions implements AutoCloseable {
         long stagingBytes;
         int planBytes;
         boolean busy,planning,closed,cleaning;
-        Entry(UUID id,long generation,long opened,long ttl,long scopeBytes,TransactionScope scope) {
-            this.id=id; this.generation=generation; this.opened=opened; this.ttl=ttl; this.scopeBytes=scopeBytes; this.scope=scope;
+        Entry(UUID id,long generation,long opened,long ttl,long scopeBytes,TransactionScope scope,SnapshotFence snapshotFence) {
+            this.id=id; this.generation=generation; this.opened=opened; this.ttl=ttl; this.scopeBytes=scopeBytes; this.scope=scope; this.snapshotFence=snapshotFence;
         }
     }
     RatisScopedTransactions(RatisRangeStateMachine machine,Limits limits,LongSupplier nanos) {
@@ -54,36 +56,78 @@ final class RatisScopedTransactions implements AutoCloseable {
         this(machine,limits,nanos,planner,ReplicatedRangeStore.ScopedHistoryPin::stage);
     }
     RatisScopedTransactions(RatisRangeStateMachine machine,Limits limits,LongSupplier nanos,PlanFactory planner,StageFactory stager) {
-        this.stager=Objects.requireNonNull(stager);
+        this(machine,limits,nanos,planner,stager,ReplicatedRangeStore.ScopedHistoryPin::close);
+    }
+    RatisScopedTransactions(RatisRangeStateMachine machine,Limits limits,LongSupplier nanos,PlanFactory planner,StageFactory stager,PinCloser pinCloser) {
+        this.pinCloser=Objects.requireNonNull(pinCloser); this.stager=Objects.requireNonNull(stager);
         this.machine=Objects.requireNonNull(machine); this.limits=Objects.requireNonNull(limits); this.nanos=Objects.requireNonNull(nanos);
         this.planner=Objects.requireNonNull(planner);
         owner=machine.transactionOwnerIncarnation();
     }
     ScopedTransactionRpc.Handle open(UUID id,TransactionScope scope,Duration ttl) throws Exception {
-        Objects.requireNonNull(id); Objects.requireNonNull(scope); Objects.requireNonNull(ttl); expire();
+        return open(id,scope,ttl,null,0,() -> machine.captureTransaction(scope),null);
+    }
+    /** Adopt exactly one tracked native cut under its original snapshot capture identity and deadline. */
+    ScopedTransactionRpc.Handle captureSnapshot(UUID id,RatisSnapshotFences homes,SnapshotFence fence,long opened,Duration ttl) throws Exception {
+        return captureSnapshot(id,homes,fence,opened,ttl,null);
+    }
+    /** Publish ownership before any later expiration or cleanup failure can hide a captured pin. */
+    ScopedTransactionRpc.Handle captureSnapshot(UUID id,RatisSnapshotFences homes,SnapshotFence fence,long opened,Duration ttl,java.util.function.Consumer<ScopedTransactionRpc.Handle> ownership) throws Exception {
+        Objects.requireNonNull(homes); Objects.requireNonNull(fence);
+        var scope=fence.participant(machine.getGroupId().getUuid()).scope();
+        return open(id,scope,ttl,fence,opened,() -> machine.captureTrackedSnapshotGate(homes,fence),ownership);
+    }
+    private ScopedTransactionRpc.Handle open(UUID id,TransactionScope scope,Duration ttl,SnapshotFence fence,long opened,java.util.concurrent.Callable<ReplicatedRangeStore.ScopedHistoryPin> capture,java.util.function.Consumer<ScopedTransactionRpc.Handle> ownership) throws Exception {
+        Objects.requireNonNull(id); Objects.requireNonNull(scope); Objects.requireNonNull(ttl);
         long duration=ttl.toNanos(); if (duration<=0 || duration>limits.maximumTtl().toNanos()) throw new IllegalArgumentException("Transaction TTL exceeds advertised limit");
+        expire();
+        if (fence!=null && nanos.getAsLong()-opened>=duration) throw new IOException("Snapshot transaction deadline expired");
         machine.checkTransactionOwner(); long generation=machine.transactionGeneration();
-        final Entry entry;
+        final Entry entry; final ScopedTransactionRpc.Handle replay;
         synchronized (this) {
             if (closed) throw new IOException("Transaction registry is closed");
             var existing=entries.get(id);
             if (existing!=null) {
+                if (!Objects.equals(existing.snapshotFence,fence) || fence!=null && existing.opened!=opened || existing.ttl!=duration
+                        || !Arrays.equals(ScopedTransactionRpc.scopeBytes(existing.scope),ScopedTransactionRpc.scopeBytes(scope))) throw new IllegalArgumentException("Transaction open identity reused with different origin/declaration");
                 if (existing.busy || existing.handle==null) throw new IOException("Transaction open is still running");
-                if (existing.ttl!=duration || !Arrays.equals(ScopedTransactionRpc.scopeBytes(existing.scope),ScopedTransactionRpc.scopeBytes(scope))) throw new IllegalArgumentException("Transaction open identity reused with different declaration");
-                return existing.handle;
+                entry=existing; replay=existing.handle;
+            } else {
+                replay=null;
+                var retiring=retired.stream().filter(old -> old.id.equals(id) && (old.snapshotFence!=null || fence!=null)).findFirst().orElse(null);
+                if (retiring!=null) {
+                    if (!Objects.equals(retiring.snapshotFence,fence) || retiring.ttl!=duration || fence!=null && retiring.opened!=opened
+                            || !Arrays.equals(ScopedTransactionRpc.scopeBytes(retiring.scope),ScopedTransactionRpc.scopeBytes(scope))) throw new IllegalArgumentException("Transaction open identity reused with different origin/declaration");
+                    throw new IOException("Snapshot transaction cleanup is still running");
+                }
+                long bytes=RangeMutationHistory.accountedScopeBytes(scope)+(fence==null ? 0 : fence.encode().length);
+                if (chargedHandles>=limits.handles() || bytes>limits.scopeBytes()-scopeBytes) throw new IOException("Transaction handle/scope admission exhausted");
+                entry=new Entry(id,generation,fence==null ? nanos.getAsLong() : opened,duration,bytes,scope,fence); entry.busy=true;
+                entries.put(id,entry); chargedHandles++; scopeBytes+=bytes;
             }
-            long bytes=RangeMutationHistory.accountedScopeBytes(scope);
-            if (chargedHandles>=limits.handles() || bytes>limits.scopeBytes()-scopeBytes) throw new IOException("Transaction handle/scope admission exhausted");
-            entry=new Entry(id,generation,nanos.getAsLong(),duration,bytes,scope); entry.busy=true;
-            entries.put(id,entry); chargedHandles++; scopeBytes+=bytes;
         }
+        if (replay!=null) { if (ownership!=null) ownership.accept(replay); return replay; }
         boolean success=false;
         try {
-            entry.pin=machine.captureTransaction(scope);
+            entry.pin=capture.call();
             var handle=new ScopedTransactionRpc.Handle(owner,entry.leaseId,generation,entry.pin.position());
-            synchronized (this) { ensureLive(entry); entry.handle=handle; handles.put(entry.leaseId,entry); }
+            synchronized (this) {
+                if (ownership==null) ensureLive(entry);
+                entry.handle=handle; handles.put(entry.leaseId,entry);
+            }
+            if (ownership!=null) ownership.accept(handle);
+            synchronized (this) { ensureLive(entry); }
             success=true; return handle;
         } finally { finish(entry,!success); }
+    }
+    /** Memory-only lease check after a fresh owner check; it never runs unrelated cleanup. */
+    boolean snapshotLive(ScopedTransactionRpc.Handle handle) {
+        Objects.requireNonNull(handle);
+        try { machine.checkTransactionOwner(); } catch (IOException | RuntimeException unavailable) { return false; }
+        synchronized (this) {
+            var entry=handles.get(handle.id());
+            return entry!=null && owner.equals(handle.owner()) && Objects.equals(entry.handle,handle) && live(entry);
+        }
     }
     byte[] get(ScopedTransactionRpc.Handle handle,UUID column,byte[] key) throws Exception {
         var entry=begin(handle,false); try { var value=entry.staging==null ? entry.pin.get(column,key) : entry.staging.get(column,key); if (value!=null && value.length>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Transaction value exceeds reply budget"); checked(entry); return value; }
@@ -195,14 +239,19 @@ final class RatisScopedTransactions implements AutoCloseable {
             finish(entry,!preserve);
         }
     }
-    void release(ScopedTransactionRpc.Handle handle) throws Exception {
-        Entry entry;
+    void release(ScopedTransactionRpc.Handle handle) throws Exception { releaseAndDrain(handle); }
+    /** Logical release is immediate; true requires actual native cleanup and accounting refund. */
+    boolean releaseAndDrain(ScopedTransactionRpc.Handle handle) throws Exception {
+        Objects.requireNonNull(handle); final Entry entry;
         synchronized (this) {
-            if (!owner.equals(handle.owner())) return; // The old incarnation alone owns its outstanding native work.
-            entry=handles.get(handle.id()); if (entry==null) return;
+            if (!owner.equals(handle.owner())) return true; // The old incarnation alone owns its outstanding native work.
+            var live=handles.get(handle.id());
+            entry=live!=null ? live : retired.stream().filter(old -> old.leaseId.equals(handle.id())).findFirst().orElse(null);
+            if (entry==null) return true;
             requireHandle(entry,handle); retire(entry);
         }
         cleanup();
+        synchronized (this) { return !retired.contains(entry); }
     }
     void expire() throws Exception {
         synchronized (this) {
@@ -250,7 +299,7 @@ final class RatisScopedTransactions implements AutoCloseable {
         Throwable failure=null;
         for (var entry:release) {
             boolean success=false;
-            try { releaseStaging(entry); if (entry.plan!=null) entry.plan.close(); if (entry.participant!=null) entry.participant.close(); if (entry.pin!=null) entry.pin.close(); success=true; }
+            try { releaseStaging(entry); if (entry.plan!=null) entry.plan.close(); if (entry.participant!=null) entry.participant.close(); if (entry.pin!=null) pinCloser.close(entry.pin); success=true; }
             catch (Throwable problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
             finally {
                 synchronized (this) {

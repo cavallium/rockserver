@@ -136,17 +136,36 @@ public final class RatisRoutedClient implements AutoCloseable {
     public PreparedSnapshotCapture prepareSnapshotCapture(SnapshotTarget target,UUID snapshotId,java.time.Duration ttl) {
         return restoreSnapshotCapture(target,new RatisSnapshotCaptureRequest(target.fence,target.incarnation,snapshotId,ttl));
     }
+    public PreparedSnapshotCapture prepareWritableSnapshotCapture(SnapshotTarget target,UUID snapshotId,java.time.Duration ttl) {
+        return restoreSnapshotCapture(target,new RatisSnapshotCaptureRequest(target.fence,target.incarnation,snapshotId,ttl,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED));
+    }
     public PreparedSnapshotCapture restoreSnapshotCapture(SnapshotTarget target,RatisSnapshotCaptureRequest request) {
         Objects.requireNonNull(target); Objects.requireNonNull(request); requireIdentity(target.source);
         if (!target.fence.equals(request.fence()) || !target.incarnation.equals(request.owner())) throw new IllegalArgumentException("Capture request differs from frozen target");
         return new PreparedSnapshotCapture(target,request);
     }
     public SnapshotFenceStatus.Capture executeSnapshotCapture(PreparedSnapshotCapture operation) throws IOException {
+        if (Objects.requireNonNull(operation).request.mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IllegalArgumentException("Expected read-only snapshot capture");
+        return executeCapture(operation).token();
+    }
+    public RatisSnapshotCaptureRequest.Result executeWritableSnapshotCapture(PreparedSnapshotCapture operation) throws IOException {
+        if (Objects.requireNonNull(operation).request.mode()!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED) throw new IllegalArgumentException("Expected writable snapshot capture");
+        return executeCapture(operation);
+    }
+    /** Reuse the already captured native owner; this method never opens or renews a snapshot. */
+    public ScopedTransaction capturedTransaction(PreparedSnapshotCapture operation,RatisSnapshotCaptureRequest.Result result) throws IOException {
+        Objects.requireNonNull(operation); Objects.requireNonNull(result); requireIdentity(operation.target.source);
+        // Revalidate the entire response binding, including mode and the native cut.
+        var certified=operation.request.certifiedResult(operation.request.reply(result.token(),result.handle()));
+        var participant=operation.request.fence().participant(operation.target.descriptor.groupId());
+        return new ScopedTransaction(operation.target.descriptor,certified.handle(),participant.scope(),participant.schemaDigest());
+    }
+    private RatisSnapshotCaptureRequest.Result executeCapture(PreparedSnapshotCapture operation) throws IOException {
         Objects.requireNonNull(operation); requireIdentity(operation.target.source); beginCall();
         try {
             var response=ScopedTransactionRpc.parse(transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes),ScopedTransactionRpc.MAX_REPLY_BYTES);
             if (response.kind()!=ScopedTransactionRpc.SNAPSHOT_CAPTURE) throw new IllegalArgumentException("Capture reply opcode changed");
-            return operation.request.result(response.body());
+            return operation.request.resultBinding(response.body());
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid capture reply",malformed); }
         finally { endCall(); }
     }
