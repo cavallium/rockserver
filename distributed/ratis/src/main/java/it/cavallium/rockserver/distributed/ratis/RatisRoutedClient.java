@@ -41,6 +41,46 @@ public final class RatisRoutedClient implements AutoCloseable {
         @Override default void close() throws IOException {}
     }
 
+    /** Original administrative route; retries never rebase a pending change onto a new schema. */
+    public static final class SchemaTarget {
+        private final RangeDescriptor descriptor;
+        private final RatisSchemaFenceRecord record;
+        private SchemaTarget(RangeDescriptor descriptor,RatisSchemaFenceRecord record) { this.descriptor=descriptor; this.record=record; }
+        public RangeDescriptor descriptor() { return descriptor; }
+        public RatisSchemaFenceRecord record() { return record; }
+    }
+    public SchemaTarget schemaTarget(SchemaChange.Definition definition,UUID group) {
+        Objects.requireNonNull(definition); var observed=current(); var original=definition.sourceDirectory();
+        if (!observed.clusterId().equals(original.clusterId()) || !observed.databaseId().equals(original.databaseId()) || !observed.domainId().equals(original.domainId()))
+            throw new IllegalArgumentException("Schema change belongs to another routed database/domain");
+        var descriptor=original.ranges().stream().filter(range -> range.groupId().equals(group)).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Schema group is outside original participant set"));
+        return new SchemaTarget(descriptor,new RatisSchemaFenceRecord(definition.header(),group));
+    }
+    public NativeSchemaFence fenceSchema(SchemaTarget target) throws IOException {
+        Objects.requireNonNull(target); beginCall();
+        try {
+            RatisSchemaFenceRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaFenceRpc.prepareRequest(target.record),true),ScopedTransactionRpc.SCHEMA_FENCE_PREPARE,target.record);
+            var proof=NativeSchemaFence.decode(transport.participant(target.descriptor,target.record.encode()));
+            proof.requireHeader(target.record.header());
+            if (!proof.participant().groupId().equals(target.descriptor.groupId())) throw new IllegalArgumentException("Schema FENCE reply names another participant");
+            return proof;
+        } catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema FENCE reply",invalid); }
+        finally { endCall(); }
+    }
+    public RatisSchemaFenceRpc.State schemaFenceState(SchemaTarget target) throws IOException {
+        Objects.requireNonNull(target); beginCall();
+        try { return RatisSchemaFenceRpc.stateReply(transport.transaction(target.descriptor,RatisSchemaFenceRpc.stateRequest(target.record),true),ScopedTransactionRpc.SCHEMA_FENCE_STATE,target.record); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema FENCE state reply",invalid); }
+        finally { endCall(); }
+    }
+    public void cancelSchemaPreparation(SchemaTarget target) throws IOException {
+        Objects.requireNonNull(target); beginCall();
+        try { RatisSchemaFenceRpc.decodePreparedReply(transport.transaction(target.descriptor,RatisSchemaFenceRpc.cancelRequest(target.record),true),ScopedTransactionRpc.SCHEMA_FENCE_CANCEL,target.record); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema preparation cancellation reply",invalid); }
+        finally { endCall(); }
+    }
+
     /** Keeps the original command identity and route for explicit retries, including after refresh. */
     public static final class PreparedCommand {
         private final RangeDirectory source;

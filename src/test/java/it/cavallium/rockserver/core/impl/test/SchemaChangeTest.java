@@ -60,7 +60,17 @@ class SchemaChangeTest {
     @Test void durableLifecycleRequiresAllFencesThenStrictInstallThenPublicationAndRetirement() {
         var definition=definition(schema(1,column(1)),schema(2,column(1),column(2)),2);
         var initial=SchemaChange.Status.begin(definition.header()); UUID first=id(400), second=id(401);
-        var partial=initial.fenced(first,new ApplyPosition(2,10)); partial.requireSuccessorOf(initial);
+        var fencing=initial.beginFencing(); fencing.requireSuccessorOf(initial);
+        assertSame(fencing,fencing.beginFencing());
+        assertThrows(IllegalStateException.class,() -> initial.fenced(first,new ApplyPosition(2,10)));
+        assertThrows(IllegalStateException.class,fencing::abort);
+        var aborted=initial.abort(); aborted.requireSuccessorOf(initial);
+        assertThrows(IllegalStateException.class,aborted::beginFencing);
+        assertThrows(IllegalArgumentException.class,() -> fencing.requireSuccessorOf(aborted));
+        assertThrows(IllegalArgumentException.class,() -> aborted.requireSuccessorOf(fencing));
+        var partial=fencing.fenced(first,new ApplyPosition(2,10)); partial.requireSuccessorOf(fencing);
+        assertEquals(SchemaChange.Phase.FENCING,partial.phase());
+        assertThrows(IllegalArgumentException.class,() -> partial.requireSuccessorOf(initial));
         assertSame(partial,partial.fenced(first,new ApplyPosition(2,10)));
         assertThrows(IllegalStateException.class,() -> partial.abort());
         assertThrows(IllegalStateException.class,() -> partial.installed(first,new ApplyPosition(2,11)));
@@ -76,7 +86,7 @@ class SchemaChangeTest {
         var published=installed.publish(); published.requireSuccessorOf(installed);
         var retired=published.retire(); retired.requireSuccessorOf(published);
         assertSame(retired,retired.retire()); retired.requireSuccessorOf(retired);
-        for (var status:List.of(initial,partial,fenced,installing,installed,published,retired,initial.abort())) {
+        for (var status:List.of(initial,fencing,partial,fenced,installing,installed,published,retired,aborted)) {
             assertArrayEquals(status.encode(),SchemaChange.Status.decode(status.encode()).encode());
             assertTrue(status.encode().length<16*1024);
         }
@@ -86,7 +96,7 @@ class SchemaChangeTest {
     }
     @Test void canonicalBoundsRejectTruncationTrailingDataAndMultiProofSuccessors() {
         var definition=definition(schema(1),schema(2,column(1)),64); var header=definition.header();
-        var status=SchemaChange.Status.begin(header);
+        var status=SchemaChange.Status.begin(header).beginFencing();
         for (var participant:header.participants()) status=status.fenced(participant.groupId(),new ApplyPosition(0,1));
         for (var participant:header.participants()) status=status.installed(participant.groupId(),new ApplyPosition(1,2));
         assertTrue(status.encode().length<=SchemaChange.MAX_STATUS_BYTES);

@@ -66,6 +66,7 @@ class RatisSchemaAdministrationTest {
     }
     RatisSchemaAdministration.Head complete(RatisSchemaAdministration admin,SchemaChange.Definition definition,RatisSchemaAdministration.Head head) throws Exception {
         var group=definition.sourceDirectory().ranges().getFirst().groupId();
+        admin.execute(admin.prepareAdvance(operation(),head,head.status().beginFencing())); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.prepareAdvance(operation(),head,head.status().fenced(group,new ApplyPosition(1,10)))); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.prepareAdvance(operation(),head,head.status().installed(group,new ApplyPosition(1,11)))); head=admin.readHead(head.status().header().domainId());
         admin.execute(admin.preparePublication(operation(),head,definition)); head=admin.readHead(head.status().header().domainId());
@@ -141,7 +142,7 @@ class RatisSchemaAdministrationTest {
         try (var f=outer.new Fixture(root)) {
             var source=initial(); var target=next(source,List.of(source.column(7),column(8,new UUID(12,1),"added")));
             var definition=new SchemaChange.Definition(new UUID(12,2),operation(),directory(source,0),source,target);
-            var status=SchemaChange.Status.begin(definition.header()).fenced(outer.dataGroup,new ApplyPosition(1,1))
+            var status=SchemaChange.Status.begin(definition.header()).beginFencing().fenced(outer.dataGroup,new ApplyPosition(1,1))
                     .installed(outer.dataGroup,new ApplyPosition(1,2)).publish().retire();
             var head=new RatisSchemaAdministration.Head(status,8); var catalogue=catalogue(client(f));
             int low=1,high=RangeDirectoryCodec.MAX_ENCODED_BYTES/4;
@@ -165,5 +166,21 @@ class RatisSchemaAdministrationTest {
                 new RangeDescriptor(new UUID(13,2),new UUID(14,2),1,1,a,b,RangeDescriptor.TopologyState.ACTIVE,replicas),
                 new RangeDescriptor(new UUID(13,3),new UUID(14,3),1,1,b,null,RangeDescriptor.TopologyState.ACTIVE,replicas));
         return new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),generation,schema.columnIds(),0,ranges);
+    }
+    @Test void abortAndIrreversibleFencingDecisionRaceThroughOneNativeHeadCas() throws Exception {
+        try (var f=outer.new Fixture(root)) {
+            var client=client(f); var catalogue=catalogue(client); var admin=admin(client); var source=initial(); var original=directory(source,0);
+            publishSchema(f,source); catalogue.execute(catalogue.prepare(operation(),null,original));
+            var target=next(source,List.of(source.column(7),column(8,new UUID(15,1),"added"))); publishSchema(f,target);
+            var definition=new SchemaChange.Definition(new UUID(15,2),operation(),original,source,target);
+            var prepared=begin(admin,definition,null);
+            var fencing=admin.prepareAdvance(operation(),prepared,prepared.status().beginFencing());
+            var abort=admin.prepareAdvance(operation(),prepared,prepared.status().abort());
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(fencing).status());
+            assertEquals(CommandResult.Status.CONFLICT,admin.execute(abort).status());
+            var current=admin.readHead(source.domainId()); assertEquals(SchemaChange.Phase.FENCING,current.status().phase());
+            assertThrows(IllegalStateException.class,current.status()::abort);
+            assertEquals(CommandResult.Status.SUCCESS,admin.execute(fencing).status());
+        }
     }
 }

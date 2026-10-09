@@ -82,6 +82,11 @@ public final class NativeRangeImage {
 
     private NativeRangeImage() {}
 
+    /** Trusted recovery-image export. The capture remains charged until the image owner releases it. */
+    public static Manifest write(Path destination,ReplicatedRangeStore store,Limits limits) throws IOException,RocksDBException {
+        try (var pin=store.captureForImage()) { return write(destination,pin,pin.interval(),limits); }
+    }
+
     /**
      * Streams only the supplied pin's cut and forces a private temporary file. An atomic hard-link
      * creation publishes the complete image without overwriting a destination; directory fsync
@@ -214,7 +219,7 @@ public final class NativeRangeImage {
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
                 if (snapshotHome!=null) {
-                    if (section==Section.STATE && key.length>16 && (key[16]==0x25 || key[16]==0x26)) throw new IOException("Snapshot HOME image contains TX HOME state");
+                    if (section==Section.STATE && key.length>16 && (key[16]==0x25 || key[16]==0x26 || key[16]==0x27)) throw new IOException("Snapshot HOME image contains TX HOME state");
                     if (section==Section.USER) {
                         try {
                             if (key.length!=16 || value.length>it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.MAX_BYTES) throw new IllegalArgumentException("Invalid snapshot HOME row size");
@@ -374,6 +379,7 @@ public final class NativeRangeImage {
         private final Map<UUID,RejectedParticipant> rejected=new HashMap<>();
         private final Map<UUID,SnapshotGate> gates=new HashMap<>();
         private long gateBytes,homeRecoveryBytes,homeCreditBytes;
+        private it.cavallium.rockserver.core.common.distributed.NativeSchemaFence schemaFence;
         private int homeCreditCount;
         private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
         private final Map<OperationId,HomeRecoveryReceipt> homeRecoveries=new HashMap<>();
@@ -403,6 +409,14 @@ public final class NativeRangeImage {
                 if (column != null || key.length < groupPrefix.length
                         || !Arrays.equals(key, 0, groupPrefix.length, groupPrefix, 0, groupPrefix.length)) {
                     throw new IOException("Wrong image group metadata prefix");
+                }
+                if (section==Section.STATE && key.length>16 && key[16]==0x27) {
+                    try {
+                        if (key.length!=17 || schemaFence!=null) throw new IllegalArgumentException("Invalid schema fence key/count");
+                        schemaFence=it.cavallium.rockserver.core.common.distributed.NativeSchemaFence.decode(value); schemaFence.requireCut(header.position());
+                        if (!schemaFence.participant().groupId().equals(header.owner().groupId()) || schemaFence.participant().rangeEpoch()!=header.owner().epoch()
+                                || !schemaFence.domainId().equals(header.interval().domainId()) || !Arrays.equals(schemaFence.sourceSchemaDigest(),header.schema())) throw new IllegalArgumentException("Schema fence differs from image ownership/schema");
+                    } catch (IllegalArgumentException failure) { throw new IOException("Invalid native schema fence image state",failure); }
                 }
                 if (section == Section.STATE && key.length > 16 && (key[16] == 0x13 || key[16] == 0x14)) {
                     boolean binding = key[16] == 0x14;
@@ -603,6 +617,7 @@ public final class NativeRangeImage {
                 if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
             }
             if (context!=null) {
+                if (schemaFence!=null) throw new IOException("HOME image contains DATA schema fence");
                 if (!header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership");
                 for (var receipt:homeRecoveries.values()) if (!receipt.recovery().before().clusterId().equals(context.cluster()) || !receipt.recovery().before().databaseId().equals(context.database()) || !receipt.recovery().command().mutations().getFirst().columnId().equals(context.column())) throw new IOException("Qualified HOME receipt database differs");
             }

@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
+import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.common.distributed.HomeRecovery;
 import it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt;
 import it.cavallium.rockserver.core.common.distributed.HomeRecoveryResult;
@@ -160,6 +162,7 @@ public final class ReplicatedRangeStore {
     private volatile Map<UUID,SnapshotGate> snapshotGates=Map.of();
     private long retainedGateBytes;
     private volatile DistributedSchema logicalSchema;
+    private volatile NativeSchemaFence activeSchemaFence;
     private volatile boolean catalogueScopeCompaction;
     private RangeMutationHistory scopedHistory;
     private RangeMutationHistory.Limits scopedLimits;
@@ -244,7 +247,7 @@ public final class ReplicatedRangeStore {
         } else {
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied);
         }
     }
 
@@ -324,7 +327,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); validateSnapshotHomeUsersUnchecked();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -333,6 +336,60 @@ public final class ReplicatedRangeStore {
         if (pendingInstallation != null || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
             throw new IllegalStateException("Range is fenced");
         }
+    }
+
+    private byte[] schemaFenceKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x27).array(); }
+    private void requireSchemaAdmission() {
+        if (activeSchemaFence!=null) throw new IllegalStateException("Schema change blocks new DATA admission");
+    }
+    private void requireSchemaFenceSchema(NativeSchemaFence fence,DistributedSchema schema) {
+        if (!fence.clusterId().equals(schema.clusterId()) || !fence.databaseId().equals(schema.databaseId())
+                || !fence.domainId().equals(schema.domainId()) || fence.sourceSchemaEpoch()!=schema.schemaEpoch()
+                || !Arrays.equals(fence.sourceSchemaDigest(),schema.digest())) throw new IllegalArgumentException("Schema fence differs from qualified logical schema");
+    }
+    private NativeSchemaFence loadSchemaFence(ApplyPosition cut) {
+        byte[] bytes;
+        try { bytes=db.get(state,schemaFenceKey()); } catch (RocksDBException failure) { throw new IllegalStateException("Cannot recover native schema fence",failure); }
+        if (bytes==null) return null;
+        var fence=NativeSchemaFence.decode(bytes); fence.requireCut(cut);
+        if (!fence.participant().groupId().equals(groupId) || fence.participant().rangeEpoch()!=rangeEpoch
+                || !fence.domainId().equals(interval.domainId()) || !Arrays.equals(fence.sourceSchemaDigest(),schemaDigest)
+                || homeRecoveryContext!=null || snapshotHomeContext!=null) throw new IllegalArgumentException("Recovered schema fence differs from DATA ownership");
+        if (logicalSchema!=null) requireSchemaFenceSchema(fence,logicalSchema);
+        return fence;
+    }
+    public NativeSchemaFence schemaFence() { return activeSchemaFence; }
+    public record SchemaFenceReadiness(NativeSchemaFence fence,boolean ready,int snapshotPins,int preparedParticipants,int snapshotGates) {}
+    /** Exact native blockers at one ordered cut; ownership is never forcibly released. */
+    public SchemaFenceReadiness schemaFenceReady() {
+        enterNative(); applyLane.lock();
+        try {
+            int pins=snapshotPins.get(),prepared=(int)preparedIndex.records().stream().filter(p -> !isFinalized(p.preparation().transactionId())).count();
+            int gates=(int)snapshotGates.values().stream().filter(SnapshotGate::active).count();
+            return new SchemaFenceReadiness(activeSchemaFence,activeSchemaFence!=null && pendingInstallation==null && pins==0 && prepared==0 && gates==0,pins,prepared,gates);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Trusted committed seam; the adapter validates source directory/lineage and drains accepted predecessors before append. */
+    public NativeSchemaFence applySchemaFence(ApplyPosition position,SchemaChange.Header header) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(header); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage();
+            var proposed=new NativeSchemaFence(header,groupId,position);
+            if (homeRecoveryContext!=null || snapshotHomeContext!=null || logicalSchema==null) throw new IllegalStateException("Schema fence requires qualified DATA schema");
+            requireSchemaFenceSchema(proposed,logicalSchema);
+            if (proposed.participant().rangeEpoch()!=rangeEpoch) throw new IllegalArgumentException("Schema fence participant epoch differs from ownership");
+            if (activeSchemaFence!=null) {
+                activeSchemaFence.requireHeader(header);
+                if (position.index()<activeSchemaFence.position().index() || position.index()==activeSchemaFence.position().index() && position.term()!=activeSchemaFence.position().term()) throw new IllegalArgumentException("Schema fence callback regresses or changes original position");
+                advanceCompletedMarker(position); return activeSchemaFence;
+            }
+            requireNext(position); var history=prepareScopedWrites(false,List.of(),Map.of());
+            try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                batch.put(state,schemaFenceKey(),proposed.encode()); batch.put(state,markerKey,encodePosition(position));
+                batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            activeSchemaFence=proposed; publishScoped(position,history,false); applied=position; return proposed;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
 
     private boolean contains(byte[] key) {
@@ -430,6 +487,7 @@ public final class ReplicatedRangeStore {
                     || logicalSchema!=null && !Arrays.equals(logicalSchema.digest(),schema.digest())
                     || prefix>0 && (interval.lowerInclusive()!=null && interval.lowerInclusive().length!=prefix
                             || interval.upperExclusive()!=null && interval.upperExclusive().length!=prefix)) throw new IllegalArgumentException("Logical schema differs from native ownership");
+            if (activeSchemaFence!=null) requireSchemaFenceSchema(activeSchemaFence,schema);
             logicalSchema=schema;
             for (var prepared:preparedIndex.records()) requirePreparation(prepared.preparation(),true);
         } finally { applyLane.unlock(); leaveNative(); }
@@ -452,13 +510,23 @@ public final class ReplicatedRangeStore {
             if (!shape.hasValue() && predicate.expectedValue()!=null && predicate.expectedValue().length!=0) throw new IllegalArgumentException("Key-only predicate has value bytes");
         }
     }
-    public void validate(DistributedCommand command) { validateCommand(command,true); }
+    public void validate(DistributedCommand command) {
+        if (activeSchemaFence==null) { validateCommand(command,true); return; }
+        enterNative(); applyLane.lock();
+        try {
+            requireActive(); validateCommand(command,false);
+            byte[] retained=db.get(receipts,receiptKey(command.operationId()));
+            if (retained==null) throw new IllegalStateException("Schema change blocks new DATA admission");
+            decodeReceipt(retained,command.receiptDigest());
+        } catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate retained schema-fenced command",failure); }
+        finally { applyLane.unlock(); leaveNative(); }
+    }
     private void validateCommand(DistributedCommand command,boolean active) { validateCommand(command,active,true); }
     private void validateCommand(DistributedCommand command,boolean active,boolean logical) {
         requireHomeRecoveryFree(command.operationId());
         if (command.sessionControl()!=null && !sessionControlsEnabled) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
-        if (active) requireActive();
+        if (active) { requireActive(); requireSchemaAdmission(); }
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
                 || !Arrays.equals(schemaDigest, command.schemaDigest())) {
             throw new IllegalArgumentException("Wrong group, epoch or schema");
@@ -553,7 +621,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(column); enterNative(); applyLane.lock();
         try {
             var context=new HomeRecoveryContext(cluster,database,column);
-            if (snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column)) || homeRecoveryContext!=null && !homeRecoveryContext.equals(context)) throw new IllegalArgumentException("HOME reservation context changed or column is not dedicated");
+            if (activeSchemaFence!=null || snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column)) || homeRecoveryContext!=null && !homeRecoveryContext.equals(context)) throw new IllegalArgumentException("HOME reservation context changed or column is not dedicated");
             for (var credit:homeRecoveryCredits.values()) if (!credit.cluster().equals(cluster) || !credit.database().equals(database) || !credit.column().equals(column)) throw new IllegalArgumentException("HOME reservation context differs from stored promises");
             for (var receipt:homeRecoveries.values()) {
                 var recovery=receipt.recovery(); if (!recovery.before().clusterId().equals(cluster) || !recovery.before().databaseId().equals(database) || !recovery.command().mutations().getFirst().columnId().equals(column)) throw new IllegalArgumentException("HOME receipt differs from configured context");
@@ -714,7 +782,7 @@ public final class ReplicatedRangeStore {
         var context=new HomeRecoveryContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column));
         enterNative(); applyLane.lock();
         try {
-            if (homeRecoveryContext!=null || !homeRecoveries.isEmpty() || !homeRecoveryCredits.isEmpty() || !columns.keySet().equals(Set.of(column)) || snapshotHomeContext!=null && !snapshotHomeContext.equals(context)) throw new IllegalArgumentException("Snapshot HOME role/column changed");
+            if (activeSchemaFence!=null || homeRecoveryContext!=null || !homeRecoveries.isEmpty() || !homeRecoveryCredits.isEmpty() || !columns.keySet().equals(Set.of(column)) || snapshotHomeContext!=null && !snapshotHomeContext.equals(context)) throw new IllegalArgumentException("Snapshot HOME role/column changed");
             var authority=sessionAuthority(null); if (authority!=null && (!authority.clusterId().equals(cluster) || !authority.databaseId().equals(database))) throw new IllegalArgumentException("Snapshot HOME session authority differs");
             validateSnapshotHomeUsers(null,context); snapshotHomeContext=context;
         } catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate snapshot HOME",failure); }
@@ -1039,6 +1107,7 @@ public final class ReplicatedRangeStore {
             var rejected=rejectedIndex.get(finalization.transactionId()); if (rejected!=null) rejected.requireFinalization(finalization);
             requireFinalizationRejectionIdentity(finalization);
             var capacity=preparedCapacityUnderLane(); boolean newFence=prepared==null && rejected==null;
+            if (newFence) requireSchemaAdmission();
             if (newFence && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("Finalization capacity exhausted");
             return new FinalizationEstimate(capacity,newFence,null,false);
         } finally { applyLane.unlock(); leaveNative(); }
@@ -1365,7 +1434,7 @@ public final class ReplicatedRangeStore {
             requireActive(); var result=readSnapshotGateResult(fence,null,applied);
             if (result!=null && result.retired()) return new GateEstimate(gateCapacityUnderLane(),null,result.retirement());
             var saved=result==null ? null : result.gate();
-            if (saved==null) { requireGateIdentity(fence); requireUngated(fence.participant(groupId).scope()); requireGateCapacity(fence); }
+            if (saved==null) { requireSchemaAdmission(); requireGateIdentity(fence); requireUngated(fence.participant(groupId).scope()); requireGateCapacity(fence); }
             return new GateEstimate(gateCapacityUnderLane(),saved,null);
         } finally { applyLane.unlock(); leaveNative(); }
     }
@@ -1550,6 +1619,7 @@ public final class ReplicatedRangeStore {
         if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied rejection lacks its receipt"); return ParticipantVote.negative(); }
         requireNext(position);
         if (saved==null && !abortedIndex.containsKey(preparation.transactionId())) {
+            requireSchemaAdmission();
             var capacity=preparedCapacityUnderLane();
             if (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes()) throw new IllegalStateException("Rejected preparation capacity exhausted");
         }
@@ -1633,6 +1703,7 @@ public final class ReplicatedRangeStore {
                 requireFinalizationRejectionIdentity(finalization);
                 if (!prepared && finalization.participant().prepared()!=null) throw new IllegalStateException("Home reports missing native prepare evidence");
                 var capacity=preparedCapacityUnderLane();
+                if (!prepared && rejected==null) requireSchemaAdmission();
                 if (!prepared && rejected==null && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("ABORT fence capacity exhausted");
             }
             var result=saved==null ? candidate : saved; var next=new HashMap<>(abortedIndex); next.put(finalization.transactionId(),result);
@@ -1749,6 +1820,7 @@ public final class ReplicatedRangeStore {
             if (applied==null || applied.index()==Long.MAX_VALUE || preparation.business().acceptance().snapshot().index()>applied.index()
                     || preparation.business().acceptance().snapshot().term()>applied.term()) throw new IllegalStateException("Rejection cannot follow its original cut");
             boolean additional=newParticipant(preparation.transactionId());
+            if (additional) requireSchemaAdmission();
             if (additional && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("Rejected preparation capacity exhausted");
             return new RejectionEstimate(capacity,null,additional);
         } finally { applyLane.unlock(); leaveNative(); }
@@ -1819,10 +1891,12 @@ public final class ReplicatedRangeStore {
             }
             requireNext(position);
             var abort=abortedIndex.get(preparation.transactionId());
+            if (saved==null && abort==null && !rejectedIndex.containsKey(preparation.transactionId())) requireSchemaAdmission();
             if (saved==null && (abort!=null || rejectedIndex.containsKey(preparation.transactionId()) || gated(preparation.scope()))) {
                 return applyRejectedUnderLane(position,preparation);
             }
             if (saved==null) {
+                requireSchemaAdmission();
                 var business=preparation.business(); var id=business.operationId(); long minimum=minimumSessionEpoch(null); long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
                 if (id.epoch()<minimum || id.sequence()<=floor || db.get(receipts,receiptKey(id))!=null || db.get(receipts,receiptKey(preparation.operation()))!=null
                         || sessionDecision(business,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepared business/control identity is no longer eligible");
@@ -1854,13 +1928,46 @@ public final class ReplicatedRangeStore {
         finally { applyLane.unlock(); leaveNative(); }
     }
 
+    public record PhysicalPoint(UUID column,byte[] key) {
+        public PhysicalPoint { Objects.requireNonNull(column); key=Objects.requireNonNull(key).clone(); }
+        @Override public byte[] key() { return key.clone(); }
+    }
+    public record CurrentPoints(ApplyPosition position,List<byte[]> values) {
+        public CurrentPoints { values=copyPointValues(values); }
+        @Override public List<byte[]> values() { return copyPointValues(values); }
+        private static List<byte[]> copyPointValues(List<byte[]> values) {
+            var copy=new ArrayList<byte[]>(values.size()); for (var value:values) copy.add(value==null ? null : value.clone());
+            return java.util.Collections.unmodifiableList(copy);
+        }
+    }
+    /** Small atomic metadata/user point read at one completed cut, without acquiring a native snapshot. */
+    public CurrentPoints readCurrentPoints(List<PhysicalPoint> points) throws RocksDBException {
+        points=List.copyOf(points); if (points.isEmpty() || points.size()>4) throw new IllegalArgumentException("Atomic point read requires 1..4 points");
+        long keyBytes=0; var spans=new ArrayList<TransactionScope.Span>(points.size());
+        for (var point:points) { keyBytes+=point.key.length; if (keyBytes>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Atomic point keys exceed budget"); spans.add(TransactionScope.Span.point(point.column,point.key)); }
+        var scope=new TransactionScope(spans); enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireSchemaAdmission(); validateSnapshotScope(scope); requireUnlocked(scope); ensureReceiptUsage();
+            byte[] marker=db.get(state,markerKey); ApplyPosition cut=marker==null ? null : decodePosition(marker);
+            if (!Objects.equals(cut,applied)) throw new IllegalStateException("Atomic point marker differs from completed apply");
+            var values=new ArrayList<byte[]>(points.size()); long valueBytes=0;
+            for (var point:points) {
+                // Read size before allocating an arbitrary native value into Java memory.
+                var cf=columns.get(point.column); int length=db.get(cf,point.key,new byte[0]);
+                if (length!=RocksDB.NOT_FOUND) { valueBytes+=length; if (valueBytes>MAX_RESULT_BYTES) throw new IllegalStateException("Atomic point values exceed budget"); }
+                values.add(length==RocksDB.NOT_FOUND ? null : db.get(cf,point.key));
+            }
+            return new CurrentPoints(cut,values);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+
     /** Fresh atomic point read after completed apply; no retained snapshot or retention quota is acquired. */
     public byte[] readCurrentPoint(UUID column, byte[] key) throws RocksDBException {
         byte[] physicalKey = Objects.requireNonNull(key).clone();
         var scope = new TransactionScope(List.of(TransactionScope.Span.point(column, physicalKey)));
         enterNative(); applyLane.lock();
         try {
-            requireActive(); validateSnapshotScope(scope); requireUnlocked(scope);
+            requireActive(); requireSchemaAdmission(); validateSnapshotScope(scope); requireUnlocked(scope);
             ensureReceiptUsage();
             byte[] marker = db.get(state, markerKey);
             ApplyPosition cut = marker == null ? null : decodePosition(marker);
@@ -1894,7 +2001,7 @@ public final class ReplicatedRangeStore {
     private byte[] applyUnderAdmission(ApplyPosition position, DistributedCommand command, byte[] result)
             throws RocksDBException {
         Objects.requireNonNull(position);
-        validate(command);
+        validateCommand(command,false);
         if (result!=null && (command.sessionControl()!=null || command.hasBucketData() || command.acceptance()!=null || command.transactionRejection())) throw new IllegalArgumentException("Controls, buckets and transaction plans require ordered native evaluation");
         if (result != null && !command.predicates().isEmpty()) {
             throw new IllegalArgumentException("Precomputed results require a fully evaluated plan without live predicates");
@@ -1907,6 +2014,13 @@ public final class ReplicatedRangeStore {
         try {
             requireActive();
             ensureReceiptUsage(); requireHomeRecoveryFree(command.operationId());
+            if (activeSchemaFence!=null) {
+                byte[] retained=db.get(receipts,receiptKey);
+                if (retained==null) throw new IllegalStateException("Schema change blocks new DATA operations");
+                byte[] original=decodeReceipt(retained,digest);
+                if (position.index()==activeSchemaFence.position().index() || position.index()<activeSchemaFence.position().index() && position.term()>activeSchemaFence.position().term()) throw new IllegalArgumentException("Operation callback conflicts with schema fence position");
+                advanceCompletedMarker(position); return original;
+            }
             long currentEpochFloor = minimumSessionEpoch(null);
             long currentFloor = command.operationId().epoch() < currentEpochFloor ? -1 : acknowledgedThrough(command.operationId(), null);
             if (command.operationId().epoch() < currentEpochFloor || command.operationId().sequence() <= currentFloor) {
@@ -1998,7 +2112,7 @@ public final class ReplicatedRangeStore {
             }
             publishHomeCredit(creditChange); publishScoped(position,writes,false); applied = position;
             return saved == null ? stableResult : original;
-        } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
+        } catch (RocksDBException | RuntimeException | Error failure) { if (activeSchemaFence==null) resetScopedUnderLane(); throw failure; }
         finally { applyLane.unlock(); }
     }
 
@@ -2286,6 +2400,13 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if (activeSchemaFence!=null) {
+                var incoming=new NativeSchemaFence[1];
+                NativeRangeImage.visit(image,limits,(section,column,key,value) -> {
+                    if (section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x27) incoming[0]=NativeSchemaFence.decode(value);
+                });
+                if (!activeSchemaFence.equals(incoming[0])) throw new IOException("Snapshot cannot discard or change a committed native schema fence");
+            }
             if (snapshotPins.get() != 0) throw new IllegalStateException("Native snapshot readers have not drained");
             if (ownership.get(owner).state() != RangeOwnership.State.FENCED) {
                 throw new IllegalStateException("Snapshot installation requires a fenced interval");
@@ -2335,6 +2456,7 @@ public final class ReplicatedRangeStore {
                     writer.flush();
                     // The current image supplies counters bound to its completed position; never normalize imported state.
                     validateReceiptUsage(expected.position());
+                    activeSchemaFence=loadSchemaFence(expected.position());
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);
@@ -2448,7 +2570,7 @@ public final class ReplicatedRangeStore {
     public boolean admissionOpen() { return !closing && pendingInstallation==null && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
     /** Memory-only scope validation before entering the short proposal coordination lane. */
     public void validateScope(TransactionScope scope) {
-        Objects.requireNonNull(scope); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);
+        Objects.requireNonNull(scope); requireSchemaAdmission(); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);
     }
     private void validateSnapshotScope(TransactionScope scope) {
         for (var span : scope.spans()) {
@@ -2777,11 +2899,22 @@ public final class ReplicatedRangeStore {
         }
     }
 
-    private SnapshotPin captureUnderAdmission() throws RocksDBException {
-        requireActive();
+    private SnapshotPin captureUnderAdmission() throws RocksDBException { return captureUnderAdmission(false); }
+    SnapshotPin captureForImage() throws RocksDBException { return captureForRecovery(); }
+    /**
+     * Trusted Raft metadata recovery and image ownership only, never fresh DATA admission.
+     * Bypasses the schema business fence while retaining physical activation, completed-marker
+     * validation and normal native snapshot quota/drain accounting. The caller owns the pin
+     * through all native reads and file I/O and must release it afterward.
+     */
+    public SnapshotPin captureForRecovery() throws RocksDBException {
+        enterNative(); try { return captureUnderAdmission(true); } finally { leaveNative(); }
+    }
+    private SnapshotPin captureUnderAdmission(boolean recovery) throws RocksDBException {
+        if (!recovery) requireSchemaAdmission(); requireActive();
         applyLane.lock();
         try {
-            requireActive();
+            if (!recovery) requireSchemaAdmission(); requireActive();
             ensureReceiptUsage();
             PoolSnapshotAdmission.Lease lease = snapshotAdmission == null ? null : snapshotAdmission.reserve();
             Snapshot snapshot;

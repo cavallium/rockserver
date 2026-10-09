@@ -199,6 +199,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             c.schemaDigest(),Map.of(c.directoryColumn(),"catalogue-directory",c.sessionsColumn(),"catalogue-sessions"),Set.of());
                     machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn()));
                     machine.role(role);
+                    machine.schemaCatalogue(plan.directory().clusterId(),plan.directory().databaseId(),c.directoryColumn());
                 } else {
                     var directory=plan.groupDirectory(id); var descriptor=plan.groupDescriptor(id); var home=plan.home(id);
                     var bindings=home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
@@ -217,7 +218,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
                     }
-                    else { machine.role(role); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
+                    else { machine.role(role); var authority=epochs.schemaAuthority(); machine.schemaAuthority(header -> authority.read(header.domainId()),directory); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
                 }
                 machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
