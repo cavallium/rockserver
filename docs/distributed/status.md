@@ -126,6 +126,24 @@ does not establish complete distributed API parity or production acceptance.
   while a forced commit journal permits exact atomic recovery. Completion does not
   consume the transaction result. Explicit release closes settled commit ownership
   before snapshot cleanup. Legacy API/transport parity remains unfinished.
+- `RatisRocksDBAdapter.api(context)` binds the common async API to bounded explicit
+  transaction handles. Unknown-scope OPEN validates the complete cached database
+  projection before identity allocation. Typed GET/FOR_UPDATE, ordered PUT/DELETE
+  and multi results, EXISTS, cached column metadata and transaction pages use the
+  same captured lease and write overlay. A definite CONFLICT returns `false` while
+  retaining its opaque legacy ID and outcome; repeated close never rebases or
+  reallocates it. Unknown commits resume their original operation, including during
+  adapter shutdown. Inputs and mutable results are copied, and concurrent operations
+  cannot install a prefix built from stale settled state.
+  `RatisTransactionIdentities` exclusively reserves disjoint snapshot/commit blocks
+  in an already-issued, adequately bound grant. Its current manifest is forced on
+  the caller's workload executor before any capture; admission and close checks do
+  not wait on checkpoint I/O. Cancellation cannot recycle reserved identities, and
+  missing used state cannot be recreated. Exhaustion requires a renewed exclusive
+  grant rather than wrapping sequence IDs.
+  This adapter currently covers explicit transactions. Autocommit, implicit update
+  retry handles and advanced operations remain unfinished; it is not yet exposed as
+  a full-capability `RocksDBConnection` or registered with server transports.
 - Scoped OPEN/GET/PAGE/PLAN/CLOSE use one framed query protocol for data and catalogue
   groups. OPEN requires a proven fresh linearizable barrier and ready native owner.
   Later owned operations use the fixed snapshot cut, not a new current read. Stale
