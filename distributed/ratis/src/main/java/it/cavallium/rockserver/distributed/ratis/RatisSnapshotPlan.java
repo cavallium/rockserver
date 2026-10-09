@@ -1,0 +1,70 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+import it.cavallium.rockserver.core.common.distributed.*;
+import java.util.*;
+
+/** Pure frozen snapshot routing and control allocation; acquires no native or remote resources. */
+public final class RatisSnapshotPlan {
+    public static final int CONTROL_SLOTS=512;
+    private static final Comparator<UUID> UUID_ORDER=(a,b) -> { int n=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits()); return n!=0 ? n : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits()); };
+    private final SnapshotFence fence;
+    private final List<RangeDescriptor> routes;
+    private final TransactionScope scope;
+    private RatisSnapshotPlan(SnapshotFence fence,List<RangeDescriptor> routes,TransactionScope scope) { this.fence=fence; this.routes=List.copyOf(routes); this.scope=scope; }
+    public SnapshotFence fence() { return fence; }
+    public List<RangeDescriptor> routes() { return routes; }
+    public TransactionScope scope() { return scope; }
+    public static RatisSnapshotPlan create(RangeDirectory directory,TransactionScope scope,UUID fenceId,OperationId business,UUID homeGroup,long homeEpoch,OperationId firstControl) {
+        Objects.requireNonNull(directory); Objects.requireNonNull(scope); Objects.requireNonNull(fenceId); Objects.requireNonNull(business); Objects.requireNonNull(homeGroup); Objects.requireNonNull(firstControl);
+        if (homeEpoch<0 || business.epoch()<1 || !business.sessionId().equals(firstControl.sessionId()) || business.epoch()!=firstControl.epoch() || firstControl.sequence()<=business.sequence() || firstControl.sequence()>Long.MAX_VALUE-CONTROL_SLOTS) throw new IllegalArgumentException("Invalid reserved snapshot identities");
+        // Check complete scope and route-count admission before allocating its clipped representation.
+        scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
+        var routes=new TreeMap<UUID,RangeDescriptor>(UUID_ORDER); var scopes=new HashMap<UUID,List<TransactionScope.Span>>(); long bytes=SnapshotFence.HEADER_BYTES,bounds=0;
+        for (var span:scope.spans()) {
+            byte[] originalLower=span.lowerInclusive(),originalUpper=span.upperExclusive();
+            var selected=span.isPoint() ? List.of(directory.route(span.columnId(),originalLower)) : directory.intersect(span.columnId(),originalLower,originalUpper,false);
+            for (var route:selected) {
+                byte[] lower=span.isPoint() ? originalLower : maximum(originalLower,route.lowerInclusive());
+                byte[] upper=span.isPoint() ? null : minimum(originalUpper,route.upperExclusive());
+                if (!span.isPoint() && lower!=null && upper!=null && Arrays.compareUnsigned(lower,upper)>=0) continue;
+                boolean added=!routes.containsKey(route.groupId());
+                long size=(lower==null ? 0 : lower.length)+(long)(upper==null ? 0 : upper.length);
+                bytes+=25+size+(added ? 140 : 0); bounds+=size;
+                if (bytes>SnapshotFence.MAX_BYTES || bounds>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Snapshot scope exceeds aggregate frozen byte budget");
+                routes.putIfAbsent(route.groupId(),route); var spans=scopes.computeIfAbsent(route.groupId(),ignored -> new ArrayList<>());
+                if (spans.size()>=TransactionScope.MAX_SPANS) throw new IllegalArgumentException("Snapshot participant scope exceeds span budget");
+                spans.add(span.isPoint() ? TransactionScope.Span.point(span.columnId(),lower) : TransactionScope.Span.range(span.columnId(),lower,upper));
+            }
+        }
+        var participants=new ArrayList<SnapshotFence.Participant>(); int index=0;
+        for (var route:routes.values()) {
+            participants.add(new SnapshotFence.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),control(firstControl,index),control(firstControl,64+index),new TransactionScope(scopes.get(route.groupId())))); index++;
+        }
+        var fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),directory.domainId(),fenceId,homeGroup,homeEpoch,business,directory.generation(),directory.schemaEpoch(),directory.schemaDigest(),participants);
+        return new RatisSnapshotPlan(fence,new ArrayList<>(routes.values()),scope);
+    }
+    private static OperationId control(OperationId first,int offset) { return new OperationId(first.sessionId(),first.epoch(),first.sequence()+offset); }
+    private static byte[] maximum(byte[] a,byte[] b) { return a==null ? b : b==null || Arrays.compareUnsigned(a,b)>=0 ? a : b; }
+    private static byte[] minimum(byte[] a,byte[] b) { return a==null ? b : b==null || Arrays.compareUnsigned(a,b)<=0 ? a : b; }
+    /** Reconstruct the physical union without multiplying the original span count at partition boundaries. */
+    public static TransactionScope scope(SnapshotFence fence) {
+        Objects.requireNonNull(fence); var spans=new ArrayList<TransactionScope.Span>(); fence.participants().forEach(p -> spans.addAll(p.scope().spans()));
+        spans.sort(Comparator.comparing(TransactionScope.Span::columnId,UUID_ORDER).thenComparing(TransactionScope.Span::lowerInclusive,(a,b) -> a==null ? b==null ? 0 : -1 : b==null ? 1 : Arrays.compareUnsigned(a,b)).thenComparing(TransactionScope.Span::isPoint));
+        var union=new ArrayList<TransactionScope.Span>();
+        for (var span:spans) {
+            if (!union.isEmpty()) {
+                var previous=union.getLast();
+                if (previous.columnId().equals(span.columnId())) {
+                    byte[] upper=previous.upperExclusive(),lower=span.lowerInclusive();
+                    if (!previous.isPoint() && (upper==null || lower==null || Arrays.compareUnsigned(lower,upper)<=0)) {
+                        if (span.isPoint()) { if (upper==null || Arrays.compareUnsigned(lower,upper)<0) continue; }
+                        else { byte[] end=span.upperExclusive(); byte[] merged=upper==null || end==null ? null : maximum(upper,end); union.set(union.size()-1,TransactionScope.Span.range(span.columnId(),previous.lowerInclusive(),merged)); continue; }
+                    }
+                    if (previous.isPoint() && span.isPoint() && Arrays.equals(previous.lowerInclusive(),lower)) continue;
+                }
+            }
+            union.add(span);
+        }
+        return new TransactionScope(union);
+    }
+}

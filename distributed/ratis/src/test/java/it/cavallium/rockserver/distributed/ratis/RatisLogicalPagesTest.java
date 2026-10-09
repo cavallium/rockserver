@@ -77,7 +77,7 @@ class RatisLogicalPagesTest {
                 changes.add(RatisLogicalClient.Change.delete(71,empty,Mutation.ReturnMode.NONE));
                 var seed=session.prepare(changes,List.of()); session.ensureBinding(seed); session.execute(seed); session.acknowledge(seed);
                 Keys lower=new Keys(Buf.wrap(new byte[]{6}),Buf.wrap(new byte[]{0})), upper=new Keys(Buf.wrap(new byte[]{9}),Buf.wrap(new byte[]{0}));
-                try (var tx=session.openTransaction(scope(schema,new byte[]{6,0},new byte[]{9,0}),Duration.ofSeconds(5))) {
+                try (var tx=session.openTransaction(scope(schema,new byte[]{6,0},new byte[]{9,1}),Duration.ofSeconds(5))) {
                     var first=tx.getRangePage(71,lower,upper,false,null,new RangeBudget(2,1024)); assertEquals(List.of(b.key(1),b.key(2)),keys(first)); assertTrue(first.hasMore());
                     var rest=tx.getRangePage(71,lower,upper,false,first.resumeAfter(),new RangeBudget(2,1024)); assertEquals(List.of(b.key(3),row8),keys(rest)); assertFalse(rest.hasMore());
                     var reverse=tx.getRangePage(71,lower,upper,true,null,new RangeBudget(2,1024)); assertEquals(List.of(row8,b.key(3)),keys(reverse));
@@ -150,7 +150,7 @@ class RatisLogicalPagesTest {
             try (var routed=new RatisRoutedClient(f.directory,transport);
                  var session=RatisDurableLogicalSession.create(Files.createDirectory(root.resolve("quantum")),schema,f.catalogue.epochs,routed,1000,RatisSessionClient.Limits.defaults())) {
                 session.advance();
-                try (var tx=session.openTransaction(scope(schema,new byte[]{0,0,0},new byte[]{32,0,0}),Duration.ofSeconds(5))) {
+                try (var tx=session.openTransaction(scope(schema,new byte[]{0,0,0},new byte[]{32,0,1}),Duration.ofSeconds(5))) {
                     var low=new Keys(Buf.wrap(new byte[]{0,0}),Buf.wrap(new byte[]{0})); var high=new Keys(Buf.wrap(new byte[]{32,0}),Buf.wrap(new byte[]{0}));
                     assertThrows(IOException.class,() -> tx.getRangePage(71,low,high,false,null,RangeBudget.DEFAULT)); assertEquals(32,calls.get()); assertTrue(session.pending().isEmpty());
                 }

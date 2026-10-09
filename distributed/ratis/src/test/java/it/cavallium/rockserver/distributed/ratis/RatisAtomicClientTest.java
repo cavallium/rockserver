@@ -38,27 +38,34 @@ class RatisAtomicClientTest {
     }
     static List<RatisLogicalClient.Condition> absentIdentity() { return List.of(new RatisLogicalClient.Condition(71,key(2),null)); }
     static final class Fixture implements AutoCloseable {
+        final Path root;
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest();
         final RatisSessionEpochsTest.Fixture catalogue;
-        final UUID session=new UUID(110,1),admin=new UUID(110,2),homeGroup=new UUID(111,3),homeColumn=new UUID(112,5);
+        final UUID session=new UUID(110,1),admin=new UUID(110,2),homeGroup=new UUID(111,3),homeColumn=new UUID(112,5),snapshotGroup=new UUID(111,4),snapshotColumn=new UUID(112,6);
         final List<UUID> groups=List.of(new UUID(111,1),new UUID(111,2));
         final DistributedSchema schema;
-        final RangeDirectory directory,homeDirectory;
-        final RatisRoutedClient data,homeClient;
+        final RangeDirectory directory,homeDirectory,snapshotDirectory;
+        final RatisRoutedClient data,homeClient,snapshotClient;
         final RatisTransactionStatuses homes;
+        final RatisSnapshotFences snapshots;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"public-atomic-test");
         final RatisProofQueryService proofs=new RatisProofQueryService();
+        final RatisSnapshotHelpService snapshotHelp;
+        RatisParticipantRecoveryRegistry snapshotRecoveries;
+        final AtomicInteger helped=new AtomicInteger();
         final Map<UUID,ReplicatedRangeStore> stores=new LinkedHashMap<>();
         final Map<UUID,RatisRangeStateMachine> machines=new LinkedHashMap<>();
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>();
         final List<RaftStorage> storages=new ArrayList<>();
-        final AtomicInteger opens=new AtomicInteger(),submissions=new AtomicInteger(),rpcs=new AtomicInteger();
-        volatile Runnable beforeAuthorize,beforeHomeRead;
-        volatile UUID losePrepareGroup;
+        final AtomicInteger opens=new AtomicInteger(),submissions=new AtomicInteger(),rpcs=new AtomicInteger(),captureRequests=new AtomicInteger();
+        volatile Runnable beforeAuthorize,beforeHomeRead,beforeSnapshotCapture,beforeSnapshotRead,beforeSnapshotRelease;
+        volatile UUID losePrepareGroup,loseCaptureGroup;
         final SessionEpochLedger ledger;
         final SessionEpochLedger.Grant grant;
-        Fixture(Path root) throws Exception {
-            Files.createDirectories(root); catalogue=outer.new Fixture(root.resolve("catalogue"));
+        Fixture(Path root) throws Exception { this(root,false); }
+        Fixture(Path root,boolean snapshotHome) throws Exception {
+            this.root=root; Files.createDirectories(root); catalogue=outer.new Fixture(root.resolve("catalogue"));
+            snapshotHelp=snapshotHome ? new RatisSnapshotHelpService(scheduler) : null;
             try {
             var initial=SessionEpochLedger.initial(outer.cluster,outer.database,10);
             catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,initial));
@@ -72,19 +79,28 @@ class RatisAtomicClientTest {
             for (int n=0;n<2;n++) routes.add(route(groups.get(n),n==0 ? null : new byte[]{(byte)128},n==0 ? new byte[]{(byte)128} : null));
             directory=new RangeDirectory(outer.cluster,outer.database,schema.domainId(),1,schema.digest(),0,schema.columnIds(),1,routes);
             homeDirectory=new RangeDirectory(outer.cluster,outer.database,new UUID(113,2),1,new byte[32],0,Set.of(homeColumn),0,List.of(route(homeGroup,null,null)));
+            snapshotDirectory=snapshotHome ? new RangeDirectory(outer.cluster,outer.database,new UUID(113,3),1,new byte[32],0,Set.of(snapshotColumn),0,List.of(route(snapshotGroup,null,null))) : null;
             data=new RatisRoutedClient(directory,transport()); homeClient=new RatisRoutedClient(homeDirectory,transport()); homes=new RatisTransactionStatuses(homeClient,homeColumn);
-            for (var source:List.of(directory,homeDirectory)) for (var descriptor:source.ranges()) {
+            snapshotClient=snapshotHome ? new RatisRoutedClient(snapshotDirectory,transport()) : null; snapshots=snapshotHome ? new RatisSnapshotFences(snapshotClient,snapshotColumn) : null;
+            var sources=new ArrayList<>(List.of(directory,homeDirectory)); if (snapshotHome) sources.add(snapshotDirectory);
+            for (var source:sources) for (var descriptor:source.ranges()) {
                 var bindings=new LinkedHashMap<UUID,String>();
-                if (source==directory) for (var column:schema.columns()) bindings.put(column.columnId(),column.name()); else bindings.put(homeColumn,"atomic-home");
+                if (source==directory) for (var column:schema.columns()) bindings.put(column.columnId(),column.name()); else if (source==homeDirectory) bindings.put(homeColumn,"atomic-home"); else bindings.put(snapshotColumn,"snapshot-home");
                 var store=catalogue.pool.openRange(new RangeOwnership.Owner(descriptor.groupId(),1),new RangeOwnership.Interval(source.domainId(),source.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),source.schemaDigest(),bindings,Set.of());
                 if (source==directory) store.enableLogicalSchema(schema); stores.put(descriptor.groupId(),store);
                 var peer=RaftPeer.newBuilder().setId("atomic-fixture").build(); var group=RaftGroup.valueOf(RaftGroupId.valueOf(descriptor.groupId()),peer); raftGroups.put(descriptor.groupId(),group);
                 var machine=RatisRangeStateMachine.withSessions(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),
-                        source==directory ? command -> {} : RatisTransactionStatuses.validator(outer.cluster,outer.database,homeGroup,1,new byte[32],homeColumn),
+                        source==directory ? command -> {} : source==homeDirectory ? RatisTransactionStatuses.validator(outer.cluster,outer.database,homeGroup,1,new byte[32],homeColumn) : RatisSnapshotFences.validator(outer.cluster,outer.database,snapshotGroup,1,new byte[32],snapshotColumn),
                         catalogue.epochs,source,RatisRangeStateMachine.RetentionLimits.defaults(),() -> new RatisRangeStateMachine.Leadership(1,true));
                 machine.proofQueries(proofs);
-                if (source==directory) machine.transactionHomes(homes);
-                else { machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(outer.cluster,outer.database,key,value)); machine.homeRecoveryReservations(outer.cluster,outer.database,homeColumn); machine.homeRecoveryData(data); }
+                if (source==directory) { machine.transactionHomes(homes); if (snapshotHome) {
+                    machine.snapshotHomes(snapshots); machine.snapshotRecovery((groupId,prepared) -> {
+                        if (snapshotRecoveries==null) throw new IOException("Snapshot recovery registry not initialized");
+                        boolean progress=snapshotRecoveries.step(groupId,prepared); if (progress) helped.incrementAndGet(); return progress;
+                    },snapshotHelp);
+                } }
+                else if (source==homeDirectory) { machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(outer.cluster,outer.database,key,value)); machine.homeRecoveryReservations(outer.cluster,outer.database,homeColumn); machine.homeRecoveryData(data); }
+                else { machine.role(RatisNodePlan.Role.SNAPSHOT_HOME,(key,value) -> RatisSnapshotFences.validateRecord(outer.cluster,outer.database,snapshotGroup,1,key,value)); machine.snapshotHomeStorage(outer.cluster,outer.database,snapshotColumn); machine.snapshotHomeData(data); }
                 var storage=RaftStorage.newBuilder().setDirectory(root.resolve(descriptor.groupId().toString()).toFile()).setOption(RaftStorage.StartupOption.FORMAT)
                         .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build();
                 storage.initialize(); storages.add(storage);
@@ -92,9 +108,10 @@ class RatisAtomicClientTest {
                     case "getId" -> peer.getId(); case "toString" -> "atomic-controlled-identity"; default -> throw new AssertionError(method);
                 });
                 machines.put(descriptor.groupId(),machine); machine.initialize(server,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
-                var binding=catalogue.epochs.prepareSessionBinding(source,descriptor.groupId(),new OperationId(admin,1,source==directory ? groups.indexOf(descriptor.groupId()) : 2),grant,1024,-1);
+                var binding=catalogue.epochs.prepareSessionBinding(source,descriptor.groupId(),new OperationId(admin,1,source==directory ? groups.indexOf(descriptor.groupId()) : source==homeDirectory ? 2 : 3),grant,snapshotHome ? 2048 : 1024,-1);
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(append(descriptor,DistributedCommandCodec.encode(binding))).status());
             }
+            if (snapshotHome) snapshotRecoveries=new RatisParticipantRecoveryRegistry(Files.createDirectory(root.resolve("snapshot-recovery")),homes,data,false,Set.copyOf(groups),RatisParticipantRecoveryRegistry.Limits.defaults());
             } catch (Exception | Error failure) {
                 try { close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
                 throw failure;
@@ -104,7 +121,7 @@ class RatisAtomicClientTest {
             var replica=new ReplicaDescriptor(new UUID(114,1),new UUID(114,2),group,"atomic-fixture","127.0.0.1:12345",ReplicaDescriptor.Role.VOTER);
             return new RangeDescriptor(group,group,1,0,lower,upper,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
         }
-        RatisAtomicClient.Identity identity(int block) { return new RatisAtomicClient.Identity(new UUID(115,block+1),new OperationId(session,1,block*256L),new OperationId(session,1,block*256L+1)); }
+        RatisAtomicClient.Identity identity(int block) { return new RatisAtomicClient.Identity(new UUID(115,block+1),new OperationId(session,1,block*(RatisAtomicClient.CONTROL_SLOTS+1L)),new OperationId(session,1,block*(RatisAtomicClient.CONTROL_SLOTS+1L)+1)); }
         RatisAtomicClient client() { return new RatisAtomicClient(schema,homes,data,scheduler,RatisAtomicClient.Limits.defaults()); }
         int writes() { return submissions.get(); }
         RatisRoutedClient.Transport transport() {
@@ -120,6 +137,18 @@ class RatisAtomicClientTest {
                     try { var message=Message.valueOf(ByteString.copyFrom(request)); var machine=machines.get(route.groupId());
                         return (fresh ? machine.queryLinearizable(message) : machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray();
                     } catch (Exception failure) { throw new IOException("Controlled transaction failed",failure); }
+                }
+                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
+                    rpcs.incrementAndGet(); int kind=ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+                    if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) { captureRequests.incrementAndGet(); if (beforeSnapshotCapture!=null) beforeSnapshotCapture.run(); }
+                    if (kind==ScopedTransactionRpc.SNAPSHOT_RELEASE && beforeSnapshotRelease!=null) beforeSnapshotRelease.run();
+                    if ((kind==ScopedTransactionRpc.SNAPSHOT_GET || kind==ScopedTransactionRpc.SNAPSHOT_PAGE) && beforeSnapshotRead!=null) beforeSnapshotRead.run();
+                    assertEquals(route.replicas().getFirst(),owner);
+                    try {
+                        byte[] reply=machines.get(route.groupId()).queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
+                        if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE && route.groupId().equals(loseCaptureGroup)) { loseCaptureGroup=null; throw new IOException("Lost native capture reply"); }
+                        return reply;
+                    } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Controlled owner query failed",failure); }
                 }
                 public RangeStateView stateView(RangeDescriptor route) throws IOException { return RangeStateView.decode(ScopedTransactionRpc.parse(transaction(route,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true),ScopedTransactionRpc.MAX_REPLY_BYTES).body()); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return CommandResult.decode(append(route,DistributedCommandCodec.encode(command))); }
@@ -153,9 +182,11 @@ class RatisAtomicClientTest {
             for (var participant:saved.participants()) { if (status==CommandResult.Status.SUCCESS) assertNotNull(participant.vote()); assertNotNull(participant.outcome()); }
         }
         public void close() throws Exception {
+            if (snapshotHelp!=null) snapshotHelp.stop().get(5,TimeUnit.SECONDS);
+            if (snapshotRecoveries!=null) snapshotRecoveries.close();
             proofs.stop().get(5,TimeUnit.SECONDS);
             for (var machine:machines.values()) { machine.close(); machine.awaitNativeReaders(Duration.ofSeconds(5)); }
-            for (var storage:storages) storage.close(); if (data!=null) data.close(); if (homeClient!=null) homeClient.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close();
+            for (var storage:storages) storage.close(); if (data!=null) data.close(); if (homeClient!=null) homeClient.close(); if (snapshotClient!=null) snapshotClient.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close();
         }
     }
     @Test void fourLogicalColumnsCommitTogetherWithOrderedResultsAndCompleteCollisionBuckets() throws Exception {

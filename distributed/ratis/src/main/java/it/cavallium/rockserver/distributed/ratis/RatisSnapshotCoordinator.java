@@ -47,6 +47,7 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
             var released=journal.executeRelease(group);
             return result(released.retired() ? Action.RETIRED : Action.RELEASED,group);
         }
+        if (snapshot.releaseRequested()) return transition(snapshot,home.abort(),Action.ABORTED,null);
         for (var progress:snapshot.participants()) {
             UUID group=progress.route().groupId();
             if (progress.captureLost()) return transition(snapshot,home.abort(),Action.ABORTED,group);

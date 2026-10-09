@@ -44,6 +44,8 @@ public final class RatisSnapshotFences {
         if (!this.cluster.equals(cluster) || !this.database.equals(database)) throw new IllegalArgumentException("Snapshot home reader belongs to another cluster/database");
     }
     public record RegistrationRead(SnapshotFenceStatus status,RangeDescriptor descriptor) {}
+    /** Cached placement only; HOME mutation admission still verifies authoritative state. */
+    RangeDescriptor route(UUID fence) { return routed.directory().route(column,key(fence)); }
     public SnapshotFenceStatus read(UUID fenceId) throws IOException { return readRegistration(fenceId).status(); }
     /** Fresh status and home authority captured by the same read; no participant gate is installed or released. */
     public RegistrationRead readRegistration(UUID fenceId) throws IOException {

@@ -253,7 +253,7 @@ does not establish complete distributed API parity or production acceptance.
   proof may authorize ACK while a participant is temporarily unavailable. The driver
   does not manufacture a consistent cross-group read cut or assemble legacy global
   result order by itself. Public atomic mutation result binding is supplied by the
-  async facade below; arbitrary cross-group snapshot reads remain separate work.
+  async facade below; arbitrary legacy read/write transactions remain separate work.
 - `RatisAtomicClient` exposes asynchronous logical atomic mutations and predicates
   over one frozen schema/directory. It opens bounded original local cuts, stages
   exact partition prefixes and forces a transaction journal before HOME/PREPARE
@@ -278,6 +278,32 @@ does not establish complete distributed API parity or production acceptance.
   one-group logical-session fast path remains available. Public legacy API/transport
   integration, automatic identity allocation and this facade's one-group optimization
   remain unfinished.
+- `RatisSnapshotClient` exposes asynchronous scoped snapshot leases, logical GET,
+  bounded forward/reverse pages and borrowed cursors over up to 64 DATA groups.
+  Planning clips physical scopes before acquisition and retains whole collision
+  buckets. A 512-slot caller reservation covers INSTALL/RELEASE and all HOME progress;
+  the requested pin lifetime is forced before the first HOME write and survives reopen.
+  All scoped gates become READY before capture. Chosen older transactions can be
+  helped through native finalization before that barrier; their HOME ACK bookkeeping
+  is independent of snapshot capture. The saved owner/token vector is immutable and
+  ordinary reads use it without HOME, catalogue, current-leader or latest-value reads.
+  Lost owners return explicit snapshot loss rather than replacement captures.
+  Logical bounds accept complete keys or leading fixed-key prefixes. Full variable
+  member bounds filter within complete boundary buckets; continuation remains an
+  exclusive full logical key across bucket and group boundaries. One shared physical
+  scan budget covers all partitions, including empty-owner and resume reads.
+  Reader and cursor counts/bytes remain charged through actual work after observer
+  cancellation. Cursor progress commits only after successful final checks;
+  `pendingPage()` retrieves the last actual page without advancing or remote work.
+  Returned page buffers cannot mutate that cached outcome or the private continuation.
+  Explicit `release` first saves a whole-lease close direction. It resolves any pending
+  HOME decision, aborts only undecided acquisition, releases gates, consumes HOME and
+  releases the exact original owner pins. Unknown capture replies can be recovered
+  under the consumed HOME without waiting for epoch GC. A known released/lost journal
+  fails acquisition on reopen. `Lease.close()` detaches local journal ownership for
+  recovery; it does not implicitly consume or release remote pins.
+  Legacy API/transport integration and consistent cross-group read/write transaction
+  certification remain unfinished; these are scoped immutable read leases.
 - `RatisTransactionRecovery` implements explicit takeover in bounded steps. It reads
   the home freshly, retries an uncertain frozen home request when still relevant,
   proposes ABORT for otherwise-undecided PREPARING state, and completes a chosen
@@ -431,10 +457,11 @@ journals additionally require durable release ACK or typed owner loss for every
 possible captured pin; gate/HOME retirement and a failed capture do not establish
 pin release. `releaseCapture(group)` freezes the original release intent before
 its single owner RPC, preserves uncertain replies and works after HOME retirement.
-If the original capture reply was lost, a forced HOME retirement proof permits
-replaying only that frozen capture request to recover its existing token; the
-method returns RECOVERED, then a later call releases it. Retired DATA floors prevent
-creating a replacement pin. RELEASED and typed LOST are the settled outcomes.
+If the original capture reply was lost, a forced matching terminal consumed HOME
+or HOME retirement proof permits replaying only that frozen capture request. An
+existing pin returns its original token; a missing pin is rejected before native
+capture by consumed HOME or retired DATA floors. The method returns RECOVERED, then
+a later call releases that token. RELEASED and typed LOST are the settled outcomes.
 Explicit release invalidates future capture publication, and unresolved COMPLETE
 requests must settle before their pins can be released.
 Payload reclamation verifies the exact canonical file with bounded streaming,
