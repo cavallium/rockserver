@@ -63,7 +63,8 @@ class RatisAtomicClientTest {
         final SessionEpochLedger ledger;
         final SessionEpochLedger.Grant grant;
         Fixture(Path root) throws Exception { this(root,false); }
-        Fixture(Path root,boolean snapshotHome) throws Exception {
+        Fixture(Path root,boolean snapshotHome) throws Exception { this(root,snapshotHome,Map.of()); }
+        Fixture(Path root,boolean snapshotHome,Map<Long,ColumnSchema> schemaOverrides) throws Exception {
             this.root=root; Files.createDirectories(root); catalogue=outer.new Fixture(root.resolve("catalogue"));
             snapshotHelp=snapshotHome ? new RatisSnapshotHelpService(scheduler) : null;
             try {
@@ -73,7 +74,7 @@ class RatisAtomicClientTest {
             catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(1),initial,ledger));
             var columns=new ArrayList<DistributedSchema.Column>();
             for (int n=0;n<4;n++) columns.add(new DistributedSchema.Column(71+n,new UUID(112,n+1),"atomic-"+n,
-                    ColumnSchema.of(IntArrayList.of(1),n==3 ? ObjectArrayList.of(ColumnHashType.ALLSAME8) : new ObjectArrayList<>(),true),null));
+                    schemaOverrides.getOrDefault(71L+n,ColumnSchema.of(IntArrayList.of(1),n==3 ? ObjectArrayList.of(ColumnHashType.ALLSAME8) : new ObjectArrayList<>(),true)),null));
             schema=new DistributedSchema(outer.cluster,outer.database,new UUID(113,1),1,1,columns);
             var routes=new ArrayList<RangeDescriptor>();
             for (int n=0;n<2;n++) routes.add(route(groups.get(n),n==0 ? null : new byte[]{(byte)128},n==0 ? new byte[]{(byte)128} : null));

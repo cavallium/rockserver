@@ -22,13 +22,13 @@ class RatisExportWorkflowTest {
         var scope=new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))); var home=f.snapshots.route(identity.fence());
         var plan=RatisSnapshotPlan.create(f.directory,scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
         var chunk=new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport.Limits(1,1024,1024*1024,Duration.ofSeconds(5));
-        return new RatisExportJournal.Definition(new UUID(250,1),plan.fence(),column,source,MessageDigest.getInstance("SHA-256").digest(plan.fence().encode()),new RatisExportJournal.Limits(16,16*1024*1024,16*1024*1024,chunk));
+        return new RatisExportJournal.Definition(new UUID(250,1),plan.fence(),List.of(column),source,MessageDigest.getInstance("SHA-256").digest(plan.fence().encode()),new RatisExportJournal.Limits(16,16*1024*1024,16*1024*1024,chunk));
     }
     static RatisSnapshotClient.Identity identity(RatisAtomicClientTest.Fixture f) { return new RatisSnapshotClient.Identity(new UUID(250,2),new OperationId(f.session,1,0),new OperationId(f.session,1,1)); }
     static RatisExportJournal.Chunk export(RatisExportJournal journal,RatisAtomicClientTest.Fixture f,UUID group) throws Exception {
-        var definition=journal.snapshot().definition(); var span=definition.fence().participant(group).scope().spans().stream().filter(s -> s.columnId().equals(definition.column())).findFirst().orElseThrow();
+        var definition=journal.snapshot().definition(); var span=definition.fence().participant(group).scope().spans().stream().filter(s -> s.columnId().equals(definition.columns().getFirst())).findFirst().orElseThrow();
         var token=journal.snapshot().captures().get(group);
-        return journal.export(group,(artifact,intent) -> f.machines.get(group).exportSnapshotPinChunk(token,pin -> f.catalogue.pool.exportSstChunk(artifact,pin,definition.column(),intent.scopeStart(),span.upperExclusive(),intent.limits())));
+        return journal.export(group,(artifact,intent) -> f.machines.get(group).exportSnapshotPinChunk(token,pin -> f.catalogue.pool.exportSstChunk(artifact,pin,intent.column(),intent.scopeStart(),span.upperExclusive(),intent.limits())));
     }
     static byte[] checkpoint(RatisExportJournal.Chunk chunk) {
         return java.nio.ByteBuffer.allocate(65).put((byte)0).putLong(chunk.jobId().getMostSignificantBits()).putLong(chunk.jobId().getLeastSignificantBits())

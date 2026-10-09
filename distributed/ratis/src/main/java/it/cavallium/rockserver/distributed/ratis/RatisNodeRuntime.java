@@ -221,7 +221,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.requireExportPin(definition);
                         return machine.exportSnapshotPinChunk(definition.capture(),pin -> {
                             var chunk=pool.exportSstChunk(artifact,pin,intent.column(),intent.scopeStart(),
-                                    definition.scope().upperExclusive(),intent.limits());
+                                    definition.scope(intent.column()).upperExclusive(),intent.limits());
                             completion.persist(chunk); return chunk;
                         });
                     }

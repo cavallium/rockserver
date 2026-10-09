@@ -156,7 +156,7 @@ public final class RatisExportClient implements AutoCloseable {
                     var recovered=journal.recoverChunk(); if (recovered!=null) return CompletableFuture.completedFuture(journal.snapshot());
                     var intent=saved.pending();
                     if (intent==null) {
-                        UUID group=saved.definition().fence().participants().stream().map(p -> p.groupId()).filter(id -> saved.chunks().stream().noneMatch(chunk -> chunk.group().equals(id) && !chunk.hasMore())).findFirst().orElseThrow();
+                        UUID group=journal.unfinishedGroup();
                         intent=journal.freezeChunk(group);
                     }
                     var frozen=intent; var request=new RatisExportSourceRpc.BuildRequest(RatisExportJournal.sourceDefinition(saved,frozen.group()),frozen);
@@ -363,7 +363,7 @@ public final class RatisExportClient implements AutoCloseable {
             refund(chargedBytes-retainedBytes); drained.complete(null); if (failure==null) result.complete(value); else result.completeExceptionally(unwrap(failure));
         }
     }
-    private static boolean sameDefinition(RatisExportJournal.Definition a,RatisExportJournal.Definition b) { return a.jobId().equals(b.jobId()) && a.fence().equals(b.fence()) && a.column().equals(b.column()) && a.sourceJournal().equals(b.sourceJournal()) && Arrays.equals(a.sourceIdentity(),b.sourceIdentity()) && a.limits().equals(b.limits()); }
+    private static boolean sameDefinition(RatisExportJournal.Definition a,RatisExportJournal.Definition b) { return a.jobId().equals(b.jobId()) && a.fence().equals(b.fence()) && a.columns().equals(b.columns()) && a.sourceJournal().equals(b.sourceJournal()) && Arrays.equals(a.sourceIdentity(),b.sourceIdentity()) && a.limits().equals(b.limits()); }
     private static boolean settled(RatisDurableSnapshot.Snapshot source) {
         if (!source.releaseRequested() || source.observedHome()==null || !source.observedHome().terminal()) return false;
         for (var participant:source.participants()) {

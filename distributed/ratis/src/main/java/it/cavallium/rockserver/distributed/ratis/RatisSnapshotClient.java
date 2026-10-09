@@ -61,9 +61,9 @@ public final class RatisSnapshotClient implements AutoCloseable {
         Objects.requireNonNull(expected); validateTtl(ttl); long deadline=scheduler.resolveMonotonicDeadline(context);
         var home=homes.route(expected.fenceId());
         if (!home.groupId().equals(expected.homeGroup()) || home.rangeEpoch()!=expected.homeEpoch()) throw new IOException("Frozen source HOME placement changed");
-        var first=expected.participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();
-        var plan=RatisSnapshotPlan.create(data.directory(),RatisSnapshotPlan.scope(expected),expected.fenceId(),expected.operation(),expected.homeGroup(),expected.homeEpoch(),first);
-        if (!plan.fence().equals(expected)) throw new IOException("Frozen source definition differs from current cached projection");
+        final RatisSnapshotPlan plan;
+        try { plan=RatisSnapshotPlan.frozen(data.directory(),expected); }
+        catch (IllegalArgumentException invalid) { throw new IOException("Frozen source definition differs from current cached projection",invalid); }
         long bytes=64*1024L+3L*expected.encode().length+128*1024L*plan.routes().size(); for (var route:plan.routes()) bytes+=2L*SessionWindowJournal.routeSize(route);
         if (bytes>RatisDurableSnapshot.MAX_BYTES) throw new IOException("Snapshot retained metadata exceeds journal capacity");
         var lease=admit(path,plan,ttl,bytes,expected); lease.beginAcquire(context,deadline); return lease;

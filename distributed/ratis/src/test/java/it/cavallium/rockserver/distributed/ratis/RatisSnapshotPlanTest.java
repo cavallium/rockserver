@@ -45,5 +45,26 @@ class RatisSnapshotPlanTest {
         var directory=directory(64,0,RangeDescriptor.TopologyState.ACTIVE);
         assertDoesNotThrow(() -> RatisSnapshotPlan.create(directory,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),new UUID(0,30),new OperationId(session,1,0),new UUID(0,31),1,new OperationId(session,1,Long.MAX_VALUE-RatisSnapshotPlan.CONTROL_SLOTS)));
     }
+    @Test void frozenQualificationPreservesAdjacentSpansAndRejectsChangedAuthority() {
+        var directory=directory(1,0,RangeDescriptor.TopologyState.ACTIVE);
+        var original=plan(directory,new TransactionScope(List.of(
+                TransactionScope.Span.range(column,new byte[]{1},new byte[]{2}),
+                TransactionScope.Span.range(column,new byte[]{2},new byte[]{4}),
+                TransactionScope.Span.point(other,new byte[]{9}))));
+        var frozen=RatisSnapshotPlan.frozen(directory,original.fence());
+        assertSame(original.fence(),frozen.fence());
+        assertArrayEquals(original.fence().encode(),frozen.fence().encode());
+        assertEquals(original.routes(),frozen.routes());
+        assertEquals(2,frozen.scope().spans().size());
+        var fence=original.fence(); var p=fence.participants().getFirst();
+        var changed=new SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),fence.fenceId(),
+                fence.homeGroup(),fence.homeEpoch(),fence.operation(),fence.directoryGeneration(),fence.schemaEpoch(),fence.schemaDigest(),
+                List.of(new SnapshotFence.Participant(p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.installOperation(),
+                        new OperationId(p.releaseOperation().sessionId(),p.releaseOperation().epoch(),p.releaseOperation().sequence()+1),p.scope())));
+        assertThrows(IllegalArgumentException.class,() -> RatisSnapshotPlan.frozen(directory,changed));
+        var newer=new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),
+                directory.schemaDigest(),directory.generation()+1,directory.columns(),directory.routingPrefixBytes(),directory.ranges());
+        assertThrows(IllegalArgumentException.class,() -> RatisSnapshotPlan.frozen(newer,fence));
+    }
 
 }

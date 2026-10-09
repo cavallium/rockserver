@@ -25,7 +25,7 @@ class RatisExportClientTest {
         var id=RatisExportWorkflowTest.identity(f); var column=f.schema.column(71).columnId(); var home=f.snapshots.route(id.fence());
         var plan=RatisSnapshotPlan.create(f.directory,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),id.fence(),id.business(),home.groupId(),home.rangeEpoch(),id.firstControl());
         var limits=new RatisExportJournal.Limits(16,16L*1024*1024,16L*1024*1024,new NativeRangeSstExport.Limits(1,1024,1024*1024,Duration.ofSeconds(5)));
-        return new RatisExportJournal.Definition(new UUID(270,1),plan.fence(),column,journal,source.identityDigest(),limits);
+        return new RatisExportJournal.Definition(new UUID(270,1),plan.fence(),List.of(column),journal,source.identityDigest(),limits);
     }
     static void seed(Fixture f) throws Exception {
         RatisRocksDBAdapterTest.seed(f,71,key(2),value(1),1900); RatisRocksDBAdapterTest.seed(f,71,key(4),value(2),1901); RatisRocksDBAdapterTest.seed(f,71,key(200),value(3),1902);
@@ -41,7 +41,7 @@ class RatisExportClientTest {
     static RatisExportClient.ChunkSource nativeWriter(Fixture f,RatisExportJournal.Definition definition,Executor executor) {
         return localSource((file,intent,token,context) -> CompletableFuture.supplyAsync(() -> {
             try {
-                var span=definition.fence().participant(intent.group()).scope().spans().stream().filter(value -> value.columnId().equals(definition.column())).findFirst().orElseThrow();
+                var span=definition.fence().participant(intent.group()).scope().spans().stream().filter(value -> value.columnId().equals(intent.column())).findFirst().orElseThrow();
                 return f.machines.get(intent.group()).exportSnapshotPinChunk(token,pin -> f.catalogue.pool.exportSstChunk(file,pin,intent.column(),intent.scopeStart(),span.upperExclusive(),intent.limits()));
             } catch (Exception failure) { throw new CompletionException(failure); }
         },executor));
@@ -116,7 +116,7 @@ class RatisExportClientTest {
             var nativeDone=new CompletableFuture<NativeRangeSstExport.Chunk>(); var reply=new CompletableFuture<NativeRangeSstExport.Chunk>(); var builds=new AtomicInteger();
             var nativeSource=nativeWriter(f,definition,executor);
             RatisExportClient.ChunkSource writer=localSource((artifact,intent,token,context) -> {
-                builds.incrementAndGet(); nativeSource.write(new RatisExportSourceRpc.BuildRequest(new RatisExportSourceRpc.JobDefinition(definition.jobId(),definition.fence(),intent.group(),definition.column(),token,definition.limits()),intent),artifact,context).whenComplete((chunk,failure) -> { if (failure==null) nativeDone.complete(chunk); else nativeDone.completeExceptionally(failure); }); return reply;
+                builds.incrementAndGet(); nativeSource.write(new RatisExportSourceRpc.BuildRequest(new RatisExportSourceRpc.JobDefinition(definition.jobId(),definition.fence(),intent.group(),definition.columns(),token,definition.limits()),intent),artifact,context).whenComplete((chunk,failure) -> { if (failure==null) nativeDone.complete(chunk); else nativeDone.completeExceptionally(failure); }); return reply;
             });
             long oneStep=definition.limits().chunk().maximumPayloadBytes()+definition.limits().chunk().maximumFileBytes()+8L*1024*1024;
             var limits=new RatisExportClient.Limits(1,RatisExportClient.Limits.defaults().metadataBytes(),oneStep);
@@ -174,9 +174,9 @@ class RatisExportClientTest {
             try (var first=client.create(one,definition,RequestContext.batch())) {
                 await(first.completion()); byte[] original=Files.readAllBytes(one);
                 assertThrows(IOException.class,() -> client.reopen(sourcePath,RequestContext.batch()));
-                var overlapping=new RatisExportJournal.Definition(new UUID(270,3),definition.fence(),definition.column(),one,definition.sourceIdentity(),definition.limits());
+                var overlapping=new RatisExportJournal.Definition(new UUID(270,3),definition.fence(),definition.columns(),one,definition.sourceIdentity(),definition.limits());
                 assertThrows(IOException.class,() -> client.create(two,overlapping,RequestContext.batch())); assertFalse(Files.exists(two)); assertArrayEquals(original,Files.readAllBytes(one));
-                try (var saved=RatisExportJournal.create(two,new RatisExportJournal.Definition(new UUID(270,4),definition.fence(),definition.column(),sourcePath,definition.sourceIdentity(),definition.limits()))) { }
+                try (var saved=RatisExportJournal.create(two,new RatisExportJournal.Definition(new UUID(270,4),definition.fence(),definition.columns(),sourcePath,definition.sourceIdentity(),definition.limits()))) { }
                 int calls=f.rpcs.get(); var failed=client.reopen(two,RequestContext.batch()); assertThrows(ExecutionException.class,() -> await(failed.completion()));
                 assertThrows(ExecutionException.class,() -> await(failed.step(RequestContext.batch()))); assertEquals(calls,f.rpcs.get()); failed.close(); assertEquals(1,client.stats().jobs());
             }
@@ -202,7 +202,7 @@ class RatisExportClientTest {
             seed(f); var directory=Files.createDirectory(root.resolve("exclusive-job")); var definition=definition(f,source,directory.resolve("source.snapshot"));
             try (var client=new RatisExportClient(source,f.scheduler,nativeWriter(f,definition,executor),RatisExportClient.Limits.defaults()); var job=client.create(directory.resolve("one.log"),definition,RequestContext.batch())) {
                 await(job.completion()); await(job.step(RequestContext.batch())); int calls=f.rpcs.get();
-                var duplicate=new RatisExportJournal.Definition(new UUID(270,2),definition.fence(),definition.column(),definition.sourceJournal(),definition.sourceIdentity(),definition.limits());
+                var duplicate=new RatisExportJournal.Definition(new UUID(270,2),definition.fence(),definition.columns(),definition.sourceJournal(),definition.sourceIdentity(),definition.limits());
                 assertThrows(IOException.class,() -> client.create(directory.resolve("two.log"),duplicate,RequestContext.batch())); assertEquals(calls,f.rpcs.get()); assertEquals(1,client.stats().jobs());
                 assertArrayEquals(new byte[]{1},await(source.lease(definition.sourceJournal()).get(71,key(2),RequestContext.batch())).toByteArray()); await(job.cancel(RequestContext.batch()));
             }

@@ -41,8 +41,15 @@ public final class RatisExportSourceRegistry implements AutoCloseable {
     private String key(JobDefinition d){return d.jobId()+"-"+d.group();}
     private void scan()throws IOException {
         int files=0,totalFiles=0;try(var listing=Files.newDirectoryStream(root)){for(Path path:listing){if(path.getFileName().toString().equals("ownership.lock"))continue;if(++files>budgets.maximumJobs() || !Files.isDirectory(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Source startup directory bound/type violated");if(path.getFileName().toString().startsWith("gc-")){int count=0;try(var gc=Files.newDirectoryStream(path)){for(Path file:gc){if(++count>3L*budgets.maximumChunks()+4 || !Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS))throw new IOException("Invalid source GC artifact");Files.delete(file);}}SessionJournalFiles.force(path);Files.delete(path);SessionJournalFiles.force(root);continue;}var def=JobDefinition.decode(read(path.resolve("definition")));if(!path.getFileName().toString().equals(key(def)))throw new IOException("Source directory binding changed");var job=new Job(def,path);jobs.put(key(def),job);chargeMetadata(64);int entries=0;try(var content=Files.newDirectoryStream(path)){for(Path file:content){if(++totalFiles>3L*budgets.maximumChunks()+3L*budgets.maximumJobs() || ++entries>3L*budgets.maximumChunks()+4 || !Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS))throw new IOException("Source startup file bound/type violated");String name=file.getFileName().toString();long size=Files.size(file);if(name.equals("definition")){chargeMetadata(size);continue;}if(name.equals("released")){if(!Arrays.equals(read(file),def.digest()))throw new IOException("Release binding changed");job.released=job.releasing=true;job.releaseReserved=false;metadata-=64;chargeMetadata(size);continue;}if(name.endsWith(".intent")){var req=BuildRequest.decode(read(file));requireDefinition(job,req.definition());if(!name.equals(req.intent().ordinal()+".intent") || job.intents.put(req.intent().ordinal(),req)!=null)throw new IOException("Intent binding changed");chargeMetadata(size);}else if(name.endsWith(".descriptor")){var desc=Descriptor.decode(read(file));if(!name.equals(desc.ordinal()+".descriptor") || !Arrays.equals(desc.bindingDigest(),def.digest()))throw new IOException("Descriptor binding changed");job.descriptors.put(desc.ordinal(),desc);chargeMetadata(size);}else if(name.endsWith(".sst") || name.endsWith(".sst.building")){chargeDisk(size);}else if(name.endsWith(".pending")){chargeMetadata(size);}else throw new IOException("Unknown source artifact");}}
-            for(var req:job.intents.values()){if(++chunks>budgets.maximumChunks())throw new IOException("Source chunk capacity exceeded");var desc=job.descriptors.get(req.intent().ordinal());if(desc!=null)validate(req,desc);}
-            for(long ordinal:job.descriptors.keySet())if(!job.intents.containsKey(ordinal))throw new IOException("Descriptor without durable intent");if(job.released)queueReleased(job);
+            for(var req:job.intents.values())if(++chunks>budgets.maximumChunks())throw new IOException("Source chunk capacity exceeded");
+            if(job.released){
+                // RELEASE is durable before artifact deletion; surviving files need no complete active sequence.
+                for(var desc:job.descriptors.values())try{if(!def.fence().participant(def.group()).scope().containsRange(desc.column(),desc.lowerInclusive(),desc.upperExclusive()))throw new IOException("Released descriptor outside original coverage");validate(new BuildRequest(def,new RatisExportJournal.ChunkIntent(desc.group(),desc.column(),desc.cut(),desc.lowerInclusive(),desc.ordinal(),def.limits().chunk())),desc);}catch(IllegalArgumentException failure){throw new IOException("Released descriptor changed original binding",failure);}
+                queueReleased(job);
+            }else{
+                long expectedOrdinal=0;for(var req:job.intents.values()){validateNext(job,req,expectedOrdinal++);var desc=job.descriptors.get(req.intent().ordinal());if(desc!=null)validate(req,desc);}
+                for(long ordinal:job.descriptors.keySet())if(!job.intents.containsKey(ordinal))throw new IOException("Descriptor without durable intent");
+            }
         }}
     }
     private byte[] read(Path path)throws IOException {if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Source metadata missing/type changed");return SessionJournalFiles.read(path,FILE_MAX);}
@@ -75,7 +82,18 @@ public final class RatisExportSourceRegistry implements AutoCloseable {
         }}finally{leave();}
     }
     private long jobMetadata(Job job){long bytes=job.definition.encode().length+96;for(var i:job.intents.values())bytes+=i.encode().length+32;for(var d:job.descriptors.values())bytes+=d.encode().length+32;return bytes;}
-    private void validateNext(Job job,BuildRequest request)throws IOException {long n=request.intent().ordinal();byte[] lower=job.definition.scope().lowerInclusive();if(n!=0){Descriptor prior=job.descriptors.get(n-1);if(prior==null || !prior.hasMore())throw new IOException("Source continuation lacks preceding descriptor");lower=prior.upperExclusive();}if(n!=job.intents.size() || !Arrays.equals(lower,request.intent().scopeStart()))throw new IOException("Source ordinal/coverage changed");}
+    private void validateNext(Job job,BuildRequest request)throws IOException {validateNext(job,request,job.intents.size());}
+    private void validateNext(Job job,BuildRequest request,long expectedOrdinal)throws IOException {
+        long n=request.intent().ordinal();var columns=job.definition.columnsForGroup();UUID column=columns.getFirst();byte[] lower=job.definition.scope(column).lowerInclusive();
+        if(n!=expectedOrdinal) throw new IOException("Source ordinal changed");
+        if(n!=0){
+            Descriptor prior=job.descriptors.get(n-1);if(prior==null) throw new IOException("Source continuation lacks preceding descriptor");
+            column=prior.column();
+            if(prior.hasMore()) lower=prior.upperExclusive();
+            else {int next=columns.indexOf(column)+1;if(next>=columns.size()) throw new IOException("Source columns already complete");column=columns.get(next);lower=job.definition.scope(column).lowerInclusive();}
+        }
+        if(!column.equals(request.intent().column()) || !Arrays.equals(lower,request.intent().scopeStart())) throw new IOException("Source column/coverage changed");
+    }
     private Descriptor descriptor(BuildRequest r,NativeRangeSstExport.Chunk chunk){var m=chunk.manifest();return new Descriptor(r.definition().digest(),r.intent().ordinal(),m.groupId(),m.rangeEpoch(),m.schemaDigest(),m.columnId(),m.position(),m.lowerInclusive(),m.upperExclusive(),m.rows()==0?hash(new byte[0]):m.sha256(),m.rows(),m.payloadBytes(),m.fileBytes(),chunk.hasMore());}
     private void validate(BuildRequest r,Descriptor d)throws IOException {try{requireDescriptor(r,d);}catch(IllegalArgumentException failure){throw new IOException("Native descriptor changed original binding",failure);}}
     private Path artifact(Job j,long ordinal){return j.path.resolve(ordinal+".sst");}

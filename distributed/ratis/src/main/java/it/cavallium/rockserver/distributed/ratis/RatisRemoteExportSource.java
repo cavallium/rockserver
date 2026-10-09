@@ -27,7 +27,7 @@ public final class RatisRemoteExportSource implements RatisExportClient.ChunkSou
         bindings.put(saved.definition().jobId(),saved); cleanup.computeIfAbsent(saved.definition().jobId(),ignored -> new HashSet<>(saved.sourceCleanup()));
     }
     private static boolean sameDefinition(RatisExportJournal.Definition a,RatisExportJournal.Definition b) {
-        return a.jobId().equals(b.jobId()) && a.fence().equals(b.fence()) && a.column().equals(b.column()) && a.sourceJournal().equals(b.sourceJournal()) && Arrays.equals(a.sourceIdentity(),b.sourceIdentity()) && a.limits().equals(b.limits());
+        return a.jobId().equals(b.jobId()) && a.fence().equals(b.fence()) && a.columns().equals(b.columns()) && a.sourceJournal().equals(b.sourceJournal()) && Arrays.equals(a.sourceIdentity(),b.sourceIdentity()) && a.limits().equals(b.limits());
     }
     private synchronized RatisRoutedClient.SnapshotTarget target(RatisExportSourceRpc.JobDefinition definition) throws IOException {
         var saved=bindings.get(definition.jobId());

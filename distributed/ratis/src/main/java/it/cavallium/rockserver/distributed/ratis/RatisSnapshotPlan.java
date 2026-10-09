@@ -43,12 +43,31 @@ public final class RatisSnapshotPlan {
         var fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),directory.domainId(),fenceId,homeGroup,homeEpoch,business,directory.generation(),directory.schemaEpoch(),directory.schemaDigest(),participants);
         return new RatisSnapshotPlan(fence,new ArrayList<>(routes.values()),scope);
     }
+    /** Qualify the original fence without rewriting equivalent adjacent scope spans or its binding digest. */
+    public static RatisSnapshotPlan frozen(RangeDirectory directory,SnapshotFence expected) {
+        Objects.requireNonNull(expected);
+        var first=expected.participants().stream().map(SnapshotFence.Participant::installOperation)
+                .min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();
+        var plan=create(directory,scope(expected),expected.fenceId(),expected.operation(),expected.homeGroup(),expected.homeEpoch(),first);
+        var participants=expected.participants().stream().map(p -> new SnapshotFence.Participant(
+                p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.installOperation(),p.releaseOperation(),
+                normalize(p.scope().spans()))).toList();
+        var qualified=new SnapshotFence(expected.clusterId(),expected.databaseId(),expected.domainId(),
+                expected.fenceId(),expected.homeGroup(),expected.homeEpoch(),expected.operation(),
+                expected.directoryGeneration(),expected.schemaEpoch(),expected.schemaDigest(),participants);
+        if (!qualified.equals(plan.fence())) throw new IllegalArgumentException("Frozen source definition differs from cached projection");
+        return new RatisSnapshotPlan(expected,plan.routes(),plan.scope());
+    }
     private static OperationId control(OperationId first,int offset) { return new OperationId(first.sessionId(),first.epoch(),first.sequence()+offset); }
     private static byte[] maximum(byte[] a,byte[] b) { return a==null ? b : b==null || Arrays.compareUnsigned(a,b)>=0 ? a : b; }
     private static byte[] minimum(byte[] a,byte[] b) { return a==null ? b : b==null || Arrays.compareUnsigned(a,b)<=0 ? a : b; }
     /** Reconstruct the physical union without multiplying the original span count at partition boundaries. */
     public static TransactionScope scope(SnapshotFence fence) {
         Objects.requireNonNull(fence); var spans=new ArrayList<TransactionScope.Span>(); fence.participants().forEach(p -> spans.addAll(p.scope().spans()));
+        return normalize(spans);
+    }
+    private static TransactionScope normalize(List<TransactionScope.Span> source) {
+        var spans=new ArrayList<>(source);
         spans.sort(Comparator.comparing(TransactionScope.Span::columnId,UUID_ORDER).thenComparing(TransactionScope.Span::lowerInclusive,(a,b) -> a==null ? b==null ? 0 : -1 : b==null ? 1 : Arrays.compareUnsigned(a,b)).thenComparing(TransactionScope.Span::isPoint));
         var union=new ArrayList<TransactionScope.Span>();
         for (var span:spans) {

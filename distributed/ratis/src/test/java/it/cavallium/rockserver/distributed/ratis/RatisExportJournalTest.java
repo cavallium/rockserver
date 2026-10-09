@@ -23,12 +23,12 @@ class RatisExportJournalTest {
         return new RangeDirectory(new UUID(0,40),new UUID(0,41),new UUID(0,42),1,new byte[32],1,Set.of(column),0,ranges);
     }
     SnapshotFence fence(RangeDirectory directory) { return RatisSnapshotPlan.create(directory,new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))),new UUID(0,50),new OperationId(new UUID(0,51),1,0),home,1,new OperationId(new UUID(0,51),1,1)).fence(); }
-    RatisExportJournal.Definition definition(RangeDirectory directory) { return new RatisExportJournal.Definition(job,fence(directory),column,root.resolve("original-snapshot.journal"),new byte[32],RatisExportJournal.Limits.defaults()); }
+    RatisExportJournal.Definition definition(RangeDirectory directory) { return new RatisExportJournal.Definition(job,fence(directory),List.of(column),root.resolve("original-snapshot.journal"),new byte[32],RatisExportJournal.Limits.defaults()); }
     Map<UUID,SnapshotFenceStatus.Capture> tokens(SnapshotFence fence) { var tokens=new LinkedHashMap<UUID,SnapshotFenceStatus.Capture>(); int n=0; for (var p:fence.participants()) tokens.put(p.groupId(),new SnapshotFenceStatus.Capture(new UUID(0,60+n),new UUID(0,70+n),new ApplyPosition(1,5+n++))); return tokens; }
     NativeRangeSstExport.Chunk artifact(RatisExportJournal journal,RatisExportJournal.ChunkIntent intent,byte[] end,boolean more,boolean empty) throws Exception {
         Path file=empty ? null : journal.artifactPath(intent); byte[] body={1,2,3}; if (file!=null) Files.write(file,body,StandardOpenOption.CREATE_NEW);
         var p=journal.snapshot().definition().fence().participant(intent.group());
-        return new NativeRangeSstExport.Chunk(new NativeRangeSstExport.Manifest(intent.group(),p.rangeEpoch(),column,p.schemaDigest(),intent.cut(),intent.scopeStart(),end,empty ? 0 : 1,empty ? 0 : 2,empty ? 0 : body.length,empty ? new byte[0] : MessageDigest.getInstance("SHA-256").digest(body),file),more);
+        return new NativeRangeSstExport.Chunk(new NativeRangeSstExport.Manifest(intent.group(),p.rangeEpoch(),intent.column(),p.schemaDigest(),intent.cut(),intent.scopeStart(),end,empty ? 0 : 1,empty ? 0 : 2,empty ? 0 : body.length,empty ? new byte[0] : MessageDigest.getInstance("SHA-256").digest(body),file),more);
     }
     RatisDurableSnapshot.Snapshot releasedSource(RangeDirectory directory,SnapshotFence fence,Map<UUID,SnapshotFenceStatus.Capture> tokens) throws Exception { return source(directory,fence,tokens,true); }
     RatisDurableSnapshot.Snapshot capturedSource(RangeDirectory directory,SnapshotFence fence,Map<UUID,SnapshotFenceStatus.Capture> tokens) throws Exception { return source(directory,fence,tokens,false); }
@@ -94,8 +94,8 @@ class RatisExportJournalTest {
                 List.of(TransactionScope.Span.range(column,null,new byte[]{4}),TransactionScope.Span.range(column,new byte[]{5},null)),
                 List.of(TransactionScope.Span.range(column,null,null),TransactionScope.Span.range(column,new byte[]{4},null)))) {
             var changed=new SnapshotFence(old.clusterId(),old.databaseId(),old.domainId(),old.fenceId(),old.homeGroup(),old.homeEpoch(),old.operation(),old.directoryGeneration(),old.schemaEpoch(),old.schemaDigest(),List.of(new SnapshotFence.Participant(local.rangeId(),local.groupId(),local.rangeEpoch(),local.schemaDigest(),local.installOperation(),local.releaseOperation(),new TransactionScope(spans))));
-            if (Arrays.equals(spans.getFirst().upperExclusive(),spans.getLast().lowerInclusive())) assertDoesNotThrow(() -> new RatisExportJournal.Definition(job,changed,column,root.resolve("source"),new byte[32],RatisExportJournal.Limits.defaults()));
-            else assertThrows(IllegalArgumentException.class,() -> new RatisExportJournal.Definition(job,changed,column,root.resolve("source"),new byte[32],RatisExportJournal.Limits.defaults()));
+            if (Arrays.equals(spans.getFirst().upperExclusive(),spans.getLast().lowerInclusive())) assertDoesNotThrow(() -> new RatisExportJournal.Definition(job,changed,List.of(column),root.resolve("source"),new byte[32],RatisExportJournal.Limits.defaults()));
+            else assertThrows(IllegalArgumentException.class,() -> new RatisExportJournal.Definition(job,changed,List.of(column),root.resolve("source"),new byte[32],RatisExportJournal.Limits.defaults()));
         }
     }
 
@@ -188,6 +188,40 @@ class RatisExportJournalTest {
             assertEquals(5,journal.snapshot().pendingArtifactBytes()); assertEquals(lost ? RatisExportJournal.Phase.SNAPSHOT_LOST : RatisExportJournal.Phase.CANCELLED,journal.snapshot().phase());
             journal.sourceReleased(group); journal.release(); journal.reclaimArtifacts(); assertEquals(0,journal.snapshot().pendingArtifactBytes());
         }
+    }
+
+    @Test void canonicalSelectionProjectsJobsButRetainsAllOriginalPinsAndReplaysColumnBoundary() throws Exception {
+        var base=directory(2); UUID second=new UUID(Long.MIN_VALUE,1),unselected=new UUID(0,99);
+        var directory=new RangeDirectory(base.clusterId(),base.databaseId(),base.domainId(),base.schemaEpoch(),base.schemaDigest(),base.generation(),Set.of(column,second,unselected),base.routingPrefixBytes(),base.ranges());
+        var original=fence(directory); var participants=new ArrayList<SnapshotFence.Participant>();
+        for (int n=0;n<original.participants().size();n++) {
+            var p=original.participants().get(n);
+            var scope=n==0 ? new TransactionScope(List.of(TransactionScope.Span.range(column,null,new byte[]{4}),TransactionScope.Span.range(column,new byte[]{4},new byte[]{(byte)128}),TransactionScope.Span.range(second,null,new byte[]{(byte)128}))) : new TransactionScope(List.of(TransactionScope.Span.range(unselected,new byte[]{(byte)128},null)));
+            participants.add(new SnapshotFence.Participant(p.rangeId(),p.groupId(),p.rangeEpoch(),p.schemaDigest(),p.installOperation(),p.releaseOperation(),scope));
+        }
+        var fence=new SnapshotFence(original.clusterId(),original.databaseId(),original.domainId(),original.fenceId(),original.homeGroup(),original.homeEpoch(),original.operation(),original.directoryGeneration(),original.schemaEpoch(),original.schemaDigest(),participants);
+        var selection=new ArrayList<>(List.of(second,column)); var definition=new RatisExportJournal.Definition(job,fence,selection,root.resolve("multi-source"),new byte[32],RatisExportJournal.Limits.defaults()); selection.clear();
+        assertEquals(List.of(column,second),definition.columns()); assertThrows(UnsupportedOperationException.class,() -> definition.columns().clear());
+        var group=participants.getFirst().groupId(); var skipped=participants.getLast().groupId();
+        assertEquals(List.of(group),definition.groups()); assertTrue(definition.columnsForGroup(skipped).isEmpty());
+        assertThrows(IllegalArgumentException.class,() -> new RatisExportJournal.Definition(job,fence,List.of(column,column),root.resolve("s"),new byte[32],definition.limits()));
+        assertThrows(IllegalArgumentException.class,() -> new RatisExportJournal.Definition(job,fence,List.of(new UUID(0,199)),root.resolve("s"),new byte[32],definition.limits()));
+        var tooFew=new RatisExportJournal.Limits(1,definition.limits().maximumJournalBytes(),definition.limits().maximumDiskBytes(),definition.limits().chunk());
+        assertThrows(IllegalArgumentException.class,() -> new RatisExportJournal.Definition(job,fence,definition.columns(),root.resolve("s"),new byte[32],tooFew));
+        var path=root.resolve("multi-export"); var tokens=tokens(fence);
+        try (var journal=RatisExportJournal.create(path,definition)) {
+            journal.bindSource(capturedSource(directory,fence,tokens)); assertEquals(2,journal.snapshot().captures().size()); assertEquals(Set.of(group),journal.snapshot().sourceCleanup());
+            assertThrows(IllegalArgumentException.class,() -> RatisExportJournal.sourceDefinition(journal.snapshot(),skipped));
+            var intent=journal.freezeChunk(group); assertEquals(column,intent.column()); journal.publish(intent,artifact(journal,intent,new byte[]{(byte)128},false,true));
+            assertEquals(RatisExportJournal.Phase.EXPORTING,journal.snapshot().phase()); assertThrows(IOException.class,() -> journal.sourceReleased(group));
+        }
+        try (var journal=RatisExportJournal.reopen(path)) {
+            assertEquals(group,journal.unfinishedGroup()); var intent=journal.freezeChunk(group); assertEquals(second,intent.column()); assertEquals(1,intent.ordinal()); assertNull(intent.scopeStart());
+            var wrong=new RatisExportJournal.ChunkIntent(group,column,intent.cut(),intent.scopeStart(),intent.ordinal(),intent.limits()); assertThrows(IOException.class,() -> journal.publish(wrong,artifact(journal,intent,new byte[]{(byte)128},false,true)));
+            journal.publish(intent,artifact(journal,intent,new byte[]{(byte)128},false,true)); assertEquals(RatisExportJournal.Phase.MATERIALIZED,journal.snapshot().phase()); journal.sourceReleased(group); journal.markReady(releasedSource(directory,fence,tokens));
+            for (var chunk:journal.snapshot().chunks()) journal.acknowledge(chunk);
+        }
+        try (var journal=RatisExportJournal.reopen(path)) { assertEquals(RatisExportJournal.Phase.READY,journal.snapshot().phase()); assertEquals(2,journal.snapshot().acknowledged().size()); }
     }
 
 }

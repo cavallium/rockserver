@@ -32,7 +32,7 @@ class RatisExportSourceOwnerTest {
                         var f=owner.get(); f.data.f.machine.requireExportPin(definition); builds.incrementAndGet();
                         return f.data.f.machine.exportSnapshotPinChunk(definition.capture(),pin -> {
                             var chunk=f.data.f.pool.exportSstChunk(artifact,pin,intent.column(),intent.scopeStart(),
-                                    definition.scope().upperExclusive(),intent.limits());
+                                    definition.scope(intent.column()).upperExclusive(),intent.limits());
                             completion.persist(chunk); return chunk;
                         });
                     }
@@ -48,7 +48,7 @@ class RatisExportSourceOwnerTest {
             var route=f.data.directory.ranges().getFirst(); var peer=route.replicas().getFirst();
             var limits=new RatisExportJournal.Limits(8,16L*1024*1024,8L*1024*1024,
                     new NativeRangeSstExport.Limits(1,1024,1024*1024,Duration.ofSeconds(5)));
-            var definition=new RatisExportSourceRpc.JobDefinition(UUID.randomUUID(),f.fence,route.groupId(),f.data.f.column,token,limits);
+            var definition=new RatisExportSourceRpc.JobDefinition(UUID.randomUUID(),f.fence,route.groupId(),List.of(f.data.f.column),token,limits);
             var request=new RatisExportSourceRpc.BuildRequest(definition,
                     new RatisExportJournal.ChunkIntent(route.groupId(),f.data.f.column,token.position(),new byte[]{1},0,limits.chunk()));
             try (var data=new RatisRoutedClient(f.data.directory,new RatisRoutedClient.Transport() {
