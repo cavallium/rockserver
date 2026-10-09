@@ -19,7 +19,7 @@ public final class RangeDirectoryCodec {
     };
     private RangeDirectoryCodec() {}
 
-    static long encodedSize(RangeDirectory directory) {
+    public static long encodedSize(RangeDirectory directory) {
         long bytes = 112 + 16L * directory.columns().size();
         for (RangeDescriptor range : directory.ranges()) {
             byte[] lower = range.lowerInclusive(), upper = range.upperExclusive();
@@ -71,7 +71,7 @@ public final class RangeDirectoryCodec {
         input.get(schema);
         long generation = input.getLong();
         int prefix = input.getInt();
-        int columnCount = count(input, MAX_COLUMNS, 16);
+        int columnCount = count(input, MAX_COLUMNS, 16, 0);
         var columns = new HashSet<UUID>();
         UUID previous = null;
         for (int i = 0; i < columnCount; i++) {
@@ -80,7 +80,7 @@ public final class RangeDirectoryCodec {
             columns.add(column);
             previous = column;
         }
-        int rangeCount = count(input, MAX_RANGES, 61);
+        int rangeCount = count(input, MAX_RANGES, 61, 1);
         var ranges = new ArrayList<RangeDescriptor>(rangeCount);
         byte[] previousLower = null;
         for (int i = 0; i < rangeCount; i++) {
@@ -96,7 +96,7 @@ public final class RangeDirectoryCodec {
                 case 3 -> RangeDescriptor.TopologyState.RETIRED;
                 default -> throw new IllegalArgumentException("Unknown range topology state");
             };
-            int replicaCount = count(input, MAX_REPLICAS, 57);
+            int replicaCount = count(input, MAX_REPLICAS, 57, 1);
             var replicas = new ArrayList<ReplicaDescriptor>(replicaCount);
             UUID previousReplica = null;
             for (int j = 0; j < replicaCount; j++) {
@@ -122,10 +122,10 @@ public final class RangeDirectoryCodec {
         try { return MessageDigest.getInstance("SHA-256").digest(encode(directory)); }
         catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
-    private static int count(ByteBuffer input, int max, int minimumBytes) {
+    private static int count(ByteBuffer input, int max, int minimumBytes, int minimumCount) {
         require(input, 4);
         int count = input.getInt();
-        if (count < 1 || count > max || (long) count * minimumBytes > input.remaining()) {
+        if (count < minimumCount || count > max || (long) count * minimumBytes > input.remaining()) {
             throw new IllegalArgumentException("Invalid directory collection count");
         }
         return count;

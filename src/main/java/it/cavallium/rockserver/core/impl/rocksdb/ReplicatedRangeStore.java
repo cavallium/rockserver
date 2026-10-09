@@ -35,6 +35,7 @@ import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
 import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.IdentityHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import it.cavallium.rockserver.core.common.distributed.RangeMutationHistory;
@@ -159,6 +160,7 @@ public final class ReplicatedRangeStore {
     private volatile Map<UUID,SnapshotGate> snapshotGates=Map.of();
     private long retainedGateBytes;
     private volatile DistributedSchema logicalSchema;
+    private volatile boolean catalogueScopeCompaction;
     private RangeMutationHistory scopedHistory;
     private RangeMutationHistory.Limits scopedLimits;
     private final Map<RangeMutationHistory.Pin,ScopedHistoryPin> scopedPins=new IdentityHashMap<>();
@@ -349,11 +351,22 @@ public final class ReplicatedRangeStore {
         finally { applyLane.unlock(); leaveNative(); }
     }
 
+    /** Trusted CATALOGUE role configuration; request bytes never enable metadata scope compaction. */
+    public void enableCatalogueScopeCompaction() {
+        enterNative(); applyLane.lock();
+        try {
+            requireActive();
+            if (scopedHistory!=null) throw new IllegalStateException("DATA scoped history excludes catalogue scope compaction");
+            catalogueScopeCompaction=true;
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+
     /** Group-local ephemeral limits, configured once; ordinary read/export pins remain independent. */
     public void enableScopedHistory(RangeMutationHistory.Limits limits) {
         Objects.requireNonNull(limits); enterNative(); applyLane.lock();
         try {
             requireActive();
+            if (catalogueScopeCompaction) throw new IllegalStateException("Catalogue scope compaction excludes DATA scoped history");
             if (scopedHistory!=null) {
                 if (!scopedLimits.equals(limits)) throw new IllegalArgumentException("Scoped history limits already configured"); return;
             }
@@ -1683,8 +1696,18 @@ public final class ReplicatedRangeStore {
         for (var record:preparedIndex.records()) if (record.preparation().ownsOperation(command.operationId())) throw new IllegalArgumentException("Operation identity is owned by durable preparation");
         var scope=commandScope(command); if (scope!=null) requireUnlocked(scope);
     }
-    private TransactionScope commandScope(DistributedCommand command) {
+    private TransactionScope commandScope(DistributedCommand command) { return commandAccessScope(command); }
+
+    /** Pure physical access scope, conservatively compacted only for trusted catalogue stores. */
+    public TransactionScope commandAccessScope(DistributedCommand command) {
+        Objects.requireNonNull(command);
         if (command.acceptance()!=null) return command.acceptance().scope();
+        if (catalogueScopeCompaction && (long)command.mutations().size()+command.predicates().size()>TransactionScope.MAX_SPANS) {
+            var columns=new LinkedHashSet<UUID>();
+            for (var mutation:command.mutations()) columns.add(mutation.columnId());
+            for (var predicate:command.predicates()) columns.add(predicate.columnId());
+            return new TransactionScope(columns.stream().map(column -> TransactionScope.Span.range(column,null,null)).toList());
+        }
         var spans=new ArrayList<TransactionScope.Span>();
         for (var m:command.mutations()) spans.add(m.kind()==Mutation.Kind.DELETE_RANGE ? TransactionScope.Span.range(m.columnId(),m.key(),m.value()) : TransactionScope.Span.point(m.columnId(),m.key()));
         for (var p:command.predicates()) spans.add(TransactionScope.Span.point(p.columnId(),p.key()));

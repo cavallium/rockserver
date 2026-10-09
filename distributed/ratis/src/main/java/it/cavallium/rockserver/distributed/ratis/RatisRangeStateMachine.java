@@ -548,6 +548,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             recover(false);
             store.activate(); validateRoleNativeState();
             if (role==RatisNodePlan.Role.DATA) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+            else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
             if (enableSessionControls) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
         } catch (Exception failure) { throw failRecovery(failure); }
@@ -871,7 +872,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear();
                 store.activate(); validateRoleNativeState();
-            if (role==RatisNodePlan.Role.DATA) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                if (role==RatisNodePlan.Role.DATA) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
                 if (enableSessionControls) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
@@ -942,7 +944,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var rejection=command.acceptance()==null ? null : DistributedCommand.rejectAcceptedTransaction(command);
             var rejectionData=rejection==null ? null : ByteString.copyFrom(DistributedCommandCodec.encode(rejection));
             var spans=new ArrayList<TransactionScope.Span>(command.mutations().size());
-            for (var mutation:command.mutations()) spans.add(mutation.kind()==Mutation.Kind.DELETE_RANGE
+            if (role==RatisNodePlan.Role.CATALOGUE) {
+                var scope=store.commandAccessScope(command);
+                if (scope!=null) spans.addAll(scope.spans());
+            } else for (var mutation:command.mutations()) spans.add(mutation.kind()==Mutation.Kind.DELETE_RANGE
                     ? TransactionScope.Span.range(mutation.columnId(),mutation.key(),mutation.value()) : TransactionScope.Span.point(mutation.columnId(),mutation.key()));
             var footprint=proposalFootprints.prepare(spans);
             // Native receipt reads stay outside the short admission lock. If apply

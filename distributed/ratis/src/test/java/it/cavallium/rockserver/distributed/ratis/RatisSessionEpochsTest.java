@@ -130,7 +130,7 @@ class RatisSessionEpochsTest {
             assertThrows(IllegalArgumentException.class,() -> f.epochs.prepare(operation(0),null,initial.issue(a,100)));
             var dir=directory(cluster); var key=bytes(dir.domainId());
             var dirCommand=new DistributedCommand(catalogue,1,new byte[32],operation(1),
-                    List.of(new Mutation(Mutation.Kind.PUT,directoryColumn,key,RangeDirectoryCodec.encode(dir))),List.of(new KeyPredicate(directoryColumn,key,null)));
+                    List.of(new Mutation(Mutation.Kind.PUT,directoryColumn,key,RangeDirectoryCodec.encode(dir))),List.of(new KeyPredicate(directoryColumn,key,null),new KeyPredicate(directoryColumn,RatisSchemaAdministration.headKey(dir.domainId()),null)));
             assertDoesNotThrow(() -> f.validate.accept(dirCommand));
         }
     }

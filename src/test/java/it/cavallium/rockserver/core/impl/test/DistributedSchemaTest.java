@@ -127,7 +127,8 @@ class DistributedSchemaTest {
     }
 
     @Test void combinedSchemaBudgetAndColumnCountsAreBoundedBeforeEncoding() {
-        assertThrows(IllegalArgumentException.class,() -> new DistributedSchema(CLUSTER,DATABASE,DOMAIN,0,0,List.of()));
+        var empty=new DistributedSchema(CLUSTER,DATABASE,DOMAIN,0,0,List.of());
+        assertArrayEquals(DistributedSchemaCodec.encode(empty),DistributedSchemaCodec.encode(DistributedSchemaCodec.decode(DistributedSchemaCodec.encode(empty))));
         var columns=new ArrayList<DistributedSchema.Column>();
         String operatorName="o".repeat(4096), className="c".repeat(4096);
         var operator=new DistributedSchema.Operator(operatorName,1,className,new byte[32],1,1);

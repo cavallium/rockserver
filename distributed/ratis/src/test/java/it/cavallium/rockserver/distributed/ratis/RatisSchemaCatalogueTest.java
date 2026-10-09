@@ -38,6 +38,82 @@ class RatisSchemaCatalogueTest {
         return new RatisSchemaCatalogue(client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
     }
 
+    private static byte[] marker(RatisSessionEpochsTest outer,RatisSessionEpochsTest.Fixture fixture,byte[] key) throws Exception {
+        try (var pin=fixture.store.capture()) { return pin.get(outer.directoryColumn,key); }
+    }
+    @Test void globalBootstrapMarkersRejectOtherDomainApiOrUuidReuseAtomically() throws Exception {
+        var outer=new RatisSessionEpochsTest(); var first=schema(outer);
+        var secondColumn=new DistributedSchema.Column(8,new UUID(8,8),"other",first.columns().getFirst().schema(),null);
+        var second=new DistributedSchema(outer.cluster,outer.database,new UUID(8,9),1,0,List.of(secondColumn));
+        try (var f=outer.new Fixture(root.resolve("issuance"))) {
+            var catalogue=catalogue(outer,f.client);
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(0),first)).status());
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(1),second)).status());
+            byte[] original=marker(outer,f,RatisColumnIdentities.apiKey(8));
+            assertArrayEquals(second.digest(),RatisColumnIdentities.requireOwned(original,second.domainId(),secondColumn.columnId(),8));
+            for (var reused:List.of(new DistributedSchema.Column(8,new UUID(9,8),"api-reuse",secondColumn.schema(),null),
+                    new DistributedSchema.Column(9,secondColumn.columnId(),"uuid-reuse",secondColumn.schema(),null))) {
+                var staged=new DistributedSchema(outer.cluster,outer.database,first.domainId(),2,0,List.of(reused));
+                var command=catalogue.prepare(new OperationId(UUID.randomUUID(),0,0),staged);
+                assertEquals(CommandResult.Status.CONFLICT,catalogue.execute(command).status()); assertNull(catalogue.read(staged.digest()));
+                byte[] fresh=reused.apiId()==8 ? RatisColumnIdentities.columnKey(reused.columnId()) : RatisColumnIdentities.apiKey(reused.apiId());
+                assertNull(marker(outer,f,fresh),"The nonconflicting half must not be published");
+                assertArrayEquals(original,marker(outer,f,RatisColumnIdentities.apiKey(8)));
+            }
+        }
+    }
+    @Test void existingFrozenWitnessesRetainFirstIssuanceAcrossLostReplyAndJournalReopen() throws Exception {
+        var outer=new RatisSessionEpochsTest(); var source=schema(outer);
+        var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,source.columns());
+        try (var f=outer.new Fixture(root.resolve("witnesses"))) {
+            var catalogue=catalogue(outer,f.client);
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(0),source)).status());
+            byte[] witness=marker(outer,f,RatisColumnIdentities.columnKey(outer.data));
+            var uuidWitnesses=new HashMap<UUID,byte[]>(); uuidWitnesses.put(outer.data,witness.clone());
+            var apiWitnesses=new HashMap<Long,byte[]>(); apiWitnesses.put(7L,witness.clone());
+            Path journal=root.resolve("witnesses.bin"); byte[] frozen;
+            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,uuidWitnesses,apiWitnesses)) {
+                frozen=DistributedCommandCodec.encode(publication.preparedCommand());
+                uuidWitnesses.get(outer.data)[0]^=1; apiWitnesses.clear();
+                f.writeOverride=new byte[4]; assertThrows(IOException.class,publication::execute);
+                assertArrayEquals(witness,marker(outer,f,RatisColumnIdentities.columnKey(outer.data)));
+            }
+            f.writeOverride=null; uuidWitnesses.put(outer.data,witness.clone()); apiWitnesses.put(7L,witness.clone());
+            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,uuidWitnesses,apiWitnesses)) {
+                assertArrayEquals(frozen,DistributedCommandCodec.encode(publication.preparedCommand()));
+                assertEquals(CommandResult.Status.SUCCESS,publication.execute().status());
+            }
+            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,uuidWitnesses,apiWitnesses)) {
+                long calls=f.next.get(); assertEquals(CommandResult.Status.SUCCESS,publication.execute().status()); assertEquals(calls,f.next.get());
+            }
+            assertArrayEquals(source.digest(),RatisColumnIdentities.requireOwned(marker(outer,f,RatisColumnIdentities.apiKey(7)),source.domainId(),outer.data,7));
+            assertEquals(0,f.closes.get());
+        }
+    }
+    @Test void exactWitnessesNamespacesAndMarkerPairsAreValidatedBeforeRpc() throws Exception {
+        var outer=new RatisSessionEpochsTest(); var schema=schema(outer);
+        try (var f=outer.new Fixture(root.resolve("marker-validation"))) {
+            var catalogue=catalogue(outer,f.client); var valid=catalogue.prepare(outer.operation(0),schema);
+            byte[] wrong=RatisColumnIdentities.value(new UUID(88,88),outer.data,7,schema.digest());
+            assertThrows(IllegalArgumentException.class,() -> catalogue.prepare(outer.operation(0),schema,Map.of(outer.data,wrong),Map.of(7L,wrong)));
+            assertThrows(IllegalArgumentException.class,() -> catalogue.prepare(outer.operation(0),schema,Map.of(outer.data,valid.mutations().get(1).value()),Map.of()));
+            var validator=RatisSchemaCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
+            for (int index=1;index<=2;index++) {
+                var mutations=new ArrayList<>(valid.mutations()); var original=mutations.get(index); byte[] wrongKey=original.key(); wrongKey[0]^=1;
+                mutations.set(index,new Mutation(Mutation.Kind.PUT,outer.directoryColumn,wrongKey,original.value()));
+                var invalid=new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(0),mutations,valid.predicates());
+                assertThrows(IllegalArgumentException.class,() -> validator.accept(invalid));
+            }
+            var predicates=new ArrayList<>(valid.predicates()); predicates.set(1,new KeyPredicate(outer.directoryColumn,predicates.get(1).key(),valid.mutations().get(1).value()));
+            var splitWitness=new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(0),valid.mutations(),predicates);
+            assertThrows(IllegalArgumentException.class,() -> validator.accept(splitWitness));
+            var bucketMutations=new ArrayList<>(valid.mutations()); var marker=valid.mutations().get(1);
+            bucketMutations.set(1,Mutation.bucketPut(outer.directoryColumn,marker.key(),List.of(new byte[] {1}),marker.value(),Mutation.ReturnMode.NONE));
+            var bucketCommand=DistributedCommand.bucketData(outer.catalogue,1,new byte[32],outer.operation(0),bucketMutations,valid.predicates(),-1);
+            assertThrows(IllegalArgumentException.class,() -> validator.accept(bucketCommand)); assertEquals(0,f.next.get());
+        }
+    }
+
     @Test void lostAppliedReplyAndReopenRetryExactCommandThenReuseDurableResultWithoutRpc() throws Exception {
         var outer=new RatisSessionEpochsTest(); var schema=schema(outer); var plan=plan(outer,schema);
         try (var f=outer.new Fixture(root.resolve("native"))) {
@@ -112,6 +188,24 @@ class RatisSchemaCatalogueTest {
             f.readOverride=ByteBuffer.allocate(4+wrongContent.length).putInt(wrongContent.length).put(wrongContent).array();
             assertThrows(IOException.class,() -> catalogue.read(schema.digest()));
             f.readOverride=ByteBuffer.allocate(5).putInt(-1).put((byte)0).array(); assertThrows(IOException.class,() -> catalogue.read(schema.digest()));
+        }
+    }
+
+    @Test void all256SchemaColumnsRegisterAtomicallyWithinCommandBounds() throws Exception {
+        var outer=new RatisSessionEpochsTest(); var columns=new ArrayList<DistributedSchema.Column>();
+        var shape=ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(),true);
+        for (int i=1;i<=RangeDirectoryCodec.MAX_COLUMNS;i++) columns.add(new DistributedSchema.Column(i,new UUID(0,i),"column"+i,shape,null));
+        var schema=new DistributedSchema(outer.cluster,outer.database,outer.directory(outer.cluster).domainId(),1,0,columns);
+        try (var f=outer.new Fixture(root.resolve("all-columns"))) {
+            f.store.enableCatalogueScopeCompaction();
+            var catalogue=catalogue(outer,f.client); var command=catalogue.prepare(outer.operation(0),schema);
+            assertEquals(513,command.mutations().size()); assertEquals(513,command.predicates().size());
+            assertArrayEquals(DistributedCommandCodec.encode(command),DistributedCommandCodec.encode(DistributedCommandCodec.decode(DistributedCommandCodec.encode(command))));
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(command).status());
+            for (var binding:columns) {
+                assertArrayEquals(schema.digest(),RatisColumnIdentities.requireOwned(marker(outer,f,RatisColumnIdentities.columnKey(binding.columnId())),schema.domainId(),binding.columnId(),binding.apiId()));
+                assertArrayEquals(marker(outer,f,RatisColumnIdentities.columnKey(binding.columnId())),marker(outer,f,RatisColumnIdentities.apiKey(binding.apiId())));
+            }
         }
     }
 

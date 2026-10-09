@@ -25,7 +25,7 @@ public final class RangeDirectory {
         }
         Objects.requireNonNull(columns, "columns");
         Objects.requireNonNull(ranges, "ranges");
-        if (columns.isEmpty() || columns.size() > RangeDirectoryCodec.MAX_COLUMNS
+        if (columns.size() > RangeDirectoryCodec.MAX_COLUMNS
                 || ranges.isEmpty() || ranges.size() > RangeDirectoryCodec.MAX_RANGES) {
             throw new IllegalArgumentException("Invalid directory column/range counts");
         }

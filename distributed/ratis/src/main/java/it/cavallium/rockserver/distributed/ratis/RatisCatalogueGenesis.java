@@ -11,7 +11,9 @@ import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
-/** Explicit new-database/first-domain intent: atomic directory+ledger CAS, never placement activation. All replicas require the combined validator. */
+/** Explicit new-database/first-domain intent: atomic directory+ledger CAS, never placement activation.
+ * Schema-bearing bootstrap publishes schema content and column issuance before this intent.
+ * All replicas require the combined validator. */
 public final class RatisCatalogueGenesis implements AutoCloseable {
     private static final int MAGIC=0x5243474a, MAX_BYTES=RatisCatalogue.MAX_DIRECTORY_BYTES+4096;
     private final Path journal; private final RaftClient client; private final RatisNodePlan plan; private final long initialTime;

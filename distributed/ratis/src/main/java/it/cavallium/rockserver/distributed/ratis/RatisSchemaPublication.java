@@ -16,6 +16,8 @@ public final class RatisSchemaPublication implements AutoCloseable {
     private final RatisSchemaCatalogue catalogue;
     private final DistributedSchema schema;
     private final byte[] intent;
+    private final Map<UUID,byte[]> columnWitnesses;
+    private final Map<Long,byte[]> apiWitnesses;
     private final FileChannel lockChannel;
     private final FileLock lock;
     private DistributedCommand command;
@@ -23,10 +25,15 @@ public final class RatisSchemaPublication implements AutoCloseable {
     private boolean busy,closed,fenced;
 
     public RatisSchemaPublication(Path journal,RaftClient client,RatisNodePlan plan,DistributedSchema schema) throws IOException {
+        this(journal,client,plan,schema,Map.of(),Map.of());
+    }
+    public RatisSchemaPublication(Path journal,RaftClient client,RatisNodePlan plan,DistributedSchema schema,
+                                  Map<UUID,byte[]> columnWitnesses,Map<Long,byte[]> apiWitnesses) throws IOException {
+        this.columnWitnesses=freeze(columnWitnesses); this.apiWitnesses=freeze(apiWitnesses);
         this.journal=journal.toAbsolutePath(); this.schema=Objects.requireNonNull(schema); Objects.requireNonNull(plan);
         schema.requireMatches(plan.directory()); var c=plan.catalogue();
         catalogue=new RatisSchemaCatalogue(client,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
-        byte[] normalized=catalogue.prepare(new OperationId(new UUID(0,0),0,0),schema).payloadDigest();
+        byte[] normalized=catalogue.prepare(new OperationId(new UUID(0,0),0,0),schema,this.columnWitnesses,this.apiWitnesses).payloadDigest();
         try {
             intent=MessageDigest.getInstance("SHA-256").digest(ByteBuffer.allocate(48).put(normalized)
                     .putLong(c.sessionsColumn().getMostSignificantBits()).putLong(c.sessionsColumn().getLeastSignificantBits()).array());
@@ -74,7 +81,12 @@ public final class RatisSchemaPublication implements AutoCloseable {
             return outcome;
         } finally { synchronized (this) { busy=false; } }
     }
-    private DistributedCommand prepare(UUID session) { return catalogue.prepare(new OperationId(session,0,0),schema); }
+    private DistributedCommand prepare(UUID session) { return catalogue.prepare(new OperationId(session,0,0),schema,columnWitnesses,apiWitnesses); }
+    private static <K> Map<K,byte[]> freeze(Map<K,byte[]> witnesses) {
+        var result=new HashMap<K,byte[]>(); Objects.requireNonNull(witnesses).forEach((key,value) -> {
+            Objects.requireNonNull(key); if (value!=null) result.put(key,value.clone());
+        }); return Collections.unmodifiableMap(result);
+    }
     private void persist(CommandResult outcome) throws IOException {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);

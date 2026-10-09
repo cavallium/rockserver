@@ -68,7 +68,10 @@ class DistributedCommandCodecTest {
         var conditionMaximum=new DistributedCommand(GROUP,9,new byte[32],OPERATION,List.of(put()),List.of(new KeyPredicate(COLUMN,new byte[0],new byte[expectedBytes])));
         assertEquals(DistributedCommandCodec.MAX_ENCODED_BYTES,DistributedCommandCodec.encode(conditionMaximum).length);
         assertArrayEquals(DistributedCommandCodec.encode(conditionMaximum),DistributedCommandCodec.encode(DistributedCommandCodec.decode(DistributedCommandCodec.encode(conditionMaximum))));
-        assertDoesNotThrow(() -> data(Collections.nCopies(256,put()))); assertThrows(IllegalArgumentException.class,() -> data(Collections.nCopies(257,put())));
+        var maximumItems=data(Collections.nCopies(DistributedCommandCodec.MAX_ITEMS,put()));
+        byte[] maximumItemsBytes=DistributedCommandCodec.encode(maximumItems);
+        assertArrayEquals(maximumItemsBytes,DistributedCommandCodec.encode(DistributedCommandCodec.decode(maximumItemsBytes)));
+        assertThrows(IllegalArgumentException.class,() -> data(Collections.nCopies(DistributedCommandCodec.MAX_ITEMS+1,put())));
         var floor=DistributedCommandCodec.encode(DistributedCommand.advanceSessionEpochFloor(GROUP,9,new byte[32],OPERATION,2));
         for (int offset:new int[] {101,105}) { byte[] bad=floor.clone(); ByteBuffer.wrap(bad).putInt(offset,1); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
         byte[] badFloor=floor.clone(); ByteBuffer.wrap(badFloor).putLong(109,-1); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(badFloor));

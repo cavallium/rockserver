@@ -7,7 +7,7 @@ import java.util.*;
 
 /** Single current canonical command format, with explicit semantic kind and item tags. */
 public final class DistributedCommandCodec {
-    public static final int FORMAT_VERSION=1, MAX_ITEMS=256, MAX_MUTATIONS=MAX_ITEMS, MAX_ENCODED_BYTES=2*1024*1024;
+    public static final int FORMAT_VERSION=1, MAX_ITEMS=2048, MAX_MUTATIONS=MAX_ITEMS, MAX_ENCODED_BYTES=2*1024*1024;
     public static final int HEADER_BYTES=109;
     private DistributedCommandCodec() {}
     public static int encodedSize(DistributedCommand command) {

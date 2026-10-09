@@ -734,6 +734,32 @@ class ReplicatedRangeStoreTest {
         }
     }
 
+    @Test void catalogueCompactionCoversReadOnlyColumnsAndKeepsDataScopesBounded() throws Exception {
+        var mutations=new ArrayList<Mutation>();
+        for (int i=0;i<TransactionScope.MAX_SPANS;i++) mutations.add(new Mutation(Mutation.Kind.PUT,A,bytes("key"+i),bytes("v")));
+        var bounded=new DistributedCommand(GROUP,1,new byte[32],new OperationId(SESSION,1,0),mutations);
+        var large=new DistributedCommand(GROUP,1,new byte[32],new OperationId(SESSION,1,1),mutations,
+                List.of(new KeyPredicate(B,bytes("read-only"),null)));
+        try (var pool=new Pool(path)) {
+            var exact=pool.store.commandAccessScope(bounded);
+            assertEquals(TransactionScope.MAX_SPANS,exact.spans().size()); assertTrue(exact.spans().stream().allMatch(TransactionScope.Span::isPoint));
+            assertFalse(exact.contains(A,bytes("other"))); assertFalse(exact.contains(B,bytes("read-only")));
+            assertThrows(IllegalArgumentException.class,() -> pool.store.commandAccessScope(large));
+            pool.store.enableCatalogueScopeCompaction(); pool.store.enableCatalogueScopeCompaction();
+            assertTrue(pool.store.commandAccessScope(bounded).spans().stream().allMatch(TransactionScope.Span::isPoint));
+            var compact=pool.store.commandAccessScope(large); assertEquals(2,compact.spans().size());
+            assertTrue(compact.containsRange(A,null,null)); assertTrue(compact.containsRange(B,null,null));
+            assertFalse(compact.intersects(new TransactionScope(List.of(TransactionScope.Span.point(UUID.randomUUID(),bytes("key"))))));
+            assertThrows(IllegalStateException.class,() -> pool.store.enableScopedHistory(RangeMutationHistory.Limits.defaults()));
+        }
+        try (var pool=new Pool(path.resolve("data"))) {
+            pool.store.enableScopedHistory(RangeMutationHistory.Limits.defaults());
+            assertThrows(IllegalStateException.class,pool.store::enableCatalogueScopeCompaction);
+            assertThrows(IllegalArgumentException.class,() -> pool.store.commandAccessScope(large));
+        }
+        assertEquals(256,TransactionScope.MAX_SPANS);
+    }
+
     private static final class Pool implements AutoCloseable {
         final DBOptions options = new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
         final ColumnFamilyOptions plain = new ColumnFamilyOptions();

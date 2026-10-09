@@ -38,14 +38,14 @@ public final class DistributedSchemaCodec {
     }
     public static DistributedSchema decode(byte[] bytes) {
         Objects.requireNonNull(bytes);
-        if (bytes.length<HEADER_BYTES+MIN_COLUMN_BYTES || bytes.length>MAX_BYTES) throw new IllegalArgumentException("Invalid distributed schema size");
+        if (bytes.length<HEADER_BYTES || bytes.length>MAX_BYTES) throw new IllegalArgumentException("Invalid distributed schema size");
         var input=ByteBuffer.wrap(bytes);
         if (input.getInt()!=MAGIC || input.getInt()!=VERSION || input.getInt()!=DistributedSchema.PHYSICAL_KEY_CODEC_VERSION) {
             throw new IllegalArgumentException("Unsupported distributed schema/physical key codec");
         }
         UUID cluster=uuid(input), database=uuid(input), domain=uuid(input); long epoch=input.getLong();
         int prefix=input.getInt(), count=input.getInt();
-        if (epoch<0 || prefix<0 || prefix>RangeDirectoryCodec.MAX_ENCODED_BYTES || count<1 || count>RangeDirectoryCodec.MAX_COLUMNS || (long)count*MIN_COLUMN_BYTES>input.remaining()) {
+        if (epoch<0 || prefix<0 || prefix>RangeDirectoryCodec.MAX_ENCODED_BYTES || count<0 || count>RangeDirectoryCodec.MAX_COLUMNS || (long)count*MIN_COLUMN_BYTES>input.remaining()) {
             throw new IllegalArgumentException("Invalid distributed schema header bounds");
         }
         var columns=new ArrayList<DistributedSchema.Column>(count); var ids=new HashSet<Long>(); var names=new HashSet<String>(); UUID previous=null;

@@ -48,7 +48,7 @@ public final class DistributedSchema {
 
     public DistributedSchema(UUID clusterId,UUID databaseId,UUID domainId,long schemaEpoch,int routingPrefixBytes,List<Column> columns) {
         this.clusterId=Objects.requireNonNull(clusterId); this.databaseId=Objects.requireNonNull(databaseId); this.domainId=Objects.requireNonNull(domainId);
-        if (schemaEpoch<0 || routingPrefixBytes<0 || routingPrefixBytes>RangeDirectoryCodec.MAX_ENCODED_BYTES || columns.isEmpty() || columns.size()>RangeDirectoryCodec.MAX_COLUMNS) {
+        if (schemaEpoch<0 || routingPrefixBytes<0 || routingPrefixBytes>RangeDirectoryCodec.MAX_ENCODED_BYTES || columns.size()>RangeDirectoryCodec.MAX_COLUMNS) {
             throw new IllegalArgumentException("Invalid distributed schema bounds");
         }
         this.schemaEpoch=schemaEpoch; this.routingPrefixBytes=routingPrefixBytes;
