@@ -32,7 +32,7 @@ class RatisCatalogueScopeTest {
             });
             var catalogue=new RatisSchemaCatalogue(client,cluster,database,f.groupId,1,new byte[32],f.column);
             var command=catalogue.prepare(new OperationId(f.session,1,0),schema);
-            assertEquals(513,command.mutations().size()); assertEquals(513,command.predicates().size());
+            assertEquals(514,command.mutations().size()); assertEquals(514,command.predicates().size());
             byte[] frozen=DistributedCommandCodec.encode(command); assertTrue(frozen.length<=DistributedCommandCodec.MAX_ENCODED_BYTES);
             assertArrayEquals(frozen,DistributedCommandCodec.encode(DistributedCommandCodec.decode(frozen)));
             var scope=f.store.commandAccessScope(command); assertEquals(1,scope.spans().size()); assertTrue(scope.containsRange(f.column,null,null));

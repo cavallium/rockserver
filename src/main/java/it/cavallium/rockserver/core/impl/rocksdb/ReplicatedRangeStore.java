@@ -185,6 +185,7 @@ public final class ReplicatedRangeStore {
     private boolean knownSchema(byte[] digest) { return Arrays.equals(schemaDigest,digest) || schemaHistory.containsKey(schemaIdentity(digest)); }
     private byte[] schemaStateKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
     private byte[] schemaHistoryKey(UUID change) { return schemaChangeKey(0x2a,change); }
+    byte[] schemaCapacityInstalledRow(UUID change) throws RocksDBException { return db.get(state,schemaHistoryKey(change)); }
     private byte[] schemaChangeKey(int tag,UUID change) { return ByteBuffer.allocate(33).put(markerKey).put((byte)tag).putLong(change.getMostSignificantBits()).putLong(change.getLeastSignificantBits()).array(); }
     @FunctionalInterface interface SchemaMetadataReader<T> { T read() throws RocksDBException; }
     <T> T readSchemaMetadata(SchemaMetadataReader<T> reader) throws RocksDBException {
@@ -494,6 +495,7 @@ public final class ReplicatedRangeStore {
             requireActive(); ensureReceiptUsage();
             var historical=schemaInstallProofs.get(header.changeId());
             if(historical!=null) { historical.requireHeader(header); historical.requireCut(applied); advanceCompletedMarker(position); return historical.fence(); }
+            if(schemaPreparationPool!=null) schemaPreparationPool.requireCapacityFence(groupId,header);
             var proposed=new NativeSchemaFence(header,groupId,position);
             if (homeRecoveryContext!=null || snapshotHomeContext!=null || logicalSchema==null) throw new IllegalStateException("Schema fence requires qualified DATA schema");
             if (proposed.participant().rangeEpoch()!=rangeEpoch) throw new IllegalArgumentException("Schema fence participant epoch differs from ownership");
@@ -522,11 +524,19 @@ public final class ReplicatedRangeStore {
             }
             if(activeSchemaFence==null || !Arrays.equals(schemaDigest,record.definition().sourceSchema().digest()) || activeSchemaInstallation!=null && activeSchemaActivation==null) throw new IllegalStateException("INSTALL source is not pending from an activated generation");
             activeSchemaFence.requireHeader(record.definition().header()); record.requireRange(groupId,rangeEpoch,interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
-            schemaInstallationBudget(record.encode());
+            schemaInstallationBudget(record.encode().length,record.definition().changeId());
         } finally { applyLane.unlock(); leaveNative(); }
     }
-    private void schemaInstallationBudget(byte[] encoded) throws RocksDBException {
-        int count=0; long bytes=3L*encoded.length+2L*NativeSchemaActivationProof.BYTES;
+    void preflightSchemaCapacity(SchemaChange.Definition definition,int installBytes) throws RocksDBException {
+        if(ownership.get(owner).state()!=RangeOwnership.State.ACTIVE || logicalSchema==null || homeRecoveryContext!=null || snapshotHomeContext!=null || activeSchemaFence!=null || activeSchemaInstallation!=null && activeSchemaActivation==null || !Arrays.equals(schemaDigest,definition.sourceSchema().digest())) throw new IllegalStateException("Capacity admission requires active qualified source DATA");
+        var participant=definition.header().participants().stream().filter(p -> p.groupId().equals(groupId)).findFirst().orElseThrow(() -> new IllegalArgumentException("Group outside original capacity membership"));
+        var descriptor=definition.sourceDirectory().ranges().stream().filter(p -> p.groupId().equals(groupId)).findFirst().orElseThrow();
+        if(participant.rangeEpoch()!=rangeEpoch || !interval.domainId().equals(definition.sourceSchema().domainId()) || !interval.columns().equals(definition.sourceSchema().columnIds()) || !Arrays.equals(interval.lowerInclusive(),descriptor.lowerInclusive()) || !Arrays.equals(interval.upperExclusive(),descriptor.upperExclusive())) throw new IllegalArgumentException("Capacity admission differs from native source lineage/bounds");
+        schemaInstallationBudget(installBytes,definition.changeId());
+    }
+    private void schemaInstallationBudget(int encodedBytes,UUID except) throws RocksDBException {
+        int count=0; long bytes=3L*encodedBytes+2L*NativeSchemaActivationProof.BYTES;
+        if(schemaPreparationPool!=null) for(var reserved:schemaPreparationPool.outstandingCapacity(groupId,except)) { count++; bytes=Math.addExact(bytes,reserved.historyBytes()); }
         var current=db.get(state,schemaStateKey(0x28)); if(current!=null) bytes+=current.length;
         var activation=db.get(state,schemaStateKey(0x2c)); if(activation!=null) bytes+=activation.length;
         for(int tag:List.of(0x2a,0x2b)) try(var iterator=db.newIterator(state)) {
@@ -540,7 +550,7 @@ public final class ReplicatedRangeStore {
     }
 
     @FunctionalInterface interface SchemaHandles { Map<UUID,ColumnFamilyHandle> create() throws RocksDBException; }
-    NativeSchemaInstallation installSchema(NativeSchemaInstallation record,RangeOwnership.SchemaTransition transition,DistributedStoragePool.SchemaInstallObserver observer,SchemaHandles create) throws RocksDBException {
+    NativeSchemaInstallation installSchema(NativeSchemaInstallation record,RangeOwnership.SchemaTransition transition,DistributedStoragePool.SchemaInstallObserver observer,SchemaHandles create,DistributedStoragePool.CapacityTransfer capacityTransfer) throws RocksDBException {
         nativeLifecycle.writeLock().lock(); applyLane.lock();
         try {
             requireSnapshotReleaseHealthy(); if(closing) throw new IllegalStateException("Range is closing");
@@ -564,7 +574,7 @@ public final class ReplicatedRangeStore {
             byte[] encoded=record.encode(), pending=db.get(state,schemaStateKey(0x29));
             if(pending!=null && !Arrays.equals(pending,encoded)) throw new IllegalArgumentException("Different pending installation");
             if(pending==null) {
-                requireNext(record.position()); schemaInstallationBudget(encoded);
+                requireNext(record.position()); schemaInstallationBudget(encoded.length,record.definition().changeId());
                 try(var options=new WriteOptions().setDisableWAL(false).setSync(true)) { db.put(state,options,schemaStateKey(0x29),encoded); }
             }
             observer.after(DistributedStoragePool.SchemaInstallStage.INTENT);
@@ -574,7 +584,8 @@ public final class ReplicatedRangeStore {
             try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
                 batch.put(state,schemaStateKey(0x28),encoded); batch.put(state,schemaHistoryKey(record.definition().changeId()),encoded);
                 batch.delete(state,schemaStateKey(0x29)); batch.delete(state,schemaStateKey(0x2c)); batch.put(state,markerKey,encodePosition(record.position()));
-                batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),record.position())); db.write(options,batch);
+                batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),record.position())); if(capacityTransfer!=null) capacityTransfer.append(batch); db.write(options,batch);
+                if(capacityTransfer!=null) capacityTransfer.committed();
             }
             observer.after(DistributedStoragePool.SchemaInstallStage.COMMITTED);
             lease.publish();
@@ -616,7 +627,8 @@ public final class ReplicatedRangeStore {
         SchemaCaptureState(SchemaChange.Header header) { this.header=header; }
     }
     private volatile SchemaCaptureState schemaCaptureGate;
-    private DistributedStoragePool schemaPreparationPool;
+    private volatile DistributedStoragePool schemaPreparationPool;
+    boolean schemaPreparationBelongsTo(DistributedStoragePool pool) { return schemaPreparationPool==pool; }
     void configureSchemaPreparationPool(DistributedStoragePool pool) { schemaPreparationPool=pool; }
     public final class SchemaInstallCaptureGate implements AutoCloseable {
         private final SchemaCaptureState captured; private volatile boolean closed;
@@ -2734,6 +2746,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if(schemaPreparationPool!=null) schemaPreparationPool.validateSnapshotCapacity(this,image,limits);
             if(activeSchemaFence!=null || activeSchemaInstallation!=null || activeSchemaActivation!=null) {
                 var incoming=new NativeSchemaFence[1]; var incomingInstall=new NativeSchemaInstallation[1]; var incomingActivation=new NativeSchemaActivationProof[1];
                 NativeRangeImage.visit(image,limits,(section,column,key,value) -> {

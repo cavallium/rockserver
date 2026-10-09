@@ -19,6 +19,7 @@ public final class RatisSchemaAdministration {
     private final byte[] schema;
     private final Consumer<DistributedCommand> validator;
 
+    /** Domain-local consumed issuance history; the catalogue allocation counter owns global allocation. */
     public record Head(SchemaChange.Status status,long allocatedThrough) {
         public Head {
             Objects.requireNonNull(status);
@@ -59,6 +60,7 @@ public final class RatisSchemaAdministration {
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid schema change head",invalid); }
     }
     /** An identity marker is retained even after deletion, independent of outcome/receipt retention. */
+    public byte[] readAllocationCounter() throws IOException { byte[] value=read(RatisColumnAllocation.counterKey(),8); RatisColumnAllocation.counter(value); return value; }
     public byte[] readColumnIdentity(UUID id) throws IOException { return read(RatisColumnIdentities.columnKey(id),72); }
     public byte[] readApiIdentity(long id) throws IOException { return read(RatisColumnIdentities.apiKey(id),72); }
     private byte[] read(byte[] key,int maximum) throws IOException {

@@ -27,13 +27,19 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
     /** Holds no placement-creation authority itself. Clients remain borrowed; root exists on durable storage. */
     public RatisDatabaseBootstrap(Path root,RatisNodePlan plan,RaftClient catalogueClient,RatisRoutedClient routed,
             long initialTime,LongSupplier time,int maxRanges) throws IOException {
-        this(root,plan,catalogueClient,routed,null,initialTime,time,maxRanges);
+        this(root,plan,catalogueClient,routed,null,null,initialTime,time,maxRanges);
     }
-    /** Publishes and freshly verifies the exact content-bound schema before creating the directory/ledger pair. */
+    /** Initial schema bootstrap convenience: freezes an absent global allocation counter witness. */
     public RatisDatabaseBootstrap(Path root,RatisNodePlan plan,RaftClient catalogueClient,RatisRoutedClient routed,
             DistributedSchema schema,long initialTime,LongSupplier time,int maxRanges) throws IOException {
+        this(root,plan,catalogueClient,routed,schema,null,initialTime,time,maxRanges);
+    }
+    /** Publishes exact schema content with a frozen global allocation witness; reopen never reads or rebases it. */
+    public RatisDatabaseBootstrap(Path root,RatisNodePlan plan,RaftClient catalogueClient,RatisRoutedClient routed,
+            DistributedSchema schema,byte[] allocationWitness,long initialTime,LongSupplier time,int maxRanges) throws IOException {
         this.plan=Objects.requireNonNull(plan); this.routed=Objects.requireNonNull(routed); this.time=Objects.requireNonNull(time); scope=plan.directory().payloadDigest();
-        this.schema=schema; if (schema!=null) schema.requireMatches(plan.directory());
+        this.schema=schema; if (schema==null && allocationWitness!=null) throw new IllegalArgumentException("Allocation witness requires schema content");
+        RatisColumnAllocation.counter(allocationWitness); if (schema!=null) schema.requireMatches(plan.directory());
         if (initialTime<0 || plan.directory().generation()!=0 || plan.directory().ranges().size()>maxRanges || maxRanges<1 || maxRanges>RangeDirectoryCodec.MAX_RANGES) {
             throw new IllegalArgumentException("Invalid initial bootstrap scope/budget");
         }
@@ -46,7 +52,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
         try {
             try { acquired=lockChannel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Bootstrap root already owned",owned); }
             if (acquired==null) throw new IOException("Bootstrap root already owned"); lock=acquired;
-            if (schema!=null) publication=new RatisSchemaPublication(directory.resolve("schema.bin"),catalogueClient,plan,schema);
+            if (schema!=null) publication=new RatisSchemaPublication(directory.resolve("schema.bin"),catalogueClient,plan,schema,allocationWitness,Map.of(),Map.of(),Map.of());
             genesis=new RatisCatalogueGenesis(directory.resolve("genesis.bin"),catalogueClient,plan,initialTime);
             clock=new RatisCatalogueClock(directory.resolve("clock.bin"),epochs);
             Path clocks=Files.createDirectories(directory.resolve("ranges")); SessionJournalFiles.force(clocks); SessionJournalFiles.force(directory);

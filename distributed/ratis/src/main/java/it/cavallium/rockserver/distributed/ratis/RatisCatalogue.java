@@ -138,13 +138,23 @@ public final class RatisCatalogue {
     /** Combined rule: directory/session CAS, immutable schema publication or atomic genesis. Install on every catalogue replica. */
     public static Consumer<DistributedCommand> validator(UUID clusterId, UUID databaseId, UUID groupId,
             long rangeEpoch, byte[] schemaDigest, UUID directoryColumn, UUID sessionColumn) {
+        return validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,sessionColumn,
+                command -> { throw new IllegalArgumentException("Operator catalogue admission is not configured"); });
+    }
+    /** Operator publication uses a configured trusted policy and committed native chunk reader. */
+    public static Consumer<DistributedCommand> validator(UUID clusterId, UUID databaseId, UUID groupId,
+            long rangeEpoch, byte[] schemaDigest, UUID directoryColumn, UUID sessionColumn,Consumer<DistributedCommand> operators) {
         if (directoryColumn.equals(sessionColumn)) throw new IllegalArgumentException("Catalogue columns must be distinct");
+        Objects.requireNonNull(operators);
         var directory = validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         var sessions = RatisSessionEpochs.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,sessionColumn);
         var schemas = RatisSchemaCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         var administration = RatisSchemaAdministration.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
+        var allocation=RatisColumnAllocation.validator(groupId,rangeEpoch,schemaDigest,directoryColumn);
         return command -> {
-            if (RatisSchemaAdministration.isCommand(command)) administration.accept(command);
+            if (RatisOperatorCatalogue.isCommand(command)) operators.accept(command);
+            else if (RatisColumnAllocation.isAllocationCommand(command)) allocation.accept(command);
+            else if (RatisSchemaAdministration.isCommand(command)) administration.accept(command);
             else if (RatisSchemaCatalogue.isSchemaCommand(command) && command.mutations().getFirst().columnId().equals(directoryColumn)) schemas.accept(command);
             else if (command.mutations().size()==2) {
                 if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1

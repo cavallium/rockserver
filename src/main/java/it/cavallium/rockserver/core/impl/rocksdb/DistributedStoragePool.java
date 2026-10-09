@@ -72,6 +72,14 @@ public final class DistributedStoragePool implements AutoCloseable {
         Binding(String name,boolean mergeAdmitted) { this(name,mergeAdmitted,BirthKind.BOOTSTRAP,BOOTSTRAP_BIRTH); }
     }
     private boolean birthsDurable=true;
+    private static final byte[] CAPACITY_KEY="SCHEMA-CAPACITY".getBytes(StandardCharsets.US_ASCII);
+    private volatile Map<UUID,SchemaCapacityClaims.Claim> capacityClaims=Map.of();
+    private volatile boolean capacityDurable=true;
+    private volatile Map<UUID,SchemaCapacityClaims.Claim> uncertainCapacityClaims=Map.of();
+    private volatile SchemaCapacityForceObserver capacityForceObserver=(after) -> {};
+    @FunctionalInterface public interface SchemaCapacityForceObserver { void boundary(boolean afterPersistence) throws RocksDBException; }
+    public void schemaCapacityForceObserver(SchemaCapacityForceObserver observer) { capacityForceObserver=Objects.requireNonNull(observer); }
+
     private final Map<String,RocksDBObjects> columnResources=new HashMap<>();
     private final List<RocksDBObjects> quarantinedColumnResources=new ArrayList<>();
     private final class PreparedColumn implements AutoCloseable {
@@ -128,10 +136,15 @@ public final class DistributedStoragePool implements AutoCloseable {
                     ColumnFamilyHandle state=null; for(var handle:nativeHandles) if(Arrays.equals(handle.getName(),STATE_COLUMN.getBytes(StandardCharsets.US_ASCII))) state=handle;
                     if(state==null) throw new IOException("Read-only native STATE missing");
                     var births=new HashMap<UUID,Binding>();
-                    var buffer=new byte[Math.max(MAX_BINDING_BYTES,NativeSchemaInstallation.MAX_BYTES)];
+                    var buffer=new byte[Math.max(SchemaCapacityClaims.MAX_BYTES,Math.max(MAX_BINDING_BYTES,NativeSchemaInstallation.MAX_BYTES))];
                     int birthLength=db.get(state,BIRTHS_KEY,buffer);
                     if(birthLength!=org.rocksdb.RocksDB.NOT_FOUND) { if(birthLength>MAX_BINDING_BYTES) throw new IOException("Native birth metadata exceeds budget"); births.putAll(decodeBirths(Arrays.copyOf(buffer,birthLength))); }
                     if(artifacts.qualified()) for(var entry:births.entrySet()) artifacts.requireBirth(entry.getKey(),entry.getValue().name(),entry.getValue().mergeAdmitted());
+                    int capacityLength=db.get(state,CAPACITY_KEY,buffer);
+                    if(capacityLength!=org.rocksdb.RocksDB.NOT_FOUND) {
+                        if(capacityLength>SchemaCapacityClaims.MAX_BYTES) throw new IOException("Capacity registry exceeds budget");
+                        artifacts.validateCapacity(SchemaCapacityClaims.decode(Arrays.copyOf(buffer,capacityLength)).values(),plainBirths(births));
+                    }
                     var live=new HashSet<String>(); for(var name:names) live.add(new String(name,StandardCharsets.US_ASCII));
                     var key=new byte[34];
                     try(var iterator=db.newIterator(state)) {
@@ -188,9 +201,182 @@ public final class DistributedStoragePool implements AutoCloseable {
             if(fresh.contains(entry.getKey()) && old==null && handles.containsKey(name)) throw new IllegalArgumentException("CREATE cannot adopt an unbound physical CF");
             next.putIfAbsent(entry.getKey(),new Binding(name,merges.contains(entry.getKey()),fresh.contains(entry.getKey()) ? BirthKind.CREATE : BirthKind.BOOTSTRAP,fresh.contains(entry.getKey()) ? change : BOOTSTRAP_BIRTH));
         }
+        validateBirthCapacity(next,chargedCapacityClaims());
         if(next.size()>MAX_BINDINGS) throw new IllegalStateException("Native CF birth budget exhausted");
         long bytes=4; for(var binding:next.values()) bytes+=36L+binding.name().length();
         if(bytes>MAX_BINDING_BYTES) throw new IllegalStateException("Native CF birth byte budget exhausted"); return next;
+    }
+    private static Map<UUID,String> plainBirths(Map<UUID,Binding> births) {
+        var result=new HashMap<UUID,String>(); for(var entry:births.entrySet()) if(!entry.getValue().mergeAdmitted()) result.put(entry.getKey(),entry.getValue().name()); return result;
+    }
+    private void validateBirthCapacity(Map<UUID,Binding> actual,Map<UUID,SchemaCapacityClaims.Claim> claims) {
+        var combined=new HashMap<>(actual);
+        for(var claim:claims.values()) if(claim.outstanding()) for(var entry:claim.targetNames().entrySet()) {
+            var expected=new Binding(entry.getValue(),claim.targetMerges().contains(entry.getKey())); var previous=combined.putIfAbsent(entry.getKey(),expected);
+            if(previous!=null && (!previous.name().equals(expected.name()) || previous.mergeAdmitted()!=expected.mergeAdmitted()) || combined.entrySet().stream().anyMatch(other -> !other.getKey().equals(entry.getKey()) && other.getValue().name().equals(entry.getValue()))) throw new IllegalArgumentException("Column is reserved by another durable schema admission");
+        }
+        long bytes=4; for(var binding:combined.values()) bytes+=36L+binding.name().length();
+        if(combined.size()>MAX_BINDINGS || bytes>MAX_BINDING_BYTES) throw new IllegalStateException("Reserved native birth capacity exhausted");
+    }
+    private void recoverCapacityClaims() {
+        try {
+            byte[] bytes=loaded.db().get().get(handles.get(STATE_COLUMN),CAPACITY_KEY); if(bytes==null) return;
+            capacityClaims=SchemaCapacityClaims.decode(bytes); validateBirthCapacity(bindings,capacityClaims); artifacts.validateCapacity(capacityClaims.values(),plainBirths(bindings));
+            for(var claim:capacityClaims.values()) for(var entry:claim.groups().entrySet()) if(entry.getValue().state()==SchemaCapacityClaims.State.CONSUMED || entry.getValue().state()==SchemaCapacityClaims.State.RETIRED) {
+                byte[] key=ByteBuffer.allocate(33).putLong(entry.getKey().getMostSignificantBits()).putLong(entry.getKey().getLeastSignificantBits()).put((byte)0x2a).putLong(claim.definition().changeId().getMostSignificantBits()).putLong(claim.definition().changeId().getLeastSignificantBits()).array();
+                var installed=loaded.db().get().get(handles.get(STATE_COLUMN),key); if(installed==null) throw new IOException("Consumed capacity lacks original INSTALL");
+                var record=NativeSchemaInstallation.decode(installed); record.requireDefinition(claim.definition());
+                claim.requireSame(new SchemaCapacityClaims.Claim(record.definition(),record.sourceNames(),record.targetNames(),record.sourceMerges(),record.targetMerges(),Map.of()));
+            }
+        } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot recover schema capacity admissions",failure); }
+    }
+    private Map<UUID,SchemaCapacityClaims.Claim> chargedCapacityClaims() { return capacityDurable ? capacityClaims : uncertainCapacityClaims; }
+    private void forceCapacityClaims(Map<UUID,SchemaCapacityClaims.Claim> proposed) throws RocksDBException {
+        byte[] bytes=SchemaCapacityClaims.encode(proposed);
+        // Unknown completion protects the union in memory; same retry always re-forces before acknowledgement.
+        var protectedClaims=new HashMap<>(chargedCapacityClaims());
+        for(var entry:proposed.entrySet()) {
+            var old=protectedClaims.get(entry.getKey()); var next=entry.getValue();
+            if(old!=null) for(var group:old.groups().entrySet()) if(group.getValue().outstanding()) {
+                var replacement=next.groups().get(group.getKey()); if(replacement==null || !replacement.outstanding()) next=next.group(group.getKey(),group.getValue());
+            }
+            protectedClaims.put(entry.getKey(),next);
+        }
+        uncertainCapacityClaims=Map.copyOf(protectedClaims); capacityDurable=false; capacityClaims=Map.copyOf(proposed);
+        capacityForceObserver.boundary(false);
+        try(var options=new org.rocksdb.WriteOptions().setSync(true).setDisableWAL(false)) { loaded.db().get().put(handles.get(STATE_COLUMN),options,CAPACITY_KEY,bytes); }
+        capacityForceObserver.boundary(true); capacityDurable=true; uncertainCapacityClaims=Map.of();
+    }
+    List<NativeSchemaCapacityReservation> outstandingCapacity(UUID group,UUID except) {
+        var proofs=new ArrayList<NativeSchemaCapacityReservation>();
+        for(var claim:chargedCapacityClaims().values()) if(!claim.definition().changeId().equals(except)) { var member=claim.groups().get(group); if(member!=null && member.outstanding()) proofs.add(member.proof()); }
+        return List.copyOf(proofs);
+    }
+    void validateSnapshotCapacity(ReplicatedRangeStore store,Path image,NativeRangeImage.Limits limits) throws IOException,RocksDBException {
+        UUID group=store.ownership().owner().groupId(); var claims=chargedCapacityClaims();
+        var expected=new HashMap<UUID,byte[]>(); int reservedCount=0; long reservedBytes=0;
+        for(var claim:claims.values()) {
+            var member=claim.groups().get(group); if(member==null) continue;
+            if(member.outstanding()) { reservedCount++; reservedBytes=Math.addExact(reservedBytes,member.proof().historyBytes()); }
+            else if(member.state()==SchemaCapacityClaims.State.CONSUMED || member.state()==SchemaCapacityClaims.State.RETIRED) {
+                byte[] original=store.schemaCapacityInstalledRow(claim.definition().changeId());
+                if(original==null) throw new IOException("Consumed schema capacity lacks original INSTALL"); expected.put(claim.definition().changeId(),original);
+            }
+        }
+        if(reservedCount==0 && expected.isEmpty()) return;
+        int[] installedCount={0}; long[] bytes={reservedBytes}; var retained=new HashSet<UUID>();
+        NativeRangeImage.visit(image,limits,(section,column,key,value) -> {
+            if(section!=NativeRangeImage.Section.STATE) return;
+            if(key.length==17 && (key[16]==0x28 || key[16]==0x2c) || key.length==33 && (key[16]==0x2a || key[16]==0x2b)) bytes[0]=Math.addExact(bytes[0],value.length);
+            if(key.length==33 && key[16]==0x2a) {
+                installedCount[0]++; var id=new UUID(ByteBuffer.wrap(key,17,16).getLong(),ByteBuffer.wrap(key,25,8).getLong()); var original=expected.get(id);
+                if(original!=null) { if(!Arrays.equals(original,value)) throw new IOException("Snapshot changes original capacity INSTALL evidence"); retained.add(id); }
+            }
+        });
+        if(installedCount[0]+reservedCount>64 || bytes[0]>16L*1024*1024) throw new IOException("Snapshot would consume outstanding schema capacity");
+        if(!retained.containsAll(expected.keySet())) throw new IOException("Snapshot discards original capacity INSTALL evidence");
+    }
+    void requireCapacityFence(UUID group,SchemaChange.Header header) {
+        var claim=capacityClaims.get(header.changeId()); if(claim==null) return;
+        var member=claim.groups().get(group); if(member==null) throw new IllegalStateException("Group lacks original capacity admission"); member.proof().requireHeader(header);
+        if(member.state()==SchemaCapacityClaims.State.ABORTED || member.state()==SchemaCapacityClaims.State.RETIRED) throw new IllegalStateException("Schema capacity admission was authoritatively released");
+        if(!capacityDurable) throw new IllegalStateException("Capacity admission force is unresolved");
+    }
+    public NativeSchemaCapacityReservation reserveSchemaCapacity(ReplicatedRangeStore store,SchemaChange.Definition definition,Map<UUID,String> targetNames,Set<UUID> targetMerges) throws RocksDBException {
+        nativeMutation.acquireUninterruptibly();
+        try {
+            synchronized(admission) { if(closing) throw new IllegalStateException("Pool is closing"); }
+            if(!ranges.contains(store)) throw new IllegalArgumentException("Foreign range store");
+            return store.readSchemaMetadata(() -> {
+                var group=store.ownership().owner().groupId(); var previous=capacityClaims.get(definition.changeId());
+                var sourceNames=new HashMap<UUID,String>(); for(var id:definition.sourceSchema().columnIds()) sourceNames.put(id,Objects.requireNonNull(bindings.get(id)).name());
+                var candidate=new SchemaCapacityClaims.Claim(definition,sourceNames,targetNames,previous!=null && previous.groups().containsKey(group) ? previous.sourceMerges() : store.deterministicMergeColumns(),targetMerges,Map.of());
+                if(previous!=null) { previous.requireSame(candidate); var original=previous.groups().get(group); if(original!=null) { if(!capacityDurable) forceCapacityClaims(capacityClaims); return original.proof(); } }
+                store.preflightSchemaCapacity(definition,candidate.installBytes());
+                validateCapacityOptions(candidate);
+                var proof=new NativeSchemaCapacityReservation(definition.header(),group,candidate.bindingDigest(),candidate.historyBytes());
+                var next=new HashMap<>(capacityClaims); var claim=previous==null ? candidate : previous;
+                next.put(definition.changeId(),claim.group(group,new SchemaCapacityClaims.Group(proof,SchemaCapacityClaims.State.ACTIVE)));
+                SchemaCapacityClaims.encode(next); validateBirthCapacity(bindings,next);
+                try { artifacts.validateCapacity(next.values(),plainBirths(bindings)); } catch(IOException failure) { throw new IllegalStateException("Schema operator capacity qualification failed",failure); }
+                forceCapacityClaims(next); return proof;
+            });
+        } finally { nativeMutation.release(); }
+    }
+    private void validateCapacityOptions(SchemaCapacityClaims.Claim claim) {
+        var definition=claim.definition();
+        if(!claim.targetNames().keySet().equals(definition.targetSchema().columnIds()) || !claim.targetNames().keySet().containsAll(claim.targetMerges()) || new HashSet<>(claim.targetNames().values()).size()!=claim.targetNames().size()) throw new IllegalArgumentException("Capacity target physical coverage changed");
+        for(var name:claim.targetNames().values()) if(name.isEmpty() || name.length()>4096 || name.indexOf('\0')>=0 || RESERVED_COLUMNS.contains(name) || !StandardCharsets.US_ASCII.newEncoder().canEncode(name)) throw new IllegalArgumentException("Invalid capacity target name");
+        boolean qualified=artifacts.qualified() || definition.targetSchema().columns().stream().anyMatch(column -> column.operator()!=null);
+        if(qualified) {
+            if(!artifacts.qualified()) for(var name:claim.sourceNames().values()) if(loaded.mergeOperators().get(name)!=null) throw new IllegalArgumentException("Configured source operator lacks qualified artifact identity");
+            for(var column:definition.targetSchema().columns()) if(claim.targetMerges().contains(column.columnId())!=(column.operator()!=null)) throw new IllegalArgumentException("Capacity operator admission differs from schema");
+            try { artifacts.validate(definition.sourceSchema(),claim.sourceNames()); artifacts.validate(definition.targetSchema(),claim.targetNames()); }
+            catch(IOException failure) { throw new IllegalStateException("Capacity artifact qualification failed",failure); }
+        }
+        var fresh=new HashSet<>(claim.targetNames().keySet()); fresh.removeAll(claim.sourceNames().keySet()); proposedBirths(claim.targetNames(),claim.targetMerges(),definition.changeId(),fresh);
+        for(var entry:claim.targetNames().entrySet()) if(handles.containsKey(entry.getValue()) && claim.targetMerges().contains(entry.getKey()) && loaded.mergeOperators().get(entry.getValue())==null) throw new IllegalArgumentException("Capacity existing merge resource missing");
+        for(var entry:claim.targetNames().entrySet()) if(!handles.containsKey(entry.getValue())) {
+            var operator=definition.targetSchema().column(entry.getKey()).operator();
+            RocksDBLoader.OperatorResolver resolver=qualified ? ignored -> operator==null ? null : artifacts.instantiate(artifacts.require(operator)) : null;
+            try(var prepared=new PreparedColumn(entry.getValue(),resolver)) {
+                if(!qualified && prepared.options.mergeOperator()!=null) throw new UnsupportedOperationException("New configured merge CF requires trusted artifact staging");
+                if(claim.targetMerges().contains(entry.getKey())!=(prepared.options.mergeOperator()!=null)) throw new IllegalArgumentException("Capacity merge resource missing or unqualified");
+            }
+        }
+    }
+    public NativeSchemaCapacityReservation lookupSchemaCapacity(ReplicatedRangeStore store,SchemaChange.Header header) {
+        if(!store.schemaPreparationBelongsTo(this)) throw new IllegalArgumentException("Foreign range store");
+        var claim=capacityClaims.get(header.changeId()); if(claim==null) return null; var member=claim.groups().get(store.ownership().owner().groupId());
+        if(member==null) return null; member.proof().requireHeader(header); return member.proof();
+    }
+    public NativeSchemaFence applySchemaFence(ReplicatedRangeStore store,ApplyPosition position,SchemaChange.Header header,NativeSchemaCapacityReservation reservation) throws RocksDBException {
+        nativeMutation.acquireUninterruptibly();
+        try {
+            if(!ranges.contains(store)) throw new IllegalArgumentException("Foreign range store");
+            return store.readSchemaMetadata(() -> {
+                var claim=capacityClaims.get(header.changeId()); var member=claim==null ? null : claim.groups().get(store.ownership().owner().groupId());
+                if(member==null || !member.proof().equals(reservation)) throw new IllegalArgumentException("Original forced capacity admission missing"); member.proof().requireHeader(header);
+                if(store.lookupSchemaInstallation(header)!=null) return store.applySchemaFence(position,header);
+                requireCapacityFence(member.proof().participant().groupId(),header);
+                if(member.state()==SchemaCapacityClaims.State.ACTIVE) { var next=new HashMap<>(capacityClaims); next.put(header.changeId(),claim.group(member.proof().participant().groupId(),new SchemaCapacityClaims.Group(member.proof(),SchemaCapacityClaims.State.FENCED))); forceCapacityClaims(next); }
+                return store.applySchemaFence(position,header);
+            });
+        } finally { nativeMutation.release(); }
+    }
+    public void releaseSchemaCapacity(ReplicatedRangeStore store,NativeSchemaCapacityReservation reservation,SchemaCapacityRelease authority) throws RocksDBException {
+        nativeMutation.acquireUninterruptibly();
+        try {
+            if(!ranges.contains(store)) throw new IllegalArgumentException("Foreign range store");
+            store.readSchemaMetadata(() -> {
+                var claim=capacityClaims.get(reservation.changeId()); var group=store.ownership().owner().groupId(); var member=claim==null ? null : claim.groups().get(group);
+                if(member==null || !member.proof().equals(reservation)) throw new IllegalArgumentException("Capacity release identity changed");
+                SchemaCapacityClaims.State terminal;
+                if(authority.kind()==SchemaCapacityRelease.Kind.ABORTED_BEFORE_FENCING) {
+                    reservation.requireHeader(authority.status().header());
+                    if(member.state()!=SchemaCapacityClaims.State.ACTIVE && member.state()!=SchemaCapacityClaims.State.ABORTED || store.lookupSchemaFence(claim.definition().header())!=null) throw new IllegalStateException("Irreversible FENCE capacity cannot be aborted");
+                    terminal=SchemaCapacityClaims.State.ABORTED;
+                } else {
+                    var proof=store.lookupSchemaInstallation(claim.definition().header()); if(proof==null) throw new IllegalStateException("Capacity completion lacks durable original INSTALL");
+                    if(authority.kind()==SchemaCapacityRelease.Kind.INSTALLED) { authority.installation().requireHeader(claim.definition().header()); if(!proof.equals(authority.installation())) throw new IllegalArgumentException("Completion proof changed"); terminal=SchemaCapacityClaims.State.CONSUMED; }
+                    else { reservation.requireHeader(authority.status().header()); if(!Objects.equals(authority.status().installed().get(group),proof.position())) throw new IllegalArgumentException("Retirement differs from original INSTALL"); terminal=SchemaCapacityClaims.State.RETIRED; }
+                }
+                var next=new HashMap<>(capacityClaims); next.put(reservation.changeId(),claim.group(group,new SchemaCapacityClaims.Group(member.proof(),terminal))); forceCapacityClaims(next); return null;
+            });
+        } finally { nativeMutation.release(); }
+    }
+    interface CapacityTransfer { void append(org.rocksdb.WriteBatch batch) throws RocksDBException; void committed(); }
+    private CapacityTransfer capacityTransfer(ReplicatedRangeStore store,NativeSchemaInstallation record) {
+        var claim=capacityClaims.get(record.definition().changeId()); if(claim==null) return null;
+        var actual=new SchemaCapacityClaims.Claim(record.definition(),record.sourceNames(),record.targetNames(),record.sourceMerges(),record.targetMerges(),Map.of()); claim.requireSame(actual);
+        UUID group=store.ownership().owner().groupId(); var member=claim.groups().get(group);
+        if(member==null || !member.outstanding()) throw new IllegalStateException("INSTALL lacks outstanding original capacity admission");
+        var next=new HashMap<>(capacityClaims); next.put(record.definition().changeId(),claim.group(group,new SchemaCapacityClaims.Group(member.proof(),SchemaCapacityClaims.State.CONSUMED)));
+        var immutable=Map.copyOf(next); byte[] bytes=SchemaCapacityClaims.encode(next);
+        return new CapacityTransfer() {
+            public void append(org.rocksdb.WriteBatch batch) throws RocksDBException { batch.put(handles.get(STATE_COLUMN),CAPACITY_KEY,bytes); }
+            public void committed() { capacityClaims=immutable; capacityDurable=true; uncertainCapacityClaims=Map.of(); }
+        };
     }
     private void reserveBirths(Map<UUID,String> names,Set<UUID> merges,UUID change,Set<UUID> fresh) throws RocksDBException {
         var next=proposedBirths(names,merges,change,fresh);
@@ -217,6 +403,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         loaded.db().getStartupColumns().forEach((descriptor, handle) ->
                 handles.put(new String(descriptor.getName(), StandardCharsets.US_ASCII), handle));
         recoverBirths();
+        recoverCapacityClaims();
     }
 
     public static void stageOperator(Path poolPath,DistributedSchema.Operator operator,
@@ -731,9 +918,11 @@ public final class DistributedStoragePool implements AutoCloseable {
         var definition=record.definition();
         store.preflightSchemaInstallation(record);
         var transition=qualifiedSchemaTransition(definition);
+        if(!capacityDurable) forceCapacityClaims(capacityClaims);
+        var transfer=capacityTransfer(store,record);
         var fresh=new HashSet<>(definition.targetSchema().columnIds()); fresh.removeAll(definition.sourceSchema().columnIds());
         if(artifacts.qualified() || definition.targetSchema().columns().stream().anyMatch(column -> column.operator()!=null)) {
-            try { artifacts.bind(definition.sourceSchema(),record.sourceNames()); artifacts.bind(definition.targetSchema(),record.targetNames()); }
+            try { artifacts.bindPermanentPlainBirths(plainBirths(bindings)); artifacts.bind(definition.sourceSchema(),record.sourceNames()); artifacts.bind(definition.targetSchema(),record.targetNames()); }
             catch(IOException failure) { throw new IllegalStateException("Cannot publish committed native operator bindings",failure); }
         }
         reserveBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
@@ -748,7 +937,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 target.put(entry.getKey(),handle);
             }
             return target;
-        });
+        },transfer);
         for(var entry:record.targetNames().entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),record.targetMerges().contains(entry.getKey())));
         for(var id:record.sourceNames().keySet()) if(!record.targetNames().containsKey(id)) { deferredDrops.add(id); deletionOrigins.put(id,definition); }
         drainDeferredDrops(); pressureColumns=List.copyOf(handles.values()); ownership.tryCompleteSchemaTransition(transition);

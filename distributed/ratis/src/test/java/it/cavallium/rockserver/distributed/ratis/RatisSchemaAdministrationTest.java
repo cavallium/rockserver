@@ -55,7 +55,7 @@ class RatisSchemaAdministrationTest {
             byte[] byColumn=identities.readColumnIdentity(column.columnId()),byId=identities.readApiIdentity(column.apiId());
             if (byColumn!=null) columns.put(column.columnId(),byColumn); if (byId!=null) ids.put(column.apiId(),byId);
         }
-        assertEquals(CommandResult.Status.SUCCESS,schemas.execute(schemas.prepare(operation(),target,columns,ids)).status());
+        assertEquals(CommandResult.Status.SUCCESS,schemas.execute(schemas.prepare(operation(),target,identities.readAllocationCounter(),columns,ids,Map.of())).status());
     }
     RatisSchemaAdministration.Head begin(RatisSchemaAdministration admin,SchemaChange.Definition definition,RatisSchemaAdministration.Head previous) throws Exception {
         byte[] oldColumn=admin.readColumnIdentity(definition.header().changedColumnId()),oldApi=admin.readApiIdentity(definition.header().changedApiId());

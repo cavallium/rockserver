@@ -48,14 +48,19 @@ class RatisSchemaCatalogueTest {
         try (var f=outer.new Fixture(root.resolve("issuance"))) {
             var catalogue=catalogue(outer,f.client);
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(0),first)).status());
-            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(1),second)).status());
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(1),second,marker(outer,f,RatisColumnAllocation.counterKey()),Map.of(),Map.of(),Map.of())).status());
             byte[] original=marker(outer,f,RatisColumnIdentities.apiKey(8));
             assertArrayEquals(second.digest(),RatisColumnIdentities.requireOwned(original,second.domainId(),secondColumn.columnId(),8));
             for (var reused:List.of(new DistributedSchema.Column(8,new UUID(9,8),"api-reuse",secondColumn.schema(),null),
                     new DistributedSchema.Column(9,secondColumn.columnId(),"uuid-reuse",secondColumn.schema(),null))) {
                 var staged=new DistributedSchema(outer.cluster,outer.database,first.domainId(),2,0,List.of(reused));
-                var command=catalogue.prepare(new OperationId(UUID.randomUUID(),0,0),staged);
-                assertEquals(CommandResult.Status.CONFLICT,catalogue.execute(command).status()); assertNull(catalogue.read(staged.digest()));
+                if (reused.apiId()==8) {
+                    assertThrows(IllegalArgumentException.class,() -> catalogue.prepare(new OperationId(UUID.randomUUID(),0,0),staged,marker(outer,f,RatisColumnAllocation.counterKey()),Map.of(),Map.of(),Map.of()));
+                } else {
+                    var command=catalogue.prepare(new OperationId(UUID.randomUUID(),0,0),staged,marker(outer,f,RatisColumnAllocation.counterKey()),Map.of(),Map.of(),Map.of());
+                    assertEquals(CommandResult.Status.CONFLICT,catalogue.execute(command).status());
+                }
+                assertNull(catalogue.read(staged.digest()));
                 byte[] fresh=reused.apiId()==8 ? RatisColumnIdentities.columnKey(reused.columnId()) : RatisColumnIdentities.apiKey(reused.apiId());
                 assertNull(marker(outer,f,fresh),"The nonconflicting half must not be published");
                 assertArrayEquals(original,marker(outer,f,RatisColumnIdentities.apiKey(8)));
@@ -72,18 +77,18 @@ class RatisSchemaCatalogueTest {
             var uuidWitnesses=new HashMap<UUID,byte[]>(); uuidWitnesses.put(outer.data,witness.clone());
             var apiWitnesses=new HashMap<Long,byte[]>(); apiWitnesses.put(7L,witness.clone());
             Path journal=root.resolve("witnesses.bin"); byte[] frozen;
-            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,uuidWitnesses,apiWitnesses)) {
+            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,RatisColumnAllocation.counterValue(7),uuidWitnesses,apiWitnesses,Map.of())) {
                 frozen=DistributedCommandCodec.encode(publication.preparedCommand());
                 uuidWitnesses.get(outer.data)[0]^=1; apiWitnesses.clear();
                 f.writeOverride=new byte[4]; assertThrows(IOException.class,publication::execute);
                 assertArrayEquals(witness,marker(outer,f,RatisColumnIdentities.columnKey(outer.data)));
             }
             f.writeOverride=null; uuidWitnesses.put(outer.data,witness.clone()); apiWitnesses.put(7L,witness.clone());
-            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,uuidWitnesses,apiWitnesses)) {
+            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,RatisColumnAllocation.counterValue(7),uuidWitnesses,apiWitnesses,Map.of())) {
                 assertArrayEquals(frozen,DistributedCommandCodec.encode(publication.preparedCommand()));
                 assertEquals(CommandResult.Status.SUCCESS,publication.execute().status());
             }
-            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,uuidWitnesses,apiWitnesses)) {
+            try (var publication=new RatisSchemaPublication(journal,f.client,plan(outer,target),target,RatisColumnAllocation.counterValue(7),uuidWitnesses,apiWitnesses,Map.of())) {
                 long calls=f.next.get(); assertEquals(CommandResult.Status.SUCCESS,publication.execute().status()); assertEquals(calls,f.next.get());
             }
             assertArrayEquals(source.digest(),RatisColumnIdentities.requireOwned(marker(outer,f,RatisColumnIdentities.apiKey(7)),source.domainId(),outer.data,7));
@@ -95,8 +100,8 @@ class RatisSchemaCatalogueTest {
         try (var f=outer.new Fixture(root.resolve("marker-validation"))) {
             var catalogue=catalogue(outer,f.client); var valid=catalogue.prepare(outer.operation(0),schema);
             byte[] wrong=RatisColumnIdentities.value(new UUID(88,88),outer.data,7,schema.digest());
-            assertThrows(IllegalArgumentException.class,() -> catalogue.prepare(outer.operation(0),schema,Map.of(outer.data,wrong),Map.of(7L,wrong)));
-            assertThrows(IllegalArgumentException.class,() -> catalogue.prepare(outer.operation(0),schema,Map.of(outer.data,valid.mutations().get(1).value()),Map.of()));
+            assertThrows(IllegalArgumentException.class,() -> catalogue.prepare(outer.operation(0),schema,null,Map.of(outer.data,wrong),Map.of(7L,wrong),Map.of()));
+            assertThrows(IllegalArgumentException.class,() -> catalogue.prepare(outer.operation(0),schema,null,Map.of(outer.data,valid.mutations().get(1).value()),Map.of(),Map.of()));
             var validator=RatisSchemaCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
             for (int index=1;index<=2;index++) {
                 var mutations=new ArrayList<>(valid.mutations()); var original=mutations.get(index); byte[] wrongKey=original.key(); wrongKey[0]^=1;
@@ -174,7 +179,8 @@ class RatisSchemaCatalogueTest {
             }
             assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(0),
                     valid.mutations(),List.of(new KeyPredicate(outer.directoryColumn,valid.mutations().getFirst().key(),new byte[0])))));
-            assertDoesNotThrow(() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(1),valid.mutations(),valid.predicates(),0)));
+            assertDoesNotThrow(() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(1),valid.mutations(),valid.predicates(),-1)));
+            assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(1),valid.mutations(),valid.predicates(),0)));
             assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.dataGroup,1,new byte[32],outer.operation(0),valid.mutations(),valid.predicates())));
             var returning=new Mutation(Mutation.Kind.PUT,outer.directoryColumn,valid.mutations().getFirst().key(),valid.mutations().getFirst().value(),Mutation.ReturnMode.PREVIOUS);
             assertThrows(IllegalArgumentException.class,() -> validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(0),List.of(returning),valid.predicates())));
@@ -199,7 +205,7 @@ class RatisSchemaCatalogueTest {
         try (var f=outer.new Fixture(root.resolve("all-columns"))) {
             f.store.enableCatalogueScopeCompaction();
             var catalogue=catalogue(outer,f.client); var command=catalogue.prepare(outer.operation(0),schema);
-            assertEquals(513,command.mutations().size()); assertEquals(513,command.predicates().size());
+            assertEquals(514,command.mutations().size()); assertEquals(514,command.predicates().size());
             assertArrayEquals(DistributedCommandCodec.encode(command),DistributedCommandCodec.encode(DistributedCommandCodec.decode(DistributedCommandCodec.encode(command))));
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(command).status());
             for (var binding:columns) {

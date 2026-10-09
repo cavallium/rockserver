@@ -101,6 +101,24 @@ final class DistributedOperatorArtifacts {
         var next=proposed(schema,names,plain); bootstrap=identity; bindings=next; dirty=true; forceBindings();
     }
     void validate(DistributedSchema schema,Map<UUID,String> names) throws IOException { proposed(schema,names,Map.of()); }
+    void validateCapacity(Collection<SchemaCapacityClaims.Claim> claims,Map<UUID,String> permanentPlainBirths) throws IOException {
+        var next=new HashMap<>(bindings);
+        for(var entry:permanentPlainBirths.entrySet()) add(next,entry.getKey(),entry.getValue(),null);
+        for(var claim:claims) if(claim.outstanding()) {
+            for(var schema:List.of(claim.definition().sourceSchema(),claim.definition().targetSchema())) {
+                var names=schema==claim.definition().sourceSchema() ? claim.sourceNames() : claim.targetNames();
+                for(var column:schema.columns()) {
+                    var operator=column.operator()==null ? null : require(column.operator()); add(next,column.columnId(),names.get(column.columnId()),operator);
+                }
+            }
+        }
+        encodedBindings(next,bootstrap);
+    }
+    void bindPermanentPlainBirths(Map<UUID,String> births) throws IOException {
+        var next=new HashMap<>(bindings); for(var entry:births.entrySet()) add(next,entry.getKey(),entry.getValue(),null);
+        encodedBindings(next,bootstrap); if(!next.equals(bindings)) { bindings=Map.copyOf(next); dirty=true; }
+        if(dirty || !qualified()) forceBindings();
+    }
     void bind(DistributedSchema schema,Map<UUID,String> names) throws IOException {
         var next=proposed(schema,names,Map.of());
         if(!next.equals(bindings)) { bindings=next; dirty=true; }

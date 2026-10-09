@@ -154,6 +154,31 @@ class RatisDatabaseBootstrapTest {
             assertArrayEquals(new byte[]{9},logical.get(71,key).toByteArray()); assertEquals(reads,f.catalogue.reads.get());
         }
     }
+    @Test void laterDomainSchemaBootstrapUsesFrozenGlobalCounterAndPreservesHighWaterAfterReopen() throws Exception {
+        var schema=schema();
+        try (var f=new RatisSessionPropagationTest.Fixture(root,false,schema.digest())) {
+            var other=new DistributedSchema(schema.clusterId(),schema.databaseId(),new UUID(91,1),1,0,List.of(
+                    new DistributedSchema.Column(70,new UUID(91,2),"other",schema.columns().getFirst().schema(),null)));
+            assertEquals(CommandResult.Status.SUCCESS,schemas(f).execute(schemas(f).prepare(f.outer.operation(99),other)).status());
+            var allocation=new RatisColumnAllocation(f.catalogue.client,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
+            byte[] witness=allocation.readCounter(); assertEquals(70,RatisColumnAllocation.counter(witness));
+            Path journals=Files.createDirectory(root.resolve("later-domain")); byte[] frozen;
+            try (var boot=new RatisDatabaseBootstrap(journals,plan(f),f.catalogue.client,f.routed,schema,witness,10,() -> 20L,2)) {
+                assertEquals(RatisDatabaseBootstrap.Phase.SCHEMA,boot.step(2).phase());
+                f.catalogue.writeOverride=new byte[4]; assertThrows(IOException.class,() -> boot.step(1));
+                assertEquals(RatisDatabaseBootstrap.Phase.SCHEMA,boot.progress().phase()); frozen=Files.readAllBytes(journals.resolve("schema.bin"));
+                assertEquals(71,RatisColumnAllocation.counter(allocation.readCounter())); assertNotNull(schemas(f).read(schema.digest()));
+            } finally { f.catalogue.writeOverride=null; }
+            assertEquals(CommandResult.Status.SUCCESS,allocation.execute(allocation.prepare(f.outer.operation(100),new UUID(91,3),other.domainId(),new UUID(91,4),allocation.readCounter())).status());
+            assertEquals(72,RatisColumnAllocation.counter(allocation.readCounter()));
+            assertThrows(IllegalArgumentException.class,() -> new RatisDatabaseBootstrap(journals,plan(f),f.catalogue.client,f.routed,schema,allocation.readCounter(),10,() -> 20L,2),"Current counter cannot replace the journal's original witness");
+            try (var boot=new RatisDatabaseBootstrap(journals,plan(f),f.catalogue.client,f.routed,schema,witness,10,() -> 20L,2)) {
+                assertArrayEquals(frozen,Files.readAllBytes(journals.resolve("schema.bin")),"Reopen preserves the original unknown command");
+                ready(boot); assertEquals(72,RatisColumnAllocation.counter(allocation.readCounter()));
+                assertArrayEquals(DistributedSchemaCodec.encode(other),DistributedSchemaCodec.encode(schemas(f).read(other.digest())));
+            }
+        }
+    }
     @Test void identicalSchemaPublicationConflictRequiresFreshContentVerificationBeforeGenesis() throws Exception {
         var schema=schema();
         try (var f=new RatisSessionPropagationTest.Fixture(root,false,schema.digest())) {

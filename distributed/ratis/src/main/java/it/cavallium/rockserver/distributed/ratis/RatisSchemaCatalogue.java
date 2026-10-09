@@ -32,13 +32,15 @@ public final class RatisSchemaCatalogue {
         try { return decode(encoded,cluster,database,key); }
         catch (IllegalArgumentException malformed) { throw new IOException("Invalid schema catalogue content",malformed); }
     }
-    /** Prepare once; uncertain outcomes must retry these exact bytes and operation identity. */
+    /** Initial bootstrap only: assumes the global allocation counter is absent. Prepare once; uncertain outcomes must retry these exact bytes and operation identity. */
     public DistributedCommand prepare(OperationId operation,DistributedSchema schema) {
-        return prepare(operation,schema,Map.of(),Map.of());
+        return prepare(operation,schema,null,Map.of(),Map.of(),Map.of());
     }
     /** Existing markers are explicit frozen witnesses; no catalogue reads occur during preparation. */
-    public DistributedCommand prepare(OperationId operation,DistributedSchema schema,Map<UUID,byte[]> columnWitnesses,Map<Long,byte[]> apiWitnesses) {
-        Objects.requireNonNull(schema); Objects.requireNonNull(columnWitnesses); Objects.requireNonNull(apiWitnesses);
+    public DistributedCommand prepare(OperationId operation,DistributedSchema schema,byte[] allocationWitness,Map<UUID,byte[]> columnWitnesses,Map<Long,byte[]> apiWitnesses,Map<UUID,RatisColumnAllocation.Reservation> reservations) {
+        Objects.requireNonNull(schema); Objects.requireNonNull(columnWitnesses); Objects.requireNonNull(apiWitnesses); Objects.requireNonNull(reservations);
+        long allocated=RatisColumnAllocation.counter(allocationWitness);
+        if (!schema.columnIds().containsAll(reservations.keySet())) throw new IllegalArgumentException("Unrelated allocation reservations");
         byte[] encoded=DistributedSchemaCodec.encode(schema);
         if (encoded.length>MAX_SCHEMA_BYTES) throw new IllegalArgumentException("Schema exceeds publication command budget");
         if (!schema.columnIds().containsAll(columnWitnesses.keySet()) || !schema.columns().stream().map(DistributedSchema.Column::apiId).toList().containsAll(apiWitnesses.keySet())) {
@@ -53,6 +55,17 @@ public final class RatisSchemaCatalogue {
             RatisColumnIdentities.requireOwned(issued,schema.domainId(),binding.columnId(),binding.apiId());
             marker(mutations,predicates,RatisColumnIdentities.columnKey(binding.columnId()),issued,uuidWitness);
             marker(mutations,predicates,RatisColumnIdentities.apiKey(binding.apiId()),issued,apiWitness);
+        }
+        long maximum=schema.columns().stream().mapToLong(DistributedSchema.Column::apiId).max().orElse(0);
+        marker(mutations,predicates,RatisColumnAllocation.counterKey(),RatisColumnAllocation.counterValue(Math.max(allocated,maximum)),allocationWitness);
+        for (var binding:schema.columns()) {
+            var reservation=reservations.get(binding.columnId());
+            boolean needed=columnWitnesses.get(binding.columnId())==null && binding.apiId()<=allocated;
+            if (needed!=(reservation!=null)) throw new IllegalArgumentException("Missing or unrelated reservation witness");
+            if (reservation!=null) {
+                reservation.requireOwner(schema.domainId(),binding.columnId(),binding.apiId());
+                predicates.add(new KeyPredicate(column,RatisColumnAllocation.reservationKey(reservation.requestId()),reservation.encode()));
+            }
         }
         var command=new DistributedCommand(group,epoch,catalogueSchema,operation,mutations,predicates);
         validator.accept(command); return command;
@@ -83,22 +96,40 @@ public final class RatisSchemaCatalogue {
         if (epoch<0 || catalogueSchema.length!=32) throw new IllegalArgumentException("Invalid schema catalogue validator binding");
         byte[] expected=catalogueSchema.clone();
         return command -> {
-            if (command.kind()!=DistributedCommand.Kind.DATA || command.hasBucketData() || !command.groupId().equals(group) || command.rangeEpoch()!=epoch
+            if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1 || command.hasBucketData() || !command.groupId().equals(group) || command.rangeEpoch()!=epoch
                     || !Arrays.equals(command.schemaDigest(),expected) || command.mutations().isEmpty()
-                    || command.mutations().size()!=command.predicates().size()) {
+                    || command.predicates().size()<command.mutations().size()) {
                 throw new IllegalArgumentException("Schema publication requires conditional content and issuance PUTs");
             }
             var mutation=command.mutations().getFirst(); var predicate=command.predicates().getFirst(); byte[] key=mutation.key();
             requirePut(mutation,predicate,column,key);
             if (predicate.expectedValue()!=null || key.length!=33 || key[0]!=0x53) throw new IllegalArgumentException("Invalid schema content namespace/CAS");
             var schema=decode(mutation.value(),cluster,database,key);
-            if (command.mutations().size()!=1+2*schema.columns().size()) throw new IllegalArgumentException("Missing or extra column issuance markers");
+            if (command.mutations().size()!=2+2*schema.columns().size()) throw new IllegalArgumentException("Missing or extra column issuance markers");
             int index=1;
             for (var binding:schema.columns()) {
                 byte[] uuidMarker=requireMarker(command,index++,column,RatisColumnIdentities.columnKey(binding.columnId()),schema,binding);
                 byte[] apiMarker=requireMarker(command,index++,column,RatisColumnIdentities.apiKey(binding.apiId()),schema,binding);
                 if (!Arrays.equals(command.predicates().get(index-2).expectedValue(),command.predicates().get(index-1).expectedValue()) || !Arrays.equals(uuidMarker,apiMarker)) throw new IllegalArgumentException("Column UUID/API issuance markers differ");
             }
+            requirePut(command.mutations().get(index),command.predicates().get(index),column,RatisColumnAllocation.counterKey());
+            long allocated=RatisColumnAllocation.counter(command.predicates().get(index).expectedValue());
+            long maximum=schema.columns().stream().mapToLong(DistributedSchema.Column::apiId).max().orElse(0);
+            if (RatisColumnAllocation.counter(command.mutations().get(index).value())!=Math.max(allocated,maximum)) throw new IllegalArgumentException("Publication changed global allocation high water");
+            int reservationIndex=index+1,markerIndex=1;
+            var requests=new HashSet<UUID>();
+            for (var binding:schema.columns()) {
+                boolean newlyIssued=command.predicates().get(markerIndex).expectedValue()==null; markerIndex+=2;
+                if (newlyIssued && binding.apiId()<=allocated) {
+                    if (reservationIndex>=command.predicates().size()) throw new IllegalArgumentException("Consumed ID lacks reservation");
+                    var reservationPredicate=command.predicates().get(reservationIndex++); byte[] reservationKey=reservationPredicate.key();
+                    if (reservationPredicate.bucket() || !reservationPredicate.columnId().equals(column) || reservationKey.length!=17 || reservationKey[0]!=RatisColumnAllocation.RESERVATION_TAG) throw new IllegalArgumentException("Invalid reservation predicate");
+                    var in=ByteBuffer.wrap(reservationKey); in.get(); var request=new UUID(in.getLong(),in.getLong());
+                    if (!requests.add(request)) throw new IllegalArgumentException("Duplicate reservation witness");
+                    RatisColumnAllocation.Reservation.decode(request,reservationPredicate.expectedValue()).requireOwner(schema.domainId(),binding.columnId(),binding.apiId());
+                }
+            }
+            if (reservationIndex!=command.predicates().size()) throw new IllegalArgumentException("Extra reservation predicates");
         };
     }
     private static void requirePut(Mutation mutation,KeyPredicate predicate,UUID column,byte[] key) {
