@@ -54,6 +54,96 @@ class CompactionIoIntegrationTest {
             assertEquals(value, api.get(0, api.getColumnId("data"), key, RequestType.current()));
         }
     }
+    private long persistedReadahead(Path dbPath) throws Exception {
+        try (var files = Files.list(dbPath)) {
+            var latest = files.filter(p -> p.getFileName().toString().startsWith("OPTIONS-"))
+                    .max(java.util.Comparator.comparingLong(p -> Long.parseLong(p.getFileName().toString().substring(8))))
+                    .orElseThrow();
+            var line = Files.readAllLines(latest).stream().map(String::strip)
+                    .filter(l -> l.startsWith("compaction_readahead_size=")).findFirst().orElseThrow();
+            return Long.parseLong(line.substring(line.indexOf('=') + 1));
+        }
+    }
+
+    @Test @Timeout(60) void liveReadaheadReadbackUsedByNewDirectCompaction(@TempDir Path root) throws Exception {
+        var cfg = config(root, "database.global.use-direct-io=true\n");
+        var lastKey = new Keys(Buf.wrap(new byte[]{15, (byte) 255}));
+        Buf lastValue = null;
+        var dbPath = root.resolve("live-readahead");
+        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        try (var connection = new EmbeddedConnection(dbPath, "live-readahead", cfg)) {
+            var internal = connection.getInternalDB();
+            ((io.micrometer.core.instrument.composite.CompositeMeterRegistry) internal.getMetricsRegistry()).add(registry);
+            var dbField = internal.getClass().getDeclaredField("db"); dbField.setAccessible(true);
+            var nativeDb = ((it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB) dbField.get(internal)).get();
+            var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
+            var options = (org.rocksdb.DBOptions) optionsField.get(internal);
+            assertTrue(options.useDirectReads());
+            assertFalse(options.allowMmapReads());
+            var apply = internal.getClass().getDeclaredMethod("applyCompactionReadahead", long.class);
+            apply.setAccessible(true);
+            assertEquals(0, persistedReadahead(dbPath));
+            int jobs = options.maxBackgroundJobs();
+            long walLimit = options.maxTotalWalSize();
+            try (var statistics = options.statistics()) {
+                long before = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES).getCount();
+                assertEquals(1L << 20, apply.invoke(internal, 1L << 20));
+                assertEquals(1L << 20, persistedReadahead(dbPath));
+                assertEquals(walLimit, options.maxTotalWalSize());
+                assertEquals(jobs, options.maxBackgroundJobs());
+                var api = connection.getSyncApi(RequestContext.batch());
+                var column = api.createColumn("prefetch-data", ColumnSchema.of(IntList.of(2), ObjectList.of(), true));
+                var random = new java.util.Random(7);
+                for (int i = 0; i < 4096; i++) {
+                    var data = new byte[1024]; random.nextBytes(data);
+                    var value = Buf.wrap(data);
+                    api.put(0, column, new Keys(Buf.wrap(new byte[]{(byte) (i >>> 8), (byte) i})), value, RequestType.none());
+                    if (i == 4095) lastValue = value;
+                    if ((i + 1) % 1024 == 0) api.flush();
+                }
+                api.compact();
+                assertTrue(statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES).getCount() > before,
+                        "a new direct compaction must use the changed prefetch option");
+                assertEquals(lastValue, api.get(0, column, lastKey, RequestType.current()));
+                var collectorField = internal.getClass().getDeclaredField("rocksDBStatistics"); collectorField.setAccessible(true);
+                var threadField = collectorField.get(internal).getClass().getDeclaredField("executor"); threadField.setAccessible(true);
+                var collector = (Thread) threadField.get(collectorField.get(internal));
+                var counter = registry.get("rocksdb.statistics").tag("ticker_name", "COMPACT_READ_BYTES").counter();
+                var compactionCount = registry.get("rocksdb.statistics").tag("histogram_name", "COMPACTION_TIME")
+                        .tag("field", "count").gauge();
+                long readBytes = statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES);
+                assertTrue(readBytes > 0, "the cumulative contract must cover actual direct compaction bytes");
+                for (int cycle = 0; cycle < 2; cycle++) {
+                    collector.interrupt();
+                    assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                        while (counter.count() < readBytes || compactionCount.value() == 0) Thread.sleep(10);
+                    });
+                    assertEquals(readBytes, statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES));
+                    assertEquals(readBytes, counter.count(), "collection must export actual bytes exactly once without resetting them");
+                }
+                statistics.reset(); collector.interrupt();
+                assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                    while (compactionCount.value() != 0) Thread.sleep(10);
+                });
+                lastValue = Buf.wrap(new byte[2048]);
+                api.put(0, column, lastKey, lastValue, RequestType.none()); api.flush(); api.compact();
+                long freshBytes = statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES);
+                assertTrue(freshBytes > 0); collector.interrupt();
+                assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                    while (counter.count() < readBytes + freshBytes) Thread.sleep(10);
+                });
+                assertEquals(freshBytes, statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES));
+                assertEquals(readBytes + freshBytes, counter.count(), "a genuine reset starts a fresh exported epoch");
+                assertEquals(0L, apply.invoke(internal, 0L));
+                assertEquals(0, persistedReadahead(dbPath));
+            }
+        } finally { registry.close(); }
+        try (var connection = new EmbeddedConnection(dbPath, "live-readahead-reopen", cfg)) {
+            var api = connection.getSyncApi(RequestContext.batch());
+            assertEquals(lastValue, api.get(0, api.getColumnId("prefetch-data"), lastKey, RequestType.current()));
+        }
+    }
+
     @Test void healthyNativeSamplerReadsL0FilesAndPollsWithoutFailures(@TempDir Path root) throws Exception {
         var cfg = config(root, "database.metrics.jmx.enabled=false\n"
                 + "database.metrics.influx.enabled=false\n");
@@ -243,6 +333,34 @@ class CompactionIoIntegrationTest {
             assertNotNull(reopened.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10))));
         }
     }
+    @Test void effectiveDirectReadGateIgnoresGenericDirectWritesAndHonorsExplicitZero(@TempDir Path root) throws Exception {
+        for (boolean direct : new boolean[]{false, true}) {
+            for (String ceiling : new String[]{"0", "16MiB"}) {
+                var cfg = config(root, "database.global.use-direct-io=" + direct
+                        + "\ndatabase.global.allow-rocksdb-memory-mapping=false"
+                        + "\ndatabase.global.adaptive-compaction-readahead-max-size=" + ceiling + "\n");
+                try (var connection = new EmbeddedConnection(root.resolve("gate" + direct + ceiling), "direct-gate", cfg)) {
+                    var internal = connection.getInternalDB();
+                    var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
+                    var options = (org.rocksdb.DBOptions) optionsField.get(internal);
+                    assertEquals(direct, options.useDirectReads());
+                    assertTrue(options.useDirectIoForFlushAndCompaction(), "generic direct write mode does not establish direct reads");
+                    var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
+                    var controller = controllerField.get(internal);
+                    var budgetField = controller.getClass().getDeclaredField("budget"); budgetField.setAccessible(true);
+                    var ceilingField = it.cavallium.rockserver.core.impl.CompactionIoBudget.class.getDeclaredField("readaheadCeiling");
+                    ceilingField.setAccessible(true);
+                    assertEquals(direct && !ceiling.equals("0") ? 16L << 20 : 0,
+                            ceilingField.getLong(budgetField.get(controller)));
+                    assertEquals(0, registryValue(internal, "rockserver.compaction.io.readahead"));
+                }
+            }
+        }
+    }
+    private double registryValue(it.cavallium.rockserver.core.impl.EmbeddedDB db, String meter) {
+        return db.getMetricsRegistry().get(meter).gauge().value();
+    }
+
     @Test void ttlDefaultsExplicitPolicyAndNativeLimiterOptions(@TempDir Path root) throws Exception {
         for (String ttl : new String[]{"", "PT0S", "PT48H"}) {
             var cfg = config(root, ttl.isEmpty() ? "" : "database.global.fallback-column-options.compaction-ttl=" + ttl);
@@ -343,7 +461,8 @@ class CompactionIoIntegrationTest {
     @Test void invalidTtlAndDisabledNativeProtectionsAreRejected(@TempDir Path root) throws Exception {
         for (String policy : new String[]{"fallback-column-options.compaction-ttl=PT-1S",
                 "fallback-column-options.compaction-ttl=PT1.5S", "disable-auto-compactions=true",
-                "disable-write-slowdown=true", "max-background-jobs=0", "fallback-column-options.disable-auto-compactions=true"}) {
+                "disable-write-slowdown=true", "max-background-jobs=0", "fallback-column-options.disable-auto-compactions=true",
+                "adaptive-compaction-readahead-max-size=17MiB", "adaptive-compaction-readahead-max-size=-1B"}) {
             var cfg = config(root, "database.global." + policy);
             assertThrows(RocksDBException.class, () -> RocksDBLoader.load(root.resolve("invalid"),
                     ConfigParser.parse(cfg), LoggerFactory.getLogger(getClass())), policy);

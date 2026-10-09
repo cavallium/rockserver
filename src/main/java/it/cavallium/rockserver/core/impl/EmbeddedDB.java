@@ -668,6 +668,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				compactionReadaheadBytes = 16 * SizeUnit.MB;
 				writableFileMaxBufferBytes = 8 * SizeUnit.MB;
 			}
+			if (globalConfig.adaptiveCompactionIo()) {
+				compactionReadaheadBytes = dbOptions.useDirectReads() && !dbOptions.allowMmapReads()
+						? java.util.Optional.ofNullable(globalConfig.adaptiveCompactionReadaheadMaxSize())
+								.map(it.cavallium.rockserver.core.config.DataSize::longValue)
+								.orElse(CompactionIoBudget.MAX_READAHEAD_BYTES) : 0;
+			}
 			int maxBackgroundJobs;
 			var configuredMaxBgJobs = globalConfig.maxBackgroundJobs();
 			if (configuredMaxBgJobs != null && configuredMaxBgJobs >= 0) {
@@ -838,8 +844,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		loadTimer.record(Duration.between(beforeLoad, afterLoad));
 		if (loadedDb.compactionIoLimiter() != null) {
 			try {
+				long readaheadCeiling;
+				try {
+					readaheadCeiling = dbOptions.useDirectReads() && !dbOptions.allowMmapReads()
+							? java.util.Optional.ofNullable(config.global().adaptiveCompactionReadaheadMaxSize())
+									.map(it.cavallium.rockserver.core.config.DataSize::longValue)
+									.orElse(CompactionIoBudget.MAX_READAHEAD_BYTES) : 0;
+				} catch (org.github.gestalt.config.exceptions.GestaltException failure) {
+					throw new RuntimeException("Failed to read adaptive readahead ceiling", failure);
+				}
 				compactionIoController = new CompactionIoController(name, loadedDb.compactionIoLimiter(),
-						() -> sampleCompactionIo(loadedDb.compactionIoLimiter()), metrics.getRegistry());
+						() -> sampleCompactionIo(loadedDb.compactionIoLimiter()), metrics.getRegistry(),
+						readaheadCeiling, this::applyCompactionReadahead);
 			} catch (RuntimeException | Error failure) {
 				try { close(); } catch (Throwable cleanupFailure) { failure.addSuppressed(cleanupFailure); }
 				throw failure;
@@ -3077,6 +3093,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private long applyCompactionReadahead(long bytes) {
+		ops.beginOp();
+		try {
+			var nativeDb = db.get();
+			nativeDb.setDBOptions(org.rocksdb.MutableDBOptions.builder().setCompactionReadaheadSize(bytes).build());
+			// Successful JNI acknowledgement; the public options getter cannot parse absolute path values.
+			return bytes;
+		} catch (org.rocksdb.RocksDBException failure) {
+			throw new RuntimeException("Failed to apply compaction readahead", failure);
+		} finally { ops.endOp(); }
+	}
+
 	@VisibleForTesting
 	public void setCompactionIoSampleObserverForTesting(@Nullable Runnable observer) {
 		compactionIoSampleObserver = observer;
@@ -3115,6 +3143,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			try (var statistics = dbOptions.statistics()) {
 				var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.READ_BLOCK_GET_MICROS);
+				var compactionReads = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_MICROS);
+				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
 				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
 						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
 				boolean foregroundPending = ops.getPendingOpsCount() > 1;
@@ -3125,7 +3155,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						limiter.getTotalBytesThrough(), background, pressure, stopped, complete,
 						foregroundPending,
 						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ)
-								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure);
+								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure,
+						statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES),
+						compactionReads.getSum(), compactionReads.getCount(), prefetch.getCount(), prefetch.getSum());
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {

@@ -29,9 +29,23 @@ class CompactionIoBudgetTest {
         assertEquals(750_000, t.policy.budget());
         assertEquals(SEED, t.policy.shutdownBudget());
         t.window(10, 80, 750_000); t.window(10, 80, 750_000);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "one beneficial window is not sustained evidence");
+        t.window(10, 80, 750_000);
         assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
         assertEquals(750_000, t.policy.budget());
     }
+    @Test void transientProbeBenefitThenReboundRestoresPriorRateImmediately() {
+        var t = new Trace();
+        t.window(10, 100, SEED);
+        t.window(10, 80, 750_000); // discarded settling window
+        t.window(10, 80, 750_000); // first qualifying benefit
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        assertEquals(100, t.policy.baselineReadMicros(), "one transient benefit cannot lower the baseline");
+        t.window(10, 120, 750_000);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(SEED, t.policy.budget(), "rebound must restore now, not after the cooldown");
+    }
+
     @Test void probeExpiresWhenMissesOrBackgroundWorkDisappear() {
         for (boolean noBackground : new boolean[]{false, true}) {
             var t = new Trace(); t.window(10, 100, SEED);
@@ -170,7 +184,7 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
         var idle = new Trace();
         idle.window(10, 100, SEED);
-        idle.window(10, 80, 750_000); idle.window(10, 80, 750_000);
+        idle.window(10, 80, 750_000); idle.window(10, 80, 750_000); idle.window(10, 80, 750_000);
         assertEquals(80, idle.policy.baselineReadMicros());
         for (int second = 0; second < 20; second++) idle.poll(10, 20, SEED, false, false);
         assertEquals(80, idle.policy.baselineReadMicros(), "uncorroborated block I/O must not pollute a calibrated baseline");

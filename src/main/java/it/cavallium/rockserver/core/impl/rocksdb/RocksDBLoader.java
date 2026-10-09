@@ -719,6 +719,12 @@ public class RocksDBLoader {
         RocksDBObjects refs,
         Logger logger) {
         try {
+            var readahead = databaseOptions.global().adaptiveCompactionReadaheadMaxSize();
+            if (readahead != null && (readahead.longValue() < 0
+                    || readahead.longValue() > it.cavallium.rockserver.core.impl.CompactionIoBudget.MAX_READAHEAD_BYTES)) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "adaptive-compaction-readahead-max-size must be between 0 and 16MiB");
+            }
             // Resolve all cache budgets before allocating native resources.
             var cacheBudgets = resolveCacheBudgets(databaseOptions.global());
             double highPriorityPoolRatio = resolveBlockCacheHighPriorityRatio(databaseOptions.global());

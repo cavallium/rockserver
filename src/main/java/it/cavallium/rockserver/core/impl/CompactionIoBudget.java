@@ -4,11 +4,20 @@ package it.cavallium.rockserver.core.impl;
 public final class CompactionIoBudget {
     public static final long MIN_BYTES_PER_SECOND = 4096 * 10; // one aligned page per 100ms refill
     public static final long MAX_BYTES_PER_SECOND = Long.MAX_VALUE / 1_000_000;
+    public static final long MAX_READAHEAD_BYTES = 16L << 20;
     public enum State { BOOTSTRAP, TRACKING, PROBE, RECOVERY }
     public record Sample(long nanos, long readCount, long readMicros, long bytes,
                          boolean background, boolean pressure, boolean stopped, boolean valid,
                          boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
-                         boolean urgentPressure) {
+                         boolean urgentPressure, long compactionReadBytes, long compactionReadMicros,
+                         long compactionReadCount, long prefetchCount, long prefetchBytes) {
+        public Sample(long nanos, long readCount, long readMicros, long bytes,
+                      boolean background, boolean pressure, boolean stopped, boolean valid,
+                      boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
+                      boolean urgentPressure) {
+            this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure, 0, 0, 0, 0, 0);
+        }
         public Sample(long nanos, long readCount, long readMicros, long bytes,
                       boolean background, boolean pressure, boolean stopped, boolean valid,
                       boolean foregroundPending, long foregroundCompletions, boolean recoveryClear) {
@@ -20,25 +29,63 @@ public final class CompactionIoBudget {
             this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid, false, 0, !pressure && !stopped);
         }
     }
-    private final long seed;
+    private final long seed, readaheadCeiling;
+    private volatile long readaheadBytes;
+    private long appliedReadahead, readWindowNanos, compactionBytes, compactionMicros, compactionReads,
+            prefetchEvents, prefetchedBytes, settleUntil, probeHoldUntil;
+    private double serviceRate, prefetchMean, priorPrefetchMean;
+    private long priorReadahead;
+    private int reliableGrowthWindows;
+    private boolean readWindowTracking = true, foregroundHealthy, readaheadSettling, readaheadUnknown,
+            previousReadWindowReliable, prefetchPopulationStable;
     private volatile long budget;
     private volatile long shutdownBudget;
     private volatile State state = State.BOOTSTRAP;
     private Sample previous;
     private long windowNanos, reads, micros, bytes;
-    private boolean background, pressuredWindow, pendingForeground, noProgressProbeUsed;
+    private boolean background, pressuredWindow, readaheadPressure, pendingForeground, noProgressProbeUsed;
     private long completions;
     private volatile double baseline;
     private double recentAchieved, lastAchieved;
     private long preThrottle, probeBudget;
     private double probeLatency, probeAchieved, probeForegroundRate;
-    private int settle, cooldown, healthyRecovery;
+    private int settle, cooldown, healthyRecovery, probeBenefits;
+    private double firstProbeBenefitLatency;
 
-    public CompactionIoBudget(long seed) {
+    public CompactionIoBudget(long seed) { this(seed, 0); }
+    public CompactionIoBudget(long seed, long readaheadCeiling) {
+        if (readaheadCeiling < 0 || readaheadCeiling > MAX_READAHEAD_BYTES) {
+            throw new IllegalArgumentException("Readahead ceiling must be between 0 and 16MiB");
+        }
+        this.readaheadCeiling = readaheadCeiling;
         this.seed = bound(seed);
         budget = shutdownBudget = this.seed;
     }
     public long budget() { return budget; }
+    public long readaheadBytes() { return readaheadBytes; }
+    void readaheadApplied(long bytes) {
+        if (bytes < 0 || bytes > readaheadCeiling) throw new IllegalArgumentException("Invalid applied readahead");
+        if (bytes != appliedReadahead || readaheadUnknown) {
+            priorReadahead = appliedReadahead;
+            priorPrefetchMean = prefetchMean;
+            settleUntil = previous.nanos + 60_000_000_000L;
+            probeHoldUntil = previous.nanos + 180_000_000_000L;
+            readaheadSettling = true;
+            clearReadWindow();
+        }
+        appliedReadahead = readaheadBytes = bytes;
+        readaheadUnknown = false;
+    }
+    void readaheadApplyFailed() {
+        // Native installation can precede a failing OPTIONS write. Force a conservative correction, even from cached 0.
+        readaheadBytes = 0;
+        if (!readaheadUnknown) {
+            settleUntil = previous.nanos + 60_000_000_000L;
+            probeHoldUntil = previous.nanos + 180_000_000_000L;
+        }
+        readaheadUnknown = readaheadSettling = true;
+        clearReadWindow();
+    }
     public double baselineReadMicros() { return baseline; }
     public long shutdownBudget() { return shutdownBudget; }
     public State state() { return state; }
@@ -47,7 +94,7 @@ public final class CompactionIoBudget {
     }
     private void clearWindow() {
         windowNanos = reads = micros = bytes = completions = 0;
-        background = pressuredWindow = pendingForeground = false;
+        background = pressuredWindow = readaheadPressure = pendingForeground = false;
     }
 
     public long sample(Sample sample) {
@@ -73,12 +120,16 @@ public final class CompactionIoBudget {
             if (state == State.PROBE) finishProbe(false, 0);
             if (state == State.RECOVERY) healthyRecovery = 0;
             clearWindow();
+            clearReadWindow();
+            foregroundHealthy = false;
             return publishBudget();
         }
         long elapsed = sample.nanos - old.nanos;
+        observeReadService(sample, old, elapsed);
         long completed = sample.readCount - old.readCount;
         long transferred = sample.bytes - old.bytes;
         pressuredWindow |= nativePressure;
+        readaheadPressure |= sample.pressure || old.pressure;
         pendingForeground |= sample.foregroundPending;
         long completedActions = sample.foregroundCompletions - old.foregroundCompletions;
         if (completedActions > 0) noProgressProbeUsed = false;
@@ -94,10 +145,15 @@ public final class CompactionIoBudget {
         double foregroundRate = completions * (1_000_000_000d / windowNanos);
         boolean active = background && bytes > 0;
         boolean pressureInWindow = pressuredWindow;
+        boolean readaheadPressureInWindow = readaheadPressure;
         boolean noForegroundProgress = pendingForeground && completions == 0;
         long completedInWindow = completions;
         boolean foregroundIdle = !pendingForeground;
+        foregroundHealthy = active && Double.isFinite(latency) && latency > 0 && baseline > 0
+                && latency <= baseline * 1.2 && !readaheadPressureInWindow;
         clearWindow();
+        readWindowTracking &= foregroundHealthy;
+        evaluateReadService(sample);
         if (state == State.RECOVERY) {
             if (achieved > 0) recentAchieved = recentAchieved == 0 ? achieved : recentAchieved * .5 + achieved * .5;
             if (pressureInWindow) {
@@ -111,9 +167,12 @@ public final class CompactionIoBudget {
         lastAchieved = active ? achieved : 0;
         if (state == State.PROBE) {
             if (--settle > 0) return publishBudget();
-            finishProbe(active && Double.isFinite(latency) && latency > 0 && latency <= probeLatency * .9
+            boolean benefit = active && Double.isFinite(latency) && latency > 0 && latency <= probeLatency * .9
                     && probeAchieved > 0 && achieved <= probeAchieved * .9
-                    && foregroundRate >= probeForegroundRate * .9, latency);
+                    && foregroundRate >= probeForegroundRate * .9;
+            if (!benefit) finishProbe(false, latency);
+            else if (++probeBenefits >= 2) finishProbe(true, Math.max(firstProbeBenefitLatency, latency));
+            else firstProbeBenefitLatency = latency;
             return publishBudget();
         }
         if (!active) {
@@ -145,10 +204,10 @@ public final class CompactionIoBudget {
             return publishBudget();
         }
         if (baseline == 0) baseline = latency;
-        if (cooldown == 0) {
+        if (cooldown == 0 && !rateProbeBlocked()) {
             beginProbe(latency, foregroundRate);
         } else {
-            cooldown--;
+            if (cooldown > 0) cooldown--;
             if (latency < baseline * 1.2) {
                 baseline = baseline * .9 + latency * .1;
                 if (achieved >= budget * .8) {
@@ -158,7 +217,87 @@ public final class CompactionIoBudget {
         }
         return publishBudget();
     }
+    private long admissionReadaheadLimit() {
+        long bytes = Math.min(readaheadCeiling, budget / 10) / 4096 * 4096;
+        return bytes < 65536 ? 0 : bytes;
+    }
+    private void clearReadWindow() {
+        readWindowNanos = compactionBytes = compactionMicros = compactionReads = prefetchEvents = prefetchedBytes = 0;
+        readWindowTracking = true;
+        reliableGrowthWindows = 0;
+        previousReadWindowReliable = prefetchPopulationStable = false;
+    }
+    private boolean rateProbeBlocked() {
+        if (!readaheadSettling && !readaheadUnknown) return false;
+        if (previous.nanos >= probeHoldUntil) return false;
+        return previous.nanos < settleUntil || !prefetchPopulationStable;
+    }
+    private void observeReadService(Sample sample, Sample old, long elapsed) {
+        if (readaheadCeiling == 0) return;
+        if (sample.compactionReadBytes < old.compactionReadBytes || sample.compactionReadMicros < old.compactionReadMicros
+                || sample.compactionReadCount < old.compactionReadCount || sample.prefetchCount < old.prefetchCount
+                || sample.prefetchBytes < old.prefetchBytes || sample.compactionReadBytes < 0
+                || sample.compactionReadMicros < 0 || sample.compactionReadCount < 0
+                || sample.prefetchCount < 0 || sample.prefetchBytes < 0) {
+            clearReadWindow(); serviceRate = 0;
+            return;
+        }
+        readWindowNanos += elapsed;
+        compactionBytes += sample.compactionReadBytes - old.compactionReadBytes;
+        compactionMicros += sample.compactionReadMicros - old.compactionReadMicros;
+        compactionReads += sample.compactionReadCount - old.compactionReadCount;
+        prefetchEvents += sample.prefetchCount - old.prefetchCount;
+        prefetchedBytes += sample.prefetchBytes - old.prefetchBytes;
+        readWindowTracking &= state == State.TRACKING && !sample.pressure && !old.pressure;
+    }
+    private void evaluateReadService(Sample sample) {
+        if (readWindowNanos < 30_000_000_000L) return;
+        long events = prefetchEvents;
+        double mean = events > 0 ? (double) prefetchedBytes / events : 0;
+        double rawRate = compactionMicros > 0 ? compactionBytes * (1_000_000d / compactionMicros) : 0;
+        boolean reliable = compactionReads >= 32 && compactionBytes > 0 && rawRate > 0 && Double.isFinite(rawRate);
+        boolean tracking = readWindowTracking && foregroundHealthy;
+        readWindowNanos = compactionBytes = compactionMicros = compactionReads = prefetchEvents = prefetchedBytes = 0;
+        readWindowTracking = true;
+        if (!reliable) {
+            reliableGrowthWindows = 0;
+            previousReadWindowReliable = prefetchPopulationStable = false;
+            return;
+        }
+        prefetchPopulationStable = previousReadWindowReliable
+                && Math.abs(mean - prefetchMean) <= Math.max(4096, prefetchMean * .25);
+        previousReadWindowReliable = true;
+        // Summed reader time avoids concurrency inflating the estimate. Bound upward innovations, not safety decreases.
+        serviceRate = serviceRate == 0 ? rawRate : serviceRate * .8 + Math.min(rawRate, serviceRate * 1.25) * .2;
+        prefetchMean = mean;
+        if (readaheadSettling && !readaheadUnknown && sample.nanos >= settleUntil) {
+            boolean effect = appliedReadahead == 0 ? events == 0
+                    : priorReadahead == 0 ? events >= 32 && mean > 0
+                    : events >= 32 && (appliedReadahead > priorReadahead
+                            ? mean >= priorPrefetchMean + (appliedReadahead - priorReadahead) * .5
+                            : mean <= priorPrefetchMean - (priorReadahead - appliedReadahead) * .5);
+            if (effect) readaheadSettling = false;
+        }
+        if (state == State.PROBE || readaheadUnknown) { reliableGrowthWindows = 0; return; }
+        // 100ms estimated reader service and admission bounds, with 25% headroom BEFORE the operator ceiling.
+        long usable = (long) Math.min(MAX_READAHEAD_BYTES,
+                Math.min(Math.min(serviceRate, rawRate), budget) / 12.5);
+        long target = Math.min(readaheadCeiling / 4096 * 4096, Long.highestOneBit(usable));
+        if (target < 65536) target = 0;
+        if (target < readaheadBytes && (target == 0 || target <= readaheadBytes * .75)) {
+            readaheadBytes = target;
+            reliableGrowthWindows = 0;
+        } else if (tracking && state == State.TRACKING && !readaheadSettling && target > readaheadBytes) {
+            if (++reliableGrowthWindows >= 2) {
+                readaheadBytes = Math.min(target, readaheadBytes == 0 ? 65536 : readaheadBytes * 2);
+                reliableGrowthWindows = 0;
+            }
+        } else reliableGrowthWindows = 0;
+    }
     private long publishBudget() {
+        // Freeze the second actuator during a rate probe. Its admission-time target can temporarily be exceeded;
+        // physical bytes remain charged/chunked, and existing job buffers never had instantaneous resizing guarantees.
+        if (state != State.PROBE) readaheadBytes = Math.min(readaheadBytes, admissionReadaheadLimit());
         shutdownBudget = bound(Math.max(Math.max(seed, budget),
                 Math.max(Math.max(preThrottle, probeBudget), recentAchieved)));
         return budget;
@@ -172,6 +311,7 @@ public final class CompactionIoBudget {
         probeBudget = 0;
         state = State.TRACKING;
         cooldown = 12;
+        clearReadWindow();
     }
     private void beginProbe(double latency, double foregroundRate) {
         long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
@@ -188,5 +328,7 @@ public final class CompactionIoBudget {
         budget = candidate;
         state = State.PROBE;
         settle = 2;
+        probeBenefits = 0;
+        clearReadWindow();
     }
 }

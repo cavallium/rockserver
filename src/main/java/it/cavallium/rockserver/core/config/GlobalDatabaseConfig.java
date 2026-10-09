@@ -68,6 +68,8 @@ public interface GlobalDatabaseConfig {
 
 	boolean adaptiveCompactionIo() throws GestaltException;
 
+	@Nullable DataSize adaptiveCompactionReadaheadMaxSize() throws GestaltException;
+
 	boolean disableAutoCompactions() throws GestaltException;
 
 	boolean disableWriteSlowdown() throws GestaltException;
