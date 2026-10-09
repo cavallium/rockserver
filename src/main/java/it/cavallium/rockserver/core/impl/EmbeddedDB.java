@@ -5932,7 +5932,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				}
 				createdReadOptions = newReadOptions("exists-multi-read-options");
 				createdReadOptions.setDeadline(deadlineMicros);
-				createdReadOptions.setFillCache(false);
+				// Bounded point lookups should warm SST metadata; data admission also uses the existing bounded cache.
+				createdReadOptions.setFillCache(true);
 				if (createdSnapshot != null) {
 					createdReadOptions.setSnapshot(createdSnapshot);
 				}
