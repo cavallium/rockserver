@@ -75,7 +75,10 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
         group=select(snapshot,p -> p.captureToken()==null || home.progress(p.route().groupId()).capture()==null);
         if (group==null) return transition(snapshot,home.complete(),Action.COMPLETED,null);
         var progress=snapshot.participant(group);
-        if (progress.capture()==null) journal.freezeCapture(data.prepareSnapshotCapture(data.snapshotTarget(home.fence(),group),Objects.requireNonNull(captureIds.get()),ttl));
+        if (progress.capture()==null) {
+            var target=data.snapshotTarget(home.fence(),group); var id=Objects.requireNonNull(captureIds.get());
+            journal.freezeCapture(journal.mode()==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED ? data.prepareWritableSnapshotCapture(target,id,ttl) : data.prepareSnapshotCapture(target,id,ttl));
+        }
         final SnapshotFenceStatus.Capture token;
         try { token=journal.executeCapture(group); }
         catch (RatisSnapshotLostException lost) { return transition(journal.snapshot(),home.abort(),Action.ABORTED,group); }

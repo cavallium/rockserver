@@ -20,7 +20,11 @@ public final class RatisTransactionPlan {
     private final RangeDirectory directory;
     private final OperationId operation;
     private final List<Partition> partitions;
-    private RatisTransactionPlan(RangeDirectory directory,OperationId operation,List<Partition> partitions) { this.directory=directory; this.operation=operation; this.partitions=List.copyOf(partitions); }
+    private record CapturedCut(RangeDescriptor route,TransactionScope scope,ScopedTransactionRpc.Handle handle) {}
+    private final Map<UUID,CapturedCut> captures;
+    private RatisTransactionPlan(RangeDirectory directory,OperationId operation,List<Partition> partitions,Map<UUID,CapturedCut> captures) {
+        this.directory=directory; this.operation=operation; this.partitions=List.copyOf(partitions); this.captures=Map.copyOf(captures);
+    }
     public RangeDirectory directory() { return directory; }
     public OperationId operation() { return operation; }
     public List<Partition> partitions() { return partitions; }
@@ -30,9 +34,42 @@ public final class RatisTransactionPlan {
         return create(directory,operation,plan.mutations(),plan.predicates());
     }
     public static RatisTransactionPlan create(RangeDirectory directory,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) {
+        return create(directory,operation,mutations,predicates,Map.of());
+    }
+    /** Every participant in the consistent original read projection must certify, including groups with no writes. */
+    public static RatisTransactionPlan captured(RangeDirectory directory,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,RatisDurableSnapshot.Snapshot snapshot) {
+        Objects.requireNonNull(directory); Objects.requireNonNull(snapshot);
+        var home=snapshot.observedHome(); var fence=snapshot.initial().fence();
+        if (snapshot.captureMode()!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED || snapshot.releaseRequested()
+                || home==null || home.phase()!=SnapshotFenceStatus.Phase.COMPLETE || !home.fence().equals(fence)
+                || directory.generation()!=fence.directoryGeneration() || directory.schemaEpoch()!=fence.schemaEpoch()
+                || !directory.clusterId().equals(fence.clusterId()) || !directory.databaseId().equals(fence.databaseId())
+                || !directory.domainId().equals(fence.domainId()) || !Arrays.equals(directory.schemaDigest(),fence.schemaDigest())) throw new IllegalArgumentException("Transaction requires a complete original writable snapshot projection");
+        var captures=new HashMap<UUID,CapturedCut>();
+        if (snapshot.participants().size()!=fence.participants().size()) throw new IllegalArgumentException("Incomplete original read projection");
+        for (var progress:snapshot.participants()) {
+            var route=progress.route(); var participant=fence.participant(route.groupId()); var request=progress.capture(); var token=progress.captureToken(); var handle=progress.certifiedHandle();
+            if (request==null || token==null || handle==null || progress.captureLost() || progress.captureReleased() || progress.captureReleaseLost()
+                    || progress.releaseReceipt()==null || progress.nativeGate()==null || !progress.releaseReceipt().equals(progress.nativeGate().released())
+                    || !progress.nativeGate().fence().equals(fence) || !token.equals(home.progress(route.groupId()).capture())
+                    || request.request().mode()!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED || !request.request().fence().equals(fence)
+                    || !request.request().owner().equals(token.ownerIncarnation()) || !request.request().snapshotId().equals(token.snapshotId())
+                    || !handle.owner().equals(token.ownerIncarnation()) || !handle.position().equals(token.position())) throw new IllegalArgumentException("Writable participant lacks its original released-gate capture and handle");
+            var current=directory.ranges().stream().filter(r -> r.groupId().equals(route.groupId())).findFirst().orElseThrow();
+            var target=request.target().descriptor();
+            if (!route.equals(current) || !target.groupId().equals(route.groupId()) || !target.rangeId().equals(route.rangeId()) || target.rangeEpoch()!=route.rangeEpoch()
+                    || !Arrays.equals(target.lowerInclusive(),route.lowerInclusive()) || !Arrays.equals(target.upperExclusive(),route.upperExclusive())
+                    || !route.rangeId().equals(participant.rangeId()) || route.rangeEpoch()!=participant.rangeEpoch()
+                    || participant.scope().participants(directory,SnapshotFence.MAX_PARTICIPANTS).size()!=1) throw new IllegalArgumentException("Original read projection changed route");
+            if (captures.putIfAbsent(route.groupId(),new CapturedCut(target,participant.scope(),handle))!=null) throw new IllegalArgumentException("Duplicate captured participant");
+        }
+        return create(directory,operation,mutations,predicates,captures);
+    }
+    private static RatisTransactionPlan create(RangeDirectory directory,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,Map<UUID,CapturedCut> captures) {
         Objects.requireNonNull(directory); Objects.requireNonNull(operation); mutations=List.copyOf(mutations); predicates=List.copyOf(predicates);
-        if (mutations.isEmpty() && predicates.isEmpty() || (long)mutations.size()+predicates.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Invalid global transaction input count");
+        if (captures.isEmpty() && mutations.isEmpty() && predicates.isEmpty() || (long)mutations.size()+predicates.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Invalid global transaction input count");
         var groups=new TreeMap<UUID,Builder>(); int returned=0; long[] bodyBytes={0};
+        for (var cut:captures.values()) group(groups,cut.route());
         for (var mutation:mutations) {
             if (mutation.kind()==Mutation.Kind.DELETE_RANGE) {
                 for (var route:directory.intersect(mutation.columnId(),mutation.key(),mutation.value(),false)) {
@@ -50,15 +87,22 @@ public final class RatisTransactionPlan {
             requireBytes(bodyBytes[0]); group(groups,directory.route(predicate.columnId(),predicate.key())).predicates.add(predicate);
         }
         var partitions=new ArrayList<Partition>(); long bytes=0;
+        if (!captures.isEmpty() && !groups.keySet().equals(captures.keySet())) throw new IllegalArgumentException("Writes or predicates extend beyond the original read projection");
         for (var group:groups.values()) {
-            var command=new DistributedCommand(group.route.groupId(),group.route.rangeEpoch(),directory.schemaDigest(),operation,group.mutations,group.predicates);
+            var cut=captures.get(group.route.groupId());
+            var command=cut!=null && group.mutations.isEmpty() && group.predicates.isEmpty()
+                    ? DistributedCommand.readCertification(group.route.groupId(),group.route.rangeEpoch(),directory.schemaDigest(),operation,
+                            new TransactionAcceptance(cut.handle().position(),cut.handle().generation(),cut.handle().owner(),cut.scope(),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()))
+                    : new DistributedCommand(group.route.groupId(),group.route.rangeEpoch(),directory.schemaDigest(),operation,group.mutations,group.predicates);
             bytes+=DistributedCommandCodec.encodedSize(command); if (bytes>MAX_BYTES) throw new IllegalArgumentException("Global transaction exceeds byte budget");
             var spans=new ArrayList<TransactionScope.Span>();
             for (var mutation:group.mutations) spans.add(mutation.kind()==Mutation.Kind.DELETE_RANGE ? TransactionScope.Span.range(mutation.columnId(),mutation.key(),mutation.value()) : TransactionScope.Span.point(mutation.columnId(),mutation.key()));
             for (var predicate:group.predicates) spans.add(TransactionScope.Span.point(predicate.columnId(),predicate.key()));
-            partitions.add(new Partition(group.route,command,new TransactionScope(spans),group.returns));
+            var scope=cut==null ? new TransactionScope(spans) : cut.scope();
+            for (var span:spans) if (!(span.isPoint() ? scope.contains(span.columnId(),span.lowerInclusive()) : scope.containsRange(span.columnId(),span.lowerInclusive(),span.upperExclusive()))) throw new IllegalArgumentException("Writes or predicates extend beyond the original captured scope");
+            partitions.add(new Partition(group.route,command,scope,group.returns));
         }
-        return new RatisTransactionPlan(directory,operation,partitions);
+        return new RatisTransactionPlan(directory,operation,partitions,captures);
     }
     private static void requireBytes(long bytes) { if (bytes>MAX_BYTES) throw new IllegalArgumentException("Global transaction exceeds byte budget"); }
     private static void addMutation(Builder group,Mutation mutation,long[] bytes) {
@@ -81,14 +125,29 @@ public final class RatisTransactionPlan {
     public Accepted accept(UUID transaction,Map<UUID,DistributedCommand> accepted,Map<UUID,OperationId> prepares,Map<UUID,OperationId> finalizes,Map<UUID,UUID> captureIds) {
         return accept(transaction,accepted,prepares,finalizes,Map.copyOf(captureIds),true);
     }
+    public Accepted acceptCaptured(UUID transaction,Map<UUID,DistributedCommand> accepted,Map<UUID,OperationId> prepares,Map<UUID,OperationId> finalizes) {
+        if (captures.isEmpty()) throw new IllegalStateException("Plan has no original captured projection");
+        var ids=new HashMap<UUID,UUID>(); captures.forEach((group,cut) -> ids.put(group,cut.handle().id()));
+        return accept(transaction,accepted,prepares,finalizes,ids,true);
+    }
     private Accepted accept(UUID transaction,Map<UUID,DistributedCommand> accepted,Map<UUID,OperationId> prepares,Map<UUID,OperationId> finalizes,Map<UUID,UUID> captureIds,boolean remote) {
         Objects.requireNonNull(transaction); var groups=new HashSet<UUID>(); partitions.forEach(p -> groups.add(p.route().groupId()));
+        if (!captures.isEmpty() && (!remote || captures.entrySet().stream().anyMatch(e -> !e.getValue().handle().id().equals(captureIds.get(e.getKey()))))) throw new IllegalArgumentException("Acceptance must retain every original captured handle");
         if (remote && !groups.equals(captureIds.keySet())) throw new IllegalArgumentException("Incomplete original remote capture set");
         if (!groups.equals(accepted.keySet()) || !groups.equals(prepares.keySet()) || !groups.equals(finalizes.keySet())) throw new IllegalArgumentException("Incomplete accepted transaction/control set");
         var intents=new ArrayList<RatisDurableTransaction.Intent>(); var participants=new ArrayList<TransactionStatus.Participant>();
+        long acceptedBytes=0;
         for (var partition:partitions) {
             var route=partition.route(); var plan=Objects.requireNonNull(accepted.get(route.groupId()));
-            if (plan.acceptance()==null || !Arrays.equals(DistributedCommandCodec.encode(plan),DistributedCommandCodec.encode(DistributedCommand.acceptedTransaction(partition.command(),plan.acceptance())))) throw new IllegalArgumentException("Accepted transaction partition changed original business plan");
+            var expected=partition.command().readCertification() ? partition.command() : plan.acceptance()==null ? null : DistributedCommand.acceptedTransaction(partition.command(),plan.acceptance());
+            if (expected==null || !Arrays.equals(DistributedCommandCodec.encode(plan),DistributedCommandCodec.encode(expected))) throw new IllegalArgumentException("Accepted transaction partition changed original business plan");
+            var cut=captures.get(route.groupId());
+            if (cut!=null) {
+                var audit=plan.acceptance();
+                if (!audit.snapshot().equals(cut.handle().position()) || audit.leaderGeneration()!=cut.handle().generation() || !audit.ownerIncarnation().equals(cut.handle().owner())
+                        || !Arrays.equals(ScopedTransactionRpc.scopeBytes(audit.scope()),ScopedTransactionRpc.scopeBytes(cut.scope()))) throw new IllegalArgumentException("Acceptance changed the original complete read cut");
+                acceptedBytes+=DistributedCommandCodec.encodedSize(plan); requireBytes(acceptedBytes);
+            }
             if (!partition.scope().spans().stream().allMatch(span -> span.isPoint() ? plan.acceptance().scope().contains(span.columnId(),span.lowerInclusive()) : plan.acceptance().scope().containsRange(span.columnId(),span.lowerInclusive(),span.upperExclusive()))) throw new IllegalArgumentException("Accepted snapshot omitted transaction inputs");
             intents.add(new RatisDurableTransaction.Intent(route,plan,prepares.get(route.groupId()),finalizes.get(route.groupId()),partition.resultPositions(),captureIds.get(route.groupId())));
             participants.add(new TransactionStatus.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),plan.payloadDigest(),null,false));

@@ -119,6 +119,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             var current=binding; if (current==null) throw new RatisSnapshotLostException("Original snapshot capture vector is unavailable"); return current.owners();
         }
         private ReadBinding binding(RatisDurableSnapshot.Snapshot saved) throws IOException {
+            if (saved.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IOException("Read-only client cannot acquire writable snapshot journal");
             if (saved.releaseRequested() || saved.observedHome()==null || saved.observedHome().phase()!=SnapshotFenceStatus.Phase.COMPLETE) throw new RatisSnapshotLostException("Snapshot has no usable COMPLETE image");
             var owners=new ArrayList<RatisLogicalSnapshotPages.Owner>();
             for (var p:saved.participants()) {
@@ -145,6 +146,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
             return new OperationId(last.sessionId(),last.epoch(),last.sequence()+1);
         }
         private void validateIdentity(RatisDurableSnapshot candidate) throws IOException {
+            if (candidate.mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IOException("Read-only client cannot acquire writable snapshot journal");
             var saved=candidate.snapshot(); var fence=saved.initial().fence();
             if (!fence.clusterId().equals(schema.clusterId()) || !fence.databaseId().equals(schema.databaseId()) || !fence.domainId().equals(schema.domainId()) || fence.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(fence.schemaDigest(),schema.digest())) throw new IOException("Snapshot journal schema differs from this client");
             var first=fence.participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow(); new Identity(fence.fenceId(),fence.operation(),first);

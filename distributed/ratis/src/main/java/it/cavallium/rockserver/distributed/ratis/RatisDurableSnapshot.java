@@ -14,10 +14,10 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private static final long MAX_ROUTES=16L*1024*1024;
     private static final int MAGIC=0x53534a4c;
     public record ParticipantProgress(RangeDescriptor route,boolean installFrozen,RatisSnapshotRecord.Result installReceipt,
-            SnapshotGate nativeGate,ApplyPosition readyProof,RatisRoutedClient.PreparedSnapshotCapture capture,SnapshotFenceStatus.Capture captureToken,
+            SnapshotGate nativeGate,ApplyPosition readyProof,RatisRoutedClient.PreparedSnapshotCapture capture,SnapshotFenceStatus.Capture captureToken,ScopedTransactionRpc.Handle certifiedHandle,
             boolean captureLost,boolean captureReleased,boolean captureReleaseLost,boolean releaseFrozen,ApplyPosition releaseReceipt,SnapshotFenceProof retirementProof) {}
     public record Snapshot(SnapshotFenceStatus initial,SnapshotFenceStatus observedHome,RatisRoutedClient.PreparedCommand pendingHome,
-            CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,List<ParticipantProgress> participants,SnapshotHomeFenceProof homeRetirementProof,boolean releaseRequested,Duration requestedTtl) {
+            CommandResult homeResult,boolean homeSuperseded,OperationId lastHome,List<ParticipantProgress> participants,SnapshotHomeFenceProof homeRetirementProof,boolean releaseRequested,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode captureMode) {
         public ParticipantProgress participant(UUID group) { return participants.stream().filter(p -> p.route().groupId().equals(group)).findFirst().orElseThrow(); }
     }
     private static final class Entry {
@@ -28,9 +28,10 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         ApplyPosition ready,releaseReceipt;
         RatisRoutedClient.PreparedSnapshotCapture capture;
         SnapshotFenceStatus.Capture token;
+        ScopedTransactionRpc.Handle certifiedHandle;
         SnapshotFenceProof retirementProof;
         Entry(RangeDescriptor route) { this.route=route; }
-        ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,captureLost,captureReleased,captureReleaseLost,releaseFrozen,releaseReceipt,retirementProof); }
+        ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,certifiedHandle,captureLost,captureReleased,captureReleaseLost,releaseFrozen,releaseReceipt,retirementProof); }
     }
     private final Path path;
     private final RatisSnapshotFences homes;
@@ -46,17 +47,26 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private CommandResult homeResult;
     private SnapshotHomeFenceProof homeRetirementProof;
     private Duration requestedTtl;
+    private RatisSnapshotCaptureRequest.Mode captureMode;
     private boolean homeSuperseded,active,closed,fenced,reclaimed,releaseRequested;
 
     public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes) throws IOException {
-        return create(path,homes,data,initial,registration,routes,null);
+        return create(path,homes,data,initial,registration,routes,null,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
     }
     public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl) throws IOException {
-        requireTtl(requestedTtl);
+        return create(path,homes,data,initial,registration,routes,requestedTtl,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
+    }
+    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
+            RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
+        return create(path,homes,data,initial,registration,routes,null,mode);
+    }
+    public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
+            RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
+        requireTtl(requestedTtl); Objects.requireNonNull(mode);
         var journal=new RatisDurableSnapshot(path,homes,data,true);
-        journal.requestedTtl=requestedTtl;
+        journal.requestedTtl=requestedTtl; journal.captureMode=mode;
         try {
             journal.initial=Objects.requireNonNull(initial);
             if (initial.phase()!=SnapshotFenceStatus.Phase.INSTALLING || initial.generation()!=0) throw new IllegalArgumentException("Snapshot journal requires initial INSTALLING definition");
@@ -95,7 +105,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     synchronized void requireClients(RatisSnapshotFences expectedHomes,RatisRoutedClient expectedData) throws IOException {
         requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,Objects.requireNonNull(expectedData).sessionIdentityDigest())) throw new IllegalArgumentException("Snapshot clients differ from journal binding");
     }
-    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof,releaseRequested,requestedTtl); }
+    public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof,releaseRequested,requestedTtl,captureMode); }
+    public synchronized RatisSnapshotCaptureRequest.Mode mode() throws IOException { requireOpen(); return captureMode; }
     /** Explicit whole-lease release direction, forced once before any remote cleanup. */
     public synchronized void requestRelease() throws IOException {
         requireOpen(); if (active) throw new IOException("Snapshot journal RPC already active");
@@ -208,7 +219,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         } finally { end(); }
     }
     public synchronized void freezeCapture(RatisRoutedClient.PreparedSnapshotCapture operation) throws IOException {
-        if (Objects.requireNonNull(operation).request().mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IllegalArgumentException("Immutable snapshot journal requires read-only capture");
+        if (Objects.requireNonNull(operation).request().mode()!=captureMode) throw new IllegalArgumentException("Capture differs from frozen snapshot mode");
         idle(); if (requestedTtl!=null && !requestedTtl.equals(operation.request().ttl())) throw new IllegalArgumentException("Capture lifetime differs from frozen requested TTL");
         var target=operation.target(); var entry=entry(target.descriptor().groupId());
         if (entry.captureLost || entry.captureReleaseFrozen) throw new RatisSnapshotLostException("Capture was lost or explicitly released");
@@ -225,21 +236,25 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         Entry entry;
         synchronized (this) { idle(); entry=entry(group); if (entry.capture==null) throw new IllegalStateException("Capture is not frozen"); if (entry.captureLost || entry.captureReleaseFrozen) throw new RatisSnapshotLostException("Capture was lost or explicitly released"); active=true; }
         try {
-            final SnapshotFenceStatus.Capture token;
-            try { token=data.executeSnapshotCapture(entry.capture); }
+            final RatisSnapshotCaptureRequest.Result captured;
+            try { captured=readCapture(entry); }
             catch (IOException failure) {
                 if (failure instanceof RatisSnapshotLostException || failure.getCause() instanceof IllegalArgumentException) { synchronized (this) { entry.captureLost=true; persist(); } throw new RatisSnapshotLostException("Frozen owner capture lost or changed",failure); }
                 throw failure;
             }
             synchronized (this) {
-                var request=entry.capture.request(); var homeToken=observed==null ? null : observed.progress(group).capture();
+                var token=captured.token(); var request=entry.capture.request(); var homeToken=observed==null ? null : observed.progress(group).capture();
                 if (!token.ownerIncarnation().equals(request.owner()) || !token.snapshotId().equals(request.snapshotId()) || entry.ready==null || !atLeast(token.position(),entry.ready)
-                        || entry.token!=null && !entry.token.equals(token) || homeToken!=null && !homeToken.equals(token)) {
+                        || entry.token!=null && !entry.token.equals(token) || entry.certifiedHandle!=null && !entry.certifiedHandle.equals(captured.handle()) || homeToken!=null && !homeToken.equals(token)) {
                     entry.captureLost=true; persist(); throw new RatisSnapshotLostException("Capture token changed its frozen identity/cut");
                 }
-                if (entry.token==null) { entry.token=token; persist(); } return token;
+                if (entry.token==null) { entry.token=token; entry.certifiedHandle=captured.handle(); persist(); } return token;
             }
         } finally { end(); }
+    }
+    private RatisSnapshotCaptureRequest.Result readCapture(Entry entry) throws IOException {
+        return captureMode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED ? data.executeWritableSnapshotCapture(entry.capture)
+                : new RatisSnapshotCaptureRequest.Result(data.executeSnapshotCapture(entry.capture),null);
     }
     public enum CaptureReleaseProgress { RECOVERED, RELEASED, LOST }
     /** One owner RPC per call: recover an unknown original token after HOME consumption, then explicitly release it. */
@@ -260,11 +275,11 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         try {
             try {
                 if (recover) {
-                    var token=data.executeSnapshotCapture(entry.capture);
+                    var captured=readCapture(entry); var token=captured.token();
                     synchronized (this) {
                         var request=entry.capture.request(); var homeToken=observed==null ? null : observed.progress(group).capture();
                         if (!token.ownerIncarnation().equals(request.owner()) || !token.snapshotId().equals(request.snapshotId()) || entry.ready==null || !atLeast(token.position(),entry.ready) || homeToken!=null && !homeToken.equals(token)) throw new IOException("Recovered capture token changed its original identity/cut");
-                        entry.token=token; persist(); return CaptureReleaseProgress.RECOVERED;
+                        entry.token=token; entry.certifiedHandle=captured.handle(); persist(); return CaptureReleaseProgress.RECOVERED;
                     }
                 }
                 data.releaseSnapshot(entry.capture.target(),entry.token);
@@ -455,7 +470,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             routes+=SessionWindowJournal.routeSize(entry.route)+futureRoute(entry.route);
         }
         if (routes>MAX_ROUTES) throw new IOException("Snapshot frozen/future routes exceed aggregate budget");
-        long reserve=initial.fence().encode().length+routes+65536L+entries.size()*1024L;
+        long reserve=initial.fence().encode().length+routes+65536L+entries.size()*(1024L+ScopedTransactionRpc.HANDLE_BYTES+1);
         if (reserve+32>MAX_BYTES) throw new IOException("Snapshot future persistence capacity unavailable");
     }
     private static long futureRoute(RangeDescriptor route) { return 60L+(route.lowerInclusive()==null ? 0 : route.lowerInclusive().length)+(route.upperExclusive()==null ? 0 : route.upperExclusive().length)+RangeDirectoryCodec.MAX_REPLICAS*(57L+128+256); }
@@ -475,7 +490,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private static byte[] project(byte[] value,int prefix) { if (value==null || prefix==0) return value; if (value.length<prefix) throw new IllegalArgumentException("Snapshot scope key shorter than projection"); return Arrays.copyOf(value,prefix); }
     /** The definition occurs once; home images and per-group native/request proofs contain only compact progress. */
     private byte[] encode() throws IOException {
-        var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(MAGIC); out.write(identity); out.write(homeIdentity);
+        var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(MAGIC); out.write(identity); out.write(homeIdentity); out.writeByte(captureMode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? 0 : 1);
         blob(out,initial.fence().encode()); route(out,homeRoute); operation(out,lastHome); status(out,observed);
         route(out,pending.descriptor()); var command=pending.command(); uuid(out,command.mutations().getFirst().columnId()); out.write(command.schemaDigest()); operation(out,command.operationId()); out.writeLong(command.acknowledgedThrough());
         status(out,expected(pending)); status(out,next(pending)); out.writeByte(homeResult==null ? 0 : homeResult.status().ordinal()+1); out.writeBoolean(homeSuperseded);
@@ -491,7 +506,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 var target=entry.capture.target(); boolean original=entry.route.equals(target.descriptor()); out.writeByte(original ? 1 : 2); if (!original) route(out,target.descriptor());
                 out.writeInt(target.descriptor().replicas().indexOf(target.replica())); uuid(out,target.incarnation()); uuid(out,entry.capture.request().snapshotId()); out.writeLong(entry.capture.request().ttl().toMillis());
             }
-            token(out,entry.token); out.writeBoolean(entry.captureLost); out.writeBoolean(entry.captureReleaseFrozen); out.writeBoolean(entry.captureReleased); out.writeBoolean(entry.captureReleaseLost); out.writeBoolean(entry.releaseFrozen); position(out,entry.releaseReceipt);
+            token(out,entry.token); out.writeBoolean(entry.certifiedHandle!=null); if (entry.certifiedHandle!=null) { var handle=ByteBuffer.allocate(ScopedTransactionRpc.HANDLE_BYTES); ScopedTransactionRpc.writeHandle(handle,entry.certifiedHandle); out.write(handle.array()); } out.writeBoolean(entry.captureLost); out.writeBoolean(entry.captureReleaseFrozen); out.writeBoolean(entry.captureReleased); out.writeBoolean(entry.captureReleaseLost); out.writeBoolean(entry.releaseFrozen); position(out,entry.releaseReceipt);
             out.writeBoolean(entry.retirementProof!=null); if (entry.retirementProof!=null) { out.writeLong(entry.retirementProof.minimumEpoch()); positionValue(out,entry.retirementProof.position()); }
         }
         out.writeBoolean(releaseRequested); out.writeLong(requestedTtl==null ? -1 : requestedTtl.toMillis());
@@ -502,6 +517,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             var in=ByteBuffer.wrap(body); if (in.getInt()!=MAGIC) throw new IOException("Invalid snapshot journal format");
             byte[] bound=new byte[32],homeBound=new byte[32]; in.get(bound).get(homeBound);
             if (!Arrays.equals(bound,identity) || !Arrays.equals(homeBound,homeIdentity)) throw new IOException("Snapshot journal client identity changed");
+            int mode=in.get() & 255; if (mode>1) throw new IOException("Invalid frozen snapshot capture mode"); captureMode=mode==0 ? RatisSnapshotCaptureRequest.Mode.READ_ONLY : RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED;
             initial=SnapshotFenceStatus.begin(SnapshotFence.decode(blob(in,SnapshotFence.MAX_BYTES))); homeRoute=SessionWindowJournal.route(in); lastHome=operation(in); observed=status(in);
             if (observed!=null) monotone(initial,observed);
             var pendingRoute=SessionWindowJournal.route(in); requireLineage(homeRoute,pendingRoute); UUID column=uuid(in); byte[] schema=new byte[32]; in.get(schema); var operation=operation(in); long ack=in.getLong();
@@ -519,9 +535,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 if (capture!=0) {
                     var captureRoute=capture==1 ? entry.route : SessionWindowJournal.route(in); requireLineage(entry.route,captureRoute); int member=in.getInt();
                     if (member<0 || member>=captureRoute.replicas().size()) throw new IOException("Invalid frozen capture member"); var owner=uuid(in); var snapshot=uuid(in); long ttl=in.getLong();
-                    var target=data.restoreSnapshotTarget(initial.fence(),captureRoute,captureRoute.replicas().get(member),owner); entry.capture=data.prepareSnapshotCapture(target,snapshot,Duration.ofMillis(ttl));
+                    var target=data.restoreSnapshotTarget(initial.fence(),captureRoute,captureRoute.replicas().get(member),owner); entry.capture=data.restoreSnapshotCapture(target,new RatisSnapshotCaptureRequest(initial.fence(),owner,snapshot,Duration.ofMillis(ttl),captureMode));
                 }
-                entry.token=token(in); entry.captureLost=flag(in); entry.captureReleaseFrozen=flag(in); entry.captureReleased=flag(in); entry.captureReleaseLost=flag(in); entry.releaseFrozen=flag(in); entry.releaseReceipt=position(in);
+                entry.token=token(in); entry.certifiedHandle=flag(in) ? ScopedTransactionRpc.readHandle(in) : null; entry.captureLost=flag(in); entry.captureReleaseFrozen=flag(in); entry.captureReleased=flag(in); entry.captureReleaseLost=flag(in); entry.releaseFrozen=flag(in); entry.releaseReceipt=position(in);
                 if (flag(in)) mergeRetirement(entry,new SnapshotFenceProof(initial.fence(),entry.route.groupId(),in.getLong(),positionValue(in)));
                 validateEntry(entry);
             }
@@ -537,6 +553,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         if (ttl!=null && (ttl.isNegative() || ttl.isZero() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis())))) throw new IllegalArgumentException("Requested snapshot TTL must be 1..60000 whole milliseconds");
     }
     private void validateEntry(Entry entry) throws IOException {
+        if (entry.capture!=null && entry.capture.request().mode()!=captureMode || captureMode==RatisSnapshotCaptureRequest.Mode.READ_ONLY && entry.certifiedHandle!=null
+                || captureMode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED && (entry.token==null)!=(entry.certifiedHandle==null)) throw new IOException("Saved capture differs from frozen snapshot mode");
+        if (entry.certifiedHandle!=null && (!entry.certifiedHandle.owner().equals(entry.token.ownerIncarnation()) || !entry.certifiedHandle.position().equals(entry.token.position()))) throw new IOException("Certified handle differs from original capture owner/cut");
         if (entry.captureReleased && entry.captureReleaseLost || entry.captureReleaseLost && !entry.captureLost) throw new IOException("Contradictory capture release settlement");
         if (entry.captureReleaseFrozen && (entry.capture==null || !entry.captureLost || entry.token==null && !captureRecoveryAllowed()) || (entry.captureReleased || entry.captureReleaseLost) && !entry.captureReleaseFrozen || entry.captureReleased && entry.token==null) throw new IOException("Capture release lacks its exact frozen target/token");
         if (entry.installReceipt!=null && !entry.installFrozen) throw new IOException("INSTALL receipt lacks frozen request");

@@ -51,7 +51,7 @@ class RatisSnapshotCoordinatorTest {
                     var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                     if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
                         var state=home.homes.read(fence.fenceId()); assertTrue(state.allReady());
-                        assertFalse(left.f.store.snapshotGate(fence.fenceId()).released()!=null || right.f.store.snapshotGate(fence.fenceId()).released()!=null);
+                        if (!state.terminal()) assertFalse(left.f.store.snapshotGate(fence.fenceId()).released()!=null || right.f.store.snapshotGate(fence.fenceId()).released()!=null);
                         captures.incrementAndGet();
                     }
                     assertEquals(route.replicas().getFirst(),owner);

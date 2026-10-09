@@ -102,8 +102,18 @@ does not establish complete distributed API parity or production acceptance.
   Immutable snapshot operations reject writable tokens; immutable journals reject
   writable requests before saving or dispatching them. Leadership/history loss
   invalidates certification without opening a replacement cut.
-  Public cross-group writable coordination and its durable journal remain unfinished;
-  immutable snapshot leases cannot be promoted after capture.
+  The durable snapshot journal now freezes READ_ONLY or WRITE_CERTIFIED before its
+  first HOME write, forces a writable token and scoped handle together, and restores
+  the same request, owner, cut and handle after reopen. Unknown-reply cleanup retains
+  that mode when recovering its original capture. The immutable client rejects a
+  writable journal before remote dispatch; immutable leases cannot be promoted.
+  `RatisTransactionPlan.captured` requires COMPLETE and every local gate RELEASE
+  proof, then carries every participant in the original read projection into 2PC.
+  Groups without writes use explicit zero-effect certification. Acceptance retains
+  the original handles and complete scopes, rejects writes outside that projection,
+  and prevents changed owner/generation/cut audits. No replacement OPEN is used.
+  The public writable lease facade and legacy API/transport integration remain
+  unfinished.
 - Scoped OPEN/GET/PAGE/PLAN/CLOSE use one framed query protocol for data and catalogue
   groups. OPEN requires a proven fresh linearizable barrier and ready native owner.
   Later owned operations use the fixed snapshot cut, not a new current read. Stale
