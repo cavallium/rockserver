@@ -34,16 +34,19 @@ class CompactionReadaheadTest {
         long rate = 256 * MIB, serviceRate = 256 * MIB, latency = 100, readerDelay;
         int readCalls = 1000;
         boolean pending = true, progress = true, pressure;
+        long pointTail = 100, nativePoints;
+        int pointCalls = 100;
         CompactionIoBudget.Sample next() {
             nanos += 1_000_000_000L;
             if (nanos >= readerChangeAt) readerSize = applied;
-            if (progress) { reads += 100; micros += 100 * latency; completions += 100; }
+            if (progress) { reads += 100; micros += 100 * latency; completions += 100; nativePoints += pointCalls; }
             bytes += rate;
             long readBytes = Math.min(rate, readCalls * 65536L);
             compBytes += readBytes; compMicros += (long) (readBytes * (1_000_000d / serviceRate)); compCount += readCalls;
             if (readerSize > 0) { prefetchCount += 32; prefetchBytes += 32 * readerSize; }
             return new CompactionIoBudget.Sample(nanos, reads, micros, bytes, true, pressure, pressure, true,
-                    pending, completions, !pressure, pressure, compBytes, compMicros, compCount, prefetchCount, prefetchBytes);
+                    pending, completions, !pressure, pressure, compBytes, compMicros, compCount, prefetchCount, prefetchBytes,
+                    0, 0, 0, 0, 0, 0, 0, 0, false, progress ? pointTail : 0, 0, nativePoints, 0, 0);
         }
         void applied(long size) { applied = size; readerChangeAt = nanos + readerDelay; }
     }
@@ -123,30 +126,30 @@ class CompactionReadaheadTest {
             t.in.progress = false; t.in.pressure = urgency;
             t.seconds(5);
             assertEquals(urgency ? CompactionIoBudget.State.RECOVERY : CompactionIoBudget.State.PROBE, t.policy.state());
-            assertEquals(65536, t.in.applied, "escape must not grow read size");
+            assertEquals(0, t.in.applied, "native pressure or foreground no-progress disables readahead immediately");
         }
     }
-    @Test void sparseAndResetServiceEpochsHoldInsteadOfRamp() {
+    @Test void sparseAndResetServiceEpochsDisableInsteadOfHoldingLargeReads() {
         var t = new Trace(16 * MIB); t.until(65536);
         int changes = t.changes;
         t.in.compBytes = t.in.compMicros = t.in.compCount = t.in.prefetchCount = t.in.prefetchBytes = 0;
         t.in.readCalls = 1; t.seconds(180);
-        assertEquals(changes, t.changes); assertEquals(65536, t.in.applied);
+        assertEquals(changes + 1, t.changes); assertEquals(0, t.in.applied);
     }
-    @Test void frozenProbeMayTemporarilyExceedAdmissionTimeTargetWithoutRaisingReadSize() {
-        var t = new Trace(MIB); t.in.rate = 13_107_200;
-        t.until(MIB);
-        boolean observed = false;
-        for (int i = 0; i < 240; i++) {
-            t.step();
-            if (t.policy.state() == CompactionIoBudget.State.PROBE) {
-                assertEquals(MIB, t.in.applied);
-                observed |= t.in.applied > t.policy.budget() / 10;
-            }
-        }
-        assertTrue(observed, "freeze isolates the rate probe; admission-time target is not an all-state latency guarantee");
+    @Test void unsafeReducedBudgetCannotFreezeTheReaderCapDuringProbe() throws Exception {
+        var t = new Trace(MIB); t.in.rate = 13_107_200; t.until(MIB);
+        var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+        var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
+        var rate = CompactionIoBudget.class.getDeclaredField("budget"); rate.setAccessible(true);
+        long restored = t.policy.budget(), reduced = restored * 3 / 4;
+        prior.setLong(t.policy, restored); rate.setLong(t.policy, reduced);
+        state.set(t.policy, CompactionIoBudget.State.PROBE);
+        t.step();
+        assertTrue(t.in.applied <= reduced / 12.5);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(restored, t.policy.budget());
     }
-    @Test void recoveryClampsReadSizeToRestoredUsefulBudgetAndNeverGrows() throws Exception {
+    @Test void recoveryDisablesReadSizeDespiteRestoringUsefulByteBudget() throws Exception {
         for (long service : new long[]{2 * MIB, CompactionIoBudget.MIN_BYTES_PER_SECOND}) {
             var p = new CompactionIoBudget(256 * MIB, 16 * MIB);
             p.sample(new CompactionIoBudget.Sample(1, 0, 0, 0, true, false, false, true));
@@ -159,15 +162,111 @@ class CompactionReadaheadTest {
             state.set(p, CompactionIoBudget.State.PROBE); // Existing frozen size with a reduced rate.
             p.sample(new CompactionIoBudget.Sample(1_000_000_001L, 0, 0, 0, true, true, true, true));
             assertEquals(CompactionIoBudget.State.RECOVERY, p.state());
-            long expected = service / 10 / 4096 * 4096;
-            if (expected < 65536) expected = 0;
-            assertEquals(expected, p.readaheadBytes());
+            assertEquals(service, p.budget());
+            assertEquals(0, p.readaheadBytes());
             long size = p.readaheadBytes();
             for (int i = 2; i < 40; i++) {
                 p.sample(new CompactionIoBudget.Sample(i * 1_000_000_000L, 0, 0, 0, true, true, true, true));
                 assertEquals(size, p.readaheadBytes(), "urgent polls cannot grow or restore a larger size");
             }
         }
+    }
+    @Test void abruptServiceCollapseShrinksWithinOnePollEvenDuringSettlingAndProbe() throws Exception {
+        for (boolean probe : new boolean[]{false, true}) {
+            var t = new Trace(16 * MIB); t.until(16 * MIB);
+            if (probe) {
+                var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+                state.set(t.policy, CompactionIoBudget.State.PROBE);
+                var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
+                prior.setLong(t.policy, t.policy.budget());
+            }
+            t.in.serviceRate = 2 * MIB;
+            t.step();
+            assertEquals(128 * 1024, t.in.applied, "one valid service poll must bypass 30s smoothing and settling");
+            t.seconds(3);
+            assertEquals(128 * 1024, t.in.applied);
+        }
+    }
+    @Test void repeatedSlowFastServiceWindowsCannotRegrowAfterEachSafetyReduction() {
+        var t = new Trace(16 * MIB); t.until(MIB);
+        for (int i = 0; i < 12; i++) {
+            t.in.serviceRate = 2 * MIB; t.step();
+            assertTrue(t.in.applied <= 128 * 1024);
+            t.in.serviceRate = 256 * MIB; t.seconds(10);
+            assertTrue(t.in.applied <= 128 * 1024, "short clear intervals cannot bypass slow growth confirmation");
+        }
+    }
+    @Test void staleOrInvalidSampleImmediatelyDisablesPreviouslyLargeCap() {
+        for (boolean valid : new boolean[]{false, true}) {
+            var t = new Trace(16 * MIB); t.until(MIB);
+            t.policy.sample(new CompactionIoBudget.Sample(t.in.nanos + 9_000_000_000L,
+                    t.in.reads, t.in.micros, t.in.bytes, true, false, false, valid));
+            assertEquals(0, t.policy.readaheadBytes());
+        }
+    }
+    @Test void freshPointTailDisablesWithinOnePollDespiteUnchangedMeanAndSettling() {
+        var t = new Trace(16 * MIB); t.until(MIB);
+        t.in.pointTail = 300;
+        t.step();
+        assertEquals(0, t.in.applied, "one native point outlier cannot be diluted by the unchanged block mean");
+        t.in.pointTail = 100;
+        t.seconds(10);
+        assertEquals(0, t.in.applied, "brief tail recovery cannot bypass the growth cooldown");
+    }
+    @Test void uncalibratedOrSparseNativePointLaneCannotAuthorizeGrowth() {
+        for (int calls : new int[]{0, 1}) {
+            var t = new Trace(16 * MIB); t.in.pointCalls = calls;
+            t.seconds(600);
+            assertEquals(0, t.in.applied, "many block reads and unrelated completions cannot supply native-call quorum");
+        }
+    }
+    @Test void pointMeanSlowdownShrinksAtCompletedForegroundWindow() {
+        var t = new Trace(16 * MIB); t.until(MIB);
+        t.in.latency = 300; // Keep the independent native tail unchanged to isolate the mean guard.
+        t.seconds(5);
+        assertEquals(0, t.in.applied);
+    }
+    @Test void singleLongCompactionReadDisablesWithoutDenseReadQuorum() {
+        var t = new Trace(16 * MIB); t.until(MIB);
+        t.in.readCalls = 1; t.in.serviceRate = 256 * 1024;
+        t.step();
+        assertEquals(0, t.in.applied, "one 64KiB/250ms physical read is sufficient safety evidence");
+    }
+    @Test void safetyReductionAbortsByteProbeAndRestoresItsBudget() throws Exception {
+        var t = new Trace(16 * MIB); t.until(MIB);
+        var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+        var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
+        var rate = CompactionIoBudget.class.getDeclaredField("budget"); rate.setAccessible(true);
+        long restored = t.policy.budget(); prior.setLong(t.policy, restored);
+        rate.setLong(t.policy, restored * 3 / 4); state.set(t.policy, CompactionIoBudget.State.PROBE);
+        t.in.pointTail = 300; t.step();
+        assertEquals(0, t.in.applied);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(restored, t.policy.budget(), "a simultaneous RA change cannot be counted as a rate-probe benefit");
+    }
+    @Test void activeCompactionWithExpiredServiceFeedbackCannotRetainLargeReads() {
+        var t = new Trace(16 * MIB); t.until(MIB);
+        t.in.readCalls = 0;
+        t.seconds(3);
+        assertEquals(0, t.in.applied, "three seconds without a matched service completion revokes optional prefetch");
+    }
+    @Test void calibratedPointLaneCannotGrowAfterItsOwnCompletionPopulationBecomesSparse() {
+        var t = new Trace(16 * MIB); t.until(65536);
+        t.in.pointCalls = 1;
+        t.seconds(600);
+        assertEquals(65536, t.in.applied, "a historical tail baseline cannot supply current native-call quorum");
+    }
+    @Test void healthyProbeBoundaryCannotCauseRepeatedCapShrinkRegrowthWobble() {
+        var t = new Trace(16 * MIB); t.in.rate = 200 * MIB; t.until(16 * MIB);
+        int changes = t.changes; boolean probed = false;
+        for (int i = 0; i < 500; i++) {
+            t.step(); probed |= t.policy.state() == CompactionIoBudget.State.PROBE;
+            assertEquals(16 * MIB, t.in.applied);
+        }
+        assertTrue(probed, "the floor still permits a useful trial when measured byte headroom exists");
+        assertEquals(changes, t.changes, "planned healthy trials must not drive an endless option rewrite cycle");
+        t.in.pointTail = 300; t.step();
+        assertEquals(0, t.in.applied, "the healthy-probe floor cannot strand the cap when foreground latency worsens");
     }
     @Test void gaugePublishesOnlySuccessfulAckAndStableOptionIsNotRewritten() throws Exception {
         RocksDBLoader.loadLibrary();
@@ -181,7 +280,7 @@ class CompactionReadaheadTest {
             var executor = (ScheduledExecutorService) executorField.get(controller);
             var pollField = controller.getClass().getDeclaredField("poll"); pollField.setAccessible(true);
             var poll = (Runnable) pollField.get(controller);
-            for (int i = 0; i < 100 && calls.get() == 0; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+            for (int i = 0; i < 300 && calls.get() == 0; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
             assertEquals(65536, registry.get("rockserver.compaction.io.readahead").gauge().value());
             for (int i = 0; i < 10; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
             assertEquals(1, calls.get());
@@ -204,6 +303,7 @@ class CompactionReadaheadTest {
              var closing = Executors.newVirtualThreadPerTaskExecutor()) {
             var budgetField = controller.getClass().getDeclaredField("budget"); budgetField.setAccessible(true);
             var sizeField = CompactionIoBudget.class.getDeclaredField("readaheadBytes"); sizeField.setAccessible(true);
+            ((CompactionIoBudget) budgetField.get(controller)).sample(input.next());
             sizeField.setLong(budgetField.get(controller), 65536); // Isolate actuator lifetime from policy timing.
             var executorField = controller.getClass().getDeclaredField("executor"); executorField.setAccessible(true);
             var executor = (ScheduledExecutorService) executorField.get(controller);
@@ -233,12 +333,12 @@ class CompactionReadaheadTest {
             var executor = (ScheduledExecutorService) executorField.get(controller);
             var pollField = controller.getClass().getDeclaredField("poll"); pollField.setAccessible(true);
             var poll = (Runnable) pollField.get(controller);
-            for (int i = 0; i < 100 && calls.get() == 0; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
-            assertEquals(65536, actual.get());
+            for (int i = 0; i < 300 && calls.get() == 0; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+            assertEquals(0, actual.get(), "failed acknowledgement must correct the installed cap in the same poll");
             assertEquals(0, registry.get("rockserver.compaction.io.readahead").gauge().value());
             assertEquals(1, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
+            assertEquals(2, calls.get(), "dirty target0 cannot be skipped against cached0");
             executor.submit(poll).get(5, TimeUnit.SECONDS);
-            assertEquals(0, actual.get()); assertEquals(2, calls.get(), "dirty target0 cannot be skipped against cached0");
             for (int i = 0; i < 10; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
             assertEquals(2, calls.get(), "stable successful targets cause no setter calls");
         } finally { registry.close(); }

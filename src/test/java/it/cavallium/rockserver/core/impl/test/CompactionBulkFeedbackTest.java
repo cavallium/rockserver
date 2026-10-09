@@ -9,24 +9,27 @@ class CompactionBulkFeedbackTest {
     private static final class Trace {
         final CompactionIoBudget p = new CompactionIoBudget(RATE, 16L << 20);
         long nanos, pointReads, pointTime, done, bytes, bulkCount, bulkTime, bulkKeys, readDone,
-                compBytes, compTime, compCalls, prefCount, prefBytes, applied;
-        long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000;
-        int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0;
-        boolean point = true, pressure, bulkPending;
+                compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys;
+        long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail;
+        int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
+        boolean point = true, pointNative = true, bulkStats = true, pressure, stopped, bulkPending;
         Trace() { step(); }
         void step() {
             nanos += 1_000_000_000L;
             if (point) { pointReads += 100; pointTime += 100 * pointLatency; }
+            nativePoints += (point && pointNative ? 100 : 0) + extraPointCalls;
             done += writes;
             bytes += transferred;
-            bulkCount += calls; bulkTime += calls * bulkCallMicros; bulkKeys += (long) calls * shape;
+            if (bulkStats) { bulkCount += calls; bulkTime += calls * bulkCallMicros; bulkKeys += (long) calls * shape; }
+            nativeBulks += calls; nativeBulkKeys += (long) calls * shape;
             readDone += calls;
             compBytes += 64L << 20; compTime += 250000; compCalls += 1000;
             if (applied > 0) { prefCount += 32; prefBytes += 32 * applied; }
             p.sample(new CompactionIoBudget.Sample(nanos, pointReads, pointTime, bytes, true,
-                    pressure, pressure, true, true, done, !pressure, pressure,
+                    pressure, stopped, true, true, done, !pressure, pressure,
                     compBytes, compTime, compCalls, prefCount, prefBytes,
-                    bulkCount, bulkTime, bulkKeys, workers, active, latencyActive, queued, readDone, bulkPending));
+                    bulkCount, bulkTime, bulkKeys, workers, active, latencyActive, queued, readDone, bulkPending, point && pointNative || extraPointCalls > 0 ? pointLatency : 0,
+                    bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys));
             if (p.readaheadBytes() != applied) {
                 applied = p.readaheadBytes();
                 try {
@@ -121,7 +124,7 @@ class CompactionBulkFeedbackTest {
             } else {
                 assertTrue(t.p.bulkBaselineMicrosPerKey() >= 100000d / 72,
                         "reliable unresponsive slow work must not create a permanent false veto");
-                assertTrue(t.applied > 0);
+                assertEquals(0, t.applied, "a slower rebased mean cannot conceal a doubled native-call tail");
             }
         }
     }
@@ -160,6 +163,146 @@ class CompactionBulkFeedbackTest {
         t.seconds(10); assertTrue(t.p.budget() <= rate);
     }
 
+    @Test void singleRawBulkTailDisablesWithoutRegressingNormalizedMeanOrPointLane() {
+        var t = new Trace(); t.seconds(500); assertTrue(t.applied > 0);
+        double mean = t.p.bulkBaselineMicrosPerKey();
+        t.bulkTail = 120000; t.step();
+        assertEquals(0, t.applied);
+        assertEquals(mean, t.p.bulkBaselineMicrosPerKey(), .001);
+    }
+    @Test void largerBatchRecalibratesRawTailInsteadOfMixingDifferentCallShapes() {
+        var t = new Trace(); t.seconds(500); long previous = t.applied;
+        t.shape *= 3; t.bulkCallMicros *= 3;
+        t.step();
+        assertEquals(previous, t.applied, "an expected raw-call increase for a larger batch is not a comparable tail regression");
+        t.seconds(15);
+        assertTrue(t.p.bulkBaselineMicrosPerKey() > 0);
+        t.bulkTail = t.bulkCallMicros * 2; t.step();
+        assertEquals(0, t.applied, "the new comparable shape must get its own tail protection");
+    }
+    @Test void freshBulkTailWithoutSamePollCountDeltaStillShrinksAndAbortsProbe() throws Exception {
+        var t = new Trace(); t.seconds(2000); assertEquals(16L << 20, t.applied);
+        var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+        var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
+        var rate = CompactionIoBudget.class.getDeclaredField("budget"); rate.setAccessible(true);
+        long restored = t.p.budget(); prior.setLong(t.p, restored);
+        rate.setLong(t.p, Math.max(restored * 3 / 4, 200L << 20));
+        state.set(t.p, CompactionIoBudget.State.PROBE);
+        t.calls = 0; t.bulkTail = 120000; // Max drains after cumulative native/SDK snapshots were already taken.
+        t.step();
+        assertEquals(0, t.applied, "a credible fresh max cannot require a matching current counter delta");
+        assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(restored, t.p.budget());
+    }
+    @Test void byteProbeWithReadaheadAlreadyZeroCannotAcceptMeanBenefitWithBadTail() throws Exception {
+        var t = new Trace(); t.prime(); assertEquals(0, t.applied);
+        t.calls = 0; t.bulkPending = true; t.probe();
+        t.calls = 120; t.bulkPending = false;
+        var before = CompactionIoBudget.class.getDeclaredField("probeBudget"); before.setAccessible(true);
+        long prior = before.getLong(t.p);
+        t.transferred = RATE * 3 / 4; t.pointLatency = 17000; t.bulkTail = 120000;
+        t.seconds(10);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(prior, t.p.budget(), 4, "improved means cannot accept a byte cut while native bulk tails doubled");
+        assertEquals(0, t.applied);
+    }
+    @Test void healthyBulkCannotHideSparseNativePointReadsWithNoBlockMisses() {
+        var t = new Trace(); t.point = false; t.extraPointCalls = 1;
+        t.seconds(600);
+        assertTrue(t.p.bulkBaselineMicrosPerKey() > 0);
+        assertEquals(0, t.applied, "a native point lane must calibrate its own tail even when reads hit cache");
+    }
+    @Test void startupUnderOscillatingQueuePressureStillProtectsRawTailsDuringRateProbe() throws Exception {
+        var t = new Trace(); t.saturated();
+        for (int i = 0; i < 20; i++) { t.queued = i % 2 == 0 ? 200 : 400; t.step(); }
+        var growthTail = CompactionIoBudget.class.getDeclaredField("bulkTailBaseline"); growthTail.setAccessible(true);
+        assertEquals(0, growthTail.getDouble(t.p), "unstable queue trajectory must not teach a growth baseline");
+        for (int i = 0; i < 100 && t.p.state() != CompactionIoBudget.State.PROBE; i++) {
+            t.queued = i % 2 == 0 ? 200 : 400; t.step();
+        }
+        assertEquals(CompactionIoBudget.State.PROBE, t.p.state());
+        assertEquals(0, growthTail.getDouble(t.p));
+        var before = CompactionIoBudget.class.getDeclaredField("probeBudget"); before.setAccessible(true);
+        long prior = before.getLong(t.p);
+        t.transferred = RATE * 3 / 4; t.pointLatency = 17000; t.bulkCallMicros = 50000; t.bulkTail = 120000;
+        for (int i = 0; i < 10; i++) { t.queued = i % 2 == 0 ? 200 : 400; t.step(); }
+        assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(prior, t.p.budget(), 4, "an uncalibrated startup probe must reject a raw-tail regression");
+        assertEquals(0, t.applied);
+    }
+    @Test void bulkMetadataBlockMissesCannotInventAnActiveNativePointLane() {
+        var t = new Trace(); t.pointNative = false;
+        t.seconds(500);
+        assertTrue(t.p.baselineReadMicros() > 0, "bulk metadata misses still participate in physical block health");
+        assertTrue(t.p.bulkBaselineMicrosPerKey() > 0);
+        assertTrue(t.applied > 0, "bulk block misses cannot require a nonexistent native point-call tail baseline");
+    }
+    @Test void missingSdkBulkFeedbackCannotTurnObservedNativeCallsIntoAnIdleLane() {
+        var t = new Trace(); t.bulkStats = false; t.seconds(600);
+        assertTrue(t.nativeBulks > 32);
+        assertEquals(0, t.p.bulkBaselineMicrosPerKey());
+        assertEquals(0, t.applied, "observed native bulk calls with no comparable SDK mean cannot authorize growth");
+    }
+    @Test void steadyLoadedReadLaneCanStartBoundedPrefetchWithoutAnIdleWindow() {
+        var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.bulkCallMicros = 128000;
+        t.seconds(240);
+        assertTrue(t.applied >= 65536, "steady full workers and a fixed queue must permit a measured prefetch seed");
+        assertTrue(t.applied <= 16L << 20);
+        assertTrue(t.veto(), "byte-rate demand pressure remains distinct from readahead latency safety");
+    }
+    @Test void steadyRecoveryCanStartBoundedPrefetchWhileDebtPersists() {
+        var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.bulkCallMicros = 128000; t.pressure = true;
+        t.seconds(240);
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());
+        assertTrue(t.applied >= 65536, "debt recovery cannot require idleness before any useful measured prefetch");
+        t.bulkTail = 256000; t.step();
+        assertEquals(0, t.applied, "recovery cannot protect a cap once measured foreground tails worsen");
+    }
+    @Test void readOnlySteadyBulkUsesItsOwnProgressDuringTrackingAndRecovery() {
+        for (boolean recovery : new boolean[]{false, true}) {
+            var t = new Trace(); t.point = false; t.writes = 0;
+            t.active = t.latencyActive = t.workers; t.queued = 16; t.bulkPending = true;
+            t.bulkCallMicros = 128000; t.pressure = recovery;
+            t.seconds(240);
+            assertTrue(t.applied >= 65536, "dense native bulk completions are progress even without point/write keys");
+            assertEquals(0, t.done - 10000, "the generic key counter must stay flat during this read-only trace");
+            if (recovery) assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());
+        }
+    }
+    @Test void calibratedQueueGrowthCutsWithinTwoPollsAndRecoversCautiously() {
+        var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.bulkCallMicros = 128000; t.seconds(240); assertTrue(t.applied >= 65536);
+        t.queued = 24; t.step(); t.step();
+        assertEquals(0, t.applied, "two sustained above-anchor full-pool observations are a fast admission safety cut");
+        t.seconds(59); assertEquals(0, t.applied, "stationary evidence cannot bypass the 60s cooldown");
+        t.seconds(180);
+        assertTrue(t.applied >= 65536 && t.applied <= 256 * 1024, "stable loaded recovery begins with bounded small reads");
+    }
+    @Test void risingAndOscillatingQueuesCannotRatchetTheirWayIntoRegrowth() {
+        for (boolean rising : new boolean[]{false, true}) {
+            var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+            t.bulkCallMicros = 128000; t.seconds(240); assertTrue(t.applied >= 65536);
+            t.queued = 24; t.step(); t.step(); assertEquals(0, t.applied);
+            for (int i = 0; i < 240; i++) {
+                t.queued = rising ? t.queued + 2 : i % 2 == 0 ? 16 : 24;
+                t.step(); assertEquals(0, t.applied, "a changing queue cannot supply stationary growth evidence");
+            }
+        }
+    }
+    @Test void sdkResetWithMonotonicOwnCountersCannotRelearnARegressedTail() throws Exception {
+        var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.bulkCallMicros = 128000; t.seconds(240); assertTrue(t.applied >= 65536);
+        var tail = CompactionIoBudget.class.getDeclaredField("bulkTailBaseline"); tail.setAccessible(true);
+        double healthy = tail.getDouble(t.p);
+        t.bulkCount = t.bulkTime = t.bulkKeys = 0; t.bulkTail = 256000;
+        t.step(); assertEquals(0, t.applied);
+        assertEquals(healthy, tail.getDouble(t.p), .001, "SDK epoch reset is not an own native-call health reset");
+        t.seconds(240);
+        assertEquals(0, t.applied);
+        assertEquals(healthy, tail.getDouble(t.p), .001, "stationary worse tails must not replace the protected reference");
+    }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;
         t.step(); assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());

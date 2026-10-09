@@ -361,6 +361,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
 	private final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
 	private final AtomicInteger activeNativeMultiGets = new AtomicInteger();
+	private final AtomicLong pointReadTailNanos = new AtomicLong();
+	private final AtomicLong nativePointReadCompletions = new AtomicLong();
+	private final AtomicLong bulkReadTailNanos = new AtomicLong();
+	private final AtomicLong nativeBulkReadCompletions = new AtomicLong();
+	private final AtomicLong nativeBulkReadKeys = new AtomicLong();
 	private final RetainedQueryLimiter retainedQueryLimiter;
 	private final AtomicLong cdcPublishedTailSequence = new AtomicLong();
 	private final ConcurrentMap<String, CdcSubscriptionProgress> cdcSubscriptionProgress = new ConcurrentHashMap<>();
@@ -2214,10 +2219,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			observer.accept(nativeKeys.length, probeBytes);
 		}
+		long readStarted = System.nanoTime();
 		activeNativeMultiGets.incrementAndGet();
 		try {
 			return db.get().multiGetByteBuffers(readOptions, List.of(col.cfh()), nativeKeys, nativeValues);
-		} finally { activeNativeMultiGets.decrementAndGet(); }
+		} finally {
+			activeNativeMultiGets.decrementAndGet();
+			recordCompactionForegroundRead(readStarted, nativeKeys.length);
+		}
 	}
 
 	private static void setBucketDecision(BucketWriteElisionProbe group,
@@ -3115,6 +3124,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		compactionIoSampleObserver = observer;
 	}
 
+	private byte[] pointGetForUpdate(org.rocksdb.Transaction transaction, ReadOptions options,
+			ColumnFamilyHandle column, byte[] key) throws org.rocksdb.RocksDBException {
+		long started = System.nanoTime();
+		try { return transaction.getForUpdate(options, column, key, true); }
+		finally { recordCompactionForegroundRead(started, 0); }
+	}
+
+	private void recordCompactionForegroundRead(long started, int bulkKeys) {
+		if (compactionIoController == null) return;
+		long elapsed = Math.max(0, System.nanoTime() - started);
+		if (bulkKeys <= 0) {
+			pointReadTailNanos.accumulateAndGet(elapsed, Math::max);
+			nativePointReadCompletions.incrementAndGet();
+		}
+		else {
+			bulkReadTailNanos.accumulateAndGet(elapsed, Math::max);
+			nativeBulkReadCompletions.incrementAndGet();
+			nativeBulkReadKeys.addAndGet(bulkKeys);
+		}
+	}
+
 	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter) {
 		return sampleCompactionIo(limiter, new long[RWScheduler.POOL_TELEMETRY_LENGTH]);
 	}
@@ -3175,7 +3205,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS],
-						activeNativeMultiGets.get() > 0 || !activeExistsMultiRequests.isEmpty());
+						activeNativeMultiGets.get() > 0 || !activeExistsMultiRequests.isEmpty(),
+						(long) Math.ceil(pointReadTailNanos.getAndSet(0) / 1000d),
+						(long) Math.ceil(bulkReadTailNanos.getAndSet(0) / 1000d),
+						nativePointReadCompletions.get(), nativeBulkReadCompletions.get(), nativeBulkReadKeys.get());
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {
@@ -4744,7 +4777,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newPointReadOptions(null)) {
 							var previousRawBucketByteArray
-									= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+									= pointGetForUpdate(((Tx) newTx).val(), readOptions, col.cfh(), calculatedKeyArray);
 							didGetForUpdateInternally = true;
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
@@ -4759,7 +4792,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray
-										= ((Tx) newTx).val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+										= pointGetForUpdate(((Tx) newTx).val(), readOptions, col.cfh(), calculatedKeyArray);
 								didGetForUpdateInternally = true;
 								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
 							} catch (org.rocksdb.RocksDBException e) {
@@ -4769,9 +4802,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							// todo: in the future this should be replaced with just keyExists
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
-								byte[] previousValueByteArray = ((Tx) newTx)
-										.val()
-										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+								byte[] previousValueByteArray = pointGetForUpdate(((Tx) newTx).val(), readOptions, col.cfh(), calculatedKeyArray);
 								didGetForUpdateInternally = true;
 								previousValue = previousValueByteArray != null ? emptyBuf() : null;
 							} catch (org.rocksdb.RocksDBException e) {
@@ -4905,9 +4936,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newPointReadOptions(null)) {
-							var previousRawBucketByteArray = ((Tx) newTx)
-									.val()
-									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+							var previousRawBucketByteArray = pointGetForUpdate(((Tx) newTx).val(), readOptions, col.cfh(), calculatedKeyArray);
 							didGetForUpdateInternally = true;
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
@@ -4922,9 +4951,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray;
-								previousValueByteArray = ((Tx) newTx)
-										.val()
-										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+								previousValueByteArray = pointGetForUpdate(((Tx) newTx).val(), readOptions, col.cfh(), calculatedKeyArray);
 								didGetForUpdateInternally = true;
 								previousValue = transformResultValue(col, toBuf(previousValueByteArray));
 							} catch (org.rocksdb.RocksDBException e) {
@@ -4935,9 +4962,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							assert newTx instanceof Tx;
 							try (var readOptions = newPointReadOptions(null)) {
 								byte[] previousValueByteArray;
-								previousValueByteArray = ((Tx) newTx)
-										.val()
-										.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+								previousValueByteArray = pointGetForUpdate(((Tx) newTx).val(), readOptions, col.cfh(), calculatedKeyArray);
 								didGetForUpdateInternally = true;
 								previousValue = previousValueByteArray != null ? emptyBuf() : null;
 							} catch (org.rocksdb.RocksDBException e) {
@@ -5065,9 +5090,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						assert newTx instanceof Tx;
 						var bucketElementKeys = col.getBucketElementKeys(keys.keys());
 						try (var readOptions = newPointReadOptions(null)) {
-							var previousRawBucketByteArray = ((Tx) newTx)
-									.val()
-									.getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
+							var previousRawBucketByteArray = pointGetForUpdate(((Tx) newTx).val(), readOptions, col.cfh(), calculatedKeyArray);
 							didGetForUpdateInternally = true;
 							Buf previousRawBucket = toBuf(previousRawBucketByteArray);
 							var bucket = previousRawBucket != null ? new Bucket(col, previousRawBucket) : new Bucket(col);
@@ -5239,6 +5262,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		} catch (org.rocksdb.RocksDBException exception) {
 			throw RocksDBException.of(RocksDBErrorType.GET_1, exception);
 		} finally {
+			if (operationStarted) recordCompactionForegroundRead(start, 0);
 			if (!ownershipTransferred) {
 				if (operationStarted) {
 					ops.endOp();
@@ -6158,11 +6182,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var columnHandles = List.of(col.cfh());
 			var sample = sampleLatency ? existsMultiPerfSampler.begin(nativeDb) : null;
 			List<org.rocksdb.ByteBufferGetStatus> statuses;
+			long readStarted = System.nanoTime();
 			activeNativeMultiGets.incrementAndGet();
 			try {
 				statuses = nativeDb.multiGetByteBuffers(readOptions, columnHandles, nativeKeys, emptyValues);
 			} finally {
 				activeNativeMultiGets.decrementAndGet();
+				recordCompactionForegroundRead(readStarted, nativeKeys.length);
 				if (sample != null) existsMultiPerfSampler.finish(sample);
 			}
 			var result = new ArrayList<Boolean>(statuses.size());
@@ -6192,6 +6218,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			List<Buf> calculatedKeys) throws org.rocksdb.RocksDBException {
 		var nativeKeys = calculatedKeys.stream().map(Buf::toByteArray).toList();
 		List<byte[]> values;
+		long readStarted = System.nanoTime();
 		activeNativeMultiGets.incrementAndGet();
 		try {
 			if (tx == null) {
@@ -6201,7 +6228,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			} else {
 				values = tx.val().multiGetAsList(readOptions, col.cfh(), nativeKeys);
 			}
-		} finally { activeNativeMultiGets.decrementAndGet(); }
+		} finally {
+			activeNativeMultiGets.decrementAndGet();
+			recordCompactionForegroundRead(readStarted, nativeKeys.size());
+		}
 
 		var result = new ArrayList<Boolean>(values.size());
 		for (int i = 0; i < values.size(); i++) {
@@ -10508,29 +10538,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private Buf dbGet(Tx tx, ColumnInstance col, ReadOptions readOptions, Buf calculatedKey, boolean forUpdate)
 			throws org.rocksdb.RocksDBException {
-		if (tx != null) {
-			byte[] previousRawBucketByteArray;
-			byte[] calculatedKeyArray = calculatedKey.toByteArray();
-			if (forUpdate || tx.isFromGetForUpdate()) {
-				previousRawBucketByteArray = tx.val().getForUpdate(readOptions, col.cfh(), calculatedKeyArray, true);
-			} else {
-				previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKeyArray);
-			}
-			return toBuf(previousRawBucketByteArray);
-		} else {
-			var db = this.db.get();
-			if (fastGet) {
-				return dbGetFast(col.cfh(), readOptions, calculatedKey);
-			} else {
-				var previousRawBucketByteArray = db.get(col.cfh(),
-						readOptions,
-						calculatedKey.getBackingByteArray(),
-						calculatedKey.getBackingByteArrayOffset(),
-						calculatedKey.getBackingByteArrayLength()
-				);
+		long readStarted = System.nanoTime();
+		boolean recordRead = tx != null ? !(forUpdate || tx.isFromGetForUpdate()) : !fastGet;
+		try {
+			if (tx != null) {
+				byte[] previousRawBucketByteArray;
+				byte[] calculatedKeyArray = calculatedKey.toByteArray();
+				if (forUpdate || tx.isFromGetForUpdate()) {
+					previousRawBucketByteArray = pointGetForUpdate(tx.val(), readOptions, col.cfh(), calculatedKeyArray);
+				} else {
+					previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKeyArray);
+				}
 				return toBuf(previousRawBucketByteArray);
+			} else {
+				var db = this.db.get();
+				if (fastGet) {
+					return dbGetFast(col.cfh(), readOptions, calculatedKey);
+				} else {
+					var previousRawBucketByteArray = db.get(col.cfh(),
+							readOptions,
+							calculatedKey.getBackingByteArray(),
+							calculatedKey.getBackingByteArrayOffset(),
+							calculatedKey.getBackingByteArrayLength()
+					);
+					return toBuf(previousRawBucketByteArray);
+				}
 			}
-		}
+
+		} finally { if (recordRead) recordCompactionForegroundRead(readStarted, 0); }
 	}
 
 	@Nullable
@@ -10568,18 +10603,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Buf calculatedKey,
 			boolean useDefaultReadOptions)
 			throws org.rocksdb.RocksDBException {
-		var reader = Objects.requireNonNull(fastGetReader);
-		byte[] value = useDefaultReadOptions
-				? reader.getHeap(cfh,
-						calculatedKey.getBackingByteArray(),
-						calculatedKey.getBackingByteArrayOffset(),
-						calculatedKey.getBackingByteArrayLength())
-				: reader.getHeap(cfh,
-						Objects.requireNonNull(readOptions),
-						calculatedKey.getBackingByteArray(),
-						calculatedKey.getBackingByteArrayOffset(),
-						calculatedKey.getBackingByteArrayLength());
-		return toBuf(value);
+		long readStarted = System.nanoTime();
+		try {
+			var reader = Objects.requireNonNull(fastGetReader);
+			byte[] value = useDefaultReadOptions
+					? reader.getHeap(cfh,
+							calculatedKey.getBackingByteArray(),
+							calculatedKey.getBackingByteArrayOffset(),
+							calculatedKey.getBackingByteArrayLength())
+					: reader.getHeap(cfh,
+							Objects.requireNonNull(readOptions),
+							calculatedKey.getBackingByteArray(),
+							calculatedKey.getBackingByteArrayOffset(),
+							calculatedKey.getBackingByteArrayLength());
+			return toBuf(value);
+
+		} finally { recordCompactionForegroundRead(readStarted, 0); }
 	}
 
 	private ColumnInstance getColumn(long columnId) {

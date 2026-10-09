@@ -50,7 +50,7 @@ final class CompactionIoController implements AutoCloseable {
                         .tag("db", name).register(registry),
                 Gauge.builder("rockserver.compaction.io.readahead", appliedReadahead, AtomicLong::doubleValue)
                         .tag("db", name).baseUnit("bytes")
-                        .description("Last successfully acknowledged DB readahead option for new compaction jobs/readers; existing buffers do not resize")
+                        .description("Last successfully acknowledged readahead cap for compaction readers")
                         .register(registry),
                 Gauge.builder("rockserver.compaction.io.adjustment.failures", failures, AtomicLong::doubleValue)
                         .tag("db", name).register(registry));
@@ -82,6 +82,18 @@ final class CompactionIoController implements AutoCloseable {
                     try {
                         if (restored != limiter.getBytesPerSecond()) limiter.setBytesPerSecond(restored);
                     } catch (RuntimeException ignored) { failures.incrementAndGet(); }
+                    // Correct a possibly installed large cap in this poll, even when its acknowledgement failed.
+                    if (readaheadDirty || appliedReadahead.get() != 0) {
+                        readaheadDirty = true;
+                        try {
+                            long actual = applyReadahead.applyAsLong(0);
+                            if (actual != 0) throw new IllegalStateException("DB readahead acknowledgement did not match safety target");
+                            appliedReadahead.set(0);
+                            budget.readaheadApplied(0);
+                            readaheadDirty = false;
+                        } catch (VirtualMachineError fatal) { throw fatal; }
+                        catch (Throwable ignored) { failures.incrementAndGet(); budget.readaheadApplyFailed(); }
+                    }
                 }
             };
         try {

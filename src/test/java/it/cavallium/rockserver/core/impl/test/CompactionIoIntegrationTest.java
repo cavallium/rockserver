@@ -54,6 +54,43 @@ class CompactionIoIntegrationTest {
             assertEquals(value, api.get(0, api.getColumnId("data"), key, RequestType.current()));
         }
     }
+    @Test void nativeReadTailSamplesDrainFreshMaximaAndCountTheirOwnCalls(@TempDir Path root) throws Exception {
+        var cfg = config(root, "");
+        try (var connection = new EmbeddedConnection(root.resolve("tail-sampling"), "tail-sampling", cfg)) {
+            var internal = connection.getInternalDB();
+            var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
+            var controller = (AutoCloseable) controllerField.get(internal);
+            controller.close(); // Serialize the sampler so the policy thread cannot drain these test observations.
+            var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
+            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
+            var sampler = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            sampler.setAccessible(true);
+            var api = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)));
+            var col = connection.getSyncApi(RequestContext.batch()).createColumn("data", ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+            var key = new Keys(Buf.wrap(new byte[]{1}));
+            var value = Buf.wrap(new byte[]{2});
+            api.put(0, col, key, value, RequestType.none());
+            var before = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(internal, limiter);
+            for (int cycle = 0; cycle < 2; cycle++) {
+                assertEquals(value, api.get(0, col, key, RequestType.current()));
+                assertEquals(java.util.List.of(true), api.existsMulti(0, col, java.util.List.of(key)));
+                var observed = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(internal, limiter);
+                assertEquals(1, observed.nativePointCompletions() - before.nativePointCompletions());
+                assertEquals(1, observed.nativeBulkCompletions() - before.nativeBulkCompletions());
+                assertEquals(1, observed.nativeBulkKeys() - before.nativeBulkKeys());
+                assertTrue(observed.pointTailMicros() > 0);
+                assertTrue(observed.bulkTailMicros() > 0);
+                var drained = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(internal, limiter);
+                assertEquals(0, drained.pointTailMicros());
+                assertEquals(0, drained.bulkTailMicros());
+                assertEquals(observed.nativePointCompletions(), drained.nativePointCompletions());
+                assertEquals(observed.nativeBulkCompletions(), drained.nativeBulkCompletions());
+                assertEquals(observed.nativeBulkKeys(), drained.nativeBulkKeys());
+                before = drained;
+            }
+        }
+    }
+
     private long persistedReadahead(Path dbPath) throws Exception {
         try (var files = Files.list(dbPath)) {
             var latest = files.filter(p -> p.getFileName().toString().startsWith("OPTIONS-"))
