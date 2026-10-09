@@ -159,6 +159,14 @@ public final class DistributedStoragePool implements AutoCloseable {
     public NativeRangeSstExport.Manifest exportSst(Path destination, ReplicatedRangeStore.ScopedSnapshot snapshot,
             UUID column, byte[] lowerInclusive, byte[] upperExclusive, NativeRangeSstExport.Limits limits)
             throws IOException, RocksDBException {
+        return exportSstPrepared(destination,snapshot,column,lowerInclusive,upperExclusive,limits,false).manifest();
+    }
+    public NativeRangeSstExport.Chunk exportSstChunk(Path destination,ReplicatedRangeStore.ScopedSnapshot snapshot,
+            UUID column,byte[] lowerInclusive,byte[] upperExclusive,NativeRangeSstExport.Limits limits) throws IOException,RocksDBException {
+        return exportSstPrepared(destination,snapshot,column,lowerInclusive,upperExclusive,limits,true);
+    }
+    private NativeRangeSstExport.Chunk exportSstPrepared(Path destination,ReplicatedRangeStore.ScopedSnapshot snapshot,
+            UUID column,byte[] lowerInclusive,byte[] upperExclusive,NativeRangeSstExport.Limits limits,boolean chunk) throws IOException,RocksDBException {
         Objects.requireNonNull(snapshot, "snapshot");
         Objects.requireNonNull(column, "column");
         ReplicatedRangeStore.NativeUse nativeUse;
@@ -179,10 +187,11 @@ public final class DistributedStoragePool implements AutoCloseable {
             // Pool close drains this range's pins before closing options, operators, caches or DB.
             nativeUse = snapshot.retainForExport();
         } finally { nativeMutation.release(); }
-        try (nativeUse) {
-            return NativeRangeSstExport.write(destination, snapshot, column, lowerInclusive, upperExclusive,
-                    loaded.dbOptions(), columnOptions, limits);
-        }
+        NativeRangeSstExport.Prepared prepared=null;
+        try {
+            try (nativeUse) { prepared=NativeRangeSstExport.prepare(destination,snapshot,column,lowerInclusive,upperExclusive,loaded.dbOptions(),columnOptions,limits,chunk); }
+            return NativeRangeSstExport.publish(prepared);
+        } finally { NativeRangeSstExport.discard(prepared); }
     }
 
     /** Stop admission and drain borrowed range work. A timeout retains every native resource for retry. */

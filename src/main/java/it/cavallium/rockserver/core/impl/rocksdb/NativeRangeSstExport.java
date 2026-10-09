@@ -42,60 +42,88 @@ public final class NativeRangeSstExport {
     }
     private NativeRangeSstExport() {}
 
+    public record Chunk(Manifest manifest,boolean hasMore) {
+        public Chunk { Objects.requireNonNull(manifest); if (hasMore && (manifest.rows()==0 || manifest.upperExclusive()==null)) throw new IllegalArgumentException("Chunk boundary needs progress and an exact next key"); }
+    }
+    static final class Prepared {
+        final Manifest manifest; final boolean more; final Path temporary,target; final long started,duration;
+        Prepared(Manifest manifest,boolean more,Path temporary,Path target,long started,long duration) { this.manifest=manifest; this.more=more; this.temporary=temporary; this.target=target; this.started=started; this.duration=duration; }
+    }
     /** Source options must belong to this column's retained pool. Caller retains the scoped snapshot. */
-    public static Manifest write(Path destination, ReplicatedRangeStore.ScopedSnapshot snapshot, UUID column,
-                                 byte[] lowerInclusive, byte[] upperExclusive, DBOptions databaseOptions,
-                                 ColumnFamilyOptions columnOptions, Limits limits) throws IOException, RocksDBException {
-        Objects.requireNonNull(snapshot); Objects.requireNonNull(column); Objects.requireNonNull(limits);
-        Objects.requireNonNull(databaseOptions); Objects.requireNonNull(columnOptions);
-        if (snapshot.position() == null) throw new IllegalArgumentException("SST export requires a completed applied cut");
-        if ((long)(lowerInclusive == null ? 0 : lowerInclusive.length) + (upperExclusive == null ? 0 : upperExclusive.length) > TransactionScope.MAX_BOUND_BYTES) {
-            throw new IllegalArgumentException("SST export bounds exceed budget");
-        }
-        byte[] lower=lowerInclusive == null ? snapshot.interval().lowerInclusive() : lowerInclusive.clone();
-        byte[] upper=upperExclusive == null ? snapshot.interval().upperExclusive() : upperExclusive.clone();
-        long started=System.nanoTime(), duration=limits.maximumDuration().toNanos();
-        Path target=Objects.requireNonNull(destination).toAbsolutePath();
-        Path directory=target.getParent();
+    public static Manifest write(Path destination,ReplicatedRangeStore.ScopedSnapshot snapshot,UUID column,
+            byte[] lowerInclusive,byte[] upperExclusive,DBOptions databaseOptions,ColumnFamilyOptions columnOptions,Limits limits) throws IOException,RocksDBException {
+        return writeRetained(destination,snapshot,column,lowerInclusive,upperExclusive,databaseOptions,columnOptions,limits,false).manifest();
+    }
+    /** Emit one bounded exact coverage interval, ending at the first unconsumed physical key. */
+    public static Chunk writeChunk(Path destination,ReplicatedRangeStore.ScopedSnapshot snapshot,UUID column,
+            byte[] lowerInclusive,byte[] upperExclusive,DBOptions databaseOptions,ColumnFamilyOptions columnOptions,Limits limits) throws IOException,RocksDBException {
+        return writeRetained(destination,snapshot,column,lowerInclusive,upperExclusive,databaseOptions,columnOptions,limits,true);
+    }
+    private static Chunk writeRetained(Path destination,ReplicatedRangeStore.ScopedSnapshot snapshot,UUID column,
+            byte[] lower,byte[] upper,DBOptions databaseOptions,ColumnFamilyOptions columnOptions,Limits limits,boolean chunk) throws IOException,RocksDBException {
+        Prepared prepared=null;
+        try {
+            try (var nativeUse=Objects.requireNonNull(snapshot).retainForExport()) { prepared=prepare(destination,snapshot,column,lower,upper,databaseOptions,columnOptions,limits,chunk); }
+            return publish(prepared);
+        } finally { discard(prepared); }
+    }
+    /** The pool retains options/native ownership around this build, then closes that retain before publish. */
+    static Prepared prepare(Path destination,ReplicatedRangeStore.ScopedSnapshot snapshot,UUID column,
+            byte[] lowerInclusive,byte[] upperExclusive,DBOptions databaseOptions,ColumnFamilyOptions columnOptions,Limits limits,boolean chunk) throws IOException,RocksDBException {
+        Objects.requireNonNull(snapshot); Objects.requireNonNull(column); Objects.requireNonNull(limits); Objects.requireNonNull(databaseOptions); Objects.requireNonNull(columnOptions);
+        if (snapshot.position()==null) throw new IllegalArgumentException("SST export requires a completed applied cut");
+        if ((long)(lowerInclusive==null ? 0 : lowerInclusive.length)+(upperExclusive==null ? 0 : upperExclusive.length)>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("SST export bounds exceed budget");
+        byte[] lower=lowerInclusive==null ? snapshot.interval().lowerInclusive() : lowerInclusive.clone(),upper=upperExclusive==null ? snapshot.interval().upperExclusive() : upperExclusive.clone();
+        long started=System.nanoTime(),duration=limits.maximumDuration().toNanos(); Path target=Objects.requireNonNull(destination).toAbsolutePath();
         if (Files.exists(target,LinkOption.NOFOLLOW_LINKS)) throw new FileAlreadyExistsException(target.toString());
-        try (var nativeUse=snapshot.retainForExport(); var cursor=snapshot.openCursor(column,lower,upper,false)) {
-            Path temporary=Files.createTempFile(directory,".range-sst-building-",".tmp");
-            long rows=0, payload=0;
-            try {
-                try (var env=new EnvOptions(databaseOptions); var options=new Options(databaseOptions,columnOptions);
-                        var writer=new SstFileWriter(env,options)) {
+        Path temporary=null; boolean complete=false; Prepared result;
+        try {
+            try (var cursor=snapshot.openCursor(column,lower,upper,false)) {
+                temporary=Files.createTempFile(target.getParent(),".range-sst-building-",".tmp"); long rows=0,payload=0; boolean more=false; byte[] boundary=upper;
+                try (var env=new EnvOptions(databaseOptions); var options=new Options(databaseOptions,columnOptions); var writer=new SstFileWriter(env,options)) {
                     writer.open(temporary.toString());
-                    while (true) {
+                    scan: while (true) {
                         deadline(started,duration);
-                        var page=cursor.nextPage(PhysicalRangePage.MAX_ITEMS,PhysicalRangePage.MAX_BYTES);
-                        for (var row : page.rows()) {
-                            byte[] key=row.key(), value=row.value();
-                            long bytes=(long)key.length+value.length;
-                            if (rows >= limits.maximumRows() || bytes > limits.maximumPayloadBytes()-payload) throw new IOException("SST export row/payload limit exceeded");
-                            deadline(started,duration);
-                            writer.put(key,value);
-                            rows++; payload+=bytes;
+                        long remaining=limits.maximumRows()-rows;
+                        int count=chunk ? (int)(remaining>=PhysicalRangePage.MAX_ITEMS ? PhysicalRangePage.MAX_ITEMS : remaining+1) : PhysicalRangePage.MAX_ITEMS;
+                        final PhysicalRangePage page;
+                        try { page=cursor.nextPage(count,PhysicalRangePage.MAX_BYTES); }
+                        catch (PhysicalRangePage.LimitExceededException oversized) { throw new IOException("SST export physical row exceeds bounded materialization",oversized); }
+                        for (var row:page.rows()) {
+                            byte[] key=row.key(),value=row.value(); long bytes=(long)key.length+value.length;
+                            if (rows>=limits.maximumRows() || bytes>limits.maximumPayloadBytes()-payload) {
+                                if (!chunk || rows==0) throw new IOException("SST export row/payload limit exceeded");
+                                boundary=key; more=true; break scan;
+                            }
+                            deadline(started,duration); writer.put(key,value); rows++; payload+=bytes;
+                            if (writer.fileSize()>limits.maximumFileBytes()) throw new IOException("SST export file limit exceeded");
                         }
-                        if (writer.fileSize() > limits.maximumFileBytes()) throw new IOException("SST export file limit exceeded");
                         if (!page.hasMore()) break;
                     }
-                    if (rows != 0) writer.finish();
+                    if (rows!=0) writer.finish();
                 }
-                if (rows == 0) return manifest(snapshot,column,lower,upper,0,0,0,new byte[0],null);
-                deadline(started,duration);
-                long fileBytes=Files.size(temporary);
-                if (fileBytes > limits.maximumFileBytes()) throw new IOException("SST export file limit exceeded");
-                force(temporary);
-                byte[] checksum=sha256(temporary,started,duration);
-                deadline(started,duration);
-                Files.createLink(target,temporary);
-                force(directory);
-                Files.delete(temporary);
-                force(directory);
-                return manifest(snapshot,column,lower,upper,rows,payload,fileBytes,checksum,target);
-            } finally { Files.deleteIfExists(temporary); }
-        }
+                deadline(started,duration); long fileBytes=rows==0 ? 0 : Files.size(temporary);
+                if (fileBytes>limits.maximumFileBytes()) throw new IOException("SST export file limit exceeded");
+                result=new Prepared(manifest(snapshot,column,lower,boundary,rows,payload,fileBytes,new byte[rows==0 ? 0 : 32],rows==0 ? null : target),more,temporary,target,started,duration);
+            }
+            complete=true; return result;
+        } finally { if (!complete && temporary!=null) Files.deleteIfExists(temporary); }
     }
+    /** No native owner remains here; the link is published only after writer/cursor/retains close. */
+    static Chunk publish(Prepared prepared) throws IOException {
+        Objects.requireNonNull(prepared); var built=prepared.manifest;
+        deadline(prepared.started,prepared.duration);
+        if (built.rows()==0) return new Chunk(built,false);
+        force(prepared.temporary); byte[] checksum=sha256(prepared.temporary,prepared.started,prepared.duration); deadline(prepared.started,prepared.duration);
+        boolean linked=false,complete=false;
+        try {
+            Files.createLink(prepared.target,prepared.temporary); linked=true; force(prepared.target.getParent());
+            Files.delete(prepared.temporary); force(prepared.target.getParent()); deadline(prepared.started,prepared.duration);
+            var result=new Manifest(built.groupId(),built.rangeEpoch(),built.columnId(),built.schemaDigest(),built.position(),built.lowerInclusive(),built.upperExclusive(),built.rows(),built.payloadBytes(),built.fileBytes(),checksum,prepared.target);
+            complete=true; return new Chunk(result,prepared.more);
+        } finally { if (linked && !complete) { Files.deleteIfExists(prepared.target); force(prepared.target.getParent()); } }
+    }
+    static void discard(Prepared prepared) throws IOException { if (prepared!=null) Files.deleteIfExists(prepared.temporary); }
     private static Manifest manifest(ReplicatedRangeStore.ScopedSnapshot snapshot, UUID column, byte[] lower, byte[] upper,
                                      long rows, long payload, long bytes, byte[] hash, Path file) {
         return new Manifest(snapshot.groupId(),snapshot.rangeEpoch(),column,snapshot.schemaDigest(),snapshot.position(),

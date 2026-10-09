@@ -2,6 +2,7 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore;
+import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport;
 import java.io.IOException;
 import java.security.*;
 import java.time.Duration;
@@ -188,6 +189,21 @@ final class RatisSnapshotPins implements AutoCloseable {
         return withPin(token,pin -> {
             var page=pin.page(column,ownedLower,ownedUpper,reverse,ownedResume,items,bytes);
             if (page.payloadBytes()>PhysicalRangePage.MAX_BYTES) throw new IOException("Snapshot page exceeds reply bound"); return page;
+        });
+    }
+    @FunctionalInterface interface ChunkWriter {
+        NativeRangeSstExport.Chunk write(ReplicatedRangeStore.ScopedSnapshot pin) throws Exception;
+    }
+    /** The trusted exporter runs as bounded BATCH work and may force its descriptor before returning. */
+    NativeRangeSstExport.Chunk export(SnapshotFenceStatus.Capture token,ChunkWriter writer) throws Exception {
+        Objects.requireNonNull(writer);
+        return withPin(token,pin -> {
+            var chunk=Objects.requireNonNull(writer.write(pin)); var manifest=chunk.manifest();
+            if (!manifest.groupId().equals(pin.groupId()) || manifest.rangeEpoch()!=pin.rangeEpoch()
+                    || !manifest.position().equals(token.position()) || !Arrays.equals(manifest.schemaDigest(),pin.schemaDigest())
+                    || !pin.scope().containsRange(manifest.columnId(),manifest.lowerInclusive(),manifest.upperExclusive()))
+                throw new IllegalArgumentException("Export artifact differs from its original captured projection");
+            return chunk;
         });
     }
     void requireBinding(SnapshotFenceStatus.Capture token,ScopedTransactionRpc.SnapshotBinding binding) throws RatisSnapshotLostException {

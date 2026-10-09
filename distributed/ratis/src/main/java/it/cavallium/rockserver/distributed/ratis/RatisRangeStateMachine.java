@@ -282,6 +282,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     public it.cavallium.rockserver.core.common.distributed.PhysicalRangePage snapshotPinPage(SnapshotFenceStatus.Capture token,UUID column,byte[] lower,byte[] upper,boolean reverse,byte[] resume,int items,int bytes) throws Exception {
         requireDataRole(); return capturedSnapshots.page(token,column,lower,upper,reverse,resume,items,bytes);
     }
+    @FunctionalInterface public interface SnapshotChunkWriter {
+        it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport.Chunk write(ReplicatedRangeStore.ScopedSnapshot pin) throws Exception;
+    }
+    /** Owner-directed export keeps the original native pin through actual exporter/descriptor completion. */
+    public it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport.Chunk exportSnapshotPinChunk(SnapshotFenceStatus.Capture token,SnapshotChunkWriter writer) throws Exception {
+        requireDataRole(); return capturedSnapshots.export(token,writer::write);
+    }
     public void releaseSnapshotPin(SnapshotFenceStatus.Capture token) throws Exception { requireDataRole(); capturedSnapshots.release(token); }
     RatisSnapshotPins.Stats snapshotPinStats() { return capturedSnapshots.stats(); }
 
