@@ -7,7 +7,7 @@ import java.util.UUID;
 
 /** A physical or bucket-member mutation. DELETE_RANGE uses key/value as inclusive/exclusive bounds. */
 public final class Mutation {
-    public enum Kind { PUT, DELETE, MERGE, DELETE_RANGE, BUCKET_PUT, BUCKET_DELETE }
+    public enum Kind { PUT, DELETE, MERGE, DELETE_RANGE, BUCKET_PUT, BUCKET_DELETE, BUCKET_MERGE }
     public enum ReturnMode { NONE, PREVIOUS, CURRENT }
 
     private final Kind kind;
@@ -31,6 +31,9 @@ public final class Mutation {
     public static Mutation bucketDelete(UUID column,byte[] physical,List<byte[]> memberKeys,ReturnMode mode) {
         return new Mutation(Kind.BUCKET_DELETE,column,physical,null,mode,Objects.requireNonNull(memberKeys));
     }
+    public static Mutation bucketMerge(UUID column,byte[] physical,List<byte[]> memberKeys,byte[] operand,ReturnMode mode) {
+        return new Mutation(Kind.BUCKET_MERGE,column,physical,operand,mode,Objects.requireNonNull(memberKeys));
+    }
     private Mutation(Kind kind,UUID columnId,byte[] key,byte[] value,ReturnMode returnMode,List<byte[]> members) {
         this.kind = Objects.requireNonNull(kind, "kind");
         this.columnId = Objects.requireNonNull(columnId, "columnId");
@@ -39,7 +42,7 @@ public final class Mutation {
             throw new IllegalArgumentException("Range deletion has no point return value");
         }
         Objects.requireNonNull(key, "key");
-        boolean bucket=kind==Kind.BUCKET_PUT || kind==Kind.BUCKET_DELETE;
+        boolean bucket=kind==Kind.BUCKET_PUT || kind==Kind.BUCKET_DELETE || kind==Kind.BUCKET_MERGE;
         if (bucket!=(members!=null)) throw new IllegalArgumentException("Bucket mutations require explicit member keys");
         boolean deletion=kind==Kind.DELETE || kind==Kind.BUCKET_DELETE;
         if (deletion ? value != null : value == null) {
@@ -63,7 +66,7 @@ public final class Mutation {
     public byte[] value() { return value == null ? null : value.clone(); }
     public ReturnMode returnMode() { return returnMode; }
 
-    public boolean bucket() { return kind==Kind.BUCKET_PUT || kind==Kind.BUCKET_DELETE; }
+    public boolean bucket() { return kind==Kind.BUCKET_PUT || kind==Kind.BUCKET_DELETE || kind==Kind.BUCKET_MERGE; }
     public List<byte[]> memberKeys() { return copyMembers(memberKeys); }
     int encodedSize() { return 26 + key.length + (value == null ? 0 : value.length) + (bucket() ? memberBytes(memberKeys) : 0); }
 

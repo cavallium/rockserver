@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
+import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
+
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
@@ -798,6 +800,7 @@ public final class ReplicatedRangeStore {
             if (mutation.kind()==Mutation.Kind.DELETE_RANGE) continue; // Bounds address whole physical rows, not member keys or stored values.
             var shape=schema.column(mutation.columnId()).schema(); boolean bucket=shape.variableLengthKeysCount()!=0;
             if (bucket!=mutation.bucket()) throw new IllegalArgumentException("Bucket mutation differs from qualified column kind");
+            if(mutation.kind()==Mutation.Kind.BUCKET_MERGE && schema.column(mutation.columnId()).operator()==null) throw new IllegalArgumentException("BUCKET_MERGE requires activated logical operator");
             if (bucket) schema.requireBucketKey(mutation.columnId(),mutation.key(),mutation.memberKeys());
             else schema.requireFixedKey(mutation.columnId(),mutation.key());
             if (!shape.hasValue() && mutation.value()!=null && mutation.value().length!=0) throw new IllegalArgumentException("Key-only mutation has value bytes");
@@ -866,7 +869,9 @@ public final class ReplicatedRangeStore {
         for (var mutation : command.mutations()) {
             if (snapshotHomeContext!=null && mutation.kind()==Mutation.Kind.PUT) requireSnapshotHomeUser(snapshotHomeContext,mutation.key(),SnapshotFenceStatus.decode(mutation.value()));
             if (!commandColumns.contains(mutation.columnId())) throw new IllegalArgumentException("Unknown logical column");
-            if (mutation.kind() == Mutation.Kind.MERGE && !(historical==null ? deterministicMergeColumns.contains(mutation.columnId()) : historical.column(mutation.columnId()).operator()!=null)) {
+            var selectedSchema=historical==null ? logicalSchema : historical;
+            if(mutation.kind()==Mutation.Kind.MERGE && selectedSchema!=null && selectedSchema.column(mutation.columnId()).schema().variableLengthKeysCount()!=0) throw new IllegalArgumentException("Bucket MERGE requires explicit member operand");
+            if ((mutation.kind() == Mutation.Kind.MERGE || mutation.kind()==Mutation.Kind.BUCKET_MERGE) && !(historical==null ? deterministicMergeColumns.contains(mutation.columnId()) : historical.column(mutation.columnId()).operator()!=null)) {
                 throw new IllegalArgumentException("Column has no admitted deterministic merge operator");
             }
             if (!contains(mutation.key())) throw new IllegalArgumentException("Mutation outside owned interval");
@@ -1595,7 +1600,7 @@ public final class ReplicatedRangeStore {
                     switch (mutation.kind()) {
                         case PUT -> batch.put(cf,mutation.key(),mutation.value()); case DELETE -> batch.delete(cf,mutation.key());
                         case MERGE -> batch.merge(cf,mutation.key(),mutation.value()); case DELETE_RANGE -> batch.deleteRange(cf,mutation.key(),mutation.value());
-                        case BUCKET_PUT, BUCKET_DELETE -> throw new IllegalStateException("Unlowered bucket finalization effect");
+                        case BUCKET_PUT, BUCKET_DELETE, BUCKET_MERGE -> throw new IllegalStateException("Unlowered bucket finalization effect");
                     }
                 }
                 for (var entry:buckets.entrySet()) batch.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
@@ -2438,7 +2443,7 @@ public final class ReplicatedRangeStore {
                             case DELETE -> batch.delete(cf, mutation.key());
                             case MERGE -> batch.merge(cf, mutation.key(), mutation.value());
                             case DELETE_RANGE -> batch.deleteRange(cf, mutation.key(), mutation.value());
-                            case BUCKET_PUT, BUCKET_DELETE -> throw new IllegalStateException("Bucket effect was not lowered into a physical batch");
+                            case BUCKET_PUT, BUCKET_DELETE, BUCKET_MERGE -> throw new IllegalStateException("Bucket effect was not lowered into a physical batch");
                         }
                     }
                     if (installUserEffects) for (var entry:bucketEffects.entrySet()) batch.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
@@ -2636,19 +2641,31 @@ public final class ReplicatedRangeStore {
                     : db.get(columns.get(predicate.columnId()),options,predicate.key());
             if (!Arrays.equals(current,predicate.expectedValue())) return new Evaluation(new CommandResult(CommandResult.Status.CONFLICT,List.of()),List.of());
         }
-        var staged=new LinkedHashMap<BucketKey,DistributedBucket>(); var effects=new ArrayList<Mutation>(); var values=new ArrayList<byte[]>(); long resultBytes=8;
+        var staged=new LinkedHashMap<BucketKey,DistributedBucket>(); var operatorReads=new HashMap<BucketKey,Integer>(); var effects=new ArrayList<Mutation>(); var values=new ArrayList<byte[]>(); long resultBytes=8;
         int order=0;
         for (var mutation:command.mutations()) {
             if (mutation.kind()==Mutation.Kind.DELETE_RANGE) { visibility.delete(mutation,order++); effects.add(mutation); continue; }
             byte[] value=null;
             if (mutation.bucket()) {
-                var key=new BucketKey(mutation.columnId(),mutation.key()); var prior=staged.get(key);
-                var bucket=visibility.deleted(mutation.columnId(),mutation.key()) ? logicalSchema.decodeBucket(mutation.columnId(),mutation.key(),null)
-                        : prior==null ? originalBucket(key,originals,budget,options) : prior;
-                if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=bucket.get(mutation.memberKeys());
-                var next=mutation.kind()==Mutation.Kind.BUCKET_PUT ? bucket.put(mutation.memberKeys(),mutation.value()) : bucket.remove(mutation.memberKeys());
-                budget.replace(prior==null ? 0 : prior.encodedSize(),next.encodedSize()); staged.put(key,next);
-                if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=next.get(mutation.memberKeys());
+                var key=new BucketKey(mutation.columnId(),mutation.key());
+                if(logicalSchema.column(mutation.columnId()).operator()!=null) {
+                    var cf=columns.get(mutation.columnId());
+                    if(visibility.deleted(mutation.columnId(),mutation.key())) overlay.delete(cf,mutation.key());
+                    if(mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=operatorBucketMember(mutation,overlay,options,operatorReads,budget);
+                    var type=switch(mutation.kind()) { case BUCKET_PUT -> BucketMergeOperand.Type.PUT; case BUCKET_DELETE -> BucketMergeOperand.Type.DELETE; case BUCKET_MERGE -> BucketMergeOperand.Type.MERGE; default -> throw new IllegalStateException("Invalid member operation"); };
+                    byte[] operand=BucketMergeOperand.encode(type,mutation.memberKeys(),mutation.value()); budget.replace(0,operand.length);
+                    overlay.merge(cf,mutation.key(),operand); effects.add(new Mutation(Mutation.Kind.MERGE,mutation.columnId(),mutation.key(),operand));
+                    if(mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=operatorBucketMember(mutation,overlay,options,operatorReads,budget);
+                } else {
+                    var prior=staged.get(key);
+                    var bucket=visibility.deleted(mutation.columnId(),mutation.key()) ? logicalSchema.decodeBucket(mutation.columnId(),mutation.key(),null)
+                            : prior==null ? originalBucket(key,originals,budget,options) : prior;
+                    if (mutation.returnMode()==Mutation.ReturnMode.PREVIOUS) value=bucket.get(mutation.memberKeys());
+                    if(mutation.kind()==Mutation.Kind.BUCKET_MERGE) throw new IllegalArgumentException("Bucket has no activated operator");
+                    var next=mutation.kind()==Mutation.Kind.BUCKET_PUT ? bucket.put(mutation.memberKeys(),mutation.value()) : bucket.remove(mutation.memberKeys());
+                    budget.replace(prior==null ? 0 : prior.encodedSize(),next.encodedSize()); staged.put(key,next);
+                    if (mutation.returnMode()==Mutation.ReturnMode.CURRENT) value=next.get(mutation.memberKeys());
+                }
             } else {
                 var cf=columns.get(mutation.columnId()); byte[] key=mutation.key();
                 if (visibility.deleted(mutation.columnId(),key)) overlay.delete(cf,key);
@@ -2670,6 +2687,12 @@ public final class ReplicatedRangeStore {
         visibility.hideDeleted(overlay,columns);
         staged.entrySet().removeIf(entry -> visibility.deleted(entry.getKey().column,entry.getKey().key));
         return new Evaluation(new CommandResult(CommandResult.Status.SUCCESS,values),List.copyOf(effects),staged);
+    }
+    private byte[] operatorBucketMember(Mutation mutation,WriteBatchWithIndex overlay,ReadOptions options,Map<BucketKey,Integer> reads,BucketBudget budget) throws RocksDBException {
+        byte[] raw=overlay.getFromBatchAndDB(db,columns.get(mutation.columnId()),options,mutation.key());
+        var key=new BucketKey(mutation.columnId(),mutation.key()); int size=raw==null ? 0 : raw.length; int previous=reads.getOrDefault(key,0);
+        if(size>previous) { budget.replace(previous,size); reads.put(key,size); }
+        return logicalSchema.decodeBucket(mutation.columnId(),mutation.key(),raw).get(mutation.memberKeys());
     }
     private CommandResult evaluateRaw(DistributedCommand command) throws RocksDBException {
         if (command.mutations().stream().allMatch(m -> m.returnMode()==Mutation.ReturnMode.NONE)) {

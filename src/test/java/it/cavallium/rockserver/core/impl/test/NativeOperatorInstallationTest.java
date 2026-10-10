@@ -178,4 +178,75 @@ class NativeOperatorInstallationTest {
         Files.write(first.resolve("bindings"),good); try(var pool=open(nativePath,source)) { assertArrayEquals(target.digest(),range(pool,source).schemaDigest()); }
     }
 
+    DistributedSchema bucketTarget(byte[] jar) throws Exception {
+        var fixed=target(jar); var column=fixed.columns().getFirst(); var operator=column.operator();
+        var shape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(it.cavallium.rockserver.core.common.ColumnHashType.ALLSAME8),true,operator.name(),operator.version(),operator.className());
+        return new DistributedSchema(fixed.clusterId(),fixed.databaseId(),fixed.domainId(),fixed.schemaEpoch(),0,List.of(new DistributedSchema.Column(column.apiId(),column.columnId(),column.name(),shape,operator)));
+    }
+    FFMAbstractMergeOperator delegate(FFMAbstractMergeOperator wrapper) throws Exception {
+        var field=DistributedBucketMergeOperator.class.getDeclaredField("delegate"); field.setAccessible(true); return (FFMAbstractMergeOperator)field.get(wrapper);
+    }
+    @Test void typedBucketInstallationUsesDeferredNativeOperandsAndRetainsChildThroughDropAndDbClose() throws Exception {
+        byte[] jar=DistributedMergeOperatorRegistryTest.classes(AppendOperator.class); var source=empty(0); var target=bucketTarget(jar); var terminal=empty(2); Path path=root.resolve("typed-bucket");
+        var operator=target.column(fixture.column).operator(); DistributedStoragePool.stageOperator(path,operator,new MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
+        var create=fixture.change(source,target,List.of(fixture.descriptor(fixture.group,null,null))); FFMAbstractMergeOperator wrapped,child;
+        try(var pool=open(path,source)) {
+            var store=range(pool,source); store.enableLogicalSchema(source); store.applyNoop(new ApplyPosition(1,0)); store.applySchemaFence(new ApplyPosition(1,1),create.header());
+            var installed=pool.installSchema(store,new ApplyPosition(1,2),create,Map.of(fixture.column,"data"),Set.of(fixture.column)); store.applySchemaActivation(new ApplyPosition(1,3),installed.proof(),UUID.randomUUID(),new ApplyPosition(2,10));
+            wrapped=loaded(pool).mergeOperators().get("data"); assertInstanceOf(DistributedBucketMergeOperator.class,wrapped); child=delegate(wrapped);
+            var db=loaded(pool); var cf=db.db().getStartupColumns().entrySet().stream().filter(e -> Arrays.equals(e.getKey().getName(),"data".getBytes())).map(Map.Entry::getValue).findFirst().orElse(null);
+            if(cf==null) { var handles=DistributedStoragePool.class.getDeclaredField("handles"); handles.setAccessible(true); cf=((Map<String,org.rocksdb.ColumnFamilyHandle>)handles.get(pool)).get("data"); }
+            byte[] key={7,0}; var one=List.of(new byte[]{1}); var two=List.of(new byte[]{2});
+            db.db().get().merge(cf,key,BucketMergeOperand.encode(BucketMergeOperand.Type.PUT,one,new byte[]{10}));
+            db.db().get().merge(cf,key,BucketMergeOperand.encode(BucketMergeOperand.Type.PUT,two,new byte[]{20}));
+            db.db().get().merge(cf,key,BucketMergeOperand.encode(BucketMergeOperand.Type.MERGE,one,new byte[]{11}));
+            try(var flush=new FlushOptions().setWaitForFlush(true)) { db.db().get().flush(flush); } db.db().get().compactRange(cf);
+            var result=DistributedBucket.decode(target.column(fixture.column).schema(),db.db().get().get(cf,key)); assertArrayEquals(new byte[]{10,11},result.get(one)); assertArrayEquals(new byte[]{20},result.get(two));
+            var delete=new SchemaChange.Definition(UUID.randomUUID(),new OperationId(UUID.randomUUID(),1,0),create.targetDirectory(),target,terminal); store.applySchemaFence(new ApplyPosition(1,4),delete.header());
+            var removed=pool.installSchema(store,new ApplyPosition(1,5),delete,Map.of(),Set.of()); store.applySchemaActivation(new ApplyPosition(1,6),removed.proof(),UUID.randomUUID(),new ApplyPosition(2,20));
+            assertTrue(wrapped.isOwningHandle()); assertTrue(child.isOwningHandle(),"Dropped bucket delegate must remain owned until native DB release");
+        }
+        assertFalse(wrapped.isOwningHandle()); assertFalse(child.isOwningHandle());
+    }
+    @Test void closingUnappliedTypedBucketInstallPlanReleasesWrapperAndDelegate() throws Exception {
+        byte[] jar=DistributedMergeOperatorRegistryTest.classes(AppendOperator.class); var source=empty(0); var target=bucketTarget(jar); var path=root.resolve("cancel-bucket-plan");
+        var operator=target.column(fixture.column).operator(); DistributedStoragePool.stageOperator(path,operator,new MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
+        var create=fixture.change(source,target,List.of(fixture.descriptor(fixture.group,null,null)));
+        try(var pool=open(path,source)) {
+            var store=range(pool,source); store.enableLogicalSchema(source); store.applyNoop(new ApplyPosition(1,0)); store.applySchemaFence(new ApplyPosition(1,1),create.header());
+            var plan=pool.prepareSchemaInstallation(store,create,Map.of(fixture.column,"data"),Set.of(fixture.column));
+            var field=plan.getClass().getDeclaredField("options"); field.setAccessible(true); var prepared=((Map<?,?>)field.get(plan)).get("data");
+            var options=prepared.getClass().getDeclaredField("options"); options.setAccessible(true); var callback=((RocksDBLoader.ColumnOptionsWithMerge)options.get(prepared)).mergeOperator(); var child=delegate(callback);
+            assertTrue(callback.isOwningHandle()); assertTrue(child.isOwningHandle()); plan.close(); assertFalse(callback.isOwningHandle()); assertFalse(child.isOwningHandle());
+        }
+    }
+
+    @Test void qualifiedBucketBootstrapReopenAndImageImportKeepTheNativeWrapper() throws Exception {
+        byte[] jar=DistributedMergeOperatorRegistryTest.classes(AppendOperator.class); var schema=bucketTarget(jar); var operator=schema.column(fixture.column).operator(); Path path=root.resolve("bucket-bootstrap"),image=root.resolve("bucket-bootstrap.image");
+        var names=Map.of(fixture.column,"bucket"); var limits=new NativeRangeImage.Limits(3*1024*1024,32*1024*1024,256);
+        DistributedStoragePool.stageOperator(path,operator,new MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
+        for(int round=0;round<2;round++) try(var pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),schema,names,Map.of())) {
+            var store=pool.openRange(new RangeOwnership.Owner(fixture.group,1),new RangeOwnership.Interval(fixture.domain,schema.columnIds(),null,null),schema.digest(),names,Set.of(fixture.column)); store.enableLogicalSchema(schema);
+            assertInstanceOf(DistributedBucketMergeOperator.class,loaded(pool).mergeOperators().get("bucket"));
+            if(round==0) {
+                store.applyNoop(new ApplyPosition(1,0));
+                var seed=DistributedCommand.bucketData(fixture.group,1,schema.digest(),new OperationId(UUID.randomUUID(),1,0),List.of(Mutation.bucketPut(fixture.column,new byte[]{7,0},List.of(new byte[]{1}),new byte[]{10},Mutation.ReturnMode.NONE),Mutation.bucketPut(fixture.column,new byte[]{7,0},List.of(new byte[]{2}),new byte[]{20},Mutation.ReturnMode.NONE)),List.of(),-1);
+                store.apply(new ApplyPosition(1,1),seed);
+                var merge=DistributedCommand.bucketData(fixture.group,1,schema.digest(),new OperationId(UUID.randomUUID(),1,0),List.of(Mutation.bucketMerge(fixture.column,new byte[]{7,0},List.of(new byte[]{1}),new byte[]{11},Mutation.ReturnMode.CURRENT)),List.of(),-1);
+                assertArrayEquals(new byte[]{10,11},CommandResult.decode(store.apply(new ApplyPosition(1,2),merge)).value(0));
+                try(var flush=new FlushOptions().setWaitForFlush(true)) { loaded(pool).db().get().flush(flush); } loaded(pool).db().get().compactRange();
+            }
+            try(var pin=store.capture()) { var bucket=DistributedBucket.decode(schema.column(fixture.column).schema(),pin.get(fixture.column,new byte[]{7,0})); assertArrayEquals(new byte[]{10,11},bucket.get(List.of(new byte[]{1}))); assertArrayEquals(new byte[]{20},bucket.get(List.of(new byte[]{2}))); }
+            if(round==1) NativeRangeImage.write(image,store,limits);
+        }
+        Path target=root.resolve("bucket-import"); DistributedStoragePool.stageOperator(target,operator,new MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
+        try(var pool=DistributedStoragePool.open(target,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),schema,names,Map.of())) {
+            var store=pool.openRange(new RangeOwnership.Owner(fixture.group,1),new RangeOwnership.Interval(fixture.domain,schema.columnIds(),null,null),schema.digest(),names,Set.of(fixture.column)); store.enableLogicalSchema(schema); store.fence(); store.installSnapshot(image,limits); store.activate();
+            assertInstanceOf(DistributedBucketMergeOperator.class,loaded(pool).mergeOperators().get("bucket"));
+            var merge=DistributedCommand.bucketData(fixture.group,1,schema.digest(),new OperationId(UUID.randomUUID(),1,0),List.of(Mutation.bucketMerge(fixture.column,new byte[]{7,0},List.of(new byte[]{2}),new byte[]{21},Mutation.ReturnMode.CURRENT)),List.of(),-1);
+            assertArrayEquals(new byte[]{20,21},CommandResult.decode(store.apply(new ApplyPosition(1,3),merge)).value(0));
+            try(var pin=store.capture()) { var bucket=DistributedBucket.decode(schema.column(fixture.column).schema(),pin.get(fixture.column,new byte[]{7,0})); assertArrayEquals(new byte[]{10,11},bucket.get(List.of(new byte[]{1}))); }
+        }
+    }
+
 }

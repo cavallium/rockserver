@@ -1,6 +1,11 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
+import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
+import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.ColumnHashType;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import it.cavallium.rockserver.core.impl.MergeOperatorRegistry;
 import it.cavallium.rockserver.core.impl.MergeOperatorRegistry.*;
@@ -21,7 +26,14 @@ final class DistributedOperatorArtifacts {
     private byte[] bootstrap;
     private Map<String,Binding> bindings;
     private boolean dirty;
-    private record Binding(UUID column,DistributedOperatorDescriptor operator) {}
+    private record BucketShape(List<Integer> keys,List<ColumnHashType> tails,boolean hasValue) {
+        BucketShape { keys=List.copyOf(keys); tails=List.copyOf(tails); if(tails.isEmpty() || !hasValue) throw new IllegalArgumentException("Invalid bucket callback shape"); }
+        ColumnSchema schema() { return new ColumnSchema(new IntArrayList(keys),new ObjectArrayList<>(tails),hasValue,null,null,null); }
+    }
+    private record Binding(UUID column,DistributedOperatorDescriptor operator,BucketShape bucket) {}
+    private static BucketShape bucketShape(DistributedSchema.Column column) {
+        var shape=column.schema(); return column.operator()==null || shape.variableLengthKeysCount()==0 ? null : new BucketShape(shape.keys(),shape.variableTailKeys(),shape.hasValue());
+    }
     DistributedOperatorArtifacts(Path poolPath) throws IOException {
         Path absolute=poolPath.toAbsolutePath().normalize();
         if(absolute.getFileName()==null) throw new IllegalArgumentException("Pool needs a named path");
@@ -72,20 +84,33 @@ final class DistributedOperatorArtifacts {
     }
     FFMAbstractMergeOperator resolve(String name) throws IOException {
         var binding=bindings.get(name); if(binding==null) throw new IOException("Physical CF lacks qualified birth binding: "+name);
-        return binding.operator()==null ? null : instantiate(binding.operator());
+        return instantiate(binding);
+    }
+    private FFMAbstractMergeOperator instantiate(Binding binding) throws IOException {
+        if(binding.operator()==null) return null;
+        try(var construction=FFMAbstractMergeOperator.trackConstruction()) {
+            var delegate=instantiate(binding.operator());
+            var operator=binding.bucket()==null ? delegate : new DistributedBucketMergeOperator(binding.bucket().schema(),delegate);
+            construction.adopt(operator); return operator;
+        }
+    }
+    FFMAbstractMergeOperator instantiate(DistributedSchema.Column column) throws IOException {
+        if(column.operator()==null) return null;
+        return instantiate(new Binding(column.columnId(),require(column.operator()),bucketShape(column)));
     }
     boolean contains(String name) { return bindings.containsKey(name); }
-    private static void add(Map<String,Binding> next,UUID id,String name,DistributedOperatorDescriptor operator) {
+    private static void add(Map<String,Binding> next,UUID id,String name,DistributedOperatorDescriptor operator) { add(next,id,name,operator,null); }
+    private static void add(Map<String,Binding> next,UUID id,String name,DistributedOperatorDescriptor operator,BucketShape bucket) {
         Objects.requireNonNull(id); Objects.requireNonNull(name);
         if(name.isEmpty() || name.length()>4096 || name.indexOf('\0')>=0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name) || DistributedStoragePool.isReservedColumn(name)) throw new IllegalArgumentException("Invalid physical CF name");
-        var binding=new Binding(id,operator); var previous=next.putIfAbsent(name,binding);
+        var binding=new Binding(id,operator,bucket); var previous=next.putIfAbsent(name,binding);
         if(previous!=null && !previous.equals(binding) || next.entrySet().stream().anyMatch(entry -> !entry.getKey().equals(name) && entry.getValue().column().equals(id))) throw new IllegalArgumentException("Qualified physical CF birth changed");
     }
     private Map<String,Binding> proposed(DistributedSchema schema,Map<UUID,String> names,Map<UUID,String> plain) throws IOException {
         if(!schema.columnIds().equals(names.keySet()) || !Collections.disjoint(names.keySet(),plain.keySet())) throw new IllegalArgumentException("Bootstrap schema/CF coverage mismatch");
         var next=new HashMap<>(bindings);
         // Validate all aliases and reserved names before inspecting artifacts or changing memory.
-        for(var column:schema.columns()) add(next,column.columnId(),names.get(column.columnId()),column.operator()==null ? null : descriptor(column.operator(),new DeterministicContract(column.operator().deterministicContract(),column.operator().deterministicContractVersion(),true)));
+        for(var column:schema.columns()) add(next,column.columnId(),names.get(column.columnId()),column.operator()==null ? null : descriptor(column.operator(),new DeterministicContract(column.operator().deterministicContract(),column.operator().deterministicContractVersion(),true)),bucketShape(column));
         for(var entry:plain.entrySet()) add(next,entry.getKey(),entry.getValue(),null);
         for(var column:schema.columns()) if(column.operator()!=null) require(column.operator());
         encodedBindings(next,bootstrap); return Map.copyOf(next);
@@ -108,7 +133,7 @@ final class DistributedOperatorArtifacts {
             for(var schema:List.of(claim.definition().sourceSchema(),claim.definition().targetSchema())) {
                 var names=schema==claim.definition().sourceSchema() ? claim.sourceNames() : claim.targetNames();
                 for(var column:schema.columns()) {
-                    var operator=column.operator()==null ? null : require(column.operator()); add(next,column.columnId(),names.get(column.columnId()),operator);
+                    var operator=column.operator()==null ? null : require(column.operator()); add(next,column.columnId(),names.get(column.columnId()),operator,bucketShape(column));
                 }
             }
         }
@@ -135,7 +160,7 @@ final class DistributedOperatorArtifacts {
             if(needed!=null && !needed.contains(names.get(column.columnId()))) continue;
             var expected=column.operator()==null ? null : descriptor(column.operator(),new DeterministicContract(column.operator().deterministicContract(),column.operator().deterministicContractVersion(),true));
             var actual=bindings.get(names.get(column.columnId()));
-            if(actual==null || !actual.column().equals(column.columnId()) || !Objects.equals(actual.operator(),expected)) throw new IOException("Native schema differs from trusted operator tuple");
+            if(actual==null || !actual.column().equals(column.columnId()) || !Objects.equals(actual.operator(),expected) || !Objects.equals(actual.bucket(),bucketShape(column))) throw new IOException("Native schema differs from trusted operator tuple");
         }
     }
     private static byte[] encodedBindings(Map<String,Binding> bindings,byte[] bootstrap) throws IOException {
@@ -145,6 +170,11 @@ final class DistributedOperatorArtifacts {
         for(var name:bindings.keySet().stream().sorted().toList()) {
             var binding=bindings.get(name); out.writeUTF(name); out.writeLong(binding.column().getMostSignificantBits()); out.writeLong(binding.column().getLeastSignificantBits());
             out.writeBoolean(binding.operator()!=null); if(binding.operator()!=null) { byte[] descriptor=encodeDescriptor(binding.operator()); out.writeInt(descriptor.length); out.write(descriptor); }
+            out.writeBoolean(binding.bucket()!=null); if(binding.bucket()!=null) {
+                out.writeInt(DistributedBucketMergeOperator.VALUE_FORMAT_ID); out.writeInt(BucketMergeOperand.FORMAT_ID);
+                out.writeInt(binding.bucket().keys().size()); for(int length:binding.bucket().keys()) out.writeInt(length);
+                out.writeInt(binding.bucket().tails().size()); for(var hash:binding.bucket().tails()) out.writeUTF(hash.name()); out.writeBoolean(binding.bucket().hasValue());
+            }
         }
         out.flush(); if(bytes.size()>MAX_INDEX_BYTES) throw new IllegalStateException("Qualified CF binding bytes exceed budget"); return bytes.toByteArray();
     }
@@ -172,7 +202,16 @@ final class DistributedOperatorArtifacts {
         for(int i=0;i<count;i++) {
             String name=in.readUTF(); UUID column=new UUID(in.readLong(),in.readLong()); DistributedOperatorDescriptor operator=null;
             if(in.readBoolean()) { int length=in.readInt(); if(length<1 || length>MAX_DESCRIPTOR_BYTES || length>in.available()) throw new IOException("Invalid descriptor length"); operator=decodeDescriptor(in.readNBytes(length)); }
-            if(name.isEmpty() || name.length()>4096 || name.indexOf('\0')>=0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name) || DistributedStoragePool.isReservedColumn(name) || !columns.add(column) || result.put(name,new Binding(column,operator))!=null) throw new IOException("Invalid qualified CF binding");
+            BucketShape bucket=null;
+            if(in.readBoolean()) {
+                if(operator==null || in.readInt()!=DistributedBucketMergeOperator.VALUE_FORMAT_ID || in.readInt()!=BucketMergeOperand.FORMAT_ID) throw new IOException("Bucket callback codec identity changed");
+                int keyCount=in.readInt(); if(keyCount<1 || keyCount>it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec.MAX_KEY_COMPONENTS) throw new IOException("Invalid bucket callback key count");
+                var keys=new ArrayList<Integer>(keyCount); for(int k=0;k<keyCount;k++) keys.add(in.readInt());
+                int tailCount=in.readInt(); if(tailCount<1 || tailCount>keyCount) throw new IOException("Invalid bucket callback tail count");
+                var tails=new ArrayList<ColumnHashType>(tailCount); for(int k=0;k<tailCount;k++) tails.add(ColumnHashType.valueOf(in.readUTF()));
+                bucket=new BucketShape(keys,tails,in.readBoolean()); bucket.schema();
+            }
+            if(name.isEmpty() || name.length()>4096 || name.indexOf('\0')>=0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name) || DistributedStoragePool.isReservedColumn(name) || !columns.add(column) || result.put(name,new Binding(column,operator,bucket))!=null) throw new IOException("Invalid qualified CF binding");
         }
         if(in.available()!=0) throw new IOException("Trailing qualified binding bytes"); return Map.copyOf(result);
     }

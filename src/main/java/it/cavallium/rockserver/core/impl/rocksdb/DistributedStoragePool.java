@@ -317,8 +317,8 @@ public final class DistributedStoragePool implements AutoCloseable {
         var fresh=new HashSet<>(claim.targetNames().keySet()); fresh.removeAll(claim.sourceNames().keySet()); proposedBirths(claim.targetNames(),claim.targetMerges(),definition.changeId(),fresh);
         for(var entry:claim.targetNames().entrySet()) if(handles.containsKey(entry.getValue()) && claim.targetMerges().contains(entry.getKey()) && loaded.mergeOperators().get(entry.getValue())==null) throw new IllegalArgumentException("Capacity existing merge resource missing");
         for(var entry:claim.targetNames().entrySet()) if(!handles.containsKey(entry.getValue())) {
-            var operator=definition.targetSchema().column(entry.getKey()).operator();
-            RocksDBLoader.OperatorResolver resolver=qualified ? ignored -> operator==null ? null : artifacts.instantiate(artifacts.require(operator)) : null;
+            var column=definition.targetSchema().column(entry.getKey());
+            RocksDBLoader.OperatorResolver resolver=qualified ? ignored -> artifacts.instantiate(column) : null;
             try(var prepared=new PreparedColumn(entry.getValue(),resolver)) {
                 if(!qualified && prepared.options.mergeOperator()!=null) throw new UnsupportedOperationException("New configured merge CF requires trusted artifact staging");
                 if(claim.targetMerges().contains(entry.getKey())!=(prepared.options.mergeOperator()!=null)) throw new IllegalArgumentException("Capacity merge resource missing or unqualified");
@@ -916,8 +916,8 @@ public final class DistributedStoragePool implements AutoCloseable {
             var name=entry.getValue();
             if(handles.containsKey(name) && record.targetMerges().contains(entry.getKey()) && loaded.mergeOperators().get(name)==null) throw new IllegalArgumentException("Missing merge operator");
             if(!handles.containsKey(name)) {
-                var operator=definition.targetSchema().column(entry.getKey()).operator();
-                RocksDBLoader.OperatorResolver resolver=qualified ? ignored -> operator==null ? null : artifacts.instantiate(artifacts.require(operator)) : null;
+                var column=definition.targetSchema().column(entry.getKey());
+                RocksDBLoader.OperatorResolver resolver=qualified ? ignored -> artifacts.instantiate(column) : null;
                 var prepared=new PreparedColumn(name,resolver); options.put(name,prepared);
                 if(!qualified && prepared.options.mergeOperator()!=null) throw new UnsupportedOperationException("New configured merge CF requires trusted artifact staging");
                 if(record.targetMerges().contains(entry.getKey()) && prepared.options.mergeOperator()==null) throw new IllegalArgumentException("Missing merge operator");

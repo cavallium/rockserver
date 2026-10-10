@@ -31,6 +31,16 @@ class DistributedCommandCodecTest {
         assertArrayEquals(DistributedCommandCodec.encode(ack),DistributedCommandCodec.encode(DistributedCommandCodec.decode(DistributedCommandCodec.encode(ack))));
     }
 
+    @Test void bucketMergeUsesSemanticTagSevenAndRetainsRawOperandReturnModes() {
+        var members=List.of(new byte[]{7},new byte[]{8,9});
+        for(var mode:Mutation.ReturnMode.values()) {
+            var mutation=Mutation.bucketMerge(COLUMN,new byte[]{1,2},members,new byte[]{3,4,5},mode); var command=data(List.of(mutation)); byte[] encoded=DistributedCommandCodec.encode(command);
+            assertTrue(mutation.bucket()); assertTrue(command.hasBucketData()); assertEquals(7,encoded[DistributedCommandCodec.HEADER_BYTES]);
+            var decoded=DistributedCommandCodec.decode(encoded); assertEquals(command.mutations(),decoded.mutations()); assertArrayEquals(encoded,DistributedCommandCodec.encode(decoded));
+        }
+        assertThrows(IllegalArgumentException.class,() -> new Mutation(Mutation.Kind.BUCKET_MERGE,COLUMN,new byte[]{1},new byte[]{2}));
+        assertThrows(IllegalArgumentException.class,() -> Mutation.bucketMerge(COLUMN,new byte[]{1},members,null,Mutation.ReturnMode.NONE));
+    }
     @Test void orderedRawOperandsReturnsPredicatesAndOwnedArraysAreCanonical() {
         var ordered=List.of(put(),new Mutation(Mutation.Kind.MERGE,COLUMN,new byte[] {10},new byte[] {1,2},Mutation.ReturnMode.CURRENT),
                 new Mutation(Mutation.Kind.MERGE,COLUMN,new byte[] {10},new byte[] {2,1},Mutation.ReturnMode.PREVIOUS),new Mutation(Mutation.Kind.DELETE,COLUMN,new byte[0],null));

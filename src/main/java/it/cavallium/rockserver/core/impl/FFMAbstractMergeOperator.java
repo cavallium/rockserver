@@ -16,6 +16,7 @@ import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * A bridge class that allows implementing RocksDB MergeOperators in pure Java
@@ -125,9 +126,13 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         }
         public List<FFMAbstractMergeOperator> created() { return List.copyOf(created); }
         public void adopt(FFMAbstractMergeOperator operator) {
-            if(closed || thread!=Thread.currentThread() || created.size()!=1 || created.getFirst()!=operator) throw new IllegalArgumentException("Operator constructor created unexpected native owners");
-            if(!operator.isOwningHandle() || !operator.instanceArena.scope().isAlive() || operator.sharedPtrContainer.address()!=operator.nativeHandle_) throw new IllegalArgumentException("Operator constructor disposed its native bridge");
-            adopted.add(operator);
+            if(closed || thread!=Thread.currentThread()) throw new IllegalArgumentException("Operator construction ownership changed");
+            var owners=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<FFMAbstractMergeOperator,Boolean>());
+            operator.collectOwnedDependencies(owners);
+            if(owners.size()!=created.size() || !owners.containsAll(created)) throw new IllegalArgumentException("Operator constructor created unexpected native owners");
+            for(var owner:owners) if(!owner.isOwningHandle() || !owner.instanceArena.scope().isAlive() || owner.sharedPtrContainer.address()!=owner.nativeHandle_) throw new IllegalArgumentException("Operator constructor disposed its native bridge");
+            for(var owner:owners) owner.dependenciesSealed=true;
+            adopted.addAll(owners);
         }
         @Override public void close() {
             if(closed) return;
@@ -141,6 +146,24 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
         for(var scope=CONSTRUCTION.get();scope!=null;scope=scope.previous) {
             if(scope.created.size()>=16) throw new IllegalStateException("Operator construction allocations exceed budget"); scope.created.add(operator);
         }
+    }
+    private final List<FFMAbstractMergeOperator> ownedDependencies=new ArrayList<>();
+    private FFMAbstractMergeOperator dependencyOwner;
+    private boolean dependenciesSealed;
+    /** Transfer a private owning callback dependency to this native bridge's lifetime. */
+    protected final void retainOwnedDependency(FFMAbstractMergeOperator dependency) {
+        Objects.requireNonNull(dependency);
+        synchronized(FFMAbstractMergeOperator.class) {
+            if(dependenciesSealed || !isOwningHandle() || !instanceArena.scope().isAlive() || !dependency.isOwningHandle() || !dependency.instanceArena.scope().isAlive() || dependency.dependencyOwner!=null || dependency==this) throw new IllegalArgumentException("Callback dependency lacks private native ownership");
+            var owners=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<FFMAbstractMergeOperator,Boolean>());
+            collectOwnedDependencies(owners); dependency.collectOwnedDependencies(owners);
+            if(owners.size()>16) throw new IllegalArgumentException("Callback dependency ownership exceeds budget");
+            dependency.dependencyOwner=this; ownedDependencies.add(dependency);
+        }
+    }
+    private void collectOwnedDependencies(java.util.Set<FFMAbstractMergeOperator> owners) {
+        if(!owners.add(this)) throw new IllegalArgumentException("Cyclic/duplicate native callback dependency");
+        for(var dependency:ownedDependencies) dependency.collectOwnedDependencies(owners);
     }
     private void closeConstructionOwner() { owningHandle_.set(false); if(instanceArena.scope().isAlive()) disposeBridge(sharedPtrContainer.address()); }
 
@@ -271,6 +294,11 @@ public abstract class FFMAbstractMergeOperator extends MergeOperator {
             LOG.warn("Error disposing native handle", e);
         } finally {
             instanceArena.close();
+            for(var dependency:ownedDependencies) if(dependency.isOwningHandle()) {
+                try { dependency.close(); }
+                catch(Throwable failure) { LOG.warn("Error disposing callback dependency",failure); }
+                finally { dependency.closeConstructionOwner(); }
+            }
         }
     }
 

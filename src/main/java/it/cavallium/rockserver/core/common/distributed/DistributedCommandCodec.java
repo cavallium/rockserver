@@ -28,7 +28,7 @@ public final class DistributedCommandCodec {
         uuid(output,command.operationId().sessionId()); output.putLong(command.operationId().epoch()).putLong(command.operationId().sequence());
         output.putLong(command.acknowledgedThrough()).putInt(command.mutations().size()).putInt(command.predicates().size());
         for (var mutation:command.mutations()) {
-            output.put((byte)switch(mutation.kind()) { case PUT -> 1; case DELETE -> 2; case MERGE -> 3; case DELETE_RANGE -> 4; case BUCKET_PUT -> 5; case BUCKET_DELETE -> 6; });
+            output.put((byte)switch(mutation.kind()) { case PUT -> 1; case DELETE -> 2; case MERGE -> 3; case DELETE_RANGE -> 4; case BUCKET_PUT -> 5; case BUCKET_DELETE -> 6; case BUCKET_MERGE -> 7; });
             output.put((byte)switch(mutation.returnMode()) { case NONE -> 0; case PREVIOUS -> 1; case CURRENT -> 2; });
             uuid(output,mutation.columnId()); bytes(output,mutation.key()); bytes(output,mutation.value());
             if (mutation.bucket()) members(output,mutation.memberKeys());
@@ -63,7 +63,7 @@ public final class DistributedCommandCodec {
             require(input,26);
             var mutation=switch(input.get()) {
                 case 1 -> Mutation.Kind.PUT; case 2 -> Mutation.Kind.DELETE; case 3 -> Mutation.Kind.MERGE;
-                case 4 -> Mutation.Kind.DELETE_RANGE; case 5 -> Mutation.Kind.BUCKET_PUT; case 6 -> Mutation.Kind.BUCKET_DELETE;
+                case 4 -> Mutation.Kind.DELETE_RANGE; case 5 -> Mutation.Kind.BUCKET_PUT; case 6 -> Mutation.Kind.BUCKET_DELETE; case 7 -> Mutation.Kind.BUCKET_MERGE;
                 default -> throw new IllegalArgumentException("Unknown mutation kind");
             };
             var mode=switch(input.get()) { case 0 -> Mutation.ReturnMode.NONE; case 1 -> Mutation.ReturnMode.PREVIOUS; case 2 -> Mutation.ReturnMode.CURRENT; default -> throw new IllegalArgumentException("Unknown return mode"); };
@@ -72,11 +72,11 @@ public final class DistributedCommandCodec {
             int valueLength=input.getInt(input.position()+keyLength), available=input.remaining()-keyLength-4;
             boolean deletion=mutation==Mutation.Kind.DELETE || mutation==Mutation.Kind.BUCKET_DELETE;
             if (deletion ? valueLength!=-1 : valueLength<0 || valueLength>available) throw new IllegalArgumentException("Invalid mutation value length");
-            boolean bucket=mutation==Mutation.Kind.BUCKET_PUT || mutation==Mutation.Kind.BUCKET_DELETE;
+            boolean bucket=mutation==Mutation.Kind.BUCKET_PUT || mutation==Mutation.Kind.BUCKET_DELETE || mutation==Mutation.Kind.BUCKET_MERGE;
             ByteBuffer tails=null; List<byte[]> memberKeys=List.of();
             if (bucket) { tails=input.duplicate(); tails.position(input.position()+keyLength+4+Math.max(0,valueLength)); memberKeys=members(tails); }
             byte[] key=new byte[keyLength]; input.get(key); input.getInt(); byte[] value=valueLength<0 ? null : new byte[valueLength]; if (value!=null) input.get(value);
-            if (bucket) { input.position(tails.position()); mutations.add(mutation==Mutation.Kind.BUCKET_PUT ? Mutation.bucketPut(column,key,memberKeys,value,mode) : Mutation.bucketDelete(column,key,memberKeys,mode)); }
+            if (bucket) { input.position(tails.position()); mutations.add(switch(mutation) { case BUCKET_PUT -> Mutation.bucketPut(column,key,memberKeys,value,mode); case BUCKET_DELETE -> Mutation.bucketDelete(column,key,memberKeys,mode); case BUCKET_MERGE -> Mutation.bucketMerge(column,key,memberKeys,value,mode); default -> throw new IllegalStateException(); }); }
             else mutations.add(new Mutation(mutation,column,key,value,mode));
         }
         var conditions=new ArrayList<KeyPredicate>(predicates);
