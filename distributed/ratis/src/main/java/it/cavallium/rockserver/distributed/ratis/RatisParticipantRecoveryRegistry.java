@@ -40,7 +40,7 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
     private final boolean takeover;
-    private final Set<UUID> allowedGroups;
+    private final java.util.function.Supplier<Set<UUID>> allowedGroups;
     private final Limits limits;
     private final FileChannel lockChannel;
     private final FileLock directoryLock;
@@ -53,10 +53,14 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
 
     public RatisParticipantRecoveryRegistry(Path existingDirectory,RatisTransactionStatuses homes,RatisRoutedClient data,
             boolean takeover,Set<UUID> allowedGroups,Limits limits) throws IOException {
+        this(existingDirectory,homes,data,takeover,fixedGroups(Set.copyOf(allowedGroups)),limits);
+    }
+    private static java.util.function.Supplier<Set<UUID>> fixedGroups(Set<UUID> groups){return ()->groups;}
+    public RatisParticipantRecoveryRegistry(Path existingDirectory,RatisTransactionStatuses homes,RatisRoutedClient data,
+            boolean takeover,java.util.function.Supplier<Set<UUID>> allowedGroups,Limits limits)throws IOException{
         this.directory=Objects.requireNonNull(existingDirectory).toAbsolutePath().normalize(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
         this.takeover=takeover;
-        this.allowedGroups=Set.copyOf(Objects.requireNonNull(allowedGroups)); this.limits=Objects.requireNonNull(limits);
-        if (this.allowedGroups.size()>MAX_FILES) throw new IllegalArgumentException("Too many allowed recovery groups");
+        this.allowedGroups=Objects.requireNonNull(allowedGroups); this.limits=Objects.requireNonNull(limits);allowedGroups();
         homes.requireDatabaseBinding(data.directory().clusterId(),data.directory().databaseId());
         if (!Files.isDirectory(directory,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Participant recovery directory must already exist");
         var lockPath=directory.resolve("registry.lock");
@@ -116,7 +120,7 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
     @Override public boolean step(UUID group,PreparedParticipant prepared) throws IOException { return visit(group,prepared,true); }
     private boolean visit(UUID group,PreparedParticipant prepared,boolean advance) throws IOException {
         Objects.requireNonNull(group); Objects.requireNonNull(prepared);
-        if (!allowedGroups.contains(group) || !group.equals(prepared.preparation().business().groupId())) throw new IllegalArgumentException("Participant recovery group is not locally allowed");
+        if (!allowedGroups().contains(group) || !group.equals(prepared.preparation().business().groupId())) throw new IllegalArgumentException("Participant recovery group is not locally allowed");
         begin();
         try {
             scan(); var key=new Key(group,prepared.preparation().transactionId()); FileEntry file;
@@ -176,7 +180,8 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
             persistedFiles=ordered.size(); reservedBytes=bytes; discovered=true;
         }
     }
-    private void requireAllowed(Key key) throws IOException { if (!allowedGroups.contains(key.group)) throw new IOException("Persisted recovery group is not locally allowed"); }
+    private Set<UUID> allowedGroups(){var groups=Set.copyOf(allowedGroups.get());if(groups.size()>MAX_FILES)throw new IllegalArgumentException("Too many allowed recovery groups");return groups;}
+    private void requireAllowed(Key key) throws IOException { if (!allowedGroups().contains(key.group)) throw new IOException("Persisted recovery group is not locally allowed"); }
     private static void requireEmptyLock(Path path) throws IOException { if (!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS) || Files.size(path)!=0) throw new IOException("Recovery lock must be an empty regular file"); }
     private static long temporarySize(Path path) throws IOException {
         if (!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Recovery pending journal must be a regular file");

@@ -10,19 +10,23 @@ public final class RatisNativeParticipantDiscovery {
     @FunctionalInterface public interface Reader { ReplicatedRangeStore.PreparedRecoveryPage read(UUID after,int limit) throws IOException; }
     public record Source(UUID group,Reader reader) { public Source { Objects.requireNonNull(group); Objects.requireNonNull(reader); } }
     private final RatisParticipantRecoveryRegistry registry;
-    private final List<Source> sources;
+    private final java.util.function.Supplier<List<Source>> sources;
     private final Map<UUID,UUID> cursors=new HashMap<>();
     private int cursor;
     private boolean active,journalsDiscovered;
     public RatisNativeParticipantDiscovery(RatisParticipantRecoveryRegistry registry,List<Source> sources) {
-        this.registry=Objects.requireNonNull(registry); this.sources=List.copyOf(sources);
-        if (sources.size()>RatisParticipantRecoveryRegistry.MAX_FILES || sources.stream().map(Source::group).distinct().count()!=sources.size()) throw new IllegalArgumentException("Invalid native recovery discovery sources");
+        this(registry,fixedSources(List.copyOf(sources)));
+    }
+    private static java.util.function.Supplier<List<Source>> fixedSources(List<Source> sources){return ()->sources;}
+    public RatisNativeParticipantDiscovery(RatisParticipantRecoveryRegistry registry,java.util.function.Supplier<List<Source>> sources){this.registry=Objects.requireNonNull(registry);this.sources=Objects.requireNonNull(sources);snapshotSources();}
+    private List<Source> snapshotSources(){var snapshot=List.copyOf(sources.get());if(snapshot.size()>RatisParticipantRecoveryRegistry.MAX_FILES || snapshot.stream().map(Source::group).distinct().count()!=snapshot.size())throw new IllegalArgumentException("Invalid native recovery discovery sources");return snapshot;
     }
     /** At most visits local reads/admissions and visits recovery writes; failures still permit queued recovery to progress. */
     public int cycle(int visits) throws IOException {
         if (visits<1 || visits>RatisParticipantRecoveryRegistry.MAX_VISITS) throw new IllegalArgumentException("Invalid native discovery quantum");
         synchronized (this) { if (active) throw new IOException("Native participant discovery already active"); active=true; }
         try {
+            var sources=snapshotSources();if(!sources.isEmpty())cursor=Math.floorMod(cursor,sources.size());cursors.keySet().retainAll(sources.stream().map(Source::group).toList());
             IOException failure=null;
             if (!journalsDiscovered) {
                 try { registry.discover(); journalsDiscovered=true; }

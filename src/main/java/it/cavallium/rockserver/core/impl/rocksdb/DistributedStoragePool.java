@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -91,6 +92,11 @@ public final class DistributedStoragePool implements AutoCloseable {
     @FunctionalInterface public interface TopologySeedForceObserver { void boundary(boolean afterPersistence) throws RocksDBException; }
     private volatile TopologySeedForceObserver topologySeedForceObserver=after -> {};
     public void topologySeedForceObserver(TopologySeedForceObserver observer) { topologySeedForceObserver=Objects.requireNonNull(observer); }
+    /** Completed, forced local artifacts; pending force attempts confer no runtime discovery authority. */
+    public List<NativeTopologySeed> topologySeeds() {
+        return topologySeeds.values().stream().sorted(Comparator.comparingLong(seed->seed.definition().sourceDirectory().generation())).toList();
+    }
+    public NativeTopologySeed topologySeed(UUID intent) { return topologySeeds.get(Objects.requireNonNull(intent)); }
     private record PendingTopologySeed(NativeTopologySeed seed,List<ReplicatedRangeStore> parents,List<HistoricalOwner> history,Map<UUID,NativeTopologySeed> seeds,RangeOwnership.TopologyTransfer transfer) {}
     private byte[] encodeTopologySeeds(Map<UUID,NativeTopologySeed> seeds) throws IOException {
         if(seeds.size()>MAX_TOPOLOGY_SEEDS) throw new IllegalStateException("Topology seed count exhausted");
@@ -125,7 +131,13 @@ public final class DistributedStoragePool implements AutoCloseable {
                 int length=in.readInt(); if(length<1 || length>NativeTopologySeed.MAX_BYTES || length>in.available()) throw new IllegalArgumentException("Topology artifact length exceeded"); var seed=NativeTopologySeed.decode(in.readNBytes(length)); requireTopologySeedRows(seed);
                 if(seeds.put(seed.definition().intentId(),seed)!=null) throw new IllegalArgumentException("Duplicate topology intent");
                 for(var parent:seed.definition().parents()) { if(retirements.put(parent.groupId(),seed)!=null) throw new IllegalArgumentException("Parent retired twice"); retired.put(new RangeOwnership.Owner(parent.groupId(),parent.rangeEpoch()),topologyInterval(seed,parent)); }
-                for(var target:seed.definition().targets()) { if(births.put(target.groupId(),seed.birth(target.groupId()))!=null) throw new IllegalArgumentException("Target born twice"); children.put(new RangeOwnership.Owner(target.groupId(),target.rangeEpoch()),topologyInterval(seed,target)); }
+                for(var target:seed.definition().targets()) { if(births.put(target.groupId(),seed.birth(target.groupId()))!=null) throw new IllegalArgumentException("Target born twice"); var childInterval=topologyInterval(seed,target); var evolution=recoverSchema(target.groupId());
+                    if(evolution.current()!=null) {
+                        if(evolution.chain().stream().noneMatch(record -> Arrays.equals(record.definition().sourceSchema().digest(),seed.header().schemaDigest()) && record.sourceNames().equals(seed.physicalNames()) && record.sourceMerges().equals(seed.mergeColumns()))) throw new IllegalArgumentException("Topology child evolution lacks original seed schema");
+                        evolution.current().requireRange(target.groupId(),target.rangeEpoch(),seed.header().domainId(),target.lowerInclusive(),target.upperExclusive());
+                        childInterval=new RangeOwnership.Interval(seed.header().domainId(),evolution.current().definition().targetSchema().columnIds(),target.lowerInclusive(),target.upperExclusive());
+                    }
+                    children.put(new RangeOwnership.Owner(target.groupId(),target.rangeEpoch()),childInterval); }
             }
             if(in.available()!=0 || !Arrays.equals(db.get(state,TOPOLOGY_SEEDS_KEY),encodeTopologySeeds(seeds))) throw new IllegalArgumentException("Noncanonical topology registry");
             // Startup never publishes an ownership transfer from merely buffered metadata.
@@ -185,7 +197,9 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     public ReplicatedRangeStore reopenTopologyRange(NativeTopologyBirth birth,DistributedSchema schema) throws RocksDBException {
         Objects.requireNonNull(birth); Objects.requireNonNull(schema); var seed=topologySeeds.get(birth.intentId()); if(seed==null) throw new IllegalArgumentException("Topology birth artifact missing"); birth.requireSeed(seed); schema.requireMatches(seed.definition().targetDirectory()); var range=birth.resolveDescriptor(seed);
-        var store=openRange(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),topologyInterval(seed,range),schema.digest(),seed.physicalNames(),seed.mergeColumns()); store.enableLogicalSchema(schema); return store;
+        var store=openRange(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),topologyInterval(seed,range),schema.digest(),seed.physicalNames(),seed.mergeColumns());
+        if(!Arrays.equals(store.schemaDigest(),schema.digest())) { var checkpoint=recoverSchema(range.groupId()); if(checkpoint.current()==null || !Arrays.equals(store.schemaDigest(),checkpoint.current().definition().targetSchema().digest())) throw new IllegalArgumentException("Topology child lacks verified current schema"); schema=checkpoint.current().definition().targetSchema(); }
+        store.enableLogicalSchema(schema); return store;
     }
 
     private byte[] encodeOwnershipHistory(List<HistoricalOwner> records) throws IOException {
@@ -983,6 +997,8 @@ public final class DistributedStoragePool implements AutoCloseable {
                 var store = new ReplicatedRangeStore(loaded.db().get(), ownership, owner, schema, rangeColumns,
                         handles.get(STATE_COLUMN), handles.get(RECEIPTS_COLUMN), merges);
                 store.configureSnapshotAdmission(snapshotAdmission); store.configureSchemaPreparationPool(this);
+                store.validateTopologyActivationRecovery();
+                if(topologySource==null && topologyChild!=null && store.topologyActivation()!=null) ownership.activate(owner);
                 for(var entry:names.entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),merges.contains(entry.getKey())));
                 ranges.add(store);
                 if(newImport!=null)newImportReservations.remove(owner.groupId());

@@ -19,7 +19,7 @@ import reactor.core.scheduler.Scheduler;
 public final class RatisTransactionExpiryService {
     private final RWScheduler scheduler;
     private final RWScheduler.WorkloadExecutor executor;
-    private final List<RatisRangeStateMachine> machines;
+    private final java.util.function.Supplier<List<RatisRangeStateMachine>> machines;
     private final int visits;
     private int cursor;
     private Task active;
@@ -28,11 +28,17 @@ public final class RatisTransactionExpiryService {
     private volatile Throwable lastFailure;
 
     public RatisTransactionExpiryService(RWScheduler scheduler,List<RatisRangeStateMachine> machines,int visits) {
+        this(scheduler,fixedMachines(machines),visits);
+    }
+    private static java.util.function.Supplier<List<RatisRangeStateMachine>> fixedMachines(List<RatisRangeStateMachine> machines){
+        if(machines.size()>RangeDirectoryCodec.MAX_RANGES+1)throw new IllegalArgumentException("Too many expiry groups");
+        var snapshot=List.copyOf(machines);return ()->snapshot;
+    }
+    public RatisTransactionExpiryService(RWScheduler scheduler,java.util.function.Supplier<List<RatisRangeStateMachine>> machines,int visits){
         this.scheduler=Objects.requireNonNull(scheduler);
         this.executor=scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,RequestContext.NO_TIMEOUT);
         Objects.requireNonNull(machines);
-        if (machines.size()>RangeDirectoryCodec.MAX_RANGES+1) throw new IllegalArgumentException("Too many expiry groups");
-        this.machines=List.copyOf(machines);
+        this.machines=machines;snapshotMachines();
         if (visits<1 || visits>32) throw new IllegalArgumentException("Invalid expiry quantum");
         this.visits=visits;
     }
@@ -85,7 +91,9 @@ public final class RatisTransactionExpiryService {
         return pending==null ? CompletableFuture.completedFuture(null) : pending.drained.copy();
     }
 
+    private List<RatisRangeStateMachine> snapshotMachines(){var supplied=machines.get();if(supplied.size()>RangeDirectoryCodec.MAX_RANGES+1)throw new IllegalArgumentException("Too many expiry groups");return List.copyOf(supplied);}
     private void cycle() throws Exception {
+        var machines=snapshotMachines();if(machines.isEmpty())return;cursor=Math.floorMod(cursor,machines.size());
         for (int i=0,n=Math.min(visits,machines.size());i<n;i++) {
             var machine=machines.get(cursor);
             cursor=(cursor+1)%machines.size(); // a failing group cannot starve the following groups

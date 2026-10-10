@@ -495,7 +495,7 @@ public final class NativeRangeImage {
                     } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema activation",failure); }
                 }
                 if(section==Section.STATE && key.length>16 && key[16]==0x29) throw new IOException("Uncompleted schema install cannot be exported");
-                if(section==Section.STATE && key.length>16 && (key[16]==0x61 || key[16]==0x62)) throw new IOException("Inactive topology USER images lack self-contained seed/retirement provenance");
+                if(section==Section.STATE && key.length>16 && (key[16]==0x61 || key[16]==0x62 || key[16]==0x63)) throw new IOException("Inactive topology USER images lack self-contained seed/retirement provenance");
                 if(section==Section.STATE && key.length>16 && key[16]==0x60) {
                     try {
                         if(key.length!=17 || topologyFreeze!=null) throw new IllegalArgumentException("Invalid topology FREEZE key/count");

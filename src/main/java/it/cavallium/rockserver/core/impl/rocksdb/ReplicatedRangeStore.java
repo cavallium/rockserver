@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyBirth;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologySeed;
 import it.cavallium.rockserver.core.common.distributed.TopologyChange;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
@@ -220,6 +221,7 @@ public final class ReplicatedRangeStore {
     private volatile NativeSchemaFence activeSchemaFence;
     private volatile NativeTopologyFreeze activeTopologyFreeze;
     private volatile NativeTopologyBirth topologyBirth;
+    private volatile NativeTopologyActivation topologyActivation;
     private volatile byte[] topologyRetirement;
     private volatile TopologyPreparation topologyPreparation;
     private volatile NativeSchemaInstallation activeSchemaInstallation;
@@ -616,7 +618,7 @@ public final class ReplicatedRangeStore {
         try {
             if(topologyRetired() || topologyBirthPending()) throw new IllegalStateException("Topology owner requires qualified future activation");
             if (pendingInstallation != null || importPending()) throw new IllegalStateException("Installation remains incomplete or unpublished");
-            try { recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
+            try { validateTopologyActivationRecovery(); recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
             homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied); validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
@@ -633,9 +635,12 @@ public final class ReplicatedRangeStore {
         byte[] birth=db.get(state,topologyOwnershipKey(0x61)),retirement=db.get(state,topologyOwnershipKey(0x62));
         if(birth!=null) { topologyBirth=NativeTopologyBirth.decode(birth); if(!topologyBirth.groupId().equals(groupId)) throw new IllegalArgumentException("Topology birth group differs from store"); }
         if(retirement!=null && retirement.length!=32) throw new IllegalArgumentException("Invalid topology retirement pointer"); topologyRetirement=retirement;
+        byte[] activation=db.get(state,topologyOwnershipKey(0x63));
+        if(activation!=null) { topologyActivation=NativeTopologyActivation.decode(activation); if(topologyBirth==null || !topologyBirth.equals(topologyActivation.birth())) throw new IllegalArgumentException("Topology activation lacks matching live birth"); topologyActivation.requireCut(applied); }
     }
     public NativeTopologyBirth topologyBirth() { return topologyBirth; }
-    public boolean topologyBirthPending() { return topologyBirth!=null && topologyRetirement==null; }
+    public NativeTopologyActivation topologyActivation() { return topologyActivation; }
+    public boolean topologyBirthPending() { return topologyBirth!=null && topologyRetirement==null && topologyActivation==null; }
     public boolean topologyRetired() { return topologyRetirement!=null; }
     void publishTopologyRetirement(NativeTopologySeed seed) { topologyRetirement=seed.digest(); }
     /** Metadata-only parent/birth status at its own completed prefix; no USER snapshot is acquired. */
@@ -647,6 +652,41 @@ public final class ReplicatedRangeStore {
         });
     }
     public long retiredAcknowledgedThrough(OperationId operation) throws RocksDBException { return readSchemaMetadata(() -> { if(!topologyRetired()) throw new IllegalStateException("Parent is not retired"); return acknowledgedThrough(operation,null); }); }
+
+    private NativeTopologySeed requireTopologyActivationSeed(boolean fresh) throws RocksDBException {
+        if(topologyBirth==null || schemaPreparationPool==null) throw new IllegalStateException("Topology activation requires retained local child birth");
+        var seed=schemaPreparationPool.topologySeed(topologyBirth.intentId());
+        if(seed==null) throw new IllegalStateException("Topology activation seed is absent");
+        var target=topologyBirth.resolveDescriptor(seed);
+        if(target.rangeEpoch()!=rangeEpoch || !target.groupId().equals(groupId) || !seed.header().domainId().equals(interval.domainId()) || fresh && (!Arrays.equals(seed.header().schemaDigest(),schemaDigest) || !seed.definition().targetDirectory().columns().equals(columns.keySet())) || !Arrays.equals(target.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(target.upperExclusive(),interval.upperExclusive())) throw new IllegalArgumentException("Topology activation child geometry/schema differs");
+        if(applied==null || applied.term()<=0 || applied.index()<0 || configurationUnderAdmission()==null) throw new IllegalStateException("Topology activation requires own committed Raft prefix/configuration");
+        return seed;
+    }
+    void validateTopologyActivationRecovery() throws RocksDBException {
+        if(topologyActivation!=null) { topologyActivation.requireSeed(requireTopologyActivationSeed(false)); topologyActivation.requireCut(applied); }
+    }
+    /** Trusted committed activation; fresh catalogue/membership authority is qualified by the adapter. */
+    public NativeTopologyActivation applyTopologyActivation(ApplyPosition position,TopologyChange.Definition definition,byte[] commonFreezeDigest,UUID catalogueGroup,ApplyPosition catalogueCut,byte[] publicationCommitment) throws RocksDBException {
+        Objects.requireNonNull(position); enterNative(); applyLane.lock();
+        try {
+            if(topologyRetired()) throw new IllegalStateException("Retired topology source cannot activate");
+            var seed=requireTopologyActivationSeed(topologyActivation==null); seed.header().requireDefinition(definition);
+            if(!Arrays.equals(seed.authority().freezeDigest(),commonFreezeDigest)) throw new IllegalArgumentException("Topology activation changes common parent freeze");
+            if(topologyActivation!=null) {
+                topologyActivation.requireSeed(seed); topologyActivation.requireRequest(definition,commonFreezeDigest,catalogueGroup,catalogueCut,publicationCommitment);
+                if(position.index()<topologyActivation.position().index() || position.index()==topologyActivation.position().index() && position.term()!=topologyActivation.position().term()) throw new IllegalArgumentException("Topology activation changes original position");
+                advanceCompletedMarker(position); return topologyActivation;
+            }
+            synchronized(ownership) {
+            if(ownership.get(owner).state()!=RangeOwnership.State.FENCED) throw new IllegalStateException("Topology activation requires fenced child");
+            requireNext(position); ensureReceiptUsage(); var receipt=new NativeTopologyActivation(seed,topologyBirth,position,catalogueGroup,catalogueCut,publicationCommitment); var history=prepareScopedWrites(false,List.of(),Map.of());
+            try(var lease=ownership.claimInstall(owner);var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                if(cdc!=null) cdc.initialize(batch); batch.put(state,topologyOwnershipKey(0x63),receipt.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            topologyActivation=receipt; publishScoped(position,history,false); applied=position; ownership.activate(owner); return receipt;
+            }
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
 
     private byte[] topologyFreezeKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x60).array(); }
     private void requireTopologyWritable() { if(activeTopologyFreeze!=null || topologyPreparation!=null) throw new IllegalStateException("Topology freeze blocks new writable admission"); }
@@ -3115,7 +3155,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
-            if(topologyRetired() || topologyBirthPending()) throw new IllegalStateException("Inactive topology owner cannot replace USER rows");
+            if(topologyRetired() || topologyBirth!=null) throw new IllegalStateException("Topology USER image install requires self-contained seed provenance");
             if(topologyPreparation!=null) throw new IllegalStateException("Topology preparation owns native replacement admission");
             if(activeTopologyFreeze!=null) {
                 var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visit(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); });
@@ -3637,7 +3677,7 @@ public final class ReplicatedRangeStore {
     }
 
     private SnapshotPin captureUnderAdmission() throws RocksDBException { return captureUnderAdmission(false); }
-    SnapshotPin captureForImage() throws RocksDBException { return captureForRecovery(); }
+    SnapshotPin captureForImage() throws RocksDBException { if(topologyBirth!=null || topologyRetired()) throw new IllegalStateException("Topology USER image export requires self-contained seed provenance"); return captureForRecovery(); }
     /**
      * Trusted Raft metadata recovery and image ownership only, never fresh DATA admission.
      * Bypasses the schema business fence while retaining physical activation, completed-marker

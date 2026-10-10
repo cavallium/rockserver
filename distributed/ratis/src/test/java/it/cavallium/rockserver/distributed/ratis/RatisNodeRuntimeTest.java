@@ -387,7 +387,7 @@ class RatisNodeRuntimeTest {
         try (var env=new Env(root)) {
             var fake=new FakeServer(); var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake); node.start();
             var field=RatisRangeStateMachine.class.getDeclaredField("store"); field.setAccessible(true);
-            var store=(ReplicatedRangeStore)field.get(fake.machines.values().iterator().next());
+            var store=(ReplicatedRangeStore)field.get(fake.machines.get(RaftGroupId.valueOf(env.plan.directory().ranges().getFirst().groupId())));
             try (var pin=store.capture()) {
                 assertThrows(IOException.class,node::close); assertFalse(node.started()); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(1,fake.closes);
                 assertNull(pin.get(env.outer.data,new byte[]{1}),"Native handles stay valid while the old reader owns them");
@@ -893,10 +893,11 @@ class RatisNodeRuntimeTest {
         public boolean isDisposed() { return disposed; }
     }
     static final class FakeServer {
-        boolean created,wrongEndpoint,joint,rejectAdd,allFencedAtClose,failCreate,failStart,exposedBeforeStart; int closes,starts;
+        boolean created,wrongEndpoint,joint,rejectAdd,loseAddReply,skipFirstNoop,allFencedAtClose,failCreate,failStart,exposedBeforeStart; int closes,starts,adds;
         volatile boolean leader=true,ready=true; volatile long term=1;
         RatisNodePlan plan; Path logs; Map<RaftGroupId,RatisRangeStateMachine> machines; RaftServer server;
         final Map<RaftGroupId,RaftStorage> storages=new LinkedHashMap<>();
+        final Map<RaftGroupId,RaftGroup> actualGroups=new LinkedHashMap<>();
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException {
             created=true; if (failCreate) throw new IOException("fixture build failure"); this.plan=plan; this.logs=logs; this.machines=machines;
             server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> switch (method.getName()) {
@@ -910,7 +911,7 @@ class RatisNodeRuntimeTest {
                 case "getGroupIds" -> List.copyOf(storages.keySet());
                 case "getDivision" -> division((RaftGroupId)args[0]);
                 case "groupManagement" -> {
-                    var request=(GroupManagementRequest)args[0]; if (!rejectAdd) initialize(request.getAdd().getGroup());
+                    var request=(GroupManagementRequest)args[0];adds++; if (!rejectAdd) initialize(request.getAdd().getGroup());if(loseAddReply){loseAddReply=false;throw new IOException("Lost added group reply");}
                     yield new RaftClientReply.Builder().setClientId(request.getClientId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(request.getRaftGroupId())
                             .setCallId(request.getCallId()).setSuccess(!rejectAdd).build();
                 }
@@ -922,14 +923,14 @@ class RatisNodeRuntimeTest {
             }); return server;
         }
         void initialize(RaftGroup group) throws Exception {
-            if (storages.containsKey(group.getGroupId())) return;
+            if (storages.containsKey(group.getGroupId())) return;actualGroups.put(group.getGroupId(),group);
             var storage=RaftStorage.newBuilder().setDirectory(logs.resolve(group.getGroupId().getUuid().toString()).toFile()).setOption(RaftStorage.StartupOption.RECOVER)
                     .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
                     .setLogCorruptionPolicy(RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build(); storage.initialize(); storages.put(group.getGroupId(),storage);
-            var machine=machines.get(group.getGroupId()); machine.initialize(server,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
+            var machine=machines.get(group.getGroupId()); machine.initialize(server,group.getGroupId(),storage); if(!skipFirstNoop)machine.notifyTermIndexUpdated(1,0);
         }
         RaftServer.Division division(RaftGroupId id) {
-            var group=plan.localGroups().stream().filter(candidate -> candidate.getGroupId().equals(id)).findFirst().orElseThrow();
+            var group=actualGroups.get(id);if(group==null)throw new IllegalArgumentException("No actual division for "+id);
             var configuration=(RaftConfiguration)Proxy.newProxyInstance(RaftConfiguration.class.getClassLoader(),new Class<?>[]{RaftConfiguration.class},(proxy,method,args) -> {
                 var role=(RaftPeerRole)args[0]; var peers=group.getPeers().stream().filter(peer -> peer.getStartupRole()==role).toList();
                 if (method.getName().equals("getPreviousPeers")) return joint ? peers : List.of();
