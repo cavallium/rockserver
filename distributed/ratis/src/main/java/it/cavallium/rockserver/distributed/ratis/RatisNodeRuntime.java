@@ -301,7 +301,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
                                 it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES,
                                 it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_TOTAL_BYTES
                                         +it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES);
-                        var files=new RatisReferencedFiles(root.resolve("referenced-files").resolve(id.toString()),id,limits,importFileIo);
+                        var files=new RatisReferencedFiles(root.resolve("referenced-files").resolve(id.toString()),id,limits,importFileIo,
+                                request->RatisRangeImportRpc.requireFile(importDefinition.manifest(id),request));
                         importFiles.put(id,files); machine.referencedFiles(files);
                         machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority());
                     }
