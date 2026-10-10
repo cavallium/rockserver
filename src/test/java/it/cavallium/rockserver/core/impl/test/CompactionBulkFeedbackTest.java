@@ -460,6 +460,20 @@ class CompactionBulkFeedbackTest {
                 "dense native cache hits must qualify despite below-quorum metadata latency variation");
         t.seconds(180); assertTrue(t.applied >= 65536);
     }
+    @Test void newUnreferencedPointLaneAbortsBulkOnlyProbeBeforeApparentBulkBenefit() throws Exception {
+        var t = new Trace(); t.point = false; t.prime(); t.probe();
+        assertEquals(0, t.p.baselineReadMicros());
+        var reference = CompactionIoBudget.class.getDeclaredField("probePointProtected"); reference.setAccessible(true);
+        assertFalse(reference.getBoolean(t.p));
+        var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
+        long restored = prior.getLong(t.p);
+        t.extraPointCalls = 1; t.nativePointMean = t.pointTail = 250;
+        t.transferred = RATE * 3 / 4; t.bulkCallMicros = 50000;
+        t.step();
+        assertEquals(CompactionIoBudget.State.TRACKING, t.p.state(),
+                "a new point lane must not be ignored by a bulk-only trial even with one fresh call");
+        assertEquals(restored, t.p.budget());
+    }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;
         t.step(); assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());

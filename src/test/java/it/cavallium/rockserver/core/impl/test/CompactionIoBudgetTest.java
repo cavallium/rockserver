@@ -81,6 +81,27 @@ class CompactionIoBudgetTest {
             assertEquals(SEED, t.policy.budget());
         }
     }
+    @Test void probeRejectsNewOrWorseningPointLaneWithoutAnyHistoricalBreach() throws Exception {
+        for (int scenario = 0; scenario < 3; scenario++) {
+            var t = new Trace(); t.pointMax = 1500; t.window(40, 500, SEED);
+            if (scenario < 2) {
+                var protectedPoint = CompactionIoBudget.class.getDeclaredField("probePointProtected");
+                protectedPoint.setAccessible(true); protectedPoint.setBoolean(t.policy, false);
+                if (scenario == 0) {
+                    var historical = CompactionIoBudget.class.getDeclaredField("baseline");
+                    historical.setAccessible(true); historical.setDouble(t.policy, 0);
+                }
+            } else {
+                var reference = CompactionIoBudget.class.getDeclaredField("probeLatency");
+                reference.setAccessible(true); reference.setDouble(t.policy, 200);
+            }
+            long count = scenario < 2 ? 1 : 40; // A newly unprotected lane cannot be hidden by low current call volume.
+            t.completions += count; t.poll(count, 250, 750000, false, true);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(),
+                    "new or worsened trial activity must fail closed even below a historical500us reference");
+            assertEquals(SEED, t.policy.budget());
+        }
+    }
     @Test void transientProbeBenefitThenReboundRestoresPriorRateImmediately() {
         var t = new Trace();
         t.window(10, 100, SEED);

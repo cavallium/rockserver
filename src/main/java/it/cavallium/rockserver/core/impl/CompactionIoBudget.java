@@ -399,15 +399,17 @@ public final class CompactionIoBudget {
         }
         long pointCalls = sample.nativePointCompletions - old.nativePointCompletions;
         long pointTime = sample.nativePointReadNanos - old.nativePointReadNanos;
-        if (pointCalls >= 32 && pointTime > 0 && baseline > 0
-                && pointTime / (pointCalls * 1000d) > baseline * 1.2) {
-            boolean alreadyOff = readaheadBytes == 0 && appliedReadahead == 0 && !readaheadUnknown;
-            reduceReadahead(0);
-            // Keep optional I/O safe against history; an already-OFF byte trial has its own comparable reference.
-            if (state == State.PROBE && (!alreadyOff || !probePointProtected
-                    || !Double.isFinite(probeLatency) || probeLatency <= 0
-                    || pointTime / (pointCalls * 1000d) > probeLatency * 1.2)) finishProbe(false, Double.NaN);
-        }
+        double pointMean = pointCalls >= 32 && pointTime > 0 ? pointTime / (pointCalls * 1000d) : Double.NaN;
+        boolean historicalPressure = baseline > 0 && pointMean > baseline * 1.2;
+        boolean pointActivity = pointCalls > 0 || pointTime > 0 || sample.pointTailMicros > 0;
+        boolean probePressure = state == State.PROBE && pointActivity
+                && (!probePointProtected || !Double.isFinite(probeLatency) || probeLatency <= 0
+                    || pointMean > probeLatency * 1.2);
+        boolean alreadyOff = readaheadBytes == 0 && appliedReadahead == 0 && !readaheadUnknown;
+        if (historicalPressure) reduceReadahead(0);
+        // Optional I/O uses history; the byte trial independently protects its qualified point population.
+        if (state == State.PROBE && (probePressure || historicalPressure && !alreadyOff))
+            finishProbe(false, Double.NaN);
         boolean pointSlow = sample.pointTailMicros > 0 && pointTailBaseline > 0
                 && sample.pointTailMicros > pointTailBaseline * 1.2;
         long calls = sample.nativeBulkCompletions - old.nativeBulkCompletions;
