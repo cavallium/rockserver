@@ -50,6 +50,21 @@ class ReplicatedRangeStoreTest {
         }
     }
 
+    @Test void cdcKeepsCommittedMergeOperandsInsteadOfReadingLaterResolvedValues() throws Exception {
+        try(var pool=new Pool(path)) {
+            pool.store.enableCdc(GROUP);
+            var first=command(0,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("first")));
+            var second=command(1,new Mutation(Mutation.Kind.MERGE,A,bytes("k"),bytes("later")));
+            pool.store.apply(new ApplyPosition(1,0),first); pool.store.apply(new ApplyPosition(1,1),second);
+            var page=pool.store.pollCdc(new DistributedCdcCheckpoint.Lineage(GROUP,GROUP,1),DistributedCdcCheckpoint.Cursor.beginning(),2,8*1024*1024);
+            assertEquals(2,page.records().size());
+            assertArrayEquals(bytes("first"),page.records().getFirst().events().getFirst().mutation().value());
+            assertArrayEquals(bytes("later"),page.records().getLast().events().getFirst().mutation().value());
+            assertEquals(Mutation.Kind.MERGE,page.records().getFirst().events().getFirst().mutation().kind());
+            assertArrayEquals(bytes("first,later"),pool.db.get(pool.handles.get(1),bytes("k")));
+        }
+    }
+
     @Test void snapshotPinsDataAndReceiptsAtSameCompletedMarker() throws Exception {
         try (Pool pool = new Pool(path)) {
             pool.store.applyNoop(new ApplyPosition(1, 0));

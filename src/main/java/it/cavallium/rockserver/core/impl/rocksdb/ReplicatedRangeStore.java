@@ -96,6 +96,36 @@ import org.rocksdb.TransactionDB;
  * consensus, ownership and operator qualification belong to the range adapter.
  */
 public final class ReplicatedRangeStore {
+    private NativeRangeCdc cdc;
+    /** Trusted DATA-role setup. Existing data without CDC history starts at a gap floor, never a false empty tail. */
+    public void enableCdc(UUID rangeId) throws RocksDBException {
+        Objects.requireNonNull(rangeId); enterNative(); applyLane.lock();
+        try {
+            var lineage=new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(rangeId,groupId,rangeEpoch);
+            if(cdc!=null) { if(!cdc.lineage().equals(lineage)) throw new IllegalStateException("CDC lineage changed"); return; }
+            var candidate=new NativeRangeCdc(db,state,lineage);
+            if(pendingInstallation==null) candidate.recover(applied);
+            cdc=candidate;
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    public record CdcPage(it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,ApplyPosition cut,
+            it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor floor,
+            it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor next,
+            List<it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord> records) {
+        public CdcPage { records=List.copyOf(records); }
+    }
+    /** One completed native cut. Fresh-read/owner authority is supplied by the range adapter. */
+    public CdcPage pollCdc(it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,
+            it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes) throws RocksDBException {
+        Objects.requireNonNull(lineage); Objects.requireNonNull(from);
+        if(maxRecords<1 || maxRecords>256 || maxBytes<1 || maxBytes>8*1024*1024) throw new IllegalArgumentException("Invalid CDC poll budget");
+        enterNative(); applyLane.lock();
+        try {
+            requireActive();
+            if(cdc==null || !cdc.lineage().equals(lineage)) throw new IllegalArgumentException("CDC lineage is not configured");
+            return cdc.poll(from,maxRecords,maxBytes,applied);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
     private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
     public static final int MAX_SCHEMA_AUTHORITY_BYTES=5*1024*1024;
@@ -327,6 +357,7 @@ public final class ReplicatedRangeStore {
             if(count<0 || count>=NativeRangeSstImport.FileReceipt.MAX_RECEIPTS)throw new IllegalStateException("Import file receipt capacity exhausted");
             var writes=prepareScopedWrites(false,List.of(),Map.of());
             try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                if(cdc!=null) cdc.initialize(batch);
                 batch.put(state,importFileKey(client,call),receipt.encode());batch.put(state,importKey(0x45),ByteBuffer.allocate(8).putLong(count+1).array());
                 batch.put(state,markerKey,encodePosition(position));batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));db.write(options,batch);
             }
@@ -371,7 +402,8 @@ public final class ReplicatedRangeStore {
                     byte[] marker=db.get(state,markerKey),usage=db.get(state,usageKey); if(marker==null || usage==null || db.get(state,importKey(0x41))!=null)throw new IllegalStateException("Import completion lacks atomic native marker");
                     var cut=decodePosition(marker); saved.requireCut(cut);
                     if(!saved.position().equals(importIntent.position()) || !cut.equals(saved.position()))throw new IllegalStateException("Unknown import completion changed original position");
-                    try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(state,importKey(0x42),completed); batch.put(state,markerKey,marker); batch.put(state,usageKey,usage); db.write(options,batch); }
+                    try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                        if(cdc!=null) cdc.initialize(batch); batch.put(state,importKey(0x42),completed); batch.put(state,markerKey,marker); batch.put(state,usageKey,usage); db.write(options,batch); }
                     importReceipt=saved; importIntent=null; applied=cut;
                 }
             }
@@ -388,7 +420,8 @@ public final class ReplicatedRangeStore {
                 try(var flush=new org.rocksdb.FlushOptions().setWaitForFlush(true)) { if(!columns.isEmpty())db.flush(flush,new ArrayList<>(columns.values())); }
                 db.flushWal(true); observer.at(NativeRangeSstImport.Stage.DATA_DURABLE);
                 var receipt=new NativeSstImportManifest.Receipt(manifest.importId(),groupId,rangeEpoch,manifest.digest(),position);
-                try(var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(state,importKey(0x42),receipt.encode()); batch.delete(state,importKey(0x41)); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch); }
+                try(var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                    if(cdc!=null) cdc.initialize(batch); batch.put(state,importKey(0x42),receipt.encode()); batch.delete(state,importKey(0x41)); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch); }
                 importIntent=null; importReceipt=receipt; applied=position; observer.at(NativeRangeSstImport.Stage.RECEIPT_FORCED); return receipt;
             }
         } finally { applyLane.unlock(); nativeLifecycle.writeLock().unlock(); }
@@ -400,7 +433,13 @@ public final class ReplicatedRangeStore {
             if(importReceipt==null || !Arrays.equals(importReceipt.encode(),authority.receipt().encode()))throw new IllegalArgumentException("Import activation requires original installed receipt");
             if(importActivation!=null) { if(!Arrays.equals(importActivation.encode(),authority.encode()))throw new IllegalArgumentException("Import activation changed"); return; }
             if(ownership.get(owner).state()!=RangeOwnership.State.FENCED || snapshotPins.get()!=0)throw new IllegalStateException("Import activation requires fenced owner"); requireNext(authority.position());
-            try(var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(state,importKey(0x43),authority.encode()); batch.put(state,markerKey,encodePosition(authority.position())); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),authority.position())); db.write(options,batch); }
+            Runnable publishCdc=()->{};
+            try(var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                if(cdc!=null) cdc.initialize(batch);
+                if(cdc!=null) publishCdc=cdc.importedBaseline(batch,authority.position());
+                batch.put(state,importKey(0x43),authority.encode()); batch.put(state,markerKey,encodePosition(authority.position())); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),authority.position())); db.write(options,batch);
+            }
+            publishCdc.run();
             importActivation=authority; applied=authority.position(); ownership.activate(owner);
         } finally { applyLane.unlock(); nativeLifecycle.writeLock().unlock(); }
     }
@@ -617,6 +656,7 @@ public final class ReplicatedRangeStore {
             requireSchemaFenceSchema(proposed,logicalSchema);
             requireNext(position); var history=prepareScopedWrites(false,List.of(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 batch.put(state,schemaFenceKey(),proposed.encode()); batch.put(state,markerKey,encodePosition(position));
                 batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
@@ -692,6 +732,7 @@ public final class ReplicatedRangeStore {
             observer.after(DistributedStoragePool.SchemaInstallStage.COLUMN_FAMILIES);
             if(!nextColumns.keySet().equals(record.targetNames().keySet())) throw new IllegalArgumentException("Target handles differ");
             try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                if(cdc!=null) cdc.initialize(batch);
                 batch.put(state,schemaStateKey(0x28),encoded); batch.put(state,schemaHistoryKey(record.definition().changeId()),encoded);
                 batch.delete(state,schemaStateKey(0x29)); batch.delete(state,schemaStateKey(0x2c)); batch.put(state,markerKey,encodePosition(record.position()));
                 batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),record.position())); if(capacityTransfer!=null) capacityTransfer.append(batch); db.write(options,batch);
@@ -723,6 +764,7 @@ public final class ReplicatedRangeStore {
             requireNext(position); var proof=new NativeSchemaActivationProof(expected,catalogueGroup,catalogueCut,position);
             var history=prepareScopedWrites(false,List.of(),Map.of());
             try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 batch.put(state,schemaChangeKey(0x2b,change),proof.encode()); batch.put(state,schemaStateKey(0x2c),proof.encode()); batch.delete(state,schemaFenceKey());
                 batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
@@ -938,6 +980,7 @@ public final class ReplicatedRangeStore {
         byte[] result=new CommandResult(CommandResult.Status.STALE_SCHEMA,List.of()).encode(),encoded=encodeReceipt(command.receiptDigest(),result);
         var history=prepareScopedWrites(false,List.of(),Map.of());
         try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+            if(cdc!=null) cdc.initialize(batch);
             updateReceiptUsage(batch,command,-1,-1,minimum,floor,encoded.length,position);
             batch.put(receipts,receiptKey(id),encoded); batch.put(state,markerKey,encodePosition(position)); db.write(options,batch);
         }
@@ -1165,6 +1208,7 @@ public final class ReplicatedRangeStore {
             if (saved==null) checkHomeCapacity(1+(creditChange==null ? 0 : creditChange.count()),homeRecoveryBytes(recovery)+(creditChange==null ? 0 : creditChange.bytes()));
             var writes=prepareScopedWrites(effects,command.mutations(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 if (effects) { var mutation=command.mutations().getFirst(); batch.put(columns.get(mutation.columnId()),mutation.key(),mutation.value()); }
                 if (saved==null) batch.put(state,homeRecoveryKey(recovery.operation()),receipt.encode()); writeHomeCredit(batch,creditChange);
                 batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
@@ -1292,6 +1336,7 @@ public final class ReplicatedRangeStore {
             var scope=new TransactionScope(List.of(TransactionScope.Span.point(identity.columnId(),key))); requireUnlocked(scope); requireUngated(scope);
             var effects=List.of(new Mutation(Mutation.Kind.DELETE,identity.columnId(),key,null)); var history=prepareScopedWrites(true,effects,Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 batch.delete(columns.get(identity.columnId()),key); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
             publishScoped(position,history,false); applied=position;
@@ -1406,6 +1451,7 @@ public final class ReplicatedRangeStore {
             }
             var published=Map.copyOf(next); var history=prepareScopedWrites(!effects.isEmpty(),effects,Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 if (plan.state().matching()) { batch.delete(columns.get(identity.columnId()),key); batch.delete(state,homeCreditKey(identity.transactionId())); }
                 for (var receipt:plan.receipts()) batch.delete(state,homeRecoveryKey(receipt.recovery().operation()));
                 batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
@@ -1520,6 +1566,7 @@ public final class ReplicatedRangeStore {
         }
         requireNext(position); var history=prepareScopedWrites(false,List.of(),Map.of());
         try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+            if(cdc!=null) cdc.initialize(batch);
             batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
         }
         publishScoped(position,history,false); applied=position;
@@ -1640,6 +1687,7 @@ public final class ReplicatedRangeStore {
             var publishedAborted=Map.copyOf(nextAborted); var publishedCommitted=Map.copyOf(nextCommitted); var publishedRejected=Map.copyOf(nextRejected);
             var history=prepareScopedWrites(false,List.of(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 batch.delete(state,preparedKey(transaction)); batch.delete(state,abortedKey(transaction)); batch.delete(state,committedKey(transaction)); batch.delete(state,rejectedKey(transaction));
                 batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
@@ -1699,7 +1747,9 @@ public final class ReplicatedRangeStore {
             var effects=evaluation==null ? List.<Mutation>of() : evaluation.effects(); var buckets=evaluation==null ? Map.<BucketKey,DistributedBucket>of() : evaluation.buckets();
             var history=prepareScopedWrites(saved==null,effects,buckets); var result=saved==null ? candidate : saved;
             var next=new HashMap<>(committedIndex); next.put(finalization.transactionId(),result); var published=Map.copyOf(next);
+            Runnable publishCdc=()->{};
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 for (var mutation:effects) {
                     var cf=columns.get(mutation.columnId());
                     switch (mutation.kind()) {
@@ -1709,8 +1759,11 @@ public final class ReplicatedRangeStore {
                     }
                 }
                 for (var entry:buckets.entrySet()) batch.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
+                if(cdc!=null && saved==null && !prepared.preparation().business().mutations().isEmpty()) publishCdc=cdc.append(batch,
+                        new it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord(cdc.lineage(),position,prepared.preparation().business(),finalization));
                 batch.put(state,committedKey(finalization.transactionId()),result.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
+            publishCdc.run();
             committedIndex=published; publishScoped(position,history,false); applied=position; return result;
         } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
         finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
@@ -1871,6 +1924,7 @@ public final class ReplicatedRangeStore {
             var next=new HashMap<>(snapshotGates); next.remove(retirement.fence().fenceId()); var published=Map.copyOf(next); long bytes=retainedGateBytes-snapshotGateBytes(saved.fence());
             var history=prepareScopedWrites(false,List.of(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 batch.delete(state,snapshotGateKey(retirement.fence().fenceId())); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
             snapshotGates=published; retainedGateBytes=bytes; publishScoped(position,history,false); applied=position;
@@ -1928,6 +1982,7 @@ public final class ReplicatedRangeStore {
         var next=new HashMap<>(snapshotGates); next.put(gate.fence().fenceId(),gate); var published=Map.copyOf(next);
         var history=prepareScopedWrites(false,List.of(),Map.of());
         try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+            if(cdc!=null) cdc.initialize(batch);
             batch.put(state,snapshotGateKey(gate.fence().fenceId()),gate.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
         }
         snapshotGates=published; retainedGateBytes=bytes; publishScoped(position,history,false); applied=position;
@@ -2075,6 +2130,7 @@ public final class ReplicatedRangeStore {
         var next=new HashMap<>(rejectedIndex); next.put(preparation.transactionId(),result); var published=Map.copyOf(next);
         var history=prepareScopedWrites(false,List.of(),Map.of());
         try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+            if(cdc!=null) cdc.initialize(batch);
             batch.put(state,rejectedKey(preparation.transactionId()),result.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
         }
         rejectedIndex=published; publishScoped(position,history,false); applied=position; return ParticipantVote.negative();
@@ -2161,6 +2217,7 @@ public final class ReplicatedRangeStore {
     private void publishAbort(ApplyPosition position,AbortedParticipant abort) throws RocksDBException {
         var history=prepareScopedWrites(false,List.of(),Map.of());
         try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+            if(cdc!=null) cdc.initialize(batch);
             batch.put(state,abortedKey(abort.finalization().transactionId()),abort.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
         }
         publishScoped(position,history,false); applied=position;
@@ -2360,6 +2417,7 @@ public final class ReplicatedRangeStore {
             // Canonical acceptance was certified before append; replicas do not consult volatile history or expose effects.
             var history=prepareScopedWrites(false,List.of(),Map.of());
             try (var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch);
                 if (saved==null) batch.put(state,preparedKey(preparation.transactionId()),value.encode());
                 batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
@@ -2490,6 +2548,7 @@ public final class ReplicatedRangeStore {
                     requireNext(position);
                     var writes=prepareScopedWrites(false,List.of(),Map.of());
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(false)) {
+                        if(cdc!=null) cdc.initialize(batch);
                         batch.put(state, markerKey, encodePosition(position));
                         batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                         db.write(options, batch);
@@ -2537,8 +2596,10 @@ public final class ReplicatedRangeStore {
             var creditChange=homeCreditChange(command,position,saved==null && installUserEffects);
             if (creditChange!=null) checkHomeCapacity(creditChange.count(),creditChange.bytes());
             var writes=prepareScopedWrites(saved==null && installUserEffects,effects,bucketEffects);
+            Runnable publishCdc=()->{};
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) publishCdc=cdc.initialize(batch);
                 if (saved == null) {
                     if (installUserEffects) for (var mutation : effects) {
                         var cf = columns.get(mutation.columnId());
@@ -2552,6 +2613,8 @@ public final class ReplicatedRangeStore {
                         }
                     }
                     if (installUserEffects) for (var entry:bucketEffects.entrySet()) batch.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
+                    if(cdc!=null && installUserEffects && !command.mutations().isEmpty()) publishCdc=cdc.append(batch,
+                            new it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord(cdc.lineage(),position,command,null));
                     if (acceptMaintenance && command.sessionControl()!=null) installSessionControl(batch,command.sessionControl());
                     if (effectiveMinimum > currentEpochFloor) {
                         batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(effectiveMinimum).array());
@@ -2572,6 +2635,7 @@ public final class ReplicatedRangeStore {
                 if (saved != null) batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 db.write(options, batch);
             }
+            publishCdc.run();
             publishHomeCredit(creditChange); publishScoped(position,writes,false); applied = position;
             return saved == null ? stableResult : original;
         } catch (RocksDBException | RuntimeException | Error failure) { if (activeSchemaFence==null) resetScopedUnderLane(); throw failure; }
@@ -2836,8 +2900,10 @@ public final class ReplicatedRangeStore {
             if (applied != null && position.index() <= applied.index()) return;
             requireNext(position);
             var writes=prepareScopedWrites(false,List.of(),Map.of());
+            Runnable publishCdc=()->{};
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) publishCdc=cdc.initialize(batch);
                 batch.put(state, markerKey, encodePosition(position));
                 batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 if (configuration != null) {
@@ -2845,6 +2911,7 @@ public final class ReplicatedRangeStore {
                 }
                 db.write(options, batch);
             }
+            publishCdc.run();
             publishScoped(position,writes,configuration!=null); applied = position;
         } catch (RocksDBException | RuntimeException | Error failure) { resetScopedUnderLane(); throw failure; }
         finally { applyLane.unlock(); }
@@ -2882,6 +2949,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if(cdc!=null) cdc.validateImage(image,limits,expected.position());
             if(importBirth!=null) {
                 byte[][] incoming=new byte[3][];
                 NativeRangeImage.visit(image,limits,(section,column,key,value)->{ if(section==NativeRangeImage.Section.STATE && key.length==17) { if(key[16]==0x40)incoming[0]=value; if(key[16]==0x42)incoming[1]=value; if(key[16]==0x43)incoming[2]=value; } });
@@ -2948,12 +3016,14 @@ public final class ReplicatedRangeStore {
                     writer.flush();
                     // The current image supplies counters bound to its completed position; never normalize imported state.
                     recoverSchemaMetadata(expected.position());
+                    if(cdc!=null) cdc.recover(expected.position());
                     validateReceiptUsage(expected.position());
                     activeSchemaFence=loadSchemaFence(expected.position());
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
+                        if(cdc!=null) cdc.initialize(batch);
                         batch.put(state, markerKey, encodePosition(expected.position()));
                         batch.delete(state, installingKey);
                         db.write(options, batch);

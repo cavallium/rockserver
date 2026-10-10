@@ -31,14 +31,19 @@ class NativeRangeSstImportTest {
         assertArrayEquals(manifest.encode(),NativeSstImportManifest.decode(manifest.encode()).encode());
         try(var pool=open(db)) {
             var store=pool.openNewFencedRange(manifest,schema); assertEquals(RangeOwnership.State.FENCED,store.ownership().state()); assertTrue(store.importPending()); assertThrows(IllegalStateException.class,store::activate);
+            store.enableCdc(group);
             receipt=pool.importSst(store,manifest,Map.of(file.fileId(),source),new ApplyPosition(1,0));
             assertTrue(Files.exists(source)); assertTrue(store.importPending()); assertEquals(new ApplyPosition(1,0),store.applied()); assertThrows(IllegalStateException.class,store::capture);
             assertArrayEquals(receipt.encode(),pool.importSst(store,manifest,Map.of(),new ApplyPosition(1,1)).encode());
         }
         try(var pool=open(db)) {
             var store=pool.openNewFencedRange(manifest,schema); assertTrue(store.importPending()); assertArrayEquals(receipt.encode(),store.importReceipt().encode());
+            store.enableCdc(group);
             assertThrows(IllegalStateException.class,()->store.installSnapshot(source,new NativeRangeImage.Limits(1024,1024*1024,256)));
             pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new byte[32],new ApplyPosition(2,2)));
+            var lineage=new DistributedCdcCheckpoint.Lineage(group,group,1);
+            assertThrows(it.cavallium.rockserver.core.common.CdcGapDetectedException.class,()->store.pollCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),1,1024));
+            assertTrue(store.pollCdc(lineage,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,2)),1,1024).records().isEmpty());
             try(var pin=store.capture()) { assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{2})); assertArrayEquals(new byte[]{8},pin.get(column,new byte[]{3})); assertNull(pin.get(column,new byte[]{4})); }
             Path image=root.resolve("activated.image"); var limits=new NativeRangeImage.Limits(3*1024*1024,32L*1024*1024,256); NativeRangeImage.write(image,store,limits); NativeRangeImage.inspect(image,limits);
             store.fence(); store.installSnapshot(image,limits); store.activate(); try(var pin=store.capture()) { assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{2})); }

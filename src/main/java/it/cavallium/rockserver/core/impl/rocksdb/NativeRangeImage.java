@@ -400,6 +400,7 @@ public final class NativeRangeImage {
         private Map<UUID,List<HomeRecoveryReceipt>> successfulHomeUsers;
         private final Map<UUID,CommittedParticipant> committed=new HashMap<>();
         private long preparedBytes,preparedScopeBytes;
+        private final NativeRangeCdc.ImageState cdc=new NativeRangeCdc.ImageState();
         private long usageCount, usageBytes, bucketCount, bucketBytes, receiptCount, receiptBytes, epochFloor;
 
         Rows(Header header, Limits limits) {
@@ -423,6 +424,13 @@ public final class NativeRangeImage {
                 if (column != null || key.length < groupPrefix.length
                         || !Arrays.equals(key, 0, groupPrefix.length, groupPrefix, 0, groupPrefix.length)) {
                     throw new IOException("Wrong image group metadata prefix");
+                }
+                if(section==Section.STATE) {
+                    try {
+                        cdc.accept(key,value,header.owner(),header.position());
+                        if(key.length>16 && key[16]==0x50) acceptSchema(it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord.decode(value).command().schemaDigest());
+                    }
+                    catch(IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Invalid CDC image metadata",invalid); }
                 }
                 if(section==Section.STATE && key.length>16 && (key[16]==0x28 || key[16]==0x2a)) {
                     try {
@@ -734,6 +742,8 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            try { cdc.finish(header.owner(),header.position()); }
+            catch(IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Invalid CDC image retention",invalid); }
             if(importFileReceipts!=importFileReceiptCount)throw new IOException("Import file result count differs from image inventory");
             if(importBirth!=null && (importReceipt==null || importActivation==null))throw new IOException("Unpublished import cannot become a native image");
             if(schemaInstallation==null && (!schemaActivations.isEmpty() || currentSchemaActivation!=null)) throw new IOException("Activation history lacks installed generation");

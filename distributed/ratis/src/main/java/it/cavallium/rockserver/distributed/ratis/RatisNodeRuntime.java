@@ -285,6 +285,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchema)
                             : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchema);
                     java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
+                    if(role==RatisNodePlan.Role.DATA) store.enableCdc(descriptor.rangeId());
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     if (role==RatisNodePlan.Role.DATA && logicalSchema!=null) {
