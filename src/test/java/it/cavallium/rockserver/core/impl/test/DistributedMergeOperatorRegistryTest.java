@@ -174,7 +174,7 @@ class DistributedMergeOperatorRegistryTest {
         var bytes=new ByteArrayOutputStream();
         try(var jar=new JarOutputStream(bytes)) {
             for(var type:types) {
-                String entry=type.getName().replace('.','/')+".class"; jar.putNextEntry(new JarEntry(entry));
+                String entry=type.getName().replace('.','/')+".class"; var archiveEntry=new JarEntry(entry); archiveEntry.setTime(0); jar.putNextEntry(archiveEntry);
                 try(var source=type.getClassLoader().getResourceAsStream(entry)) { assertNotNull(source); source.transferTo(jar); }
                 jar.closeEntry();
             }
