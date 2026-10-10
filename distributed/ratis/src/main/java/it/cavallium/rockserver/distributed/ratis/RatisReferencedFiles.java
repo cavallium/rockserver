@@ -49,6 +49,11 @@ public final class RatisReferencedFiles implements StateMachine.DataApi,AutoClos
     }
     private RatisReferencedFile reference(LogEntryProto entry,RatisReferencedFile.Request request) { return new RatisReferencedFile(group,entry.getTerm(),entry.getIndex(),request.clientId(),request.callId(),request.length(),request.sha256()); }
     public synchronized RatisReferencedFile reference(long term,long index) throws IOException { requireOpen(); var result=references.get(index); if(result==null || result.term()!=term) throw new IOException("Exact referenced file unavailable"); return result; }
+    /** Cheap deterministic log-envelope validation; publication remains owned by DataApi I/O. */
+    RatisReferencedFile.Request validateEntry(LogEntryProto entry) throws IOException { return request(entry); }
+    RatisReferencedFile publishedReference(long term,long index,RatisReferencedFile.Request expected) throws IOException {
+        var result=reference(term,index); if(!result.request().equals(expected))throw new IOException("Published reference differs from committed envelope"); return result;
+    }
     @FunctionalInterface private interface Io<T> { T run() throws Exception; }
     private <T> CompletableFuture<T> submit(CompletableFuture<T> future,Io<T> work) { return submit(future,work,false); }
     private <T> CompletableFuture<T> submit(CompletableFuture<T> future,Io<T> work,boolean cleanup) {

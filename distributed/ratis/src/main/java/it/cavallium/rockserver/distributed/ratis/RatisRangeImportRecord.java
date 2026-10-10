@@ -11,6 +11,7 @@ public sealed interface RatisRangeImportRecord permits RatisRangeImportRecord.In
     int MAX_BYTES=16*1024, MAGIC=0x52494950;
     byte[] encode();
     void requireDefinition(RangeImportDefinition definition);
+    static boolean isImport(byte[] bytes) { return bytes!=null && bytes.length>=4 && ByteBuffer.wrap(bytes).getInt()==MAGIC; }
 
     record Install(UUID importId,UUID groupId,long rangeEpoch,byte[] definitionDigest,
                    RatisReferencedFile manifestReference,Map<UUID,RatisReferencedFile> fileReferences) implements RatisRangeImportRecord {

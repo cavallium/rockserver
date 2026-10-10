@@ -43,6 +43,56 @@ class RatisRangeImportApplyTest {
     RatisRangeImportRecord.Publication publication(Input input) { return new RatisRangeImportRecord.Publication(UUID.randomUUID(),new ApplyPosition(2,10),RatisRangeImportCatalogue.Head.prepared(input.definition()).publish(new byte[32])); }
     ReplicatedRangeStore reopen(DistributedStoragePool pool,Input input) throws Exception { return pool.reopenImportRange(input.manifest(),input.schema()); }
 
+    org.apache.ratis.statemachine.TransactionContext committed(RatisRangeStateMachine machine,long index,byte[] bytes) {
+        return org.apache.ratis.statemachine.TransactionContext.newBuilder().setStateMachine(machine).setServerRole(org.apache.ratis.proto.RaftProtos.RaftPeerRole.FOLLOWER)
+                .setLogEntry(org.apache.ratis.proto.RaftProtos.LogEntryProto.newBuilder().setTerm(1).setIndex(index)
+                        .setStateMachineLogEntry(org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto.newBuilder()
+                                .setLogData(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(bytes))).build()).build();
+    }
+    @Test void committedImportUsesOrderedAsyncLaneAndKeepsPinsAfterObserverCancellation() throws Exception {
+        var input=input("raft-apply",false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var queries=new RatisProofQueryService();
+        var fileEntered=new CountDownLatch(1); var fileRelease=new CountDownLatch(1);
+        try(var io=Executors.newSingleThreadExecutor();var pool=pool(root.resolve("raft-native"));var files=new RatisReferencedFiles(root.resolve("raft-files"),group,RatisReferencedFiles.Limits.defaults(),io);
+            var storage=org.apache.ratis.server.storage.RaftStorage.newBuilder().setDirectory(root.resolve("raft-log").toFile())
+                    .setOption(org.apache.ratis.server.storage.RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
+                    .setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build()) {
+            storage.initialize(); var store=pool.openNewFencedRange(input.manifest(),input.schema());
+            var peer=org.apache.ratis.protocol.RaftPeer.newBuilder().setId("fixture").setAddress("127.0.0.1:9999").build();
+            var raft=org.apache.ratis.protocol.RaftGroup.valueOf(org.apache.ratis.protocol.RaftGroupId.valueOf(group),peer);
+            var machine=new RatisRangeStateMachine(store,raft,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),command->{},command->{},()->new RatisRangeStateMachine.Leadership(1,true));
+            var adapter=new RatisRangeImportApply(pool,store,files,input.definition(),stage->{if(stage==NativeRangeSstImport.Stage.COLUMN_INGESTED){entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Import fixture timeout");}catch(InterruptedException e){throw new IOException(e);}}});
+            machine.rangeImportApply(adapter,definition->{throw new AssertionError("Committed replay must not query catalogue");}); machine.referencedFiles(files); machine.proofQueries(queries);
+            var server=(org.apache.ratis.server.RaftServer)java.lang.reflect.Proxy.newProxyInstance(org.apache.ratis.server.RaftServer.class.getClassLoader(),new Class<?>[]{org.apache.ratis.server.RaftServer.class},(proxy,method,args)->{
+                if(method.getName().equals("getId"))return peer.getId(); if(method.getName().equals("toString"))return "import-apply-fixture"; throw new AssertionError(method);
+            });
+            machine.initialize(server,raft.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
+            try {
+                files.publicationObserver(stage->{if(stage==RatisReferencedFiles.PublishStage.FILE_FORCED){fileEntered.countDown();try{if(!fileRelease.await(10,TimeUnit.SECONDS))throw new IOException("File force fixture timeout");}catch(InterruptedException e){throw new IOException(e);}}});
+                UUID client=UUID.randomUUID(); var fileEntry=RatisReferencedFilesTest.entry(group,client,1,1,input.bytes(),true);
+                var writing=files.write(fileEntry); assertTrue(fileEntered.await(10,TimeUnit.SECONDS));
+                var fileApply=org.apache.ratis.statemachine.TransactionContext.newBuilder().setStateMachine(machine).setServerRole(org.apache.ratis.proto.RaftProtos.RaftPeerRole.FOLLOWER).setLogEntry(fileEntry).build();
+                var acknowledgment=machine.applyTransaction(fileApply); assertFalse(acknowledgment.isDone()); assertEquals(new ApplyPosition(1,0),store.applied());
+                fileRelease.countDown(); writing.get(10,TimeUnit.SECONDS); var file=RatisReferencedFile.decode(acknowledgment.get(10,TimeUnit.SECONDS).getContent().toByteArray());
+                assertEquals(files.reference(1,1),file); assertEquals(new ApplyPosition(1,1),store.applied());
+                var manifestEntry=RatisReferencedFilesTest.entry(group,client,2,2,input.manifest().encode(),true); files.write(manifestEntry).get(10,TimeUnit.SECONDS);
+                var manifestApply=org.apache.ratis.statemachine.TransactionContext.newBuilder().setStateMachine(machine).setServerRole(org.apache.ratis.proto.RaftProtos.RaftPeerRole.FOLLOWER).setLogEntry(manifestEntry).build();
+                var manifest=RatisReferencedFile.decode(machine.applyTransaction(manifestApply).get(10,TimeUnit.SECONDS).getContent().toByteArray());
+                var install=new RatisRangeImportRecord.Install(input.manifest().importId(),group,1,input.definition().digest(),manifest,Map.of(input.manifest().columns().getFirst().files().getFirst().fileId(),file));
+                var pending=machine.applyTransaction(committed(machine,3,install.encode())); assertTrue(entered.await(10,TimeUnit.SECONDS));
+                pending.cancel(false); files.truncate(0).get(10,TimeUnit.SECONDS); assertThrows(IOException.class,files::close);
+                assertEquals(new ApplyPosition(1,2),store.applied()); assertEquals(2,machine.getLastAppliedTermIndex().getIndex());
+                var expected=new NativeSstImportManifest.Receipt(input.manifest().importId(),group,1,input.manifest().digest(),new ApplyPosition(1,3));
+                var activate=new RatisRangeImportRecord.Activate(expected,publication(input)); var activation=machine.applyTransaction(committed(machine,4,activate.encode()));
+                machine.notifyTermIndexUpdated(1,5); assertFalse(activation.isDone()); assertEquals(new ApplyPosition(1,2),store.applied());
+                release.countDown(); var proof=activation.get(10,TimeUnit.SECONDS).getContent().toByteArray(); assertEquals(new ApplyPosition(1,5),store.applied()); assertEquals(5,machine.getLastAppliedTermIndex().getIndex());
+                assertFalse(store.importPending()); try(var pin=store.capture()){assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{2}));}
+                assertArrayEquals(expected.encode(),machine.applyTransaction(committed(machine,6,install.encode())).get(10,TimeUnit.SECONDS).getContent().toByteArray());
+                assertArrayEquals(proof,machine.applyTransaction(committed(machine,7,activate.encode())).get(10,TimeUnit.SECONDS).getContent().toByteArray());
+                assertEquals(new ApplyPosition(1,7),store.applied());
+            } finally { fileRelease.countDown(); release.countDown(); queries.stop().get(10,TimeUnit.SECONDS); machine.beginShutdown(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); }
+        } finally { fileRelease.countDown(); release.countDown(); queries.stop().get(10,TimeUnit.SECONDS); }
+    }
+
     @Test void realReferencedSstInstallPublicationAndOriginalRetriesSurviveReferenceTruncateAndReopen() throws Exception {
         var input=input("workflow",false); Path nativePath=root.resolve("native"),filesPath=root.resolve("files"); RatisRangeImportRecord.Install install; RatisRangeImportRecord.Activate activate; NativeRangeSstImport.Activation originalActivation;
         try(var pool=pool(nativePath);var files=new RatisReferencedFiles(filesPath,group,RatisReferencedFiles.Limits.defaults(),Runnable::run)) {

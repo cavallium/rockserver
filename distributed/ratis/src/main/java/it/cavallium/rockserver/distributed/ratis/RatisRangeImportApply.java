@@ -45,6 +45,16 @@ public final class RatisRangeImportApply {
     public UUID groupId() { return manifest.groupId(); }
     public RangeImportDefinition definition() { return definition; }
     public void requireGroup(UUID group) { if(!groupId().equals(group))throw new IllegalArgumentException("Foreign import apply group"); }
+    /** Original committed reply, qualified locally without file pins or catalogue RPC. */
+    public synchronized byte[] recoveredResult(RatisRangeImportRecord record) throws RocksDBException {
+        record.requireDefinition(definition);
+        if(record instanceof RatisRangeImportRecord.Install install) {
+            var receipt=store.importReceipt(); if(receipt==null)return null;
+            receipt.requireManifest(manifest); install.requireCut(receipt.position()); receipt.requireCut(store.applied()); return receipt.encode();
+        }
+        var activate=(RatisRangeImportRecord.Activate)record; var saved=store.importActivation(); if(saved==null)return null;
+        requireInstalled(activate); requireSavedActivation(activate,saved); saved.requireCut(store.applied()); return saved.encode();
+    }
 
     /** Pre-append validation copies/qualifies originals but changes no native apply position or user interval. */
     public synchronized void validateInstallProposal(RatisRangeImportRecord.Install record) throws IOException,RocksDBException {

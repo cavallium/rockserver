@@ -772,6 +772,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || !identity.columnId().equals(homeColumn)) throw new IllegalArgumentException("HOME retirement requires the configured transaction HOME context");
     }
     private void requireRoleRecord(byte[] encoded) {
+        if (RatisReferencedFile.Request.isRequest(encoded)) { requireDataRole(); if(referencedFiles==null || rangeImportApply==null)throw new IllegalArgumentException("Native import file owner is not configured"); referencedFiles.requireGroup(RatisReferencedFile.Request.decode(encoded).groupId()); return; }
+        if (RatisRangeImportRecord.isImport(encoded)) { requireDataRole(); if(rangeImportApply==null)throw new IllegalArgumentException("Native import adapter is not configured"); RatisRangeImportRecord.decode(encoded).requireDefinition(rangeImportApply.definition()); return; }
         if (RatisSchemaFenceRecord.isFence(encoded)) { requireSchemaRecord(RatisSchemaFenceRecord.decode(encoded)); return; }
         if (RatisSchemaInstallRecord.isInstall(encoded)) { requireSchemaGroup(RatisSchemaInstallRecord.decode(encoded).groupId()); return; }
         if (RatisSchemaActivateRecord.isActivate(encoded)) { requireSchemaGroup(RatisSchemaActivateRecord.decode(encoded).groupId()); return; }
@@ -1061,13 +1063,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final TreeMap<Long, ConfigurationEntry> configurations = new TreeMap<>();
     private final TreeMap<Long, Long> pendingNoops = new TreeMap<>();
     private long deferredBytes;
-    private SchemaApply schemaApply;
-    private static final class SchemaApply {
-        final long index; final Deferred deferred; final RatisSchemaInstallRecord record;
+    private NativeApply nativeApply;
+    private static final class NativeApply {
+        final long index; final Deferred deferred; final RatisSchemaInstallRecord record; final RatisRangeImportRecord importRecord; final RatisReferencedFile.Request referenceRequest;
         ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
         DistributedStoragePool.SchemaInstallPlan plan; boolean running,suspended,stageReady,cancelled;
         byte[] coveredResult;
-        SchemaApply(long index,Deferred deferred,RatisSchemaInstallRecord record) { this.index=index; this.deferred=deferred; this.record=record; }
+        NativeApply(long index,Deferred deferred) {
+            this.index=index; this.deferred=deferred;
+            byte[] bytes=deferred.encoded(); boolean importing=RatisRangeImportRecord.isImport(bytes),referencing=RatisReferencedFile.Request.isRequest(bytes);
+            record=importing || referencing ? null : RatisSchemaInstallRecord.decode(bytes);
+            importRecord=importing ? RatisRangeImportRecord.decode(bytes) : null;
+            referenceRequest=referencing ? RatisReferencedFile.Request.decode(bytes) : null;
+        }
         void close() { if (plan!=null) plan.close(); if (captureGate!=null) captureGate.close(); }
     }
     private final Object durabilityGate = new Object();
@@ -1330,10 +1338,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
         try { capturedSnapshots.close(); } catch (Exception failure) { storageFailure=failure; }
         IOException failure = new IOException("Range is shutting down");
-        SchemaApply abandoned=null;
+        NativeApply abandoned=null;
         synchronized (gate) {
             storageFailure = failure; store.fence();
-            if (schemaApply!=null) { schemaApply.cancelled=true; if (!schemaApply.running) abandoned=schemaApply; schemaApply=null; }
+            if (nativeApply!=null) { nativeApply.cancelled=true; if (!nativeApply.running) abandoned=nativeApply; nativeApply=null; }
         }
         if (abandoned!=null) abandoned.close();
         failDeferred(failure);
@@ -1474,7 +1482,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates(); store.invalidateScopedSnapshots();
         var completions = new java.util.ArrayList<Completion>();
         var coveredOperations = new java.util.ArrayList<OperationId>();
-        IOException failure = null; SchemaApply covered=null; boolean closeCovered=false;
+        IOException failure = null; NativeApply covered=null; boolean closeCovered=false;
         synchronized (gate) {
             getLifeCycle().transition(LifeCycle.State.STARTING);
             try {
@@ -1486,7 +1494,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if (pending.term() > a.term() || entry.getKey() == a.index() && pending.term() != a.term()) {
                         throw new IOException("Deferred term conflicts with installed image");
                     }
-                    var recovered=recoveredRecord(pending.encoded());
+                    var recovered=RatisReferencedFile.Request.isRequest(pending.encoded())
+                            ? new AppliedRecord(null,referenceProof(pending.term(),entry.getKey(),RatisReferencedFile.Request.decode(pending.encoded())))
+                            : recoveredRecord(pending.encoded());
                     byte[] result=recovered.result();
                     if (result == null) throw new IOException("Installed image omitted deferred receipt");
                     completions.add(new Completion(pending.future(), Message.valueOf(ByteString.copyFrom(result))));
@@ -1519,10 +1529,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 var installed=store.schemaInstallation();
                 if (installed!=null) refreshSessionAdmission(installed.definition().targetDirectory());
-                if (schemaApply!=null && schemaApply.index<=a.index()) {
-                    var original=schemaInstallProof(schemaApply.record);
+                if (nativeApply!=null && nativeApply.index<=a.index()) {
+                    var original=nativeApplyProof(nativeApply);
                     if (original==null) throw new IOException("Covered INSTALL lacks original native proof");
-                    covered=schemaApply; covered.coveredResult=original.encode(); closeCovered=!covered.running; schemaApply=null;
+                    covered=nativeApply; covered.coveredResult=original; closeCovered=!covered.running; nativeApply=null;
                 }
                 getLifeCycle().transition(LifeCycle.State.RUNNING);
             } catch (Exception problem) { failure = failRecovery(problem); }
@@ -1534,10 +1544,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             throw failure;
         }
         for (var completion : completions) completion.future().complete(completion.result());
-        SchemaApply resume;
-        synchronized (gate) { resume=schemaApply; }
+        NativeApply resume;
+        synchronized (gate) { resume=nativeApply; }
         if (covered!=null && closeCovered) covered.close();
-        if (resume!=null && resume.suspended) scheduleSchemaApply(resume,resume.stageReady);
+        if (resume!=null && resume.suspended) scheduleNativeApply(resume,resume.stageReady);
     }
 
     private IOException failRecovery(Exception failure) {
@@ -1570,6 +1580,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray(); requireRoleRecord(encoded);
+            if (RatisRangeImportRecord.isImport(encoded) || RatisReferencedFile.Request.isRequest(encoded)) throw new IOException("Native import proposals require bounded prepared admission");
             if (RatisSchemaFenceRecord.isFence(encoded)) return startSchemaFence(transaction,RatisSchemaFenceRecord.decode(encoded),generation,leadership);
             if (RatisSchemaInstallRecord.isInstall(encoded)) return startSchemaLifecycle(transaction,RatisSchemaInstallRecord.decode(encoded),generation,leadership);
             if (RatisSchemaActivateRecord.isActivate(encoded)) return startSchemaLifecycle(transaction,RatisSchemaActivateRecord.decode(encoded),generation,leadership);
@@ -2040,6 +2051,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
+        if (RatisRangeImportRecord.isImport(encoded)) return new AppliedRecord(null,rangeImportApply.recoveredResult(RatisRangeImportRecord.decode(encoded)));
+        if (RatisReferencedFile.Request.isRequest(encoded)) throw new IOException("Reference recovery requires exact original log position");
         if (RatisSchemaFenceRecord.isFence(encoded)) { var proof=schemaProof(RatisSchemaFenceRecord.decode(encoded)); return new AppliedRecord(null,proof==null ? null : proof.encode()); }
         if (RatisSchemaInstallRecord.isInstall(encoded)) return new AppliedRecord(null,schemaRecovered(RatisSchemaInstallRecord.decode(encoded)));
         if (RatisSchemaActivateRecord.isActivate(encoded)) return new AppliedRecord(null,schemaRecovered(RatisSchemaActivateRecord.decode(encoded)));
@@ -2084,7 +2097,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         Deferred completion = null;
         Message result = null;
         Throwable failure = null;
-        SchemaApply schedule=null; CompletableFuture<Message> waiting=null; AppliedRecord appliedRecord=null;
+        NativeApply schedule=null; CompletableFuture<Message> waiting=null; AppliedRecord appliedRecord=null;
         synchronized (gate) {
             try {
                 if (storageFailure != null) requireHealthy();
@@ -2093,19 +2106,20 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     throw new IllegalStateException("Log entry changed from metadata to data");
                 }
                 byte[] encoded = entry.getStateMachineLogEntry().getLogData().toByteArray();
+                if (RatisReferencedFile.Request.isRequest(encoded)) { requireRoleRecord(encoded); referencedFiles.validateEntry(entry); }
                 var pending = deferred.get(entry.getIndex());
                 if (pending != null && (pending.term() != entry.getTerm() || !Arrays.equals(pending.encoded(), encoded))) {
                     throw new IllegalStateException("Deferred/replayed log identity changed");
                 }
-                if (getLifeCycleState() != LifeCycle.State.RUNNING || schemaApply!=null || RatisSchemaInstallRecord.isInstall(encoded)) {
+                if (getLifeCycleState() != LifeCycle.State.RUNNING || nativeApply!=null || asyncNativeRecord(encoded)) {
                     if (pending == null) {
                         if (deferred.size() >= 1024 || deferredBytes + encoded.length > 16L * 1024 * 1024) throw new IllegalStateException("Deferred apply budget exhausted");
                         pending = new Deferred(entry.getTerm(), encoded, new CompletableFuture<>());
                         deferred.put(entry.getIndex(), pending); deferredBytes += encoded.length;
                     }
                     waiting=pending.future().whenComplete((message, problem) -> releaseAdmission(transaction));
-                    if (schemaApply==null && getLifeCycleState()==LifeCycle.State.RUNNING && deferred.firstKey()==entry.getIndex()) {
-                        schemaApply=new SchemaApply(entry.getIndex(),pending,RatisSchemaInstallRecord.decode(encoded)); schedule=schemaApply;
+                    if (nativeApply==null && getLifeCycleState()==LifeCycle.State.RUNNING && deferred.firstKey()==entry.getIndex()) {
+                        nativeApply=new NativeApply(entry.getIndex(),pending); schedule=nativeApply;
                     }
                 } else {
                 var applied=applyRecord(new ApplyPosition(entry.getTerm(),entry.getIndex()),encoded); appliedRecord=applied;
@@ -2126,7 +2140,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 failure = problem;
             }
         }
-        if (waiting!=null && failure==null) { if (schedule!=null) scheduleSchemaApply(schedule,false); return waiting; }
+        if (waiting!=null && failure==null) { if (schedule!=null) scheduleNativeApply(schedule,false); return waiting; }
         releaseAdmission(transaction);
         if (failure != null) {
             failDeferred(failure);
@@ -2137,21 +2151,47 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return CompletableFuture.completedFuture(result);
     }
 
-    private void scheduleSchemaApply(SchemaApply work,boolean ready) {
+    private static boolean asyncNativeRecord(byte[] bytes) { return RatisSchemaInstallRecord.isInstall(bytes) || RatisRangeImportRecord.isImport(bytes) || RatisReferencedFile.Request.isRequest(bytes); }
+    private byte[] referenceProof(long term,long index,RatisReferencedFile.Request request) throws IOException {
+        var cut=store.applied(); if(cut==null || cut.index()<index)return null;
+        if(cut.term()<term || cut.index()==index && cut.term()!=term)throw new IOException("Reference conflicts with completed native cut");
+        return referencedFiles.publishedReference(term,index,request).encode();
+    }
+    private byte[] nativeApplyProof(NativeApply work) throws Exception {
+        if (work.referenceRequest!=null) return referenceProof(work.deferred.term(),work.index,work.referenceRequest);
+        if (work.importRecord!=null) return rangeImportApply.recoveredResult(work.importRecord);
+        var proof=schemaInstallProof(work.record); return proof==null ? null : proof.encode();
+    }
+    private void scheduleNativeApply(NativeApply work,boolean ready) {
         var executor=proofQueries;
-        if (executor==null) { failSchemaApply(work,new IOException("Bounded schema apply dispatcher is not configured")); return; }
+        if (executor==null) { failNativeApply(work,new IOException("Bounded schema apply dispatcher is not configured")); return; }
         byte[] input=ByteBuffer.allocate(17+work.deferred.encoded().length).putLong(work.deferred.term()).putLong(work.index).put((byte)(ready ? 1 : 0)).put(work.deferred.encoded()).array();
         executor.submit(store.ownership().owner().groupId(),input,input.length,false,ignored -> {
             synchronized (gate) {
-                if (schemaApply!=work || work.cancelled) return Message.EMPTY;
+                if (nativeApply!=work || work.cancelled) return Message.EMPTY;
                 if (storageFailure!=null) requireHealthy();
                 if (getLifeCycleState()!=LifeCycle.State.RUNNING) { work.suspended=true; work.stageReady=ready; return Message.EMPTY; }
                 work.running=true; work.suspended=false;
             }
             try {
+            if (work.referenceRequest!=null) {
+                referencedFiles.flush(work.index).get();
+                var reference=referencedFiles.publishedReference(work.deferred.term(),work.index,work.referenceRequest);
+                try(var retained=referencedFiles.pin(reference)) {
+                    store.applyNoop(new ApplyPosition(work.deferred.term(),work.index));
+                }
+                return finishNativeApply(work,reference.encode());
+            }
+            if (work.importRecord!=null) {
+                var position=new ApplyPosition(work.deferred.term(),work.index);
+                byte[] result=work.importRecord instanceof RatisRangeImportRecord.Install install
+                        ? rangeImportApply.applyInstall(position,install).encode()
+                        : rangeImportApply.applyActivate(position,(RatisRangeImportRecord.Activate)work.importRecord).encode();
+                return finishNativeApply(work,result);
+            }
             if (!ready) {
                 var saved=schemaInstallProof(work.record);
-                if (saved!=null) { store.applyNoop(new ApplyPosition(work.deferred.term(),work.index)); return finishSchemaApply(work,saved.encode()); }
+                if (saved!=null) { store.applyNoop(new ApplyPosition(work.deferred.term(),work.index)); return finishNativeApply(work,saved.encode()); }
                 if (schemaStorage==null) throw new IOException("Schema installation storage is not configured");
                 synchronized (admissions) {
                     if (schemaHold!=null && schemaHold.record.equals(work.record) && schemaHold.installPlan!=null) {
@@ -2171,32 +2211,39 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var fence=store.lookupSchemaFence(work.record.header());
                 if (fence==null || !fence.position().equals(work.record.expectedFencePosition())) throw new IllegalArgumentException("Committed installation original fence changed");
                 if (!work.captureGate.ready()) {
-                    work.captureGate.readyFuture().whenComplete((unused,failure) -> { if (failure!=null) failSchemaApply(work,failure); else scheduleSchemaApply(work,true); });
+                    work.captureGate.readyFuture().whenComplete((unused,failure) -> { if (failure!=null) failNativeApply(work,failure); else scheduleNativeApply(work,true); });
                     return Message.EMPTY;
                 }
             }
             // No Ratis gate or admission monitor owns JNI schema mutation or waits for retained pins.
             var installed=schemaStorage.installSchema(store,new ApplyPosition(work.deferred.term(),work.index),work.plan);
-            return finishSchemaApply(work,installed.proof().encode());
+            return finishNativeApply(work,installed.proof().encode());
             } finally { boolean close; synchronized (gate) { work.running=false; close=work.cancelled || work.coveredResult!=null; } if (close) work.close(); }
-        }).whenComplete((ignored,failure) -> { if (failure!=null) failSchemaApply(work,failure); });
+        }).whenComplete((ignored,failure) -> { if (failure!=null) failNativeApply(work,failure); });
     }
-    private Message finishSchemaApply(SchemaApply work,byte[] bytes) throws Exception {
-        var completions=new java.util.ArrayList<Completion>(); var activations=new java.util.ArrayList<AppliedRecord>(); SchemaApply next=null;
+    private Message finishNativeApply(NativeApply work,byte[] bytes) throws Exception {
+        var completions=new java.util.ArrayList<Completion>(); var activations=new java.util.ArrayList<AppliedRecord>(); NativeApply next=null;
         var result=Message.valueOf(ByteString.copyFrom(bytes));
         try {
         synchronized (gate) {
-            if (schemaApply!=work || deferred.get(work.index)!=work.deferred) {
-                var cut=store.applied(); var original=schemaInstallProof(work.record);
-                if (work.coveredResult!=null && original!=null && Arrays.equals(work.coveredResult,bytes) && Arrays.equals(original.encode(),bytes)
+            if (nativeApply!=work || deferred.get(work.index)!=work.deferred) {
+                var cut=store.applied(); var original=nativeApplyProof(work);
+                if (work.coveredResult!=null && original!=null && Arrays.equals(work.coveredResult,bytes) && Arrays.equals(original,bytes)
                         && cut!=null && cut.index()>=work.index && cut.term()>=work.deferred.term()
                         && (cut.index()!=work.index || cut.term()==work.deferred.term())) return result;
                 throw new IOException("Schema apply lost native ordered owner");
             }
             var current=store.schemaInstallation();
-            if (current!=null && current.definition().changeId().equals(work.record.header().changeId())) refreshSessionAdmission(current.definition().targetDirectory());
-            schemaRecovered(work.record); advance(work.deferred.term(),work.index);
-            deferred.remove(work.index); deferredBytes-=work.deferred.encoded().length; schemaApply=null;
+            if (work.record!=null) {
+                if (current!=null && current.definition().changeId().equals(work.record.header().changeId())) refreshSessionAdmission(current.definition().targetDirectory());
+                schemaRecovered(work.record);
+            } else if (work.importRecord instanceof RatisRangeImportRecord.Activate) {
+                store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                if (enableSessionControls) store.enableSessionControls();
+                refreshSessionAdmission(current==null ? rangeImportApply.definition().targetDirectory() : current.definition().targetDirectory());
+            }
+            advance(work.deferred.term(),work.index);
+            deferred.remove(work.index); deferredBytes-=work.deferred.encoded().length; nativeApply=null;
             completions.add(new Completion(work.deferred.future(),result));
             while (getLifeCycleState()==LifeCycle.State.RUNNING && (!deferred.isEmpty() || !pendingNoops.isEmpty())) {
                 long data=deferred.isEmpty() ? Long.MAX_VALUE : deferred.firstKey(); long metadata=pendingNoops.isEmpty() ? Long.MAX_VALUE : pendingNoops.firstKey();
@@ -2207,7 +2254,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     store.applyNoop(new ApplyPosition(term,metadata),cfg==null ? null : cfg.bytes()); schemaConfigurationPending=!configurations.isEmpty(); advance(term,metadata); continue;
                 }
                 var pending=deferred.get(data);
-                if (RatisSchemaInstallRecord.isInstall(pending.encoded())) { next=new SchemaApply(data,pending,RatisSchemaInstallRecord.decode(pending.encoded())); schemaApply=next; break; }
+                if (asyncNativeRecord(pending.encoded())) { next=new NativeApply(data,pending); nativeApply=next; break; }
                 var applied=applyRecord(new ApplyPosition(pending.term(),data),pending.encoded());
                 if (applied.activation()!=null) activations.add(applied);
                 synchronized (admissions) { var admission=admissions.get(applied.operation()); if (admission!=null) settleAdmission(admission); }
@@ -2216,7 +2263,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
         }
         work.close(); activations.forEach(this::publishSchemaActivation); for (var completion:completions) completion.future().complete(completion.result());
-        if (next!=null) scheduleSchemaApply(next,false); return result;
+        if (next!=null) scheduleNativeApply(next,false); return result;
         } catch (Exception failure) {
             synchronized (gate) { storageFailure=failure; }
             work.close();
@@ -2226,8 +2273,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             work.deferred.future().completeExceptionally(failure); failDeferred(failure); throw failure;
         }
     }
-    private void failSchemaApply(SchemaApply work,Throwable failure) {
-        synchronized (gate) { if (schemaApply!=work) return; storageFailure=failure; schemaApply=null; }
+    private void failNativeApply(NativeApply work,Throwable failure) {
+        synchronized (gate) { if (nativeApply!=work) return; storageFailure=failure; nativeApply=null; }
         work.close(); failDeferred(failure);
     }
 
@@ -3268,7 +3315,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (deferred.containsKey(index)) throw new IllegalStateException("Log entry changed from data to metadata");
                 var pending = pendingNoops.get(index);
                 if (pending != null && pending != term) throw new IllegalStateException("Metadata log identity changed");
-                if (getLifeCycleState() != LifeCycle.State.RUNNING || schemaApply!=null) {
+                if (getLifeCycleState() != LifeCycle.State.RUNNING || nativeApply!=null) {
                     if (pending == null && pendingNoops.size() >= 1024) throw new IllegalStateException("Paused metadata budget exhausted");
                     pendingNoops.put(index, term);
                     return;
