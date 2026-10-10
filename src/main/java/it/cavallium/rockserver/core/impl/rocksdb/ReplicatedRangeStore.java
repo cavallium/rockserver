@@ -7,6 +7,7 @@ import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyBirth;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyImageOrigin;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologySeed;
 import it.cavallium.rockserver.core.common.distributed.TopologyChange;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
@@ -47,6 +48,8 @@ import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.DistributedBucket;
 import it.cavallium.rockserver.core.common.distributed.KeyPredicate;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.IdentityHashMap;
@@ -524,14 +527,15 @@ public final class ReplicatedRangeStore {
         usageBucketsPrefix = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x11).array();
         byte[] recovered = this.db.get(state, markerKey);
         applied = recovered == null ? null : decodePosition(recovered);
-        recoverTopologyOwnership();
         pendingInstallation = this.db.get(state, installingKey);
         if (pendingInstallation != null) {
             if (pendingInstallation.length != 52 || ByteBuffer.wrap(pendingInstallation).getInt() != STATE_VERSION) {
                 throw new IllegalStateException("Invalid pending installation marker");
             }
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
-        } else {
+        }
+        recoverTopologyOwnership();
+        if(pendingInstallation==null) {
             recoverSchemaMetadata();
             recoverImportMetadata();
             ensureReceiptUsage();
@@ -636,7 +640,32 @@ public final class ReplicatedRangeStore {
         if(birth!=null) { topologyBirth=NativeTopologyBirth.decode(birth); if(!topologyBirth.groupId().equals(groupId)) throw new IllegalArgumentException("Topology birth group differs from store"); }
         if(retirement!=null && retirement.length!=32) throw new IllegalArgumentException("Invalid topology retirement pointer"); topologyRetirement=retirement;
         byte[] activation=db.get(state,topologyOwnershipKey(0x63));
-        if(activation!=null) { topologyActivation=NativeTopologyActivation.decode(activation); if(topologyBirth==null || !topologyBirth.equals(topologyActivation.birth())) throw new IllegalArgumentException("Topology activation lacks matching live birth"); topologyActivation.requireCut(applied); }
+        if(activation!=null) { topologyActivation=NativeTopologyActivation.decode(activation); if(topologyBirth==null || !topologyBirth.equals(topologyActivation.birth())) throw new IllegalArgumentException("Topology activation lacks matching live birth"); topologyActivation.requireCut(topologyRecoveryCut()); }
+    }
+    private ApplyPosition topologyRecoveryCut() {
+        if(applied!=null || pendingInstallation==null)return applied;
+        return snapshotInstallationCut(pendingInstallation);
+    }
+    static ApplyPosition snapshotInstallationCut(byte[] pending) {
+        if(pending==null)return null;
+        if(pending.length!=52 || ByteBuffer.wrap(pending).getInt()!=STATE_VERSION)throw new IllegalArgumentException("Invalid pending snapshot installation intent");
+        var in=ByteBuffer.wrap(pending);in.getInt();return new ApplyPosition(in.getLong(),in.getLong());
+    }
+    /** Read-only target qualification; source image validation remains NativeRangeImage's responsibility. */
+    public void validateTopologyImageOrigin(NativeTopologyImageOrigin origin) throws IOException,RocksDBException {
+        enterNative();applyLane.lock();try { qualifyTopologyImageOrigin(origin); } finally { applyLane.unlock();leaveNative(); }
+    }
+    private NativeTopologyActivation qualifyTopologyImageOrigin(NativeTopologyImageOrigin origin) throws IOException,RocksDBException {
+        if(topologyRetired())throw new IOException("Retired topology parent cannot restore USER image");
+        if(topologyBirth==null) { if(origin!=null)throw new IOException("Topology image requires an existing qualified original member birth");return null; }
+        if(origin==null || schemaPreparationPool==null)throw new IOException("Born-child image requires self-contained qualified topology origin");
+        try {
+            origin.requireImage(groupId,rangeEpoch,interval.domainId(),interval.lowerInclusive(),interval.upperExclusive(),origin.activation().position());
+            var seed=schemaPreparationPool.topologySeed(topologyBirth.intentId());if(seed==null)throw new IllegalArgumentException("Target original local seed missing");topologyBirth.requireSeed(seed);var local=origin.localActivation(seed);
+            if(topologyActivation!=null && !Arrays.equals(topologyActivation.encode(),local.encode()))throw new IllegalArgumentException("Topology image changes target original activation/cut/publication");
+            var cut=topologyRecoveryCut();if(configurationUnderAdmission()==null || cut==null || cut.term()<=0 || cut.index()<0)throw new IllegalArgumentException("Topology image requires configured positive original local child prefix");
+            return local;
+        } catch(IllegalArgumentException invalid) { throw new IOException("Topology image differs from retained local birth",invalid); }
     }
     public NativeTopologyBirth topologyBirth() { return topologyBirth; }
     public NativeTopologyActivation topologyActivation() { return topologyActivation; }
@@ -659,11 +688,12 @@ public final class ReplicatedRangeStore {
         if(seed==null) throw new IllegalStateException("Topology activation seed is absent");
         var target=topologyBirth.resolveDescriptor(seed);
         if(target.rangeEpoch()!=rangeEpoch || !target.groupId().equals(groupId) || !seed.header().domainId().equals(interval.domainId()) || fresh && (!Arrays.equals(seed.header().schemaDigest(),schemaDigest) || !seed.definition().targetDirectory().columns().equals(columns.keySet())) || !Arrays.equals(target.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(target.upperExclusive(),interval.upperExclusive())) throw new IllegalArgumentException("Topology activation child geometry/schema differs");
-        if(applied==null || applied.term()<=0 || applied.index()<0 || configurationUnderAdmission()==null) throw new IllegalStateException("Topology activation requires own committed Raft prefix/configuration");
+        var cut=fresh ? applied : topologyRecoveryCut();
+        if(cut==null || cut.term()<=0 || cut.index()<0 || configurationUnderAdmission()==null) throw new IllegalStateException("Topology activation requires own committed Raft prefix/configuration");
         return seed;
     }
     void validateTopologyActivationRecovery() throws RocksDBException {
-        if(topologyActivation!=null) { topologyActivation.requireSeed(requireTopologyActivationSeed(false)); topologyActivation.requireCut(applied); }
+        if(topologyActivation!=null) { topologyActivation.requireSeed(requireTopologyActivationSeed(false)); topologyActivation.requireCut(topologyRecoveryCut()); }
     }
     /** Trusted committed activation; fresh catalogue/membership authority is qualified by the adapter. */
     public NativeTopologyActivation applyTopologyActivation(ApplyPosition position,TopologyChange.Definition definition,byte[] commonFreezeDigest,UUID catalogueGroup,ApplyPosition catalogueCut,byte[] publicationCommitment) throws RocksDBException {
@@ -3141,6 +3171,41 @@ public final class ReplicatedRangeStore {
         finally { try { drainScopedReleases(); } finally { leaveNative(); } }
     }
 
+    private static boolean topologySchemaRow(byte[] key) { return key.length>16 && (key[16]==0x27 || key[16]==0x28 || key[16]==0x2a || key[16]==0x2b || key[16]==0x2c); }
+    private Map<String,byte[]> topologySchemaRows() throws RocksDBException {
+        var rows=new HashMap<String,byte[]>();long bytes=0;
+        try(var iterator=db.newIterator(state)) {
+            iterator.seek(markerKey);
+            while(iterator.isValid()) {
+                byte[] key=iterator.key();if(key.length<16 || !Arrays.equals(key,0,16,markerKey,0,16))break;
+                if(topologySchemaRow(key)) { byte[] value=iterator.value();if((bytes+=value.length)>16L*1024*1024 || rows.size()>=131)throw new IllegalStateException("Topology local schema evidence exceeds retention budget");rows.put(HexFormat.of().formatHex(key),value); }
+                iterator.next();
+            }
+            iterator.status();
+        }
+        return Map.copyOf(rows);
+    }
+    private Map<String,byte[]> validateTopologySchemaImage(Path image,NativeRangeImage.Limits limits) throws IOException,RocksDBException {
+        var local=topologySchemaRows();var seen=new HashSet<String>();
+        NativeRangeImage.visit(image,limits,(section,column,key,value)->{
+            if(section!=NativeRangeImage.Section.STATE || !topologySchemaRow(key))return;
+            var identity=HexFormat.of().formatHex(key);byte[] original=local.get(identity);
+            if(original==null)throw new IOException("Topology image schema requires qualified local schema preparation/INSTALL/ACTIVATE first");
+            try {
+                if(key[16]==0x28 || key[16]==0x2a) {
+                    var incoming=NativeSchemaInstallation.decode(value);var retained=NativeSchemaInstallation.decode(original);retained.requireDefinition(incoming.definition());
+                    if(!retained.fence().equals(incoming.fence()) || !retained.position().equals(incoming.position()) || !retained.sourceMerges().equals(incoming.sourceMerges()) || !retained.targetMerges().equals(incoming.targetMerges()))throw new IllegalArgumentException("Topology image schema changed common original native evidence");
+                } else if(!Arrays.equals(original,value))throw new IllegalArgumentException("Topology image schema changed original fence/activation evidence");
+            } catch(IllegalArgumentException invalid) { throw new IOException("Topology image schema origin differs",invalid); }
+            seen.add(identity);
+        });
+        if(!seen.equals(local.keySet()))throw new IOException("Topology image discards retained original local schema evidence");
+        return local;
+    }
+    static byte[] topologySchemaValue(Map<String,byte[]> rows,byte[] key,byte[] value) {
+        return rows==null || !topologySchemaRow(key) ? value : Objects.requireNonNull(rows.get(HexFormat.of().formatHex(key)),"Missing prevalidated local schema image evidence");
+    }
+
     private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
             InstallationObserver observer) throws IOException, RocksDBException {
         if(importPending()) throw new IllegalStateException("Unpublished native import cannot be replaced by snapshot replay");
@@ -3155,7 +3220,8 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
-            if(topologyRetired() || topologyBirth!=null) throw new IllegalStateException("Topology USER image install requires self-contained seed provenance");
+            final NativeTopologyActivation localActivation=qualifyTopologyImageOrigin(expected.topologyOrigin());
+            final Map<String,byte[]> localSchemaRows=localActivation==null ? null : validateTopologySchemaImage(image,limits);
             if(topologyPreparation!=null) throw new IllegalStateException("Topology preparation owns native replacement admission");
             if(activeTopologyFreeze!=null) {
                 var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visit(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); });
@@ -3167,12 +3233,12 @@ public final class ReplicatedRangeStore {
                 NativeRangeImage.visit(image,limits,(section,column,key,value)->{ if(section==NativeRangeImage.Section.STATE && key.length==17) { if(key[16]==0x40)incoming[0]=value; if(key[16]==0x42)incoming[1]=value; if(key[16]==0x43)incoming[2]=value; } });
                 if(!Arrays.equals(importBirth.encode(),incoming[0]) || importReceipt==null || !Arrays.equals(importReceipt.encode(),incoming[1]) || importActivation==null || !Arrays.equals(importActivation.encode(),incoming[2]))throw new IOException("Snapshot cannot discard or change native import publication evidence");
             }
-            if(schemaPreparationPool!=null) schemaPreparationPool.validateSnapshotCapacity(this,image,limits);
+            if(schemaPreparationPool!=null) schemaPreparationPool.validateSnapshotCapacity(this,image,limits,localSchemaRows);
             if(activeSchemaFence!=null || activeSchemaInstallation!=null || activeSchemaActivation!=null) {
                 var incoming=new NativeSchemaFence[1]; var incomingInstall=new NativeSchemaInstallation[1]; var incomingActivation=new NativeSchemaActivationProof[1];
                 NativeRangeImage.visit(image,limits,(section,column,key,value) -> {
                     if (section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x27) incoming[0]=NativeSchemaFence.decode(value);
-                    if (section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x28) incomingInstall[0]=NativeSchemaInstallation.decode(value);
+                    if (section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x28) incomingInstall[0]=NativeSchemaInstallation.decode(topologySchemaValue(localSchemaRows,key,value));
                     if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x2c) incomingActivation[0]=NativeSchemaActivationProof.decode(value);
                 });
                 if(activeSchemaFence!=null && !activeSchemaFence.equals(incoming[0])) throw new IOException("Snapshot cannot discard or change a committed native schema fence");
@@ -3218,7 +3284,8 @@ public final class ReplicatedRangeStore {
                                 case RECEIPTS -> writer.put(receipts, key, value);
                                 case STATE -> {
                                     if (Arrays.equals(key, installingKey)) throw new IOException("Image contains incomplete-install metadata");
-                                    if (!Arrays.equals(key, markerKey)) writer.put(state, key, value);
+                                    if(localActivation!=null && key.length==17 && (key[16]==0x61 || key[16]==0x63 || key[16]==0x64))break;
+                                    if (!Arrays.equals(key, markerKey)) writer.put(state, key, topologySchemaValue(localSchemaRows,key,value));
                                 }
                             }
                         } catch (RocksDBException storage) { throw new IOException("Native snapshot import failed", storage); }
@@ -3226,7 +3293,7 @@ public final class ReplicatedRangeStore {
                     var actual=snapshotContext==null ? NativeRangeImage.visit(image,limits,importer) : NativeRangeImage.visitSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column(),importer);
                     if (!Arrays.equals(expected.sha256(), actual.sha256())) throw new IOException("Snapshot changed during installation");
                     writer.flush();
-                    // The current image supplies counters bound to its completed position; never normalize imported state.
+                    // Ordinary counters remain bound to the source cut; only local ownership/alias evidence is normalized.
                     recoverSchemaMetadata(expected.position());
                     if(cdc!=null) cdc.recover(expected.position(),cdcAuthorityTime());
                     validateReceiptUsage(expected.position());
@@ -3236,12 +3303,13 @@ public final class ReplicatedRangeStore {
                     db.flushWal(true);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
                         if(cdc!=null) cdc.initialize(batch);
+                        if(localActivation!=null) { batch.put(state,topologyOwnershipKey(0x61),topologyBirth.encode());batch.put(state,topologyOwnershipKey(0x63),localActivation.encode()); }
                         batch.put(state, markerKey, encodePosition(expected.position()));
                         batch.delete(state, installingKey);
                         db.write(options, batch);
                     }
                     publishScoped(expected.position(),prepareScopedWrites(false,List.of(),Map.of()),false); applied = expected.position();
-                    recoverImportMetadata();
+                    recoverImportMetadata();recoverTopologyOwnership();validateTopologyActivationRecovery();
                     installationGeneration++;
                     pendingInstallation = null;
                     return actual;
@@ -3295,7 +3363,7 @@ public final class ReplicatedRangeStore {
                 if (upper != null && Arrays.compareUnsigned(key, upper) >= 0) break;
                 if (prefix != null && (key.length < prefix.length
                         || !Arrays.equals(prefix, 0, prefix.length, key, 0, prefix.length))) break;
-                if (cf.getID() != state.getID() || !Arrays.equals(key, installingKey)) writer.delete(cf, key);
+                if (cf.getID() != state.getID() || !Arrays.equals(key, installingKey) && !(topologyBirth!=null && (topologySchemaRow(key) || key.length==17 && (key[16]==0x61 || key[16]==0x63 || key[16]==1)))) writer.delete(cf, key);
                 iterator.next();
             }
             iterator.status();
@@ -3677,7 +3745,7 @@ public final class ReplicatedRangeStore {
     }
 
     private SnapshotPin captureUnderAdmission() throws RocksDBException { return captureUnderAdmission(false); }
-    SnapshotPin captureForImage() throws RocksDBException { if(topologyBirth!=null || topologyRetired()) throw new IllegalStateException("Topology USER image export requires self-contained seed provenance"); return captureForRecovery(); }
+    SnapshotPin captureForImage() throws RocksDBException { if(topologyBirthPending() || topologyRetired()) throw new IllegalStateException("Inactive topology owner cannot export USER image"); return captureForRecovery(); }
     /**
      * Trusted Raft metadata recovery and image ownership only, never fresh DATA admission.
      * Bypasses the schema business fence while retaining physical activation, completed-marker
@@ -3796,6 +3864,18 @@ public final class ReplicatedRangeStore {
             acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) {
                 return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,columns.keySet(),interval.lowerInclusive(),interval.upperExclusive(),position,minimumSessionEpoch(options),sessionAuthority(options));
+            } finally { releaseUse(); }
+        }
+        /** Local topology evidence is read from this owned native cut, never the live store cache. */
+        public NativeTopologyImageOrigin topologyImageOrigin() throws RocksDBException {
+            acquireUse();
+            try(var options=new ReadOptions().setSnapshot(snapshot)) {
+                byte[] retired=db.get(state,options,topologyOwnershipKey(0x62));if(retired!=null)throw new IllegalStateException("Retired topology parent cannot export USER image");
+                byte[] birth=db.get(state,options,topologyOwnershipKey(0x61)),activation=db.get(state,options,topologyOwnershipKey(0x63));
+                if(birth==null && activation==null)return null;
+                if(birth==null || activation==null || schemaPreparationPool==null)throw new IllegalStateException("Topology image lacks completed local birth/activation/original seed");
+                var pointer=NativeTopologyBirth.decode(birth);var seed=schemaPreparationPool.topologySeed(pointer.intentId());if(seed==null)throw new IllegalStateException("Topology image original seed missing");pointer.requireSeed(seed);
+                var receipt=NativeTopologyActivation.decode(activation);if(!pointer.equals(receipt.birth()))throw new IllegalArgumentException("Topology image birth/activation differ");var origin=new NativeTopologyImageOrigin(seed,receipt);origin.requireImage(groupId,rangeEpoch,capturedInterval.domainId(),capturedInterval.lowerInclusive(),capturedInterval.upperExclusive(),position);return origin;
             } finally { releaseUse(); }
         }
         public Configuration configuration() throws RocksDBException {

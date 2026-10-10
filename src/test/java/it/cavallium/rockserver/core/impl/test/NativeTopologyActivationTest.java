@@ -15,6 +15,9 @@ class NativeTopologyActivationTest {
     final ApplyPosition catalogueCut=new ApplyPosition(3,5);
     @Test void forcedActivationOwnPrefixRetryBusinessAndColdRecovery() throws Exception {
         var definition=fixture.topology.split(fixture.outer.schema(),100); NativeTopologySeed seed; NativeTopologyActivation receipt;
+        byte[] fencing=TopologyChange.State.begin(definition.header()).beginFencing().encode();
+        byte[] admission=OperatorUpload.sha256(java.nio.ByteBuffer.allocate(16+fencing.length).putLong(catalogue.getMostSignificantBits()).putLong(catalogue.getLeastSignificantBits()).put(fencing).array());
+        System.arraycopy(admission,0,fixture.topology.admission,0,admission.length);
         var path=root.resolve("activation");
         try(var pool=fixture.pool(path)) {
             var parent=fixture.open(pool,definition.parents().getFirst()); parent.applyNoop(new ApplyPosition(1,0)); parent.apply(new ApplyPosition(1,1),fixture.put(parent.ownership().owner().groupId(),0,1,9));
@@ -35,7 +38,7 @@ class NativeTopologyActivationTest {
             assertThrows(IllegalArgumentException.class,()->child.applyTopologyActivation(new ApplyPosition(2,1),definition,common,catalogue,catalogueCut,publication));
             assertArrayEquals(fixture.helper.key(9),child.readCurrentPoint(fixture.outer.fixed,fixture.helper.key(1)));
             child.apply(new ApplyPosition(2,3),fixture.put(child.ownership().owner().groupId(),1,1,8));
-            assertThrows(IllegalStateException.class,()->NativeRangeImage.write(root.resolve("child.img"),child,new NativeRangeImage.Limits(4<<20,16<<20,4)));
+            assertNotNull(NativeRangeImage.write(root.resolve("child.img"),child,new NativeRangeImage.Limits(4<<20,16<<20,4)).topologyOrigin());
             assertThrows(IllegalStateException.class,()->parent.applyTopologyActivation(new ApplyPosition(1,parent.applied().index()+1),definition,common,catalogue,catalogueCut,publication));
         }
         try(var pool=fixture.pool(path)) {

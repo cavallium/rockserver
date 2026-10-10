@@ -1,6 +1,9 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyImageOrigin;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyBirth;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
 import it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt;
 import it.cavallium.rockserver.core.common.distributed.OperationId;
 import it.cavallium.rockserver.core.common.distributed.PreparedParticipant;
@@ -36,7 +39,7 @@ public final class NativeRangeImage {
         return first != 0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(), b.getLeastSignificantBits());
     };
 
-    /** maxRowBytes bounds key+value bytes together, and also each encoded interval bound. */
+    /** maxRowBytes bounds key+value bytes together, including image-only provenance, and each interval bound. */
     public record Limits(int maxRowBytes, long maxImageBytes, int maxColumns) {
         public Limits {
             if (maxRowBytes <= 0 || maxImageBytes <= 0 || maxColumns <= 0) {
@@ -48,7 +51,7 @@ public final class NativeRangeImage {
     /** sha256 hashes the entire file, including its embedded body checksum; bytes is the file size. */
     public record Manifest(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
                            byte[] schemaDigest, ApplyPosition position, Set<UUID> deterministicMergeColumns,
-                           long rows, long bytes, byte[] sha256) {
+                           long rows, long bytes, byte[] sha256, NativeTopologyImageOrigin topologyOrigin) {
         public Manifest {
             Objects.requireNonNull(owner, "owner");
             Objects.requireNonNull(interval, "interval");
@@ -62,6 +65,7 @@ public final class NativeRangeImage {
             if (!interval.columns().containsAll(deterministicMergeColumns)) {
                 throw new IllegalArgumentException("Merge admission refers to another column");
             }
+            if(topologyOrigin!=null) topologyOrigin.requireImage(owner.groupId(),owner.epoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive(),position);
         }
         @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
         @Override public byte[] sha256() { return sha256.clone(); }
@@ -103,6 +107,13 @@ public final class NativeRangeImage {
         if (!pin.interval().equals(interval) || !pin.columns().equals(interval.columns()) || pin.position() == null) {
             throw new IllegalArgumentException("Image requires exact pin interval/columns and a completed position");
         }
+        NativeTopologyImageOrigin origin=pin.topologyImageOrigin();
+        byte[] originBytes=origin==null ? null : origin.encode();
+        if(originBytes!=null && ((long)originBytes.length+17>limits.maxRowBytes() || (long)originBytes.length+17>limits.maxImageBytes())) throw new IOException("Topology image origin exceeds configured byte limit");
+        if(origin!=null) {
+            try { origin.requireImage(pin.groupId(),pin.rangeEpoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive(),pin.position()); }
+            catch(IllegalArgumentException invalid) { throw new IOException("Topology image origin differs from snapshot cut",invalid); }
+        }
         Header header = new Header(new RangeOwnership.Owner(pin.groupId(), pin.rangeEpoch()), interval,
                 pin.schemaDigest(), pin.position(), Set.copyOf(pin.deterministicMergeColumns()));
         validateHeader(header, limits);
@@ -136,7 +147,14 @@ public final class NativeRangeImage {
                     pin.visitColumn(column, interval.lowerInclusive(), interval.upperExclusive(),
                             (key, value) -> append.accept(Section.USER, column, key, value));
                 }
-                pin.visitState((key, value) -> append.accept(Section.STATE, null, key, value));
+                byte[] originKey=ByteBuffer.allocate(17).putLong(pin.groupId().getMostSignificantBits()).putLong(pin.groupId().getLeastSignificantBits()).put((byte)0x64).array();
+                boolean[] originWritten={false};
+                pin.visitState((key,value) -> {
+                    if(Arrays.equals(key,originKey)) throw new IOException("Image-only topology origin cannot be persisted as native state");
+                    if(originBytes!=null && !originWritten[0] && Arrays.compareUnsigned(key,originKey)>0) { append.accept(Section.STATE,null,originKey,originBytes); originWritten[0]=true; }
+                    append.accept(Section.STATE,null,key,value);
+                });
+                if(originBytes!=null && !originWritten[0]) append.accept(Section.STATE,null,originKey,originBytes);
                 pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
                 tracker.finish();
                 try { pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
@@ -155,7 +173,7 @@ public final class NativeRangeImage {
             forceDirectory(directory);
             Files.delete(temporary);
             forceDirectory(directory);
-            return manifest(header, rows, bytes, whole.digest());
+            return manifest(header, rows, bytes, whole.digest(),origin);
         } finally {
             Files.deleteIfExists(temporary);
         }
@@ -214,8 +232,9 @@ public final class NativeRangeImage {
                     throw new IOException("Invalid image row lengths");
                 }
                 byte[] key = new byte[keyLength];
-                byte[] value = new byte[valueLength];
                 input.readFully(key);
+                if(section==Section.STATE && key.length>16 && key[16]==0x64 && valueLength>NativeTopologyImageOrigin.MAX_BYTES) throw new IOException("Topology image origin exceeds canonical bound");
+                byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
                 if (snapshotHome!=null) {
@@ -234,13 +253,14 @@ public final class NativeRangeImage {
             long declaredRows = input.readLong();
             if (declaredRows != tracker.count) throw new IOException("Image row count mismatch");
             tracker.finish();
+            if(snapshotHome!=null && (tracker.topologyOrigin!=null || tracker.topologyBirth!=null || tracker.topologyActivation!=null)) throw new IOException("Snapshot HOME image contains topology provenance");
             if (snapshotHome!=null && tracker.sessionAuthority!=null && (!tracker.sessionAuthority.clusterId().equals(snapshotHome.cluster()) || !tracker.sessionAuthority.databaseId().equals(snapshotHome.database()))) throw new IOException("Snapshot HOME image session authority differs");
             bodyInput.on(false);
             byte[] embedded = new byte[HASH_BYTES];
             input.readFully(embedded);
             if (!MessageDigest.isEqual(embedded, body.digest())) throw new IOException("Image body checksum mismatch");
             if (input.read() != -1 || counted.count != size) throw new IOException("Trailing or changing image bytes");
-            var manifest=manifest(header, tracker.count, size, whole.digest());
+            var manifest=manifest(header, tracker.count, size, whole.digest(),tracker.topologyOrigin);
             var homeContext=tracker.homeContext(required);
             if (verifyCreditUsers && (homeContext!=null || tracker.homeSuccessCount()!=0)) {
                 var matched=new HashSet<UUID>(); var successful=new HashSet<OperationId>();
@@ -258,8 +278,8 @@ public final class NativeRangeImage {
         }
     }
 
-    private static Manifest manifest(Header header, long rows, long bytes, byte[] sha256) {
-        return new Manifest(header.owner(), header.interval(), header.schema(), header.position(), header.mergeColumns(), rows, bytes, sha256);
+    private static Manifest manifest(Header header, long rows, long bytes, byte[] sha256,NativeTopologyImageOrigin origin) {
+        return new Manifest(header.owner(), header.interval(), header.schema(), header.position(), header.mergeColumns(), rows, bytes, sha256,origin);
     }
 
     private static void validateHeader(Header header, Limits limits) throws IOException {
@@ -381,6 +401,9 @@ public final class NativeRangeImage {
         private long gateBytes,homeRecoveryBytes,homeCreditBytes;
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaFence schemaFence;
         private it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze topologyFreeze;
+        private NativeTopologyBirth topologyBirth;
+        private NativeTopologyActivation topologyActivation;
+        private NativeTopologyImageOrigin topologyOrigin;
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation schemaInstallation;
         private final Map<String,it.cavallium.rockserver.core.common.distributed.DistributedSchema> schemaHistory=new HashMap<>();
         private final List<byte[]> referencedSchemas=new ArrayList<>();
@@ -495,7 +518,18 @@ public final class NativeRangeImage {
                     } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema activation",failure); }
                 }
                 if(section==Section.STATE && key.length>16 && key[16]==0x29) throw new IOException("Uncompleted schema install cannot be exported");
-                if(section==Section.STATE && key.length>16 && (key[16]==0x61 || key[16]==0x62 || key[16]==0x63)) throw new IOException("Inactive topology USER images lack self-contained seed/retirement provenance");
+                if(section==Section.STATE && key.length>16 && key[16]==0x62) throw new IOException("Retired topology parents cannot export USER images");
+                if(section==Section.STATE && key.length>16 && (key[16]==0x61 || key[16]==0x63 || key[16]==0x64)) {
+                    try {
+                        if(key.length!=17) throw new IllegalArgumentException("Invalid topology image provenance key");
+                        if(key[16]==0x61) { if(topologyBirth!=null) throw new IllegalArgumentException("Duplicate topology birth"); topologyBirth=NativeTopologyBirth.decode(value); }
+                        else if(key[16]==0x63) { if(topologyActivation!=null) throw new IllegalArgumentException("Duplicate topology activation"); topologyActivation=NativeTopologyActivation.decode(value); topologyActivation.requireCut(header.position()); }
+                        else {
+                            if(topologyOrigin!=null) throw new IllegalArgumentException("Duplicate topology image origin"); topologyOrigin=NativeTopologyImageOrigin.decode(value);
+                            topologyOrigin.requireImage(header.owner().groupId(),header.owner().epoch(),header.interval().domainId(),lower,upper,header.position());
+                        }
+                    } catch(IllegalArgumentException invalid) { throw new IOException("Invalid topology image provenance",invalid); }
+                }
                 if(section==Section.STATE && key.length>16 && key[16]==0x60) {
                     try {
                         if(key.length!=17 || topologyFreeze!=null) throw new IllegalArgumentException("Invalid topology FREEZE key/count");
@@ -710,7 +744,7 @@ public final class NativeRangeImage {
                 if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
             }
             if (context!=null) {
-                if(topologyFreeze!=null || schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null || importBirth!=null) throw new IOException("HOME image contains DATA schema/import lifecycle");
+                if(topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null || topologyFreeze!=null || schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null || importBirth!=null) throw new IOException("HOME image contains DATA schema/import lifecycle");
                 if (!header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership");
                 for (var receipt:homeRecoveries.values()) if (!receipt.recovery().before().clusterId().equals(context.cluster()) || !receipt.recovery().before().databaseId().equals(context.database()) || !receipt.recovery().command().mutations().getFirst().columnId().equals(context.column())) throw new IOException("Qualified HOME receipt database differs");
             }
@@ -774,6 +808,21 @@ public final class NativeRangeImage {
                     if(!committed.containsKey(id) && !aborted.containsKey(id)) throw new IOException("Historical preparation remains unresolved");
                     var old=schemaHistory.get(java.util.HexFormat.of().formatHex(prepared.preparation().business().schemaDigest()));
                     if(old==null || prepared.preparation().scope().spans().stream().anyMatch(span -> !old.columnIds().contains(span.columnId()))) throw new IOException("Historical preparation columns differ");
+                }
+            }
+            if(topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null) {
+                if(topologyOrigin==null || topologyBirth==null || topologyActivation==null || topologyFreeze!=null || importBirth!=null
+                        || !topologyBirth.equals(topologyOrigin.activation().birth()) || !Arrays.equals(topologyActivation.encode(),topologyOrigin.activation().encode())) throw new IOException("Topology image lacks exact complete birth/activation/origin provenance");
+                var seed=topologyOrigin.seed(); var source=seed.definition().sourceDirectory();
+                boolean original=Arrays.equals(source.schemaDigest(),header.schema()) && source.columns().equals(header.interval().columns()) && seed.mergeColumns().equals(header.mergeColumns());
+                if(!original) {
+                    boolean qualified=false;
+                    if(schemaInstallation!=null && currentSchemaActivation!=null) for(var record:schemaInstallations) {
+                        var position=topologyActivation.position(); var fence=record.fence().position();
+                        if(Arrays.equals(record.definition().sourceSchema().digest(),source.schemaDigest()) && record.sourceNames().equals(seed.physicalNames()) && record.sourceMerges().equals(seed.mergeColumns())
+                                && fence.index()>position.index() && fence.term()>=position.term()) { qualified=true; break; }
+                    }
+                    if(!qualified) throw new IOException("Topology image original schema lacks complete qualified subsequent lifecycle");
                 }
             }
             if(importBirth!=null && (!Arrays.equals(importBirth.schemaDigest(),header.schema()) || !importBirth.physicalNames().keySet().equals(header.interval().columns()) || !importBirth.mergeColumns().equals(header.mergeColumns()))) {

@@ -444,7 +444,8 @@ public final class DistributedStoragePool implements AutoCloseable {
         for(var claim:chargedCapacityClaims().values()) if(!claim.definition().changeId().equals(except)) { var member=claim.groups().get(group); if(member!=null && member.outstanding()) proofs.add(member.proof()); }
         return List.copyOf(proofs);
     }
-    void validateSnapshotCapacity(ReplicatedRangeStore store,Path image,NativeRangeImage.Limits limits) throws IOException,RocksDBException {
+    void validateSnapshotCapacity(ReplicatedRangeStore store,Path image,NativeRangeImage.Limits limits) throws IOException,RocksDBException { validateSnapshotCapacity(store,image,limits,null); }
+    void validateSnapshotCapacity(ReplicatedRangeStore store,Path image,NativeRangeImage.Limits limits,Map<String,byte[]> localSchemaRows) throws IOException,RocksDBException {
         UUID group=store.ownership().owner().groupId(); var claims=chargedCapacityClaims();
         var expected=new HashMap<UUID,byte[]>(); int reservedCount=0; long reservedBytes=0;
         for(var claim:claims.values()) {
@@ -459,6 +460,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         int[] installedCount={0}; long[] bytes={reservedBytes}; var retained=new HashSet<UUID>();
         NativeRangeImage.visit(image,limits,(section,column,key,value) -> {
             if(section!=NativeRangeImage.Section.STATE) return;
+            value=ReplicatedRangeStore.topologySchemaValue(localSchemaRows,key,value);
             if(key.length==17 && (key[16]==0x28 || key[16]==0x2c) || key.length==33 && (key[16]==0x2a || key[16]==0x2b)) bytes[0]=Math.addExact(bytes[0],value.length);
             if(key.length==33 && key[16]==0x2a) {
                 installedCount[0]++; var id=new UUID(ByteBuffer.wrap(key,17,16).getLong(),ByteBuffer.wrap(key,25,8).getLong()); var original=expected.get(id);
@@ -791,7 +793,7 @@ public final class DistributedStoragePool implements AutoCloseable {
     private RecoveredSchema recoverSchemaUnderLane(UUID group) throws RocksDBException {
         var state=handles.get(STATE_COLUMN); var db=loaded.db().get();
         byte[] marker=ByteBuffer.allocate(16).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).array();
-        var markerBytes=db.get(state,marker); var cut=markerBytes==null ? null : ReplicatedRangeStore.decodePosition(markerBytes);
+        var markerBytes=db.get(state,marker); var cut=markerBytes==null ? ReplicatedRangeStore.snapshotInstallationCut(db.get(state,groupSchemaKey(group,0x7f))) : ReplicatedRangeStore.decodePosition(markerBytes);
         var currentBytes=db.get(state,groupSchemaKey(group,0x28)); var current=currentBytes==null ? null : NativeSchemaInstallation.decode(currentBytes);
         var activationBytes=db.get(state,groupSchemaKey(group,0x2c)); var activation=activationBytes==null ? null : NativeSchemaActivationProof.decode(activationBytes);
         var pendingBytes=db.get(state,groupSchemaKey(group,0x27)); var pending=pendingBytes==null ? null : NativeSchemaFence.decode(pendingBytes);
@@ -998,7 +1000,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                         handles.get(STATE_COLUMN), handles.get(RECEIPTS_COLUMN), merges);
                 store.configureSnapshotAdmission(snapshotAdmission); store.configureSchemaPreparationPool(this);
                 store.validateTopologyActivationRecovery();
-                if(topologySource==null && topologyChild!=null && store.topologyActivation()!=null) ownership.activate(owner);
+                if(topologySource==null && topologyChild!=null && store.topologyActivation()!=null && !store.pendingInstallation()) ownership.activate(owner);
                 for(var entry:names.entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),merges.contains(entry.getKey())));
                 ranges.add(store);
                 if(newImport!=null)newImportReservations.remove(owner.groupId());

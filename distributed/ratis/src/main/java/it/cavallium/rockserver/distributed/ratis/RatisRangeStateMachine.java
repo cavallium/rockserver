@@ -1604,6 +1604,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
         };
         var manifest=homeReservations ? NativeRangeImage.visitHomeRecoveryReservations(image,limits,homeCluster,homeDatabase,homeColumn,visitor) : NativeRangeImage.visit(image,limits,visitor);
+        if(manifest.topologyOrigin()!=null && role!=RatisNodePlan.Role.DATA)throw new IOException("Non-DATA image contains topology provenance");
+        if(manifest.topologyOrigin()!=null || store.topologyBirth()!=null) {
+            var birth=store.topologyBirth();
+            if(birth==null || topologyStorage==null || topologyLocalReplica==null)throw new IOException("Topology snapshot target has no configured local birth");
+            var seed=topologyStorage.topologySeed(birth.intentId());
+            var server=getServer().getNow(null);
+            if(seed==null || !seed.localReplica().equals(topologyLocalReplica) || server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("Topology snapshot target local replica changed");
+            try { store.validateTopologyImageOrigin(manifest.topologyOrigin()); }
+            catch(org.rocksdb.RocksDBException invalid) { throw new IOException("Cannot qualify local topology image provenance",invalid); }
+        }
         var cfg = cutConfiguration[0];
         if (cfg == null || cfg.index() > manifest.position().index() || cfg.term() > manifest.position().term()) {
             throw new IOException("Snapshot lacks configuration at its cut");
@@ -1633,7 +1643,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public long takeSnapshot() throws IOException {
         // A retired parent's shared USER rows may already belong to its children.
-        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirth()!=null)return -1;
+        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending())return -1;
         try (var pin = snapshotPin()) {
             if (pin.position() == null) return -1;
             var position = TermIndex.valueOf(pin.position().term(), pin.position().index());

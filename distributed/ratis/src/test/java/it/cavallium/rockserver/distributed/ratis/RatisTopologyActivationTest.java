@@ -76,10 +76,10 @@ class RatisTopologyActivationTest {
     }
     @Test void freshPreparationOriginalRetryAndChildBusinessAfterNativeActivation()throws Exception {
         try(var f=new Fixture(root)) {
-            assertNotNull(f.propose(f.record.encode()).getException());assertEquals(0,f.reads.get());assertTrue(f.prepare().ready());assertTrue(f.prepare().ready());assertEquals(1,f.reads.get());var receipt=f.activate(1);assertEquals(1,f.observations.get());assertFalse(f.child.topologyBirthPending());assertEquals(-1,f.machine.takeSnapshot());assertEquals(new ApplyPosition(1,1),receipt.position());
+            assertNotNull(f.propose(f.record.encode()).getException());assertEquals(0,f.reads.get());assertTrue(f.prepare().ready());assertTrue(f.prepare().ready());assertEquals(1,f.reads.get());var receipt=f.activate(1);assertEquals(1,f.observations.get());assertFalse(f.child.topologyBirthPending());assertEquals(1,f.machine.takeSnapshot());assertEquals(new ApplyPosition(1,1),receipt.position());
             f.unavailable=true;assertArrayEquals(receipt.encode(),f.activate(2).encode());assertEquals(1,f.reads.get());assertEquals(1,f.observations.get());assertArrayEquals(new byte[]{9},f.child.readCurrentPoint(f.parent.column,new byte[]{1}));
             var command=new DistributedCommand(f.target.groupId(),1,f.parent.schema.digest(),new OperationId(RatisTopologyFreezeTest.id(333),1,0),List.of(new Mutation(Mutation.Kind.PUT,f.parent.column,new byte[]{1},new byte[]{8})));var write=f.propose(DistributedCommandCodec.encode(command));assertNull(write.getException());f.machine.preAppendTransaction(write);write.initLogEntry(1,3);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.machine.applyTransaction(write).get(5,TimeUnit.SECONDS).getContent().toByteArray()).status());assertArrayEquals(new byte[]{8},f.child.readCurrentPoint(f.parent.column,new byte[]{1}));
-            assertThrows(IllegalStateException.class,()->NativeRangeImage.write(root.resolve("child-image"),f.child,new NativeRangeImage.Limits(4<<20,16<<20,1)));
+            assertNotNull(NativeRangeImage.write(root.resolve("child-image"),f.child,new NativeRangeImage.Limits(4<<20,16<<20,1)).topologyOrigin());
         }
     }
     @Test void followerUsesOwnDurableBirthAndOwnerProofRequiresActualCurrentDivision()throws Exception {
