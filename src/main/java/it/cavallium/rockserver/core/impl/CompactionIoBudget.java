@@ -13,7 +13,23 @@ public final class CompactionIoBudget {
                          long compactionReadCount, long prefetchCount, long prefetchBytes,
                          long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
                          int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
-                         long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys) {
+                         long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos) {
+        public Sample(long nanos, long readCount, long readMicros, long bytes,
+                      boolean background, boolean pressure, boolean stopped, boolean valid,
+                      boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
+                      boolean urgentPressure, long compactionReadBytes, long compactionReadMicros,
+                      long compactionReadCount, long prefetchCount, long prefetchBytes,
+                      long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
+                      int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
+                      long pointTailMicros, long bulkTailMicros, long nativePointCompletions,
+                      long nativeBulkCompletions, long nativeBulkKeys) {
+            this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure,
+                    compactionReadBytes, compactionReadMicros, compactionReadCount, prefetchCount, prefetchBytes,
+                    bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
+                    readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
+                    nativeBulkCompletions, nativeBulkKeys, 0);
+        }
         public Sample(long nanos, long readCount, long readMicros, long bytes,
                       boolean background, boolean pressure, boolean stopped, boolean valid,
                       boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
@@ -81,7 +97,7 @@ public final class CompactionIoBudget {
     private int tailBlockWindows, tailBlocks;
     private long tailOffProbeHoldUntil;
     private long tailBlockPointMax, tailBlockBulkMax, firstPointMax, firstBulkMax;
-    private long tailBlockReads, tailBlockMicros, tailBlockKeys, tailBlockBulkMicros;
+    private long tailBlockReads, tailBlockPointNanos, tailBlockKeys, tailBlockBulkMicros;
     private double firstPointMean, firstBulkMean, tailBlockShape, firstTailShape;
     private boolean tailBlockPointActive, tailBlockBulkActive;
     private double queueAnchor = -1, lastPointMean, lastBulkMean;
@@ -95,13 +111,13 @@ public final class CompactionIoBudget {
     private volatile long shutdownBudget;
     private volatile State state = State.BOOTSTRAP;
     private Sample previous;
-    private long windowNanos, reads, micros, bytes;
+    private long windowNanos, reads, pointNanos, bytes;
     private boolean background, pressuredWindow, pendingForeground, noProgressProbeUsed;
     private long completions;
     private volatile double baseline;
     private double recentAchieved, lastAchieved;
     private long preThrottle, probeBudget;
-    private double probeLatency, probeAchieved, probeForegroundRate;
+    private double probeLatency, probeAchieved, probeForegroundRate, probePointCallRate;
     private int settle, cooldown, healthyRecovery, probeBenefits;
     private double firstProbeBenefitLatency;
     private long bulkCalls, bulkTime, bulkKeys, readSaturatedNanos, readPendingNanos, readQueuedNanos, readCompleted;
@@ -155,7 +171,7 @@ public final class CompactionIoBudget {
         return (long) Math.max(MIN_BYTES_PER_SECOND, Math.min(MAX_BYTES_PER_SECOND, value));
     }
     private void clearWindow() {
-        windowNanos = reads = micros = bytes = completions = 0;
+        windowNanos = reads = pointNanos = bytes = completions = 0;
         background = pressuredWindow = pendingForeground = false;
         bulkCalls = bulkTime = bulkKeys = readSaturatedNanos = readPendingNanos = readQueuedNanos = readCompleted = 0;
         bulkEpochValid = true;
@@ -167,6 +183,10 @@ public final class CompactionIoBudget {
     public long sample(Sample sample) {
         var old = previous;
         previous = sample;
+        boolean pointEpochFailure = sample.valid && old != null && old.valid
+                && (sample.nativePointCompletions < 0 || sample.nativePointReadNanos < 0
+                    || sample.nativePointCompletions < old.nativePointCompletions
+                    || sample.nativePointReadNanos < old.nativePointReadNanos);
         boolean nativePressure = sample.urgentPressure || sample.stopped;
         if (sample.stopped) reduceReadahead(0);
         if (nativePressure && state != State.RECOVERY) {
@@ -181,9 +201,8 @@ public final class CompactionIoBudget {
             clearWindow();
         }
         if (!sample.valid || old == null || !old.valid || sample.nanos <= old.nanos
-                || sample.readCount < 0 || sample.readMicros < 0 || sample.bytes < 0 || sample.foregroundCompletions < 0
-                || sample.nanos - old.nanos > 3_000_000_000L || sample.readCount < old.readCount
-                || sample.readMicros < old.readMicros || sample.bytes < old.bytes
+                || pointEpochFailure || sample.bytes < 0 || sample.foregroundCompletions < 0
+                || sample.nanos - old.nanos > 3_000_000_000L || sample.bytes < old.bytes
                 || sample.foregroundCompletions < old.foregroundCompletions) {
             if (state == State.PROBE) finishProbe(false, 0);
             if (state == State.RECOVERY) healthyRecovery = 0;
@@ -192,9 +211,9 @@ public final class CompactionIoBudget {
             clearReadWindow();
             recentReadBytes = recentReadMicros = recentReadCount = 0;
             foregroundHealthy = false;
+            if (pointEpochFailure) { baseline = 0; pointTailBaseline = 0; tailCalibrationNeeded = true; }
             if (sample.valid && old != null && old.valid
-                    && (sample.nativePointCompletions < old.nativePointCompletions || sample.nativePointCompletions < 0
-                        || sample.nativeBulkCompletions < old.nativeBulkCompletions || sample.nativeBulkCompletions < 0
+                    && (sample.nativeBulkCompletions < old.nativeBulkCompletions || sample.nativeBulkCompletions < 0
                         || sample.nativeBulkKeys < old.nativeBulkKeys || sample.nativeBulkKeys < 0)) {
                 pointTailBaseline = bulkTailBaseline = 0;
                 tailCalibrationNeeded = true; resetTailBlocks();
@@ -208,7 +227,7 @@ public final class CompactionIoBudget {
         accumulateBulk(sample, old, elapsed);
         observeForegroundSafety(sample, old);
         if (!bulkEpochValid && state == State.PROBE) finishProbe(false, Double.NaN);
-        long completed = sample.readCount - old.readCount;
+        long completed = sample.nativePointCompletions - old.nativePointCompletions;
         long transferred = sample.bytes - old.bytes;
         pressuredWindow |= nativePressure;
         pendingForeground |= sample.foregroundPending;
@@ -217,13 +236,14 @@ public final class CompactionIoBudget {
         completions += Math.max(0, completedActions);
         windowNanos += elapsed;
         reads += completed;
-        micros += sample.readMicros - old.readMicros;
+        pointNanos += sample.nativePointReadNanos - old.nativePointReadNanos;
         bytes += transferred;
         background |= sample.background || old.background || transferred > 0;
         if (windowNanos < 5_000_000_000L) return publishBudget();
         double achieved = bytes * (1_000_000_000d / windowNanos);
-        double latency = reads >= 32 && completions >= 32 ? (double) micros / reads : Double.NaN;
+        double latency = reads >= 32 && pointNanos > 0 ? pointNanos / (reads * 1000d) : Double.NaN;
         double foregroundRate = completions * (1_000_000_000d / windowNanos);
+        double pointCallRate = reads * (1_000_000_000d / windowNanos);
         boolean active = background && bytes > 0;
         boolean pressureInWindow = pressuredWindow;
         boolean noForegroundProgress = pendingForeground && completions == 0 && nativePoints == 0 && nativeBulks == 0;
@@ -253,7 +273,7 @@ public final class CompactionIoBudget {
         boolean unhealthyMean = pointReliable && baseline > 0 && latency > baseline * 1.2
                 || bulkComparable && bulkBaseline > 0 && bulkLatency > bulkBaseline * 1.2;
         if (unhealthyMean || noForegroundProgress || bulkNoProgress) reduceReadahead(0);
-        boolean ownPointReliable = !pointTailActive || nativePoints >= 32 && pointTailInWindow > 0;
+        boolean ownPointReliable = !pointTailActive || pointReliable && pointTailInWindow > 0;
         boolean ownBulkReliable = bulkIdle && !bulkTailActive
                 || bulkComparable && nativeBulks >= 32 && nativeBulkShapeInWindow > 0 && bulkTailInWindow > 0;
         boolean sameBulkShape = previousBulkTailShape == 0 || nativeBulkShapeInWindow == 0
@@ -297,7 +317,7 @@ public final class CompactionIoBudget {
         if (state == State.PROBE) {
             if (--settle > 0) return publishBudget();
             boolean pointOk = !probePointProtected || pointReliable && latency <= probeLatency * 1.05
-                    && foregroundRate >= probeForegroundRate * .9;
+                    && foregroundRate >= probeForegroundRate * .9 && pointCallRate >= probePointCallRate * .9;
             boolean bulkOk = !probeBulkProtected ? bulkIdle : bulkComparable
                     && compatibleShape(bulkShape, probeBulkShape) && bulkLatency <= probeBulkLatency * 1.05
                     && bulkCallRate >= probeBulkCallRate * .9 && bulkKeyRate >= probeBulkKeyRate * .9;
@@ -332,12 +352,12 @@ public final class CompactionIoBudget {
             preThrottle = bound(achieved);
             state = State.TRACKING;
             if (pointReliable) baseline = latency;
-            if ((pointReliable || bulkComparable) && bulkSafe) beginProbe(latency, foregroundRate);
+            if ((pointReliable || bulkComparable) && bulkSafe) beginProbe(latency, foregroundRate, pointCallRate);
             return publishBudget();
         }
         if (bulkNoProgress && !bulkNoProgressProbeUsed && bulkBaseline > 0) {
             bulkNoProgressProbeUsed = true;
-            beginProbe(latency, foregroundRate);
+            beginProbe(latency, foregroundRate, pointCallRate);
             return publishBudget();
         }
         // Cache hits/mutations or proven foreground idleness cannot conceal an active slow/sparse bulk lane.
@@ -346,13 +366,13 @@ public final class CompactionIoBudget {
                 budget = bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
             } else if (noForegroundProgress && !noProgressProbeUsed && baseline > 0) {
                 noProgressProbeUsed = true;
-                beginProbe(baseline, foregroundRate);
+                beginProbe(baseline, foregroundRate, pointCallRate);
             }
             return publishBudget();
         }
         if (pointReliable && baseline == 0) baseline = latency;
         if (cooldown == 0 && !rateProbeBlocked() && (bulkIdle || bulkComparable)) {
-            beginProbe(latency, foregroundRate);
+            beginProbe(latency, foregroundRate, pointCallRate);
         } else {
             if (cooldown > 0) cooldown--;
             if (pointHealthy && growthAllowed) {
@@ -374,6 +394,13 @@ public final class CompactionIoBudget {
             tailCalibrationNeeded = true; resetTailBlocks();
             latencyUnsafe = tailUnsafe = true;
             return;
+        }
+        long pointCalls = sample.nativePointCompletions - old.nativePointCompletions;
+        long pointTime = sample.nativePointReadNanos - old.nativePointReadNanos;
+        if (pointCalls >= 32 && pointTime > 0 && baseline > 0
+                && pointTime / (pointCalls * 1000d) > baseline * 1.2) {
+            reduceReadahead(0);
+            if (state == State.PROBE) finishProbe(false, Double.NaN);
         }
         boolean pointSlow = sample.pointTailMicros > 0 && pointTailBaseline > 0
                 && sample.pointTailMicros > pointTailBaseline * 1.2;
@@ -442,7 +469,7 @@ public final class CompactionIoBudget {
     private void resetTailBlocks() {
         tailBlockWindows = tailBlocks = 0;
         tailBlockPointMax = tailBlockBulkMax = firstPointMax = firstBulkMax = 0;
-        tailBlockReads = tailBlockMicros = tailBlockKeys = tailBlockBulkMicros = 0;
+        tailBlockReads = tailBlockPointNanos = tailBlockKeys = tailBlockBulkMicros = 0;
         tailBlockShape = firstTailShape = firstPointMean = firstBulkMean = 0;
     }
     private void updateForegroundTails(boolean healthy, boolean pointReliable, boolean pointActive, boolean bulkActive) {
@@ -464,10 +491,10 @@ public final class CompactionIoBudget {
         }
         tailBlockPointMax = Math.max(tailBlockPointMax, pointTailWindow);
         tailBlockBulkMax = Math.max(tailBlockBulkMax, bulkTailWindow);
-        if (pointReliable) { tailBlockReads += reads; tailBlockMicros += micros; }
+        if (pointReliable) { tailBlockReads += reads; tailBlockPointNanos += pointNanos; }
         tailBlockKeys += bulkKeys; tailBlockBulkMicros += bulkTime;
         if (++tailBlockWindows < 6) return;
-        double pointMean = tailBlockReads > 0 ? (double) tailBlockMicros / tailBlockReads : 0;
+        double pointMean = tailBlockReads > 0 ? tailBlockPointNanos / (tailBlockReads * 1000d) : 0;
         double bulkMean = tailBlockKeys > 0 ? (double) tailBlockBulkMicros / tailBlockKeys : 0;
         if (tailBlocks == 0) {
             firstPointMax = tailBlockPointMax; firstBulkMax = tailBlockBulkMax;
@@ -490,7 +517,7 @@ public final class CompactionIoBudget {
             return;
         }
         tailBlockWindows = 0;
-        tailBlockPointMax = tailBlockBulkMax = tailBlockReads = tailBlockMicros = tailBlockKeys = tailBlockBulkMicros = 0;
+        tailBlockPointMax = tailBlockBulkMax = tailBlockReads = tailBlockPointNanos = tailBlockKeys = tailBlockBulkMicros = 0;
     }
     private static boolean compatibleShape(double shape, double reference) {
         return reference > 0 && Math.abs(shape / reference - 1) <= .25;
@@ -589,7 +616,7 @@ public final class CompactionIoBudget {
             reliableGrowthWindows = 0;
             readWindowTracking = false;
         }
-        if (unsafe) latencyUnsafe = true;
+        if (unsafe) latencyUnsafe = nonTailUnsafe = true;
     }
     private void clearReadWindow() {
         readWindowNanos = compactionBytes = compactionMicros = compactionReads = prefetchEvents = prefetchedBytes = 0;
@@ -716,7 +743,7 @@ public final class CompactionIoBudget {
         cooldown = 12;
         clearReadWindow();
     }
-    private void beginProbe(double latency, double foregroundRate) {
+    private void beginProbe(double latency, double foregroundRate, double pointCallRate) {
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
         long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
@@ -731,6 +758,7 @@ public final class CompactionIoBudget {
         probeLatency = latency;
         probeAchieved = lastAchieved;
         probeForegroundRate = foregroundRate;
+        probePointCallRate = pointCallRate;
         probePointTail = lastPointTail;
         probeBulkTail = lastBulkTail;
         probeBulkTailShape = lastBulkTailShape;

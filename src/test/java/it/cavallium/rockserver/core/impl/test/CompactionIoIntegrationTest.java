@@ -76,6 +76,10 @@ class CompactionIoIntegrationTest {
                 assertEquals(java.util.List.of(true), api.existsMulti(0, col, java.util.List.of(key)));
                 var observed = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(internal, limiter);
                 assertEquals(1, observed.nativePointCompletions() - before.nativePointCompletions());
+                long pointElapsed = observed.nativePointReadNanos() - before.nativePointReadNanos();
+                assertTrue(pointElapsed > 0);
+                assertTrue(pointElapsed <= observed.pointTailMicros() * 1000,
+                        "the cumulative mean and drained maximum must measure the same completed point call");
                 assertEquals(1, observed.nativeBulkCompletions() - before.nativeBulkCompletions());
                 assertEquals(1, observed.nativeBulkKeys() - before.nativeBulkKeys());
                 assertTrue(observed.pointTailMicros() > 0);
@@ -84,6 +88,7 @@ class CompactionIoIntegrationTest {
                 assertEquals(0, drained.pointTailMicros());
                 assertEquals(0, drained.bulkTailMicros());
                 assertEquals(observed.nativePointCompletions(), drained.nativePointCompletions());
+                assertEquals(observed.nativePointReadNanos(), drained.nativePointReadNanos());
                 assertEquals(observed.nativeBulkCompletions(), drained.nativeBulkCompletions());
                 assertEquals(observed.nativeBulkKeys(), drained.nativeBulkKeys());
                 before = drained;
@@ -486,7 +491,9 @@ class CompactionIoIntegrationTest {
                     throw new IllegalStateException("injected sampling failure");
                 }
                 return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(call * 1_000_000_000L,
-                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true);
+                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true, false,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
+                        100, 0, call * 10, 0, 0, call * 1_000_000L);
             };
             var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
                     .getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
@@ -524,7 +531,9 @@ class CompactionIoIntegrationTest {
                     catch (InterruptedException failure) { throw new AssertionError(failure); }
                 }
                 return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(call * 1_000_000_000L,
-                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true);
+                        call * 10, call * 1000, call * 1_000_000L, true, false, false, true, true, call * 10, true, false,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
+                        100, 0, call * 10, 0, 0, call * 1_000_000L);
             };
             var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
                     .getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,

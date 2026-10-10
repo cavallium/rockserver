@@ -34,19 +34,19 @@ class CompactionReadaheadTest {
         long rate = 256 * MIB, serviceRate = 256 * MIB, latency = 100, readerDelay;
         int readCalls = 1000;
         boolean pending = true, progress = true, pressure;
-        long pointTail = 100, nativePoints;
+        long pointTail = 100, nativePoints, nativePointNanos, pointMean = 100;
         int pointCalls = 100;
         CompactionIoBudget.Sample next() {
             nanos += 1_000_000_000L;
             if (nanos >= readerChangeAt) readerSize = applied;
-            if (progress) { reads += 100; micros += 100 * latency; completions += 100; nativePoints += pointCalls; }
+            if (progress) { reads += 100; micros += 100 * latency; completions += 100; nativePoints += pointCalls; nativePointNanos += pointCalls * pointMean * 1000; }
             bytes += rate;
             long readBytes = Math.min(rate, readCalls * 65536L);
             compBytes += readBytes; compMicros += (long) (readBytes * (1_000_000d / serviceRate)); compCount += readCalls;
             if (readerSize > 0) { prefetchCount += 32; prefetchBytes += 32 * readerSize; }
             return new CompactionIoBudget.Sample(nanos, reads, micros, bytes, true, pressure, pressure, true,
                     pending, completions, !pressure, pressure, compBytes, compMicros, compCount, prefetchCount, prefetchBytes,
-                    0, 0, 0, 0, 0, 0, 0, 0, false, progress ? pointTail : 0, 0, nativePoints, 0, 0);
+                    0, 0, 0, 0, 0, 0, 0, 0, false, progress ? pointTail : 0, 0, nativePoints, 0, 0, nativePointNanos);
         }
         void applied(long size) { applied = size; readerChangeAt = nanos + readerDelay; }
     }
@@ -90,14 +90,14 @@ class CompactionReadaheadTest {
         sparse.seconds(600); assertEquals(0, sparse.changes);
     }
     @Test void badEndingForegroundWindowPreventsSecondServiceConfirmation() {
-        var t = new Trace(16 * MIB); t.seconds(70); // now at second 71; first reliable service window was healthy.
-        t.in.latency = 300; t.seconds(5);
+        var t = new Trace(16 * MIB); t.in.pointTail = 300; t.seconds(70); // now at second 71; first reliable service window was healthy.
+        t.in.pointMean = 300; t.seconds(5);
         assertEquals(0, t.in.applied, "current, not previous five-second foreground health must gate growth");
     }
     @Test void earlierBadForegroundWindowCannotBeHiddenByHealthyEndingWindow() {
-        var t = new Trace(16 * MIB); t.seconds(45);
-        t.in.latency = 300; t.seconds(5);
-        t.in.latency = 100; t.seconds(25);
+        var t = new Trace(16 * MIB); t.in.pointTail = 300; t.seconds(45);
+        t.in.pointMean = 300; t.seconds(5);
+        t.in.pointMean = 100; t.seconds(25);
         assertEquals(0, t.in.applied, "every constituent foreground window must be healthy");
     }
     @Test void upwardOutlierAndSmallJitterDoNotWobbleOptionSize() {
@@ -221,11 +221,61 @@ class CompactionReadaheadTest {
             assertEquals(0, t.in.applied, "many block reads and unrelated completions cannot supply native-call quorum");
         }
     }
+    @Test void backgroundSdkReadMeanCannotCutHealthyNativePointCalls() {
+        var t = new Trace(16 * MIB); t.in.latency = 20000; t.until(MIB);
+        t.in.latency = 30000; // SDK block reads can be background I/O; actual native point calls stay100us.
+        assertEquals(100, t.in.pointTail);
+        t.seconds(5);
+        assertTrue(t.in.applied >= MIB, "background SDK reads must not become a foreground latency veto");
+    }
+    @Test void backgroundSdkMeanOscillationCannotPermanentlyFreezeHealthyForeground() {
+        var t = new Trace(16 * MIB); t.in.latency = 20000; t.until(MIB);
+        for (int cycle = 0; cycle < 30; cycle++) {
+            t.in.latency = 20000; t.seconds(10);
+            t.in.latency = 30000; t.seconds(5);
+        }
+        assertEquals(100, t.in.pointTail);
+        assertTrue(t.in.applied >= MIB, "changing background SDK population cannot keep healthy own reads OFF");
+    }
     @Test void pointMeanSlowdownShrinksAtCompletedForegroundWindow() {
-        var t = new Trace(16 * MIB); t.until(MIB);
-        t.in.latency = 300; // Keep the independent native tail unchanged to isolate the mean guard.
+        var t = new Trace(16 * MIB); t.in.pointTail = 300; t.until(MIB);
+        t.in.pointMean = 300; // Keep the independent native tail unchanged to isolate the mean guard.
         t.seconds(5);
         assertEquals(0, t.in.applied);
+    }
+    @Test void trueOwnedMeanCutsFirstPollAndAbortsProbeEvenWhenReadaheadAlreadyOff() throws Exception {
+        for (boolean alreadyOff : new boolean[]{true, false}) {
+            var t = new Trace(16 * MIB); t.in.pointTail = 300; t.until(MIB);
+            if (alreadyOff) {
+                t.in.serviceRate = 256 * 1024; t.step(); assertEquals(0, t.in.applied);
+                t.in.serviceRate = 256 * MIB;
+            }
+            var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+            var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
+            var rate = CompactionIoBudget.class.getDeclaredField("budget"); rate.setAccessible(true);
+            long restored = t.policy.budget(); prior.setLong(t.policy, restored);
+            rate.setLong(t.policy, restored * 3 / 4); state.set(t.policy, CompactionIoBudget.State.PROBE);
+            t.in.pointMean = 130; t.step(); // Max stays300us and SDK mean stays100us.
+            assertEquals(0, t.in.applied);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+            assertEquals(restored, t.policy.budget());
+        }
+    }
+    @Test void sparseOnePollOwnedMeanNeedsCompletedFiveSecondQuorum() {
+        var t = new Trace(16 * MIB); t.in.pointTail = 300; t.in.pointCalls = 10; t.until(MIB);
+        t.in.pointMean = 130; t.step(); assertEquals(MIB, t.in.applied);
+        t.seconds(4); assertEquals(0, t.in.applied);
+    }
+    @Test void sdkResetIsDiagnosticWhileOwnedElapsedResetAndMissingTimeHoldGrowth() {
+        var t = new Trace(16 * MIB); t.until(MIB);
+        t.in.reads = t.in.micros = 0; t.step();
+        assertTrue(t.in.applied >= MIB);
+        assertEquals(100, t.policy.baselineReadMicros());
+        t.in.nativePointNanos = 0; t.step();
+        assertEquals(0, t.in.applied); assertEquals(0, t.policy.baselineReadMicros());
+        t.seconds(500); assertTrue(t.in.applied >= 65536);
+        var missing = new Trace(16 * MIB); missing.in.pointMean = 0; missing.seconds(600);
+        assertEquals(0, missing.in.applied); assertEquals(0, missing.policy.baselineReadMicros());
     }
     @Test void singleLongCompactionReadDisablesWithoutDenseReadQuorum() {
         var t = new Trace(16 * MIB); t.until(MIB);

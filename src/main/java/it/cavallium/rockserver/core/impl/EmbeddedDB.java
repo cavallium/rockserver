@@ -363,6 +363,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicInteger activeNativeMultiGets = new AtomicInteger();
 	private final AtomicLong pointReadTailNanos = new AtomicLong();
 	private final AtomicLong nativePointReadCompletions = new AtomicLong();
+	private final AtomicLong nativePointReadNanos = new AtomicLong();
 	private final AtomicLong bulkReadTailNanos = new AtomicLong();
 	private final AtomicLong nativeBulkReadCompletions = new AtomicLong();
 	private final AtomicLong nativeBulkReadKeys = new AtomicLong();
@@ -3136,6 +3137,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		long elapsed = Math.max(0, System.nanoTime() - started);
 		if (bulkKeys <= 0) {
 			pointReadTailNanos.accumulateAndGet(elapsed, Math::max);
+			nativePointReadNanos.addAndGet(elapsed);
 			nativePointReadCompletions.incrementAndGet();
 		}
 		else {
@@ -3192,6 +3194,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				for (var profile : WorkloadProfile.values()) {
 					foregroundPending |= scheduler.activeTasks(profile) + scheduler.queuedTasks(profile) > 0;
 				}
+				long pointCount = nativePointReadCompletions.get();
+				long pointElapsed = nativePointReadNanos.get();
 				return new CompactionIoBudget.Sample(System.nanoTime(), histogram.getCount(), histogram.getSum(),
 						limiter.getTotalBytesThrough(), background, pressure, stopped, complete,
 						foregroundPending,
@@ -3208,7 +3212,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						activeNativeMultiGets.get() > 0 || !activeExistsMultiRequests.isEmpty(),
 						(long) Math.ceil(pointReadTailNanos.getAndSet(0) / 1000d),
 						(long) Math.ceil(bulkReadTailNanos.getAndSet(0) / 1000d),
-						nativePointReadCompletions.get(), nativeBulkReadCompletions.get(), nativeBulkReadKeys.get());
+						pointCount, nativeBulkReadCompletions.get(), nativeBulkReadKeys.get(), pointElapsed);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {

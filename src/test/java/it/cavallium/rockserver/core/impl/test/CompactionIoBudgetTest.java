@@ -8,12 +8,16 @@ class CompactionIoBudgetTest {
     private static final long SEED = 1_000_000;
     private static final class Trace {
         final CompactionIoBudget policy = new CompactionIoBudget(SEED);
-        long nanos, reads, micros, bytes, completions;
+        long nanos, reads, micros, bytes, completions, nativePoints, nativeNanos;
+        boolean point = true, timed = true;
         Trace() { poll(0, 0, 0, false, false); }
         long poll(long count, long latency, long transferred, boolean pressure, boolean pending) {
             nanos += 1_000_000_000L; reads += count; micros += count * latency; bytes += transferred;
+            if (point) { nativePoints += count; if (timed) nativeNanos += count * latency * 1000; }
             return policy.sample(new CompactionIoBudget.Sample(nanos, reads, micros, bytes,
-                    transferred > 0, pressure, pressure, true, pending, completions, !pressure));
+                    transferred > 0, pressure, pressure, true, pending, completions, !pressure, pressure,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
+                    point ? latency : 0, 0, nativePoints, 0, 0, nativeNanos));
         }
         void window(long count, long latency, long transferred) {
             for (int i = 0; i < 5; i++) {
@@ -129,12 +133,30 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.MAX_BYTES_PER_SECOND, new CompactionIoBudget(Long.MAX_VALUE).budget());
     }
     @Test void startupBlockReadsWithoutForegroundCompletionsDoNotCalibrateLatency() {
-        var t = new Trace();
+        var t = new Trace(); t.point = false;
         for (int second = 0; second < 5; second++) t.poll(10, 20, SEED, false, false);
         assertEquals(0, t.policy.baselineReadMicros());
         assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(),
                 "startup block reads without completed foreground work cannot calibrate foreground latency");
         assertEquals(SEED, t.policy.budget());
+    }
+    @Test void ownPointCallsCalibrateWithoutUnrelatedGlobalKeyCompletions() {
+        var t = new Trace();
+        for (int second = 0; second < 5; second++) t.poll(10, 20, SEED, false, false);
+        assertEquals(20, t.policy.baselineReadMicros());
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+    }
+    @Test void pointProbeCannotAcceptMissingOwnedTimeOrPointProgressHiddenByWrites() {
+        for (boolean missingTime : new boolean[]{true, false}) {
+            var t = new Trace(); t.window(20, 100, SEED);
+            if (missingTime) t.timed = false;
+            for (int second = 0; second < 10; second++) {
+                t.completions += 20; // Writes keep the global progress rate unchanged.
+                t.poll(missingTime ? 20 : 10, 50, 750000, false, true);
+            }
+            assertEquals(SEED, t.policy.budget(), "only the measured point lane may prove its latency benefit");
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        }
     }
     @Test void mediaShiftWithForegroundProgressDoesNotBackOffPermanently() {
         var t = new Trace();
@@ -186,6 +208,7 @@ class CompactionIoBudgetTest {
         idle.window(10, 100, SEED);
         idle.window(10, 80, 750_000); idle.window(10, 80, 750_000); idle.window(10, 80, 750_000);
         assertEquals(80, idle.policy.baselineReadMicros());
+        idle.point = false;
         for (int second = 0; second < 20; second++) idle.poll(10, 20, SEED, false, false);
         assertEquals(80, idle.policy.baselineReadMicros(), "uncorroborated block I/O must not pollute a calibrated baseline");
     }
@@ -204,7 +227,9 @@ class CompactionIoBudgetTest {
         for (int second = 1; second <= 15; second++) {
             p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L,
                     second * 100, second * 600_000, second * (SEED / 4),
-                    true, false, false, true, true, second * 3_000, false));
+                    true, false, false, true, true, second * 3_000, false, false,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
+                    6000, 0, second * 100, 0, 0, second * 600_000_000L));
         }
         assertEquals(CompactionIoBudget.State.PROBE, p.state(),
                 "soft debt hysteresis alone must not bypass foreground calibration indefinitely");
@@ -212,7 +237,9 @@ class CompactionIoBudgetTest {
         for (int second = 16; second <= 25; second++) {
             p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L,
                     second * 100, second * 600_000, 15 * (SEED / 4) + (second - 15) * 187_500,
-                    true, false, false, true, true, second * 3_000, false));
+                    true, false, false, true, true, second * 3_000, false, false,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
+                    6000, 0, second * 100, 0, 0, second * 600_000_000L));
         }
         assertEquals(SEED / 4, p.budget(), "an ineffective latency probe must restore observed useful service");
         assertEquals(CompactionIoBudget.State.TRACKING, p.state());
@@ -232,7 +259,9 @@ class CompactionIoBudgetTest {
         for (int second = 1; second <= 5; second++) {
             t.policy.sample(new CompactionIoBudget.Sample(t.nanos + second * 1_000_000_000L,
                     second * 100, second * 600_000, t.bytes + second * SEED,
-                    true, true, false, true, true, second * 3_000, false, false));
+                    true, true, false, true, true, second * 3_000, false, false,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
+                    6000, 0, second * 100, 0, 0, second * 600_000_000L));
         }
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
     }

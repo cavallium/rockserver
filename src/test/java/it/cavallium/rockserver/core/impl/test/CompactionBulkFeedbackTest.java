@@ -9,12 +9,12 @@ class CompactionBulkFeedbackTest {
     private static final class Trace {
         final CompactionIoBudget p = new CompactionIoBudget(RATE, 16L << 20);
         long nanos, pointReads, pointTime, done, bytes, bulkCount, bulkTime, bulkKeys, readDone,
-                compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys;
+                compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos;
         long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail, pointTail,
                 compTransferred = 64L << 20, compReadMicros = 250000;
         int bytePeriod = 1, bytePhase, sampleIndex, compReadCalls = 1000;
         int metadataReads;
-        long metadataMicros = 1000;
+        long metadataMicros = 1000, nativePointMean = -1;
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
         boolean point = true, pointNative = true, bulkStats = true, pressure, stopped, bulkPending;
         Trace() { step(); }
@@ -22,7 +22,9 @@ class CompactionBulkFeedbackTest {
             nanos += 1_000_000_000L;
             if (point) { pointReads += 100; pointTime += 100 * pointLatency; }
             pointReads += metadataReads; pointTime += metadataReads * metadataMicros;
-            nativePoints += (point && pointNative ? 100 : 0) + extraPointCalls;
+            long pointCalls = (point && pointNative ? 100 : 0) + extraPointCalls;
+            nativePoints += pointCalls;
+            nativePointNanos += pointCalls * (nativePointMean >= 0 ? nativePointMean : pointLatency) * 1000;
             done += writes;
             bytes += transferred;
             if (bulkStats) { bulkCount += calls; bulkTime += calls * bulkCallMicros; bulkKeys += (long) calls * shape; }
@@ -35,7 +37,7 @@ class CompactionBulkFeedbackTest {
                     pressure, stopped, true, true, done, !pressure, pressure,
                     compBytes, compTime, compCalls, prefCount, prefBytes,
                     bulkCount, bulkTime, bulkKeys, workers, active, latencyActive, queued, readDone, bulkPending, point && pointNative || extraPointCalls > 0 ? (pointTail > 0 ? pointTail : pointLatency) : 0,
-                    bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys));
+                    bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos));
             if (p.readaheadBytes() != applied) {
                 applied = p.readaheadBytes();
                 try {
@@ -242,7 +244,7 @@ class CompactionBulkFeedbackTest {
     @Test void bulkMetadataBlockMissesCannotInventAnActiveNativePointLane() {
         var t = new Trace(); t.pointNative = false;
         t.seconds(500);
-        assertTrue(t.p.baselineReadMicros() > 0, "bulk metadata misses still participate in physical block health");
+        assertEquals(0, t.p.baselineReadMicros(), "bulk metadata misses cannot initialize an owned point-call mean");
         assertTrue(t.p.bulkBaselineMicrosPerKey() > 0);
         assertTrue(t.applied > 0, "bulk block misses cannot require a nonexistent native point-call tail baseline");
     }
