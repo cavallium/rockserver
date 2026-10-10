@@ -77,6 +77,39 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Initial synchronous apply adapter; the pool owner drains Ratis before closing native handles. */
 public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.impl.LinearizableQueryStateMachine {
+    private RatisReferencedFiles referencedFiles;
+    private static final org.apache.ratis.statemachine.StateMachine.DataApi NO_REFERENCED_DATA=new org.apache.ratis.statemachine.StateMachine.DataApi() {
+        @Override public CompletableFuture<?> write(org.apache.ratis.proto.RaftProtos.LogEntryProto entry) {
+            var data=entry.getStateMachineLogEntry();
+            if(data.getType()==org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto.Type.DATASTREAM
+                    || !data.getStateMachineEntry().getStateMachineData().isEmpty()
+                    || data.getStateMachineEntry().getLogEntryProtoSerializedSize()!=0)
+                return CompletableFuture.failedFuture(new IOException("Referenced data owner is not configured"));
+            return CompletableFuture.completedFuture(null);
+        }
+        @Override public CompletableFuture<ByteString> read(org.apache.ratis.proto.RaftProtos.LogEntryProto entry) {
+            return CompletableFuture.failedFuture(new IOException("Referenced data owner is not configured"));
+        }
+        @Override public CompletableFuture<org.apache.ratis.statemachine.StateMachine.DataStream> stream(RaftClientRequest request) {
+            return CompletableFuture.failedFuture(new IOException("Referenced data owner is not configured"));
+        }
+        @Override public CompletableFuture<?> link(org.apache.ratis.statemachine.StateMachine.DataStream stream,org.apache.ratis.proto.RaftProtos.LogEntryProto entry) {
+            // Released Ratis nests the returned link future; a synchronous failure must reach its outer future.
+            throw new UnsupportedOperationException("Referenced data owner is not configured");
+        }
+        @Override public long transferTo(Message message,java.nio.channels.WritableByteChannel destination) throws IOException {
+            throw new IOException("Referenced data owner is not configured");
+        }
+    };
+    /** Fixed before initialization. The enclosing owner closes files only after Ratis has drained its log I/O. */
+    public void referencedFiles(RatisReferencedFiles files) {
+        if(getLifeCycleState()!=LifeCycle.State.NEW || referencedFiles!=null) throw new IllegalStateException("Referenced data owner is fixed before initialization");
+        java.util.Objects.requireNonNull(files).requireGroup(initialGroup.getGroupId().getUuid());
+        referencedFiles=files;
+    }
+    @Override public org.apache.ratis.statemachine.StateMachine.DataApi data() {
+        return referencedFiles==null ? NO_REFERENCED_DATA : referencedFiles;
+    }
     private final ReplicatedRangeStore store;
     private final Consumer<DistributedCommand> commandValidator;
     private volatile Consumer<DistributedCommand> epochFloorAdmission;
