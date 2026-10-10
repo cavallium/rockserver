@@ -322,6 +322,7 @@ public class RocksDBStatistics {
 			long lastKeysWritten = 0;
 			long lastCompactionReadBytes = 0;
 			long lastMultigetKeysRead = 0;
+			long lastMultigetKeysFound = 0;
 			while (!stopRequested) {
 				var taskStartTime = System.nanoTime();
 
@@ -330,21 +331,24 @@ public class RocksDBStatistics {
 						double tickerCount;
 						if (tickerType == TickerType.NUMBER_KEYS_READ || tickerType == TickerType.NUMBER_KEYS_WRITTEN
 								|| tickerType == TickerType.COMPACT_READ_BYTES
-								|| tickerType == TickerType.NUMBER_MULTIGET_KEYS_READ) {
+								|| tickerType == TickerType.NUMBER_MULTIGET_KEYS_READ
+								|| tickerType == TickerType.NUMBER_MULTIGET_KEYS_FOUND) {
 							// The compaction controller samples these native counters cumulatively.
 							long current = statistics.getTickerCount(tickerType);
 							long previous = switch (tickerType) {
 								case NUMBER_KEYS_READ -> lastKeysRead;
 								case NUMBER_KEYS_WRITTEN -> lastKeysWritten;
 								case COMPACT_READ_BYTES -> lastCompactionReadBytes;
-								default -> lastMultigetKeysRead;
+								case NUMBER_MULTIGET_KEYS_READ -> lastMultigetKeysRead;
+								default -> lastMultigetKeysFound;
 							};
 							long delta = Long.compareUnsigned(current, previous) >= 0 ? current - previous : current;
 							tickerCount = delta >= 0 ? delta : 0x1.0p63 + (delta & Long.MAX_VALUE);
 							if (tickerType == TickerType.NUMBER_KEYS_READ) lastKeysRead = current;
 							else if (tickerType == TickerType.NUMBER_KEYS_WRITTEN) lastKeysWritten = current;
 							else if (tickerType == TickerType.COMPACT_READ_BYTES) lastCompactionReadBytes = current;
-							else lastMultigetKeysRead = current;
+							else if (tickerType == TickerType.NUMBER_MULTIGET_KEYS_READ) lastMultigetKeysRead = current;
+							else lastMultigetKeysFound = current;
 						} else {
 							tickerCount = statistics.getAndResetTickerCount(tickerType);
 						}

@@ -406,6 +406,9 @@ class CompactionIoIntegrationTest {
                 var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
                 long nativeKeys = statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ);
                 assertEquals(64L * keys.size(), nativeKeys);
+                long nativeFound = statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND);
+                long nativeReturned = statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum();
+                assertEquals(nativeKeys, nativeFound); assertTrue(nativeReturned > 0);
                 assertTrue(histogram.getCount() >= 64); assertTrue(histogram.getSum() > 0);
                 for (int cycle = 0; cycle < 2; cycle++) {
                     thread.interrupt();
@@ -416,6 +419,9 @@ class CompactionIoIntegrationTest {
                     assertEquals(nativeKeys, statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ));
                     var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
                     assertEquals(nativeKeys, sample.bulkKeys()); assertEquals(histogram.getCount(), sample.bulkCount());
+                    assertEquals(nativeFound, sample.bulkFoundKeys()); assertEquals(nativeReturned, sample.bulkReturnedBytes());
+                    assertEquals(nativeFound, statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND));
+                    assertTrue(sample.readFailures() >= 0);
                     assertTrue(sample.bulkMicros() > 0); assertTrue(sample.readWorkers() > 0);
                     assertEquals(0, sample.latencyReadQueued());
                     assertFalse(sample.bulkPending());

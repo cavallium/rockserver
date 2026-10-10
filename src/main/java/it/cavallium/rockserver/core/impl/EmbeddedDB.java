@@ -3244,7 +3244,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						activeNativeMultiGets.get() > 0 || !activeExistsMultiRequests.isEmpty(),
 						(long) Math.ceil(pointReadTailNanos.getAndSet(0) / 1000d),
 						(long) Math.ceil(bulkReadTailNanos.getAndSet(0) / 1000d),
-						pointCount, nativeBulkReadCompletions.get(), nativeBulkReadKeys.get(), pointElapsed);
+						pointCount, nativeBulkReadCompletions.get(), nativeBulkReadKeys.get(), pointElapsed,
+						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND),
+						statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum(),
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS]);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {

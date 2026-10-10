@@ -9,12 +9,14 @@ class CompactionBulkFeedbackTest {
     private static final class Trace {
         final CompactionIoBudget p = new CompactionIoBudget(RATE, 16L << 20);
         long nanos, pointReads, pointTime, done, bytes, bulkCount, bulkTime, bulkKeys, readDone,
-                compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos;
+                compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, foundKeys, returnedBytes, readFailures;
         long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail, pointTail,
                 compTransferred = 64L << 20, compReadMicros = 250000;
         int bytePeriod = 1, bytePhase, sampleIndex, compReadCalls = 1000;
         int metadataReads;
         long metadataMicros = 1000, nativePointMean = -1;
+        int foundPerCall = 72, returnedPerCall = 4096, readTasks = -1, pointCallsPerSecond = 100;
+        boolean contentAvailable = true;
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
         boolean point = true, pointNative = true, bulkStats = true, pressure, stopped, bulkPending;
         Trace() { step(); }
@@ -22,14 +24,15 @@ class CompactionBulkFeedbackTest {
             nanos += 1_000_000_000L;
             if (point) { pointReads += 100; pointTime += 100 * pointLatency; }
             pointReads += metadataReads; pointTime += metadataReads * metadataMicros;
-            long pointCalls = (point && pointNative ? 100 : 0) + extraPointCalls;
+            long pointCalls = (point && pointNative ? pointCallsPerSecond : 0) + extraPointCalls;
             nativePoints += pointCalls;
             nativePointNanos += pointCalls * (nativePointMean >= 0 ? nativePointMean : pointLatency) * 1000;
             done += writes;
             bytes += transferred;
             if (bulkStats) { bulkCount += calls; bulkTime += calls * bulkCallMicros; bulkKeys += (long) calls * shape; }
             nativeBulks += calls; nativeBulkKeys += (long) calls * shape;
-            readDone += calls;
+            readDone += readTasks >= 0 ? readTasks : calls;
+            foundKeys += (long) calls * foundPerCall; returnedBytes += (long) calls * returnedPerCall;
             if ((++sampleIndex + bytePhase) % bytePeriod == 0) compBytes += compTransferred;
             compTime += compReadMicros; compCalls += compReadCalls;
             if (applied > 0) { prefCount += 32; prefBytes += 32 * applied; }
@@ -37,7 +40,8 @@ class CompactionBulkFeedbackTest {
                     pressure, stopped, true, true, done, !pressure, pressure,
                     compBytes, compTime, compCalls, prefCount, prefBytes,
                     bulkCount, bulkTime, bulkKeys, workers, active, latencyActive, queued, readDone, bulkPending, point && pointNative || extraPointCalls > 0 ? (pointTail > 0 ? pointTail : pointLatency) : 0,
-                    bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos));
+                    bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, contentAvailable ? foundKeys : -1, contentAvailable ? returnedBytes : -1,
+                    contentAvailable ? readFailures : -1));
             if (p.readaheadBytes() != applied) {
                 applied = p.readaheadBytes();
                 try {
@@ -530,6 +534,75 @@ class CompactionBulkFeedbackTest {
         assertEquals(0, reference.getDouble(t.p));
         assertEquals(0, t.applied);
         assertEquals(0, blocks.getInt(t.p), "+14% weighted bulk drift must still reject the second whole block");
+    }
+    @Test void sustainedQueueReliefCanAcceptSmallNativeMeanBenefitWithoutLosingForegroundWork() {
+        var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
+        t.active = t.latencyActive = t.workers; t.queued = 213;
+        t.seconds(10); t.probe();
+        long reduced = t.p.budget();
+        t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 120;
+        t.seconds(10); assertEquals(CompactionIoBudget.State.PROBE, t.p.state());
+        t.seconds(5); assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(reduced, t.p.budget(),
+                "two relieved queue windows with preserved useful work may justify a real25% background cut");
+    }
+    @Test void queueReliefCannotReplaceUsefulWorkWithLowerDemandFailuresOrDifferentReadMix() {
+        for (String loss : new String[]{"foreground", "point", "bulk", "found", "returned", "readMix", "failed", "missing", "background", "mean", "shape", "epoch"}) {
+            var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
+            t.active = t.latencyActive = t.workers; t.queued = 213;
+            t.seconds(10); t.probe();
+            long prior = t.p.budget() / 3 * 4;
+            t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 120;
+            switch (loss) {
+                case "foreground" -> t.writes = 9900;
+                case "point" -> t.pointCallsPerSecond = 99;
+                case "bulk" -> t.calls = 119;
+                case "found" -> t.foundPerCall = 71;
+                case "returned" -> t.returnedPerCall = 4095;
+                case "readMix" -> t.readTasks = 130;
+                case "failed" -> t.readFailures++;
+                case "missing" -> t.contentAvailable = false;
+                case "background" -> t.transferred = RATE;
+                case "mean" -> t.bulkCallMicros = 60000;
+                case "shape" -> t.shape = 54;
+                case "epoch" -> t.nativeBulks = 0;
+                default -> throw new AssertionError(loss);
+            }
+            t.seconds(15);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.p.state(), loss);
+            assertEquals(prior, t.p.budget(), 4, "queue relief must restore when " + loss + " invalidates useful-work evidence");
+        }
+    }
+    @Test void oneRelievedQueueWindowCannotAcceptAByteCut() {
+        var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
+        t.active = t.latencyActive = t.workers; t.queued = 213;
+        t.seconds(10); t.probe(); long prior = t.p.budget() / 3 * 4;
+        t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 120;
+        t.seconds(10); assertEquals(CompactionIoBudget.State.PROBE, t.p.state());
+        t.queued = 213; t.seconds(5);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(prior, t.p.budget(), 4);
+    }
+    @Test void preexistingQueueDrainCannotQualifyAnOrdinaryProbe() throws Exception {
+        var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
+        t.active = t.latencyActive = t.workers; t.queued = 213; t.seconds(10);
+        var cooldown = CompactionIoBudget.class.getDeclaredField("cooldown"); cooldown.setAccessible(true);
+        cooldown.setInt(t.p, 0);
+        t.queued = 120; t.seconds(5);
+        assertEquals(CompactionIoBudget.State.PROBE, t.p.state());
+        var protectedQueue = CompactionIoBudget.class.getDeclaredField("probeQueueProtected"); protectedQueue.setAccessible(true);
+        assertFalse(protectedQueue.getBoolean(t.p), "a pretrial drop beyond the deadband is already draining demand");
+        long prior = t.p.budget() / 3 * 4;
+        t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 40;
+        t.seconds(15); assertEquals(prior, t.p.budget(), 4);
+    }
+    @Test void aNewPointLaneCannotBeHiddenByBulkQueueRelief() {
+        var t = new Trace(); t.point = false; t.seconds(20); t.bulkCallMicros = 55000;
+        t.active = t.latencyActive = t.workers; t.queued = 213; t.seconds(10); t.probe();
+        long prior = t.p.budget() / 3 * 4;
+        t.point = true; t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 120;
+        t.step(); assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(prior, t.p.budget(), 4);
     }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;
