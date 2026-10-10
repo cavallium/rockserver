@@ -412,7 +412,12 @@ class CompactionIoIntegrationTest {
                     .getAsync(0, column, keys.getFirst(), RequestType.current()).get(5, TimeUnit.SECONDS);
             var schedulerField = internal.getClass().getDeclaredField("scheduler"); schedulerField.setAccessible(true);
             var scheduler = (it.cavallium.rockserver.core.impl.RWScheduler) schedulerField.get(internal);
-            long accepted = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ).acceptedTasks();
+            assertTimeoutPreemptively(java.time.Duration.ofSeconds(5), () -> {
+                while (scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ).outstandingTasks() != 0)
+                    Thread.sleep(10);
+            });
+            var readSnapshot = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ);
+            long accepted = readSnapshot.acceptedTasks();
             assertTrue(accepted > 0, "the async point read must exercise the real READ arrival counter");
             var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
             var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
@@ -446,6 +451,10 @@ class CompactionIoIntegrationTest {
                     assertEquals(nativeFound, sample.bulkFoundKeys()); assertEquals(nativeReturned, sample.bulkReturnedBytes());
                     assertEquals(nativeFound, statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND));
                     assertTrue(sample.readFailures() >= 0); assertEquals(accepted, sample.readAccepted());
+                    assertEquals(readSnapshot.terminalOutcomes(), sample.readTerminalOutcomes());
+                    assertEquals(readSnapshot.terminalOutcomes()
+                            - readSnapshot.outcomes().get(it.cavallium.rockserver.core.impl.RWScheduler.TerminalOutcome.RUN),
+                            sample.readNonRunOutcomes());
                     assertTrue(sample.bulkMicros() > 0); assertTrue(sample.readWorkers() > 0);
                     assertEquals(0, sample.latencyReadQueued());
                     assertFalse(sample.bulkPending());

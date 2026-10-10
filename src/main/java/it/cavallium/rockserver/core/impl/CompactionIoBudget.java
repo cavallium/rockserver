@@ -13,7 +13,23 @@ public final class CompactionIoBudget {
                          long compactionReadCount, long prefetchCount, long prefetchBytes,
                          long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
                          int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
+                         long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted, long readTerminalOutcomes, long readNonRunOutcomes) {
+        public Sample(long nanos, long readCount, long readMicros, long bytes,
+                         boolean background, boolean pressure, boolean stopped, boolean valid,
+                         boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
+                         boolean urgentPressure, long compactionReadBytes, long compactionReadMicros,
+                         long compactionReadCount, long prefetchCount, long prefetchBytes,
+                         long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
+                         int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
                          long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted) {
+            this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure,
+                    compactionReadBytes, compactionReadMicros, compactionReadCount, prefetchCount, prefetchBytes,
+                    bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
+                    readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
+                    nativeBulkCompletions, nativeBulkKeys, nativePointReadNanos, bulkFoundKeys, bulkReturnedBytes,
+                    readFailures, readAccepted, -1, -1);
+        }
         public Sample(long nanos, long readCount, long readMicros, long bytes,
                          boolean background, boolean pressure, boolean stopped, boolean valid,
                          boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
@@ -139,7 +155,7 @@ public final class CompactionIoBudget {
     private boolean queueReferencePoint, probeQueueProtected;
     private double probeQueueDepth, probeReadCompletionRate, probeNativeBulkCallRate, probeNativeBulkKeyRate,
             probeBulkFoundRate, probeBulkReturnedRate, probeBulkReadMix, probeReadArrivalRate;
-    private long bulkFoundKeys, bulkReturnedBytes, readAccepted;
+    private long bulkFoundKeys, bulkReturnedBytes, readAccepted, readTerminalOutcomes, probeQueueRemovals;
     private boolean bulkContentValid = true;
     private int queueWorkers = -1, queueBadPolls, stableLoadedWindows;
     private long priorReadahead;
@@ -220,7 +236,7 @@ public final class CompactionIoBudget {
         pointTailWindow = bulkTailWindow = nativePoints = nativeBulks = nativeBulkKeys = 0;
         latencyUnsafe = tailUnsafe = nonTailUnsafe = false;
         queuedIntegral = 0;
-        bulkFoundKeys = bulkReturnedBytes = readAccepted = 0; bulkContentValid = true;
+        bulkFoundKeys = bulkReturnedBytes = readAccepted = readTerminalOutcomes = 0; bulkContentValid = true;
     }
 
     public long sample(Sample sample) {
@@ -350,7 +366,7 @@ public final class CompactionIoBudget {
                 && nativeBulks >= 32 && !latencyUnsafe && !readaheadUnknown && !readaheadSettling;
         if (state != State.PROBE) {
             boolean qualified = state == State.TRACKING && queueWorkReliable && stationary
-                    && queueMean >= 2 && readSaturatedNanos >= windowNanos / 2 && readAccepted >= readCompleted;
+                    && queueMean >= 2 && readSaturatedNanos >= windowNanos / 2 && readAccepted >= readTerminalOutcomes;
             if (qualified) {
                 boolean comparable = queueReferenceWindows > 0 && queueReferencePoint == pointTailActive
                         && compatibleShape(nativeBulkShapeInWindow, queueReferenceShape)
@@ -397,7 +413,7 @@ public final class CompactionIoBudget {
                     && bulkTailInWindow <= probeBulkTail * 1.2
                     && (nativeBulkShapeInWindow == 0 || compatibleShape(nativeBulkShapeInWindow, probeBulkTailShape));
             boolean queueBenefit = probeQueueProtected && queueWorkReliable
-                    && queueMean < probeQueueDepth - Math.max(2, probeQueueDepth * .2)
+                    && probeQueueDepth - queueMean > Math.max(2, probeQueueDepth * .2) + probeQueueRemovals
                     && readCompletionRate >= probeReadCompletionRate && readArrivalRate >= probeReadArrivalRate
                     && nativeBulkCallRate >= probeNativeBulkCallRate && nativeBulkKeyRate >= probeNativeBulkKeyRate
                     && bulkFoundRate >= probeBulkFoundRate && bulkReturnedRate >= probeBulkReturnedRate
@@ -627,11 +643,18 @@ public final class CompactionIoBudget {
         if (sample.bulkFoundKeys < 0 || old.bulkFoundKeys < 0 || sample.bulkReturnedBytes < 0 || old.bulkReturnedBytes < 0
                 || sample.bulkFoundKeys < old.bulkFoundKeys || sample.bulkReturnedBytes < old.bulkReturnedBytes
                 || sample.readFailures < 0 || old.readFailures < 0 || sample.readFailures != old.readFailures
-                || sample.readAccepted < 0 || old.readAccepted < 0 || sample.readAccepted < old.readAccepted) {
+                || sample.readAccepted < 0 || old.readAccepted < 0 || sample.readAccepted < old.readAccepted
+                || sample.readTerminalOutcomes < 0 || old.readTerminalOutcomes < 0
+                || sample.readTerminalOutcomes < old.readTerminalOutcomes
+                || sample.readNonRunOutcomes < 0 || old.readNonRunOutcomes < 0
+                || sample.readNonRunOutcomes < old.readNonRunOutcomes
+                || sample.readNonRunOutcomes > sample.readTerminalOutcomes) {
             bulkContentValid = false;
             queueReferenceWindows = 0; probeQueueProtected = false;
         } else {
             readAccepted += sample.readAccepted - old.readAccepted;
+            readTerminalOutcomes += sample.readTerminalOutcomes - old.readTerminalOutcomes;
+            if (state == State.PROBE) probeQueueRemovals += sample.readNonRunOutcomes - old.readNonRunOutcomes;
             bulkFoundKeys += sample.bulkFoundKeys - old.bulkFoundKeys;
             bulkReturnedBytes += sample.bulkReturnedBytes - old.bulkReturnedBytes;
         }
@@ -850,6 +873,7 @@ public final class CompactionIoBudget {
             cooldown = 12;
             return;
         }
+        probeQueueRemovals = 0;
         probeQueueProtected = queueReferenceWindows >= 2;
         queueReferenceWindows = 0;
         probeBudget = budget;

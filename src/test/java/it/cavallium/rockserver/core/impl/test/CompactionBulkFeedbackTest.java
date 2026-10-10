@@ -9,14 +9,14 @@ class CompactionBulkFeedbackTest {
     private static final class Trace {
         final CompactionIoBudget p = new CompactionIoBudget(RATE, 16L << 20);
         long nanos, pointReads, pointTime, done, bytes, bulkCount, bulkTime, bulkKeys, readDone,
-                compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, foundKeys, returnedBytes, readFailures, readArrivals;
+                compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, foundKeys, returnedBytes, readFailures, readArrivals, terminalOutcomes, nonRunOutcomes;
         long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail, pointTail,
                 compTransferred = 64L << 20, compReadMicros = 250000;
         int bytePeriod = 1, bytePhase, sampleIndex, compReadCalls = 1000;
         int metadataReads;
         long metadataMicros = 1000, nativePointMean = -1;
-        int foundPerCall = 72, returnedPerCall = 4096, readTasks = -1, acceptedTasks = -1, pointCallsPerSecond = 100;
-        boolean contentAvailable = true, arrivalsAvailable = true;
+        int foundPerCall = 72, returnedPerCall = 4096, readTasks = -1, acceptedTasks = -1, pointCallsPerSecond = 100, removalsPerSecond;
+        boolean contentAvailable = true, arrivalsAvailable = true, outcomesAvailable = true;
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
         boolean point = true, pointNative = true, bulkStats = true, pressure, stopped, bulkPending;
         Trace() { step(); }
@@ -33,6 +33,8 @@ class CompactionBulkFeedbackTest {
             nativeBulks += calls; nativeBulkKeys += (long) calls * shape;
             readDone += readTasks >= 0 ? readTasks : calls;
             readArrivals += acceptedTasks >= 0 ? acceptedTasks : readTasks >= 0 ? readTasks : calls;
+            terminalOutcomes += readTasks >= 0 ? readTasks : calls;
+            nonRunOutcomes += removalsPerSecond;
             foundKeys += (long) calls * foundPerCall; returnedBytes += (long) calls * returnedPerCall;
             if ((++sampleIndex + bytePhase) % bytePeriod == 0) compBytes += compTransferred;
             compTime += compReadMicros; compCalls += compReadCalls;
@@ -42,7 +44,8 @@ class CompactionBulkFeedbackTest {
                     compBytes, compTime, compCalls, prefCount, prefBytes,
                     bulkCount, bulkTime, bulkKeys, workers, active, latencyActive, queued, readDone, bulkPending, point && pointNative || extraPointCalls > 0 ? (pointTail > 0 ? pointTail : pointLatency) : 0,
                     bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, contentAvailable ? foundKeys : -1, contentAvailable ? returnedBytes : -1,
-                    contentAvailable ? readFailures : -1, arrivalsAvailable ? readArrivals : -1));
+                    contentAvailable ? readFailures : -1, arrivalsAvailable ? readArrivals : -1, outcomesAvailable ? terminalOutcomes : -1,
+                    outcomesAvailable ? nonRunOutcomes : -1));
             if (p.readaheadBytes() != applied) {
                 applied = p.readaheadBytes();
                 try {
@@ -628,6 +631,61 @@ class CompactionBulkFeedbackTest {
         assertEquals(CompactionIoBudget.State.PROBE, t.p.state());
         var protectedQueue = CompactionIoBudget.class.getDeclaredField("probeQueueProtected"); protectedQueue.setAccessible(true);
         assertFalse(protectedQueue.getBoolean(t.p), "both pretrial windows require arrival rate >= completed rate");
+    }
+    @Test void cancelledQueuedTasksCannotMasqueradeAsQueueServiceBenefit() {
+        var t = new Trace(); t.prime(); t.bulkCallMicros = 55000; t.readTasks = t.acceptedTasks = 133;
+        t.active = t.latencyActive = t.workers; t.queued = 34; t.seconds(10); t.probe();
+        long prior = t.p.budget() / 3 * 4;
+        t.nonRunOutcomes += 10; t.terminalOutcomes += 10;
+        t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 24;
+        t.seconds(10); t.nonRunOutcomes += 7; t.terminalOutcomes += 7; t.queued = 17; t.seconds(5);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(prior, t.p.budget(), 4,
+                "constant arrivals and service cannot turn pure queued cancellation into throttle benefit");
+    }
+    @Test void genuineQueueReliefLargerThanSmallCancellationsStillAccepts() {
+        var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
+        t.active = t.latencyActive = t.workers; t.queued = 213; t.seconds(10); t.probe();
+        long reduced = t.p.budget();
+        t.nonRunOutcomes += 2; t.terminalOutcomes += 2;
+        t.calls = 128; t.readTasks = 130; t.acceptedTasks = 120;
+        t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 120;
+        t.seconds(10); assertEquals(CompactionIoBudget.State.PROBE, t.p.state());
+        t.seconds(5); assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(reduced, t.p.budget(), "93 fewer pending tasks exceed the deadband plus2 possible removals");
+    }
+    @Test void cancellationBoundIncludesSettleAndBothBenefitWindows() {
+        var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
+        t.active = t.latencyActive = t.workers; t.queued = 213; t.seconds(10); t.probe();
+        long prior = t.p.budget() / 3 * 4;
+        t.nonRunOutcomes += 2; t.terminalOutcomes += 2;
+        t.calls = 128; t.readTasks = 130; t.acceptedTasks = 120;
+        t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 120;
+        t.seconds(10); assertEquals(CompactionIoBudget.State.PROBE, t.p.state());
+        t.nonRunOutcomes += 60; t.terminalOutcomes += 60; t.seconds(5);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
+        assertEquals(prior, t.p.budget(), 4, "the whole-trial removal bound cannot reset at5s boundaries");
+    }
+    @Test void balancedAdmissionsAndTerminalOutcomesCanQualifyDespiteLegalCancellations() throws Exception {
+        var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
+        t.readTasks = t.acceptedTasks = 134; t.removalsPerSecond = 1;
+        t.active = t.latencyActive = t.workers; t.queued = 34; t.seconds(10); t.probe();
+        var protectedQueue = CompactionIoBudget.class.getDeclaredField("probeQueueProtected"); protectedQueue.setAccessible(true);
+        assertTrue(protectedQueue.getBoolean(t.p),
+                "started cooperative cancellations are already terminal: completed+nonRUN would count them twice");
+    }
+    @Test void missingOrResetRemovalAccountingCannotAuthorizeQueueOnlyBenefit() {
+        for (String epoch : new String[]{"missing", "terminal", "nonRun"}) {
+            var t = new Trace(); t.nonRunOutcomes = 100; t.terminalOutcomes += 100;
+            t.prime(); t.bulkCallMicros = 55000;
+            t.active = t.latencyActive = t.workers; t.queued = 213; t.seconds(10); t.probe();
+            long prior = t.p.budget() / 3 * 4;
+            t.transferred = RATE * 3 / 4; t.bulkCallMicros = 52000; t.queued = 120;
+            if (epoch.equals("missing")) t.outcomesAvailable = false;
+            else if (epoch.equals("terminal")) t.terminalOutcomes = 0;
+            else t.nonRunOutcomes = 0;
+            t.seconds(15); assertEquals(prior, t.p.budget(), 4, epoch);
+        }
     }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;

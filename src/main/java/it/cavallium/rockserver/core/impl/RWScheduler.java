@@ -50,8 +50,9 @@ public final class RWScheduler {
 	public static final int POOL_TELEMETRY_QUEUED_BY_PROFILE = POOL_TELEMETRY_SCALARS;
 	public static final int POOL_TELEMETRY_ACTIVE_BY_PROFILE =
 			POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.values().length;
-	public static final int POOL_TELEMETRY_LENGTH =
+	public static final int POOL_TELEMETRY_NON_RUN_OUTCOMES =
 			POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.values().length;
+	public static final int POOL_TELEMETRY_LENGTH = POOL_TELEMETRY_NON_RUN_OUTCOMES + 1;
 
 	private static final long SHUTDOWN_WAIT_SECONDS = 10L;
 	private static final Logger LOG = LoggerFactory.getLogger(RWScheduler.class);

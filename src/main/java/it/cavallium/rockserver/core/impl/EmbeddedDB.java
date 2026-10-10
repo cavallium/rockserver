@@ -3248,7 +3248,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND),
 						statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum(),
 						workloadGroups.isEmpty() ? readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] : -1,
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS]);
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES]);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {

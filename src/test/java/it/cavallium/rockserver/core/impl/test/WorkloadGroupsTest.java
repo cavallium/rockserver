@@ -77,6 +77,15 @@ class WorkloadGroupsTest {
 				assertEquals(2, compactionTelemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()]);
 				assertTrue(cancelled.cancel(false));
 				assertEquals(1, slow.queuedTasks(WorkloadProfile.LATENCY));
+				var readTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+				slow.copyPoolTelemetry(RWScheduler.Pool.READ, readTelemetry);
+				var readSnapshot = slow.poolSnapshot(RWScheduler.Pool.READ);
+				long nonRun = readSnapshot.terminalOutcomes() - readSnapshot.outcomes().get(RWScheduler.TerminalOutcome.RUN);
+				assertEquals(nonRun, readTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES]);
+				assertTrue(nonRun >= 2, "queued cancellation and overload are exact non-RUN outcomes");
+				var legacyTelemetry = new long[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES];
+				slow.copyPoolTelemetry(RWScheduler.Pool.READ, legacyTelemetry);
+				assertEquals(1, legacyTelemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()]);
 				assertNull(async.getAsync(0, hotId, KEY, RequestType.current()).get(5, SECONDS));
 				assertFalse(queued.isDone());
 				release.countDown();
