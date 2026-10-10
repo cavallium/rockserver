@@ -31,9 +31,10 @@ class RatisCdcSubscriptionControllerTest {
         final Map<String,List<byte[]>> writes=new HashMap<>();
         final Set<String> lose=new HashSet<>();
         RatisCdcPollRpc.Outcome outcome=RatisCdcPollRpc.Outcome.DATA;
-        boolean losePoll,competeDelivery,transportClosed,unselectedOnly;
+        boolean losePoll,competeDelivery,competeCreate,transportClosed,unselectedOnly,expiredQualification,delayedGate;
+        int qualifications;
         @FunctionalInterface interface Observer { void run() throws IOException; }
-        Observer pollObserver=() -> {};
+        Observer pollObserver=() -> {},closeObserver=() -> {},cancelObserver=() -> {};
         Fixture(boolean twoRanges) throws Exception {
             fixtureOwner.root=Files.createDirectory(root.resolve("catalogue")); nativeCatalogue=fixtureOwner.new Fixture();
             var original=support.directory(nativeCatalogue); selected=original.columns().iterator().next(); var ranges=original.ranges();
@@ -51,7 +52,8 @@ class RatisCdcSubscriptionControllerTest {
                     boolean qualification=request.maxBytes()==RatisCdcPollRpc.REPLY_BASE_BYTES+1 && request.maxRecords()==1;
                     if(!qualification) { polls.add(bytes.clone()); pollObserver.run(); }
                     var cut=new ApplyPosition(1,5); var beginning=DistributedCdcCheckpoint.Cursor.beginning(); RatisCdcPollRpc.Result result;
-                    if(!qualification && outcome==RatisCdcPollRpc.Outcome.GAP) result=new RatisCdcPollRpc.Result(request,outcome,cut,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,4)),request.from(),false,0,List.of());
+                    if(qualification) qualifications++;
+                    if(qualification && expiredQualification || !qualification && outcome==RatisCdcPollRpc.Outcome.GAP) result=new RatisCdcPollRpc.Result(request,RatisCdcPollRpc.Outcome.GAP,cut,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,4)),request.from(),false,0,List.of());
                     else if(!qualification && outcome==RatisCdcPollRpc.Outcome.TOO_LARGE) result=new RatisCdcPollRpc.Result(request,outcome,cut,beginning,request.from(),true,request.maxBytes()+100,List.of());
                     else {
                         var record=record(request.binding().lineage()); var records=request.from().covers(record.end()) ? List.<DistributedCdcRecord>of() : List.of(record);
@@ -70,6 +72,10 @@ class RatisCdcSubscriptionControllerTest {
                         var command=RatisCdcDeliveryRpc.decode(bytes); nativeCatalogue.pure.accept(command); authority.validate(command); prepares.add(DistributedCommandCodec.encode(command)); prepared[0]=DistributedCommandCodec.encode(command);
                         if(lose.remove("PREPARE")) throw new IOException("Lost exact delivery prepare reply"); return reply(bytes);
                     }
+                    if(packet.kind()==RatisCdcDeliveryRpc.CANCEL) {
+                        RatisCdcDeliveryRpc.decode(bytes); prepared[0]=null; delayedGate=false; cancelObserver.run();
+                        if(lose.remove("CANCEL")) throw new IOException("Lost delivery cancellation reply"); return reply(bytes);
+                    }
                     return nativeCatalogue.client.io().sendReadOnly(message);
                 }
                 if(method.getName().equals("send")) {
@@ -77,6 +83,11 @@ class RatisCdcSubscriptionControllerTest {
                     if(command.mutations().isEmpty()) { receiptAcks.add(bytes.clone()); action="RECEIPT"; }
                     else {
                         action=action(command); writes.computeIfAbsent(action,k -> new ArrayList<>()).add(bytes.clone());
+                        if(action.equals("CREATE") && competeCreate) {
+                            competeCreate=false; var competing=catalogue().prepareCreate(nativeCatalogue.operation(1),definition(99),directory,null);
+                            assertEquals(CommandResult.Status.SUCCESS,catalogue().execute(competing).status());
+                        }
+                        if(action.equals("CLOSE")) closeObserver.run();
                         if(action.equals("DELIVER")) {
                             assertArrayEquals(bytes,prepared[0],"Delivery append requires its exact prepared command"); prepared[0]=null;
                             if(competeDelivery) {
@@ -85,6 +96,7 @@ class RatisCdcSubscriptionControllerTest {
                             }
                         }
                     }
+                    if(delayedGate) throw new IOException("Late delivery preparation still owns the catalogue gate");
                     var reply=nativeCatalogue.client.io().send(message); if(lose.remove(action)) throw new IOException("Lost original "+action+" reply"); return reply;
                 }
                 throw new AssertionError(method);
@@ -192,6 +204,125 @@ class RatisCdcSubscriptionControllerTest {
                 assertTrue(batch.envelopes().isEmpty()); assertNotEquals(batch.from(),batch.next()); assertEquals(start,h.state().checkpoint());
                 assertEquals(batch.id(),c.poll(h,16,4096).batch().id()); var acknowledged=c.acknowledge(h,batch.id());
                 assertEquals(batch.next(),acknowledged.checkpoint().cursors().get(batch.lineage())); assertEquals(acknowledged.checkpoint(),acknowledged.delivered());
+            }
+        }
+    }
+
+    @Test void explicitCloseFencesExpiredPendingDeliveryWithoutConsumerAck() throws Exception {
+        try(var f=new Fixture(false)) {
+            Path journal=Files.createDirectory(root.resolve("journal")); var definition=f.definition(1);
+            try(var c=f.controller(journal)) {
+                var h=c.create(definition,f.directory); f.pollObserver=()->f.expiredQualification=true;
+                assertThrows(IOException.class,()->c.poll(h,16,4096)); int qualifications=f.qualifications;
+                byte[] original=RatisSchemaClientJournal.read(journal.resolve(definition.subscriptionId()+".cdc")).get("pendingCommand");
+                var closed=c.closeSubscription(h); assertEquals(DistributedCdcSubscription.Phase.CLOSED,closed.phase());
+                assertEquals(definition.start(),closed.checkpoint()); assertEquals(definition.start(),closed.delivered());
+                assertEquals(qualifications,f.qualifications,"Explicit closure never requalifies expired source data");
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,f.catalogue().execute(DistributedCommandCodec.decode(original)).status());
+                assertEquals(closed,f.catalogue.read(definition.subscriptionId())); assertFalse(f.writes.containsKey("ACK"));
+            }
+        }
+    }
+
+    @Test void closingIntentAndOriginalCommandsSurviveLostCancellationCloseAndReceiptReplies() throws Exception {
+        try(var f=new Fixture(false)) {
+            Path journal=Files.createDirectory(root.resolve("journal")); var definition=f.definition(1); byte[] original;
+            try(var c=f.controller(journal)) {
+                var h=c.create(definition,f.directory); f.pollObserver=()->f.expiredQualification=true;
+                assertThrows(IOException.class,()->c.poll(h,16,4096));
+                original=RatisSchemaClientJournal.read(journal.resolve(definition.subscriptionId()+".cdc")).get("pendingCommand");
+                f.lose.add("CANCEL"); assertThrows(IOException.class,()->c.closeSubscription(h)); assertEquals(RatisCdcSubscriptionController.Phase.CLOSING,h.phase());
+            }
+            try(var c=f.controller(journal)) {
+                var h=c.reopen(definition.subscriptionId()); f.lose.add("CLOSE"); assertThrows(IOException.class,()->c.closeSubscription(h));
+                assertEquals(RatisCdcSubscriptionController.Phase.CLOSING,h.phase());
+                assertEquals(DistributedCdcSubscription.Phase.CLOSED,f.catalogue.read(definition.subscriptionId()).phase());
+            }
+            try(var c=f.controller(journal)) {
+                var h=c.reopen(definition.subscriptionId()); f.lose.add("RECEIPT"); assertThrows(IOException.class,()->c.closeSubscription(h));
+                assertEquals(RatisCdcSubscriptionController.Phase.CLOSED,h.phase()); assertArrayEquals(f.writes.get("CLOSE").getFirst(),f.writes.get("CLOSE").getLast());
+            }
+            try(var c=f.controller(journal)) {
+                var h=c.reopen(definition.subscriptionId()); var closed=c.closeSubscription(h);
+                assertEquals(definition.start(),closed.checkpoint()); assertEquals(definition.start(),closed.delivered());
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,f.catalogue().execute(DistributedCommandCodec.decode(original)).status());
+                assertThrows(IllegalStateException.class,()->c.poll(h,16,4096)); assertFalse(f.writes.containsKey("ACK")); assertEquals(1,f.qualifications);
+            }
+        }
+    }
+    @Test void closePreservesDeliveryHiddenByLostReplyWithoutRequalifyingOrAcknowledgingIt() throws Exception {
+        try(var f=new Fixture(false)) {
+            Path journal=Files.createDirectory(root.resolve("journal")); var definition=f.definition(1);
+            try(var c=f.controller(journal)) {
+                var h=c.create(definition,f.directory); f.lose.add("DELIVER"); assertThrows(IOException.class,()->c.poll(h,16,4096));
+                var delivered=f.catalogue.read(definition.subscriptionId()); assertNotEquals(delivered.checkpoint(),delivered.delivered());
+                f.expiredQualification=true; var closed=c.closeSubscription(h);
+                assertEquals(delivered.checkpoint(),closed.checkpoint()); assertEquals(delivered.delivered(),closed.delivered());
+                assertEquals(DistributedCdcSubscription.Phase.CLOSED,closed.phase()); assertEquals(1,f.qualifications); assertFalse(f.writes.containsKey("ACK"));
+            }
+        }
+    }
+    @Test void deliveryWinningCloseCasUsesNewCloseIdentityOnlyAfterDefiniteConflictAndReopen() throws Exception {
+        try(var f=new Fixture(false)) {
+            Path journal=Files.createDirectory(root.resolve("journal")); var definition=f.definition(1); byte[] failedClose;
+            try(var c=f.controller(journal)) {
+                var h=c.create(definition,f.directory); f.pollObserver=()->f.expiredQualification=true;
+                assertThrows(IOException.class,()->c.poll(h,16,4096));
+                var original=DistributedCommandCodec.decode(RatisSchemaClientJournal.read(journal.resolve(definition.subscriptionId()+".cdc")).get("pendingCommand"));
+                f.closeObserver=()->{ f.closeObserver=()->{}; assertEquals(CommandResult.Status.SUCCESS,f.catalogue().execute(original).status()); };
+                assertThrows(RatisCdcSubscriptionController.Conflict.class,()->c.closeSubscription(h));
+                assertEquals(RatisCdcSubscriptionController.Phase.CLOSING,h.phase()); failedClose=f.writes.get("CLOSE").getLast();
+            }
+            try(var c=f.controller(journal)) {
+                var h=c.reopen(definition.subscriptionId()); var closed=c.closeSubscription(h); var successful=DistributedCommandCodec.decode(f.writes.get("CLOSE").getLast());
+                assertNotEquals(DistributedCommandCodec.decode(failedClose).operationId(),successful.operationId());
+                assertEquals(DistributedCdcSubscription.Phase.CLOSED,closed.phase()); assertEquals(definition.start(),closed.checkpoint()); assertNotEquals(closed.checkpoint(),closed.delivered());
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,f.catalogue().execute(DistributedCommandCodec.decode(failedClose)).status());
+                assertEquals(closed,f.catalogue.read(definition.subscriptionId())); assertEquals(1,f.qualifications); assertFalse(f.writes.containsKey("ACK"));
+            }
+        }
+    }
+    @Test void explicitCloseResolvesPendingCreateBeforePersistingClosure() throws Exception {
+        try(var f=new Fixture(false)) {
+            Path journal=Files.createDirectory(root.resolve("journal")); var definition=f.definition(1);
+            try(var c=f.controller(journal)) { f.lose.add("CREATE"); assertThrows(IOException.class,()->c.create(definition,f.directory)); }
+            try(var c=f.controller(journal)) {
+                var h=c.reopen(definition.subscriptionId()); var closed=c.closeSubscription(h);
+                assertEquals(DistributedCdcSubscription.Phase.CLOSED,closed.phase()); assertEquals(definition.start(),closed.checkpoint());
+                assertArrayEquals(f.writes.get("CREATE").getFirst(),f.writes.get("CREATE").getLast()); assertFalse(f.writes.containsKey("DELIVER"));
+            }
+        }
+    }
+
+    @Test void closingConflictedBirthNeverIssuesAnotherCreateAfterLostReplyOrReopen() throws Exception {
+        try(var f=new Fixture(false)) {
+            Path journal=Files.createDirectory(root.resolve("journal")); var definition=f.definition(1);
+            try(var c=f.controller(journal)) {
+                f.competeCreate=true; f.lose.add("CREATE"); assertThrows(IOException.class,()->c.create(definition,f.directory));
+                var h=c.reopen(definition.subscriptionId()); assertThrows(RatisCdcSubscriptionController.Conflict.class,()->c.closeSubscription(h));
+            }
+            int creates=f.writes.get("CREATE").size();
+            try(var c=f.controller(journal)) {
+                var h=c.reopen(definition.subscriptionId()); assertThrows(IOException.class,()->c.closeSubscription(h));
+                assertThrows(IOException.class,()->c.closeSubscription(h)); assertEquals(creates,f.writes.get("CREATE").size());
+                assertNull(f.catalogue.read(definition.subscriptionId())); assertEquals(1,f.catalogue.readCapacity().count());
+            }
+        }
+    }
+
+    @Test void everyFrozenCloseRetryCancelsLateUnsubmittedDeliveryPreparationBeforeAppend() throws Exception {
+        try(var f=new Fixture(false)) {
+            Path journal=Files.createDirectory(root.resolve("journal")); var definition=f.definition(1); byte[] originalClose;
+            try(var c=f.controller(journal)) {
+                var h=c.create(definition,f.directory); f.lose.add("PREPARE"); assertThrows(IOException.class,()->c.poll(h,16,4096));
+                f.cancelObserver=()->{ f.cancelObserver=()->{}; f.delayedGate=true; };
+                assertThrows(IOException.class,()->c.closeSubscription(h)); assertEquals(RatisCdcSubscriptionController.Phase.CLOSING,h.phase());
+                originalClose=f.writes.get("CLOSE").getLast();
+            }
+            try(var c=f.controller(journal)) {
+                var h=c.reopen(definition.subscriptionId()); var closed=c.closeSubscription(h);
+                assertEquals(DistributedCdcSubscription.Phase.CLOSED,closed.phase()); assertEquals(definition.start(),closed.checkpoint());
+                assertArrayEquals(originalClose,f.writes.get("CLOSE").getLast()); assertFalse(f.delayedGate); assertEquals(1,f.qualifications);
             }
         }
     }

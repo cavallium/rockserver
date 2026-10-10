@@ -16,7 +16,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 public final class RatisCdcSubscriptionController implements AutoCloseable {
     public static final int MAX_JOBS=8,MAX_METADATA_BYTES=RatisSchemaClientJournal.MAX_BYTES;
     public static final long MAX_PENDING_REPLY_BYTES=(long)MAX_JOBS*RatisCdcPollRpc.MAX_REPLY_BYTES;
-    public enum Phase { CREATE, ACTIVE, CLOSED, CONFLICT }
+    public enum Phase { CREATE, ACTIVE, CLOSING, CLOSED, CONFLICT }
     public record Poll(RatisCdcPollRpc.Outcome outcome,RatisCdcSubscriptionBatch batch,int requiredBytes,
                        DistributedCdcCheckpoint.Cursor floor,ApplyPosition cut) {}
     public static final class Conflict extends IOException {
@@ -111,22 +111,61 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
     }
     public DistributedCdcSubscription closeSubscription(Handle h) throws IOException {
         begin(); try {
-            requireHandle(h); resume(h); if(h.phase()==Phase.CLOSED) return h.state(); requireActive(h);
-            freeze(h,Action.CLOSE,catalogue.prepareClose(next(h),h.state())); resolve(h); return h.state();
+            requireHandle(h);
+            if(h.phase()==Phase.CLOSED) { acknowledgeReceipt(h); return h.state(); }
+            if(!h.fields.containsKey("closeRequested")) { text(h,"closeRequested",h.phase().name()); text(h,"phase",Phase.CLOSING.name()); save(h); }
+            resumeClose(h); return h.state();
         } finally { end(); }
     }
     private void resume(Handle h) throws IOException {
+        if(h.fields.containsKey("closeRequested")) { resumeClose(h); return; }
         acknowledgeReceipt(h);
         if(h.fields.containsKey("pendingCommand")) resolve(h);
         if(h.phase()==Phase.CONFLICT) throw new Conflict(text(h,"conflictAction"));
-        if(h.phase()==Phase.CREATE) {
-            text(h,"read","capacity"); save(h); var capacity=catalogue.readCapacity();
-            final DistributedCommand command;
-            try { command=catalogue.prepareCreate(next(h),h.definition,h.source,capacity); }
-            catch(IllegalArgumentException exhausted) { text(h,"phase",Phase.CONFLICT.name()); text(h,"conflictAction",Action.CREATE.name()); save(h); throw new Conflict(Action.CREATE.name()); }
-            freeze(h,Action.CREATE,command); resolve(h);
-        }
+        if(h.phase()==Phase.CREATE) createCatalogue(h);
         if(h.phase()==Phase.ACTIVE && h.fields.containsKey("pollReply") && result(h).outcome()==RatisCdcPollRpc.Outcome.DATA && !h.fields.containsKey("batchReady")) deliver(h);
+    }
+    private void createCatalogue(Handle h) throws IOException {
+        text(h,"read","capacity"); save(h); var capacity=catalogue.readCapacity();
+        final DistributedCommand command;
+        try { command=catalogue.prepareCreate(next(h),h.definition,h.source,capacity); }
+        catch(IllegalArgumentException exhausted) { text(h,"phase",Phase.CONFLICT.name()); text(h,"conflictAction",Action.CREATE.name()); save(h); throw new Conflict(Action.CREATE.name()); }
+        freeze(h,Action.CREATE,command); resolve(h);
+    }
+    /** Explicit closure supersedes source qualification, but never rewrites an uncertain original. */
+    private void resumeClose(Handle h) throws IOException {
+        // A queued PREPARE may acquire a new hold after a prior cancellation echo.
+        if(h.fields.containsKey("abandonedDelivery")) catalogue.cancelDelivery(DistributedCommandCodec.decode(h.fields.get("abandonedDelivery")));
+        acknowledgeReceipt(h);
+        if(h.fields.containsKey("pendingCommand")) {
+            var action=Action.valueOf(text(h,"action"));
+            if(action==Action.DELIVER && !h.fields.containsKey("pendingResult")) {
+                h.fields.put("abandonedDelivery",h.fields.get("pendingCommand"));
+                h.fields.remove("pendingCommand"); h.fields.remove("action"); save(h);
+                catalogue.cancelDelivery(DistributedCommandCodec.decode(h.fields.get("abandonedDelivery")));
+            } else { resolve(h); if(h.phase()==Phase.CLOSED) return; }
+        }
+        if(Phase.CREATE.name().equals(text(h,"closeRequested"))) createCatalogue(h);
+        text(h,"phase",Phase.CLOSING.name()); save(h);
+        var observed=catalogue.read(h.id); var previous=h.state();
+        if(observed==null || !observed.definition().equals(h.definition) || observed.generation()<previous.generation()) throw new IOException("CDC closure lacks matching catalogue state");
+        for(var entry:previous.checkpoint().cursors().entrySet()) {
+            if(!observed.checkpoint().cursors().get(entry.getKey()).covers(entry.getValue())
+                    || !observed.delivered().cursors().get(entry.getKey()).covers(previous.delivered().cursors().get(entry.getKey()))) throw new IOException("CDC closure observed regressing catalogue state");
+        }
+        h.fields.put("state",observed.encode()); save(h);
+        if(observed.phase()==DistributedCdcSubscription.Phase.CLOSED) {
+            finishClose(h); queueReceipt(h,number(h,"sequence")-1); save(h); acknowledgeReceipt(h); return;
+        }
+        freeze(h,Action.CLOSE,catalogue.prepareClose(next(h),observed)); resolve(h);
+    }
+    private static void finishClose(Handle h) {
+        text(h,"phase",Phase.CLOSED.name()); clearPoll(h); h.fields.remove("closeRequested"); h.fields.remove("abandonedDelivery");
+    }
+    private void queueReceipt(Handle h,long consumed) {
+        h.fields.put("receiptSequence",longBytes(consumed));
+        var ack=new DistributedCommand(binding.groupId(),binding.epoch(),binding.schemaDigest(),next(h),List.of(),List.of(),consumed);
+        h.fields.put("pendingReceiptAck",DistributedCommandCodec.encode(ack));
     }
     private void deliver(Handle h) throws IOException {
         var result=result(h); var state=h.state(); var delivered=state.delivered().advance(result.request().binding().lineage(),result.next());
@@ -144,16 +183,17 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
             save(h); var result=catalogue.execute(command); if(result.valueCount()!=0) throw new IOException("CDC command returned unexpected values"); h.fields.put("pendingResult",result.encode()); save(h);
         }
         var result=CommandResult.decode(h.fields.get("pendingResult"));
+        // A definite birth outcome must never trigger another CREATE solely to close the job.
+        if(action==Action.CREATE && h.fields.containsKey("closeRequested")) text(h,"closeRequested",Phase.ACTIVE.name());
         if(result.status()==CommandResult.Status.SUCCESS) {
             h.fields.put("state",command.mutations().getFirst().value()); text(h,"phase",action==Action.CLOSE ? Phase.CLOSED.name() : Phase.ACTIVE.name());
             if(action==Action.DELIVER) h.fields.put("batchReady",new byte[]{1});
             if(action==Action.ACK) finishBatch(h);
-            if(action==Action.CLOSE) clearPoll(h);
-        } else { text(h,"phase",Phase.CONFLICT.name()); text(h,"conflictAction",action.name()); h.fields.put("conflictResult",h.fields.get("pendingResult")); }
-        long consumed=command.operationId().sequence(); h.fields.put("receiptSequence",longBytes(consumed));
-        var ack=new DistributedCommand(binding.groupId(),binding.epoch(),binding.schemaDigest(),next(h),List.of(),List.of(),consumed); h.fields.put("pendingReceiptAck",DistributedCommandCodec.encode(ack));
+            if(action==Action.CLOSE) finishClose(h);
+        } else { text(h,"phase",h.fields.containsKey("closeRequested") ? Phase.CLOSING.name() : Phase.CONFLICT.name()); text(h,"conflictAction",action.name()); h.fields.put("conflictResult",h.fields.get("pendingResult")); }
+        queueReceipt(h,command.operationId().sequence());
         h.fields.remove("pendingCommand"); h.fields.remove("pendingResult"); h.fields.remove("action"); save(h); acknowledgeReceipt(h);
-        if(h.phase()==Phase.CONFLICT) throw new Conflict(action.name());
+        if(result.status()!=CommandResult.Status.SUCCESS) throw new Conflict(action.name());
     }
     private void acknowledgeReceipt(Handle h) throws IOException {
         if(!h.fields.containsKey("pendingReceiptAck")) return; save(h);
@@ -174,11 +214,18 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
     private void validateRecovered(Handle h) {
         requireDefinition(h.definition,h.source); h.phase(); UUID issuer=UUID.fromString(text(h,"issuer"));
         if(!h.id.equals(h.definition.subscriptionId()) || !Arrays.equals(h.fields.get("binding"),bindingBytes()) || !h.state().definition().equals(h.definition) || number(h,"sequence")<0 || number(h,"lineage")<0) throw new IllegalArgumentException("CDC journal namespace/state identity differs");
+        if(h.fields.containsKey("closeRequested")) Phase.valueOf(text(h,"closeRequested"));
+        else if(h.phase()==Phase.CLOSING || h.fields.containsKey("abandonedDelivery")) throw new IllegalArgumentException("CDC closing state lacks durable intent");
+        if(h.fields.containsKey("abandonedDelivery")) {
+            var original=DistributedCommandCodec.decode(h.fields.get("abandonedDelivery")); validateCommand(h,original,issuer);
+            RatisCdcSubscriptionCatalogue.validator(cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).accept(original);
+            if(!RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(original) || !DistributedCdcSubscription.decode(original.mutations().getFirst().value()).definition().equals(h.definition)) throw new IllegalArgumentException("CDC abandoned delivery changed identity");
+        }
         if(h.fields.containsKey("pendingCommand")) {
             var command=DistributedCommandCodec.decode(h.fields.get("pendingCommand")); validateCommand(h,command,issuer); var action=Action.valueOf(text(h,"action"));
             var next=DistributedCdcSubscription.decode(command.mutations().getFirst().value());
             var actual=command.mutations().size()==2 ? Action.CREATE : next.phase()==DistributedCdcSubscription.Phase.CLOSED ? Action.CLOSE : RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command) ? Action.DELIVER : Action.ACK;
-            if(action!=actual || (action==Action.CREATE ? h.phase()!=Phase.CREATE : !Arrays.equals(command.predicates().getFirst().expectedValue(),h.fields.get("state")))) throw new IllegalArgumentException("CDC frozen action/predecessor changed");
+            if(action!=actual || (action==Action.CREATE ? h.phase()!=Phase.CREATE && !(h.phase()==Phase.CLOSING && Phase.CREATE.name().equals(text(h,"closeRequested"))) : !Arrays.equals(command.predicates().getFirst().expectedValue(),h.fields.get("state")))) throw new IllegalArgumentException("CDC frozen action/predecessor changed");
             RatisCdcSubscriptionCatalogue.validator(cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn()).accept(command);
             if(!DistributedCdcSubscription.decode(command.mutations().getFirst().value()).definition().equals(h.definition)) throw new IllegalArgumentException("CDC pending definition changed");
         }
