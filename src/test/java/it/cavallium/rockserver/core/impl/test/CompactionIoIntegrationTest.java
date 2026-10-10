@@ -54,6 +54,24 @@ class CompactionIoIntegrationTest {
             assertEquals(value, api.get(0, api.getColumnId("data"), key, RequestType.current()));
         }
     }
+    @Test void namedWorkloadGroupsDoNotPresentMixedQueuePopulationAsQualified(@TempDir Path root) throws Exception {
+        var cfg = config(root, "database.parallelism.workload-groups=[{name:slow,read:4,write:4}]\n");
+        try (var connection = new EmbeddedConnection(root.resolve("group-sampling"), "group-sampling", cfg)) {
+            var internal = connection.getInternalDB();
+            var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
+            var controller = (AutoCloseable) controllerField.get(internal);
+            controller.close();
+            var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
+            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
+            var sampler = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            sampler.setAccessible(true);
+            var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampler.invoke(internal, limiter);
+            assertTrue(sample.valid());
+            assertEquals(-1, sample.readFailures(),
+                    "selected-group queue depth and summed completions cannot qualify queue-only benefit");
+            assertTrue(sample.bulkFoundKeys() >= 0); assertTrue(sample.bulkReturnedBytes() >= 0);
+        }
+    }
     @Test void nativeReadTailSamplesDrainFreshMaximaAndCountTheirOwnCalls(@TempDir Path root) throws Exception {
         var cfg = config(root, "");
         try (var connection = new EmbeddedConnection(root.resolve("tail-sampling"), "tail-sampling", cfg)) {

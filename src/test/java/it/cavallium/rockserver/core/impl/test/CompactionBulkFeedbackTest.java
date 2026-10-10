@@ -547,7 +547,7 @@ class CompactionBulkFeedbackTest {
                 "two relieved queue windows with preserved useful work may justify a real25% background cut");
     }
     @Test void queueReliefCannotReplaceUsefulWorkWithLowerDemandFailuresOrDifferentReadMix() {
-        for (String loss : new String[]{"foreground", "point", "bulk", "found", "returned", "readMix", "failed", "missing", "background", "mean", "shape", "epoch"}) {
+        for (String loss : new String[]{"foreground", "point", "bulk", "found", "returned", "readMix", "failed", "missing", "unknownGroup", "background", "mean", "shape", "epoch"}) {
             var t = new Trace(); t.prime(); t.bulkCallMicros = 55000;
             t.active = t.latencyActive = t.workers; t.queued = 213;
             t.seconds(10); t.probe();
@@ -562,6 +562,7 @@ class CompactionBulkFeedbackTest {
                 case "readMix" -> t.readTasks = 130;
                 case "failed" -> t.readFailures++;
                 case "missing" -> t.contentAvailable = false;
+                case "unknownGroup" -> t.readFailures = -1;
                 case "background" -> t.transferred = RATE;
                 case "mean" -> t.bulkCallMicros = 60000;
                 case "shape" -> t.shape = 54;

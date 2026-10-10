@@ -3247,7 +3247,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						pointCount, nativeBulkReadCompletions.get(), nativeBulkReadKeys.get(), pointElapsed,
 						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND),
 						statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum(),
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS]);
+						workloadGroups.isEmpty() ? readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] : -1);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {
