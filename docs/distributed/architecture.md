@@ -211,7 +211,7 @@ Execute range scans in comparator order, visiting only intersecting descriptors.
 
 ## 6. Catalogue, reconfiguration and movement
 
-Run a small independent three-voter catalogue Raft group, optionally cohosted initially with dedicated resource reservations. It owns database/schema/operator manifests, node identities/capabilities, range descriptors, placement intents and cluster feature epoch. It is not queried for every operation. Loss of its quorum freezes topology/admin changes while healthy established data groups may continue with their already-installed ownership.
+Run a small independent three-voter catalogue Raft group, optionally cohosted initially with dedicated resource reservations. It owns database/schema/operator manifests, node identities/capabilities, range descriptors and placement intents. It is not queried for every operation. Loss of its quorum freezes topology/admin changes while healthy established data groups may continue with their already-installed ownership.
 
 All administrative operations carry idempotency IDs, expected descriptor epoch and persisted stages. Catalogue intent alone is not write ownership. A data group enforces its installed range/schema epoch; the old group must commit its fence before a replacement can become writable. Cached redirects improve routing, not correctness. Explicit node incarnation and TLS identity prevent a wiped/reused node directory from masquerading as the previous replica. Bootstrap creates a unique cluster ID and an agreed initial membership; an empty node never elects itself into an existing cluster by guessing seeds.
 

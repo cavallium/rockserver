@@ -164,9 +164,11 @@ public final class RatisCatalogue {
                 : RatisSchemaAdministration.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,immutable);
         var imports=RatisRangeImportCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,immutable==null ? null : immutable::read);
         var allocation=RatisColumnAllocation.validator(groupId,rangeEpoch,schemaDigest,directoryColumn);
+        var topology=RatisTopologyCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,immutable==null ? null : immutable::read);
         var cdc=RatisCdcSubscriptionCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         return command -> {
-            if(RatisCdcSubscriptionCatalogue.isCommand(command)) cdc.accept(command);
+            if(RatisTopologyCatalogue.isCommand(command)) topology.accept(command);
+            else if(RatisCdcSubscriptionCatalogue.isCommand(command)) cdc.accept(command);
             else if (RatisRangeImportCatalogue.isCommand(command)) imports.accept(command);
             else if (RatisOperatorCatalogue.isCommand(command)) operators.accept(command);
             else if (RatisColumnAllocation.isAllocationCommand(command)) allocation.accept(command);

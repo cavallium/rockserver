@@ -894,6 +894,16 @@ server process, network/quorum probe, power-loss run or deployment was performed
 
 ## Required remaining work
 
+Topology now has a bounded canonical definition and staged quorum-proof model,
+plus native catalogue CAS for immutable intent reservation, PREPARED and explicit
+abort. Controlled native tests cover retry, conflicting reservations, stale source
+directories, reopen and image restoration. The focused topology/catalogue gate
+passes 29 tests in six classes (`/tmp/rockserver-topology-intent-value-gate.log`).
+No execution phase can be persisted through this catalogue adapter yet: committed
+parent freeze, metadata-only child birth, dynamic Ratis startup, qualified publication,
+activation and lineage handoff remain required. Relocation keeps its source writable
+and currently admits only intent preparation/abort.
+
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained
   cooperative streams. The current logical page adapter is one-group and transaction-bound.
