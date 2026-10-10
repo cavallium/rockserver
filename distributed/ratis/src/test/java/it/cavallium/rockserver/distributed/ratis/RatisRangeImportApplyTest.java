@@ -44,10 +44,14 @@ class RatisRangeImportApplyTest {
     ReplicatedRangeStore reopen(DistributedStoragePool pool,Input input) throws Exception { return pool.reopenImportRange(input.manifest(),input.schema()); }
 
     org.apache.ratis.statemachine.TransactionContext committed(RatisRangeStateMachine machine,long index,byte[] bytes) {
+        return committed(machine,1,index,bytes);
+    }
+    org.apache.ratis.statemachine.TransactionContext committed(RatisRangeStateMachine machine,long term,long index,byte[] bytes) {
+        var data=org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto.newBuilder().setLogData(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(bytes));
+        if(RatisReferencedFile.Request.isRequest(bytes)){var request=RatisReferencedFile.Request.decode(bytes);data.setClientId(org.apache.ratis.protocol.ClientId.valueOf(request.clientId()).toByteString()).setCallId(request.callId());}
         return org.apache.ratis.statemachine.TransactionContext.newBuilder().setStateMachine(machine).setServerRole(org.apache.ratis.proto.RaftProtos.RaftPeerRole.FOLLOWER)
-                .setLogEntry(org.apache.ratis.proto.RaftProtos.LogEntryProto.newBuilder().setTerm(1).setIndex(index)
-                        .setStateMachineLogEntry(org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto.newBuilder()
-                                .setLogData(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(bytes))).build()).build();
+                .setLogEntry(org.apache.ratis.proto.RaftProtos.LogEntryProto.newBuilder().setTerm(term).setIndex(index)
+                        .setStateMachineLogEntry(data).build()).build();
     }
     org.apache.ratis.protocol.Message message(byte[] bytes) { return org.apache.ratis.protocol.Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(bytes)); }
     org.apache.ratis.statemachine.TransactionContext proposal(RatisRangeStateMachine machine,RatisRangeImportRecord record) throws Exception {
@@ -59,6 +63,7 @@ class RatisRangeImportApplyTest {
         var input=input("proposal",false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var queries=new RatisProofQueryService();
         var reads=new java.util.concurrent.atomic.AtomicInteger(); var block=new java.util.concurrent.atomic.AtomicBoolean(true);
         var leader=new java.util.concurrent.atomic.AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
+        var completedFile=new java.util.concurrent.atomic.AtomicReference<RatisReferencedFile>();
         try(var pool=pool(root.resolve("proposal-native"));var files=new RatisReferencedFiles(root.resolve("proposal-files"),group,RatisReferencedFiles.Limits.defaults(),Runnable::run,request->RatisRangeImportRpc.requireFile(input.manifest(),request));
             var storage=org.apache.ratis.server.storage.RaftStorage.newBuilder().setDirectory(root.resolve("proposal-log").toFile())
                     .setOption(org.apache.ratis.server.storage.RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
@@ -146,12 +151,31 @@ class RatisRangeImportApplyTest {
                     var reference=RatisReferencedFile.decode(machine.applyTransaction(streamed).get(5,TimeUnit.SECONDS).getContent().toByteArray());
                     assertEquals(files.reference(2,10),reference); assertEquals(referenceRequest,reference.request()); assertEquals(new ApplyPosition(2,10),store.applied());
                     try(var reader=files.pin(reference)){assertArrayEquals(input.bytes(),reader.read().toByteArray());}
+                    var lookup=message(RatisRangeImportFileResultRpc.request(referenceRequest));
+                    completedFile.set(reference);
+                    assertThrows(ExecutionException.class,()->machine.query(lookup).get(5,TimeUnit.SECONDS));
+                    assertEquals(reference,RatisRangeImportFileResultRpc.decodeReply(machine.queryLinearizable(lookup).get(5,TimeUnit.SECONDS).getContent().toByteArray(),referenceRequest));
+                    var reused=new RatisReferencedFile.Request(group,fileClient,fileCall,input.manifest().encode().length,input.manifest().digest());
+                    assertThrows(ExecutionException.class,()->machine.queryLinearizable(message(RatisRangeImportFileResultRpc.request(reused))).get(5,TimeUnit.SECONDS));
+                    assertThrows(ExecutionException.class,()->machine.queryLinearizable(message(RatisRangeImportRpc.prepare(reused))).get(5,TimeUnit.SECONDS));
+                    assertEquals(new ApplyPosition(2,10),store.applied());
+                    var image=root.resolve("file-result.image");var limits=new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1);
+                    NativeRangeImage.write(image,store,limits);NativeRangeImage.inspect(image,limits);store.fence();store.installSnapshot(image,limits);store.activate();
+                    files.truncate(0).get(5,TimeUnit.SECONDS);
+                    assertEquals(reference,RatisRangeImportFileResultRpc.decodeReply(machine.queryLinearizable(lookup).get(5,TimeUnit.SECONDS).getContent().toByteArray(),referenceRequest));
+                    assertArrayEquals(reference.encode(),machine.applyTransaction(committed(machine,2,11,referenceRequest.encode())).get(5,TimeUnit.SECONDS).getContent().toByteArray());
+                    assertEquals(new ApplyPosition(2,11),store.applied());
                 } finally { stream.cleanUp().get(5,TimeUnit.SECONDS); }
                 var foreign=new RatisReferencedFile.Request(group,UUID.randomUUID(),11,file.bytes(),new byte[32]);
                 assertThrows(ExecutionException.class,()->machine.queryLinearizable(message(RatisRangeImportRpc.prepare(foreign))).get(5,TimeUnit.SECONDS));
                 assertThrows(ExecutionException.class,()->files.stream(RatisReferencedFilesTest.request(group,foreign.clientId(),foreign.callId(),new byte[]{1})).get(5,TimeUnit.SECONDS));
             } finally { release.countDown(); queries.stop().get(10,TimeUnit.SECONDS); machine.beginShutdown(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); }
         } finally { release.countDown(); queries.stop().get(10,TimeUnit.SECONDS); }
+        try(var reopened=pool(root.resolve("proposal-native"))) {
+            var store=reopened.reopenImportRange(input.manifest(),input.schema());var reference=completedFile.get();
+            var receipt=store.importFileReceipt(reference.clientId(),reference.callId(),RangeImportAdmission.sha256(reference.request().encode()));
+            assertArrayEquals(reference.encode(),receipt.result());
+        }
     }
     @Test void committedImportUsesOrderedAsyncLaneAndKeepsPinsAfterObserverCancellation() throws Exception {
         var input=input("raft-apply",false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var queries=new RatisProofQueryService();

@@ -27,7 +27,10 @@ class RatisRangeImportFileClientTest {
         var definition=new RangeImportDefinition(job,new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));
         var client=mock(RaftClient.class); var control=mock(BlockingApi.class); var streams=mock(DataStreamRpcApi.class); var output=mock(DataStreamOutput.class);
         when(client.getId()).thenReturn(clientId); when(client.getGroupId()).thenReturn(RaftGroupId.valueOf(group)); when(client.getLeaderId()).thenReturn(RaftPeerId.valueOf("leader")); when(client.io()).thenReturn(control);
-        when(control.sendReadOnly(any())).thenAnswer(call->new RaftClientReply.Builder().setClientId(clientId).setServerId(client.getLeaderId()).setGroupId(client.getGroupId()).setCallId(1).setSuccess(true).setMessage(call.getArgument(0)).build());
+        var recovered=new java.util.concurrent.atomic.AtomicReference<RatisReferencedFile>();
+        when(control.sendReadOnly(any())).thenAnswer(call->{Message requestMessage=call.getArgument(0);byte[] content=requestMessage.getContent().toByteArray();
+            if(ScopedTransactionRpc.kind(content,1024)==RatisRangeImportFileResultRpc.KIND)requestMessage=Message.valueOf(ByteString.copyFrom(RatisRangeImportFileResultRpc.reply(request,new ApplyPosition(2,recovered.get()==null?89:90),recovered.get())));
+            return new RaftClientReply.Builder().setClientId(clientId).setServerId(client.getLeaderId()).setGroupId(client.getGroupId()).setCallId(1).setSuccess(true).setMessage(requestMessage).build();});
         when(streams.stream(any(RaftClientRequest.class))).thenAnswer(call->{RaftClientRequest header=call.getArgument(0);assertEquals(request,RatisReferencedFile.Request.decode(header.getMessage().getContent().toByteArray()));assertEquals(71,header.getCallId());assertEquals(clientId,header.getClientId());return output;});
         var collected=new java.io.ByteArrayOutputStream(); var maximum=new java.util.concurrent.atomic.AtomicInteger();
         when(output.writeAsync(any(ByteBuffer.class),any(Iterable.class))).thenAnswer(call->{ByteBuffer chunk=call.getArgument(0);int count=chunk.remaining();maximum.accumulateAndGet(count,Math::max);byte[] part=new byte[count];chunk.get(part);collected.writeBytes(part);DataStreamReply reply=mock(DataStreamReply.class);when(reply.isSuccess()).thenReturn(true);when(reply.getBytesWritten()).thenReturn((long)count);return CompletableFuture.completedFuture(reply);});
@@ -37,6 +40,7 @@ class RatisRangeImportFileClientTest {
         when(output.getRaftClientReplyFuture()).thenReturn(CompletableFuture.completedFuture(reply));
         var transfer=new RatisRangeImportFileClient(client,streams); assertEquals(reference,transfer.transfer(definition,request,source));assertArrayEquals(bytes,collected.toByteArray());assertEquals(RatisRangeImportFileClient.BUFFER_BYTES,maximum.get());assertEquals(0,transfer.activeTransfers());
         verify(output,times(4)).writeAsync(any(ByteBuffer.class),any(Iterable.class));
+        recovered.set(reference);Files.delete(source);assertEquals(reference,transfer.transfer(definition,request,source));verify(streams,times(1)).stream(any(RaftClientRequest.class));recovered.set(null);
         Files.write(source,new byte[bytes.length]); assertThrows(java.io.IOException.class,()->transfer.transfer(definition,request,source));verify(streams,times(1)).stream(any(RaftClientRequest.class));assertEquals(0,transfer.activeTransfers());
         Files.write(source,bytes); var wrong=new RaftClientReply.Builder().setClientId(clientId).setServerId(client.getLeaderId()).setGroupId(client.getGroupId()).setCallId(72).setLogIndex(90).setSuccess(true).setMessage(reply.getMessage()).build();
         when(output.getRaftClientReplyFuture()).thenReturn(CompletableFuture.completedFuture(wrong));assertThrows(java.io.IOException.class,()->transfer.transfer(definition,request,source));assertEquals(0,transfer.activeTransfers());

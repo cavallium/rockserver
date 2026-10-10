@@ -391,6 +391,8 @@ public final class NativeRangeImage {
         private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest importBirth;
         private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.Receipt importReceipt;
         private NativeRangeSstImport.Activation importActivation;
+        private int importFileReceipts;
+        private long importFileReceiptCount;
         private boolean acceptSchema(byte[] digest) { referencedSchemas.add(digest.clone()); return true; }
         private int homeCreditCount;
         private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
@@ -456,6 +458,20 @@ public final class NativeRangeImage {
                         } else if(key[16]==0x42) { if(importBirth==null || importReceipt!=null)throw new IllegalArgumentException("Import receipt lacks birth"); importReceipt=it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.Receipt.decode(value); importReceipt.requireManifest(importBirth); importReceipt.requireCut(header.position()); }
                         else { if(importReceipt==null || importActivation!=null)throw new IllegalArgumentException("Import activation lacks receipt"); importActivation=NativeRangeSstImport.Activation.decode(value); if(!Arrays.equals(importActivation.receipt().encode(),importReceipt.encode()))throw new IllegalArgumentException("Import activation differs from receipt"); importActivation.requireCut(header.position()); }
                     } catch(IllegalArgumentException invalid) { throw new IOException("Invalid import image metadata",invalid); }
+                }
+                if(section==Section.STATE && key.length>16 && (key[16]==0x44 || key[16]==0x45)) {
+                    try {
+                        if(importBirth==null)throw new IllegalArgumentException("File result lacks import birth");
+                        if(key[16]==0x44) {
+                            if(key.length!=41 || ++importFileReceipts>NativeRangeSstImport.FileReceipt.MAX_RECEIPTS)throw new IllegalArgumentException("Invalid file result key/count");
+                            var receipt=NativeRangeSstImport.FileReceipt.decode(value);receipt.requireCut(header.position());
+                            var expected=ByteBuffer.allocate(41).put(groupPrefix).put((byte)0x44).putLong(receipt.clientId().getMostSignificantBits()).putLong(receipt.clientId().getLeastSignificantBits()).putLong(receipt.callId()).array();
+                            if(!Arrays.equals(key,expected))throw new IllegalArgumentException("File result identity differs from key");
+                        } else {
+                            if(key.length!=17 || value.length!=8)throw new IllegalArgumentException("Invalid file result count");importFileReceiptCount=ByteBuffer.wrap(value).getLong();
+                            if(importFileReceiptCount<0 || importFileReceiptCount>NativeRangeSstImport.FileReceipt.MAX_RECEIPTS)throw new IllegalArgumentException("File result count exceeds bound");
+                        }
+                    }catch(IllegalArgumentException invalid){throw new IOException("Invalid import file result metadata",invalid);}
                 }
                 if(section==Section.STATE && key.length>16 && (key[16]==0x2b || key[16]==0x2c)) {
                     try {
@@ -718,6 +734,7 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            if(importFileReceipts!=importFileReceiptCount)throw new IOException("Import file result count differs from image inventory");
             if(importBirth!=null && (importReceipt==null || importActivation==null))throw new IOException("Unpublished import cannot become a native image");
             if(schemaInstallation==null && (!schemaActivations.isEmpty() || currentSchemaActivation!=null)) throw new IOException("Activation history lacks installed generation");
             for(var digest:referencedSchemas) if(!Arrays.equals(digest,header.schema()) && !schemaHistory.containsKey(java.util.HexFormat.of().formatHex(digest))) throw new IOException("Historical schema metadata missing");

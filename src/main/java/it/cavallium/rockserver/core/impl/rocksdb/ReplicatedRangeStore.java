@@ -307,6 +307,33 @@ public final class ReplicatedRangeStore {
     private volatile NativeRangeSstImport.Activation importActivation;
     public boolean importPending() { return importBirth!=null && importActivation==null; }
     public NativeSstImportManifest.Receipt importReceipt() { return importReceipt; }
+    private byte[] importFileKey(UUID client,long call){return ByteBuffer.allocate(41).put(markerKey).put((byte)0x44).putLong(client.getMostSignificantBits()).putLong(client.getLeastSignificantBits()).putLong(call).array();}
+    public NativeRangeSstImport.FileReceipt importFileReceipt(UUID client,long call,byte[] digest)throws RocksDBException {
+        return readSchemaMetadata(()->{
+            if(call<0 || digest.length!=32)throw new IllegalArgumentException("Invalid file result identity");
+            byte[] value=db.get(state,importFileKey(client,call));if(value==null)return null;var result=NativeRangeSstImport.FileReceipt.decode(value);
+            if(!client.equals(result.clientId()) || call!=result.callId() || !Arrays.equals(digest,result.requestDigest()))throw new IllegalArgumentException("File request identity reused with different payload");
+            result.requireCut(applied);return result;
+        });
+    }
+    public NativeRangeSstImport.FileReceipt applyImportFileReceipt(ApplyPosition position,UUID client,long call,byte[] digest,byte[] result)throws RocksDBException {
+        enterNative();applyLane.lock();
+        try {
+            if(importBirth==null || pendingInstallation!=null || importIntent!=null)throw new IllegalStateException("File publication requires its original import owner");
+            var stateNow=ownership.get(owner).state();if(stateNow!=RangeOwnership.State.ACTIVE && stateNow!=RangeOwnership.State.FENCED)throw new IllegalStateException("Import file owner unavailable");
+            var saved=importFileReceipt(client,call,digest);if(saved!=null){applyNoopUnderAdmission(position,null);return saved;}
+            requireNext(position);ensureReceiptUsage();var receipt=new NativeRangeSstImport.FileReceipt(client,call,digest,position,result);
+            byte[] encodedCount=db.get(state,importKey(0x45));if(encodedCount!=null && encodedCount.length!=8)throw new IllegalStateException("Invalid import file receipt count");long count=encodedCount==null?0:ByteBuffer.wrap(encodedCount).getLong();
+            if(count<0 || count>=NativeRangeSstImport.FileReceipt.MAX_RECEIPTS)throw new IllegalStateException("Import file receipt capacity exhausted");
+            var writes=prepareScopedWrites(false,List.of(),Map.of());
+            try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
+                batch.put(state,importFileKey(client,call),receipt.encode());batch.put(state,importKey(0x45),ByteBuffer.allocate(8).putLong(count+1).array());
+                batch.put(state,markerKey,encodePosition(position));batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));db.write(options,batch);
+            }
+            publishScoped(position,writes,false);applied=position;return receipt;
+        }catch(RocksDBException|RuntimeException|Error failure){resetScopedUnderLane();throw failure;}
+        finally{applyLane.unlock();try{drainScopedReleases();}finally{leaveNative();}}
+    }
     public NativeRangeSstImport.Activation importActivation() throws RocksDBException { return readSchemaMetadata(() -> { recoverImportMetadata(); return importActivation; }); }
     private byte[] importKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
     private void recoverImportMetadata() throws RocksDBException {

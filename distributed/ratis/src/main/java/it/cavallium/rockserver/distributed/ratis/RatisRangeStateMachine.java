@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
+import it.cavallium.rockserver.core.common.distributed.RangeImportAdmission;
+
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.common.distributed.SchemaAdmissionManifest;
@@ -237,6 +239,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             requireImportMembership();
             if(record instanceof RatisRangeImportRecord.Install install)rangeImportApply.validateInstallProposal(install);
             else if(record instanceof RatisRangeImportRecord.Activate activate)rangeImportApply.validateActivationProposal(activate,rangeImportPublication);
+            else if(record instanceof RatisReferencedFile.Request file)referenceProof(file);
             var current=leadership();
             synchronized(admissions) { hold.reading=false; hold.qualified=true; requireImportApply(hold,record,current,generation); qualified=true; }
         } finally { synchronized(admissions) { hold.reading=false; if(!qualified || hold.invalidated || hold.released)releaseImportApply(hold); } }
@@ -1572,7 +1575,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         throw new IOException("Deferred term conflicts with installed image");
                     }
                     var recovered=RatisReferencedFile.Request.isRequest(pending.encoded())
-                            ? new AppliedRecord(null,referenceProof(pending.term(),entry.getKey(),RatisReferencedFile.Request.decode(pending.encoded())))
+                            ? new AppliedRecord(null,referenceProof(RatisReferencedFile.Request.decode(pending.encoded())))
                             : recoveredRecord(pending.encoded());
                     byte[] result=recovered.result();
                     if (result == null) throw new IOException("Installed image omitted deferred receipt");
@@ -2245,13 +2248,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     private static boolean asyncNativeRecord(byte[] bytes) { return RatisSchemaInstallRecord.isInstall(bytes) || RatisRangeImportRecord.isImport(bytes) || RatisReferencedFile.Request.isRequest(bytes); }
-    private byte[] referenceProof(long term,long index,RatisReferencedFile.Request request) throws IOException {
-        var cut=store.applied(); if(cut==null || cut.index()<index)return null;
-        if(cut.term()<term || cut.index()==index && cut.term()!=term)throw new IOException("Reference conflicts with completed native cut");
-        return referencedFiles.publishedReference(term,index,request).encode();
+    private byte[] referenceProof(RatisReferencedFile.Request request) throws Exception {
+        var result=store.importFileReceipt(request.clientId(),request.callId(),RangeImportAdmission.sha256(request.encode()));
+        if(result==null)return null;
+        var reference=RatisReferencedFile.decode(result.result());
+        if(!reference.request().equals(request) || reference.term()!=result.position().term() || reference.index()!=result.position().index())throw new IOException("Original file result differs from native receipt");
+        return reference.encode();
     }
     private byte[] nativeApplyProof(NativeApply work) throws Exception {
-        if (work.referenceRequest!=null) return referenceProof(work.deferred.term(),work.index,work.referenceRequest);
+        if (work.referenceRequest!=null) return referenceProof(work.referenceRequest);
         if (work.importRecord!=null) return rangeImportApply.recoveredResult(work.importRecord);
         var proof=schemaInstallProof(work.record); return proof==null ? null : proof.encode();
     }
@@ -2268,10 +2273,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             try {
             if (work.referenceRequest!=null) {
+                byte[] saved=referenceProof(work.referenceRequest);
+                if(saved!=null){store.applyNoop(new ApplyPosition(work.deferred.term(),work.index));return finishNativeApply(work,saved);}
                 referencedFiles.flush(work.index).get();
                 var reference=referencedFiles.publishedReference(work.deferred.term(),work.index,work.referenceRequest);
                 try(var retained=referencedFiles.pin(reference)) {
-                    store.applyNoop(new ApplyPosition(work.deferred.term(),work.index));
+                    var original=store.applyImportFileReceipt(new ApplyPosition(work.deferred.term(),work.index),work.referenceRequest.clientId(),work.referenceRequest.callId(),RangeImportAdmission.sha256(work.referenceRequest.encode()),reference.encode());
+                    reference=RatisReferencedFile.decode(original.result());
                 }
                 return finishNativeApply(work,reference.encode());
             }
@@ -3473,6 +3481,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                 return dispatcher.submit(store.ownership().owner().groupId(),kind,packet.body()).thenApply(payload ->
                         Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,payload))));
+            }
+            if(kind==RatisRangeImportFileResultRpc.KIND) {
+                if(!freshBarrier || rangeImportApply==null || proofQueries==null)throw new IOException("File result lookup requires configured fresh DATA barrier");
+                var file=RatisRangeImportFileResultRpc.decodeRequest(encoded);requireImportProposal(file);long generation=admissionGeneration.get();
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,4L*RatisRangeImportFileResultRpc.MAX_REPLY_BYTES,false,owned->{
+                    var leader=leadership();var cut=requireImportOwner(leader);final long stamp;synchronized(admissions){stamp=schemaConfigurationStamp;}
+                    requireImportMembership();byte[] original=referenceProof(file);var current=leadership();
+                    synchronized(admissions){requireImportOwner(current);if(generation!=admissionGeneration.get() || current.term()!=leader.term() || stamp!=schemaConfigurationStamp || !java.util.Objects.equals(cut,store.applied()))throw new IOException("File result lookup lost native owner/cut");}
+                    return Message.valueOf(ByteString.copyFrom(RatisRangeImportFileResultRpc.reply(file,cut,original==null?null:RatisReferencedFile.decode(original))));
+                });
             }
             if(kind==RatisRangeImportStatusRpc.KIND) {
                 requireDataRole(); if(rangeImportApply==null || importLocalReplica==null || proofQueries==null)throw new IOException("Import status owner is not configured");

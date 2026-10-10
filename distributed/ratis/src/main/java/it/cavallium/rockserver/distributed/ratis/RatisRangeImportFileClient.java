@@ -28,7 +28,11 @@ public final class RatisRangeImportFileClient {
         if(!client.getGroupId().getUuid().equals(request.groupId()) || !client.getId().getUuid().equals(request.clientId()))throw new IOException("File client group/identity differs from original request");
         if(!slots.tryAcquire())throw new IOException("File transfer capacity exhausted");
         DataStreamOutput stream=null; boolean drained=false,preparationAttempted=false; Throwable failure=null;
-        try(var source=FileChannel.open(immutableSource,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS)) {
+        try {
+            var lookup=client.io().sendReadOnly(message(RatisRangeImportFileResultRpc.request(request)));
+            if(lookup==null || !lookup.isSuccess() || lookup.getMessage()==null || !client.getGroupId().equals(lookup.getRaftGroupId()) || lookup.getMessage().getContent().size()>RatisRangeImportFileResultRpc.MAX_REPLY_BYTES)throw new IOException("Original file result lookup failed",lookup==null?null:lookup.getException());
+            var saved=RatisRangeImportFileResultRpc.decodeReply(lookup.getMessage().getContent().toByteArray(),request);if(saved!=null)return saved;
+            try(var source=FileChannel.open(immutableSource,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS)) {
             var buffer=ByteBuffer.allocate(BUFFER_BYTES); qualify(source,request,buffer);
             preparationAttempted=true; var prepared=client.io().sendReadOnly(message(RatisRangeImportRpc.prepare(request)));
             if(prepared==null || !prepared.isSuccess() || prepared.getMessage()==null || !client.getGroupId().equals(prepared.getRaftGroupId()) || prepared.getMessage().getContent().size()>RatisRangeImportRpc.MAX_BYTES)throw new IOException("File preparation failed",prepared==null ? null : prepared.getException());
@@ -48,7 +52,8 @@ public final class RatisRangeImportFileClient {
             if(closed==null || !closed.isSuccess() || reply==null || !reply.isSuccess() || reply.getMessage()==null || reply.getMessage().getContent().size()!=RatisReferencedFile.BYTES
                     || !client.getGroupId().equals(reply.getRaftGroupId()) || !client.getId().equals(reply.getClientId()) || reply.getCallId()!=request.callId())throw new IOException("Streamed file outcome failed or crossed original identity",reply==null ? null : reply.getException());
             var reference=RatisReferencedFile.decode(reply.getMessage().getContent().toByteArray());
-            if(!reference.request().equals(request) || reply.getLogIndex()!=reference.index())throw new IOException("File outcome differs from committed reference"); return reference;
+            if(!reference.request().equals(request) || reply.getLogIndex()<reference.index())throw new IOException("File outcome differs from committed reference"); return reference;
+            }
         } catch(IOException|Error problem) { failure=problem; throw problem; }
         catch(RuntimeException problem) { var invalid=new IOException("Invalid streamed file response or transport failure",problem); failure=invalid; throw invalid; }
         finally {

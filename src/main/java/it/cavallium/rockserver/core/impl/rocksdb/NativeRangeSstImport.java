@@ -23,6 +23,16 @@ public final class NativeRangeSstImport {
         public void requireCut(ApplyPosition cut) { receipt.requireCut(position); if(cut==null || position.index()>cut.index() || position.term()>cut.term() || position.index()==cut.index() && position.term()!=cut.term())throw new IllegalArgumentException("Import activation exceeds/conflicts with cut"); }
     }
     private NativeRangeSstImport() {}
+    /** Original bounded file acknowledgment, atomically committed with its native apply marker. */
+    public record FileReceipt(UUID clientId,long callId,byte[] requestDigest,ApplyPosition position,byte[] result) {
+        public static final int MAX_RESULT_BYTES=128,MAX_RECEIPTS=4096;
+        public FileReceipt { Objects.requireNonNull(clientId);Objects.requireNonNull(position);if(callId<0 || requestDigest.length!=32 || position.term()<1 || result.length<1 || result.length>MAX_RESULT_BYTES)throw new IllegalArgumentException("Invalid import file receipt");requestDigest=requestDigest.clone();result=result.clone(); }
+        @Override public byte[] requestDigest(){return requestDigest.clone();}
+        @Override public byte[] result(){return result.clone();}
+        public byte[] encode(){return ByteBuffer.allocate(80+result.length).putInt(0x4e534652).putLong(clientId.getMostSignificantBits()).putLong(clientId.getLeastSignificantBits()).putLong(callId).put(requestDigest).putLong(position.term()).putLong(position.index()).putInt(result.length).put(result).array();}
+        public static FileReceipt decode(byte[] bytes){if(bytes==null || bytes.length<81 || bytes.length>80+MAX_RESULT_BYTES)throw new IllegalArgumentException("Invalid file receipt length");var in=ByteBuffer.wrap(bytes);if(in.getInt()!=0x4e534652)throw new IllegalArgumentException("Invalid file receipt tag");UUID client=new UUID(in.getLong(),in.getLong());long call=in.getLong();byte[] digest=new byte[32];in.get(digest);var position=new ApplyPosition(in.getLong(),in.getLong());int size=in.getInt();if(size!=in.remaining())throw new IllegalArgumentException("Invalid file receipt body");byte[] result=new byte[size];in.get(result);return new FileReceipt(client,call,digest,position,result);}
+        public void requireCut(ApplyPosition cut){if(cut==null || position.term()>cut.term() || position.index()>cut.index() || position.index()==cut.index() && position.term()!=cut.term())throw new IllegalArgumentException("File receipt exceeds completed native cut");}
+    }
     private static Path directory(Path root,NativeSstImportManifest manifest) { return root.resolve(manifest.groupId()+"-"+manifest.importId()); }
     static Path original(Path root,NativeSstImportManifest manifest,NativeSstImportManifest.File file) { return directory(root,manifest).resolve(file.fileId()+".sst"); }
     static void retain(Path root,NativeSstImportManifest manifest,Map<UUID,Path> sources) throws IOException {
