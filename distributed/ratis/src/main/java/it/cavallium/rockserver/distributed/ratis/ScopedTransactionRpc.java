@@ -25,6 +25,9 @@ public final class ScopedTransactionRpc {
     public static final int IMPORT_PUBLICATION_PREPARE=74,IMPORT_PUBLICATION_CANCEL=75;
     public static final int IMPORT_APPLY_PREPARE=77,IMPORT_APPLY_CANCEL=78;
     public static final int TOPOLOGY_FREEZE_PREPARE=85,TOPOLOGY_FREEZE_CANCEL=86,TOPOLOGY_FREEZE_STATE=87;
+    public static final int TOPOLOGY_OWNER=88,TOPOLOGY_ACTIVATE_PREPARE=89,TOPOLOGY_ACTIVATE_CANCEL=90,TOPOLOGY_ACTIVATE_STATE=91,TOPOLOGY_SEED=92,TOPOLOGY_EXECUTION_PREPARE=93,TOPOLOGY_EXECUTION_CANCEL=94;
+    public static boolean topologyActivate(int kind) { return kind==TOPOLOGY_ACTIVATE_PREPARE || kind==TOPOLOGY_ACTIVATE_CANCEL || kind==TOPOLOGY_ACTIVATE_STATE; }
+    public static boolean topologyExecution(int kind) { return kind==TOPOLOGY_EXECUTION_PREPARE || kind==TOPOLOGY_EXECUTION_CANCEL; }
     public static boolean topologyFreeze(int kind) { return kind==TOPOLOGY_FREEZE_PREPARE || kind==TOPOLOGY_FREEZE_CANCEL || kind==TOPOLOGY_FREEZE_STATE; }
     public static boolean importApply(int kind) { return kind==IMPORT_APPLY_PREPARE || kind==IMPORT_APPLY_CANCEL; }
     public static boolean importPublication(int kind) { return kind==IMPORT_PUBLICATION_PREPARE || kind==IMPORT_PUBLICATION_CANCEL; }
@@ -268,7 +271,7 @@ public final class ScopedTransactionRpc {
     }
     public static boolean homeRecovery(int kind) { return kind==HOME_RECOVERY_PREPARE || kind==HOME_RECOVERY_RESULT || kind==HOME_RECOVERY_CANCEL; }
     private static void requireKind(int kind) {
-        if(topologyFreeze(kind) || kind==RatisCdcPollRpc.KIND || RatisCdcDeliveryRpc.kind(kind) || kind==RatisTopologyAuthority.KIND) return;
+        if(kind==TOPOLOGY_OWNER || kind==TOPOLOGY_SEED || topologyActivate(kind) || topologyExecution(kind) || topologyFreeze(kind) || kind==RatisCdcPollRpc.KIND || RatisCdcDeliveryRpc.kind(kind) || kind==RatisTopologyAuthority.KIND) return;
         if (kind != POINT && kind != STATE && kind != OPEN && kind != GET && kind != PAGE && kind != PLAN && kind != CLOSE && kind != STAGE && kind != PARTICIPANT_AUTHORIZE && kind != PARTICIPANT_STATE && kind != PARTICIPANT_OUTCOME && kind != PARTICIPANT_FENCE && kind != PARTICIPANT_RETIRE_PREPARE && kind != PARTICIPANT_RETIRE_CANCEL && kind != SNAPSHOT_GATE_STATE && kind != SNAPSHOT_FENCE && kind != SNAPSHOT_RETIRE_PREPARE && kind != SNAPSHOT_RETIRE_CANCEL && kind != FINALIZATION_PREPARE && kind != FINALIZATION_CANCEL && kind != HOME_FENCE && kind != HOME_RETIRE_PREPARE && kind != HOME_RETIRE_CANCEL && kind != SNAPSHOT_HOME_FENCE && kind != SNAPSHOT_HOME_RETIRE_PREPARE && kind != SNAPSHOT_HOME_RETIRE_CANCEL && kind != SNAPSHOT_OWNER && kind != SNAPSHOT_READY && kind != SNAPSHOT_BLOCKERS && kind != SNAPSHOT_HELP && kind != SNAPSHOT_GATE_PREPARE && kind != SNAPSHOT_GATE_CANCEL && !homeRecovery(kind) && !ownerSnapshot(kind) && !ownerExport(kind) && !schemaFence(kind) && !schemaInstall(kind) && !schemaActivate(kind) && !schemaReplica(kind) && !schemaFencing(kind) && !importPublication(kind) && kind!=SCHEMA_AUTHORITY && kind!=RatisRangeImportAuthority.KIND && kind!=RatisRangeImportStatusRpc.KIND && kind!=RatisRangeImportFileResultRpc.KIND) {
             if (!importApply(kind)) throw invalid("Unknown read frame kind");
         }

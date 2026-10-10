@@ -15,6 +15,11 @@ public final class RatisTopologyCatalogue {
     public static final long MAX_BYTES=64L*1024*1024;
     private static final byte STATE=(byte)0x82,HEAD=(byte)0x83,DEFINITION=(byte)0x84,IDENTITY=(byte)0x85,CAPACITY=(byte)0x86;
     @FunctionalInterface public interface ImmutableReader { byte[] read(byte[] key); }
+    /** Trusted transport validates the actual addressed owner, stable configuration and current Raft term. */
+    @FunctionalInterface public interface OwnerProofReader { QualifiedOwner read(TopologyChange.Definition definition,TopologyChange.Proof expected) throws IOException; }
+    public record QualifiedOwner(TopologyChange.Proof proof,ApplyPosition completedCut) {
+        public QualifiedOwner { Objects.requireNonNull(proof); Objects.requireNonNull(completedCut); }
+    }
     public record Capacity(int count,long bytes) {
         public Capacity { if(count<0 || count>MAX_INTENTS || bytes<0 || bytes>MAX_BYTES || (count==0)!=(bytes==0)) throw new IllegalArgumentException("Invalid topology capacity"); }
         public byte[] encode() { return ByteBuffer.allocate(12).putInt(count).putLong(bytes).array(); }
@@ -69,8 +74,92 @@ public final class RatisTopologyCatalogue {
                         predicate(domainKey(header.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),predicate(identityKey(header.intentId()),definition.digest()),
                         predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode())));
     }
+    public DistributedCommand prepareProof(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.Proof proof) {
+        UUID domain=definition.header().domainId();
+        byte[] schemaHead=uncheckedRead(RatisSchemaAdministration.headKey(domain)),importHead=uncheckedRead(RatisRangeImportCatalogue.headKey(domain));
+        return prepareProof(operation,definition,expected,proof,schemaHead==null ? null : RatisSchemaAdministration.Head.decode(schemaHead),importHead==null ? null : RatisRangeImportCatalogue.Head.decode(importHead));
+    }
+    public DistributedCommand prepareProof(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.Proof proof,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead) {
+        expected.requireDefinition(definition); var next=switch(proof.stage()) { case FREEZE -> expected.frozen(proof); case SEED -> expected.seeded(proof); case ACTIVATE -> expected.activated(proof); };
+        if(next.equals(expected)) throw new IllegalArgumentException("Recorded topology proof must retry its original command");
+        return prepareProgress(operation,definition,expected,next,schemaHead,importHead,false);
+    }
+    public DistributedCommand preparePublication(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead) {
+        expected.requireDefinition(definition);
+        if(expected.phase()!=TopologyChange.Phase.SEEDED) throw new IllegalArgumentException("Topology publication requires exact SEEDED intent");
+        return prepareProgress(operation,definition,expected,expected.publish(),schemaHead,importHead,true);
+    }
+    private DistributedCommand prepareProgress(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.State next,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead,boolean publication) {
+        var header=next.header(); byte[] bytes=next.encode();
+        var directory=expected.phase()==TopologyChange.Phase.PUBLISHED || expected.phase()==TopologyChange.Phase.ACTIVE ? definition.targetDirectory() : definition.sourceDirectory();
+        var writes=new ArrayList<Mutation>(); writes.add(put(stateKey(header.intentId()),bytes)); writes.add(put(headKey(header.domainId()),bytes));
+        if(publication) writes.add(put(domainKey(header.domainId()),RangeDirectoryCodec.encode(definition.targetDirectory())));
+        return checked(operation,writes,List.of(predicate(stateKey(header.intentId()),expected.encode()),predicate(headKey(header.domainId()),expected.encode()),
+                predicate(domainKey(header.domainId()),RangeDirectoryCodec.encode(directory)),predicate(identityKey(header.intentId()),definition.digest()),
+                predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode())));
+    }
+    public static boolean requiresOwnerAdmission(DistributedCommand command) {
+        if(!isCommand(command) || command.mutations().size()<2 || command.predicates().size()!=6 || command.predicates().getFirst().expectedValue()==null) return false;
+        var previous=TopologyChange.State.decode(command.predicates().getFirst().expectedValue());
+        var next=TopologyChange.State.decode(command.mutations().getFirst().value());
+        return previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.FENCING;
+    }
+    /** Fresh preparation only. Deterministic validation and committed replay never call remote owners. */
+    public static void admitExecution(DistributedCommand command,UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,ImmutableReader reader,OwnerProofReader owners) throws IOException {
+        validator(cluster,database,group,epoch,schema,column,reader).accept(command);
+        if(!requiresOwnerAdmission(command)) throw new IllegalArgumentException("Expected topology execution progress/publication");
+        if(reader==null || owners==null) throw new IOException("Fresh topology owner admission is not configured");
+        requireCurrentWitnesses(command,reader);
+        var previous=TopologyChange.State.decode(command.predicates().getFirst().expectedValue()); var next=TopologyChange.State.decode(command.mutations().getFirst().value());
+        var definition=TopologyChange.Definition.decode(reader.read(definitionKey(next.header().definitionDigest()))); next.requireDefinition(definition);
+        if(previous.phase()==TopologyChange.Phase.SEEDED && next.phase()==TopologyChange.Phase.PUBLISHED) {
+            for(var target:definition.header().targets()) {
+                int qualified=0; IOException unavailable=null;
+                for(var owner:target.owners()) {
+                    if(owner.role()!=ReplicaDescriptor.Role.VOTER) continue;
+                    var proof=previous.seeded().get(new TopologyChange.Key(target.groupId(),owner.replicaId())); if(proof==null) continue;
+                    try { requireQualified(proof,owners.read(definition,proof)); qualified++; }
+                    catch(IOException invalid) { unavailable=invalid; }
+                    if(qualified==target.quorum()) break;
+                }
+                if(qualified<target.quorum()) throw new IOException("Topology publication lacks fresh committed child SEED quorum",unavailable);
+            }
+        } else {
+            var proof=addedProof(previous,next); requireQualified(proof,owners.read(definition,proof));
+        }
+        requireCurrentWitnesses(command,reader);
+    }
+    private static void requireCurrentWitnesses(DistributedCommand command,ImmutableReader reader) throws IOException {
+        for(var predicate:command.predicates()) if(!Arrays.equals(reader.read(predicate.key()),predicate.expectedValue())) throw new IOException("Topology execution lost exact committed metadata witnesses");
+    }
+    public static TopologyChange.Proof executionProof(DistributedCommand command) {
+        if(!requiresOwnerAdmission(command) || command.mutations().size()!=2) throw new IllegalArgumentException("Expected single-owner topology proof command");
+        var previous=TopologyChange.State.decode(command.predicates().getFirst().expectedValue()); var next=TopologyChange.State.decode(command.mutations().getFirst().value());
+        next.requireSuccessorOf(previous); return addedProof(previous,next);
+    }
+    public static List<TopologyChange.Proof> publicationProofs(DistributedCommand command) {
+        if(!requiresOwnerAdmission(command) || command.mutations().size()!=3) throw new IllegalArgumentException("Expected topology publication");
+        var previous=TopologyChange.State.decode(command.predicates().getFirst().expectedValue()); var next=TopologyChange.State.decode(command.mutations().getFirst().value());
+        next.requireSuccessorOf(previous);
+        if(previous.phase()!=TopologyChange.Phase.SEEDED || next.phase()!=TopologyChange.Phase.PUBLISHED) throw new IllegalArgumentException("Expected SEEDED publication");
+        return previous.seeded().values().stream().filter(proof -> proof.owner().role()==ReplicaDescriptor.Role.VOTER).sorted(Comparator.comparing(TopologyChange.Proof::groupId,RangeDirectoryCodec.UUID_ORDER).thenComparing(proof -> proof.owner().replicaId(),RangeDirectoryCodec.UUID_ORDER)).toList();
+    }
+    private static void requireQualified(TopologyChange.Proof expected,QualifiedOwner actual) throws IOException {
+        if(actual==null || !expected.equals(actual.proof())) throw new IOException("Topology owner changed its original native proof");
+        var cut=actual.completedCut(); var original=expected.position();
+        if(cut.term()<1 || cut.index()<original.index() || cut.term()<original.term() || original.term()>0 && cut.index()==original.index() && cut.term()!=original.term()) throw new IOException("Topology owner lacks a completed committed native cut covering its proof");
+    }
+    private static Map<TopologyChange.Key,TopologyChange.Proof> proofs(TopologyChange.State state,TopologyChange.Stage stage) { return switch(stage) { case FREEZE -> state.frozen(); case SEED -> state.seeded(); case ACTIVATE -> state.activated(); }; }
+    /** Decode the single new native owner proof; never derive one owner's proof from another row. */
+    private static TopologyChange.Proof addedProof(TopologyChange.State previous,TopologyChange.State next) {
+        TopologyChange.Proof result=null;
+        for(var stage:TopologyChange.Stage.values()) for(var row:proofs(next,stage).entrySet()) if(!proofs(previous,stage).containsKey(row.getKey())) {
+            if(result!=null) throw new IllegalArgumentException("Topology progress adds more than one owner proof"); result=row.getValue();
+        }
+        if(result==null) throw new IllegalArgumentException("Topology progress must add one original owner proof"); return result;
+    }
     public CommandResult execute(DistributedCommand command) throws IOException { validator.accept(command); try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))),8)); } catch(IllegalArgumentException invalid) { throw new IOException("Invalid topology command reply",invalid); } }
-    private DistributedCommand checked(OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) { var command=new DistributedCommand(group,epoch,schema,operation,mutations,predicates); validator.accept(command); return command; }
+    private DistributedCommand checked(OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) { var command=new DistributedCommand(group,epoch,schema,operation,mutations,predicates); validator.accept(command); DistributedCommandCodec.encode(command); return command; }
     private Mutation put(byte[] key,byte[] value) { return new Mutation(Mutation.Kind.PUT,column,key,value); }
     private KeyPredicate predicate(byte[] key,byte[] value) { return new KeyPredicate(column,key,value); }
     public static boolean isCommand(DistributedCommand command) { return command.mutations().stream().anyMatch(m->{ byte[] key=m.key(); return key.length==33 && key[0]==DEFINITION || key.length==17 && (key[0]==STATE || key[0]==HEAD || key[0]==IDENTITY) || key.length==1 && key[0]==CAPACITY; }); }
@@ -86,7 +175,7 @@ public final class RatisTopologyCatalogue {
                         || !Capacity.decode(command.mutations().get(2).value()).equals(Capacity.decode(command.predicates().get(2).expectedValue()).reserve(definition.encode().length))) throw new IllegalArgumentException("Topology definition identity/capacity differs");
                 return;
             }
-            if(command.mutations().size()!=2 || command.predicates().size()!=2 && command.predicates().size()!=6) throw new IllegalArgumentException("Invalid topology intent shape");
+            if((command.mutations().size()!=2 && command.mutations().size()!=3) || command.predicates().size()!=2 && command.predicates().size()!=6) throw new IllegalArgumentException("Invalid topology intent shape");
             var next=TopologyChange.State.decode(command.mutations().getFirst().value()); var header=next.header(); requireNamespace(header,cluster,database);
             mutation(command.mutations().get(0),stateKey(header.intentId())); mutation(command.mutations().get(1),headKey(header.domainId()));
             if(!Arrays.equals(command.mutations().get(0).value(),command.mutations().get(1).value())) throw new IllegalArgumentException("Topology head/state differ");
@@ -95,22 +184,39 @@ public final class RatisTopologyCatalogue {
                 var previous=TopologyChange.State.decode(command.predicates().get(0).expectedValue());
                 if(!Arrays.equals(command.predicates().get(0).expectedValue(),command.predicates().get(1).expectedValue())) throw new IllegalArgumentException("Topology predecessor head/state differ");
                 next.requireSuccessorOf(previous);
-                if(previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.ABORTED) throw new IllegalArgumentException("Native topology execution authority is not configured");
+                if(command.mutations().size()!=2 || previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.ABORTED) throw new IllegalArgumentException("Native topology execution authority is not configured");
                 return;
             }
             var oldState=command.predicates().get(0).expectedValue(); var oldHead=command.predicates().get(1).expectedValue();
             if(oldState==null) {
-                if(!next.equals(TopologyChange.State.begin(header))) throw new IllegalArgumentException("Topology BEGIN must be initial");
+                if(command.mutations().size()!=2 || !next.equals(TopologyChange.State.begin(header))) throw new IllegalArgumentException("Topology BEGIN must be initial");
                 if(oldHead!=null) { var previous=TopologyChange.State.decode(oldHead); requireNamespace(previous.header(),cluster,database); if(!previous.header().domainId().equals(header.domainId()) || !previous.terminal()) throw new IllegalArgumentException("Topology predecessor is not terminal"); }
             } else {
                 var previous=TopologyChange.State.decode(oldState); next.requireSuccessorOf(previous);
-                if(!Arrays.equals(oldState,oldHead) || previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.FENCING) throw new IllegalArgumentException("Topology fencing requires exact prepared head/state");
+                if(!Arrays.equals(oldState,oldHead)) throw new IllegalArgumentException("Topology progress requires exact predecessor head/state");
+                if(previous.phase()==TopologyChange.Phase.PREPARED) {
+                    if(command.mutations().size()!=2 || next.phase()!=TopologyChange.Phase.FENCING) throw new IllegalArgumentException("Topology fencing requires exact prepared head/state");
+                } else if(previous.phase()==TopologyChange.Phase.SEEDED && next.phase()==TopologyChange.Phase.PUBLISHED) {
+                    if(command.mutations().size()!=3) throw new IllegalArgumentException("Topology publication must atomically replace its directory");
+                } else {
+                    if(command.mutations().size()!=2 || next.phase()==TopologyChange.Phase.RETIRED || previous.terminal()) throw new IllegalArgumentException("Topology terminal retention barriers are not configured");
+                    var proof=addedProof(previous,next);
+                    boolean allowed=switch(proof.stage()) {
+                        case FREEZE -> previous.phase()==TopologyChange.Phase.FENCING || previous.phase()==TopologyChange.Phase.FENCED || previous.phase()==TopologyChange.Phase.SEEDED;
+                        case SEED -> previous.phase()==TopologyChange.Phase.FENCED || previous.phase()==TopologyChange.Phase.SEEDED || previous.phase()==TopologyChange.Phase.PUBLISHED || previous.phase()==TopologyChange.Phase.ACTIVE;
+                        case ACTIVATE -> previous.phase()==TopologyChange.Phase.PUBLISHED || previous.phase()==TopologyChange.Phase.ACTIVE;
+                    };
+                    if(!allowed) throw new IllegalArgumentException("Topology native proof belongs to another execution stage");
+                }
             }
             if(reader==null) throw new IllegalArgumentException("Topology immutable definition reader unavailable");
-            var definition=TopologyChange.Definition.decode(reader.read(definitionKey(header.definitionDigest()))); header.requireDefinition(definition);
-            guard(command.predicates().get(2),column,domainKey(header.domainId())); if(!Arrays.equals(command.predicates().get(2).expectedValue(),RangeDirectoryCodec.encode(definition.sourceDirectory()))) throw new IllegalArgumentException("Topology source directory differs");
+            var definition=TopologyChange.Definition.decode(reader.read(definitionKey(header.definitionDigest()))); header.requireDefinition(definition); requireDefinition(definition,cluster,database,header.definitionDigest());
+            var previous=oldState==null ? null : TopologyChange.State.decode(oldState);
+            var directory=previous!=null && (previous.phase()==TopologyChange.Phase.PUBLISHED || previous.phase()==TopologyChange.Phase.ACTIVE) ? definition.targetDirectory() : definition.sourceDirectory();
+            guard(command.predicates().get(2),column,domainKey(header.domainId())); if(!Arrays.equals(command.predicates().get(2).expectedValue(),RangeDirectoryCodec.encode(directory))) throw new IllegalArgumentException("Topology stage directory differs");
+            if(command.mutations().size()==3) { mutation(command.mutations().get(2),domainKey(header.domainId())); if(!Arrays.equals(command.mutations().get(2).value(),RangeDirectoryCodec.encode(definition.targetDirectory()))) throw new IllegalArgumentException("Topology publication target directory differs"); }
             guard(command.predicates().get(3),column,identityKey(header.intentId())); if(!Arrays.equals(command.predicates().get(3).expectedValue(),header.definitionDigest())) throw new IllegalArgumentException("Topology definition identity is not committed");
-            RatisSchemaAdministration.requireTopologyGuard(command.predicates().get(4),definition.sourceDirectory()); RatisRangeImportCatalogue.requireTopologyGuard(command.predicates().get(5),definition.sourceDirectory());
+            RatisSchemaAdministration.requireTopologyGuard(command.predicates().get(4),directory); RatisRangeImportCatalogue.requireTopologyGuard(command.predicates().get(5),directory);
             if(!command.predicates().get(4).columnId().equals(column) || !command.predicates().get(5).columnId().equals(column)) throw new IllegalArgumentException("Topology administrative guard column differs");
         };
     }

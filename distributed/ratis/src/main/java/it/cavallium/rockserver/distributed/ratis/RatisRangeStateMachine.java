@@ -5,6 +5,8 @@ import it.cavallium.rockserver.core.common.distributed.RangeImportAdmission;
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.TopologyChange;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologySeed;
 import it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor;
 import it.cavallium.rockserver.core.common.distributed.RangeDescriptor;
 import it.cavallium.rockserver.core.common.distributed.SchemaChange;
@@ -132,12 +134,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @FunctionalInterface public interface ImportPublicationAdmission { void validate(DistributedCommand command) throws IOException; }
     private ImportPublicationAdmission importPublicationAdmission;
     private ImportPublicationAdmission cdcDeliveryAdmission;
+    private ImportPublicationAdmission topologyExecutionAdmission;
+    void topologyExecutionAdmission(ImportPublicationAdmission admission) {
+        if(role!=RatisNodePlan.Role.CATALOGUE || getLifeCycleState()!=LifeCycle.State.NEW || topologyExecutionAdmission!=null)throw new IllegalStateException("Topology execution admission is fixed before initialization");topologyExecutionAdmission=java.util.Objects.requireNonNull(admission);
+    }
     void cdcDeliveryAdmission(ImportPublicationAdmission admission) {
         if(role!=RatisNodePlan.Role.CATALOGUE || getLifeCycleState()!=LifeCycle.State.NEW || cdcDeliveryAdmission!=null) throw new IllegalStateException("CDC delivery admission is fixed before initialization");
         cdcDeliveryAdmission=java.util.Objects.requireNonNull(admission);
     }
     private boolean requiresCataloguePreparation(DistributedCommand command) {
-        return role==RatisNodePlan.Role.CATALOGUE && (RatisRangeImportCatalogue.requiresOwnerAdmission(command) || RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command));
+        return role==RatisNodePlan.Role.CATALOGUE && (RatisTopologyCatalogue.requiresOwnerAdmission(command) || RatisRangeImportCatalogue.requiresOwnerAdmission(command) || RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command));
     }
     /** Trusted fresh owner checks for new publications only. Committed replay never invokes this callback. */
     public void importPublicationAdmission(ImportPublicationAdmission admission) {
@@ -166,13 +172,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         proposalFootprints.release(hold.lease);
         if(importPublicationHolds.remove(hold.command.operationId(),hold))importPublicationBytes-=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;
     }
+    private static boolean preparedCutMatches(ImportPublicationHold hold,ApplyPosition current) {
+        if(hold.cut==null || current==null)return false;
+        // The drained topology key gate protects every witness; unrelated same-term metadata
+        // can advance the completed prefix without changing the qualified catalogue decision.
+        return RatisTopologyCatalogue.requiresOwnerAdmission(hold.command)
+                ? current.term()==hold.term && current.index()>=hold.cut.index()
+                : hold.cut.equals(current);
+    }
     private void requireImportPublication(ImportPublicationHold hold,DistributedCommand command,Leadership owner,long generation)throws IOException{
         if(hold==null || importPublicationHolds.get(command.operationId())!=hold || !Arrays.equals(hold.digest,command.payloadDigest()) || hold.reading || !hold.qualified || hold.invalidated || hold.released
                 || !owner.ready() || hold.term!=owner.term() || hold.generation!=generation || generation!=admissionGeneration.get() || getLifeCycleState()!=LifeCycle.State.RUNNING
-                || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(hold.cut,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication lacks current prepared owner");
+                || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp || !preparedCutMatches(hold,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication lacks current prepared owner");
     }
     private void prepareImportPublication(DistributedCommand command)throws Exception{
-        var admission=RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command) ? cdcDeliveryAdmission : importPublicationAdmission;
+        var admission=RatisTopologyCatalogue.requiresOwnerAdmission(command) ? topologyExecutionAdmission : RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command) ? cdcDeliveryAdmission : importPublicationAdmission;
         if(role!=RatisNodePlan.Role.CATALOGUE || !requiresCataloguePreparation(command))throw new IOException("Expected catalogue delivery/publication preparation");
         checkCatalogueOwner();var owner=leadership();long generation=admissionGeneration.get();
         if(!store.estimateReceiptRetention(command).newReceipt())return;
@@ -203,7 +217,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             commandValidator.accept(command);store.validate(command);
             var points=new ArrayList<ReplicatedRangeStore.PhysicalPoint>();for(var predicate:command.predicates())points.add(new ReplicatedRangeStore.PhysicalPoint(predicate.columnId(),predicate.key()));
             ApplyPosition cut=null;int checked=0;
-            for(int offset=0;offset<points.size();offset+=4){var witnesses=store.readCurrentPoints(points.subList(offset,Math.min(offset+4,points.size())));if(cut!=null && !cut.equals(witnesses.position()))throw new IOException("Import publication witness cut advanced");cut=witnesses.position();var values=witnesses.values();for(var value:values)if(!Arrays.equals(value,command.predicates().get(checked++).expectedValue()))throw new IOException("Import publication current native witness changed");}
+            for(int offset=0;offset<points.size();offset+=4){var keys=points.subList(offset,Math.min(offset+4,points.size()));int[] bounds=new int[keys.size()];for(int i=0;i<bounds.length;i++){byte[] expected=command.predicates().get(offset+i).expectedValue();bounds[i]=expected==null ? 1 : Math.max(1,expected.length);}var witnesses=RatisTopologyCatalogue.requiresOwnerAdmission(command) ? store.readSchemaAuthorityPoints(keys,bounds) : store.readCurrentPoints(keys);if(cut!=null && (RatisTopologyCatalogue.requiresOwnerAdmission(command)
+                    ? witnesses.position()==null || witnesses.position().term()!=hold.term || witnesses.position().index()<cut.index()
+                    : !cut.equals(witnesses.position())))throw new IOException("Import publication witness cut advanced");cut=witnesses.position();var values=witnesses.values();for(var value:values)if(!Arrays.equals(value,command.predicates().get(checked++).expectedValue()))throw new IOException("Import publication current native witness changed");}
             hold.cut=cut;admission.validate(command);
             var current=leadership();
             synchronized(admissions){hold.reading=false;requireImportPublicationForQualification(hold,current);hold.qualified=true;qualified=true;}
@@ -212,7 +228,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void requireImportPublicationForQualification(ImportPublicationHold hold,Leadership current)throws IOException{
         if(importPublicationHolds.get(hold.command.operationId())!=hold || hold.invalidated || hold.released || !current.ready() || current.term()!=hold.term || hold.generation!=admissionGeneration.get()
                 || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp || hold.cut==null || hold.cut.term()!=current.term()
-                || !java.util.Objects.equals(hold.cut,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication preparation lost its cut/owner");
+                || !preparedCutMatches(hold,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication preparation lost its cut/owner");
     }
     private void cancelImportPublication(DistributedCommand command){synchronized(admissions){var hold=importPublicationHolds.get(command.operationId());if(hold!=null && Arrays.equals(hold.digest,command.payloadDigest()) && !hold.submitted){hold.invalidated=true;releaseImportPublication(hold);}}}
     private static byte[] importProposalBytes(Object record) {
@@ -328,7 +344,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     record Leadership(long term, boolean ready) {}
     @FunctionalInterface interface LeadershipSource { Leadership get() throws IOException; }
     private final LeadershipSource leadershipSource;
-    @FunctionalInterface interface TopologyAuthorityReader { RatisTopologyAuthority.View read(TopologyChange.Header header)throws IOException; }
+    @FunctionalInterface interface TopologyAuthorityReader { RatisTopologyAuthority.View read(TopologyChange.Header header,TopologyChange.Stage stage)throws IOException; }
     private TopologyAuthorityReader topologyAuthority;
     private RangeDescriptor topologyDescriptor;private ReplicaDescriptor topologyLocalReplica;private DistributedStoragePool topologyStorage;
     void topologyAuthority(TopologyAuthorityReader reader,RangeDirectory directory,ReplicaDescriptor local,DistributedStoragePool pool){
@@ -348,7 +364,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     record TopologyFreezeStats(int holds,long bytes,int reading) {}
     TopologyFreezeStats topologyFreezeStats(){synchronized(admissions){return new TopologyFreezeStats(topologySlots,topologyBytes,topologyHold!=null && topologyHold.reading ? 1 : 0);}}
-    CompletableFuture<Void> topologyCleanup(){synchronized(admissions){return CompletableFuture.allOf(topologyApplyCleanup,topologyHold==null ? CompletableFuture.completedFuture(null) : topologyHold.cleanup).copy();}}
+    CompletableFuture<Void> topologyCleanup(){synchronized(admissions){return CompletableFuture.allOf(topologyApplyCleanup,topologyActivationHold==null ? CompletableFuture.completedFuture(null) : topologyActivationHold.cleanup,topologyHold==null ? CompletableFuture.completedFuture(null) : topologyHold.cleanup).copy();}}
     private void finishTopologyHold(TopologyHold hold){if(topologyHold==hold){topologyHold=null;topologySlots--;topologyBytes-=hold.bytes.length;}}
     private void releaseTopologyHold(TopologyHold hold){
         hold.released=true;if(hold.reading || hold.cleaning)return;
@@ -389,7 +405,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         boolean qualified=false;
         try{
-            var view=topologyAuthority.read(record.header());view.require(RatisTopologyAuthority.Request.of(record.header()));
+            var view=topologyAuthority.read(record.header(),TopologyChange.Stage.FREEZE);view.require(RatisTopologyAuthority.Request.of(record.header(),TopologyChange.Stage.FREEZE));
             if(!Arrays.equals(view.definition().encode(),record.definition().encode()) || !Arrays.equals(view.admissionDigest(),record.admissionDigest()))throw new IOException("Topology FREEZE catalogue admission changed");
             requireTopologyRecord(record);boolean drained;synchronized(admissions){if(hold.invalidated || hold.released || generation!=admissionGeneration.get() || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Topology FREEZE preparation lost replacement owner");drained=proposalFootprints.drained(hold.lease);}
             var capture=drained ? store.prepareTopologyFreeze(record.definition(),record.admissionDigest()) : null;var state=capture==null ? null : capture.state();var current=leadership();
@@ -417,6 +433,122 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var hold=topologyHold;requireTopologyOwner(hold,record,owner,generation,true);hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}
     }
     private byte[] topologyRecovered(RatisTopologyFreezeRecord record){var freeze=store.lookupTopologyFreeze(record.header(),record.admissionDigest());if(freeze==null)return null;freeze.requireCut(store.applied());synchronized(admissions){if(topologyHold!=null && topologyHold.record.equals(record))releaseTopologyHold(topologyHold);}return freeze.encode();}
+    @FunctionalInterface interface TopologySeedInstaller { NativeTopologySeed install(RatisTopologySeedRpc.Request request)throws IOException; }
+    private TopologySeedInstaller topologySeedInstaller;
+    void topologySeedInstaller(TopologySeedInstaller installer) { requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || topologySeedInstaller!=null)throw new IllegalStateException("Topology seed installer is fixed before initialization");topologySeedInstaller=java.util.Objects.requireNonNull(installer); }
+    private ActivationHold topologyActivationHold;
+    private java.util.function.BiConsumer<TopologyChange.Definition,NativeTopologyActivation> topologyActivationObserver;
+    private volatile Throwable topologyActivationObserverFailure;
+    void topologyActivated(java.util.function.BiConsumer<TopologyChange.Definition,NativeTopologyActivation> observer) {
+        requireDataRole(); if(getLifeCycleState()!=LifeCycle.State.NEW || topologyActivationObserver!=null)throw new IllegalStateException("Topology activation observer is fixed before initialization"); topologyActivationObserver=java.util.Objects.requireNonNull(observer);
+    }
+    Throwable topologyActivationObserverFailure() { return topologyActivationObserverFailure; }
+    private static final class ActivationHold {
+        final RatisTopologyActivationRecord record; final long term,generation,stamp; final ApplyPosition cut; final ProposalFootprints.GateLease lease;
+        final CompletableFuture<Void> cleanup=new CompletableFuture<>();
+        boolean reading=true,qualified,submitted,maybeAppended,invalidated,released; int owners;
+        ActivationHold(RatisTopologyActivationRecord record,Leadership leader,long generation,long stamp,ApplyPosition cut,ProposalFootprints.GateLease lease) { this.record=record; term=leader.term();this.generation=generation;this.stamp=stamp;this.cut=cut;this.lease=lease; }
+    }
+    record TopologyActivationStats(int holds,long bytes,int reading) {}
+    TopologyActivationStats topologyActivationStats() { synchronized(admissions) { var h=topologyActivationHold; return new TopologyActivationStats(h==null?0:1,h==null?0:h.record.encode().length,h!=null && h.reading?1:0); } }
+    private void releaseTopologyActivation(ActivationHold hold) {
+        hold.released=true; if(hold.reading || hold.owners!=0)return;
+        if(hold.lease!=null)proposalFootprints.release(hold.lease);
+        if(topologyActivationHold==hold) { topologyActivationHold=null;topologySlots--;topologyBytes-=hold.record.encode().length; }
+        hold.cleanup.complete(null);
+    }
+    private NativeTopologyActivation savedTopologyActivation(RatisTopologyActivationRecord record) {
+        var saved=store.topologyActivation(); if(saved==null)return null;
+        RatisTopologyActivationRpc.requireActivation(record,saved); var seed=topologyStorage.topologySeed(saved.birth().intentId()); if(seed==null)throw new IllegalArgumentException("Topology activation original seed missing"); saved.requireSeed(seed); saved.requireCut(store.applied()); return saved;
+    }
+    private void requireTopologyActivationRecord(RatisTopologyActivationRecord record)throws Exception {
+        requireDataRole(); if(topologyAuthority==null || topologyStorage==null || topologyLocalReplica==null || topologyDescriptor==null || !record.groupId().equals(store.ownership().owner().groupId()) || schemaConfigurationPending)throw new IOException("Topology activation local owner is not configured");
+        var seed=topologyStorage.topologySeed(record.header().intentId()); var birth=store.topologyBirth(); if(seed==null || birth==null || store.topologyRetired())throw new IOException("Topology activation requires retained live local child");
+        birth.requireSeed(seed); seed.header().requireDefinition(record.definition()); if(!seed.localReplica().equals(topologyLocalReplica) || !Arrays.equals(seed.authority().freezeDigest(),record.freezeDigest()))throw new IOException("Topology activation local seed/source changed");
+        var target=birth.resolveDescriptor(seed);var interval=store.ownership().interval();
+        if(!target.equals(topologyDescriptor) || target.rangeEpoch()!=store.ownership().owner().epoch() || !record.header().domainId().equals(interval.domainId()) || !Arrays.equals(target.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(target.upperExclusive(),interval.upperExclusive()))throw new IOException("Topology activation frozen placement changed");
+        if(store.topologyActivation()==null) { if(!store.topologyBirthPending() || store.ownership().state()!=RangeOwnership.State.FENCED)throw new IOException("Topology activation requires fenced pending birth"); var schema=store.installedSchema();if(schema==null)throw new IOException("Topology activation schema unavailable"); schema.requireMatches(record.definition().targetDirectory()); }
+        var cfg=store.configuration();if(cfg==null)throw new IOException("Topology activation own native configuration absent");requireSchemaMembership(target,cfg.data());
+        var cut=store.applied(); if(cut==null || cut.term()<=0 || cut.index()<0 || cfg.term()>cut.term() || cfg.index()>cut.index())throw new IOException("Topology activation own prefix/configuration incomplete");
+        var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("Topology activation local server identity changed");
+    }
+    private void requireTopologyActivationOwner(ActivationHold hold,RatisTopologyActivationRecord record,Leadership leader,long generation)throws IOException {
+        var cut=store.applied(); if(hold==null || topologyActivationHold!=hold || !hold.record.equals(record) || hold.reading || !hold.qualified || hold.released || hold.invalidated || !leader.ready() || leader.term()!=hold.term || hold.generation!=generation || generation!=admissionGeneration.get() || hold.stamp!=schemaConfigurationStamp || schemaConfigurationPending || getLifeCycleState()!=LifeCycle.State.RUNNING || cut==null || cut.term()!=leader.term() || !cut.equals(hold.cut) || store.topologyRetired() || !(store.topologyBirthPending() || store.admissionOpen()) || hold.lease!=null && !proposalFootprints.drained(hold.lease))throw new IOException("Topology activation lacks current prepared owner");
+    }
+    private void prepareTopologyActivation(RatisTopologyActivationRecord record,long generation)throws Exception {
+        requireTopologyActivationRecord(record); var leader=leadership(); var cut=store.applied(); if(!leader.ready() || cut.term()!=leader.term() || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Topology activation leader lacks completed current term");
+        if(savedTopologyActivation(record)!=null)return; final ActivationHold hold;
+        synchronized(admissions) {
+            reconcileOlderProposalTerms(leader.term()); if(schemaConfigurationPending || generation!=admissionGeneration.get())throw new IOException("Topology activation owner changed");
+            if(topologyActivationHold!=null) {
+                var existing=topologyActivationHold;
+                if(!existing.record.equals(record))throw new IOException("Topology activation identity already reserved");
+                try { requireTopologyActivationOwner(existing,record,leader,generation);return; }
+                catch(IOException stale) { if(existing.reading || existing.submitted || existing.owners!=0)throw stale;existing.invalidated=true;releaseTopologyActivation(existing); }
+            }
+            if(schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Protected activation proposal budget exhausted");
+            var spans=record.definition().targetDirectory().columns().stream().map(c->TransactionScope.Span.range(c,null,null)).toList();var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),leader.term(),generation);if(lease==null)throw new IOException("Topology activation scope already reserved");
+            hold=new ActivationHold(record,leader,generation,schemaConfigurationStamp,cut,lease);topologyActivationHold=hold;topologySlots++;topologyBytes+=record.encode().length;
+        }
+        boolean qualified=false;
+        try {
+            synchronized(admissions) { if(!proposalFootprints.drained(hold.lease))throw new IOException("Topology activation predecessors still settling"); }
+            var view=topologyAuthority.read(record.header(),TopologyChange.Stage.ACTIVATE);record.requireAuthority(view);requireTopologyActivationRecord(record);var current=leadership();
+            synchronized(admissions) { hold.reading=false;hold.qualified=true;requireTopologyActivationOwner(hold,record,current,generation);qualified=true; }
+        } finally { synchronized(admissions) { hold.reading=false;if(!qualified || hold.released || hold.invalidated)releaseTopologyActivation(hold); } }
+    }
+    private RatisTopologyActivationRpc.State topologyActivationState(RatisTopologyActivationRecord record)throws Exception {
+        requireTopologyActivationRecord(record);var saved=savedTopologyActivation(record);boolean ready=saved!=null;
+        var current=leadership();
+        synchronized(admissions) { if(saved==null && topologyActivationHold!=null) { try { requireTopologyActivationOwner(topologyActivationHold,record,current,admissionGeneration.get());ready=true; } catch(IOException stale) { ready=false; } } }
+        return new RatisTopologyActivationRpc.State(record,saved,ready);
+    }
+    private TransactionContext startTopologyActivation(TransactionContext transaction,RatisTopologyActivationRecord record,long generation,Leadership leader)throws Exception {
+        requireTopologyActivationRecord(record);var saved=savedTopologyActivation(record);
+        synchronized(admissions) { reconcileOlderProposalTerms(leader.term());
+            if(saved!=null && topologyActivationHold==null) { if(schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Topology activation retry budget exhausted");var hold=new ActivationHold(record,leader,generation,schemaConfigurationStamp,store.applied(),null);hold.reading=false;hold.qualified=true;topologyActivationHold=hold;topologySlots++;topologyBytes+=record.encode().length; }
+            var hold=topologyActivationHold;requireTopologyActivationOwner(hold,record,leader,generation);hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;
+        }
+    }
+    private byte[] topologyActivationRecovered(RatisTopologyActivationRecord record) {
+        var saved=savedTopologyActivation(record);if(saved==null)return null; synchronized(admissions) { if(topologyActivationHold!=null && topologyActivationHold.record.equals(record))releaseTopologyActivation(topologyActivationHold); } return saved.encode();
+    }
+    private RatisTopologyOwnerRpc.Evidence topologyOwnerEvidence(RatisTopologyOwnerRpc.Target target)throws Exception {
+        requireHealthy();requireDataRole();if(getLifeCycleState()!=LifeCycle.State.RUNNING || topologyStorage==null || topologyDescriptor==null || topologyLocalReplica==null || !target.group().equals(store.ownership().owner().groupId()) || !target.replica().equals(topologyLocalReplica.replicaId()) || !target.owner().equals(topologyLocalReplica) || !target.range().equals(topologyDescriptor))throw new IOException("Topology proof does not address actual initialized local owner");
+        var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("Topology proof local server changed");
+        var division=server.getDivision(getGroupId());final org.apache.ratis.server.RaftConfiguration raftConfiguration;final long term;
+        synchronized(division) { if(division.getStateMachine()!=this || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING || !division.getInfo().isAlive())throw new IOException("Topology proof division is not the running state-machine owner");term=division.getInfo().getCurrentTerm();raftConfiguration=division.getRaftConf(); }
+        final long generation=admissionGeneration.get(),stamp;
+        synchronized(admissions) { if(schemaConfigurationPending)throw new IOException("Topology proof waits for configuration completion");stamp=schemaConfigurationStamp; }
+        var cut=store.applied();var cfg=store.configuration();if(cut==null || cut.term()<=0 || cut.index()<0 || cut.term()!=term || cfg==null || cfg.term()>cut.term() || cfg.index()>cut.index() || cfg.index()==cut.index() && cfg.term()!=cut.term())throw new IOException("Topology proof lacks actual current-term completed prefix/configuration");
+        requireSchemaMembership(target.range(),cfg.data());
+        for(var role:List.of(RaftPeerRole.FOLLOWER,RaftPeerRole.LISTENER)) {
+            if(!raftConfiguration.getPreviousPeers(role).isEmpty())throw new IOException("Topology proof waits for stable actual Raft membership");
+            var expected=new java.util.TreeMap<String,String>();var actual=new java.util.TreeMap<String,String>();
+            for(var replica:target.range().replicas())if((replica.role()==ReplicaDescriptor.Role.LISTENER)==(role==RaftPeerRole.LISTENER))expected.put(replica.peerId(),replica.address());
+            for(var peer:raftConfiguration.getCurrentPeers(role))actual.put(peer.getId().toString(),peer.getAddress());if(!actual.equals(expected))throw new IOException("Topology proof actual division address/role configuration changed");
+        }
+        if(raftConfiguration.getLogEntryIndex()>cut.index() || cfg.index()>=0 && raftConfiguration.getLogEntryIndex()!=cfg.index())throw new IOException("Topology proof actual/native configuration positions differ");
+        final TopologyChange.Proof proof;final byte[] artifact;
+        switch(target.stage()) {
+            case FREEZE -> {
+                var view=new RatisTopologyAuthority.View(target.catalogue(),cut,target.definition(),TopologyChange.State.begin(target.definition().header()).beginFencing());
+                var freeze=store.lookupTopologyFreeze(target.definition().header(),view.admissionDigest());if(freeze==null)throw new IOException("Topology proof has no original native FREEZE");freeze.requireCut(cut);proof=freeze.proof(topologyLocalReplica.replicaId());artifact=freeze.encode();
+            }
+            case SEED -> {
+                var seed=topologyStorage.topologySeed(target.definition().intentId());var birth=store.topologyBirth();if(seed==null || birth==null || !seed.localReplica().equals(topologyLocalReplica))throw new IOException("Topology proof has no actual local SEED");seed.header().requireDefinition(target.definition());birth.requireSeed(seed);proof=birth.proof(seed);artifact=seed.encode();
+            }
+            case ACTIVATE -> {
+                var seed=topologyStorage.topologySeed(target.definition().intentId());var receipt=store.topologyActivation();if(seed==null || receipt==null || !receipt.catalogueGroup().equals(target.catalogue()))throw new IOException("Topology proof has no actual local ACTIVATE");receipt.requireSeed(seed);receipt.header().requireDefinition(target.definition());receipt.requireCut(cut);proof=receipt.proof();artifact=receipt.encode();
+            }
+            default -> throw new IOException("Unknown topology proof stage");
+        }
+        var evidence=new RatisTopologyOwnerRpc.Evidence(target,topologyLocalReplica,proof,cut,cfg.term(),cfg.index(),cfg.data(),term,artifact);
+        synchronized(division) { if(division.getStateMachine()!=this || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING || !division.getInfo().isAlive() || division.getInfo().getCurrentTerm()!=term || division.getRaftConf()!=raftConfiguration)throw new IOException("Topology proof actual division changed during native lookup"); }
+        synchronized(admissions) { requireHealthy();if(getLifeCycleState()!=LifeCycle.State.RUNNING || generation!=admissionGeneration.get() || stamp!=schemaConfigurationStamp || schemaConfigurationPending || !cut.equals(store.applied()))throw new IOException("Topology proof native owner/cut changed"); }
+        var current=store.configuration();if(current==null || current.term()!=cfg.term() || current.index()!=cfg.index() || !Arrays.equals(current.data(),cfg.data()))throw new IOException("Topology proof native membership changed");
+        return evidence;
+    }
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
     @FunctionalInterface interface SnapshotHelpAction { boolean run() throws Exception; }
@@ -503,7 +635,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized (admissions) { if (schemaConfigurationPending || stamp!=schemaConfigurationStamp) throw new IOException("Schema replica configuration changed during validation"); }
         return stamp;
     }
-    private static void requireSchemaMembership(it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor,byte[] configuration) throws IOException {
+    static void requireSchemaMembership(it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor,byte[] configuration) throws IOException {
         var nativeConfiguration=RaftConfigurationProto.parseFrom(configuration);
         var actual=new java.util.HashMap<String,String>();
         if (nativeConfiguration.getOldPeersCount()!=0 || nativeConfiguration.getOldListenersCount()!=0) throw new IOException("Schema replica waits for stable native membership");
@@ -535,6 +667,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         };
     }
     private void publishSchemaActivation(AppliedRecord applied) {
+        if(applied!=null && applied.topologyActivation()!=null && topologyActivationObserver!=null) {
+            try { topologyActivationObserver.accept(applied.topologyDefinition(),applied.topologyActivation()); }
+            catch(Throwable failure) { topologyActivationObserverFailure=failure; }
+        }
         if (applied==null || applied.activation()==null || schemaActivationObserver==null) return;
         try { schemaActivationObserver.accept(applied.definition(),applied.activation()); }
         catch (Throwable failure) { schemaActivationObserverFailure=failure; }
@@ -976,6 +1112,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || !identity.columnId().equals(homeColumn)) throw new IllegalArgumentException("HOME retirement requires the configured transaction HOME context");
     }
     private void requireRoleRecord(byte[] encoded) {
+        if(RatisTopologyActivationRecord.isActivation(encoded)){requireDataRole();if(!RatisTopologyActivationRecord.decode(encoded).groupId().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign topology ACTIVATE group");return;}
         if(RatisTopologyFreezeRecord.isFreeze(encoded)){requireDataRole();if(!RatisTopologyFreezeRecord.decode(encoded).groupId().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign topology FREEZE group");return;}
         if (RatisReferencedFile.Request.isRequest(encoded)) { requireDataRole(); if(referencedFiles==null || rangeImportApply==null)throw new IllegalArgumentException("Native import file owner is not configured"); referencedFiles.requireGroup(RatisReferencedFile.Request.decode(encoded).groupId()); return; }
         if (RatisRangeImportRecord.isImport(encoded)) { requireDataRole(); if(rangeImportApply==null)throw new IllegalArgumentException("Native import adapter is not configured"); RatisRangeImportRecord.decode(encoded).requireDefinition(rangeImportApply.definition()); return; }
@@ -1437,6 +1574,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         validateConfiguration(cfg.data());
         if (schemaHold!=null) schemaRecovered(schemaHold.record);
         if(topologyHold!=null)topologyRecovered(topologyHold.record);
+        if(topologyActivationHold!=null)topologyActivationRecovered(topologyActivationHold.record);
         setLastAppliedTermIndex(a == null ? TermIndex.INITIAL_VALUE : TermIndex.valueOf(a.term(), a.index()));
     }
 
@@ -1495,7 +1633,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public long takeSnapshot() throws IOException {
         // A retired parent's shared USER rows may already belong to its children.
-        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending())return -1;
+        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirth()!=null)return -1;
         try (var pin = snapshotPin()) {
             if (pin.position() == null) return -1;
             var position = TermIndex.valueOf(pin.position().term(), pin.position().index());
@@ -1816,6 +1954,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray(); requireRoleRecord(encoded);
+            if(RatisTopologyActivationRecord.isActivation(encoded)){if(!initialGroup.getGroupId().equals(request.getRaftGroupId()))throw new IOException("Topology activation request crossed group");return startTopologyActivation(transaction,RatisTopologyActivationRecord.decode(encoded),generation,leadership);}
             if(RatisTopologyFreezeRecord.isFreeze(encoded))return startTopologyFreeze(transaction,RatisTopologyFreezeRecord.decode(encoded),generation,leadership);
             if (RatisRangeImportRecord.isImport(encoded)) {
                 if(!initialGroup.getGroupId().equals(request.getRaftGroupId()))throw new IOException("Native import request addresses another group");
@@ -2196,6 +2335,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var nativePosition = store.applied();
             synchronized (admissions) {
                 requireHealthy();
+                if(transaction.getStateMachineContext() instanceof ActivationHold hold){requireTopologyActivationOwner(hold,hold.record,current,admissionGeneration.get());if(hold.owners<=0)throw new IOException("Topology activation proposal owner released");return super.preAppendTransaction(transaction);}
                 if(transaction.getStateMachineContext() instanceof TopologyHold hold){requireTopologyOwner(hold,hold.record,current,admissionGeneration.get(),true);return super.preAppendTransaction(transaction);}
                 if (transaction.getStateMachineContext() instanceof ImportApplyHold hold) {
                     requireImportApply(hold,hold.record,current,admissionGeneration.get());
@@ -2231,11 +2371,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
 
-    private record AppliedRecord(OperationId operation,byte[] result,SchemaChange.Definition definition,NativeSchemaActivationProof activation) {
-        AppliedRecord(OperationId operation,byte[] result) { this(operation,result,null,null); }
+    private record AppliedRecord(OperationId operation,byte[] result,SchemaChange.Definition definition,NativeSchemaActivationProof activation,TopologyChange.Definition topologyDefinition,NativeTopologyActivation topologyActivation) {
+        AppliedRecord(OperationId operation,byte[] result) { this(operation,result,null,null,null,null); }
+        AppliedRecord(OperationId operation,byte[] result,SchemaChange.Definition definition,NativeSchemaActivationProof activation) { this(operation,result,definition,activation,null,null); }
     }
     private AppliedRecord applyRecord(ApplyPosition positionArg,byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
+        if(RatisTopologyActivationRecord.isActivation(encoded)) {
+            var record=RatisTopologyActivationRecord.decode(encoded);boolean fresh=store.topologyActivation()==null;
+            var receipt=store.applyTopologyActivation(positionArg,record.definition(),record.freezeDigest(),record.catalogueGroup(),record.catalogueCut(),record.publicationCommitment());
+            if(fresh)refreshSessionAdmission(record.definition().targetDirectory());if(enableSessionControls)store.enableSessionControls();store.enableScopedHistory(RangeMutationHistory.Limits.defaults());
+            synchronized(admissions) { if(topologyActivationHold!=null && topologyActivationHold.record.equals(record))releaseTopologyActivation(topologyActivationHold); }
+            return new AppliedRecord(null,receipt.encode(),null,null,fresh?record.definition():null,fresh?receipt:null);
+        }
         if (RatisSchemaFenceRecord.isFence(encoded)) {
             var record=RatisSchemaFenceRecord.decode(encoded);
             var proof=schemaReplicas==null ? store.applySchemaFence(positionArg,record.header(),record.admissionDigest())
@@ -2302,6 +2450,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
+        if(RatisTopologyActivationRecord.isActivation(encoded))return new AppliedRecord(null,topologyActivationRecovered(RatisTopologyActivationRecord.decode(encoded)));
         if(RatisTopologyFreezeRecord.isFreeze(encoded))return new AppliedRecord(null,topologyRecovered(RatisTopologyFreezeRecord.decode(encoded)));
         if (RatisRangeImportRecord.isImport(encoded)) return new AppliedRecord(null,rangeImportApply.recoveredResult(RatisRangeImportRecord.decode(encoded)));
         if (RatisReferencedFile.Request.isRequest(encoded)) throw new IOException("Reference recovery requires exact original log position");
@@ -2535,7 +2684,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var pending=deferred.get(data);
                 if (asyncNativeRecord(pending.encoded())) { next=new NativeApply(data,pending); nativeApply=next; break; }
                 var applied=applyRecord(new ApplyPosition(pending.term(),data),pending.encoded());
-                if (applied.activation()!=null) activations.add(applied);
+                if (applied.activation()!=null || applied.topologyActivation()!=null) activations.add(applied);
                 synchronized (admissions) { var admission=admissions.get(applied.operation()); if (admission!=null) settleAdmission(admission); }
                 advance(pending.term(),data); deferred.remove(data); deferredBytes-=pending.encoded().length;
                 completions.add(new Completion(pending.future(),Message.valueOf(ByteString.copyFrom(applied.result()))));
@@ -2570,6 +2719,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private void releaseAdmission(TransactionContext transaction) {
         synchronized (admissions) {
+            if(transaction.getStateMachineContext() instanceof ActivationHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released)releaseTopologyActivation(hold);else if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseTopologyActivation(hold);}}
             if(transaction.getStateMachineContext() instanceof TopologyHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseTopologyHold(hold);}}
             if (transaction.getStateMachineContext() instanceof ImportApplyHold hold) {
                 transaction.setStateMachineContext(null); hold.owners--; if(transaction.getLogEntry()!=null)hold.maybeAppended=true;
@@ -2659,6 +2809,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private record NativeAdmissionProof(List<Admission> settled,List<Admission> terminalScopes) {}
     private void invalidateProposalCandidates() { synchronized (admissions) { invalidateUnsubmitted(); } }
     private void invalidateUnsubmitted() {
+        if(topologyActivationHold!=null){topologyActivationHold.invalidated=true;if(!topologyActivationHold.submitted)releaseTopologyActivation(topologyActivationHold);}
         if(topologyHold!=null){topologyHold.invalidated=true;if(!topologyHold.submitted)releaseTopologyHold(topologyHold);}
         if(importApplyHold!=null){importApplyHold.invalidated=true;if(!importApplyHold.submitted)releaseImportApply(importApplyHold);}
         for(var hold:List.copyOf(importPublicationHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseImportPublication(hold);}
@@ -2689,6 +2840,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     /** Only a strictly newer ready native term proves an older term's unknown suffix can no longer interpose. */
     private void reconcileOlderProposalTerms(long term) {
+        // Leadership alone does not exclude a possibly appended activation. A newer completed
+        // native term does; retained TransactionContexts still own the charged record until release.
+        var nativeCut=store.applied();
+        if(topologyActivationHold!=null && topologyActivationHold.term<term && nativeCut!=null && nativeCut.term()>=term)releaseTopologyActivation(topologyActivationHold);
         if (term<=reconciledProposalTerm) return;
         invalidateUnsubmitted();
         for(var hold:List.copyOf(importPublicationHolds.values()))if(hold.term<term)releaseImportPublication(hold);
@@ -3589,7 +3744,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (previous==null) {
                     schemaConfigurationStamp++; schemaConfigurationPending=true;
-                    if(topologyHold!=null){topologyHold.invalidated=true;if(!topologyHold.submitted)releaseTopologyHold(topologyHold);}
+                    if(topologyActivationHold!=null){topologyActivationHold.invalidated=true;if(!topologyActivationHold.submitted)releaseTopologyActivation(topologyActivationHold);}
+        if(topologyHold!=null){topologyHold.invalidated=true;if(!topologyHold.submitted)releaseTopologyHold(topologyHold);}
                     if(importApplyHold!=null){importApplyHold.invalidated=true;if(!importApplyHold.submitted)releaseImportApply(importApplyHold);}
                     for(var hold:List.copyOf(importPublicationHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseImportPublication(hold);}
                     if (schemaHold!=null) { schemaHold.invalidated=true; if (!schemaHold.submitted) releaseSchemaHold(schemaHold); }
@@ -3633,7 +3789,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
-            if(kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner import status has no requested index override");return query(request);}
+            if(kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner import status has no requested index override");return query(request);}
             if (kind>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
@@ -3701,6 +3857,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     return Message.valueOf(ByteString.copyFrom(RatisRangeImportFileResultRpc.reply(file,cut,original==null?null:RatisReferencedFile.decode(original))));
                 });
             }
+            if(kind==ScopedTransactionRpc.TOPOLOGY_SEED) {
+                requireDataRole();if(proofQueries==null || topologySeedInstaller==null)throw new IOException("Topology SEED actual owner installer is not configured");var requested=RatisTopologySeedRpc.decodeRequest(encoded);if(!requested.anchorGroup().equals(store.ownership().owner().groupId()))throw new IOException("Topology SEED crossed parent group");
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{ var seedRequest=RatisTopologySeedRpc.decodeRequest(owned);var target=new RatisTopologyOwnerRpc.Target(seedRequest.definition(),TopologyChange.Stage.FREEZE,seedRequest.catalogue(),seedRequest.anchorGroup(),seedRequest.replica());topologyOwnerEvidence(target);var seed=topologySeedInstaller.install(seedRequest);seedRequest.requireSeed(seed);topologyOwnerEvidence(target);return Message.valueOf(ByteString.copyFrom(RatisTopologySeedRpc.reply(new RatisTopologySeedRpc.Reply(seedRequest,seed)))); });
+            }
+            if(kind==ScopedTransactionRpc.TOPOLOGY_OWNER) {
+                requireDataRole();if(proofQueries==null)throw new IOException("Topology owner proof dispatcher is not configured");var target=RatisTopologyOwnerRpc.decodeRequest(encoded);if(!target.group().equals(store.ownership().owner().groupId()))throw new IOException("Topology proof crossed native group");
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->Message.valueOf(ByteString.copyFrom(RatisTopologyOwnerRpc.reply(topologyOwnerEvidence(RatisTopologyOwnerRpc.decodeRequest(owned))))));
+            }
             if(kind==RatisRangeImportStatusRpc.KIND) {
                 requireDataRole(); if(rangeImportApply==null || importLocalReplica==null || proofQueries==null)throw new IOException("Import status owner is not configured");
                 var target=RatisRangeImportStatusRpc.decodeRequest(encoded); target.requireBinding(rangeImportApply.definition(),importLocalReplica);
@@ -3741,6 +3905,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     return Message.valueOf(ByteString.copyFrom(RatisTopologyAuthority.reply(view)));
                 });
             }
+            if(ScopedTransactionRpc.topologyActivate(kind)) {
+                if(role!=RatisNodePlan.Role.DATA || topologyAuthority==null || proofQueries==null)throw new IOException("Topology activation requires configured DATA dispatcher");
+                var record=RatisTopologyActivationRpc.request(encoded);
+                if(kind==RatisTopologyActivationRpc.CANCEL) { synchronized(admissions) { var hold=topologyActivationHold;if(hold!=null && hold.record.equals(record) && !hold.submitted) { hold.invalidated=true;releaseTopologyActivation(hold); } } return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(RatisTopologyActivationRpc.cancelledReply(record)))); }
+                if(kind==RatisTopologyActivationRpc.PREPARE && !freshBarrier)throw new IOException("Topology activation preparation requires fresh leader barrier");
+                long generation=admissionGeneration.get();
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{ var requested=RatisTopologyActivationRpc.request(owned);if(kind==RatisTopologyActivationRpc.PREPARE) { if(generation!=admissionGeneration.get())throw new IOException("Topology activation lost barrier generation");prepareTopologyActivation(requested,generation); } return Message.valueOf(ByteString.copyFrom(RatisTopologyActivationRpc.reply(kind,topologyActivationState(requested)))); });
+            }
             if(ScopedTransactionRpc.topologyFreeze(kind)){
                 requireDataRole();if(topologyAuthority==null || proofQueries==null)throw new IOException("Topology FREEZE dispatcher is not configured");
                 var record=RatisTopologyFreezeRpc.request(encoded);
@@ -3760,6 +3932,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                             || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(view.publication().completedCatalogueCut(),store.applied()))throw new IOException("Import authority cut/configuration changed");}
                     return Message.valueOf(ByteString.copyFrom(RatisRangeImportAuthority.reply(view)));
                 });
+            }
+            if(ScopedTransactionRpc.topologyExecution(kind)) {
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE)throw new IOException("Topology execution preparation requires fresh catalogue barrier");
+                var command=RatisTopologyExecutionRpc.decode(encoded);
+                if(kind==RatisTopologyExecutionRpc.CANCEL) { cancelImportPublication(command);return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(encoded))); }
+                var executor=importPublicationQueries;if(executor==null)throw new IOException("Bounded topology execution dispatcher is not configured");long generation=admissionGeneration.get();
+                return executor.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.IMPORT_PUBLICATION_BYTES,false,owned->{if(generation!=admissionGeneration.get())throw new IOException("Topology execution lost read-barrier owner");prepareImportPublication(RatisTopologyExecutionRpc.decode(owned));return Message.valueOf(ByteString.copyFrom(owned));});
             }
             if(ScopedTransactionRpc.importPublication(kind)){
                 if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE)throw new IOException("Import publication requires a fresh catalogue barrier");

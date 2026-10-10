@@ -31,7 +31,7 @@ public final class RatisTopologyAuthority {
             if(!request.cluster().equals(header.clusterId()) || !request.database().equals(header.databaseId()) || !request.domain().equals(header.domainId()) || !request.intent().equals(header.intentId()) || !Arrays.equals(request.digest(),header.definitionDigest())) throw new IllegalArgumentException("Topology authority identity differs");
             boolean usable=switch(request.stage()) {
                 case FREEZE -> state.phase()==TopologyChange.Phase.FENCING || state.phase()==TopologyChange.Phase.FENCED || state.phase()==TopologyChange.Phase.SEEDED;
-                case SEED -> state.phase()==TopologyChange.Phase.FENCED || state.phase()==TopologyChange.Phase.SEEDED;
+                case SEED -> state.phase()==TopologyChange.Phase.FENCED || state.phase()==TopologyChange.Phase.SEEDED || state.phase()==TopologyChange.Phase.PUBLISHED || state.phase()==TopologyChange.Phase.ACTIVE || state.phase()==TopologyChange.Phase.RETIRED;
                 case ACTIVATE -> state.phase()==TopologyChange.Phase.PUBLISHED || state.phase()==TopologyChange.Phase.ACTIVE || state.phase()==TopologyChange.Phase.RETIRED;
             };
             if(!usable) throw new IllegalArgumentException("Topology authority phase differs from requested stage");
@@ -75,7 +75,8 @@ public final class RatisTopologyAuthority {
             var values=points.values(); if(points.position()==null || values.stream().anyMatch(Objects::isNull) || !Arrays.equals(values.get(0),values.get(1))) throw new IOException("Topology authority head/state missing or inconsistent");
             var definition=TopologyChange.Definition.decode(values.get(2)); var state=TopologyChange.State.decode(values.get(0));
             var view=new View(store.ownership().owner().groupId(),points.position(),definition,state); view.require(request);
-            var directory=request.stage()==TopologyChange.Stage.ACTIVATE ? definition.targetDirectory() : definition.sourceDirectory();
+            boolean published=state.phase()==TopologyChange.Phase.PUBLISHED || state.phase()==TopologyChange.Phase.ACTIVE || state.phase()==TopologyChange.Phase.RETIRED;
+            var directory=request.stage()==TopologyChange.Stage.ACTIVATE || request.stage()==TopologyChange.Stage.SEED && published ? definition.targetDirectory() : definition.sourceDirectory();
             if(!Arrays.equals(values.get(3),RangeDirectoryCodec.encode(directory))) throw new IOException("Topology authority directory differs from requested stage");
             return view;
         } catch(org.rocksdb.RocksDBException|IllegalArgumentException|IllegalStateException invalid) { throw new IOException("Invalid native topology authority",invalid); }

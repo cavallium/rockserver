@@ -932,6 +932,7 @@ class RatisNodeRuntimeTest {
         RaftServer.Division division(RaftGroupId id) {
             var group=actualGroups.get(id);if(group==null)throw new IllegalArgumentException("No actual division for "+id);
             var configuration=(RaftConfiguration)Proxy.newProxyInstance(RaftConfiguration.class.getClassLoader(),new Class<?>[]{RaftConfiguration.class},(proxy,method,args) -> {
+                if(method.getName().equals("getLogEntryIndex")){var nativeField=RatisRangeStateMachine.class.getDeclaredField("store");nativeField.setAccessible(true);var store=(ReplicatedRangeStore)nativeField.get(machines.get(id));var saved=store.configuration();return saved==null ? -1L : saved.index();}
                 var role=(RaftPeerRole)args[0]; var peers=group.getPeers().stream().filter(peer -> peer.getStartupRole()==role).toList();
                 if (method.getName().equals("getPreviousPeers")) return joint ? peers : List.of();
                 if (method.getName().equals("getCurrentPeers")) return peers.stream().map(peer -> wrongEndpoint ? RaftPeer.newBuilder().setId(peer.getId()).setAddress("127.0.0.1:9999").setStartupRole(peer.getStartupRole()).build() : peer).toList();
@@ -940,7 +941,7 @@ class RatisNodeRuntimeTest {
             return (RaftServer.Division)Proxy.newProxyInstance(RaftServer.Division.class.getClassLoader(),new Class<?>[]{RaftServer.Division.class},(proxy,method,args) -> switch (method.getName()) {
                 case "getRaftConf" -> configuration; case "getStateMachine" -> machines.get(id);
                 case "getInfo" -> Proxy.newProxyInstance(DivisionInfo.class.getClassLoader(),new Class<?>[]{DivisionInfo.class},(p,m,a) -> switch (m.getName()) {
-                    case "isLeader" -> leader; case "isLeaderReady" -> ready; case "getCurrentTerm" -> term; default -> throw new AssertionError(m);
+                    case "isLeader" -> leader; case "isLeaderReady" -> ready; case "getCurrentTerm" -> term;case "isAlive" -> true;case "getLifeCycleState" -> org.apache.ratis.util.LifeCycle.State.RUNNING; default -> throw new AssertionError(m);
                 }); default -> throw new AssertionError(method);
             });
         }

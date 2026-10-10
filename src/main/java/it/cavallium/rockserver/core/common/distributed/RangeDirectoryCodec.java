@@ -13,7 +13,7 @@ public final class RangeDirectoryCodec {
     public static final int MAX_REPLICAS = 16;
     public static final int MAX_COLUMNS = 256;
     public static final int MAX_ENCODED_BYTES = 1024 * 1024;
-    static final Comparator<UUID> UUID_ORDER = (a, b) -> {
+    public static final Comparator<UUID> UUID_ORDER = (a, b) -> {
         int first = Long.compareUnsigned(a.getMostSignificantBits(), b.getMostSignificantBits());
         return first != 0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(), b.getLeastSignificantBits());
     };

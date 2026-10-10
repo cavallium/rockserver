@@ -99,7 +99,7 @@ class RatisTopologyAuthorityTest {
                 for(var stage:TopologyChange.Stage.values()) {
                     boolean allowed=switch(stage) {
                         case FREEZE -> phase==TopologyChange.Phase.FENCING || phase==TopologyChange.Phase.FENCED || phase==TopologyChange.Phase.SEEDED;
-                        case SEED -> phase==TopologyChange.Phase.FENCED || phase==TopologyChange.Phase.SEEDED;
+                        case SEED -> phase==TopologyChange.Phase.FENCED || phase==TopologyChange.Phase.SEEDED || target;
                         case ACTIVATE -> target;
                     };
                     if(!allowed) { assertThrows(java.io.IOException.class,()->f.nativeRead(stage),phase+" cannot authorize "+stage); continue; }

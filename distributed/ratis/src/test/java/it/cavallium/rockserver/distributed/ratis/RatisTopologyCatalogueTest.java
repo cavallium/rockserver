@@ -89,4 +89,22 @@ class RatisTopologyCatalogueTest {
             assertThrows(IllegalArgumentException.class,()->catalogue.prepareBegin(f.operation(8),split(next,3,96),previous,null,null));
         }
     }
+    @Test void proofProgressRequiresOrderedReciprocalGuardsAndExactSourceWitness() throws Exception {
+        var owner=owner(); try(var f=owner.new Fixture()) {
+            var source=source(f); f.seed(source); var definition=split(source,1,128); var catalogue=catalogue(f);
+            catalogue.execute(catalogue.prepareDefinition(f.operation(1),definition,null)); catalogue.execute(catalogue.prepareBegin(f.operation(2),definition,null,null,null));
+            catalogue.execute(catalogue.prepareFencing(f.operation(3),definition,catalogue.readHead(source.domainId()),null,null));
+            var expected=catalogue.readHead(source.domainId()); var parent=definition.header().parents().getFirst(); var replica=parent.owners().getFirst();
+            var proof=TopologyChange.Proof.of(TopologyChange.Stage.FREEZE,definition.header(),parent.groupId(),replica.replicaId(),new ApplyPosition(1,1),new byte[32],definition.header().sourceDirectoryDigest());
+            var valid=catalogue.prepareProof(f.operation(4),definition,expected,proof,null,null); assertTrue(RatisTopologyCatalogue.requiresOwnerAdmission(valid)); assertDoesNotThrow(()->f.pure.accept(valid));
+            for(int index:new int[]{2,3,4,5}) {
+                var predicates=new ArrayList<>(valid.predicates()); var original=predicates.get(index);
+                predicates.set(index,new KeyPredicate(f.outer.directoryColumn,new byte[]{42},original.expectedValue()));
+                var malformed=new DistributedCommand(f.outer.catalogue,1,new byte[32],f.operation(5+index),valid.mutations(),predicates);
+                assertThrows(IllegalArgumentException.class,()->f.pure.accept(malformed));
+            }
+            assertEquals(expected,catalogue.readHead(source.domainId()));
+        }
+    }
+
 }

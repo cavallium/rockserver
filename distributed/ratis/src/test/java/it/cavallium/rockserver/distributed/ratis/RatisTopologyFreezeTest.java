@@ -58,7 +58,7 @@ class RatisTopologyFreezeTest {
             storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).build(); storage.initialize();
             machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),command->{},command->{},leader::get);
             machine.role(RatisNodePlan.Role.DATA); machine.proofQueries((groupId,input,weight,coalesce,action)->queries.submit(groupId,input,weight,coalesce,owned->{ beforeProof.run(); try { return action.run(owned); } finally { afterProof.run(); } }));
-            machine.topologyAuthority(header->{ reads.incrementAndGet(); beforeRead.run(); if(unavailable)throw new java.io.IOException("Authority unavailable"); return view; },directory,local,pool);
+            machine.topologyAuthority((header,stage)->{ assertEquals(TopologyChange.Stage.FREEZE,stage); reads.incrementAndGet(); beforeRead.run(); if(unavailable)throw new java.io.IOException("Authority unavailable"); return view; },directory,local,pool);
             var identity=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args)->{ if(method.getName().equals("getId"))return peer.getId(); if(method.getName().equals("toString"))return "topology-freeze-fixture"; throw new AssertionError(method); });
             machine.initialize(identity,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
         }
