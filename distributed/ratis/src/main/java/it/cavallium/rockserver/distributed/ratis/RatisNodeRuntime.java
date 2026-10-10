@@ -94,6 +94,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisExportSourceService exportSources;
     private RatisSchemaReplicaService schemaReplicas;
     private RatisSchemaReplicaClient schemaFencingReplicas;
+    private RatisRangeImportOwnerClient importOwners;
+    private boolean importOwnersClosed;
     private boolean schemaFencingReplicasClosed;
     private FileChannel lockChannel; private FileLock lock;
     private boolean started,starting,closeRequested,closing,closed,serverClosed,poolClosed;
@@ -247,8 +249,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
         pool.configureSnapshotAdmission(settings.exports().pins());
         if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.DATA))
             schemaReplicas=new RatisSchemaReplicaService(nativePath,root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());
-        if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE))
+        if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE)) {
             schemaFencingReplicas=Objects.requireNonNull(replicaFactory.create());
+            importOwners=new RatisRangeImportOwnerClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
+        }
         if (plan.localGroups().stream().anyMatch(group -> plan.importDefinition(group.getGroupId().getUuid())!=null))
             importFileIo=new ThreadPoolExecutor(2,2,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(32),
                     Thread.ofPlatform().daemon(true).name("ratis-import-file-",0).factory(),new ThreadPoolExecutor.AbortPolicy());
@@ -268,6 +272,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     machine.schemaFencingReplicaClient(schemaFencingReplicas);
                     machine.schemaAuthorityQueries(authorityQueries);
                     machine.importPublicationQueries(importPublicationQueries);
+                    machine.importPublicationAdmission(command->{
+                        if(RatisRangeImportCatalogue.isPublication(command))RatisRangeImportCatalogue.admitPublication(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::receipt);
+                        else RatisRangeImportCatalogue.admitCompletion(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::activation);
+                    });
                 } else {
                     var directory=plan.groupDirectory(id); var descriptor=plan.groupDescriptor(id); var home=plan.home(id);
                     var bindings=home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
@@ -306,7 +314,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         var files=new RatisReferencedFiles(root.resolve("referenced-files").resolve(id.toString()),id,limits,importFileIo,
                                 request->RatisRangeImportRpc.requireFile(importDefinition.manifest(id),request));
                         importFiles.put(id,files); machine.referencedFiles(files);
-                        machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority());
+                        machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority(),ownReplica(descriptor));
                     }
                 }
                 machine.proofQueries(proofQueries);
@@ -556,6 +564,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Import file drain interrupted",interrupted); }
             }
             if (schemaFencingReplicas!=null && !schemaFencingReplicasClosed) { schemaFencingReplicas.close(); schemaFencingReplicasClosed=true; }
+            if (importOwners!=null && !importOwnersClosed) { importOwners.close(); importOwnersClosed=true; }
             if (pool!=null && !poolClosed) { pool.close(); poolClosed=true; }
             for (var client:homeClients.values()) client.close();
             if (lock!=null && lock.isValid()) lock.release(); if (lockChannel!=null) lockChannel.close();

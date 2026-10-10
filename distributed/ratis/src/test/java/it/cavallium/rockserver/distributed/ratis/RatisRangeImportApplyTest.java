@@ -71,7 +71,7 @@ class RatisRangeImportApplyTest {
             machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,input.definition()),definition->{
                 reads.incrementAndGet(); if(block.get()){entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Catalogue fixture timeout");}catch(InterruptedException e){throw new IOException(e);}}
                 return new RatisRangeImportApply.PublicationView(published,definition.targetDirectory());
-            }); machine.referencedFiles(files); machine.proofQueries(queries);
+            },input.definition().sourceDirectory().ranges().getFirst().replicas().getFirst()); machine.referencedFiles(files); machine.proofQueries(queries);
             var server=(org.apache.ratis.server.RaftServer)java.lang.reflect.Proxy.newProxyInstance(org.apache.ratis.server.RaftServer.class.getClassLoader(),new Class<?>[]{org.apache.ratis.server.RaftServer.class},(proxy,method,args)->{
                 if(method.getName().equals("getId"))return peer.getId(); if(method.getName().equals("toString"))return "import-proposal-fixture"; throw new AssertionError(method);
             });
@@ -81,6 +81,11 @@ class RatisRangeImportApplyTest {
             var membership=org.apache.ratis.proto.RaftProtos.RaftConfigurationProto.newBuilder().addPeers(member.getRaftPeerProto()).build();
             machine.notifyConfigurationChanged(1,0,membership); machine.notifyTermIndexUpdated(1,0); machine.notifyTermIndexUpdated(1,1);
             try {
+                var statusTarget=RatisRangeImportStatusRpc.Target.of(input.definition(),group,owner);
+                var statusRequest=message(RatisRangeImportStatusRpc.request(statusTarget));
+                var fenced=RatisRangeImportStatusRpc.decodeReply(machine.queryStale(statusRequest,0).get(5,TimeUnit.SECONDS).getContent().toByteArray(),statusTarget);
+                assertEquals(RatisRangeImportApply.Phase.FENCED,fenced.phase()); assertNull(fenced.receipt());
+                assertThrows(ExecutionException.class,()->machine.queryStale(statusRequest,1).get(5,TimeUnit.SECONDS));
                 assertNotNull(proposal(machine,install).getException()); assertEquals(0,reads.get());
                 assertThrows(ExecutionException.class,()->machine.query(message(RatisRangeImportRpc.prepare(install))).get(5,TimeUnit.SECONDS));
                 var prepared=machine.queryLinearizable(message(RatisRangeImportRpc.prepare(install))).get(5,TimeUnit.SECONDS);
@@ -91,6 +96,10 @@ class RatisRangeImportApplyTest {
                 machine.queryLinearizable(message(RatisRangeImportRpc.prepare(install))).get(5,TimeUnit.SECONDS);
                 var tx=proposal(machine,install); assertNull(tx.getException()); machine.preAppendTransaction(tx); tx.initLogEntry(1,3);
                 var receipt=NativeSstImportManifest.Receipt.decode(machine.applyTransaction(tx).get(10,TimeUnit.SECONDS).getContent().toByteArray());
+                leader.set(new RatisRangeStateMachine.Leadership(1,false));
+                var installedStatus=RatisRangeImportStatusRpc.decodeReply(machine.queryStale(statusRequest,0).get(5,TimeUnit.SECONDS).getContent().toByteArray(),statusTarget);
+                assertEquals(RatisRangeImportApply.Phase.INSTALLED,installedStatus.phase()); assertArrayEquals(receipt.encode(),installedStatus.receipt().encode());
+                leader.set(new RatisRangeStateMachine.Leadership(1,true));
                 var activate=new RatisRangeImportRecord.Activate(receipt,published); assertNotNull(proposal(machine,activate).getException()); assertEquals(0,reads.get());
                 var pending=machine.queryLinearizable(message(RatisRangeImportRpc.prepare(activate))); assertTrue(entered.await(5,TimeUnit.SECONDS));
                 machine.queryLinearizable(message(RatisRangeImportRpc.cancel(activate))).get(5,TimeUnit.SECONDS); assertNotNull(proposal(machine,activate).getException());
@@ -99,6 +108,12 @@ class RatisRangeImportApplyTest {
                 machine.queryLinearizable(message(RatisRangeImportRpc.prepare(activate))).get(5,TimeUnit.SECONDS);
                 var activation=proposal(machine,activate); assertNull(activation.getException()); machine.preAppendTransaction(activation); activation.initLogEntry(1,4);
                 var proof=machine.applyTransaction(activation).get(10,TimeUnit.SECONDS).getContent().toByteArray(); assertEquals(2,reads.get()); assertFalse(store.importPending());
+                var ownerReply=machine.queryStale(statusRequest,0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
+                var activatedStatus=RatisRangeImportStatusRpc.decodeReply(ownerReply,statusTarget);assertEquals(RatisRangeImportApply.Phase.PUBLISHED,activatedStatus.phase());assertArrayEquals(proof,activatedStatus.activation().encode());
+                var changedOwner=new ReplicaDescriptor(owner.nodeId(),UUID.randomUUID(),owner.replicaId(),owner.peerId(),owner.address(),owner.role());
+                var crossed=new RatisRangeImportStatusRpc.Target(statusTarget.cluster(),statusTarget.database(),statusTarget.domain(),statusTarget.importId(),statusTarget.group(),statusTarget.range(),statusTarget.epoch(),statusTarget.configuration(),statusTarget.definitionDigest(),statusTarget.manifestDigest(),changedOwner);
+                assertThrows(IllegalArgumentException.class,()->RatisRangeImportStatusRpc.decodeReply(ownerReply,crossed));
+                assertThrows(ExecutionException.class,()->machine.queryStale(message(RatisRangeImportStatusRpc.request(crossed)),0).get(5,TimeUnit.SECONDS));
                 files.truncate(0).get(5,TimeUnit.SECONDS);
                 machine.queryLinearizable(message(RatisRangeImportRpc.prepare(activate))).get(5,TimeUnit.SECONDS);
                 var retry=proposal(machine,activate); assertNull(retry.getException()); machine.preAppendTransaction(retry); retry.initLogEntry(1,5);
@@ -113,6 +128,7 @@ class RatisRangeImportApplyTest {
                 assertArrayEquals(proof,machine.applyTransaction(replacement).get(5,TimeUnit.SECONDS).getContent().toByteArray()); assertEquals(2,reads.get());
                 var changed=org.apache.ratis.protocol.RaftPeer.newBuilder().setId(owner.peerId()).setAddress(owner.address()).setDataStreamAddress("127.0.0.1:9996").build();
                 machine.notifyConfigurationChanged(2,8,org.apache.ratis.proto.RaftProtos.RaftConfigurationProto.newBuilder().addPeers(changed.getRaftPeerProto()).build()); machine.notifyTermIndexUpdated(2,8);
+                assertThrows(ExecutionException.class,()->machine.queryStale(statusRequest,0).get(5,TimeUnit.SECONDS));
                 assertThrows(ExecutionException.class,()->machine.queryLinearizable(message(RatisRangeImportRpc.prepare(activate))).get(5,TimeUnit.SECONDS)); assertEquals(2,reads.get());
                 machine.notifyConfigurationChanged(2,9,membership); machine.notifyTermIndexUpdated(2,9);
                 var file=input.manifest().columns().getFirst().files().getFirst(); UUID fileClient=UUID.randomUUID(); long fileCall=10;

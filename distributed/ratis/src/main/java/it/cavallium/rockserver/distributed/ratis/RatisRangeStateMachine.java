@@ -208,6 +208,22 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || !Arrays.equals(hold.bytes,importProposalBytes(record)) || hold.term!=leader.term() || hold.generation!=generation || generation!=admissionGeneration.get()
                 || hold.configurationStamp!=schemaConfigurationStamp || !hold.cut.equals(cut))throw new IOException("Native import lacks exact prepared append owner");
     }
+    private ReplicatedRangeStore.Configuration requireImportMembership() throws Exception {
+        var configuration=store.configuration();
+        if(configuration==null)throw new IOException("Native import lacks completed membership");
+        var descriptor=rangeImportApply.definition().sourceDirectory().ranges().stream()
+                .filter(range -> range.groupId().equals(rangeImportApply.groupId())).findFirst().orElseThrow();
+        requireSchemaMembership(descriptor,configuration.data());
+        if(initialGroup.getPeers().stream().anyMatch(peer->peer.getDataStreamAddress()!=null && !peer.getDataStreamAddress().isEmpty())) {
+            var expected=new java.util.TreeMap<String,String>(); var actual=new java.util.TreeMap<String,String>();
+            for(var peer:initialGroup.getPeers())expected.put(peer.getId().toString(),java.util.Objects.toString(peer.getDataStreamAddress(),""));
+            var nativeConfiguration=RaftConfigurationProto.parseFrom(configuration.data());
+            for(var peer:nativeConfiguration.getPeersList())actual.put(peer.getId().toStringUtf8(),peer.getDataStreamAddress());
+            for(var peer:nativeConfiguration.getListenersList())actual.put(peer.getId().toStringUtf8(),peer.getDataStreamAddress());
+            if(!expected.equals(actual))throw new IOException("Native import streaming membership differs from frozen endpoints");
+        }
+        return configuration;
+    }
     private void prepareImportApply(Object record,long generation) throws Exception {
         requireImportProposal(record); var leader=leadership(); var cut=requireImportOwner(leader); final ImportApplyHold hold;
         synchronized(admissions) {
@@ -218,19 +234,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         boolean qualified=false;
         try {
-            var configuration=store.configuration();
-            if(configuration==null)throw new IOException("Native import lacks completed membership");
-            var descriptor=rangeImportApply.definition().sourceDirectory().ranges().stream()
-                    .filter(range -> range.groupId().equals(rangeImportApply.groupId())).findFirst().orElseThrow();
-            requireSchemaMembership(descriptor,configuration.data());
-            if(initialGroup.getPeers().stream().anyMatch(peer->peer.getDataStreamAddress()!=null && !peer.getDataStreamAddress().isEmpty())) {
-                var expected=new java.util.TreeMap<String,String>(); var actual=new java.util.TreeMap<String,String>();
-                for(var peer:initialGroup.getPeers())expected.put(peer.getId().toString(),java.util.Objects.toString(peer.getDataStreamAddress(),""));
-                var nativeConfiguration=RaftConfigurationProto.parseFrom(configuration.data());
-                for(var peer:nativeConfiguration.getPeersList())actual.put(peer.getId().toStringUtf8(),peer.getDataStreamAddress());
-                for(var peer:nativeConfiguration.getListenersList())actual.put(peer.getId().toStringUtf8(),peer.getDataStreamAddress());
-                if(!expected.equals(actual))throw new IOException("Native import streaming membership differs from frozen endpoints");
-            }
+            requireImportMembership();
             if(record instanceof RatisRangeImportRecord.Install install)rangeImportApply.validateInstallProposal(install);
             else if(record instanceof RatisRangeImportRecord.Activate activate)rangeImportApply.validateActivationProposal(activate,rangeImportPublication);
             var current=leadership();
@@ -244,11 +248,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             hold.submitted=true; hold.owners++; transaction.setStateMachineContext(hold); return transaction;
         }
     }
+    private it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor importLocalReplica;
     private RatisRangeImportApply rangeImportApply;
     private RatisRangeImportApply.PublicationReader rangeImportPublication;
-    public void rangeImportApply(RatisRangeImportApply adapter,RatisRangeImportApply.PublicationReader reader){
+    public void rangeImportApply(RatisRangeImportApply adapter,RatisRangeImportApply.PublicationReader reader){rangeImportApply(adapter,reader,null);}
+    public void rangeImportApply(RatisRangeImportApply adapter,RatisRangeImportApply.PublicationReader reader,it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor local){
         if(getLifeCycleState()!=LifeCycle.State.NEW || rangeImportApply!=null || role!=RatisNodePlan.Role.DATA)throw new IllegalStateException("Native import adapter is fixed before initialization");
-        java.util.Objects.requireNonNull(adapter).requireGroup(store.ownership().owner().groupId());adapter.requireGroup(initialGroup.getGroupId().getUuid());rangeImportApply=adapter;rangeImportPublication=java.util.Objects.requireNonNull(reader);
+        java.util.Objects.requireNonNull(adapter).requireGroup(store.ownership().owner().groupId());adapter.requireGroup(initialGroup.getGroupId().getUuid());java.util.Objects.requireNonNull(reader);
+        if(local!=null){
+            RatisRangeImportStatusRpc.Target.of(adapter.definition(),adapter.groupId(),local);
+            if(initialGroup.getPeers().stream().noneMatch(peer->peer.getId().toString().equals(local.peerId()) && peer.getAddress().equals(local.address())))throw new IllegalArgumentException("Import local peer differs from initial group");
+            importLocalReplica=local;
+        }
+        rangeImportApply=adapter;rangeImportPublication=reader;
     }
     private void activateRecoveredOwner()throws IOException{
         if(store.importPending()){if(rangeImportApply==null)throw new IOException("Unpublished native import lacks configured adapter");rangeImportApply.requireGroup(store.ownership().owner().groupId());store.fence();return;}
@@ -3431,6 +3443,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
+            if(kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner import status has no requested index override");return query(request);}
             if (kind>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
@@ -3460,6 +3473,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                 return dispatcher.submit(store.ownership().owner().groupId(),kind,packet.body()).thenApply(payload ->
                         Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,payload))));
+            }
+            if(kind==RatisRangeImportStatusRpc.KIND) {
+                requireDataRole(); if(rangeImportApply==null || importLocalReplica==null || proofQueries==null)throw new IOException("Import status owner is not configured");
+                var target=RatisRangeImportStatusRpc.decodeRequest(encoded); target.requireBinding(rangeImportApply.definition(),importLocalReplica);
+                var server=getServer().getNow(null); if(server==null || !server.getId().toString().equals(importLocalReplica.peerId()))throw new IOException("Import status server identity differs");
+                long generation=admissionGeneration.get(); final long stamp;
+                synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Import status waits for configuration apply");stamp=schemaConfigurationStamp;}
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,4L*RatisRangeImportStatusRpc.MAX_REPLY_BYTES,false,owned->{
+                    var before=store.applied(); var configuration=requireImportMembership(); var status=rangeImportApply.status(); var cut=status.applied();
+                    if(cut==null || configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term())throw new IOException("Import status configuration exceeds completed cut");
+                    synchronized(admissions){requireHealthy();if(generation!=admissionGeneration.get() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || !java.util.Objects.equals(before,cut) || !java.util.Objects.equals(cut,store.applied()))throw new IOException("Import status native cut/configuration changed");}
+                    return Message.valueOf(ByteString.copyFrom(RatisRangeImportStatusRpc.reply(target,status)));
+                });
             }
             if(ScopedTransactionRpc.importApply(kind)) {
                 if(!freshBarrier || role!=RatisNodePlan.Role.DATA || rangeImportApply==null || proofQueries==null)throw new IOException("Native import preparation requires configured fresh DATA barrier");
