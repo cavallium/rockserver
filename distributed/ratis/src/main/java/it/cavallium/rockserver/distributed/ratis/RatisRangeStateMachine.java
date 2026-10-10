@@ -113,6 +113,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return referencedFiles==null ? NO_REFERENCED_DATA : referencedFiles;
     }
     private final ReplicatedRangeStore store;
+    private RatisCdcPollRpc.Binding cdcBinding;
+    /** Trusted namespace setup, fixed before the DATA state machine starts. */
+    void cdcBinding(UUID cluster,UUID database,UUID rangeId) {
+        requireDataRole();
+        if(getLifeCycleState()!=LifeCycle.State.NEW || cdcBinding!=null) throw new IllegalStateException("CDC binding is fixed before initialization");
+        var ownership=store.ownership(); var owner=ownership.owner();
+        var binding=new RatisCdcPollRpc.Binding(cluster,database,ownership.interval().domainId(),
+                new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(rangeId,owner.groupId(),owner.epoch()));
+        try { store.enableCdc(rangeId); } catch(org.rocksdb.RocksDBException failure) { throw new IllegalStateException("Cannot configure native CDC",failure); }
+        cdcBinding=binding;
+    }
     private final Consumer<DistributedCommand> commandValidator;
     @FunctionalInterface public interface ImportPublicationAdmission { void validate(DistributedCommand command) throws IOException; }
     private ImportPublicationAdmission importPublicationAdmission;
@@ -3490,6 +3501,33 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                 return dispatcher.submit(store.ownership().owner().groupId(),kind,packet.body()).thenApply(payload ->
                         Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,payload))));
+            }
+            if(kind==RatisCdcPollRpc.KIND) {
+                requireDataRole();
+                if(!freshBarrier || cdcBinding==null || proofQueries==null) throw new IOException("CDC poll requires configured fresh DATA barrier");
+                var poll=RatisCdcPollRpc.decodeRequest(encoded);
+                if(!cdcBinding.equals(poll.binding())) throw new IOException("CDC poll namespace/lineage differs");
+                checkTransactionOwner(); long generation=admissionGeneration.get(); var leader=leadership(); final long stamp;
+                synchronized(admissions){if(schemaConfigurationPending)throw new IOException("CDC poll waits for configuration apply");stamp=schemaConfigurationStamp;}
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,Math.max(4096,4L*poll.maxBytes()),false,owned->{
+                    checkTransactionOwner();
+                    if(generation!=admissionGeneration.get() || leadership().term()!=leader.term()) throw new IOException("CDC poll lost read-barrier owner");
+                    var ownedPoll=RatisCdcPollRpc.decodeRequest(owned);
+                    ReplicatedRangeStore.CdcPage page; byte[] reply;
+                    try {
+                        var data=store.pollCdc(ownedPoll.binding().lineage(),ownedPoll.from(),ownedPoll.maxRecords(),ownedPoll.maxBytes()-RatisCdcPollRpc.REPLY_BASE_BYTES);
+                        page=data; reply=RatisCdcPollRpc.reply(ownedPoll,data);
+                    } catch(ReplicatedRangeStore.CdcGap gap) {
+                        var status=gap.page(); page=status;
+                        reply=RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(ownedPoll,RatisCdcPollRpc.Outcome.GAP,status.cut(),status.floor(),status.next(),0,List.of()));
+                    } catch(ReplicatedRangeStore.CdcTooLarge large) {
+                        var status=large.page(); page=status;
+                        reply=RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(ownedPoll,RatisCdcPollRpc.Outcome.TOO_LARGE,status.cut(),status.floor(),status.next(),RatisCdcPollRpc.REPLY_BASE_BYTES+large.requiredPayloadBytes(),List.of()));
+                    }
+                    checkTransactionOwner(); var current=leadership();
+                    synchronized(admissions){if(generation!=admissionGeneration.get() || current.term()!=leader.term() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || page.cut()==null || page.cut().term()!=current.term())throw new IOException("CDC poll lost native cut/configuration");}
+                    return Message.valueOf(ByteString.copyFrom(reply));
+                });
             }
             if(kind==RatisRangeImportFileResultRpc.KIND) {
                 if(!freshBarrier || rangeImportApply==null || proofQueries==null)throw new IOException("File result lookup requires configured fresh DATA barrier");

@@ -34,7 +34,7 @@ class NativeDistributedCdcTest {
             var record=page.records().getFirst(); assertEquals(original.mutations(),record.command().mutations()); assertNull(record.finalization());
             assertEquals(List.of(0,1,2),record.events().stream().map(e->e.cursor().mutationOrdinal()).toList());
             assertEquals(DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2)),page.next());
-            assertThrows(IllegalArgumentException.class,()->f.store.pollCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),1,1));
+            assertThrows(it.cavallium.rockserver.core.common.RocksDBException.class,()->f.store.pollCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),1,1));
             try(var pin=f.store.capture()) { NativeRangeImage.write(image,pin,f.store.ownership().interval(),limits); }
         }
         for(boolean install:new boolean[]{false,true}) try(var f=outer.new Fixture(install ? root.resolve("target") : source,true)) {
@@ -167,5 +167,19 @@ class NativeDistributedCdcTest {
             }
         }
         try(var f=outer.new Fixture(source,true)) { assertThrows(IllegalArgumentException.class,()->f.store.enableCdc(outer.group)); }
+    }
+
+    @Test void tinyPollUsesCachedMetadataBeforeLoadingTheNextEnvelope() throws Exception {
+        try(var f=outer.new Fixture(root.resolve("metadata-budget"),true)) {
+            f.store.enableCdc(outer.group); f.apply(0,helper.put(f,0,1,9));
+            var dbField=ReplicatedRangeStore.class.getDeclaredField("db"); var stateField=ReplicatedRangeStore.class.getDeclaredField("state");
+            dbField.setAccessible(true); stateField.setAccessible(true);
+            var db=(org.rocksdb.RocksDB)dbField.get(f.store); var state=(org.rocksdb.ColumnFamilyHandle)stateField.get(f.store);
+            byte[] key=java.nio.ByteBuffer.allocate(25).putLong(outer.group.getMostSignificantBits()).putLong(outer.group.getLeastSignificantBits()).put((byte)0x50).putLong(0).array();
+            int required=4+db.get(state,key).length; db.put(state,key,new byte[]{0});
+            var large=assertThrows(ReplicatedRangeStore.CdcTooLarge.class,()->f.store.pollCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),1,1));
+            assertEquals(required,large.requiredPayloadBytes()); assertEquals(new ApplyPosition(1,0),large.page().cut());
+            assertThrows(IllegalArgumentException.class,()->poll(f,DistributedCdcCheckpoint.Cursor.beginning()));
+        }
     }
 }

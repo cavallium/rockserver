@@ -41,6 +41,20 @@ public final class RatisRoutedClient implements AutoCloseable {
         @Override default void close() throws IOException {}
     }
 
+    /** Returns whole envelopes; consumers skip event cursors covered by from. GAP requires snapshot resynchronization. */
+    public RatisCdcPollRpc.Result pollCdc(it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,
+            it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes) throws IOException {
+        Objects.requireNonNull(lineage); var directory=current();
+        var descriptor=directory.ranges().stream().filter(range->range.groupId().equals(lineage.groupId()) && range.rangeId().equals(lineage.rangeId())
+                && range.rangeEpoch()==lineage.rangeEpoch() && range.topologyState()==RangeDescriptor.TopologyState.ACTIVE).findFirst()
+                .orElseThrow(()->new IllegalArgumentException("CDC lineage is outside the current active directory"));
+        var request=new RatisCdcPollRpc.Request(new RatisCdcPollRpc.Binding(directory.clusterId(),directory.databaseId(),directory.domainId(),lineage),from,maxRecords,maxBytes);
+        beginCall();
+        try { return RatisCdcPollRpc.decodeReply(transport.transaction(descriptor,RatisCdcPollRpc.request(request),true),request); }
+        catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC poll reply",invalid); }
+        finally { endCall(); }
+    }
+
     /** Original administrative route; retries never rebase a pending change onto a new schema. */
     public static final class SchemaTarget {
         private final RangeDescriptor descriptor;

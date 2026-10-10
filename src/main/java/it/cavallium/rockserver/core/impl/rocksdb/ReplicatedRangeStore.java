@@ -114,6 +114,19 @@ public final class ReplicatedRangeStore {
             List<it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord> records) {
         public CdcPage { records=List.copyOf(records); }
     }
+    public static final class CdcGap extends it.cavallium.rockserver.core.common.CdcGapDetectedException {
+        private final CdcPage page;
+        CdcGap(CdcPage page) { super("Distributed CDC retention gap"); this.page=page; }
+        public CdcPage page() { return page; }
+    }
+    public static final class CdcTooLarge extends it.cavallium.rockserver.core.common.RocksDBException {
+        private final CdcPage page; private final int requiredPayloadBytes;
+        CdcTooLarge(CdcPage page,int requiredPayloadBytes) {
+            super(RocksDBErrorType.CDC_RESPONSE_TOO_LARGE,"CDC response budget cannot fit next mutation envelope"); this.page=page; this.requiredPayloadBytes=requiredPayloadBytes;
+        }
+        public CdcPage page() { return page; }
+        public int requiredPayloadBytes() { return requiredPayloadBytes; }
+    }
     /** One completed native cut. Fresh-read/owner authority is supplied by the range adapter. */
     public CdcPage pollCdc(it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,
             it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes) throws RocksDBException {

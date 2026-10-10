@@ -285,7 +285,6 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchema)
                             : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchema);
                     java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
-                    if(role==RatisNodePlan.Role.DATA) store.enableCdc(descriptor.rangeId());
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     if (role==RatisNodePlan.Role.DATA && logicalSchema!=null) {
@@ -306,7 +305,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
                     }
-                    else { machine.role(role); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority((header,digest) -> readSchemaAuthority(authority,header,digest),effectiveDirectory); machine.schemaReplicas(schemaReplicas,ownReplica(descriptor)); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
+                    else { machine.role(role); machine.cdcBinding(directory.clusterId(),directory.databaseId(),descriptor.rangeId()); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority((header,digest) -> readSchemaAuthority(authority,header,digest),effectiveDirectory); machine.schemaReplicas(schemaReplicas,ownReplica(descriptor)); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
                     if (importDefinition!=null) {
                         var limits=new RatisReferencedFiles.Limits(4096,8,32,
                                 it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES,
