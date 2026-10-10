@@ -27,6 +27,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private final RatisTransactionClient transactions;
     private final AllocationSource allocations;
     private final RatisRocksDBDirect direct;
+    private final RatisRocksDBBatches batches;
     private final RatisRocksDBRanges ranges;
     private final RatisRocksDBIterators iterators;
     private final java.util.function.LongSupplier handleIds;
@@ -86,7 +87,12 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         this(schema,directory,transactions,allocations,direct,ranges,new java.util.concurrent.atomic.AtomicLong(ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE/2))::incrementAndGet);
     }
     public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,java.util.function.LongSupplier handleIds) {
-        this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); this.handleIds=Objects.requireNonNull(handleIds); schema.requireMatches(directory); iterators=new RatisRocksDBIterators(schema,handleIds);
+        this(schema,directory,transactions,allocations,direct,ranges,handleIds,null);
+    }
+    /** Optional bulk owner has its own exclusive session; other wrappers remain borrowed. */
+    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,java.util.function.LongSupplier handleIds,RatisRocksDBBatches batches) {
+        if(batches!=null && !batches.binds(schema,directory)) throw new IllegalArgumentException("Bulk owner differs from adapter's frozen generation");
+        this.batches=batches; this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); this.handleIds=Objects.requireNonNull(handleIds); schema.requireMatches(directory); iterators=new RatisRocksDBIterators(schema,handleIds);
     }
     synchronized boolean ownsTransactionOrUpdate(long id) { return entries.containsKey(id); }
     boolean ownsIterator(long id) { return iterators.owns(id); }
@@ -106,6 +112,9 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private void track(CompletableFuture<?> actual) { var tracker=tracking.get(); if (tracker!=null) tracker.actual.add(actual); }
     private <T> CompletableFuture<T> rangeView(RatisRocksDBRanges.OwnedResult<T> owned) {
         track(owned.drained()); var tracker=tracking.get(); if (tracker!=null) tracker.cancel.add(owned.cancelObserver()); return owned.observer();
+    }
+    private CompletableFuture<Void> batchView(CompletableFuture<Void> source) {
+        track(batches.actualCompletion(source)); var tracker=tracking.get(); if(tracker!=null) tracker.cancel.add(() -> source.cancel(false)); return source;
     }
     private CompletableFuture<Object> directView(CompletableFuture<Object> source,java.util.function.Function<Object,Object> mapper) {
         var actual=direct.actualCompletion(source); track(actual); var view=source.thenApply(mapper); var tracker=tracking.get(); if (tracker!=null) tracker.cancel.add(() -> view.cancel(false));
@@ -129,6 +138,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     public synchronized Stats stats() { return new Stats(entries.size(),(int)entries.values().stream().filter(entry -> entry.acquiring).count()); }
     private CompletableFuture<?> dispatch(RocksDBAPICommand<?,?,?> request,Deadline deadline) throws Exception {
         synchronized (this) { if (closing) throw new IOException("Adapter closing"); }
+        if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch batch) { if(batches==null) throw unsupported(); return batchView(batches.putBatch(batch.columnId(),batch.batchPublisher(),batch.mode(),deadline.remaining())); }
+        if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch batch) { if(batches==null) throw unsupported(); return batchView(batches.mergeBatch(batch.columnId(),batch.batchPublisher(),batch.mode(),deadline.remaining())); }
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction open) return open(open.transactionLeaseTtl(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction close) return close(close.transactionId(),close.commit(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate close) return closeFailedUpdate(close.updateId(),deadline);

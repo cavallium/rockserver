@@ -31,15 +31,19 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     /** Return a generation-owned durable session with an exclusive installed grant; never reuse another sequence owner's grant. */
     @FunctionalInterface public interface SessionFactory { RatisDurableSessionClient open(Path generationRoot,DistributedSchema schema,RangeDirectory directory) throws IOException; }
     public static final class Generation implements AutoCloseable {
-        private final RatisRocksDBAdapter adapter; private final RatisRocksDBDirect direct; private final RatisRocksDBRanges ranges; private final RatisTransactionClient transactions; private final RatisSnapshotClient snapshots; private final List<AutoCloseable> owned;
+        private final RatisRocksDBAdapter adapter; private final RatisRocksDBDirect direct; private final RatisRocksDBBatches batches; private final RatisRocksDBRanges ranges; private final RatisTransactionClient transactions; private final RatisSnapshotClient snapshots; private final List<AutoCloseable> owned;
         private int closed;
         public Generation(RatisRocksDBAdapter adapter,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,RatisTransactionClient transactions,RatisSnapshotClient snapshots,List<AutoCloseable> owned) {
-            this.adapter=Objects.requireNonNull(adapter); this.direct=direct; this.ranges=ranges; this.transactions=transactions; this.snapshots=snapshots; this.owned=List.copyOf(owned);
+            this(adapter,direct,ranges,transactions,snapshots,owned,null);
+        }
+        public Generation(RatisRocksDBAdapter adapter,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,RatisTransactionClient transactions,RatisSnapshotClient snapshots,List<AutoCloseable> owned,RatisRocksDBBatches batches) {
+            this.batches=batches; this.adapter=Objects.requireNonNull(adapter); this.direct=direct; this.ranges=ranges; this.transactions=transactions; this.snapshots=snapshots; this.owned=List.copyOf(owned);
         }
         public RatisRocksDBAdapter adapter() { return adapter; }
         public RatisRocksDBDirect direct() { return direct; }
+        public RatisRocksDBBatches batches() { return batches; }
         @Override public synchronized void close() throws IOException {
-            var resources=new ArrayList<AutoCloseable>(); if (direct!=null) resources.add(direct); resources.add(adapter); if (ranges!=null) resources.add(ranges); if (transactions!=null) resources.add(transactions); if (snapshots!=null) resources.add(snapshots); resources.addAll(owned);
+            var resources=new ArrayList<AutoCloseable>(); if(batches!=null) resources.add(batches); if (direct!=null) resources.add(direct); resources.add(adapter); if (ranges!=null) resources.add(ranges); if (transactions!=null) resources.add(transactions); if (snapshots!=null) resources.add(snapshots); resources.addAll(owned);
             while (closed<resources.size()) { try { resources.get(closed).close(); closed++; } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Generation resource close failed",failure); } }
         }
     }
@@ -47,13 +51,23 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         public DirectRecovery { schemaDigest=schemaDigest.clone(); }
         @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
     }
+    /** Bounds apply to one copied KVBatch's complete encoded group commands; chunks are independently atomic. */
+    public record BatchLimits(int maximumInputItems,int maximumEncodedInputBytes,int maximumChunkItems,int maximumEncodedChunkBytes) {}
+    public record BatchRecovery(byte[] schemaDigest,long schemaEpoch,RatisRocksDBBatches.RecoveryState state,RatisRocksDBBatches.Progress progress) {
+        public BatchRecovery { schemaDigest=schemaDigest.clone(); }
+        @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
+    }
+    public BatchLimits batchLimits() { return new BatchLimits(RatisRocksDBBatches.MAX_INPUT_ITEMS,RatisRocksDBBatches.MAX_INPUT_BYTES,RatisRocksDBBatches.MAX_CHUNK_ITEMS,RatisRocksDBBatches.MAX_CHUNK_BYTES); }
     public static GenerationFactory durableGenerationFactory(RatisRoutedClient routed,RWScheduler scheduler,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisRocksDBAdapter.AllocationSource allocations,SessionFactory sessions) {
         return (schema,directory,root,ids) -> {
-            RatisDurableSessionClient session=null; RatisTransactionClient tx=null; RatisSnapshotClient snapshots=null; RatisRocksDBRanges ranges=null; RatisRocksDBDirect direct=null;
+            RatisDurableSessionClient session=null,bulkSession=null; RatisRocksDBBatches batches=null; RatisTransactionClient tx=null; RatisSnapshotClient snapshots=null; RatisRocksDBRanges ranges=null; RatisRocksDBDirect direct=null;
             try {
-                session=sessions.open(root,schema,directory); tx=new RatisTransactionClient(schema,snapshotHomes,transactionHomes,routed,scheduler,RatisTransactionClient.Limits.defaults()); snapshots=new RatisSnapshotClient(schema,snapshotHomes,routed,scheduler,RatisSnapshotClient.Limits.defaults()); ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); direct=new RatisRocksDBDirect(schema,routed,session,scheduler,root.resolve("direct"));
-                return new Generation(new RatisRocksDBAdapter(schema,directory,tx,allocations,direct,ranges,ids),direct,ranges,tx,snapshots,List.of(session));
-            } catch (Throwable failure) { for (var resource:new AutoCloseable[]{direct,ranges,snapshots,tx,session}) if (resource!=null) try { resource.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Generation creation failed",failure); }
+                session=sessions.open(Files.createDirectories(root.resolve("point-session")),schema,directory); bulkSession=sessions.open(Files.createDirectories(root.resolve("bulk-session")),schema,directory);
+                if(session==bulkSession || session.grant().sessionId().equals(bulkSession.grant().sessionId()) && session.grant().epoch()==bulkSession.grant().epoch()) throw new IOException("Point and bulk sessions require distinct exclusively owned grants");
+                batches=new RatisRocksDBBatches(schema,routed,bulkSession,scheduler,root.resolve("bulk"),RatisRocksDBBatches.SessionOwnership.OWNED); bulkSession=null;
+                tx=new RatisTransactionClient(schema,snapshotHomes,transactionHomes,routed,scheduler,RatisTransactionClient.Limits.defaults()); snapshots=new RatisSnapshotClient(schema,snapshotHomes,routed,scheduler,RatisSnapshotClient.Limits.defaults()); ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); direct=new RatisRocksDBDirect(schema,routed,session,scheduler,root.resolve("direct"));
+                return new Generation(new RatisRocksDBAdapter(schema,directory,tx,allocations,direct,ranges,ids,batches),direct,ranges,tx,snapshots,List.of(session),batches);
+            } catch (Throwable failure) { for (var resource:new AutoCloseable[]{batches,direct,ranges,snapshots,tx,bulkSession==session ? null : bulkSession,session}) if (resource!=null) try { resource.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Generation creation failed",failure); }
         };
     }
     private final URI uri; private final Path root; private final RWScheduler clock; private final RatisRoutedClient routed; private final Limits limits;
@@ -157,7 +171,10 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
                 remaining(context,deadline); if (view.isCancelled()) throw new CancellationException("Connection observer cancelled before DATA dispatch");
                 {
                     long iterator=iterator(original),handle=handle(original); var owner=iterator!=0 ? generations.iterator(iterator) : handle!=0 ? generations.transaction(handle) : generations.current(); selected.set(owner);
-                    if (handle==0 && iterator==0 && !original.isReadOnly()) for (var generation:generations.all()) if (generation.generation().direct()!=null && generation.generation().direct().recoveryState()!=RatisRocksDBDirect.RecoveryState.NONE) throw new IOException("Resolve the original generation's retained direct request before fresh mutation");
+                    if (handle==0 && iterator==0 && !original.isReadOnly()) for (var generation:generations.all()) {
+                        if(generation.generation().direct()!=null && generation.generation().direct().recoveryState()!=RatisRocksDBDirect.RecoveryState.NONE) throw new IOException("Resolve the original generation's retained direct request before fresh mutation");
+                        if(generation.generation().batches()!=null && generation.generation().batches().recoveryState()!=RatisRocksDBBatches.RecoveryState.NONE) throw new IOException("Resolve the original generation's retained batch request before fresh mutation");
+                    }
                     var dispatched=owner.generation().adapter().dispatchOwned(original,remaining(context,deadline)); cancelDelegate.set(dispatched.cancelObserver()); if (view.isCancelled()) dispatched.cancelObserver().run();
                     Object delegated=dispatched.observer(); drained=dispatched.drained(); actual=streamOwner!=null ? CompletableFuture.completedFuture(delegated) : (CompletableFuture<?>)delegated;
                 }
@@ -186,6 +203,36 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     private RequestContext remaining(RequestContext context,long deadline) { if (deadline==Long.MAX_VALUE) return context; long nanos=clock.remainingMonotonicDeadlineNanos(deadline); if (nanos<=0) throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,"Connection request deadline expired"); return new RequestContext(context.profile(),nanos); }
     public CompletableFuture<List<DirectRecovery>> directRecoveryStatus(RequestContext context) { return diagnostic(context,remaining -> { var states=new ArrayList<DirectRecovery>(); for (var generation:generations.all()) if (generation.generation().direct()!=null) states.add(new DirectRecovery(generation.schema().digest(),generation.schema().schemaEpoch(),generation.generation().direct().recoveryState())); return CompletableFuture.completedFuture(List.copyOf(states)); }); }
     public CompletableFuture<Object> resumeDirectRequest(byte[] schemaDigest,RequestContext context) { byte[] frozen=schemaDigest.clone(); return diagnostic(context,remaining -> { for (var generation:generations.all()) if (Arrays.equals(generation.schema().digest(),frozen) && generation.generation().direct()!=null) return generation.generation().direct().resumeRetained(remaining); return CompletableFuture.failedFuture(new IOException("Unknown original direct generation")); }); }
+    public CompletableFuture<List<BatchRecovery>> batchRecoveryStatus(RequestContext context) {
+        return diagnostic(context,remaining -> { var states=new ArrayList<BatchRecovery>(); for(var generation:generations.all()) if(generation.generation().batches()!=null) { var batches=generation.generation().batches(); states.add(new BatchRecovery(generation.schema().digest(),generation.schema().schemaEpoch(),batches.recoveryState(),batches.progress())); } return CompletableFuture.completedFuture(List.copyOf(states)); });
+    }
+    public CompletableFuture<RatisRocksDBBatches.Progress> resumeBatchRequest(byte[] schemaDigest,UUID requestId,RequestContext context) {
+        byte[] frozen=Objects.requireNonNull(schemaDigest).clone(); Objects.requireNonNull(requestId);
+        return diagnosticOwned(context,remaining -> {
+            for(var generation:generations.all()) if(Arrays.equals(generation.schema().digest(),frozen) && generation.generation().batches()!=null) {
+                var batches=generation.generation().batches(); var progress=batches.progress();
+                if(progress==null || !requestId.equals(progress.requestId())) throw new IOException("Batch token differs from original retained request");
+                var observer=batches.resumeRetained(remaining); return new OwnedDiagnostic<>(observer,batches.actualCompletion(observer),() -> observer.cancel(false));
+            }
+            throw new IOException("Unknown original batch generation");
+        });
+    }
+    private record OwnedDiagnostic<T>(CompletableFuture<T> observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
+    @FunctionalInterface private interface OwnedDiagnosticWork<T> { OwnedDiagnostic<T> run(RequestContext remaining) throws Exception; }
+    private <T> CompletableFuture<T> diagnosticOwned(RequestContext context,OwnedDiagnosticWork<T> work) {
+        final long deadline; try { Objects.requireNonNull(context); WorkloadAdmission.resolve(context,OperationFamily.METADATA); deadline=clock.resolveMonotonicDeadline(context); acquireData(); } catch(Throwable failure) { return CompletableFuture.failedFuture(failure); }
+        var view=new CompletableFuture<T>(); var cancel=new java.util.concurrent.atomic.AtomicReference<Runnable>();
+        view.whenComplete((value,failure) -> { if(view.isCancelled()) { var action=cancel.get(); if(action!=null) action.run(); } });
+        Runnable dispatch=() -> {
+            OwnedDiagnostic<T> owned;
+            try { if(view.isCancelled()) throw new CancellationException("Diagnostic cancelled before dispatch"); owned=work.run(remaining(context,deadline)); }
+            catch(Throwable failure) { owned=new OwnedDiagnostic<>(CompletableFuture.failedFuture(failure),CompletableFuture.completedFuture(null),() -> {}); }
+            cancel.set(owned.cancelObserver()); if(view.isCancelled()) owned.cancelObserver().run();
+            owned.drained().whenComplete((ignored,failure) -> { synchronized(RatisRocksDBConnection.this) { dataOwners--; } });
+            owned.observer().whenComplete((value,failure) -> { Runnable publish=() -> { if(failure==null) view.complete(value); else view.completeExceptionally(unwrap(failure)); }; try { dataLane.execute(publish); } catch(RejectedExecutionException rejected) { publish.run(); } });
+        };
+        try { dataLane.execute(dispatch); } catch(RejectedExecutionException failure) { synchronized(this) { dataOwners--; } view.completeExceptionally(failure); } return view;
+    }
     @FunctionalInterface private interface Diagnostic<T> { CompletableFuture<T> run(RequestContext remaining) throws Exception; }
     private <T> CompletableFuture<T> diagnostic(RequestContext context,Diagnostic<T> work) {
         final long deadline; try { Objects.requireNonNull(context); WorkloadAdmission.resolve(context,OperationFamily.METADATA); deadline=clock.resolveMonotonicDeadline(context); acquireData(); } catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
