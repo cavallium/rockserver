@@ -65,6 +65,11 @@ public class LoggingClient implements RocksDBConnection {
 		}
 
 		@Override
+		public void flushWal() {
+			requestSync(new RocksDBAPICommand.Flush(true));
+		}
+
+		@Override
 		public <RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> SYNC_RESULT requestSync(RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_RESULT> req) {
 			logger.trace("Request input (sync): {}", req);
 			SYNC_RESULT result;
@@ -85,6 +90,11 @@ public class LoggingClient implements RocksDBConnection {
 
 		public LoggingAsyncApi(RocksDBAsyncAPI asyncApi) {
 			this.asyncApi = asyncApi;
+		}
+
+		@Override
+		public CompletableFuture<Void> flushWalAsync() {
+			return requestAsync(new RocksDBAPICommand.Flush(true));
 		}
 
 		@SuppressWarnings("unchecked")

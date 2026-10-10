@@ -1,12 +1,61 @@
 # Rockserver workload configuration
 
-All workload tuning is under `database.parallelism.workload`. The old
+Default workload tuning is under `database.parallelism.workload`. The old
 `maintenance-write`, `foreground-write-queue-capacity`, and
 `maintenance-write-queue-capacity` keys do not describe the seven-profile
 scheduler and have been removed. There is no compatibility translation.
 
 The effective database configuration logged at startup prints every value below.
 Durations use ISO-8601 syntax and byte limits use binary units.
+
+## Column workload groups
+
+With no `workload-groups`, every column retains the existing global scheduler.
+To isolate slow-storage admission from hot-only columns, define named groups and
+assign them explicitly in column options:
+
+```hocon
+database.parallelism.workload-groups: [{
+  name: "slow"
+  read: 4
+  write: 4
+  workload: {
+    latency-queue-capacity: 128
+    ingest-queue-capacity: 128
+    batch-queue-capacity: 64
+    competing-batch-read-maximum-active: 2
+  }
+}]
+database.global.column-options: [
+  { name: "archive", workload-group: "slow" },
+  { name: "hot", workload-group: "default" }
+]
+```
+
+Unspecified group values inherit the global settings and must satisfy the same
+capacity constraints, including reservations and batch limits. Group names must
+be unique, contain only letters, digits, underscores or hyphens, and cannot be
+`default`. Unknown column group references fail startup. A column with no group
+inherits `fallback-column-options.workload-group`, which defaults to `default`.
+Assignments are configuration choices applied at database open; they do not infer
+storage speed from volume paths.
+
+Each group has independent bounded queues, workers, profile reservations and
+batch-pressure admission. Its pending-compaction backlog does not throttle another
+group. RocksDB's database-wide write-stop and delayed-write signals still apply
+to every group. Column reads, mutations, ranges, scans and iterator continuations
+use their group over both embedded and gRPC APIs. WAL/CDC, transaction commits,
+whole-database flush/compact and global control operations use global admission;
+a transaction can still operate on columns in different groups without acquiring
+nested scheduler permits. Root shutdown drains all groups.
+
+Group workload overrides cover scheduler admission settings. Retained snapshots,
+response limits, scan/WAL quanta and other bounded-operation settings remain
+global; differing overrides are rejected. Groups share RocksDB WAL, memory, CPU
+and physical storage. Admission isolation does not guarantee disk-latency isolation.
+Adaptive compaction observes the most contended read group and database-wide
+completion progress. Named-group scheduler metrics add `workload_group`; default
+metrics retain their existing tags.
 
 ## Data pools and queues
 
@@ -164,3 +213,17 @@ Tune only with the seven-profile hardware harness. Keep the smallest candidate
 within the throughput/latency acceptance envelope, then verify it and its
 adjacent candidates on the target storage class. CI results alone are not
 hardware acceptance and must not be used to retune these defaults.
+
+## WAL durability barrier
+
+`flushWal()` / `flushWalAsync()` synchronously publish and sync the WAL without
+flushing column memtables to SST files. Use the completed barrier after a committed
+archive transaction before deleting its source data when manual WAL flushing is
+enabled. Barrier failure must prevent that deletion. Existing `flush()` remains a
+full WAL and memtable flush.
+
+The existing gRPC Flush RPC adds `wal_only` at field 2; field 1 retains workload
+contract version 3. An omitted/false flag keeps full-flush behavior. Older servers
+ignore the additive flag and safely perform a full flush; older Java backend and
+Thrift implementations use the full-flush fallback. Both modes retain the global
+physical-maintenance FLUSH admission and shutdown accounting.

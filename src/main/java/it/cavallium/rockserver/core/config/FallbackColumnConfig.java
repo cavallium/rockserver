@@ -5,6 +5,9 @@ import org.jetbrains.annotations.Nullable;
 
 public interface FallbackColumnConfig {
 
+	/** Omitted or "default" uses the global scheduler. */
+	@Nullable String workloadGroup() throws GestaltException;
+
 	@Nullable java.time.Duration compactionTtl() throws GestaltException;
 
 	@Nullable

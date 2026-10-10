@@ -67,6 +67,31 @@ class GrpcPhysicalMaintenanceIdentityTest {
 	}
 
 	@Test
+	void walOnlyRpcSelectsBarrierAndPropagatesBarrierFailure() throws Exception {
+		try (var backend = new MaintenanceBackend();
+				var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort()).usePlaintext().build();
+			try {
+				var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
+				var request = FlushRequest.newBuilder().setWorkloadContractVersion(3).setWalOnly(true).build();
+				stub.flush(request).block(Duration.ofSeconds(5));
+				assertEquals(1, backend.walFlushCalls.get());
+				assertEquals(0, backend.flushCalls.get());
+				backend.failWalFlush = true;
+				var failure = assertThrows(io.grpc.StatusRuntimeException.class,
+						() -> stub.flush(request).block(Duration.ofSeconds(5)));
+				assertEquals(io.grpc.Status.Code.INTERNAL, failure.getStatus().getCode());
+				assertEquals(2, backend.walFlushCalls.get());
+				assertEquals(0, backend.flushCalls.get());
+			} finally {
+				channel.shutdownNow();
+				assertTrue(channel.awaitTermination(5, SECONDS));
+			}
+		}
+	}
+
+	@Test
 	void maintenanceDispatchCancellationAndRejectionKeepRequestedOperationIdentity() throws Exception {
 		try (var backend = new MaintenanceBackend()) {
 			var blockerStarted = new CountDownLatch(1);
@@ -176,11 +201,19 @@ class GrpcPhysicalMaintenanceIdentityTest {
 		private final RWScheduler scheduler = RWScheduler.forTesting(
 				1, 1, 1, 2, 2, "grpc-physical-identity", registry, DATABASE);
 		private final AtomicInteger flushCalls = new AtomicInteger();
+		private final AtomicInteger walFlushCalls = new AtomicInteger();
+		private volatile boolean failWalFlush;
 		private final AtomicInteger compactCalls = new AtomicInteger();
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
 			public void flush() {
 				flushCalls.incrementAndGet();
+			}
+
+			@Override
+			public void flushWal() {
+				walFlushCalls.incrementAndGet();
+				if (failWalFlush) throw RocksDBException.of(RocksDBException.RocksDBErrorType.INTERNAL_ERROR, "WAL sync failed");
 			}
 
 			@Override

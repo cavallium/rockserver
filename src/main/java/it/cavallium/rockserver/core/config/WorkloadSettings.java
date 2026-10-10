@@ -199,6 +199,57 @@ public record WorkloadSettings(
 		return settings;
 	}
 
+	/** Resolve all groups before native resources or worker pools are opened. */
+	public static Map<String, WorkloadSettings> resolveGroups(DatabaseConfig config) throws GestaltException {
+		var parallelism = config.parallelism();
+		var global = resolve(config);
+		var result = new java.util.LinkedHashMap<String, WorkloadSettings>();
+		var groups = parallelism.workloadGroups();
+		if (groups != null) {
+			for (var group : groups) {
+				String name = group.name();
+				if (name == null || !name.matches("[A-Za-z0-9_-]+") || name.equals("default")) {
+					throw invalid("workload group name must be unique, nonempty and not default: " + name);
+				}
+				var settings = from(Objects.requireNonNullElse(group.workload(), parallelism.workload()),
+						Objects.requireNonNullElse(group.read(), global.readParallelism()),
+						Objects.requireNonNullElse(group.write(), global.writeParallelism()), parallelism.workload());
+				settings.validateProductionCapacities();
+				validateGroupOperationBounds(settings, global);
+				if (result.putIfAbsent(name, settings) != null) throw invalid("Duplicate workload group: " + name);
+			}
+		}
+		validateGroup(config.global().fallbackColumnOptions().workloadGroup(), result);
+		for (var column : config.global().columnOptions()) validateGroup(column.workloadGroup(), result);
+		return Map.copyOf(result);
+	}
+
+	private static void validateGroupOperationBounds(WorkloadSettings group, WorkloadSettings global) {
+		// Retained native state, response contracts and WAL quanta still belong to the database.
+		if (!Objects.equals(group.retainedAnalyticalSnapshots(), global.retainedAnalyticalSnapshots())
+				|| !Objects.equals(group.retainedSnapshotMaximumAge(), global.retainedSnapshotMaximumAge())
+				|| !Objects.equals(group.rangeQuantumMaxItems(), global.rangeQuantumMaxItems())
+				|| !Objects.equals(group.rangeQuantumMaxBytes(), global.rangeQuantumMaxBytes())
+				|| !Objects.equals(group.rangeQuantumMaxDuration(), global.rangeQuantumMaxDuration())
+				|| !Objects.equals(group.rawScanFileConcurrency(), global.rawScanFileConcurrency())
+				|| !Objects.equals(group.rawScanReadaheadBytes(), global.rawScanReadaheadBytes())
+				|| !Objects.equals(group.cdcQuantumMaxMutations(), global.cdcQuantumMaxMutations())
+				|| !Objects.equals(group.cdcQuantumMaxBytes(), global.cdcQuantumMaxBytes())
+				|| !Objects.equals(group.cdcQuantumMaxDuration(), global.cdcQuantumMaxDuration())
+				|| !Objects.equals(group.latencyRangeMaxItems(), global.latencyRangeMaxItems())
+				|| !Objects.equals(group.latencyRangeMaxBytes(), global.latencyRangeMaxBytes())
+				|| !Objects.equals(group.latencyFanOutMaxItems(), global.latencyFanOutMaxItems())
+				|| !Objects.equals(group.latencyFanOutMaxBytes(), global.latencyFanOutMaxBytes())) {
+			throw invalid("Workload groups may override scheduler admission settings only; bounded-operation settings are global");
+		}
+	}
+
+	private static void validateGroup(String group, Map<String, WorkloadSettings> groups) {
+		if (group != null && !group.equals("default") && !groups.containsKey(group)) {
+			throw invalid("Unknown column workload group: " + group);
+		}
+	}
+
 	public void validateProductionCapacities() {
 		if (readParallelism < MIN_PRODUCTION_DATA_THREADS || writeParallelism < MIN_PRODUCTION_DATA_THREADS) {
 			throw invalid("read and write capacities must each be at least "
@@ -226,49 +277,54 @@ public record WorkloadSettings(
 	private static WorkloadSettings from(WorkloadConfig o,
 			int readParallelism,
 			int writeParallelism) throws GestaltException {
+		return from(o, readParallelism, writeParallelism, o);
+	}
+
+	private static WorkloadSettings from(WorkloadConfig o, int readParallelism,
+			int writeParallelism, WorkloadConfig fallback) throws GestaltException {
 		return new WorkloadSettings(
 				readParallelism,
 				writeParallelism,
-				require(o.latencyQueueCapacity(), "latency-queue-capacity"),
-				require(o.ingestQueueCapacity(), "ingest-queue-capacity"),
-				require(o.cdcQueueCapacity(), "cdc-queue-capacity"),
-				require(o.analyticalQueueCapacity(), "analytical-queue-capacity"),
-				require(o.batchQueueCapacity(), "batch-queue-capacity"),
-				require(o.controlQueueCapacity(), "control-queue-capacity"),
-				require(o.physicalMaintenanceQueueCapacity(), "physical-maintenance-queue-capacity"),
-				require(o.readLatencyReservation(), "read-latency-reservation"),
-				require(o.readIngestReservation(), "read-ingest-reservation"),
-				require(o.readCdcReservation(), "read-cdc-reservation"),
-				require(o.writeLatencyReservation(), "write-latency-reservation"),
-				require(o.writeIngestReservation(), "write-ingest-reservation"),
-				require(o.writeCdcReservation(), "write-cdc-reservation"),
-				require(o.controlThreads(), "control-threads"),
-				require(o.physicalConcurrency(), "physical-concurrency"),
-				require(o.analyticalActiveLimit(), "analytical-active-limit"),
-				require(o.retainedAnalyticalSnapshots(), "retained-analytical-snapshots"),
-				require(o.retainedSnapshotMaximumAge(), "retained-snapshot-maximum-age"),
-				require(o.latencyBurst(), "latency-burst"),
-				require(o.ingestDrrWeight(), "ingest-drr-weight"),
-				require(o.cdcDrrWeight(), "cdc-drr-weight"),
-				require(o.analyticalDrrWeight(), "analytical-drr-weight"),
-				require(o.batchDrrWeight(), "batch-drr-weight"),
-				require(o.competingBatchReadMaximumActive(), "competing-batch-read-maximum-active"),
-				require(o.competingBatchWriteMaximumActive(), "competing-batch-write-maximum-active"),
-				require(o.competingBatchWriteInterval(), "competing-batch-write-interval"),
-				require(o.pressuredBatchMaximumActive(), "pressured-batch-maximum-active"),
-				require(o.pressuredBatchInterval(), "pressured-batch-interval"),
-				require(o.rangeQuantumMaxItems(), "range-quantum-max-items"),
-				require(o.rangeQuantumMaxBytes(), "range-quantum-max-bytes").longValue(),
-				require(o.rangeQuantumMaxDuration(), "range-quantum-max-duration"),
-				require(o.rawScanFileConcurrency(), "raw-scan-file-concurrency"),
-				require(o.rawScanReadaheadBytes(), "raw-scan-readahead-bytes").longValue(),
-				require(o.cdcQuantumMaxMutations(), "cdc-quantum-max-mutations"),
-				require(o.cdcQuantumMaxBytes(), "cdc-quantum-max-bytes").longValue(),
-				require(o.cdcQuantumMaxDuration(), "cdc-quantum-max-duration"),
-				require(o.latencyRangeMaxItems(), "latency-range-max-items"),
-				require(o.latencyRangeMaxBytes(), "latency-range-max-bytes").longValue(),
-				require(o.latencyFanOutMaxItems(), "latency-fan-out-max-items"),
-				require(o.latencyFanOutMaxBytes(), "latency-fan-out-max-bytes").longValue());
+				require(o.latencyQueueCapacity(), fallback.latencyQueueCapacity(), "latency-queue-capacity"),
+				require(o.ingestQueueCapacity(), fallback.ingestQueueCapacity(), "ingest-queue-capacity"),
+				require(o.cdcQueueCapacity(), fallback.cdcQueueCapacity(), "cdc-queue-capacity"),
+				require(o.analyticalQueueCapacity(), fallback.analyticalQueueCapacity(), "analytical-queue-capacity"),
+				require(o.batchQueueCapacity(), fallback.batchQueueCapacity(), "batch-queue-capacity"),
+				require(o.controlQueueCapacity(), fallback.controlQueueCapacity(), "control-queue-capacity"),
+				require(o.physicalMaintenanceQueueCapacity(), fallback.physicalMaintenanceQueueCapacity(), "physical-maintenance-queue-capacity"),
+				require(o.readLatencyReservation(), fallback.readLatencyReservation(), "read-latency-reservation"),
+				require(o.readIngestReservation(), fallback.readIngestReservation(), "read-ingest-reservation"),
+				require(o.readCdcReservation(), fallback.readCdcReservation(), "read-cdc-reservation"),
+				require(o.writeLatencyReservation(), fallback.writeLatencyReservation(), "write-latency-reservation"),
+				require(o.writeIngestReservation(), fallback.writeIngestReservation(), "write-ingest-reservation"),
+				require(o.writeCdcReservation(), fallback.writeCdcReservation(), "write-cdc-reservation"),
+				require(o.controlThreads(), fallback.controlThreads(), "control-threads"),
+				require(o.physicalConcurrency(), fallback.physicalConcurrency(), "physical-concurrency"),
+				require(o.analyticalActiveLimit(), fallback.analyticalActiveLimit(), "analytical-active-limit"),
+				require(o.retainedAnalyticalSnapshots(), fallback.retainedAnalyticalSnapshots(), "retained-analytical-snapshots"),
+				require(o.retainedSnapshotMaximumAge(), fallback.retainedSnapshotMaximumAge(), "retained-snapshot-maximum-age"),
+				require(o.latencyBurst(), fallback.latencyBurst(), "latency-burst"),
+				require(o.ingestDrrWeight(), fallback.ingestDrrWeight(), "ingest-drr-weight"),
+				require(o.cdcDrrWeight(), fallback.cdcDrrWeight(), "cdc-drr-weight"),
+				require(o.analyticalDrrWeight(), fallback.analyticalDrrWeight(), "analytical-drr-weight"),
+				require(o.batchDrrWeight(), fallback.batchDrrWeight(), "batch-drr-weight"),
+				require(o.competingBatchReadMaximumActive(), fallback.competingBatchReadMaximumActive(), "competing-batch-read-maximum-active"),
+				require(o.competingBatchWriteMaximumActive(), fallback.competingBatchWriteMaximumActive(), "competing-batch-write-maximum-active"),
+				require(o.competingBatchWriteInterval(), fallback.competingBatchWriteInterval(), "competing-batch-write-interval"),
+				require(o.pressuredBatchMaximumActive(), fallback.pressuredBatchMaximumActive(), "pressured-batch-maximum-active"),
+				require(o.pressuredBatchInterval(), fallback.pressuredBatchInterval(), "pressured-batch-interval"),
+				require(o.rangeQuantumMaxItems(), fallback.rangeQuantumMaxItems(), "range-quantum-max-items"),
+				require(o.rangeQuantumMaxBytes(), fallback.rangeQuantumMaxBytes(), "range-quantum-max-bytes").longValue(),
+				require(o.rangeQuantumMaxDuration(), fallback.rangeQuantumMaxDuration(), "range-quantum-max-duration"),
+				require(o.rawScanFileConcurrency(), fallback.rawScanFileConcurrency(), "raw-scan-file-concurrency"),
+				require(o.rawScanReadaheadBytes(), fallback.rawScanReadaheadBytes(), "raw-scan-readahead-bytes").longValue(),
+				require(o.cdcQuantumMaxMutations(), fallback.cdcQuantumMaxMutations(), "cdc-quantum-max-mutations"),
+				require(o.cdcQuantumMaxBytes(), fallback.cdcQuantumMaxBytes(), "cdc-quantum-max-bytes").longValue(),
+				require(o.cdcQuantumMaxDuration(), fallback.cdcQuantumMaxDuration(), "cdc-quantum-max-duration"),
+				require(o.latencyRangeMaxItems(), fallback.latencyRangeMaxItems(), "latency-range-max-items"),
+				require(o.latencyRangeMaxBytes(), fallback.latencyRangeMaxBytes(), "latency-range-max-bytes").longValue(),
+				require(o.latencyFanOutMaxItems(), fallback.latencyFanOutMaxItems(), "latency-fan-out-max-items"),
+				require(o.latencyFanOutMaxBytes(), fallback.latencyFanOutMaxBytes(), "latency-fan-out-max-bytes").longValue());
 	}
 
 	private static WorkloadSettings defaults(int readParallelism,
@@ -405,6 +461,10 @@ public record WorkloadSettings(
 		} catch (ArithmeticException e) {
 			throw invalid(key + " is too large");
 		}
+	}
+
+	private static <T> T require(T value, T fallback, String key) {
+		return require(value == null ? fallback : value, key);
 	}
 
 	private static <T> T require(T value, String key) {

@@ -274,7 +274,7 @@ message ScanRawResponse {
 
 message CompactRequest {int32 workloadContractVersion = 1;}
 
-message FlushRequest {int32 workloadContractVersion = 1;}
+message FlushRequest {int32 workloadContractVersion = 1; bool wal_only = 2;}
 
 message GetAllColumnDefinitionsRequest {RequestContext context = 1;}
 message GetAllColumnDefinitionsResponse {repeated Column columns = 1;}

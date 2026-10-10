@@ -61,6 +61,8 @@ public final class RWScheduler {
 	private final ProfiledWorkloadExecutor controlPool;
 	private final ProfiledWorkloadExecutor physicalPool;
 	private final List<ProfiledWorkloadExecutor> pools;
+	private volatile List<ProfiledWorkloadExecutor> ownedPools;
+	private volatile List<RWScheduler> ownedGroups = List.of();
 	private final WorkloadPressureController pressureController;
 	private final SchedulerDeadlineClock deadlineClock;
 	private final ThreadLocal<DeadlineBindingSlot> localDeadlineBinding = new ThreadLocal<>();
@@ -84,6 +86,17 @@ public final class RWScheduler {
 			String databaseName,
 			boolean productionCapacities,
 			SchedulerDeadlineClock deadlineClock) {
+		this(settings, name, registry, databaseName, productionCapacities, deadlineClock, "default");
+	}
+
+	public RWScheduler(WorkloadSettings settings, String name, @Nullable MeterRegistry registry,
+			String databaseName, String workloadGroup) {
+		this(settings, name, registry, databaseName, true, SchedulerDeadlineClock.system(), workloadGroup);
+	}
+
+	private RWScheduler(WorkloadSettings settings, String name, @Nullable MeterRegistry registry,
+			String databaseName, boolean productionCapacities, SchedulerDeadlineClock deadlineClock,
+			String workloadGroup) {
 		Objects.requireNonNull(settings, "settings");
 		Objects.requireNonNull(name, "name");
 		Objects.requireNonNull(databaseName, "databaseName");
@@ -116,7 +129,7 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName);
+				databaseName, workloadGroup);
 		this.writePool = new ProfiledWorkloadExecutor(settings.writeParallelism(),
 				1,
 				writeCapacities,
@@ -129,7 +142,7 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName);
+				databaseName, workloadGroup);
 		this.controlPool = new ProfiledWorkloadExecutor(settings.controlThreads(),
 				settings.controlThreads(),
 				Map.of(WorkloadProfile.CONTROL, settings.controlQueueCapacity()),
@@ -142,7 +155,7 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName);
+				databaseName, workloadGroup);
 		this.physicalPool = new ProfiledWorkloadExecutor(settings.physicalConcurrency(),
 				settings.physicalConcurrency(),
 				Map.of(WorkloadProfile.PHYSICAL_MAINTENANCE, settings.physicalMaintenanceQueueCapacity()),
@@ -155,15 +168,16 @@ public final class RWScheduler {
 				pressureController,
 				deadlineClock,
 				registry,
-				databaseName);
+				databaseName, workloadGroup);
 		this.pools = List.of(readPool, writePool, controlPool, physicalPool);
+		this.ownedPools = pools;
 		this.noDeadlineExecutors = createNoDeadlineExecutors();
 		pressureController.setBatchDispatchabilitySources(
 				readPool::batchDispatchable,
 				writePool::batchDispatchable);
 		pressureController.setNotifier(this::signalAllPools);
 		pressureController.setBatchNotifier(this::signalBatchPools);
-		registerStoragePressureGauge(registry, databaseName);
+		registerStoragePressureGauge(registry, databaseName, workloadGroup);
 	}
 
 	private WorkloadExecutor[][] createNoDeadlineExecutors() {
@@ -198,7 +212,7 @@ public final class RWScheduler {
 		return false;
 	}
 
-	private void registerStoragePressureGauge(@Nullable MeterRegistry registry, String databaseName) {
+	private void registerStoragePressureGauge(@Nullable MeterRegistry registry, String databaseName, String workloadGroup) {
 		if (registry == null) {
 			return;
 		}
@@ -207,6 +221,8 @@ public final class RWScheduler {
 					pressureController,
 					value -> value.isPressured() ? 1 : 0)
 					.tag("database", databaseName)
+					.tags(workloadGroup.equals("default") ? io.micrometer.core.instrument.Tags.empty()
+							: io.micrometer.core.instrument.Tags.of("workload_group", workloadGroup))
 					.register(registry);
 		} catch (VirtualMachineError fatal) {
 			throw fatal;
@@ -454,26 +470,20 @@ public final class RWScheduler {
 	}
 
 	public int queuedTasks(WorkloadProfile profile) {
-		return addExact(readPool.queued(profile), writePool.queued(profile),
-				controlPool.queued(profile), physicalPool.queued(profile));
-	}
-
-	public int activeTasks(WorkloadProfile profile) {
-		return addExact(readPool.active(profile), writePool.active(profile),
-				controlPool.active(profile), physicalPool.active(profile));
-	}
-
-	public int queueCapacity(WorkloadProfile profile) {
-		return addExact(readPool.capacity(profile), writePool.capacity(profile),
-				controlPool.capacity(profile), physicalPool.capacity(profile));
-	}
-
-	private static int addExact(int... values) {
 		int result = 0;
-		for (int value : values) result = Math.addExact(result, value);
+		for (var pool : pools()) result = Math.addExact(result, pool.queued(profile));
 		return result;
 	}
-
+	public int activeTasks(WorkloadProfile profile) {
+		int result = 0;
+		for (var pool : pools()) result = Math.addExact(result, pool.active(profile));
+		return result;
+	}
+	public int queueCapacity(WorkloadProfile profile) {
+		int result = 0;
+		for (var pool : pools()) result = Math.addExact(result, pool.capacity(profile));
+		return result;
+	}
 	public ProfileAdmissionSnapshot admissionSnapshot() {
 		var queued = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
 		var active = new EnumMap<WorkloadProfile, Integer>(WorkloadProfile.class);
@@ -529,6 +539,32 @@ public final class RWScheduler {
 			case PHYSICAL -> physicalPool;
 		};
 		executor.copyPoolTelemetry(target);
+	}
+
+	/**
+	 * Compaction shares physical resources across groups. Protect the most contended read pool,
+	 * rather than letting idle workers in another group mask its LATENCY backlog. Completion
+	 * counters include every group, preserving a monotonic database-wide progress signal.
+	 */
+	public void copyCompactionReadTelemetry(long[] target, long[] scratch) {
+		copyPoolTelemetry(Pool.READ, target);
+		long completions = target[POOL_TELEMETRY_COMPLETED_TASKS];
+		for (var group : ownedGroups) {
+			group.copyPoolTelemetry(Pool.READ, scratch);
+			completions = Math.addExact(completions, scratch[POOL_TELEMETRY_COMPLETED_TASKS]);
+			if (moreReadContention(scratch, target)) System.arraycopy(scratch, 0, target, 0, POOL_TELEMETRY_LENGTH);
+		}
+		target[POOL_TELEMETRY_COMPLETED_TASKS] = completions;
+	}
+
+	private static boolean moreReadContention(long[] candidate, long[] selected) {
+		long candidateQueued = candidate[POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()];
+		long selectedQueued = selected[POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()];
+		boolean candidateSaturated = candidateQueued > 0
+				&& candidate[POOL_TELEMETRY_ACTIVE_TASKS] >= candidate[POOL_TELEMETRY_WORKER_COUNT];
+		boolean selectedSaturated = selectedQueued > 0
+				&& selected[POOL_TELEMETRY_ACTIVE_TASKS] >= selected[POOL_TELEMETRY_WORKER_COUNT];
+		return candidateSaturated != selectedSaturated ? candidateSaturated : candidateQueued > selectedQueued;
 	}
 
 	public SchedulerSnapshot instrumentationSnapshot() {
@@ -615,7 +651,21 @@ public final class RWScheduler {
 	}
 
 	private List<ProfiledWorkloadExecutor> pools() {
-		return pools;
+		return ownedPools;
+	}
+
+	/** Startup-only ownership transfer: root shutdown and cancellation cover every group. */
+	public synchronized void ownGroup(RWScheduler group) {
+		if (group == this || group.pools().stream().anyMatch(ownedPools::contains)
+				|| ownedPools.stream().anyMatch(pool -> pool.snapshot().shutdown())) {
+			throw new IllegalStateException("Cannot attach workload group to this scheduler");
+		}
+		var combined = new java.util.ArrayList<>(ownedPools);
+		combined.addAll(group.pools());
+		ownedPools = List.copyOf(combined);
+		var groups = new java.util.ArrayList<>(ownedGroups);
+		groups.add(group);
+		ownedGroups = List.copyOf(groups);
 	}
 
 	public Mono<Void> disposeGracefully() {

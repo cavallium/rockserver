@@ -1340,7 +1340,17 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public CompletableFuture<Void> flushAsync() {
+		return flushAsync(false);
+	}
+
+	@Override
+	public CompletableFuture<Void> flushWalAsync() {
+		return flushAsync(true);
+	}
+
+	private CompletableFuture<Void> flushAsync(boolean walOnly) {
 		var request = FlushRequest.newBuilder()
+				.setWalOnly(walOnly)
 				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
 				.build();
 		return toResponse(this.futureStub.flush(request), _ -> null);

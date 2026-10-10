@@ -385,6 +385,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicLong resourceLeases = new AtomicLong();
 	private final Object columnEditLock = new Object();
 	private final DatabaseConfig config;
+	private final Map<String, RWScheduler> workloadGroups = new java.util.LinkedHashMap<>();
+	private final Map<String, StoragePressureSignal> workloadGroupPressure = new java.util.LinkedHashMap<>();
+	private final Map<String, String> columnWorkloadGroups = new HashMap<>();
+	private final ConcurrentHashMap<Long, String> columnWorkloadNames = new ConcurrentHashMap<>();
+	private String fallbackWorkloadGroup = "default";
+
 	private final WorkloadSettings workloadSettings;
 	private final RocksDBObjects refs;
 	private final Map<String, Cache> caches;
@@ -503,6 +509,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					e);
 		}
 		this.workloadSettings = workloadSettings;
+		try {
+			fallbackWorkloadGroup = Objects.requireNonNullElse(config.global().fallbackColumnOptions().workloadGroup(), "default");
+			for (var column : config.global().columnOptions()) {
+				columnWorkloadGroups.put(column.name(), Objects.requireNonNullElse(column.workloadGroup(), fallbackWorkloadGroup));
+			}
+		} catch (GestaltException failure) {
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, failure);
+		}
 		this.maxRetainedSnapshotAgeMs = workloadSettings.retainedSnapshotMaximumAge().toMillis();
 		int readCap = workloadSettings.readParallelism();
 		int writeCap = workloadSettings.writeParallelism();
@@ -711,6 +725,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						"db[" + name + "]",
 						metrics.getRegistry(),
 						name);
+		try {
+			for (var group : WorkloadSettings.resolveGroups(config).entrySet()) {
+				var groupScheduler = new RWScheduler(group.getValue(),
+						"db[" + name + "]-" + group.getKey(), metrics.getRegistry(),
+						name, group.getKey());
+				workloadGroups.put(group.getKey(), groupScheduler);
+				scheduler.ownGroup(groupScheduler);
+				workloadGroupPressure.put(group.getKey(), newWorkloadGroupPressureSignal());
+			}
+		} catch (GestaltException failure) {
+			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, failure);
+		}
+		if (!workloadGroups.isEmpty()) workloadGroupPressure.put("default", newWorkloadGroupPressureSignal());
 		registerStoragePressureSignalMetrics(metrics.getRegistry());
 		// Pin capture performs filesystem work while RocksDB file deletion is
 		// disabled. Keep that serialized critical section on one owned thread so
@@ -861,8 +888,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					throw new RuntimeException("Failed to read adaptive readahead ceiling", failure);
 				}
 				var readPoolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+				var groupReadPoolTelemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
 				compactionIoController = new CompactionIoController(name, loadedDb.compactionIoLimiter(),
-						() -> sampleCompactionIo(loadedDb.compactionIoLimiter(), readPoolTelemetry), metrics.getRegistry(),
+						() -> sampleCompactionIo(loadedDb.compactionIoLimiter(), readPoolTelemetry, groupReadPoolTelemetry), metrics.getRegistry(),
 						readaheadCeiling, this::applyCompactionReadahead);
 			} catch (RuntimeException | Error failure) {
 				try { close(); } catch (Throwable cleanupFailure) { failure.addSuppressed(cleanupFailure); }
@@ -1141,6 +1169,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		var column = new ColumnInstance(cfh, schema, mergeOp);
+		columnWorkloadNames.put(id, columnWorkloadGroups.getOrDefault(name, fallbackWorkloadGroup));
 		this.columns.put(id, column);
 		upsertStoragePressureColumn(new StoragePressureColumn(
 				pressureColumn.id(),
@@ -1343,6 +1372,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	 * may not be registered
 	 */
 	private ColumnInstance unregisterColumn(long id, @NotNull String name) {
+		columnWorkloadNames.remove(id);
 		synchronized (columnEditLock) {
 			var col = this.columns.remove(id);
 			Objects.requireNonNull(col, () -> "Column does not exist: " + id);
@@ -3148,10 +3178,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter) {
-		return sampleCompactionIo(limiter, new long[RWScheduler.POOL_TELEMETRY_LENGTH]);
+		return sampleCompactionIo(limiter, new long[RWScheduler.POOL_TELEMETRY_LENGTH],
+				new long[RWScheduler.POOL_TELEMETRY_LENGTH]);
 	}
 
-	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter, long[] readPoolTelemetry) {
+	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter, long[] readPoolTelemetry,
+			long[] groupReadPoolTelemetry) {
 		ops.beginOp();
 		boolean stopped = false;
 		boolean pressure = false;
@@ -3187,7 +3219,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var compactionReads = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_MICROS);
 				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
 				var bulk = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
-				scheduler.copyPoolTelemetry(RWScheduler.Pool.READ, readPoolTelemetry);
+				scheduler.copyCompactionReadTelemetry(readPoolTelemetry, groupReadPoolTelemetry);
 				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
 						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
 				boolean foregroundPending = ops.getPendingOpsCount() > 1;
@@ -3241,10 +3273,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long writeStopped = rocksDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY);
 			long actualDelayedWriteRate = rocksDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY);
 			storagePressureSignal.reset(writeStopped, actualDelayedWriteRate);
+			for (var signal : workloadGroupPressure.values()) signal.reset(writeStopped, actualDelayedWriteRate);
+			boolean databasePressure = storagePressureSignal.pressured();
 
 			// The DB-wide signals already prove pressure. Avoid one JNI call per
 			// column until RocksDB reports that writes are flowing normally again.
-			if (!storagePressureSignal.pressured()) {
+			if (!databasePressure) {
 				for (StoragePressureColumn pressureColumn : pressureColumns) {
 					ColumnInstance registeredColumn = pressureColumn.registeredColumn();
 					if (registeredColumn != null && !tryBeginColumnUse(registeredColumn)) {
@@ -3254,6 +3288,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						long pendingCompactionBytes = rocksDb.getLongProperty(
 								pressureColumn.handle(),
 								ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
+						var groupSignal = workloadGroupPressure.get(columnWorkloadNames.getOrDefault(pressureColumn.id(), "default"));
+						if (groupSignal != null) groupSignal.observeColumn(pressureColumn.id(), pendingCompactionBytes,
+								pressureColumn.effectiveSoftPendingCompactionBytesLimit());
 						storagePressureSignal.observeColumn(pressureColumn.id(),
 								pendingCompactionBytes,
 								pressureColumn.effectiveSoftPendingCompactionBytesLimit());
@@ -3262,12 +3299,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							registeredColumn.endUse();
 						}
 					}
-					if (storagePressureSignal.pressured()) {
+					if (workloadGroups.isEmpty() && storagePressureSignal.pressured()) {
 						break;
 					}
 				}
 			}
-			scheduler.setStoragePressure(storagePressureSignal.pressured());
+			scheduler.setStoragePressure(workloadGroups.isEmpty() ? storagePressureSignal.pressured()
+					: workloadGroupPressure.get("default").pressured());
+			for (var group : workloadGroups.entrySet()) {
+				group.getValue().setStoragePressure(workloadGroupPressure.get(group.getKey()).pressured());
+			}
 		} catch (VirtualMachineError fatal) {
 			throw fatal;
 		} catch (Throwable error) {
@@ -3282,9 +3323,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private static StoragePressureSignal newWorkloadGroupPressureSignal() {
+		return STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE == 0L
+				? new StoragePressureSignal() : new StoragePressureSignal(STORAGE_PRESSURE_PENDING_COMPACTION_BYTES_OVERRIDE);
+	}
+
 	private void handleStoragePressureRefreshFailure(Throwable error) {
 		storagePressureSignal.markSignalFailure();
 		scheduler.setStoragePressure(true);
+		for (var group : workloadGroups.values()) group.setStoragePressure(true);
 		storagePressureRefreshFailures.increment();
 		logger.debug("Unable to refresh workload storage-pressure state", error);
 	}
@@ -4128,7 +4175,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull PutBatchMode mode) throws RocksDBException {
 		return putBatchInternal(columnId, batchPublisher, mode,
-				scheduler.scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
+				getSchedulerForColumn(columnId).scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
 	}
 
 	public CompletableFuture<Void> putBatchInternal(long columnId,
@@ -4166,7 +4213,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Publisher<@NotNull KVBatch> batchPublisher,
 			@NotNull MergeBatchMode mode) throws RocksDBException {
 		return mergeBatchInternal(columnId, batchPublisher, mode,
-				scheduler.scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
+				getSchedulerForColumn(columnId).scheduler(WorkloadProfile.INGEST, OperationFamily.MUTATION, Long.MAX_VALUE));
 	}
 
 	public CompletableFuture<Void> mergeBatchInternal(long columnId,
@@ -6482,6 +6529,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final class IteratorState extends RocksDBObjects {
 
 		private final ColumnInstance column;
+		private final RWScheduler workloadScheduler;
 		private final boolean reverse;
 		private RocksIterator iterator;
 		private java.util.ListIterator<Entry<Buf[], Buf>> bucketIterator;
@@ -6490,6 +6538,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		private IteratorState(ColumnInstance.ColumnUse columnUse, boolean reverse) {
 			super(columnUse);
 			this.column = columnUse.column();
+			this.workloadScheduler = getSchedulerForColumn(column.cfh().getID());
 			this.reverse = reverse;
 		}
 	}
@@ -7240,7 +7289,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
 		var deadline = retainedReadDeadline(context);
-		var workloadExecutor = scheduler.executor(workloadProfile,
+		var workloadExecutor = getSchedulerForColumn(columnId).executor(workloadProfile,
 				OperationFamily.RANGE_PAGE,
 				deadline.monotonicNanos());
 		boolean fillCache = !(requestType instanceof RequestType.RequestGetAllInRangeNoCache<?>);
@@ -7351,7 +7400,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		LongAdder totalTime = new LongAdder();
 		long start = System.nanoTime();
 		var deadline = retainedReadDeadline(context);
-		var workloadExecutor = scheduler.executor(workloadProfile,
+		var workloadExecutor = getSchedulerForColumn(columnId).executor(workloadProfile,
 				OperationFamily.FULL_SCAN_AGGREGATE,
 				deadline.monotonicNanos());
 		actionLogger.logAction("ReduceRange (begin)",
@@ -10095,8 +10144,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				null,
 				Function.identity(),
 				null,
-				scheduler.scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE),
-				scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
+				getSchedulerForColumn(columnId).scheduler(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE),
+				getSchedulerForColumn(columnId).executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE));
 	}
 
 	public Flux<SerializedKVBatch> scanRawAsyncInternal(long columnId,
@@ -10105,7 +10154,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Scheduler workloadScheduler) {
 		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
 				? indexedScheduler.workloadExecutor()
-				: scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+				: getSchedulerForColumn(columnId).executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		return scanRawAsyncInternal(columnId,
 				shardIndex,
 				shardCount,
@@ -10248,7 +10297,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			@NotNull Scheduler workloadScheduler) {
 		var workloadExecutor = workloadScheduler instanceof IndexedWorkloadScheduler indexedScheduler
 				? indexedScheduler.workloadExecutor()
-				: scheduler.executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
+				: getSchedulerForColumn(columnId).executor(WorkloadProfile.BATCH, OperationFamily.RANGE_PAGE, Long.MAX_VALUE);
 		return scanRawAsyncInternal(columnId,
 				shardIndex,
 				shardCount,
@@ -10269,10 +10318,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	@Override
 	public void flush() {
+		flush(false);
+	}
+
+	@Override
+	public void flushWal() {
+		flush(true);
+	}
+
+	private void flush(boolean walOnly) {
 		var start = System.nanoTime();
 		ops.beginOp();
 		try {
-			actionLogger.logAction("Flush", start, null, null, null, null, null, null, null);
+			actionLogger.logAction(walOnly ? "FlushWal" : "Flush", start, null, null, null, null, null, null, null);
+			if (walOnly) {
+				db.get().flushWal(true);
+				recordCdcPublishedTail();
+				return;
+			}
 			synchronized (columnEditLock) {
 				var observer = columnMaintenanceObserver;
 				if (observer != null) {
@@ -10388,7 +10451,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
     private Mono<Map<String, ColumnTableProperties>> collectTablePropertiesMetrics() {
         // Schedule each column separately, so batch admission/pressure is rechecked between columns.
         return Flux.fromIterable(List.copyOf(columns.entrySet()))
-                .concatMap(entry -> scheduleTracked(scheduler.scheduler(WorkloadProfile.BATCH,
+                .concatMap(entry -> scheduleTracked(getSchedulerForColumn(entry.getKey()).scheduler(WorkloadProfile.BATCH,
                         OperationFamily.FULL_SCAN_AGGREGATE, Long.MAX_VALUE), () -> {
                     var column = entry.getValue();
                     if (!tryBeginColumnUse(column)) return null; // An empty Mono skips retired columns.
@@ -10863,6 +10926,47 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	@VisibleForTesting
 	public DatabaseConfig getConfig() {
 		return config;
+	}
+
+	/** No native lookup or extra permit acquisition is needed to select column admission. */
+	public RWScheduler getSchedulerForColumn(long columnId) {
+		return workloadGroups.getOrDefault(columnWorkloadNames.getOrDefault(columnId, "default"), scheduler);
+	}
+
+	public RWScheduler getSchedulerForIterator(long iteratorId) {
+		var entry = its.get(iteratorId);
+		return entry != null && entry.objs() instanceof IteratorState state ? state.workloadScheduler : scheduler;
+	}
+
+	/** Database-wide operations, including transaction commit and WAL polling, use global admission. */
+	public RWScheduler getSchedulerForCommand(RocksDBAPICommand<?, ?, ?> command) {
+		return switch (command) {
+			case RocksDBAPICommand.RocksDBAPICommandSingle.DeleteColumn value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.EstimateNumKeys value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.Put<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.Delete<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.Merge<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeMulti<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.Get<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.OpenIterator value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.ReduceRange<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandStream.GetRange<?> value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandStream.ScanRaw value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.RocksDBAPICommandStream.ScanRawResumable value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.GetTableProperties value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.GetSstMetadata value -> getSchedulerForColumn(value.columnId());
+			case RocksDBAPICommand.CompactFiles value -> getSchedulerForColumn(value.request().columnId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.SeekTo value -> getSchedulerForIterator(value.iterationId());
+			case RocksDBAPICommand.RocksDBAPICommandSingle.Subsequent<?> value -> getSchedulerForIterator(value.iterationId());
+			default -> scheduler;
+		};
 	}
 
 	/** Resolved workload limits shared by scheduler and bounded-operation implementations. */

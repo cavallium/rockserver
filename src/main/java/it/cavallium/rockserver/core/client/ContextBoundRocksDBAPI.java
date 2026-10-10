@@ -43,6 +43,16 @@ final class ContextBoundRocksDBAPI implements RocksDBAPI {
 	}
 
 	@Override
+	public void flushWal() {
+		requestSync(new RocksDBAPICommand.Flush(true));
+	}
+
+	@Override
+	public java.util.concurrent.CompletableFuture<Void> flushWalAsync() {
+		return requestAsync(new RocksDBAPICommand.Flush(true));
+	}
+
+	@Override
 	public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
 		// Exact CDC batch cursors are richer than the legacy event-stream default:
 		// filtered-empty pages still advance and transports enforce a response budget.

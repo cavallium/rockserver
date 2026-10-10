@@ -99,6 +99,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	private final WorkloadPressureController pressureController;
 	private final SchedulerDeadlineClock deadlineClock;
 	private final String databaseName;
+	private final String workloadGroup;
 	private final String resourceKind;
 	private final RWScheduler.Pool resourcePool;
 	private final ThreadFactory threadFactory;
@@ -145,7 +146,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                         WorkloadPressureController pressureController,
 	                         SchedulerDeadlineClock deadlineClock,
 	                         @Nullable MeterRegistry registry,
-	                         String databaseName) {
+	                         String databaseName, String workloadGroup) {
 		if (workerCount < 1) {
 			throw new IllegalArgumentException("workerCount must be positive");
 		}
@@ -169,6 +170,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		this.pressureController = Objects.requireNonNull(pressureController, "pressureController");
 		this.deadlineClock = Objects.requireNonNull(deadlineClock, "deadlineClock");
 		this.databaseName = Objects.requireNonNull(databaseName, "databaseName");
+		this.workloadGroup = Objects.requireNonNull(workloadGroup, "workloadGroup");
 		this.resourceKind = Objects.requireNonNull(resourceKind, "resourceKind");
 		this.resourcePool = Objects.requireNonNull(resourcePool, "resourcePool");
 		int reservationTotal = 0;
@@ -200,7 +202,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		this.taskMetrics = registry == null ? null : registerTaskMetrics(registry);
 		this.workerFailureMetric = registerCounter(registry,
 				"rockserver.workload.worker.failures",
-				"database", databaseName,
+				"database", this.databaseName,
 				"resource", resourceKind);
 		registerGauges(registry);
 	}
@@ -2204,7 +2206,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                                        WorkloadProfile profile,
 	                                        OperationFamily family) {
 		String[] tags = {
-				"database", databaseName,
+				"database", this.databaseName,
 				"resource", resourceKind,
 				"profile", metricName(profile),
 				"operation", metricName(family)
@@ -2247,14 +2249,14 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 		registerGauge(registry,
 				"rockserver.workload.worker.limit",
 				ProfiledWorkloadExecutor::workerCount,
-				"database", databaseName,
+				"database", this.databaseName,
 				"resource", resourceKind);
 		for (var profile : PROFILES) {
 			if (capacityUnsafe(profile) == 0) {
 				continue;
 			}
 			String[] tags = {
-					"database", databaseName,
+					"database", this.databaseName,
 					"resource", resourceKind,
 					"profile", metricName(profile)
 			};
@@ -2278,6 +2280,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private CounterHandle registerCounter(@Nullable MeterRegistry registry, String name, String... tags) {
+		if (!workloadGroup.equals("default")) tags = tagsWith(tags, "workload_group", workloadGroup);
 		if (registry == null) {
 			return INERT_COUNTER;
 		}
@@ -2301,6 +2304,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	}
 
 	private TimerHandle registerTimer(@Nullable MeterRegistry registry, String name, String... tags) {
+		if (!workloadGroup.equals("default")) tags = tagsWith(tags, "workload_group", workloadGroup);
 		if (registry == null) {
 			return INERT_TIMER;
 		}
@@ -2327,6 +2331,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	                           String name,
 	                           ToDoubleFunction<ProfiledWorkloadExecutor> value,
 	                           String... tags) {
+		if (!workloadGroup.equals("default")) tags = tagsWith(tags, "workload_group", workloadGroup);
 		try {
 			Gauge.builder(name, this, value).tags(tags).register(registry);
 		} catch (VirtualMachineError fatal) {

@@ -541,7 +541,7 @@ public class GrpcServer extends Server {
 							RequestType.current());
 					var profile = grpc.preAdmit(requestContext, OperationFamily.POINT_LOOKUP, command);
 					estimatedBytes = command.estimatedBytes();
-					scheduled = scheduler.scheduler(profile,
+					scheduled = commandWorkloadScheduler(command).scheduler(profile,
 							command.operationFamily(),
 							requestContext.localMonotonicDeadlineNanos())
 							.schedule(this);
@@ -888,6 +888,14 @@ public class GrpcServer extends Server {
 	}
 
 
+	private RWScheduler columnWorkloadScheduler(long columnId) {
+		return embeddedDatabase == null ? scheduler : embeddedDatabase.getSchedulerForColumn(columnId);
+	}
+
+	private RWScheduler commandWorkloadScheduler(RocksDBAPICommand<?, ?, ?> command) {
+		return embeddedDatabase == null ? scheduler : embeddedDatabase.getSchedulerForCommand(command);
+	}
+
 	private final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplBase {
 
 		private static final long ITERATOR_VALUE_PAGE_SIZE = 64L;
@@ -1064,8 +1072,8 @@ public class GrpcServer extends Server {
 
 		private reactor.core.scheduler.Scheduler contextualScheduler(
 				ResolvedRequestContext context,
-				OperationFamily family) {
-			return scheduler.scheduler(context.profile(),
+				OperationFamily family, long columnId) {
+			return columnWorkloadScheduler(columnId).scheduler(context.profile(),
 					family,
 					context.localMonotonicDeadlineNanos());
 		}
@@ -1512,7 +1520,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 							initialRequest.getColumnId(),
 							mapKeys(data.getKeysList()),
@@ -1563,7 +1571,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
+							.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -1685,7 +1693,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
+							.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> {
 								var merged = contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 										initialRequest.getColumnId(),
@@ -1724,7 +1732,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						contextualApi.merge(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -1875,7 +1883,7 @@ public class GrpcServer extends Server {
 					}
 					var contextualApi = syncApi(context);
 					return dataFlux
-							.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
+							.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 							.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 									initialRequest.getColumnId(),
 									mapKeys(data.getKeysList()),
@@ -1909,7 +1917,7 @@ public class GrpcServer extends Server {
 			}
 			var contextualApi = syncApi(context);
 			return dataFlux
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						contextualApi.put(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
@@ -1943,7 +1951,7 @@ public class GrpcServer extends Server {
 			var contextualApi = syncApi(context);
 			return dataFlux
 					.buffer(WRITE_ELISION_MULTI_STEP_SIZE)
-					.publishOn(contextualScheduler(context, OperationFamily.MUTATION))
+					.publishOn(contextualScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 					.doOnNext(data -> {
 						var batch = mapKVBatch(data);
 						contextualApi.putMulti(initialRequest.getTransactionOrUpdateId(),
@@ -2481,7 +2489,7 @@ public class GrpcServer extends Server {
 		public Mono<Empty> flush(FlushRequest request) {
 			requireV3(request.getWorkloadContractVersion());
 			return executeScheduled(() -> {
-				protectedApi().flush();
+				if (request.getWalOnly()) protectedApi().flushWal(); else protectedApi().flush();
 				return Empty.getDefaultInstance();
 			}, scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.FLUSH, Long.MAX_VALUE))
 					.transform(this.onErrorMapMonoWithRequestInfo("flush", request));
@@ -2525,7 +2533,7 @@ public class GrpcServer extends Server {
                             .setValidatedInputBytes(result.validatedInputBytes()).setOutputBytes(result.outputBytes())
                             .setElapsedNanos(result.elapsedNanos()).build();
                 },
-                        scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE));
+                        columnWorkloadScheduler(request.getColumnId()).scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE));
             }).transform(this.onErrorMapMonoWithRequestInfo("compactFiles", request));
         }
 
@@ -2698,7 +2706,7 @@ public class GrpcServer extends Server {
 				var command = captureCommand(operation);
 					var profile = preAdmit(context, family, command);
 					return executeScheduled(() -> operation.apply(syncApi(context)),
-							scheduler.scheduler(profile,
+							commandWorkloadScheduler(command).scheduler(profile,
 									command.operationFamily(),
 									context.localMonotonicDeadlineNanos()),
 						command.estimatedBytes());
@@ -2716,7 +2724,7 @@ public class GrpcServer extends Server {
 				var command = captureCommand(operation);
 					var profile = preAdmit(context, family, command);
 					return executeScheduled(() -> operation.apply(syncApi(context)),
-							scheduler.scheduler(profile,
+							commandWorkloadScheduler(command).scheduler(profile,
 									command.operationFamily(),
 									context.localMonotonicDeadlineNanos()),
 						lateSuccessCleanup,
@@ -2812,7 +2820,7 @@ public class GrpcServer extends Server {
 							RequestType.multi());
 					profile = preAdmit(requestContext, OperationFamily.RANGE_PAGE, command);
 					contextualApi = syncApi(requestContext);
-					workloadExecutor = scheduler.executor(
+					workloadExecutor = commandWorkloadScheduler(command).executor(
 							profile,
 							command.operationFamily(),
 							requestContext.localMonotonicDeadlineNanos());

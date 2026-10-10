@@ -153,14 +153,22 @@ public class ConfigPrinter {
 	}
 
 	public static String stringifyParallelism(ParallelismConfig o) throws GestaltException {
+		var groups = new StringJoiner(",", "[", "]");
+		for (var group : Objects.requireNonNullElse(o.workloadGroups(), new NamedWorkloadGroupConfig[0])) {
+			groups.add("{\"name\": %s, \"read\": %s, \"write\": %s, \"workload\": %s}".formatted(
+					quote(group.name()), group.read(), group.write(),
+					group.workload() == null ? "null" : stringifyWorkload(group.workload())));
+		}
 		return """
 				{
 				    "read": %d,
 				    "write": %d,
+				    "workload-groups": %s,
 				    "workload": %s
 				  }\
 				""".formatted(o.read(),
 				o.write(),
+				groups,
 				stringifyWorkload(o.workload())
 		);
 	}
@@ -340,7 +348,8 @@ public class ConfigPrinter {
 				      "partition-filters": %s,
 				      "bloom-filter": %s,
 				      "block-size": %s,
-				      "write-buffer-size": %s
+				      "write-buffer-size": %s,
+				      "workload-group": %s
 			    }\
 			""".formatted(
 				quote(o.mergeOperatorClass()),
@@ -358,7 +367,8 @@ public class ConfigPrinter {
 				o.partitionFilters(),
 				bloom,
 				quote(o.blockSize()),
-				quote(o.writeBufferSize())
+				quote(o.writeBufferSize()),
+				quote(o.workloadGroup())
 		);
 	}
 
@@ -397,7 +407,8 @@ public class ConfigPrinter {
 				      "partition-filters": %s,
 				      "bloom-filter": %s,
 				      "block-size": %s,
-				      "write-buffer-size": %s
+				      "write-buffer-size": %s,
+				      "workload-group": %s
 			    }\
 			""".formatted(quote(o.mergeOperatorClass()),
 				quote(o.name()),
@@ -415,7 +426,8 @@ public class ConfigPrinter {
 				o.partitionFilters(),
 				bloom,
 				quote(o.blockSize()),
-				quote(o.writeBufferSize())
+				quote(o.writeBufferSize()),
+				quote(o.workloadGroup())
 		);
 	}
 

@@ -334,17 +334,17 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	private RWScheduler.WorkloadExecutor commandExecutor(RocksDBAPICommand<?, ?, ?> command) {
 		var context = currentRequestContext();
 		var profile = resolveCommand(context, command);
-		return db.getScheduler().executor(profile,
+		return db.getSchedulerForCommand(command).executor(profile,
 				command.operationFamily(),
-				context);
+				db.getScheduler().resolveMonotonicDeadline(context));
 	}
 
 	private Scheduler commandScheduler(RocksDBAPICommand<?, ?, ?> command) {
 		var context = currentRequestContext();
 		var profile = resolveCommand(context, command);
-		return db.getScheduler().scheduler(profile,
+		return db.getSchedulerForCommand(command).scheduler(profile,
 				command.operationFamily(),
-				context);
+				db.getScheduler().resolveMonotonicDeadline(context));
 	}
 
 	private WorkloadProfile resolveCommand(RequestContext context,
@@ -468,7 +468,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 			@NotNull List<Keys> keys,
 			RequestDelete<? super Buf, T> requestType) throws RocksDBException {
 		db.validateTransactionOrUpdateProfile(transactionOrUpdateId, currentRequestContext().profile());
-		var executor = db.getScheduler().executor(currentRequestContext(), OperationFamily.MUTATION);
+		var executor = db.getSchedulerForColumn(columnId).executor(currentRequestContext().profile(), OperationFamily.MUTATION,
+				db.getScheduler().resolveMonotonicDeadline(currentRequestContext()));
 		return supplyAsyncPreservingRunningCompletion(
 				() -> db.deleteMulti(transactionOrUpdateId, columnId, keys, requestType), executor);
 	}
@@ -481,7 +482,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		return db.putBatchInternal(columnId,
 				batchPublisher,
 				mode,
-				db.getScheduler().scheduler(context, OperationFamily.MUTATION));
+				db.getSchedulerForColumn(columnId).scheduler(context.profile(), OperationFamily.MUTATION,
+					db.getScheduler().resolveMonotonicDeadline(context)));
 	}
 
 	@Override
@@ -492,7 +494,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		return db.mergeBatchInternal(columnId,
 				batchPublisher,
 				mode,
-				db.getScheduler().scheduler(context, OperationFamily.MUTATION));
+				db.getSchedulerForColumn(columnId).scheduler(context.profile(), OperationFamily.MUTATION,
+					db.getScheduler().resolveMonotonicDeadline(context)));
 	}
 
 	@Override
@@ -542,7 +545,8 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 				columnId,
 				keys,
 				context.profile(),
-				db.getScheduler().executor(context, OperationFamily.BOUNDED_FAN_OUT),
+				db.getSchedulerForColumn(columnId).executor(context.profile(), OperationFamily.BOUNDED_FAN_OUT,
+					db.getScheduler().resolveMonotonicDeadline(context)),
 				db.getScheduler().resolveMonotonicDeadline(context));
 	}
 
@@ -613,8 +617,7 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 		WorkloadProfile profile;
 		try {
 			profile = resolveCommand(context, command);
-			workloadExecutor = db.getScheduler().executor(
-					profile, command.operationFamily(), context);
+			workloadExecutor = commandExecutor(command);
 		} catch (Throwable error) {
 			releaseAsyncIteratorOperation(iterationId, iteratorOperation);
 			return CompletableFuture.failedFuture(error);
@@ -1507,6 +1510,11 @@ final class EmbeddedConnectionDelegate extends BaseConnection implements RocksDB
 	@Override
 	public void flush() {
 		db.flush();
+	}
+
+	@Override
+	public void flushWal() {
+		db.flushWal();
 	}
 
     @Override public ColumnTableProperties getTableProperties(long columnId) {

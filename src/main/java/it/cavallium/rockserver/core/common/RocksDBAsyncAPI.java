@@ -343,6 +343,11 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new Flush());
 	}
 
+	/** Sync the WAL to stable storage. Older implementations safely fall back to a full flush. */
+	default CompletableFuture<Void> flushWalAsync() {
+		return flushAsync();
+	}
+
 	/** See: {@link Compact}. */
 	default CompletableFuture<Void> compactAsync() {
 		return requestAsync(new Compact());

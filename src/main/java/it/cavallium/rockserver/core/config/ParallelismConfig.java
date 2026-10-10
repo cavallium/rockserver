@@ -11,5 +11,7 @@ public interface ParallelismConfig {
 	@Nullable
 	Integer write() throws GestaltException;
 
+	@Nullable NamedWorkloadGroupConfig[] workloadGroups() throws GestaltException;
+
 	WorkloadConfig workload() throws GestaltException;
 }

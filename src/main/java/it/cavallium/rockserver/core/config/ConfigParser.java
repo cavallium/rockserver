@@ -68,6 +68,7 @@ public class ConfigParser {
 
 			var config = gestalt.getConfig("database", DatabaseConfig.class);
 			WorkloadSettings.resolve(config);
+			WorkloadSettings.resolveGroups(config);
 			return config;
 		} catch (GestaltException ex) {
 			throw RocksDBException.of(RocksDBErrorType.CONFIG_ERROR, ex);

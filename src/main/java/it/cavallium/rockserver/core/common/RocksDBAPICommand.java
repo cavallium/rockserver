@@ -1253,17 +1253,19 @@ public sealed interface RocksDBAPICommand<RESULT_ITEM_TYPE, SYNC_RESULT, ASYNC_R
 	/**
 	 * Flush the database
 	 */
-	record Flush() implements RocksDBAPICommandSingle<Void> {
+	record Flush(boolean walOnly) implements RocksDBAPICommandSingle<Void> {
+
+		public Flush() { this(false); }
 
 		@Override
 		public Void handleSync(RocksDBSyncAPI api) {
-			api.flush();
+			if (walOnly) api.flushWal(); else api.flush();
 			return null;
 		}
 
 		@Override
 		public CompletableFuture<Void> handleAsync(RocksDBAsyncAPI api) {
-			return api.flushAsync();
+			return walOnly ? api.flushWalAsync() : api.flushAsync();
 		}
 
 		@Override

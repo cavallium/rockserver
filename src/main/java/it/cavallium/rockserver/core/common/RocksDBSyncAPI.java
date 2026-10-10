@@ -321,6 +321,11 @@ public interface RocksDBSyncAPI extends RocksDBSyncAPIRequestHandler {
 		requestSync(new Flush());
 	}
 
+	/** Sync the WAL to stable storage. Older implementations safely fall back to a full flush. */
+	default void flushWal() {
+		flush();
+	}
+
 	/** See: {@link Compact}. */
 	default void compact() {
 		requestSync(new Compact());

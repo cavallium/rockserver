@@ -1529,6 +1529,18 @@ impl RockserverClient {
     pub async fn flush(&self) -> Result<()> {
         let req = FlushRequest {
             workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+            wal_only: false,
+        };
+        self.client.clone().flush(req).await?;
+        Ok(())
+    }
+
+    /// Syncs the WAL to stable storage without forcing memtables to SST files.
+    /// Older servers safely fall back to a full database flush.
+    pub async fn flush_wal(&self) -> Result<()> {
+        let req = FlushRequest {
+            workload_contract_version: REQUIRED_WORKLOAD_CONTRACT_VERSION,
+            wal_only: true,
         };
         self.client.clone().flush(req).await?;
         Ok(())
