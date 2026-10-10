@@ -35,6 +35,7 @@ public final class RatisSessionEpochs {
     /** Schema controls borrow the same bounded-lifetime catalogue client; no additional transport is owned. */
     RatisSchemaAuthority schemaAuthority() { return new RatisSchemaAuthority(client,cluster,database,group); }
     RatisRangeImportAuthority.Client importAuthority() { return new RatisRangeImportAuthority.Client(client,cluster,database,group); }
+    RatisTopologyAuthority.Client topologyAuthority() { return new RatisTopologyAuthority.Client(client,cluster,database,group); }
     void requireDatabaseBinding(UUID expectedCluster,UUID expectedDatabase) {
         if (!cluster.equals(expectedCluster) || !database.equals(expectedDatabase)) throw new IllegalArgumentException("Wrong session authority database");
     }

@@ -663,6 +663,8 @@ public final class ReplicatedRangeStore {
     public final class TopologyFreezeGate implements AutoCloseable {
         private final TopologyPreparation preparation; private volatile boolean closed;
         private TopologyFreezeGate(TopologyPreparation preparation) { this.preparation=preparation; }
+        boolean belongsToPool(DistributedStoragePool pool){return schemaPreparationPool==pool;}
+        boolean closed(){return closed;}
         public TopologyFreezeState state() { enterNative(); applyLane.lock(); try { if(closed || preparation!=null && topologyPreparation!=preparation && activeTopologyFreeze==null) throw new IllegalStateException("Topology preparation released"); return topologyFreezeStateUnderLane(); } finally { applyLane.unlock(); leaveNative(); } }
         public boolean ready() { return state().ready(); }
         public java.util.concurrent.CompletionStage<Void> whenReady() {

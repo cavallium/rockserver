@@ -662,7 +662,7 @@ class RatisNodeRuntimeTest {
                 return (org.apache.ratis.client.RaftClient)Proxy.newProxyInstance(org.apache.ratis.client.RaftClient.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.RaftClient.class},(proxy,method,args) -> switch (method.getName()) { case "getGroupId" -> RaftGroupId.valueOf(range.groupId()); case "io" -> io; case "close" -> { closes.incrementAndGet(); yield null; } default -> throw new AssertionError(method); });
             });
             var fake=new FakeServer(); RatisNodeRuntime.ServerFactory factory=(plan,logs,machines) -> {
-                try { for (var entry:machines.entrySet()) { assertEquals("NEW",entry.getValue().getLifeCycleState().name()); assertSame(plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE ? clients : null,schemaFencingClient(entry.getValue())); var authority=proofLane(entry.getValue(),"schemaAuthorityQueries"); if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE) { assertNotNull(authority); assertEquals(1,configuredProofThreads(authority)); assertNotSame(proofLane(entry.getValue(),"proofQueries"),authority); } else assertNull(authority); } return fake.create(plan,logs,machines); }
+                try { for (var entry:machines.entrySet()) { assertEquals("NEW",entry.getValue().getLifeCycleState().name()); assertSame(plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE ? clients : null,schemaFencingClient(entry.getValue())); assertEquals(plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA,topologyAuthority(entry.getValue())!=null); var authority=proofLane(entry.getValue(),"schemaAuthorityQueries"); if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE) { assertNotNull(authority); assertEquals(1,configuredProofThreads(authority)); assertNotSame(proofLane(entry.getValue(),"proofQueries"),authority); } else assertNull(authority); } return fake.create(plan,logs,machines); }
                 catch (ReflectiveOperationException failure) { throw new IOException(failure); }
             };
             var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,factory,null,null,null,RatisRoutedClient::connect,RatisNodeRuntime.SchemaReplicaConfig.defaults(),() -> clients);
@@ -802,6 +802,9 @@ class RatisNodeRuntimeTest {
     private static Object schemaFencingClient(RatisRangeStateMachine machine) throws ReflectiveOperationException {
         for (var field:RatisRangeStateMachine.class.getDeclaredFields()) if (field.getType()==RatisSchemaReplicaClient.class) { field.setAccessible(true); return field.get(machine); }
         throw new NoSuchFieldException("Catalogue schema replica client");
+    }
+    private static Object topologyAuthority(RatisRangeStateMachine machine) throws ReflectiveOperationException {
+        var field=RatisRangeStateMachine.class.getDeclaredField("topologyAuthority"); field.setAccessible(true); return field.get(machine);
     }
     private static Object schemaReplicaService(RatisRangeStateMachine machine) throws ReflectiveOperationException {
         var field=RatisRangeStateMachine.class.getDeclaredField("schemaReplicas"); field.setAccessible(true); return field.get(machine);

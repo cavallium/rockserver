@@ -906,8 +906,17 @@ Cold reopen and images preserve the fence; images cannot discard it.
 Combined focused validation passes 149 tests in 19 classes. Unchanged passing
 results from `/tmp/rockserver-topology-freeze-fixture-gate.log` are reused with the
 four repaired authority fixtures in `/tmp/rockserver-topology-authority-fixture-gate.log`.
-The DATA Ratis FREEZE admission/replay adapter, metadata-only child birth, dynamic
-group startup, qualified publication/activation and lineage handoff remain required.
+DATA Ratis FREEZE now qualifies a bounded whole-column admission hold, drains
+accepted predecessors before native preparation, and waits for follower-local
+readiness without parking the proof lane. Runtime wiring supplies the actual local
+replica and borrowed catalogue authority. Snapshot replacement drains actual actions,
+closes volatile gates and fences stale callbacks; covered replay returns the original
+artifact and an uncovered suffix recreates preparation. Controlled adapter validation
+passes 68 tests in seven classes (`/tmp/rockserver-topology-ratis-freeze-final-gate.log`),
+with 12 unchanged native/schema tests reused from the first compile gate. The received
+snapshot regression failed before repair (`/tmp/rockserver-topology-freeze-snapshot-before-fix.log`).
+Metadata-only child birth, dynamic group startup, qualified publication/activation
+and lineage handoff remain required. No real server sockets or quorum were exercised.
 Relocation currently admits preparation/abort while its source stays writable.
 
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,

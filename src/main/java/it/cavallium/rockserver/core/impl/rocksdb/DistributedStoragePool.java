@@ -992,12 +992,19 @@ public final class DistributedStoragePool implements AutoCloseable {
     /** Enqueues ownership cleanup only; completion follows actual releases outside pool locks. */
     public java.util.concurrent.CompletionStage<Void> submitSchemaCleanup(SchemaInstallPlan plan,ReplicatedRangeStore.SchemaInstallCaptureGate capture) {
         if(plan!=null && plan.pool!=this || capture!=null && !capture.belongsToPool(this)) throw new IllegalArgumentException("Foreign schema preparation owner");
+        return submitPreparationCleanup(new Object[]{plan,capture});
+    }
+    public java.util.concurrent.CompletionStage<Void> submitTopologyCleanup(ReplicatedRangeStore.TopologyFreezeGate capture){
+        if(capture!=null && !capture.belongsToPool(this))throw new IllegalArgumentException("Foreign topology preparation owner");
+        return submitPreparationCleanup(new Object[]{capture});
+    }
+    private java.util.concurrent.CompletionStage<Void> submitPreparationCleanup(Object[] requested){
         var pending=new ArrayList<java.util.concurrent.CompletableFuture<Void>>(); var owners=new ArrayList<Object>();
         java.util.concurrent.CompletableFuture<Void> completion=null;
         java.util.concurrent.RejectedExecutionException rejected=null;
         synchronized(admission) {
-            for(var owner:new Object[]{plan,capture}) {
-                if(owner==null || owner instanceof SchemaInstallPlan p && p.closed || owner instanceof ReplicatedRangeStore.SchemaInstallCaptureGate c && c.closed()) continue;
+            for(var owner:requested) {
+                if(owner==null || owner instanceof SchemaInstallPlan p && p.closed || owner instanceof ReplicatedRangeStore.SchemaInstallCaptureGate c && c.closed() || owner instanceof ReplicatedRangeStore.TopologyFreezeGate t && t.closed()) continue;
                 var existing=schemaCleanups.get(owner);
                 if(existing!=null) pending.add(existing); else owners.add(owner);
             }
@@ -1012,6 +1019,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                         Throwable failure=null;
                         try {
                             for(var owner:owners) if(owner instanceof ReplicatedRangeStore.SchemaInstallCaptureGate c) c.close();
+                            for(var owner:owners) if(owner instanceof ReplicatedRangeStore.TopologyFreezeGate t) t.close();
                             for(var owner:owners) if(owner instanceof SchemaInstallPlan p) p.close();
                         } catch(Throwable thrown) { failure=thrown; }
                         synchronized(admission) { owners.forEach(schemaCleanups::remove); admission.notifyAll(); }
@@ -1291,6 +1299,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         List<SchemaInstallPlan> plans; List<ReplicatedRangeStore.SchemaInstallCaptureGate> captures;
         synchronized(admission) { plans=List.copyOf(schemaPlans); captures=List.copyOf(schemaCaptures); }
         var cleanup=new ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+        synchronized(admission){cleanup.addAll(schemaCleanups.values());}
         for(var plan:plans) cleanup.add(submitSchemaCleanup(plan,null).toCompletableFuture());
         for(var capture:captures) cleanup.add(submitSchemaCleanup(null,capture).toCompletableFuture());
         try { java.util.concurrent.CompletableFuture.allOf(cleanup.toArray(java.util.concurrent.CompletableFuture[]::new)).get(Math.max(0,budget-(System.nanoTime()-started)),TimeUnit.NANOSECONDS); }

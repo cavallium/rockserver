@@ -3,6 +3,10 @@ package it.cavallium.rockserver.distributed.ratis;
 import it.cavallium.rockserver.core.common.distributed.RangeImportAdmission;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
+import it.cavallium.rockserver.core.common.distributed.TopologyChange;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
+import it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor;
+import it.cavallium.rockserver.core.common.distributed.RangeDescriptor;
 import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.common.distributed.SchemaAdmissionManifest;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
@@ -323,6 +327,95 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     record Leadership(long term, boolean ready) {}
     @FunctionalInterface interface LeadershipSource { Leadership get() throws IOException; }
     private final LeadershipSource leadershipSource;
+    @FunctionalInterface interface TopologyAuthorityReader { RatisTopologyAuthority.View read(TopologyChange.Header header)throws IOException; }
+    private TopologyAuthorityReader topologyAuthority;
+    private RangeDescriptor topologyDescriptor;private ReplicaDescriptor topologyLocalReplica;private DistributedStoragePool topologyStorage;
+    void topologyAuthority(TopologyAuthorityReader reader,RangeDirectory directory,ReplicaDescriptor local,DistributedStoragePool pool){
+        requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || topologyAuthority!=null)throw new IllegalStateException("Topology authority is fixed before initialization");
+        var descriptor=directory.ranges().stream().filter(r->r.groupId().equals(store.ownership().owner().groupId())).findFirst().orElseThrow();
+        if(!descriptor.replicas().contains(local) || !initialGroup.getGroupId().getUuid().equals(descriptor.groupId()))throw new IllegalArgumentException("Topology local owner differs from frozen placement");
+        topologyAuthority=java.util.Objects.requireNonNull(reader);topologyDescriptor=descriptor;topologyLocalReplica=java.util.Objects.requireNonNull(local);topologyStorage=java.util.Objects.requireNonNull(pool);
+    }
+    private TopologyHold topologyHold;private int topologySlots;private long topologyBytes;
+    private CompletableFuture<Void> topologyApplyCleanup=CompletableFuture.completedFuture(null);
+    private static final class TopologyHold {
+        final RatisTopologyFreezeRecord record;final byte[] bytes;final long term,generation,stamp;final ProposalFootprints.GateLease lease;
+        ReplicatedRangeStore.TopologyFreezeGate nativeGate;
+        boolean reading=true,qualified,nativeReady,submitted,maybeAppended,invalidated,released,cleaning;int owners;
+        final CompletableFuture<Void> cleanup=new CompletableFuture<>();
+        TopologyHold(RatisTopologyFreezeRecord record,Leadership owner,long generation,long stamp,ProposalFootprints.GateLease lease){this.record=record;bytes=record.encode();term=owner.term();this.generation=generation;this.stamp=stamp;this.lease=lease;}
+    }
+    record TopologyFreezeStats(int holds,long bytes,int reading) {}
+    TopologyFreezeStats topologyFreezeStats(){synchronized(admissions){return new TopologyFreezeStats(topologySlots,topologyBytes,topologyHold!=null && topologyHold.reading ? 1 : 0);}}
+    CompletableFuture<Void> topologyCleanup(){synchronized(admissions){return CompletableFuture.allOf(topologyApplyCleanup,topologyHold==null ? CompletableFuture.completedFuture(null) : topologyHold.cleanup).copy();}}
+    private void finishTopologyHold(TopologyHold hold){if(topologyHold==hold){topologyHold=null;topologySlots--;topologyBytes-=hold.bytes.length;}}
+    private void releaseTopologyHold(TopologyHold hold){
+        hold.released=true;if(hold.reading || hold.cleaning)return;
+        if(hold.lease!=null)proposalFootprints.release(hold.lease);
+        var capture=hold.nativeGate;if(capture==null){finishTopologyHold(hold);hold.cleanup.complete(null);return;}
+        hold.cleaning=true;hold.nativeGate=null;
+        topologyStorage.submitTopologyCleanup(capture).whenComplete((unused,failure)->{synchronized(admissions){if(failure==null)finishTopologyHold(hold);else storageFailure=failure;}if(failure==null)hold.cleanup.complete(null);else hold.cleanup.completeExceptionally(failure);});
+    }
+    private void requireTopologyRecord(RatisTopologyFreezeRecord record)throws IOException{
+        requireDataRole();if(schemaConfigurationPending)throw new IOException("Topology FREEZE waits for queued configuration apply");if(topologyAuthority==null || topologyDescriptor==null || topologyLocalReplica==null || topologyStorage==null || !record.groupId().equals(store.ownership().owner().groupId()))throw new IOException("Topology FREEZE owner is not configured");
+        var definition=record.definition();var descriptor=definition.parents().stream().filter(r->r.groupId().equals(record.groupId())).findFirst().orElseThrow();var ownership=store.ownership();var interval=ownership.interval();var schema=store.installedSchema();
+        if(schema==null)throw new IOException("Topology FREEZE native schema unavailable");schema.requireMatches(definition.sourceDirectory());
+        if(definition.kind()==TopologyChange.Kind.RELOCATE || descriptor.rangeEpoch()!=ownership.owner().epoch() || !descriptor.rangeId().equals(topologyDescriptor.rangeId()) || descriptor.configurationVersion()!=topologyDescriptor.configurationVersion()
+                || !descriptor.replicas().equals(topologyDescriptor.replicas()) || !descriptor.replicas().contains(topologyLocalReplica) || !definition.header().domainId().equals(interval.domainId())
+                || !Arrays.equals(descriptor.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(descriptor.upperExclusive(),interval.upperExclusive()))throw new IOException("Topology FREEZE native placement/schema changed");
+        final ReplicatedRangeStore.Configuration configuration;
+        try { configuration=store.configuration(); } catch(org.rocksdb.RocksDBException failure) { throw new IOException("Cannot read topology FREEZE native membership",failure); }
+        if(configuration==null)throw new IOException("Topology FREEZE native membership missing");requireSchemaMembership(descriptor,configuration.data());
+        var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(topologyLocalReplica.peerId()))throw new IOException("Topology FREEZE local peer identity changed");
+    }
+    private void requireTopologyOwner(TopologyHold hold,RatisTopologyFreezeRecord record,Leadership current,long generation,boolean ready)throws IOException{
+        var applied=store.applied();
+        if(topologyHold!=hold || hold==null || !hold.record.equals(record) || hold.reading || !hold.qualified || hold.invalidated || hold.released || !current.ready() || hold.term!=current.term() || hold.generation!=generation || generation!=admissionGeneration.get()
+                || schemaConfigurationPending || hold.stamp!=schemaConfigurationStamp || getLifeCycleState()!=LifeCycle.State.RUNNING || applied==null || applied.term()!=current.term() || !store.admissionOpen()
+                || ready && (!hold.nativeReady || hold.lease!=null && !proposalFootprints.drained(hold.lease)))throw new IOException("Topology FREEZE lacks current drained preparation");
+    }
+    private void prepareTopologyFreeze(RatisTopologyFreezeRecord record,long generation)throws Exception{
+        requireTopologyRecord(record);requireHealthy();var owner=leadership();var applied=store.applied();
+        if(!owner.ready() || applied==null || applied.term()!=owner.term() || getLifeCycleState()!=LifeCycle.State.RUNNING || !store.admissionOpen())throw new IOException("Topology FREEZE leader is not ready");
+        var saved=store.lookupTopologyFreeze(record.header(),record.admissionDigest());if(saved!=null){saved.requireCut(applied);return;}
+        final TopologyHold hold;
+        synchronized(admissions){reconcileOlderProposalTerms(owner.term());if(schemaConfigurationPending || generation!=admissionGeneration.get())throw new IOException("Topology FREEZE configuration changed");
+            if(topologyHold!=null){hold=topologyHold;requireTopologyOwner(hold,record,owner,generation,false);if(hold.nativeGate!=null)return;hold.reading=true;}
+            else {
+            if(schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Protected topology proposal budget exhausted");
+            var spans=record.definition().sourceDirectory().columns().stream().map(column->TransactionScope.Span.range(column,null,null)).toList();var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),owner.term(),generation);
+            if(lease==null)throw new IOException("Topology FREEZE scope already reserved");hold=new TopologyHold(record,owner,generation,schemaConfigurationStamp,lease);topologyHold=hold;topologySlots++;topologyBytes+=hold.bytes.length;}
+        }
+        boolean qualified=false;
+        try{
+            var view=topologyAuthority.read(record.header());view.require(RatisTopologyAuthority.Request.of(record.header()));
+            if(!Arrays.equals(view.definition().encode(),record.definition().encode()) || !Arrays.equals(view.admissionDigest(),record.admissionDigest()))throw new IOException("Topology FREEZE catalogue admission changed");
+            requireTopologyRecord(record);boolean drained;synchronized(admissions){if(hold.invalidated || hold.released || generation!=admissionGeneration.get() || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Topology FREEZE preparation lost replacement owner");drained=proposalFootprints.drained(hold.lease);}
+            var capture=drained ? store.prepareTopologyFreeze(record.definition(),record.admissionDigest()) : null;var state=capture==null ? null : capture.state();var current=leadership();
+            synchronized(admissions){hold.nativeGate=capture;hold.reading=false;hold.qualified=true;hold.nativeReady=state!=null && state.ready();requireTopologyOwner(hold,record,current,generation,false);qualified=true;}
+            if(capture!=null)capture.whenReady().whenComplete((unused,failure)->{synchronized(admissions){if(topologyHold!=hold || hold.released || hold.invalidated)return;if(failure!=null){hold.invalidated=true;if(!hold.submitted)releaseTopologyHold(hold);}else hold.nativeReady=true;}});
+        }finally{synchronized(admissions){hold.reading=false;if(!qualified || hold.invalidated || hold.released)releaseTopologyHold(hold);}}
+    }
+    private RatisTopologyFreezeRpc.State topologyState(RatisTopologyFreezeRecord record)throws Exception{
+        final long stamp;synchronized(admissions){stamp=schemaConfigurationStamp;}
+        requireTopologyRecord(record);var freeze=store.lookupTopologyFreeze(record.header(),record.admissionDigest());if(freeze!=null){record.requireFreeze(freeze);freeze.requireCut(store.applied());}
+        final TopologyHold hold;final ReplicatedRangeStore.TopologyFreezeGate capture;
+        synchronized(admissions){hold=topologyHold;capture=hold!=null && hold.record.equals(record) && !hold.reading && !hold.released ? hold.nativeGate : null;}
+        var state=capture==null ? store.topologyFreezeState() : capture.state();boolean ready=freeze!=null && state.ready();
+        synchronized(admissions){if(capture!=null && topologyHold==hold && !hold.invalidated && !hold.released && !schemaConfigurationPending && hold.stamp==schemaConfigurationStamp && hold.generation==admissionGeneration.get()){hold.nativeReady=state.ready();ready=state.ready() && hold.qualified && proposalFootprints.drained(hold.lease);}}
+        requireTopologyRecord(record);synchronized(admissions){if(stamp!=schemaConfigurationStamp || schemaConfigurationPending)throw new IOException("Topology FREEZE state configuration changed");}
+        return new RatisTopologyFreezeRpc.State(record,freeze,state.writablePins(),state.preparedParticipants(),state.snapshotGates(),ready);
+    }
+    TopologyChange.Proof topologyFreezeProof(RatisTopologyFreezeRecord record)throws Exception{
+        requireTopologyRecord(record);var freeze=store.lookupTopologyFreeze(record.header(),record.admissionDigest());if(freeze==null)throw new IOException("Topology FREEZE has no committed native artifact");record.requireFreeze(freeze);freeze.requireCut(store.applied());return freeze.proof(topologyLocalReplica.replicaId());
+    }
+    private TransactionContext startTopologyFreeze(TransactionContext transaction,RatisTopologyFreezeRecord record,long generation,Leadership owner)throws Exception{
+        requireTopologyRecord(record);var saved=store.lookupTopologyFreeze(record.header(),record.admissionDigest());
+        synchronized(admissions){reconcileOlderProposalTerms(owner.term());
+            if(saved!=null && topologyHold==null){if(schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Protected topology retry budget exhausted");topologyHold=new TopologyHold(record,owner,generation,schemaConfigurationStamp,null);topologyHold.reading=false;topologyHold.qualified=topologyHold.nativeReady=true;topologySlots++;topologyBytes+=topologyHold.bytes.length;}
+            var hold=topologyHold;requireTopologyOwner(hold,record,owner,generation,true);hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}
+    }
+    private byte[] topologyRecovered(RatisTopologyFreezeRecord record){var freeze=store.lookupTopologyFreeze(record.header(),record.admissionDigest());if(freeze==null)return null;freeze.requireCut(store.applied());synchronized(admissions){if(topologyHold!=null && topologyHold.record.equals(record))releaseTopologyHold(topologyHold);}return freeze.encode();}
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
     @FunctionalInterface interface SnapshotHelpAction { boolean run() throws Exception; }
@@ -531,7 +624,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             reconcileOlderProposalTerms(owner.term());
             if (schemaConfigurationPending) throw new IOException("FENCING waits for queued configuration apply");
             if (schemaHold!=null) { requireFencingOwner(schemaHold,command,owner,generation); return; }
-            if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
+            if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
             var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(store.commandAccessScope(command)),owner.term(),generation);
             if (lease==null) throw new IOException("Conflicting catalogue gate owns FENCING");
             hold=new SchemaHold(command,owner.term(),generation,schemaConfigurationStamp,lease); schemaHold=hold; schemaSlots++;
@@ -644,7 +737,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (!proposalFootprints.drained(hold.lease)) throw new IOException("Schema predecessors have not drained");
                 return;
             }
-            if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)
+            if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)
                 throw new IOException("Protected schema proposal budget exhausted");
             var interval=store.ownership().interval();
             var spans=interval.columns().stream().map(c -> TransactionScope.Span.range(c,null,null)).toList();
@@ -679,7 +772,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (proof!=null) {
                 // A native retry needs no new source capture or volatile gate, but still owns a bounded input slot.
                 if (schemaHold==null) {
-                    if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
+                    if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
                     schemaHold=new SchemaHold(record,leader.term(),generation,schemaConfigurationStamp,null); schemaHold.reading=false; schemaHold.qualified=true; schemaSlots++;
                 }
                 var hold=schemaHold;
@@ -753,7 +846,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (hold.lease!=null && !proposalFootprints.drained(hold.lease) || hold.captureGate!=null && !hold.captureGate.ready()) throw new IOException("Schema predecessors have not drained");
                 hold.nativeReady=true; return hold;
             }
-            if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
+            if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
             var spans=store.ownership().interval().columns().stream().map(c -> TransactionScope.Span.range(c,null,null)).toList();
             var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),owner.term(),generation);
             if (lease==null) throw new IOException("Conflicting DATA gate owns schema admission");
@@ -830,7 +923,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized (admissions) {
             if (schemaConfigurationPending) throw new IOException("Schema append waits for queued configuration apply");
             if (saved!=null && schemaHold==null) {
-                if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
+                if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
                 schemaHold=new SchemaHold(record,leader.term(),generation,schemaConfigurationStamp,null); schemaHold.reading=false; schemaHold.qualified=true; schemaSlots++;
             }
             var hold=schemaHold;
@@ -882,6 +975,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || !identity.columnId().equals(homeColumn)) throw new IllegalArgumentException("HOME retirement requires the configured transaction HOME context");
     }
     private void requireRoleRecord(byte[] encoded) {
+        if(RatisTopologyFreezeRecord.isFreeze(encoded)){requireDataRole();if(!RatisTopologyFreezeRecord.decode(encoded).groupId().equals(store.ownership().owner().groupId()))throw new IllegalArgumentException("Foreign topology FREEZE group");return;}
         if (RatisReferencedFile.Request.isRequest(encoded)) { requireDataRole(); if(referencedFiles==null || rangeImportApply==null)throw new IllegalArgumentException("Native import file owner is not configured"); referencedFiles.requireGroup(RatisReferencedFile.Request.decode(encoded).groupId()); return; }
         if (RatisRangeImportRecord.isImport(encoded)) { requireDataRole(); if(rangeImportApply==null)throw new IllegalArgumentException("Native import adapter is not configured"); RatisRangeImportRecord.decode(encoded).requireDefinition(rangeImportApply.definition()); return; }
         if (RatisSchemaFenceRecord.isFence(encoded)) { requireSchemaRecord(RatisSchemaFenceRecord.decode(encoded)); return; }
@@ -897,6 +991,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.SESSION_FLOOR && command.kind()!=DistributedCommand.Kind.SESSION_CONTROL) throw new IllegalArgumentException("Range role rejects transaction business records");
     }
     private void validateRoleNativeState() throws IOException {
+        if(role!=RatisNodePlan.Role.DATA && store.topologyFreeze()!=null)throw new IOException("Non-DATA range contains topology FREEZE state");
         if (role!=RatisNodePlan.Role.DATA && (store.schemaFence()!=null || store.schemaInstallation()!=null)) throw new IOException("Non-DATA range contains schema transition state");
         if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.homeRecoveryCapacity().effectiveCount()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
         if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
@@ -1174,19 +1269,22 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final TreeMap<Long, Long> pendingNoops = new TreeMap<>();
     private long deferredBytes;
     private NativeApply nativeApply;
-    private static final class NativeApply {
-        final long index; final Deferred deferred; final RatisSchemaInstallRecord record; final RatisRangeImportRecord importRecord; final RatisReferencedFile.Request referenceRequest;
+    private final class NativeApply {
+        final long index; final Deferred deferred; final RatisSchemaInstallRecord record; final RatisRangeImportRecord importRecord; final RatisReferencedFile.Request referenceRequest;final RatisTopologyFreezeRecord topologyRecord;
+        ReplicatedRangeStore.TopologyFreezeGate topologyGate;DistributedStoragePool topologyPool;
+        long topologyGeneration;boolean topologyReplacing;CompletableFuture<Void> topologyActions=CompletableFuture.completedFuture(null);
         ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
         DistributedStoragePool.SchemaInstallPlan plan; boolean running,suspended,stageReady,cancelled;
         byte[] coveredResult;
         NativeApply(long index,Deferred deferred) {
             this.index=index; this.deferred=deferred;
-            byte[] bytes=deferred.encoded(); boolean importing=RatisRangeImportRecord.isImport(bytes),referencing=RatisReferencedFile.Request.isRequest(bytes);
-            record=importing || referencing ? null : RatisSchemaInstallRecord.decode(bytes);
+            byte[] bytes=deferred.encoded(); boolean importing=RatisRangeImportRecord.isImport(bytes),referencing=RatisReferencedFile.Request.isRequest(bytes),freezing=RatisTopologyFreezeRecord.isFreeze(bytes);
+            topologyRecord=freezing ? RatisTopologyFreezeRecord.decode(bytes) : null;
+            record=importing || referencing || freezing ? null : RatisSchemaInstallRecord.decode(bytes);
             importRecord=importing ? RatisRangeImportRecord.decode(bytes) : null;
             referenceRequest=referencing ? RatisReferencedFile.Request.decode(bytes) : null;
         }
-        void close() { if (plan!=null) plan.close(); if (captureGate!=null) captureGate.close(); }
+        void close() { if(topologyGate!=null){var capture=topologyGate;topologyGate=null;var cleanup=topologyPool.submitTopologyCleanup(capture).toCompletableFuture();synchronized(admissions){topologyApplyCleanup=CompletableFuture.allOf(topologyApplyCleanup,cleanup);}}if (plan!=null) plan.close(); if (captureGate!=null) captureGate.close(); }
     }
     private final Object durabilityGate = new Object();
     private Path raftRoot;
@@ -1337,6 +1435,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (a != null && (cfg.index() > a.index() || cfg.term() > a.term())) throw new IOException("Native configuration exceeds completed marker");
         validateConfiguration(cfg.data());
         if (schemaHold!=null) schemaRecovered(schemaHold.record);
+        if(topologyHold!=null)topologyRecovered(topologyHold.record);
         setLastAppliedTermIndex(a == null ? TermIndex.INITIAL_VALUE : TermIndex.valueOf(a.term(), a.index()));
     }
 
@@ -1347,7 +1446,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private NativeRangeImage.Manifest validateImage(Path image, TermIndex position) throws IOException {
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         NativeRangeImage.RowVisitor visitor = (section, column, key, value) -> {
-            if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x27 && (key[16]&255)<=0x2b) throw new IllegalArgumentException("Non-DATA image contains schema transition state");
+            if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x27 && ((key[16]&255)<=0x2b || (key[16]&255)==0x60)) throw new IllegalArgumentException("Non-DATA image contains schema transition state");
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x20 && (key[16]&255)<=0x24) throw new IllegalArgumentException("Non-DATA image contains participant/snapshot state");
             if (role!=RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && ((key[16]&255)==0x25 || (key[16]&255)==0x26)) throw new IllegalArgumentException("Image role rejects protected HOME recovery receipts");
             if (role==RatisNodePlan.Role.TRANSACTION_HOME && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)==0x25) {
@@ -1588,13 +1687,33 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private record Completion(CompletableFuture<Message> future, Message result) {}
 
+    /** Drop only volatile native admission before image replacement; committed suffix bytes remain owned. */
+    private void quiesceTopologyReplacement()throws IOException{
+        final NativeApply work;final CompletableFuture<Void> actions;final CompletableFuture<Void> abandoned;
+        synchronized(gate){getLifeCycle().transition(LifeCycle.State.STARTING);work=nativeApply!=null && nativeApply.topologyRecord!=null ? nativeApply : null;if(work!=null){work.topologyReplacing=true;work.topologyGeneration++;work.suspended=true;work.stageReady=false;}actions=work==null ? CompletableFuture.completedFuture(null) : work.topologyActions;}
+        synchronized(admissions){var hold=topologyHold;abandoned=hold!=null && !hold.submitted ? hold.cleanup.copy() : CompletableFuture.completedFuture(null);}
+        try{
+            // Neither native mutation nor readiness callbacks may race replacement. No monitor is held while waiting.
+            CompletableFuture.allOf(actions,abandoned).get(10,java.util.concurrent.TimeUnit.SECONDS);
+            final ReplicatedRangeStore.TopologyFreezeGate leaderGate;
+            synchronized(admissions){var hold=topologyHold;leaderGate=hold!=null && hold.submitted ? hold.nativeGate : null;if(leaderGate!=null){hold.nativeGate=null;hold.nativeReady=false;hold.invalidated=true;}}
+            final ReplicatedRangeStore.TopologyFreezeGate followerGate;
+            synchronized(gate){followerGate=work==null ? null : work.topologyGate;if(work!=null)work.topologyGate=null;}
+            var cleanups=new ArrayList<CompletableFuture<Void>>();
+            if(leaderGate!=null)cleanups.add(topologyStorage.submitTopologyCleanup(leaderGate).toCompletableFuture());
+            if(followerGate!=null)cleanups.add(topologyStorage.submitTopologyCleanup(followerGate).toCompletableFuture());
+            synchronized(admissions){cleanups.add(topologyApplyCleanup);}
+            CompletableFuture.allOf(cleanups.toArray(CompletableFuture[]::new)).get(10,java.util.concurrent.TimeUnit.SECONDS);
+        }catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Topology replacement preparation interrupted",interrupted);}
+        catch(java.util.concurrent.ExecutionException|java.util.concurrent.TimeoutException failure){throw new IOException("Topology replacement preparation did not drain",failure);}
+    }
     @Override public void reinitialize() throws IOException {
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates(); store.invalidateScopedSnapshots();
+        quiesceTopologyReplacement();
         var completions = new java.util.ArrayList<Completion>();
         var coveredOperations = new java.util.ArrayList<OperationId>();
         IOException failure = null; NativeApply covered=null; boolean closeCovered=false;
         synchronized (gate) {
-            getLifeCycle().transition(LifeCycle.State.STARTING);
             try {
                 if (storageFailure != null) throw new IOException("Unhealthy range cannot reload", storageFailure);
                 recover(true);
@@ -1647,6 +1766,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     if (original==null) throw new IOException("Covered INSTALL lacks original native proof");
                     covered=nativeApply; covered.coveredResult=original; closeCovered=!covered.running; nativeApply=null;
                 }
+                if(nativeApply!=null && nativeApply.topologyRecord!=null)nativeApply.topologyReplacing=false;
                 getLifeCycle().transition(LifeCycle.State.RUNNING);
             } catch (Exception problem) { failure = failRecovery(problem); }
         }
@@ -1693,6 +1813,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");
             byte[] encoded = request.getMessage().getContent().toByteArray(); requireRoleRecord(encoded);
+            if(RatisTopologyFreezeRecord.isFreeze(encoded))return startTopologyFreeze(transaction,RatisTopologyFreezeRecord.decode(encoded),generation,leadership);
             if (RatisRangeImportRecord.isImport(encoded)) {
                 if(!initialGroup.getGroupId().equals(request.getRaftGroupId()))throw new IOException("Native import request addresses another group");
                 return startImportApply(transaction,RatisRangeImportRecord.decode(encoded),generation,leadership);
@@ -1782,7 +1903,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         if (estimate.newReceipt() && (command.acceptance()==null || reject) && estimate.maintenance() && proposalFootprints.stats().candidates()>0) throw new IllegalStateException("Transaction reservations hold session metadata stable");
                         boolean maintenance = estimate.newReceipt() && estimate.maintenance();
                         boolean protectedControl = estimate.maintenance() && command.mutations().isEmpty() && command.predicates().isEmpty();
-                        if (protectedControl ? schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots >= 16
+                        if (protectedControl ? schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots >= 16
                                 : dataAdmissions >= 1024 || dataProposalBytes + encoded.length > 16L * 1024 * 1024) {
                             throw new IllegalStateException("Range proposal budget exhausted");
                         }
@@ -1873,7 +1994,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (known!=null) throw new IllegalStateException("Previous snapshot control is still settling");
                 if (preparingSnapshots.containsKey(operation)) throw new IllegalStateException("Snapshot control is still preparing");
-                if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes
+                if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes
                         || install && (snapshotInstallOwners+snapshotAdmittedInstalls>=8 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-snapshotInstallBytes-snapshotInstallAdmittedBytes)) throw new IllegalStateException("Snapshot protected input budget exhausted");
                 var charge=snapshotCharges.get(fence.fenceId());
                 if (charge!=null && !charge.fence.equals(fence)) throw new IllegalArgumentException("Snapshot fence definition changed");
@@ -2036,7 +2157,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (receipt==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Snapshot gate has no fresh home admission authority");
                 if (accepted!=null && !accepted.drained()) throw new IllegalStateException("Snapshot gate predecessors are still settling");
                 if (accepted==null && snapshotRetryIdentityBusy(request.operation(),request.fence())) throw new IllegalStateException("Snapshot control identity belongs to other work");
-                if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
                 long transferred=accepted==null ? 0 : accepted.hold.bytes;
                 if (encoded.length>16L*1024*1024-snapshotProposalBytes-snapshotAdmittedBytes+transferred
                         || !request.isRelease() && (snapshotInstallOwners+snapshotAdmittedInstalls-(accepted==null ? 0 : 1)>=8
@@ -2072,6 +2193,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var nativePosition = store.applied();
             synchronized (admissions) {
                 requireHealthy();
+                if(transaction.getStateMachineContext() instanceof TopologyHold hold){requireTopologyOwner(hold,hold.record,current,admissionGeneration.get(),true);return super.preAppendTransaction(transaction);}
                 if (transaction.getStateMachineContext() instanceof ImportApplyHold hold) {
                     requireImportApply(hold,hold.record,current,admissionGeneration.get());
                     if(hold.owners<=0)throw new IOException("Native import proposal owner released");
@@ -2177,6 +2299,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         requireRoleRecord(encoded);
+        if(RatisTopologyFreezeRecord.isFreeze(encoded))return new AppliedRecord(null,topologyRecovered(RatisTopologyFreezeRecord.decode(encoded)));
         if (RatisRangeImportRecord.isImport(encoded)) return new AppliedRecord(null,rangeImportApply.recoveredResult(RatisRangeImportRecord.decode(encoded)));
         if (RatisReferencedFile.Request.isRequest(encoded)) throw new IOException("Reference recovery requires exact original log position");
         if (RatisSchemaFenceRecord.isFence(encoded)) { var proof=schemaProof(RatisSchemaFenceRecord.decode(encoded)); return new AppliedRecord(null,proof==null ? null : proof.encode()); }
@@ -2277,7 +2400,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return CompletableFuture.completedFuture(result);
     }
 
-    private static boolean asyncNativeRecord(byte[] bytes) { return RatisSchemaInstallRecord.isInstall(bytes) || RatisRangeImportRecord.isImport(bytes) || RatisReferencedFile.Request.isRequest(bytes); }
+    private static boolean asyncNativeRecord(byte[] bytes) { return RatisTopologyFreezeRecord.isFreeze(bytes) || RatisSchemaInstallRecord.isInstall(bytes) || RatisRangeImportRecord.isImport(bytes) || RatisReferencedFile.Request.isRequest(bytes); }
     private byte[] referenceProof(RatisReferencedFile.Request request) throws Exception {
         var result=store.importFileReceipt(request.clientId(),request.callId(),RangeImportAdmission.sha256(request.encode()));
         if(result==null)return null;
@@ -2286,22 +2409,35 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return reference.encode();
     }
     private byte[] nativeApplyProof(NativeApply work) throws Exception {
+        if(work.topologyRecord!=null)return topologyRecovered(work.topologyRecord);
         if (work.referenceRequest!=null) return referenceProof(work.referenceRequest);
         if (work.importRecord!=null) return rangeImportApply.recoveredResult(work.importRecord);
         var proof=schemaInstallProof(work.record); return proof==null ? null : proof.encode();
     }
-    private void scheduleNativeApply(NativeApply work,boolean ready) {
+    private void scheduleNativeApply(NativeApply work,boolean ready) { scheduleNativeApply(work,ready,-1); }
+    private void scheduleNativeApply(NativeApply work,boolean ready,long expectedTopologyGeneration) {
         var executor=proofQueries;
-        if (executor==null) { failNativeApply(work,new IOException("Bounded schema apply dispatcher is not configured")); return; }
+        if (executor==null) { failNativeApply(work,new IOException("Bounded schema apply dispatcher is not configured"),expectedTopologyGeneration); return; }
         byte[] input=ByteBuffer.allocate(17+work.deferred.encoded().length).putLong(work.deferred.term()).putLong(work.index).put((byte)(ready ? 1 : 0)).put(work.deferred.encoded()).array();
+        var topologyContinuation=new CompletableFuture<Void>();var topologyWaiting=new java.util.concurrent.atomic.AtomicBoolean();
+        final long topologyGeneration;var topologyAction=new CompletableFuture<Void>();
+        synchronized(gate){topologyGeneration=work.topologyGeneration;if(work.topologyRecord!=null){if(nativeApply!=work || work.topologyReplacing || expectedTopologyGeneration>=0 && expectedTopologyGeneration!=topologyGeneration)return;work.topologyActions=CompletableFuture.allOf(work.topologyActions,topologyAction);}}
         executor.submit(store.ownership().owner().groupId(),input,input.length,false,ignored -> {
             synchronized (gate) {
-                if (nativeApply!=work || work.cancelled) return Message.EMPTY;
+                if (nativeApply!=work || work.cancelled || work.topologyRecord!=null && (work.topologyReplacing || topologyGeneration!=work.topologyGeneration)) return Message.EMPTY;
                 if (storageFailure!=null) requireHealthy();
                 if (getLifeCycleState()!=LifeCycle.State.RUNNING) { work.suspended=true; work.stageReady=ready; return Message.EMPTY; }
                 work.running=true; work.suspended=false;
             }
             try {
+            if(work.topologyRecord!=null){
+                var record=work.topologyRecord;var saved=store.lookupTopologyFreeze(record.header(),record.admissionDigest());
+                if(saved!=null){store.applyTopologyFreeze(new ApplyPosition(work.deferred.term(),work.index),record.definition(),record.admissionDigest());return finishNativeApply(work,saved.encode());}
+                if(topologyStorage==null)throw new IOException("Topology FREEZE storage is not configured");work.topologyPool=topologyStorage;
+                if(work.topologyGate==null){synchronized(admissions){if(topologyHold!=null && topologyHold.record.equals(record) && !topologyHold.reading && topologyHold.nativeGate!=null){work.topologyGate=topologyHold.nativeGate;topologyHold.nativeGate=null;}}if(work.topologyGate==null)work.topologyGate=store.prepareTopologyFreeze(record.definition(),record.admissionDigest());}
+                if(!ready && !work.topologyGate.state().ready()){topologyWaiting.set(true);work.topologyGate.whenReady().whenComplete((unused,failure)->{if(failure==null)topologyContinuation.complete(null);else topologyContinuation.completeExceptionally(failure);});return Message.EMPTY;}
+                var freeze=store.applyTopologyFreeze(new ApplyPosition(work.deferred.term(),work.index),record.definition(),record.admissionDigest());return finishNativeApply(work,freeze.encode());
+            }
             if (work.referenceRequest!=null) {
                 byte[] saved=referenceProof(work.referenceRequest);
                 if(saved!=null){store.applyNoop(new ApplyPosition(work.deferred.term(),work.index));return finishNativeApply(work,saved);}
@@ -2350,7 +2486,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var installed=schemaStorage.installSchema(store,new ApplyPosition(work.deferred.term(),work.index),work.plan);
             return finishNativeApply(work,installed.proof().encode());
             } finally { boolean close; synchronized (gate) { work.running=false; close=work.cancelled || work.coveredResult!=null; } if (close) work.close(); }
-        }).whenComplete((ignored,failure) -> { if (failure!=null) failNativeApply(work,failure); });
+        }).whenComplete((ignored,failure) -> {
+            topologyAction.complete(null);
+            synchronized(gate){if(work.topologyRecord!=null && (work.topologyReplacing || topologyGeneration!=work.topologyGeneration))return;}
+            if(failure!=null)failNativeApply(work,failure,topologyGeneration);
+            else if(topologyWaiting.get())topologyContinuation.whenComplete((unused,problem)->{
+                if(problem!=null)failNativeApply(work,problem,topologyGeneration);else scheduleNativeApply(work,true,topologyGeneration);
+            });
+        });
     }
     private Message finishNativeApply(NativeApply work,byte[] bytes) throws Exception {
         var completions=new java.util.ArrayList<Completion>(); var activations=new java.util.ArrayList<AppliedRecord>(); NativeApply next=null;
@@ -2373,6 +2516,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (enableSessionControls) store.enableSessionControls();
                 refreshSessionAdmission(current==null ? rangeImportApply.definition().targetDirectory() : current.definition().targetDirectory());
             }
+            if(work.topologyRecord!=null)topologyRecovered(work.topologyRecord);
             synchronized(admissions){if(importApplyHold!=null && Arrays.equals(importApplyHold.bytes,work.deferred.encoded()))releaseImportApply(importApplyHold);}
             advance(work.deferred.term(),work.index);
             deferred.remove(work.index); deferredBytes-=work.deferred.encoded().length; nativeApply=null;
@@ -2405,8 +2549,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             work.deferred.future().completeExceptionally(failure); failDeferred(failure); throw failure;
         }
     }
-    private void failNativeApply(NativeApply work,Throwable failure) {
-        synchronized (gate) { if (nativeApply!=work) return; storageFailure=failure; nativeApply=null; }
+    private void failNativeApply(NativeApply work,Throwable failure) { failNativeApply(work,failure,-1); }
+    private void failNativeApply(NativeApply work,Throwable failure,long expectedTopologyGeneration) {
+        synchronized (gate) { if (nativeApply!=work || work.topologyRecord!=null && expectedTopologyGeneration>=0 && (work.topologyReplacing || expectedTopologyGeneration!=work.topologyGeneration)) return; storageFailure=failure; nativeApply=null; }
         work.close(); failDeferred(failure);
     }
 
@@ -2422,6 +2567,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private void releaseAdmission(TransactionContext transaction) {
         synchronized (admissions) {
+            if(transaction.getStateMachineContext() instanceof TopologyHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseTopologyHold(hold);}}
             if (transaction.getStateMachineContext() instanceof ImportApplyHold hold) {
                 transaction.setStateMachineContext(null); hold.owners--; if(transaction.getLogEntry()!=null)hold.maybeAppended=true;
                 if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseImportApply(hold);}
@@ -2510,6 +2656,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private record NativeAdmissionProof(List<Admission> settled,List<Admission> terminalScopes) {}
     private void invalidateProposalCandidates() { synchronized (admissions) { invalidateUnsubmitted(); } }
     private void invalidateUnsubmitted() {
+        if(topologyHold!=null){topologyHold.invalidated=true;if(!topologyHold.submitted)releaseTopologyHold(topologyHold);}
         if(importApplyHold!=null){importApplyHold.invalidated=true;if(!importApplyHold.submitted)releaseImportApply(importApplyHold);}
         for(var hold:List.copyOf(importPublicationHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseImportPublication(hold);}
         if (schemaHold!=null) { schemaHold.invalidated=true; if (!schemaHold.submitted) releaseSchemaHold(schemaHold); }
@@ -2542,6 +2689,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (term<=reconciledProposalTerm) return;
         invalidateUnsubmitted();
         for(var hold:List.copyOf(importPublicationHolds.values()))if(hold.term<term)releaseImportPublication(hold);
+        if(topologyHold!=null && topologyHold.term<term)releaseTopologyHold(topologyHold);
         if (importApplyHold!=null && importApplyHold.term<term)releaseImportApply(importApplyHold);
         if (schemaHold!=null && schemaHold.term<term) releaseSchemaHold(schemaHold);
         for (var admission:List.copyOf(admissions.values())) if (admission.term<term) settleAdmission(admission);
@@ -2673,7 +2821,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
     }
     private void requireHomeInput(int bytes) {
-        if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16
+        if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16
                 || bytes>16L*1024*1024-homeRecoveryInputBytes) throw new IllegalStateException("Protected HOME input budget exhausted");
     }
     private void requireHomeHold(HomeHold hold) throws IOException {
@@ -2795,7 +2943,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (ready!=null && ready.finalization.transactionId().equals(transaction) && ready.authorized()) return borrowedFinalization(ready.hold,ready.finalization);
             var known=admissions.get(recovery);
             if (known!=null && known.finalization!=null && known.finalization.transactionId().equals(transaction) && known.term==leader.term() && known.generation==generation) return borrowedFinalization(known.finalizationHold,known.finalization);
-            if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+            if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IllegalStateException("Protected proposal budget exhausted");
             if (participantIdentityBusy(recovery) || finalizingTransactions.containsKey(transaction)) throw new IllegalStateException("Finalization identity/transaction is already owned");
             hold=new FinalizationHold(transaction,recovery,leader.term(),generation); preparingFinalizations.put(recovery,hold); finalizingTransactions.put(transaction,hold); finalizationOwners.put(recovery,hold); protectedFinalizationSlots++;
         }
@@ -2850,7 +2998,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 var accepted=estimate.existing()==null && !estimate.retired() ? preparedFinalizations.get(finalization.operation()) : null;
                 if (estimate.existing()==null && !estimate.retired() && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Finalization has no fresh home acceptance authority");
-                if (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
+                if (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots-(accepted==null ? 0 : 1)>=16) throw new IllegalStateException("Protected proposal budget exhausted");
                 var admission=new Admission(finalization.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,true,null,null,null);
                 admission.finalization=finalization; admission.finalizationHold=accepted==null ? null : accepted.hold; admissions.put(admission.id,admission);
                 if (accepted!=null) { accepted.claimed=true; preparedFinalizations.remove(admission.id,accepted); protectedFinalizationSlots--; }
@@ -2883,7 +3031,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var ready=preparedSnapshotHomeRetirements.get(operation); if (ready!=null && !ready.invalidated && ready.term==leader.term() && ready.generation==generation && ready.retirement.equals(retirement)) return false;
             var known=admissions.get(operation); if (known!=null) { if (retirement.equals(known.snapshotHomeRetirement) && known.term==leader.term() && known.generation==generation) return false; throw new IOException("Snapshot HOME retirement identity is still owned"); }
             int bytes=RatisSnapshotHomeRetirementRecord.encode(retirement).length;
-            if (participantIdentityBusy(operation) || schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || bytes>16L*1024*1024-snapshotHomeRetirementInputBytes) throw new IOException("Protected snapshot HOME retirement input exhausted");
+            if (participantIdentityBusy(operation) || schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || bytes>16L*1024*1024-snapshotHomeRetirementInputBytes) throw new IOException("Protected snapshot HOME retirement input exhausted");
             var id=retirement.identity(); byte[] key=ByteBuffer.allocate(16).putLong(id.snapshotId().getMostSignificantBits()).putLong(id.snapshotId().getLeastSignificantBits()).array();
             var scope=proposalFootprints.reserveCandidate(proposalFootprints.prepare(List.of(TransactionScope.Span.point(id.columnId(),key))),leader.term(),generation); if (scope==null) throw new IOException("Snapshot HOME retirement row overlaps in-flight work");
             hold=new SnapshotHomeRetirementHold(retirement,leader.term(),generation,scope); preparingSnapshotHomeRetirements.put(operation,hold); snapshotHomeRetirementSlots++; snapshotHomeRetirementInputBytes+=hold.bytes;
@@ -2910,7 +3058,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             checkHomeOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot HOME retirement owner changed"); reconcileOlderProposalTerms(leader.term()); var known=admissions.get(operation);
             if (known!=null) { if (!retirement.equals(known.snapshotHomeRetirement) || known.term!=leader.term() || known.generation!=generation) throw new IOException("Snapshot HOME retirement is still settling"); known.owners++; transaction.setStateMachineContext(known); return transaction; }
             var accepted=preparedSnapshotHomeRetirements.get(operation); if (needed && (accepted==null || accepted.invalidated || accepted.term!=leader.term() || accepted.generation!=generation || !accepted.retirement.equals(retirement) || !accepted.scope.active())) throw new IOException("Snapshot HOME retirement lacks fresh DATA authority");
-            if (accepted==null && (participantIdentityBusy(operation) || schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>16L*1024*1024-snapshotHomeRetirementInputBytes)) throw new IOException("Protected snapshot HOME retirement input exhausted");
+            if (accepted==null && (participantIdentityBusy(operation) || schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>16L*1024*1024-snapshotHomeRetirementInputBytes)) throw new IOException("Protected snapshot HOME retirement input exhausted");
             var admission=new Admission(operation,retirement.digest(),encoded.length,leader.term(),generation,0,0,false,true,null,accepted==null ? null : accepted.scope,null); admission.snapshotHomeRetirement=retirement;
             if (accepted!=null) { proposalFootprints.submit(accepted.scope); preparedSnapshotHomeRetirements.remove(operation,accepted); snapshotHomeRetirementSlots--; } else snapshotHomeRetirementInputBytes+=encoded.length;
             admissions.put(operation,admission); protectedAdmissions++; admittedBytes+=encoded.length; transaction.setStateMachineContext(admission); return transaction;
@@ -2924,7 +3072,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot retirement owner changed"); reconcileOlderProposalTerms(leader.term());
             var ready=preparedSnapshotRetirements.get(operation); if (ready!=null && ready.term()==leader.term() && ready.generation()==generation && ready.retirement().equals(retirement)) return false;
             var known=admissions.get(operation); if (known!=null) { if (retirement.equals(known.snapshotRetirement) && known.term==leader.term() && known.generation==generation) return false; throw new IOException("Snapshot retirement identity is still owned"); }
-            if (participantIdentityBusy(operation) || snapshotRetirementSlots>=8 || schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || hold.bytes()>16L*1024*1024-snapshotRetirementInputBytes) throw new IOException("Protected snapshot retirement input budget exhausted");
+            if (participantIdentityBusy(operation) || snapshotRetirementSlots>=8 || schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || hold.bytes()>16L*1024*1024-snapshotRetirementInputBytes) throw new IOException("Protected snapshot retirement input budget exhausted");
             preparingSnapshotRetirements.put(operation,hold); snapshotRetirementSlots++; snapshotRetirementInputBytes+=hold.bytes();
         }
         boolean retained=false;
@@ -2949,7 +3097,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             checkTransactionOwner(); if (generation!=admissionGeneration.get()) throw new IOException("Snapshot retirement owner changed"); reconcileOlderProposalTerms(leader.term()); var known=admissions.get(operation);
             if (known!=null) { if (!retirement.equals(known.snapshotRetirement) || known.term!=leader.term() || known.generation!=generation) throw new IOException("Snapshot retirement is still settling"); known.owners++; transaction.setStateMachineContext(known); return transaction; }
             var accepted=preparedSnapshotRetirements.get(operation); if (needed && (accepted==null || accepted.term()!=leader.term() || accepted.generation()!=generation || !accepted.retirement().equals(retirement))) throw new IOException("Snapshot retirement lacks fresh HOME authority");
-            if (accepted==null && (participantIdentityBusy(operation) || schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>16L*1024*1024-snapshotRetirementInputBytes)) throw new IOException("Protected snapshot retirement input budget exhausted");
+            if (accepted==null && (participantIdentityBusy(operation) || schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>16L*1024*1024-snapshotRetirementInputBytes)) throw new IOException("Protected snapshot retirement input budget exhausted");
             var admission=new Admission(operation,retirement.digest(),encoded.length,leader.term(),generation,0,0,false,true,null,null,null); admission.snapshotRetirement=retirement;
             if (accepted!=null) { preparedSnapshotRetirements.remove(operation,accepted); snapshotRetirementSlots--; } else snapshotRetirementInputBytes+=encoded.length;
             admissions.put(operation,admission); protectedAdmissions++; admittedBytes+=encoded.length; transaction.setStateMachineContext(admission); return transaction;
@@ -2969,7 +3117,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 throw new IOException("HOME retirement identity is still owned");
             }
             int bytes=RatisHomeRetirementRecord.encode(retirement).length;
-            if (participantIdentityBusy(operation) || schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16
+            if (participantIdentityBusy(operation) || schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16
                     || bytes>1024L*1024-homeRetirementInputBytes) throw new IOException("Protected HOME retirement input budget exhausted");
             var id=retirement.identity(); byte[] key=ByteBuffer.allocate(16).putLong(id.transactionId().getMostSignificantBits()).putLong(id.transactionId().getLeastSignificantBits()).array();
             var scope=proposalFootprints.reserveCandidate(proposalFootprints.prepare(List.of(TransactionScope.Span.point(id.columnId(),key))),leader.term(),generation);
@@ -3010,7 +3158,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             var accepted=preparedHomeRetirements.get(operation);
             if (needed && (accepted==null || accepted.invalidated || accepted.term!=leader.term() || accepted.generation!=generation || !accepted.retirement.equals(retirement) || !accepted.scope.active())) throw new IOException("HOME retirement lacks fresh DATA authority");
-            if (accepted==null && (participantIdentityBusy(operation) || schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>1024L*1024-homeRetirementInputBytes)) throw new IOException("Protected HOME retirement input budget exhausted");
+            if (accepted==null && (participantIdentityBusy(operation) || schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>1024L*1024-homeRetirementInputBytes)) throw new IOException("Protected HOME retirement input budget exhausted");
             var admission=new Admission(operation,retirement.digest(),encoded.length,leader.term(),generation,0,0,false,true,null,accepted==null ? null : accepted.scope,null); admission.homeRetirement=retirement;
             if (accepted!=null) { proposalFootprints.submit(accepted.scope); preparedHomeRetirements.remove(operation,accepted); homeRetirementSlots--; } else homeRetirementInputBytes+=encoded.length;
             admissions.put(operation,admission); protectedAdmissions++; admittedBytes+=encoded.length; transaction.setStateMachineContext(admission); return transaction;
@@ -3032,7 +3180,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (retirement.equals(known.retirement) && known.term==leader.term() && known.generation==generation) return false;
                 throw new IOException("Retirement identity is still owned");
             }
-            if (participantIdentityBusy(operation) || schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16
+            if (participantIdentityBusy(operation) || schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16
                     || hold.bytes()>1024L*1024-retirementInputBytes) throw new IOException("Protected retirement input budget exhausted");
             preparingRetirements.put(operation,hold); retirementSlots++; retirementInputBytes+=hold.bytes();
         }
@@ -3073,7 +3221,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             var accepted=preparedRetirements.get(operation);
             if (needed && (accepted==null || accepted.term()!=leader.term() || accepted.generation()!=generation || !accepted.retirement().equals(retirement))) throw new IOException("Retirement has no fresh HOME authority");
-            if (accepted==null && (schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>1024L*1024-retirementInputBytes)) throw new IOException("Protected retirement input budget exhausted");
+            if (accepted==null && (schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || encoded.length>1024L*1024-retirementInputBytes)) throw new IOException("Protected retirement input budget exhausted");
             var admission=new Admission(operation,RatisParticipantRecord.digest(retirement),encoded.length,leader.term(),generation,0,0,false,true,null,null,null);
             admission.retirement=retirement;
             if (accepted!=null) { preparedRetirements.remove(operation,accepted); retirementSlots--; } else retirementInputBytes+=encoded.length;
@@ -3204,7 +3352,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 long ownedScope=negative ? 0 : scopeBytes;
                 if (reserve && (capacity.count()+reservedParticipantCount+reservedFinalizationCount>=ReplicatedRangeStore.MAX_PREPARED_PARTICIPANTS || bytes>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.bytes()-reservedParticipantBytes-reservedFinalizationBytes)
                         || ownedScope>ReplicatedRangeStore.MAX_PREPARED_BYTES-capacity.scopeBytes()-reservedParticipantScopeBytes) throw new IllegalStateException("Participant staged capacity exhausted");
-                if (negative ? schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-negativeInputBytes
+                if (negative ? schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16 || DistributedCommandCodec.MAX_ENCODED_BYTES>8L*1024*1024-negativeInputBytes
                         : DistributedCommandCodec.MAX_ENCODED_BYTES>16L*1024*1024-preparedCommitBytes) throw new IllegalStateException("Participant input budget exhausted");
                 ProposalReservation reservation=null;
                 if (!negative) { var lease=proposalFootprints.reserveCandidate(footprint,leader.term(),generation); if (lease==null) throw new IllegalStateException("Participant scope overlaps in-flight work"); reservation=new ProposalReservation(lease); }
@@ -3322,7 +3470,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 var accepted=existing==null ? preparedParticipants.get(preparation.operation()) : null;
                 if (existing==null && (accepted==null || !Arrays.equals(accepted.digest,digest) || !accepted.authorized())) throw new IllegalStateException("Prepare has no current acceptance authority; resolve through its home");
-                if (negative ? schemaSlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots-(accepted==null ? 0 : 1)>=16 || accepted==null && encoded.length>8L*1024*1024-negativeInputBytes
+                if (negative ? schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots-(accepted==null ? 0 : 1)>=16 || accepted==null && encoded.length>8L*1024*1024-negativeInputBytes
                         : dataAdmissions>=1024 || encoded.length>16L*1024*1024-dataProposalBytes) throw new IllegalStateException("Participant input budget exhausted");
                 var admission=new Admission(preparation.operation(),digest,encoded.length,leadership.term(),generation,0,0,false,negative,null,accepted==null || accepted.reservation==null ? null : accepted.reservation.lease,null);
                 admission.participant=preparation; admission.participantNegative=negative; admission.participantHold=accepted==null ? null : accepted.hold;
@@ -3438,6 +3586,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (previous==null) {
                     schemaConfigurationStamp++; schemaConfigurationPending=true;
+                    if(topologyHold!=null){topologyHold.invalidated=true;if(!topologyHold.submitted)releaseTopologyHold(topologyHold);}
                     if(importApplyHold!=null){importApplyHold.invalidated=true;if(!importApplyHold.submitted)releaseImportApply(importApplyHold);}
                     for(var hold:List.copyOf(importPublicationHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseImportPublication(hold);}
                     if (schemaHold!=null) { schemaHold.invalidated=true; if (!schemaHold.submitted) releaseSchemaHold(schemaHold); }
@@ -3588,6 +3737,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                             || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(view.cut(),store.applied()))throw new IOException("Topology authority cut/configuration changed");}
                     return Message.valueOf(ByteString.copyFrom(RatisTopologyAuthority.reply(view)));
                 });
+            }
+            if(ScopedTransactionRpc.topologyFreeze(kind)){
+                requireDataRole();if(topologyAuthority==null || proofQueries==null)throw new IOException("Topology FREEZE dispatcher is not configured");
+                var record=RatisTopologyFreezeRpc.request(encoded);
+                if(kind==ScopedTransactionRpc.TOPOLOGY_FREEZE_CANCEL){synchronized(admissions){var hold=topologyHold;if(hold!=null && hold.record.equals(record) && !hold.submitted){hold.invalidated=true;releaseTopologyHold(hold);}}return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(RatisTopologyFreezeRpc.cancelledReply(record))));}
+                if(kind==ScopedTransactionRpc.TOPOLOGY_FREEZE_PREPARE && !freshBarrier)throw new IOException("Topology FREEZE preparation requires a fresh barrier");long generation=admissionGeneration.get();
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,4L*encoded.length+RatisTopologyFreezeRpc.MAX_REPLY_BYTES,false,owned->{var requested=RatisTopologyFreezeRpc.request(owned);if(kind==ScopedTransactionRpc.TOPOLOGY_FREEZE_PREPARE){if(generation!=admissionGeneration.get())throw new IOException("Topology FREEZE lost barrier owner");prepareTopologyFreeze(requested,generation);}return Message.valueOf(ByteString.copyFrom(RatisTopologyFreezeRpc.reply(kind,topologyState(requested))));});
             }
             if(kind==RatisRangeImportAuthority.KIND){
                 if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Import authority requires configured fresh catalogue dispatcher");
