@@ -502,6 +502,35 @@ class CompactionBulkFeedbackTest {
         assertEquals(0, t.applied);
         assertEquals(0, blocks.getInt(t.p), "the second weighted mean must still satisfy the whole-block drift guard");
     }
+    @Test void boundedPeriodicBulkMeansCanCompleteOffBlocksAndSeedPrefetch() throws Exception {
+        var t = new Trace(); t.nativePointMean = 800; t.pointTail = 2000;
+        t.bulkCallMicros = 60000; t.bulkTail = 120000;
+        t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.seconds(20);
+        for (int cycle = 0; cycle < 30 && t.applied == 0; cycle++) {
+            t.bulkCallMicros = 50000; t.seconds(5);
+            t.bulkCallMicros = 60000; t.seconds(5);
+        }
+        var reference = CompactionIoBudget.class.getDeclaredField("bulkTailBaseline"); reference.setAccessible(true);
+        assertEquals(120000, reference.getDouble(t.p), .001,
+                "two comparable30s blocks with a55ms weighted bulk mean must learn the fixed120ms envelope");
+        assertTrue(t.applied >= 65536, "safe periodic bulk means must permit bounded prefetch seeding");
+        t.bulkTail = 150000; t.step();
+        assertEquals(0, t.applied, "a genuine tail breach must still cut on the first poll");
+    }
+    @Test void sustainedBulkMeanDriftStillRejectsSecondOffBlockBelowFastThreshold() throws Exception {
+        var t = new Trace(); t.nativePointMean = 800; t.pointTail = 2000;
+        t.bulkCallMicros = 60000; t.bulkTail = 120000;
+        t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.seconds(20); t.bulkCallMicros = 50000; t.seconds(65);
+        var blocks = CompactionIoBudget.class.getDeclaredField("tailBlocks"); blocks.setAccessible(true);
+        assertEquals(1, blocks.getInt(t.p));
+        t.bulkCallMicros = 57000; t.seconds(30);
+        var reference = CompactionIoBudget.class.getDeclaredField("bulkTailBaseline"); reference.setAccessible(true);
+        assertEquals(0, reference.getDouble(t.p));
+        assertEquals(0, t.applied);
+        assertEquals(0, blocks.getInt(t.p), "+14% weighted bulk drift must still reject the second whole block");
+    }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;
         t.step(); assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());

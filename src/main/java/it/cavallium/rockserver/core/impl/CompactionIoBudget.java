@@ -100,7 +100,7 @@ public final class CompactionIoBudget {
     private long tailBlockReads, tailBlockPointNanos, tailBlockKeys, tailBlockBulkMicros;
     private double firstPointMean, firstBulkMean, tailBlockShape, firstTailShape;
     private boolean tailBlockPointActive, tailBlockBulkActive;
-    private double queueAnchor = -1, lastBulkMean;
+    private double queueAnchor = -1;
     private volatile double lastPointMean;
     private long queuedIntegral, safetyGrowthUntil;
     private int queueWorkers = -1, queueBadPolls, stableLoadedWindows;
@@ -220,7 +220,7 @@ public final class CompactionIoBudget {
                 pointTailBaseline = bulkTailBaseline = 0;
                 tailCalibrationNeeded = true; resetTailBlocks();
             }
-            lastPointMean = lastBulkMean = 0;
+            lastPointMean = 0;
             reduceReadahead(0);
             return publishBudget();
         }
@@ -259,7 +259,6 @@ public final class CompactionIoBudget {
             reduceReadahead(0);
             latencyUnsafe = true;
         }
-        double previousBulkTailShape = lastBulkTailShape;
         long pointTailInWindow = pointTailWindow, bulkTailInWindow = bulkTailWindow;
         double nativeBulkShapeInWindow = nativeBulks > 0 ? (double) nativeBulkKeys / nativeBulks : 0;
         lastPointTail = nativePoints >= 32 ? pointTailInWindow : 0;
@@ -278,11 +277,8 @@ public final class CompactionIoBudget {
         boolean ownPointReliable = !pointTailActive || pointReliable && pointTailInWindow > 0;
         boolean ownBulkReliable = bulkIdle && !bulkTailActive
                 || bulkComparable && nativeBulks >= 32 && nativeBulkShapeInWindow > 0 && bulkTailInWindow > 0;
-        boolean sameBulkShape = previousBulkTailShape == 0 || nativeBulkShapeInWindow == 0
-                || compatibleShape(nativeBulkShapeInWindow, previousBulkTailShape);
         boolean stationary = !nonTailUnsafe && !unhealthyMean && !noForegroundProgress && !bulkNoProgress
                 && ownPointReliable && ownBulkReliable && bulkSafe
-                && (!bulkComparable || !sameBulkShape || lastBulkMean == 0 || bulkLatency <= lastBulkMean * 1.1)
                 && (queueAnchor < 0 || queueMean <= queueAnchor + Math.max(2, queueAnchor * .2));
         if (stationary) {
             if (queueAnchor < 0) queueAnchor = queueMean; // Provisional until the second stationary window confirms it.
@@ -290,7 +286,6 @@ public final class CompactionIoBudget {
             if (stableLoadedWindows >= 2 && baseline == 0 && pointReliable) baseline = latency;
         } else stableLoadedWindows = 0;
         lastPointMean = pointReliable ? latency : 0;
-        lastBulkMean = bulkComparable ? bulkLatency : 0;
         updateForegroundTails(stationary && !unhealthyMean, pointReliable, pointTailActive, bulkTailActive);
         boolean tailsCalibrated = !tailCalibrationNeeded
                 && (!pointTailActive || pointTailBaseline > 0 && nativePoints >= 32)
@@ -434,7 +429,7 @@ public final class CompactionIoBudget {
         else if (queueWorkers != sample.readWorkers) {
             queueWorkers = sample.readWorkers;
             queueAnchor = -1;
-            lastPointMean = lastBulkMean = 0;
+            lastPointMean = 0;
             reduceReadahead(0);
             clearReadWindow();
         }
