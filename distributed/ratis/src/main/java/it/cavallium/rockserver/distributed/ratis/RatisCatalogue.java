@@ -57,23 +57,27 @@ public final class RatisCatalogue {
 
     /** Prepare once; retry this exact command/operation identity after an uncertain reply. */
     public DistributedCommand prepare(OperationId operationId, RangeDirectory expected, RangeDirectory next) {
-        return prepareGuarded(operationId,expected,next,null);
+        return prepareGuarded(operationId,expected,next,null,null);
     }
 
     /** Resume ordinary topology changes after the domain's schema operation has fully retired or aborted. */
     public DistributedCommand prepareAfterAdministration(OperationId operationId, RangeDirectory expected, RangeDirectory next,
                                                         RatisSchemaAdministration.Head administrativeHead) {
         Objects.requireNonNull(administrativeHead);
-        return prepareGuarded(operationId,expected,next,administrativeHead.encode());
+        return prepareGuarded(operationId,expected,next,administrativeHead.encode(),null);
     }
 
-    private DistributedCommand prepareGuarded(OperationId operationId,RangeDirectory expected,RangeDirectory next,byte[] administrativeHead) {
+    /** Explicitly qualify both terminal administrative owners; null means an exact absent-head guard. */
+    public DistributedCommand prepareAfterAdministration(OperationId operationId,RangeDirectory expected,RangeDirectory next,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead) {
+        return prepareGuarded(operationId,expected,next,schemaHead==null ? null : schemaHead.encode(),importHead==null ? null : importHead.encode());
+    }
+    private DistributedCommand prepareGuarded(OperationId operationId,RangeDirectory expected,RangeDirectory next,byte[] administrativeHead,byte[] importHead) {
         byte[] value = RangeDirectoryCodec.encode(Objects.requireNonNull(next));
         byte[] previous = expected == null ? null : RangeDirectoryCodec.encode(expected);
         byte[] key = key(next.domainId());
         var command = new DistributedCommand(groupId, rangeEpoch, schemaDigest, operationId,
                 List.of(new Mutation(Mutation.Kind.PUT, columnId, key, value)),
-                List.of(new KeyPredicate(columnId, key, previous),new KeyPredicate(columnId,RatisSchemaAdministration.headKey(next.domainId()),administrativeHead)));
+                List.of(new KeyPredicate(columnId, key, previous),new KeyPredicate(columnId,RatisSchemaAdministration.headKey(next.domainId()),administrativeHead),new KeyPredicate(columnId,RatisRangeImportCatalogue.headKey(next.domainId()),importHead)));
         validator.accept(command);
         return command;
     }
@@ -102,7 +106,7 @@ public final class RatisCatalogue {
                 throw new IllegalArgumentException("Wrong catalogue identity/schema");
             }
             if ((command.acknowledgedThrough() >= 0 || command.minimumSessionEpoch() >= 0) && command.mutations().isEmpty() && command.predicates().isEmpty()) return;
-            if (command.mutations().size() != 1 || command.predicates().size() != 2) {
+            if (command.mutations().size() != 1 || command.predicates().size() != 3) {
                 throw new IllegalArgumentException("Catalogue requires one conditional directory replacement");
             }
             var mutation = command.mutations().getFirst();
@@ -116,14 +120,17 @@ public final class RatisCatalogue {
             requireIdentity(next, clusterId, databaseId, mutation.key());
             byte[] previous = predicate.expectedValue();
             var guard=command.predicates().get(1);
-            if (!guard.columnId().equals(columnId)) throw new IllegalArgumentException("Wrong schema administration guard column");
+            if (!guard.columnId().equals(columnId) || !command.predicates().get(2).columnId().equals(columnId)) throw new IllegalArgumentException("Wrong schema administration guard column");
             if (previous == null) {
                 if (next.generation() != 0) throw new IllegalArgumentException("Initial directory generation must be zero");
                 RatisSchemaAdministration.requireTopologyGuard(guard,next);
+                RatisRangeImportCatalogue.requireTopologyGuard(command.predicates().get(2),next);
             } else {
                 var expected = decode(previous);
                 requireIdentity(expected, clusterId, databaseId, mutation.key());
                 RatisSchemaAdministration.requireTopologyGuard(guard,expected);
+                RatisRangeImportCatalogue.requireTopologyGuard(command.predicates().get(2),expected);
+                for(var range:expected.ranges()) if(range.topologyState()==RangeDescriptor.TopologyState.FENCED && next.ranges().stream().anyMatch(target -> target.groupId().equals(range.groupId()) && target.topologyState()==RangeDescriptor.TopologyState.ACTIVE)) throw new IllegalArgumentException("Fenced group activation requires distinct import publication");
                 if (expected.generation() == Long.MAX_VALUE || next.generation() != expected.generation() + 1
                         || expected.schemaEpoch() != next.schemaEpoch()
                         || !Arrays.equals(expected.schemaDigest(), next.schemaDigest())
@@ -155,22 +162,23 @@ public final class RatisCatalogue {
         var schemas = RatisSchemaCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn);
         var administration = immutable==null ? RatisSchemaAdministration.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn)
                 : RatisSchemaAdministration.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,immutable);
+        var imports=RatisRangeImportCatalogue.validator(clusterId,databaseId,groupId,rangeEpoch,schemaDigest,directoryColumn,immutable==null ? null : immutable::read);
         var allocation=RatisColumnAllocation.validator(groupId,rangeEpoch,schemaDigest,directoryColumn);
         return command -> {
-            if (RatisOperatorCatalogue.isCommand(command)) operators.accept(command);
+            if (RatisRangeImportCatalogue.isCommand(command)) imports.accept(command);
+            else if (RatisOperatorCatalogue.isCommand(command)) operators.accept(command);
             else if (RatisColumnAllocation.isAllocationCommand(command)) allocation.accept(command);
             else if (RatisSchemaAdministration.isCommand(command)) administration.accept(command);
             else if (RatisSchemaCatalogue.isSchemaCommand(command) && command.mutations().getFirst().columnId().equals(directoryColumn)) schemas.accept(command);
             else if (command.mutations().size()==2) {
                 if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
-                        || command.predicates().size()!=2 || !command.mutations().get(0).columnId().equals(directoryColumn)
+                        || command.predicates().size()!=4 || !command.mutations().get(0).columnId().equals(directoryColumn)
                         || !command.mutations().get(1).columnId().equals(sessionColumn)
                         || command.predicates().stream().anyMatch(predicate -> predicate.expectedValue()!=null)) {
-                    throw new IllegalArgumentException("Genesis requires an ordered pair of absent directory/session keys");
+                    throw new IllegalArgumentException("Genesis requires ordered absent directory/session/schema/import keys");
                 }
                 directory.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
-                        List.of(command.mutations().get(0)),List.of(command.predicates().get(0),new KeyPredicate(directoryColumn,
-                        RatisSchemaAdministration.headKey(RangeDirectoryCodec.decode(command.mutations().get(0).value()).domainId()),null))));
+                        List.of(command.mutations().get(0)),List.of(command.predicates().get(0),command.predicates().get(2),command.predicates().get(3))));
                 sessions.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
                         List.of(command.mutations().get(1)),List.of(command.predicates().get(1))));
             } else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(sessionColumn)) sessions.accept(command);

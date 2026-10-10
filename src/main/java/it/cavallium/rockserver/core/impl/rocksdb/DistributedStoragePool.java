@@ -711,18 +711,25 @@ public final class DistributedStoragePool implements AutoCloseable {
     public ReplicatedRangeStore openRange(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
             byte[] schemaDigest, Map<UUID, String> physicalColumns, Set<UUID> admittedMergeColumns)
             throws RocksDBException {
-        return openRange(owner,interval,schemaDigest,physicalColumns,admittedMergeColumns,null,null);
+        return openRange(owner,interval,schemaDigest,physicalColumns,admittedMergeColumns,null,null,false);
     }
 
     /** Creates only a virgin manifest-bound fenced owner; never temporarily publishes ACTIVE ownership. */
     public ReplicatedRangeStore openNewFencedRange(NativeSstImportManifest manifest,DistributedSchema schema) throws RocksDBException {
         manifest.requireSchema(schema);
-        var store=openRange(new RangeOwnership.Owner(manifest.groupId(),manifest.rangeEpoch()),new RangeOwnership.Interval(manifest.domainId(),manifest.physicalNames().keySet(),manifest.lowerInclusive(),manifest.upperExclusive()),schema.digest(),manifest.physicalNames(),manifest.mergeColumns(),manifest,schema);
+        var store=openRange(new RangeOwnership.Owner(manifest.groupId(),manifest.rangeEpoch()),new RangeOwnership.Interval(manifest.domainId(),manifest.physicalNames().keySet(),manifest.lowerInclusive(),manifest.upperExclusive()),schema.digest(),manifest.physicalNames(),manifest.mergeColumns(),manifest,schema,false);
         store.enableLogicalSchema(schema); return store;
     }
 
+    /** Recovery-only opener: exact durable birth is mandatory; ownership remains fenced until native validation. */
+    public ReplicatedRangeStore reopenImportRange(NativeSstImportManifest manifest,DistributedSchema originalSchema) throws RocksDBException {
+        manifest.requireSchema(originalSchema);
+        var store=openRange(new RangeOwnership.Owner(manifest.groupId(),manifest.rangeEpoch()),new RangeOwnership.Interval(manifest.domainId(),manifest.physicalNames().keySet(),manifest.lowerInclusive(),manifest.upperExclusive()),originalSchema.digest(),manifest.physicalNames(),manifest.mergeColumns(),manifest,originalSchema,true);
+        var installed=store.installedSchema(); store.enableLogicalSchema(installed==null ? originalSchema : installed); return store;
+    }
+
     private ReplicatedRangeStore openRange(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
-            byte[] schemaDigest,Map<UUID,String> physicalColumns,Set<UUID> admittedMergeColumns,NativeSstImportManifest newImport,DistributedSchema importSchema) throws RocksDBException {
+            byte[] schemaDigest,Map<UUID,String> physicalColumns,Set<UUID> admittedMergeColumns,NativeSstImportManifest newImport,DistributedSchema importSchema,boolean recoverImport) throws RocksDBException {
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(interval, "interval");
         final byte[] bootstrapSchema=schemaDigest.clone();
@@ -747,6 +754,10 @@ public final class DistributedStoragePool implements AutoCloseable {
                 if (closing) throw new IllegalStateException("Pool is closing");
             }
             byte[] importBirth=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x40));
+            if(recoverImport) {
+                if(importBirth==null || !Arrays.equals(importBirth,newImport.encode()))throw new IllegalStateException("Import recovery requires exact persisted native birth");
+                newImport=null; // Recover through ordinary generation qualification, without NEW admission or birth publication.
+            }
             var heldImport=newImportReservations.get(owner.groupId());
             if(heldImport!=null && (newImport==null || !Arrays.equals(heldImport.encode(),newImport.encode())))throw new IllegalArgumentException("Unpublished native import requires exact original-manifest retry");
             if(newImport!=null) {
@@ -885,6 +896,29 @@ public final class DistributedStoragePool implements AutoCloseable {
     private static boolean startsWith(byte[] key,byte[] prefix) { return key.length>=prefix.length && Arrays.equals(key,0,prefix.length,prefix,0,prefix.length); }
 
     /** Trusted local source paths are copied to forced immutable pool-owned originals before native mutation. */
+    public void validateSstImport(ReplicatedRangeStore store,NativeSstImportManifest manifest,Map<UUID,Path> originals) throws IOException,RocksDBException {
+        nativeMutation.acquireUninterruptibly();
+        try {
+            synchronized(admission) { if(closing || !ranges.contains(store))throw new IllegalStateException("Import store is not owned by this open pool"); }
+            store.readSchemaMetadata(()->{
+                if(store.pendingInstallation() || !store.importPending() || store.ownership().state()!=RangeOwnership.State.FENCED)throw new IllegalStateException("Import proposal requires unpublished fenced native owner");
+                byte[] birth=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(manifest.groupId(),0x40));
+                if(!store.ownership().owner().equals(new RangeOwnership.Owner(manifest.groupId(),manifest.rangeEpoch())) || !Arrays.equals(birth,manifest.encode()))throw new IllegalArgumentException("Import proposal differs from original native birth");
+                try { qualifySstOriginals(store,manifest,originals); } catch(IOException failure) { throw new UncheckedIOException(failure); } return null;
+            });
+        } catch(UncheckedIOException failure) { throw failure.getCause(); }
+        finally { nativeMutation.release(); }
+    }
+    private void qualifySstOriginals(ReplicatedRangeStore store,NativeSstImportManifest manifest,Map<UUID,Path> originals) throws IOException,RocksDBException {
+        var schema=store.installedSchema(); manifest.requireSchema(schema);
+        var actualNames=new HashMap<UUID,String>(); for(var column:store.ownership().interval().columns())actualNames.put(column,Objects.requireNonNull(bindings.get(column)).name());
+        if(!manifest.physicalNames().equals(actualNames))throw new IllegalArgumentException("Import physical bindings differ");
+        Path root=loaded.definitiveDbPath().resolve("range-imports"); NativeRangeSstImport.retain(root,manifest,originals);
+        for(var column:manifest.columns()) {
+            var config=loaded.definitiveColumnFamilyOptionsMap().get(column.physicalName()); SSTWriter.rejectUnsafeMultiPathIngestion(config,false);
+            try(var options=new org.rocksdb.Options(loaded.dbOptions(),config)) { for(var file:column.files())NativeRangeSstImport.qualify(NativeRangeSstImport.original(root,manifest,file),file,manifest,column.columnId(),schema,options); }
+        }
+    }
     public NativeSstImportManifest.Receipt importSst(ReplicatedRangeStore store,NativeSstImportManifest manifest,Map<UUID,Path> originals,ApplyPosition position) throws IOException,RocksDBException {
         return importSst(store,manifest,originals,position,stage -> {});
     }
@@ -893,16 +927,9 @@ public final class DistributedStoragePool implements AutoCloseable {
         try {
             synchronized(admission) { if(closing || !ranges.contains(store))throw new IllegalStateException("Import store is not owned by this open pool"); }
             if(store.importReceipt()!=null)return store.installSstUnderPool(manifest,position,()->{},(db,columns)->{},observer);
-            var schema=store.installedSchema(); manifest.requireSchema(schema);
-            var actualNames=new HashMap<UUID,String>(); for(var column:store.ownership().interval().columns())actualNames.put(column,Objects.requireNonNull(bindings.get(column)).name());
-            if(!manifest.physicalNames().equals(actualNames))throw new IllegalArgumentException("Import physical bindings differ");
             Path root=loaded.definitiveDbPath().resolve("range-imports");
             return store.installSstUnderPool(manifest,position,() -> {
-                NativeRangeSstImport.retain(root,manifest,originals);
-                for(var column:manifest.columns()) {
-                    var config=loaded.definitiveColumnFamilyOptionsMap().get(column.physicalName()); SSTWriter.rejectUnsafeMultiPathIngestion(config,false);
-                    try(var options=new org.rocksdb.Options(loaded.dbOptions(),config)) { for(var file:column.files())NativeRangeSstImport.qualify(NativeRangeSstImport.original(root,manifest,file),file,manifest,column.columnId(),schema,options); }
-                }
+                qualifySstOriginals(store,manifest,originals);
                 observer.at(NativeRangeSstImport.Stage.ORIGINALS_FORCED);
             },(db,columns) -> {
                 try(var options=new org.rocksdb.IngestExternalFileOptions().setMoveFiles(false).setIngestBehind(false).setWriteGlobalSeqno(false).setSnapshotConsistency(true).setAllowGlobalSeqNo(true).setAllowBlockingFlush(true)) {

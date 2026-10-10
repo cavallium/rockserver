@@ -21,7 +21,7 @@ class RatisCatalogueValidationTest {
     DistributedCommand command(byte[] expected, byte[] value) {
         return new DistributedCommand(group, 1, new byte[32], new OperationId(UUID.randomUUID(), 1, 1),
                 List.of(new Mutation(Mutation.Kind.PUT, column, key, value)), List.of(new KeyPredicate(column, key, expected),
-                new KeyPredicate(column,RatisSchemaAdministration.headKey(domain),null)));
+                new KeyPredicate(column,RatisSchemaAdministration.headKey(domain),null),new KeyPredicate(column,RatisRangeImportCatalogue.headKey(domain),null)));
     }
     @Test void acknowledgementOnlyDoesNotRequireOrWeakenDirectoryReplacement() {
         var operation = new OperationId(UUID.randomUUID(),1,2);
@@ -45,7 +45,7 @@ class RatisCatalogueValidationTest {
     @Test void acceptedUserPlansCannotBypassCataloguePredicates() {
         var base=command(null,RangeDirectoryCodec.encode(directory(cluster,0)));
         var audit=new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1),
-                new TransactionScope(List.of(TransactionScope.Span.point(column,key),TransactionScope.Span.point(column,RatisSchemaAdministration.headKey(domain)))),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
+                new TransactionScope(List.of(TransactionScope.Span.point(column,key),TransactionScope.Span.point(column,RatisSchemaAdministration.headKey(domain)),TransactionScope.Span.point(column,RatisRangeImportCatalogue.headKey(domain)))),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
         var accepted=DistributedCommand.acceptedTransaction(base,audit);
         assertThrows(IllegalArgumentException.class,() -> validate.accept(accepted));
         var epochs=RatisSessionEpochs.validator(cluster,database,group,1,new byte[32],column);

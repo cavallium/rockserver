@@ -87,6 +87,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
     private RatisProofQueryService authorityQueries;
+    private RatisProofQueryService importPublicationQueries;
     private RatisExportSourceService exportSources;
     private RatisSchemaReplicaService schemaReplicas;
     private RatisSchemaReplicaClient schemaFencingReplicas;
@@ -220,8 +221,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
         proofQueries=new RatisProofQueryService();
-        if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE))
+        if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE)) {
             authorityQueries=RatisProofQueryService.authorityLane();
+            importPublicationQueries=RatisProofQueryService.importPublicationLane();
+        }
         if (transactionHomes!=null) snapshotHelp=new RatisSnapshotHelpService(scheduler);
         var metadataBindings=new HashMap<UUID,String>();
         for (var group:plan.localGroups()) switch (plan.role(group.getGroupId().getUuid())) {
@@ -256,6 +259,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     machine.schemaCatalogue(plan.directory().clusterId(),plan.directory().databaseId(),c.directoryColumn());
                     machine.schemaFencingReplicaClient(schemaFencingReplicas);
                     machine.schemaAuthorityQueries(authorityQueries);
+                    machine.importPublicationQueries(importPublicationQueries);
                 } else {
                     var directory=plan.groupDirectory(id); var descriptor=plan.groupDescriptor(id); var home=plan.home(id);
                     var bindings=home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
@@ -468,6 +472,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 try { proofQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Proof query drain interrupted",interrupted); }
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Proof queries did not drain",failure); }
+            }
+            // Import preparation can await owner reads which themselves need catalogue authority.
+            if (importPublicationQueries!=null) {
+                try { importPublicationQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Import publication drain interrupted",interrupted); }
+                catch (ExecutionException | TimeoutException failure) { throw new IOException("Import publication queries did not drain",failure); }
             }
             if (schemaReplicas!=null) {
                 try { schemaReplicas.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }

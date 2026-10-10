@@ -168,6 +168,8 @@ public final class RatisReferencedFiles implements StateMachine.DataApi,AutoClos
     public final class Reader implements AutoCloseable {
         private final RatisReferencedFile reference; private boolean released;
         private Reader(RatisReferencedFile reference) { this.reference=reference; }
+        /** Trusted local JNI bridge only; retain this pin until all native users of the immutable file return. */
+        public synchronized Path immutablePath() throws IOException { if(released) throw new IOException("Referenced reader closed"); return file(reference.sha256()); }
         public synchronized ByteString read() throws IOException { if(released) throw new IOException("Referenced reader closed"); byte[] bytes=new byte[Math.toIntExact(reference.length())]; try(var channel=FileChannel.open(file(reference.sha256()),StandardOpenOption.READ)) { if(channel.size()!=reference.length()) throw new IOException("Referenced bytes changed"); var buffer=ByteBuffer.wrap(bytes); while(buffer.hasRemaining()) if(channel.read(buffer)<0) throw new EOFException("Referenced bytes shortened"); if(channel.size()!=reference.length()) throw new IOException("Referenced bytes changed"); } if(!MessageDigest.isEqual(hash(bytes),reference.sha256())) throw new IOException("Referenced bytes changed"); return ByteString.copyFrom(bytes); }
         public void close() throws IOException { synchronized(this) { if(released) return; released=true; } synchronized(RatisReferencedFiles.this) { String sha=HexFormat.of().formatHex(reference.sha256()); readers.compute(sha,(key,count) -> count==1 ? null : count-1); if(!readers.containsKey(sha)) readerBytes.remove(sha); } reclaim(); }
     }

@@ -13,6 +13,7 @@ public final class RangeImportAdmission {
         public OwnerReceipt {
             Objects.requireNonNull(groupId); Objects.requireNonNull(rangeId); Objects.requireNonNull(owner); Objects.requireNonNull(receipt); Objects.requireNonNull(completed);
             if(configurationVersion<0 || !groupId.equals(receipt.groupId()) || receipt.position().term()<1 || completed.term()<receipt.position().term() || completed.index()<receipt.position().index()) throw new IllegalArgumentException("Import evidence requires a completed configured cut covering the receipt");
+            receipt.requireCut(completed);
         }
     }
     private record OwnerKey(UUID group,UUID replica) {}

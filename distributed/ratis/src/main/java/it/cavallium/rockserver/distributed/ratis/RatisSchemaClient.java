@@ -27,6 +27,7 @@ public final class RatisSchemaClient implements AutoCloseable {
     private final RatisCatalogue catalogue;
     private final RatisSchemaCatalogue schemas;
     private final RatisSchemaAdministration administration;
+    private final RatisRangeImportCatalogue imports;
     private final RatisColumnAllocation allocation;
     private final RatisRoutedClient routed;
     private final RatisSchemaReplicaClient replicas;
@@ -61,6 +62,7 @@ public final class RatisSchemaClient implements AutoCloseable {
         catalogue=new RatisCatalogue(client,cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
         schemas=new RatisSchemaCatalogue(client,cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
         administration=new RatisSchemaAdministration(client,cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
+        imports=new RatisRangeImportCatalogue(client,cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
         allocation=new RatisColumnAllocation(client,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
         lockChannel=FileChannel.open(this.root.resolve("schema-client.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
         try { FileLock acquired; try { acquired=lockChannel.tryLock(); } catch(OverlappingFileLockException owned) { throw new IOException("Schema client root already owned",owned); } if (acquired==null) throw new IOException("Schema client root already owned"); lock=acquired; }
@@ -252,10 +254,10 @@ public final class RatisSchemaClient implements AutoCloseable {
             case DEFINITION -> {
                 if(!h.fields.containsKey("pendingCommand")) { var current=catalogue.read(domain); if(current==null || !Arrays.equals(current.payloadDigest(),sourceDirectory(h).payloadDigest())) { phase(h,Phase.CONFLICT); return; } }
                 if (!h.fields.containsKey("definition")) { h.fields.put("definition",new SchemaChange.Definition(h.id,new OperationId(h.id,0,h.number("sequence")+1),sourceDirectory(h),sourceSchema(h),DistributedSchemaCodec.decode(h.fields.get("targetSchema"))).encode()); save(h); }
-                success(h,command(h,() -> { var d=definition(h); return administration.prepareDefinition(next(h),d,administration.readHead(domain),administration.readColumnIdentity(column(h)),administration.readApiIdentity(h.number("api"))); },administration::execute),Phase.BEGIN);
+                success(h,command(h,() -> { var d=definition(h); return administration.prepareDefinition(next(h),d,administration.readHead(domain),administration.readColumnIdentity(column(h)),administration.readApiIdentity(h.number("api")),imports.readHead(domain)); },administration::execute),Phase.BEGIN);
             }
             case BEGIN -> {
-                var result=command(h,() -> administration.prepareBegin(definition(h),administration.readHead(domain),administration.readColumnIdentity(column(h)),administration.readApiIdentity(h.number("api"))),administration::execute);
+                var result=command(h,() -> administration.prepareBegin(definition(h),administration.readHead(domain),administration.readColumnIdentity(column(h)),administration.readApiIdentity(h.number("api")),imports.readHead(domain)),administration::execute);
                 h.number("sequence",definition(h).beginOperation().sequence()+1); success(h,result,merge(h) ? Phase.ARTIFACTS : Phase.CAPACITY);
             }
             case ARTIFACTS -> artifacts(h);
@@ -271,7 +273,7 @@ public final class RatisSchemaClient implements AutoCloseable {
             }
             case FENCE -> groupProof(h,false);
             case INSTALL -> groupProof(h,true);
-            case PUBLISH -> success(h,command(h,() -> administration.preparePublication(next(h),head(h),definition(h)),administration::execute),Phase.ACTIVATE);
+            case PUBLISH -> success(h,command(h,() -> administration.preparePublication(next(h),head(h),definition(h),imports.readHead(domain)),administration::execute),Phase.ACTIVATE);
             case ACTIVATE -> activate(h);
             case RETIRE -> success(h,command(h,() -> administration.prepareAdvance(next(h),head(h),head(h).status().retire()),administration::execute),Phase.CLEANUP);
             case CLEANUP -> cleanup(h);

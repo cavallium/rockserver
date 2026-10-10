@@ -112,6 +112,84 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private final ReplicatedRangeStore store;
     private final Consumer<DistributedCommand> commandValidator;
+    @FunctionalInterface public interface ImportPublicationAdmission { void validate(DistributedCommand command) throws IOException; }
+    private ImportPublicationAdmission importPublicationAdmission;
+    /** Trusted fresh owner checks for new publications only. Committed replay never invokes this callback. */
+    public void importPublicationAdmission(ImportPublicationAdmission admission) {
+        if(getLifeCycleState()!=LifeCycle.State.NEW || importPublicationAdmission!=null) throw new IllegalStateException("Import publication admission is fixed before initialization");
+        importPublicationAdmission=java.util.Objects.requireNonNull(admission);
+    }
+    private ProofQueryExecutor importPublicationQueries;
+    void importPublicationQueries(ProofQueryExecutor executor){
+        if(role!=RatisNodePlan.Role.CATALOGUE || getLifeCycleState()!=LifeCycle.State.NEW || importPublicationQueries!=null)throw new IllegalStateException("Import publication dispatcher is fixed before initialization");
+        importPublicationQueries=java.util.Objects.requireNonNull(executor);
+    }
+    private final HashMap<OperationId,ImportPublicationHold> importPublicationHolds=new HashMap<>();
+    private long importPublicationBytes;
+    private static final class ImportPublicationHold {
+        final DistributedCommand command;final byte[] digest;final long term,generation,configurationStamp;
+        final ProposalFootprints.GateLease lease;ApplyPosition cut;
+        boolean reading=true,qualified,submitted,invalidated,released;
+        ImportPublicationHold(DistributedCommand command,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease){this.command=command;this.digest=command.payloadDigest();this.term=term;this.generation=generation;this.configurationStamp=configurationStamp;this.lease=lease;}
+    }
+    record ImportPublicationStats(int holds,long bytes,int reading) {}
+    ImportPublicationStats importPublicationStats(){synchronized(admissions){return new ImportPublicationStats(importPublicationHolds.size(),importPublicationBytes,(int)importPublicationHolds.values().stream().filter(h->h.reading).count());}}
+    private void releaseImportPublication(ImportPublicationHold hold){
+        hold.released=true;
+        // An invalidated lookup still owns its gate and metadata until its actual finally exits.
+        if(hold.reading)return;
+        proposalFootprints.release(hold.lease);
+        if(importPublicationHolds.remove(hold.command.operationId(),hold))importPublicationBytes-=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;
+    }
+    private void requireImportPublication(ImportPublicationHold hold,DistributedCommand command,Leadership owner,long generation)throws IOException{
+        if(hold==null || importPublicationHolds.get(command.operationId())!=hold || !Arrays.equals(hold.digest,command.payloadDigest()) || hold.reading || !hold.qualified || hold.invalidated || hold.released
+                || !owner.ready() || hold.term!=owner.term() || hold.generation!=generation || generation!=admissionGeneration.get() || getLifeCycleState()!=LifeCycle.State.RUNNING
+                || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(hold.cut,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication lacks current prepared owner");
+    }
+    private void prepareImportPublication(DistributedCommand command)throws Exception{
+        if(role!=RatisNodePlan.Role.CATALOGUE || importPublicationAdmission==null || !RatisRangeImportCatalogue.requiresOwnerAdmission(command))throw new IOException("Fresh import publication admission is not configured");
+        checkCatalogueOwner();var owner=leadership();long generation=admissionGeneration.get();
+        if(!store.estimateReceiptRetention(command).newReceipt())return;
+        final ImportPublicationHold hold;
+        synchronized(admissions){
+            reconcileOlderProposalTerms(owner.term());
+            if(schemaConfigurationPending || generation!=admissionGeneration.get())throw new IOException("Import publication configuration/owner changed");
+            if(importPublicationHolds.containsKey(command.operationId()) || admissions.containsKey(command.operationId()))throw new IOException("Import operation already owns preparation/proposal");
+            if(importPublicationHolds.size()>=2 || RatisProofQueryService.IMPORT_PUBLICATION_BYTES>2*RatisProofQueryService.IMPORT_PUBLICATION_BYTES-importPublicationBytes)throw new IOException("Import publication metadata budget exhausted");
+            var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(store.commandAccessScope(command)),owner.term(),generation);
+            if(lease==null)throw new IOException("Import publication overlaps a reserved proposal");
+            hold=new ImportPublicationHold(command,owner.term(),generation,schemaConfigurationStamp,lease);importPublicationHolds.put(command.operationId(),hold);importPublicationBytes+=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;
+        }
+        boolean qualified=false;
+        try{
+            synchronized(admissions){if(!proposalFootprints.drained(hold.lease))throw new IOException("Import publication predecessors are still settling");}
+            // Ordered native witnesses and slow configured owner reads never run under admission/Raft monitors.
+            commandValidator.accept(command);store.validate(command);
+            var points=new ArrayList<ReplicatedRangeStore.PhysicalPoint>();for(var predicate:command.predicates())points.add(new ReplicatedRangeStore.PhysicalPoint(predicate.columnId(),predicate.key()));
+            ApplyPosition cut=null;int checked=0;
+            for(int offset=0;offset<points.size();offset+=4){var witnesses=store.readCurrentPoints(points.subList(offset,Math.min(offset+4,points.size())));if(cut!=null && !cut.equals(witnesses.position()))throw new IOException("Import publication witness cut advanced");cut=witnesses.position();var values=witnesses.values();for(var value:values)if(!Arrays.equals(value,command.predicates().get(checked++).expectedValue()))throw new IOException("Import publication current native witness changed");}
+            hold.cut=cut;importPublicationAdmission.validate(command);
+            var current=leadership();
+            synchronized(admissions){hold.reading=false;requireImportPublicationForQualification(hold,current);hold.qualified=true;qualified=true;}
+        }finally{synchronized(admissions){hold.reading=false;if(!qualified || hold.invalidated || hold.released)releaseImportPublication(hold);}}
+    }
+    private void requireImportPublicationForQualification(ImportPublicationHold hold,Leadership current)throws IOException{
+        if(importPublicationHolds.get(hold.command.operationId())!=hold || hold.invalidated || hold.released || !current.ready() || current.term()!=hold.term || hold.generation!=admissionGeneration.get()
+                || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp || hold.cut==null || hold.cut.term()!=current.term()
+                || !java.util.Objects.equals(hold.cut,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication preparation lost its cut/owner");
+    }
+    private void cancelImportPublication(DistributedCommand command){synchronized(admissions){var hold=importPublicationHolds.get(command.operationId());if(hold!=null && Arrays.equals(hold.digest,command.payloadDigest()) && !hold.submitted){hold.invalidated=true;releaseImportPublication(hold);}}}
+    private RatisRangeImportApply rangeImportApply;
+    private RatisRangeImportApply.PublicationReader rangeImportPublication;
+    public void rangeImportApply(RatisRangeImportApply adapter,RatisRangeImportApply.PublicationReader reader){
+        if(getLifeCycleState()!=LifeCycle.State.NEW || rangeImportApply!=null || role!=RatisNodePlan.Role.DATA)throw new IllegalStateException("Native import adapter is fixed before initialization");
+        java.util.Objects.requireNonNull(adapter).requireGroup(store.ownership().owner().groupId());adapter.requireGroup(initialGroup.getGroupId().getUuid());rangeImportApply=adapter;rangeImportPublication=java.util.Objects.requireNonNull(reader);
+    }
+    private void activateRecoveredOwner()throws IOException{
+        if(store.importPending()){if(rangeImportApply==null)throw new IOException("Unpublished native import lacks configured adapter");rangeImportApply.requireGroup(store.ownership().owner().groupId());store.fence();return;}
+        else store.activate();
+        validateRoleNativeState();
+    }
     private volatile Consumer<DistributedCommand> epochFloorAdmission;
     private RatisSessionEpochs sessionEpochs;
     private java.util.function.BiConsumer<SchemaChange.Definition,NativeSchemaActivationProof> schemaActivationObserver;
@@ -864,6 +942,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         HomeHold homeHold;
         long homeCreditCount,homeCreditBytes;
         SchemaHold fencingHold;
+        ImportPublicationHold importPublicationHold;
         boolean retentionReleased,maybeAppended,settled;
         int owners = 1;
         Admission(OperationId id, byte[] digest, int bytes, long term, long generation,
@@ -1088,8 +1167,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             recoveryDir = raftRoot.resolve("native-snapshot-recovery");
             snapshots.init(storage);
             recover(false);
-            store.activate(); validateRoleNativeState();
-            if (role==RatisNodePlan.Role.DATA) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+            activateRecoveredOwner();
+            if (role==RatisNodePlan.Role.DATA && !store.importPending()) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
             else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
             if (enableSessionControls) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
@@ -1422,8 +1501,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 deferred.headMap(a.index(), true).clear();
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear(); schemaConfigurationPending=!configurations.isEmpty();
-                store.activate(); validateRoleNativeState();
-                if (role==RatisNodePlan.Role.DATA) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                activateRecoveredOwner();
+                if (role==RatisNodePlan.Role.DATA && !store.importPending()) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
                 else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
                 if (enableSessionControls) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
@@ -1503,7 +1582,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (RatisParticipantRecord.isParticipant(encoded)) return RatisParticipantRecord.isFinalization(encoded) ? startFinalization(transaction,encoded,generation,leadership) : startParticipant(transaction,encoded,generation,leadership);
             var command = DistributedCommandCodec.decode(encoded);
             if (command.transactionRejection()) throw new IllegalArgumentException("Internal rejection records cannot be submitted by clients");
-            commandValidator.accept(command);
+            // Fresh publication metadata/owner reads belong to the independently bounded preparation lane.
+            if(!RatisRangeImportCatalogue.requiresOwnerAdmission(command))commandValidator.accept(command);
             store.validate(command);
             byte[] digest = command.payloadDigest();
             boolean fencing=role==RatisNodePlan.Role.CATALOGUE && RatisSchemaAdministration.isFencing(command);
@@ -1541,6 +1621,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     var known=admissions.get(command.operationId());
                     if (known!=null && !estimate.newReceipt()) settleAdmission(known);
                     var admission = admissions.get(command.operationId());
+                    var importOwner=estimate.newReceipt() && RatisRangeImportCatalogue.requiresOwnerAdmission(command) ? importPublicationHolds.get(command.operationId()) : null;
+                    if(estimate.newReceipt() && RatisRangeImportCatalogue.requiresOwnerAdmission(command))requireImportPublication(importOwner,command,leadership,generation);
                     var fencingOwner=fencing && estimate.newReceipt() ? schemaHold : null;
                     if (fencing && estimate.newReceipt()) requireFencingOwner(fencingOwner,command,leadership,generation);
                     if (admission != null) {
@@ -1581,11 +1663,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                                 || !retentionFits(estimate.usage().retainedBytes(),reservedReceiptBytes,estimate.additionalBytes(),byteLimit)) {
                             throw new IllegalStateException("Retained receipt budget exhausted; acknowledge outcomes or expire epochs");
                         }
-                        var lease=fencingOwner==null && !reject && accepted==null && estimate.newReceipt() && !footprint.isEmpty() ? proposalFootprints.registerOrdinary(footprint,leadership.term(),generation) : null;
-                        if (fencingOwner==null && !reject && accepted==null && estimate.newReceipt() && !footprint.isEmpty() && lease==null) throw new IllegalStateException("Proposal overlaps a reserved transaction scope");
+                        var lease=importOwner==null && fencingOwner==null && !reject && accepted==null && estimate.newReceipt() && !footprint.isEmpty() ? proposalFootprints.registerOrdinary(footprint,leadership.term(),generation) : null;
+                        if (importOwner==null && fencingOwner==null && !reject && accepted==null && estimate.newReceipt() && !footprint.isEmpty() && lease==null) throw new IllegalStateException("Proposal overlaps a reserved transaction scope");
                         try {
                             admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation,
                                     estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl,lease,accepted==null ? null : accepted.reservation.lease,reject ? rejectionData : null);
+                            admission.importPublicationHold=importOwner;if(importOwner!=null)importOwner.submitted=true;
                             admission.fencingHold=fencingOwner;
                             if (fencingOwner!=null) fencingOwner.submitted=true;
                             if (homeCredit!=null) { admission.homeCreditCount=homeCredit.additionalCount(); admission.homeCreditBytes=homeCredit.additionalBytes(); }
@@ -1873,6 +1956,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         || nativePosition == null || nativePosition.term() != current.term() || !store.admissionOpen()) {
                     throw new IOException("Admission lost its completed current-term owner before append");
                 }
+                if(admission.importPublicationHold!=null && !admission.settled)requireImportPublication(admission.importPublicationHold,admission.importPublicationHold.command,current,admissionGeneration.get());
                 if (admission.fencingHold!=null && !admission.settled) requireFencingOwner(admission.fencingHold,(DistributedCommand)admission.fencingHold.record,current,admissionGeneration.get());
                 if (admission.snapshotHold!=null && admission.snapshotHold.install && admission.snapshotHold.lease!=null
                         && admission.snapshotHold.lease.active() && !proposalFootprints.drained(admission.snapshotHold.lease)) throw new IOException("Snapshot gate predecessors are still settling");
@@ -2208,6 +2292,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (admission.participantHold!=null) finishParticipantHold(admission.participantHold,true);
     }
     private void releaseFootprint(Admission admission) {
+        if(admission.importPublicationHold!=null)releaseImportPublication(admission.importPublicationHold);
         if (admission.fencingHold!=null) releaseSchemaHold(admission.fencingHold);
         if (admission.homeHold!=null) releaseHomeHold(admission.homeHold);
         if (admission.snapshotHold!=null) releaseSnapshotHold(admission.snapshotHold);
@@ -2242,6 +2327,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private record NativeAdmissionProof(List<Admission> settled,List<Admission> terminalScopes) {}
     private void invalidateProposalCandidates() { synchronized (admissions) { invalidateUnsubmitted(); } }
     private void invalidateUnsubmitted() {
+        for(var hold:List.copyOf(importPublicationHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseImportPublication(hold);}
         if (schemaHold!=null) { schemaHold.invalidated=true; if (!schemaHold.submitted) releaseSchemaHold(schemaHold); }
         snapshotHelpers.clear();
         for (var hold:preparedSnapshotHomeRetirements.values()) { snapshotHomeRetirementSlots--; snapshotHomeRetirementInputBytes-=hold.bytes; proposalFootprints.release(hold.scope); }
@@ -2271,6 +2357,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void reconcileOlderProposalTerms(long term) {
         if (term<=reconciledProposalTerm) return;
         invalidateUnsubmitted();
+        for(var hold:List.copyOf(importPublicationHolds.values()))if(hold.term<term)releaseImportPublication(hold);
         if (schemaHold!=null && schemaHold.term<term) releaseSchemaHold(schemaHold);
         for (var admission:List.copyOf(admissions.values())) if (admission.term<term) settleAdmission(admission);
         reconciledProposalTerm=term;
@@ -3166,6 +3253,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (previous==null) {
                     schemaConfigurationStamp++; schemaConfigurationPending=true;
+                    for(var hold:List.copyOf(importPublicationHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseImportPublication(hold);}
                     if (schemaHold!=null) { schemaHold.invalidated=true; if (!schemaHold.submitted) releaseSchemaHold(schemaHold); }
                 }
             }
@@ -3236,6 +3324,25 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                 return dispatcher.submit(store.ownership().owner().groupId(),kind,packet.body()).thenApply(payload ->
                         Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,payload))));
+            }
+            if(kind==RatisRangeImportAuthority.KIND){
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Import authority requires configured fresh catalogue dispatcher");
+                checkCatalogueOwner();long generation=admissionGeneration.get();var owner=leadership();final long configurationStamp;
+                synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Import authority waits for configuration apply");configurationStamp=schemaConfigurationStamp;}
+                return schemaAuthorityQueries.submit(store.ownership().owner().groupId(),encoded,4L*RatisRangeImportAuthority.MAX_REPLY_BYTES,false,owned->{
+                    checkCatalogueOwner();if(generation!=admissionGeneration.get() || leadership().term()!=owner.term())throw new IOException("Import authority lost read-barrier owner");
+                    var view=RatisRangeImportAuthority.readNative(store,schemaColumn,schemaCluster,schemaDatabase,RatisRangeImportAuthority.decodeRequest(owned));
+                    checkCatalogueOwner();var current=leadership();
+                    synchronized(admissions){if(generation!=admissionGeneration.get() || current.term()!=owner.term() || view.publication().completedCatalogueCut().term()!=current.term()
+                            || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(view.publication().completedCatalogueCut(),store.applied()))throw new IOException("Import authority cut/configuration changed");}
+                    return Message.valueOf(ByteString.copyFrom(RatisRangeImportAuthority.reply(view)));
+                });
+            }
+            if(ScopedTransactionRpc.importPublication(kind)){
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE)throw new IOException("Import publication requires a fresh catalogue barrier");
+                if(kind==ScopedTransactionRpc.IMPORT_PUBLICATION_CANCEL){var command=RatisImportPublicationRpc.request(encoded);cancelImportPublication(command);return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(RatisImportPublicationRpc.preparedReply(kind,command))));}
+                var executor=importPublicationQueries;if(executor==null)throw new IOException("Bounded import publication dispatcher is not configured");long generation=admissionGeneration.get();
+                return executor.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.IMPORT_PUBLICATION_BYTES,false,owned->{if(generation!=admissionGeneration.get())throw new IOException("Import publication lost read-barrier owner");var command=RatisImportPublicationRpc.request(owned);prepareImportPublication(command);return Message.valueOf(ByteString.copyFrom(RatisImportPublicationRpc.preparedReply(kind,command)));});
             }
             if (kind==ScopedTransactionRpc.SNAPSHOT_HELP) return snapshotHelpQuery(encoded,freshBarrier);
             if (kind==ScopedTransactionRpc.SCHEMA_FENCING_PREPARE || kind==ScopedTransactionRpc.SCHEMA_FENCE_PREPARE || kind==ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE || kind==ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {

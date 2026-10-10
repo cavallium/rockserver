@@ -46,6 +46,8 @@ public final class RatisNodePlan {
     private final Map<UUID,String> columns;
     private final Set<UUID> merges;
     private final List<Home> homes;
+    private final List<RangeImportDefinition> imports;
+    private final Map<UUID,RangeImportDefinition> groupImports;
     private final Map<UUID,Role> roles;
     private final Map<UUID,Home> groupHomes;
     private final String peerId,address;
@@ -58,9 +60,24 @@ public final class RatisNodePlan {
     }
     public RatisNodePlan(UUID nodeId,UUID nodeIncarnation,RangeDirectory directory,Catalogue catalogue,
             Map<UUID,String> columns,Set<UUID> merges,List<Home> homes,int maxLocalGroups) {
+        this(nodeId,nodeIncarnation,directory,catalogue,columns,merges,homes,List.of(),maxLocalGroups);
+    }
+    public RatisNodePlan(UUID nodeId,UUID nodeIncarnation,RangeDirectory directory,Catalogue catalogue,
+            Map<UUID,String> columns,Set<UUID> merges,List<Home> homes,Collection<RangeImportDefinition> imports,int maxLocalGroups) {
         this.nodeId=Objects.requireNonNull(nodeId); this.nodeIncarnation=Objects.requireNonNull(nodeIncarnation);
         this.directory=Objects.requireNonNull(directory); this.catalogue=Objects.requireNonNull(catalogue);
         this.columns=Map.copyOf(columns); this.merges=Set.copyOf(merges); this.homes=homes.stream().sorted(Comparator.comparing(Home::role)).toList();
+        var imported=new HashMap<UUID,RangeImportDefinition>(); var jobs=new HashSet<UUID>(); long importBytes=0;
+        this.imports=imports.stream().sorted(Comparator.comparing(RangeImportDefinition::importId,UUID_ORDER)).toList();
+        if(this.imports.size()>RangeImportDefinition.MAX_GROUPS) throw new IllegalArgumentException("Node import definition count exceeds bound");
+        for(var definition:this.imports) {
+            importBytes+=definition.encode().length;
+            if(importBytes>RangeImportDefinition.MAX_BYTES || !jobs.add(definition.importId()) || !Arrays.equals(directory.payloadDigest(),definition.sourceDirectory().payloadDigest())) throw new IllegalArgumentException("Node import definition differs from exact frozen placement or exceeds budget");
+            for(var manifest:definition.manifests()) {
+                if(!manifest.physicalNames().equals(this.columns) || !manifest.mergeColumns().equals(this.merges) || imported.put(manifest.groupId(),definition)!=null) throw new IllegalArgumentException("Node import physical bindings/target ownership differ");
+            }
+        }
+        groupImports=Map.copyOf(imported);
         int homeGroups=0; long homeBytes=0; var homeRoles=EnumSet.noneOf(Role.class); var domains=new HashSet<>(Set.of(directory.domainId())); domains.add(catalogue.groupId());
         var columnIds=new HashSet<>(directory.columns());
         if (!columnIds.add(catalogue.directoryColumn()) || !columnIds.add(catalogue.sessionsColumn())) throw new IllegalArgumentException("Metadata/data column identities overlap");
@@ -77,7 +94,7 @@ public final class RatisNodePlan {
         var groups=new TreeMap<UUID,RaftGroup>(UUID_ORDER); var roles=new HashMap<UUID,Role>(); var groupHomes=new HashMap<UUID,Home>();
         roles.put(catalogue.groupId(),Role.CATALOGUE); inspect(catalogue.groupId(),catalogue.replicas(),nodes,peers,endpoints,groups);
         for (var range:directory.ranges()) {
-            if (range.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || roles.putIfAbsent(range.groupId(),Role.DATA)!=null) throw new IllegalArgumentException("Static node join requires distinct active data groups");
+            if (range.topologyState()!=RangeDescriptor.TopologyState.ACTIVE && (range.topologyState()!=RangeDescriptor.TopologyState.FENCED || !groupImports.containsKey(range.groupId())) || roles.putIfAbsent(range.groupId(),Role.DATA)!=null) throw new IllegalArgumentException("Static node join requires active or exactly qualified import data groups");
             inspect(range.groupId(),range.replicas(),nodes,peers,endpoints,groups);
         }
         for (var home:this.homes) for (var range:home.directory().ranges()) {
@@ -120,6 +137,8 @@ public final class RatisNodePlan {
     public Map<UUID,String> columns() { return columns; }
     public Set<UUID> merges() { return merges; }
     public List<Home> homes() { return homes; }
+    public List<RangeImportDefinition> imports() { return imports; }
+    public RangeImportDefinition importDefinition(UUID group) { role(group); return groupImports.get(group); }
     public Role role(UUID group) { var role=roles.get(group); if (role==null) throw new IllegalArgumentException("Unplanned Raft group"); return role; }
     public Home home(UUID group) { role(group); return groupHomes.get(group); }
     public Home home(Role role) { return homes.stream().filter(home -> home.role()==role).findFirst().orElse(null); }
@@ -150,6 +169,7 @@ public final class RatisNodePlan {
                 output.writeByte(home.role().ordinal()); byte[] placement=RangeDirectoryCodec.encode(home.directory()); output.writeInt(placement.length); output.write(placement);
                 uuid(output,home.column()); byte[] name=home.physicalName().getBytes(StandardCharsets.US_ASCII); output.writeInt(name.length); output.write(name);
             }
+            output.writeInt(imports.size()); for(var definition:imports) output.write(definition.digest());
             output.writeInt(localGroups.size());
             for (var group:localGroups) {
                 UUID id=group.getGroupId().getUuid(); uuid(output,id); output.writeByte(role(id).ordinal());

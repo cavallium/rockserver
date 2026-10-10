@@ -63,9 +63,10 @@ public final class RatisNodeManifest {
         Objects.requireNonNull(manifest);
         byte[] schema=DistributedSchemaCodec.encode(manifest.schema), directory=RangeDirectoryCodec.encode(manifest.plan.directory());
         byte[] catalogue=RangeDirectoryCodec.encode(synthetic(manifest.plan));
-        long size=4L+12+schema.length+directory.length+catalogue.length+72+4+SETTINGS_BYTES;
+        long size=4L+12+schema.length+directory.length+catalogue.length+72+8+SETTINGS_BYTES;
         for (var home:manifest.plan.homes()) size+=25L+RangeDirectoryCodec.encode(home.directory()).length+text(home.physicalName()).length;
         for (var name:manifest.plan.columns().values()) size+=20L+text(name).length;
+        for(var definition:manifest.plan.imports()) size+=4L+definition.encode().length;
         if (size>MAX_BYTES-32) throw new IllegalArgumentException("Node manifest exceeds byte budget");
         var output=ByteBuffer.allocate((int)size).putInt(MAGIC);
         blob(output,schema); blob(output,directory); blob(output,catalogue);
@@ -79,6 +80,7 @@ public final class RatisNodeManifest {
         for (var home:manifest.plan.homes()) {
             output.put((byte)home.role().ordinal()); blob(output,RangeDirectoryCodec.encode(home.directory())); uuid(output,home.column()); blob(output,text(home.physicalName()));
         }
+        output.putInt(manifest.plan.imports().size()); for(var definition:manifest.plan.imports()) blob(output,definition.encode());
         var settings=manifest.settings; var images=settings.images(); var retention=settings.retention();
         output.putInt(images.maxRowBytes()).putLong(images.maxImageBytes()).putInt(images.maxColumns());
         output.putLong(retention.dataCount()).putLong(retention.dataBytes()).putLong(retention.maintenanceCount()).putLong(retention.maintenanceBytes());
@@ -123,6 +125,16 @@ public final class RatisNodeManifest {
             var homeDirectory=RangeDirectoryCodec.decode(encoded); require(input,16); UUID column=uuid(input); String name=text(input);
             homes.add(new RatisNodePlan.Home(RatisNodePlan.Role.values()[role],homeDirectory,column,name));
         }
+        require(input,4+SETTINGS_BYTES); int importCount=input.getInt();
+        if(importCount<0 || importCount>RangeImportDefinition.MAX_GROUPS || 4L*importCount>input.remaining()-SETTINGS_BYTES) throw new IllegalArgumentException("Invalid node import count");
+        var imports=new ArrayList<RangeImportDefinition>(importCount); UUID previousImport=null; long importBytes=0;
+        for(int i=0;i<importCount;i++) {
+            byte[] encoded=blob(input,RangeImportDefinition.MAX_BYTES); importBytes+=encoded.length;
+            if(importBytes>RangeImportDefinition.MAX_BYTES) throw new IllegalArgumentException("Node import definitions exceed byte bound");
+            var definition=RangeImportDefinition.decode(encoded);
+            if(previousImport!=null && UUID_ORDER.compare(previousImport,definition.importId())>=0) throw new IllegalArgumentException("Noncanonical node import order");
+            previousImport=definition.importId(); imports.add(definition);
+        }
         require(input,SETTINGS_BYTES);
         var images=new NativeRangeImage.Limits(input.getInt(),input.getLong(),input.getInt());
         final RatisRangeStateMachine.RetentionLimits retention;
@@ -137,7 +149,7 @@ public final class RatisNodeManifest {
         if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
         var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io));
         var recovered=catalogue(catalogue,directory,directoryColumn,sessionsColumn);
-        var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,mergeColumns(schema),homes,groups);
+        var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,mergeColumns(schema),homes,imports,groups);
         if (plan.localGroups().size()!=groups) throw new IllegalArgumentException("Manifest group budget is not canonical");
         var manifest=new RatisNodeManifest(schema,plan,settings,reads,writes,replicaLimits);
         if (!Arrays.equals(bytes,encode(manifest))) throw new IllegalArgumentException("Noncanonical node manifest encoding");

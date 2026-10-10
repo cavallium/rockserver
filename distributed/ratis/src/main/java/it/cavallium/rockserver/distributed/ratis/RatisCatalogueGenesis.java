@@ -73,7 +73,7 @@ public final class RatisCatalogueGenesis implements AutoCloseable {
         byte[] ledger=SessionEpochLedger.initial(d.clusterId(),d.databaseId(),initialTime).encode();
         var prepared=new DistributedCommand(c.groupId(),c.epoch(),c.schemaDigest(),new OperationId(session,0,0),
                 List.of(new Mutation(Mutation.Kind.PUT,c.directoryColumn(),uuid(d.domainId()),directory),new Mutation(Mutation.Kind.PUT,c.sessionsColumn(),uuid(d.databaseId()),ledger)),
-                List.of(new KeyPredicate(c.directoryColumn(),uuid(d.domainId()),null),new KeyPredicate(c.sessionsColumn(),uuid(d.databaseId()),null)));
+                List.of(new KeyPredicate(c.directoryColumn(),uuid(d.domainId()),null),new KeyPredicate(c.sessionsColumn(),uuid(d.databaseId()),null),new KeyPredicate(c.directoryColumn(),RatisSchemaAdministration.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisRangeImportCatalogue.headKey(d.domainId()),null)));
         validator.accept(prepared); return prepared;
     }
     private void persist(CommandResult outcome) throws IOException {

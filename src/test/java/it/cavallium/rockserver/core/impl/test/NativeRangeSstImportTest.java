@@ -38,7 +38,7 @@ class NativeRangeSstImportTest {
         try(var pool=open(db)) {
             var store=pool.openNewFencedRange(manifest,schema); assertTrue(store.importPending()); assertArrayEquals(receipt.encode(),store.importReceipt().encode());
             assertThrows(IllegalStateException.class,()->store.installSnapshot(source,new NativeRangeImage.Limits(1024,1024*1024,256)));
-            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new ApplyPosition(2,2)));
+            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new byte[32],new ApplyPosition(2,2)));
             try(var pin=store.capture()) { assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{2})); assertArrayEquals(new byte[]{8},pin.get(column,new byte[]{3})); assertNull(pin.get(column,new byte[]{4})); }
             Path image=root.resolve("activated.image"); var limits=new NativeRangeImage.Limits(3*1024*1024,32L*1024*1024,256); NativeRangeImage.write(image,store,limits); NativeRangeImage.inspect(image,limits);
             store.fence(); store.installSnapshot(image,limits); store.activate(); try(var pin=store.capture()) { assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{2})); }
@@ -60,7 +60,7 @@ class NativeRangeSstImportTest {
         Files.delete(source);
         try(var pool=open(db)) {
             var store=pool.openNewFencedRange(manifest,schema); assertTrue(store.importPending()); var receipt=pool.importSst(store,manifest,Map.of(),new ApplyPosition(1,1));
-            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new ApplyPosition(2,2)));
+            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new byte[32],new ApplyPosition(2,2)));
             try(var pin=store.capture()) { assertArrayEquals(new byte[]{7},pin.get(column,new byte[]{2})); }
             var configuration=store.configuration(); assertNotNull(configuration); assertArrayEquals(new byte[]{4,5},configuration.data());
             var neighbour=pool.openRange(new RangeOwnership.Owner(neighbourId,1),new RangeOwnership.Interval(domain,schema.columnIds(),new byte[]{5},null),schema.digest(),Map.of(column,"data"),Set.of()); neighbour.enableLogicalSchema(schema); try(var pin=neighbour.capture()) { assertArrayEquals(new byte[]{9},pin.get(column,new byte[]{6})); }
@@ -122,7 +122,7 @@ class NativeRangeSstImportTest {
         var limits=new NativeRangeImage.Limits(3*1024*1024,32L*1024*1024,256);
         try(var pool=open(db)) {
             var store=pool.openNewFencedRange(manifest,sourceSchema); receipt=pool.importSst(store,manifest,Map.of(file.fileId(),original),new ApplyPosition(1,0));
-            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new ApplyPosition(1,1)));
+            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new byte[32],new ApplyPosition(1,1)));
             store.applySchemaFence(new ApplyPosition(1,2),deletion.header()); var installed=pool.installSchema(store,new ApplyPosition(1,3),deletion,Map.of(),Set.of()); store.applySchemaActivation(new ApplyPosition(1,4),installed.proof(),UUID.randomUUID(),new ApplyPosition(2,20));
             assertArrayEquals(receipt.encode(),pool.importSst(store,manifest,Map.of(),new ApplyPosition(1,5)).encode());
             assertEquals(Set.of(),NativeRangeImage.write(image,store,limits).interval().columns()); NativeRangeImage.inspect(image,limits);
@@ -172,8 +172,8 @@ class NativeRangeSstImportTest {
         try(var pool=open(receiptDb)) { assertThrows(IllegalArgumentException.class,()->pool.openNewFencedRange(manifest,schema)); }
         try(var pool=open(activationDb)) {
             var store=pool.openNewFencedRange(manifest,schema); var receipt=pool.importSst(store,manifest,Map.of(file.fileId(),original),new ApplyPosition(1,0)); var catalogue=UUID.randomUUID();
-            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,catalogue,new ApplyPosition(2,10),new ApplyPosition(2,1)));
-            var conflict=new NativeRangeSstImport.Activation(receipt,catalogue,new ApplyPosition(2,10),new ApplyPosition(1,1)); assertThrows(IllegalArgumentException.class,()->conflict.requireCut(store.applied())); replaceMetadata(pool,0x43,conflict.encode());
+            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,catalogue,new ApplyPosition(2,10),new byte[32],new ApplyPosition(2,1)));
+            var conflict=new NativeRangeSstImport.Activation(receipt,catalogue,new ApplyPosition(2,10),new byte[32],new ApplyPosition(1,1)); assertThrows(IllegalArgumentException.class,()->conflict.requireCut(store.applied())); replaceMetadata(pool,0x43,conflict.encode());
             assertThrows(IOException.class,()->NativeRangeImage.write(root.resolve("conflicting.image"),store,new NativeRangeImage.Limits(3*1024*1024,32L*1024*1024,256)));
         }
         try(var pool=open(activationDb)) { assertThrows(IllegalArgumentException.class,()->pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(domain,schema.columnIds(),manifest.lowerInclusive(),manifest.upperExclusive()),schema.digest(),manifest.physicalNames(),Set.of())); }
@@ -181,7 +181,7 @@ class NativeRangeSstImportTest {
     @Test void closedStoreCannotBeActivatedOrBecomeServingAgain() throws Exception {
         var schema=schema(); Path db=root.resolve("closed-import"),original=root.resolve("closed-import.sst"); var file=file(original,false); var manifest=manifest(schema,file);
         try(var pool=open(db)) {
-            var store=pool.openNewFencedRange(manifest,schema); var receipt=pool.importSst(store,manifest,Map.of(file.fileId(),original),new ApplyPosition(1,0)); var authority=new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new ApplyPosition(1,1));
+            var store=pool.openNewFencedRange(manifest,schema); var receipt=pool.importSst(store,manifest,Map.of(file.fileId(),original),new ApplyPosition(1,0)); var authority=new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new byte[32],new ApplyPosition(1,1));
             assertTrue(store.close(java.time.Duration.ofSeconds(1))); assertThrows(IllegalStateException.class,()->pool.activateImport(store,authority)); assertEquals(RangeOwnership.State.FENCED,store.ownership().state()); assertTrue(store.importPending()); assertEquals(new ApplyPosition(1,0),store.applied());
         }
         try(var pool=open(db)) { var store=pool.openNewFencedRange(manifest,schema); assertTrue(store.importPending()); assertThrows(IllegalStateException.class,store::capture); }

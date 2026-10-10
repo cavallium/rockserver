@@ -13,11 +13,16 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     public record Stats(int jobs,long bytes,int threads) {}
     private record Key(UUID group,String digest) {}
     private final ThreadPoolExecutor executor;
+    private final int maximumJobs;private final long maximumBytes;
     public RatisProofQueryService() { this(THREADS,"ratis-proof-query-"); }
     /** Independent bounded catalogue reads, so DATA proof dependencies never compete for their own response budget. */
     public static RatisProofQueryService authorityLane() { return new RatisProofQueryService(1,"ratis-schema-authority-"); }
-    private RatisProofQueryService(int threads,String name) {
-        executor=new ThreadPoolExecutor(threads,threads,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(MAX_JOBS),
+    public static final long IMPORT_PUBLICATION_BYTES=64L*1024*1024;
+    public static RatisProofQueryService importPublicationLane(){return new RatisProofQueryService(1,"ratis-import-publication-",2,2*IMPORT_PUBLICATION_BYTES);}
+    private RatisProofQueryService(int threads,String name) {this(threads,name,MAX_JOBS,MAX_BYTES);}
+    private RatisProofQueryService(int threads,String name,int maximumJobs,long maximumBytes) {
+        this.maximumJobs=maximumJobs;this.maximumBytes=maximumBytes;
+        executor=new ThreadPoolExecutor(threads,threads,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(maximumJobs),
                 Thread.ofPlatform().daemon(true).name(name,0).factory(),new ThreadPoolExecutor.AbortPolicy());
     }
     private final Map<Key,Task> tasks=new HashMap<>();
@@ -31,7 +36,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     @Override public CompletableFuture<Message> submit(UUID group,byte[] encoded,long estimatedBytes,boolean coalesce,RatisRangeStateMachine.ProofQueryAction action) {
         Objects.requireNonNull(group); Objects.requireNonNull(encoded); Objects.requireNonNull(action);
         long weight=Math.max(encoded.length,estimatedBytes);
-        if (estimatedBytes<0 || weight>MAX_BYTES) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query estimated ownership exceeds byte bound"));
+        if (estimatedBytes<0 || weight>maximumBytes) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query estimated ownership exceeds byte bound"));
         final Key key;
         try { key=new Key(group,HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(encoded))); }
         catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
@@ -45,7 +50,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
                 if (existing.waiters>=MAX_WAITERS) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query waiter capacity exhausted"));
                 existing.waiters++; return existing.result.copy();
             }
-            if (tasks.size()>=MAX_JOBS || weight>MAX_BYTES-bytes) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query capacity exhausted"));
+            if (tasks.size()>=maximumJobs || weight>maximumBytes-bytes) return CompletableFuture.failedFuture(new RejectedExecutionException("Proof query capacity exhausted"));
             task=new Task(key,encoded.clone(),weight,action); tasks.put(key,task); bytes+=task.weight;
         }
         try { executor.execute(task); } catch (RuntimeException rejected) { task.reject(rejected); }

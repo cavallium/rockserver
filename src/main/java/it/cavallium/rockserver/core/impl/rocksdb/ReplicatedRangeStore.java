@@ -307,6 +307,7 @@ public final class ReplicatedRangeStore {
     private volatile NativeRangeSstImport.Activation importActivation;
     public boolean importPending() { return importBirth!=null && importActivation==null; }
     public NativeSstImportManifest.Receipt importReceipt() { return importReceipt; }
+    public NativeRangeSstImport.Activation importActivation() throws RocksDBException { return readSchemaMetadata(() -> { recoverImportMetadata(); return importActivation; }); }
     private byte[] importKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
     private void recoverImportMetadata() throws RocksDBException {
         byte[] birth=db.get(state,importKey(0x40)),intent=db.get(state,importKey(0x41)),receipt=db.get(state,importKey(0x42)),activation=db.get(state,importKey(0x43));

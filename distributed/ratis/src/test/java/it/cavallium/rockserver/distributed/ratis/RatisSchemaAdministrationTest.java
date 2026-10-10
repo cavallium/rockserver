@@ -263,6 +263,28 @@ class RatisSchemaAdministrationTest {
             assertArrayEquals(manifest.digest(),admin.readHead(source.domainId()).status().admissionDigest()); assertArrayEquals(published,DistributedCommandCodec.encode(publication));
         }
     }
+    @Test void schemaBeginAndImportPreparationRaceThroughOrderedNativeGuards() throws Exception {
+        for(boolean schemaWins:List.of(true,false)) try(var f=outer.new Fixture(root.resolve("import-race-"+schemaWins))) {
+            var client=client(f); var admin=admin(client); var catalogue=catalogue(client); var source=initial(); var active=directory(source,0);
+            var columns=new ArrayList<>(source.columns()); columns.add(column(8,new UUID(78,1),"added")); var target=next(source,columns);
+            var schemaChange=new SchemaChange.Definition(new UUID(78,2),operation(),active,source,target);
+            publishSchema(f,source); catalogue.execute(catalogue.prepare(operation(),null,active)); publishSchema(f,target); admin.execute(admin.prepareDefinition(operation(),schemaChange,null,null,null));
+            var schemaBegin=admin.prepareBegin(schemaChange,null,null,null); assertEquals(5,schemaBegin.predicates().size());
+            var ranges=active.ranges().stream().map(r -> new RangeDescriptor(r.rangeId(),r.groupId(),r.rangeEpoch(),r.configurationVersion(),r.lowerInclusive(),r.upperExclusive(),RangeDescriptor.TopologyState.FENCED,r.replicas())).toList();
+            var fenced=new RangeDirectory(active.clusterId(),active.databaseId(),active.domainId(),active.schemaEpoch(),active.schemaDigest(),active.generation()+1,active.columns(),active.routingPrefixBytes(),ranges); var fence=catalogue.prepare(operation(),active,fenced);
+            UUID importId=new UUID(78,3); var manifests=new ArrayList<NativeSstImportManifest>();
+            for(var range:fenced.ranges()) manifests.add(new NativeSstImportManifest(importId,range.groupId(),range.rangeEpoch(),fenced.domainId(),fenced.schemaDigest(),range.lowerInclusive(),range.upperExclusive(),List.of(new NativeSstImportManifest.Column(source.columns().getFirst().columnId(),"data",false,List.of()))));
+            var importDefinition=new RangeImportDefinition(importId,operation(),fenced,manifests); var imports=new RatisRangeImportCatalogue(client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
+            for(int index=0;index<RatisRangeImportCatalogue.definitionArtifact(importDefinition).chunks();index++) imports.execute(imports.prepareDefinitionChunk(operation(),importDefinition,index)); imports.execute(imports.prepareDefinitionCommit(operation(),importDefinition));
+            var importBegin=imports.prepareBegin(operation(),importDefinition,null,null);
+            if(schemaWins) {
+                assertEquals(CommandResult.Status.SUCCESS,admin.execute(schemaBegin).status()); assertEquals(CommandResult.Status.CONFLICT,catalogue.execute(fence).status()); assertEquals(CommandResult.Status.CONFLICT,imports.execute(importBegin).status()); assertNull(imports.readHead(source.domainId()));
+            } else {
+                assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(fence).status()); assertEquals(CommandResult.Status.SUCCESS,imports.execute(importBegin).status()); assertEquals(CommandResult.Status.CONFLICT,admin.execute(schemaBegin).status()); assertNull(admin.readHead(source.domainId()));
+                var importHead=imports.readHead(source.domainId()); assertThrows(IllegalArgumentException.class,() -> admin.prepareBegin(schemaChange,null,null,null,importHead));
+            }
+        }
+    }
     @Test void nearMaximumDefinitionPublishesAndBeginsWithoutDuplicatedImmutablePayloads() throws Exception {
         try (var f=outer.new Fixture(root)) {
             f.store.enableCatalogueScopeCompaction(); var client=client(f); var admin=admin(client); var columns=new ArrayList<DistributedSchema.Column>();
@@ -272,7 +294,7 @@ class RatisSchemaAdministrationTest {
             var definition=new SchemaChange.Definition(new UUID(40,0),operation(),original,source,target); assertTrue(definition.encode().length>1900*1024);
             publishSchema(f,source); catalogue(client).execute(catalogue(client).prepare(operation(),null,original)); publishSchema(f,target);
             var publish=admin.prepareDefinition(operation(),definition,null,null,null); assertTrue(DistributedCommandCodec.encode(publish).length<=DistributedCommandCodec.MAX_ENCODED_BYTES); admin.execute(publish);
-            var begin=admin.prepareBegin(definition,null,null,null); assertEquals(4,begin.predicates().size()); assertTrue(DistributedCommandCodec.encode(begin).length<16*1024);
+            var begin=admin.prepareBegin(definition,null,null,null); assertEquals(5,begin.predicates().size()); assertTrue(DistributedCommandCodec.encode(begin).length<16*1024);
             assertEquals(CommandResult.Status.SUCCESS,admin.execute(begin).status()); var prepared=admin.readHead(source.domainId()); var manifest=admissions(definition);
             admin.execute(admin.prepareAdmissions(operation(),prepared,definition,manifest)); assertEquals(CommandResult.Status.SUCCESS,admin.executeFencing(admin.prepareFencing(operation(),prepared,definition,manifest)).status());
         }

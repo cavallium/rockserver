@@ -35,9 +35,10 @@ class RatisRangeImportCatalogueTest {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest();
         final RatisSessionEpochsTest.Fixture nativeCatalogue=outer.new Fixture(root);
         final RatisRangeImportCatalogue.ImmutableReader immutable=key -> { try { return nativeCatalogue.store.readCurrentPoint(outer.directoryColumn,key); } catch(Exception failure) { throw new IllegalStateException(failure); } };
-        final java.util.function.Consumer<DistributedCommand> pure=RatisRangeImportCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,immutable);
+        final java.util.function.Consumer<DistributedCommand> pure=RatisCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,command -> { throw new IllegalArgumentException("No operators in import fixture"); },immutable::read);
         final AtomicInteger ownerReads=new AtomicInteger(); final List<byte[]> publications=new ArrayList<>();
-        boolean missingListener,loseReply;
+        boolean missingListener,missingActivationListener,loseReply;
+        RangeImportActivationAdmission activations;
         final RaftClient client;
         final RatisRangeImportCatalogue catalogue;
         Fixture() throws Exception {
@@ -47,6 +48,12 @@ class RatisRangeImportCatalogueTest {
                     byte[] encoded=((Message)args[0]).getContent().toByteArray(); var command=DistributedCommandCodec.decode(encoded); pure.accept(command);
                     if(RatisRangeImportCatalogue.isPublication(command)) {
                         RatisRangeImportCatalogue.admitPublication(command,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,immutable,(definition,range,owner) -> { ownerReads.incrementAndGet(); if(missingListener && owner.role()==ReplicaDescriptor.Role.LISTENER) return null; return admission(definition,10).owner(range.groupId(),owner.replicaId()); }); publications.add(encoded);
+                    }
+                    if(RatisRangeImportCatalogue.isCompletion(command)) {
+                        RatisRangeImportCatalogue.admitCompletion(command,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,immutable,(definition,published,range,owner) -> {
+                            ownerReads.incrementAndGet(); if(missingActivationListener && owner.role()==ReplicaDescriptor.Role.LISTENER) return null;
+                            return activations.owners().stream().filter(entry -> entry.groupId().equals(range.groupId()) && entry.owner().equals(owner)).findFirst().orElseThrow();
+                        });
                     }
                     result=nativeCatalogue.store.apply(new ApplyPosition(1,nativeCatalogue.next.getAndIncrement()),command);
                     if(loseReply && RatisRangeImportCatalogue.isPublication(command)) { loseReply=false; throw new IOException("Lost original publication reply"); }
@@ -81,6 +88,47 @@ class RatisRangeImportCatalogueTest {
             var changed=new DistributedCommand(publication.groupId(),publication.rangeEpoch(),publication.schemaDigest(),f.operation(21),publication.mutations(),publication.predicates()); assertThrows(IllegalArgumentException.class,() -> f.pure.accept(changed));
             var altered=new ArrayList<>(publication.mutations()); altered.set(2,new Mutation(Mutation.Kind.PUT,f.outer.directoryColumn,altered.get(2).key(),RangeDirectoryCodec.encode(definition.sourceDirectory()))); var changedBytes=new DistributedCommand(publication.groupId(),publication.rangeEpoch(),publication.schemaDigest(),publication.operationId(),altered,publication.predicates()); assertThrows(IllegalArgumentException.class,() -> f.pure.accept(changedBytes));
             assertThrows(IllegalArgumentException.class,() -> RatisRangeImportCatalogue.validator(f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,null).accept(publication));
+        }
+    }
+    @Test void orderedImportGuardBlocksTopologyAndRequiresQualifiedTerminalImportHead() throws Exception {
+        try(var f=new Fixture()) {
+            var definition=definition(f.outer.cluster,f.outer.database,f.operation(20)); var admissions=admission(definition,5); f.seed(definition.sourceDirectory());
+            var ordinary=new RatisCatalogue(f.client,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
+            assertThrows(IllegalArgumentException.class,() -> ordinary.prepare(f.operation(30),definition.sourceDirectory(),definition.targetDirectory()));
+            var before=definition.sourceDirectory(); var fencedAdvance=new RangeDirectory(before.clusterId(),before.databaseId(),before.domainId(),before.schemaEpoch(),before.schemaDigest(),before.generation()+1,before.columns(),before.routingPrefixBytes(),before.ranges());
+            var raced=ordinary.prepare(f.operation(31),before,fencedAdvance); f.stage(definition,admissions);
+            assertEquals(CommandResult.Status.CONFLICT,ordinary.execute(raced).status(),"An import BEGIN winning after topology preparation is excluded by native predicate");
+            var prepared=f.catalogue.readHead(before.domainId()); assertThrows(IllegalArgumentException.class,() -> ordinary.prepareAfterAdministration(f.operation(32),before,fencedAdvance,null,prepared));
+            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.preparePublication(definition,prepared,admissions,null)).status());
+            var active=definition.targetDirectory(); var later=new RangeDirectory(active.clusterId(),active.databaseId(),active.domainId(),active.schemaEpoch(),active.schemaDigest(),active.generation()+1,active.columns(),active.routingPrefixBytes(),active.ranges());
+            assertEquals(CommandResult.Status.CONFLICT,ordinary.execute(ordinary.prepare(f.operation(33),active,later)).status(),"Published import remains an explicit native expected-head guard");
+            var published=f.catalogue.readHead(active.domainId());
+            assertThrows(IllegalArgumentException.class,() -> ordinary.prepareAfterAdministration(f.operation(34),active,later,null,published),"Publication is not terminal while an owner may still be import-gated");
+            byte[] originalPublished=f.catalogue.readImport(definition.importId()).encode();
+            var activationOwners=new ArrayList<RangeImportActivationAdmission.OwnerActivation>();
+            for(var installed:admissions.owners()) {
+                var nativeActivation=new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstImport.Activation(installed.receipt(),f.outer.catalogue,new ApplyPosition(1,f.nativeCatalogue.next.get()-1),RangeImportAdmission.sha256(published.encode()),new ApplyPosition(2,6));
+                var activation=RangeImportActivationAdmission.Activation.decode(nativeActivation.encode());
+                activationOwners.add(new RangeImportActivationAdmission.OwnerActivation(installed.groupId(),installed.rangeId(),installed.configurationVersion(),installed.owner(),activation,new ApplyPosition(2,10)));
+            }
+            f.activations=new RangeImportActivationAdmission(definition,admissions,f.outer.catalogue,RangeImportAdmission.sha256(published.encode()),activationOwners);
+            assertArrayEquals(f.activations.encode(),RangeImportActivationAdmission.decode(f.activations.encode(),definition,admissions,f.outer.catalogue,RangeImportAdmission.sha256(published.encode())).encode());
+            assertThrows(IllegalArgumentException.class,() -> new RangeImportActivationAdmission(definition,admissions,f.outer.catalogue,RangeImportAdmission.sha256(published.encode()),List.of(activationOwners.getFirst())));
+            long seq=40;
+            for(int i=0;i<RatisRangeImportCatalogue.activationArtifact(f.activations).chunks();i++) assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.prepareActivationChunk(f.operation(seq++),definition,admissions,published,f.activations,i)).status());
+            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.prepareActivationCommit(f.operation(seq),definition,admissions,published,f.activations)).status());
+            var completion=f.catalogue.prepareCompletion(f.operation(50),definition,admissions,published,f.activations,null);
+            assertTrue(RatisRangeImportCatalogue.requiresOwnerAdmission(completion)); assertFalse(RatisRangeImportCatalogue.isPublication(completion));
+            f.missingActivationListener=true; assertThrows(IOException.class,() -> f.catalogue.execute(completion));
+            assertEquals(RatisRangeImportCatalogue.Phase.PUBLISHED,f.catalogue.readHead(active.domainId()).phase());
+            assertArrayEquals(originalPublished,f.catalogue.readImport(definition.importId()).encode());
+            f.missingActivationListener=false; assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(completion).status());
+            var completed=f.catalogue.readHead(active.domainId()); assertEquals(RatisRangeImportCatalogue.Phase.COMPLETE,completed.phase());
+            assertArrayEquals(originalPublished,f.catalogue.readImport(definition.importId()).encode(),"Original publication authority remains immutable for delayed owner retries");
+            int reads=f.ownerReads.get(); f.pure.accept(completion); nativeReplay(f,completion); assertEquals(reads,f.ownerReads.get(),"Completion replay never invokes configured owners");
+            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(completion).status(),"Original operation returns its retained completion result");
+            assertEquals(CommandResult.Status.SUCCESS,ordinary.execute(ordinary.prepareAfterAdministration(f.operation(60),active,later,null,completed)).status());
+            var missing=new ArrayList<>(raced.predicates()); missing.removeLast(); var bypass=new DistributedCommand(raced.groupId(),raced.rangeEpoch(),raced.schemaDigest(),f.operation(35),raced.mutations(),missing); assertThrows(IllegalArgumentException.class,() -> f.pure.accept(bypass));
         }
     }
     private static void nativeReplay(Fixture f,DistributedCommand publication) throws Exception { assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.nativeCatalogue.store.apply(new ApplyPosition(1,f.nativeCatalogue.next.getAndIncrement()),publication)).status()); }

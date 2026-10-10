@@ -43,6 +43,22 @@ class RatisNodeManifestTest {
         var schema=schema(bucket,false); var bindings=new LinkedHashMap<UUID,String>(); bindings.put(B,"physical-beta"); bindings.put(A,"physical-alpha");
         return new RatisNodeManifest(schema,plan(schema,bindings,Set.of()),settings(),3,5);
     }
+    @Test void exactFencedImportPlacementAndDefinitionSurviveCurrentManifestRoundTrip() {
+        var original=manifest(false); var active=original.plan().directory(); var range=active.ranges().getFirst();
+        var fenced=new RangeDirectory(active.clusterId(),active.databaseId(),active.domainId(),active.schemaEpoch(),active.schemaDigest(),active.generation(),active.columns(),active.routingPrefixBytes(),List.of(
+                new RangeDescriptor(range.rangeId(),range.groupId(),range.rangeEpoch(),range.configurationVersion(),null,null,RangeDescriptor.TopologyState.FENCED,range.replicas())));
+        UUID job=UUID.randomUUID(); var columns=original.plan().columns().entrySet().stream().map(entry -> new NativeSstImportManifest.Column(entry.getKey(),entry.getValue(),false,List.of())).toList();
+        var nativeManifest=new NativeSstImportManifest(job,range.groupId(),range.rangeEpoch(),fenced.domainId(),fenced.schemaDigest(),null,null,columns);
+        var definition=new RangeImportDefinition(job,new OperationId(UUID.randomUUID(),1,0),fenced,List.of(nativeManifest));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,fenced,original.plan().catalogue(),original.plan().columns(),Set.of(),20));
+        var configured=new RatisNodePlan(NODE,INCARNATION,fenced,original.plan().catalogue(),original.plan().columns(),Set.of(),List.of(),List.of(definition),20);
+        var value=new RatisNodeManifest(original.schema(),configured,settings(),3,5); byte[] encoded=RatisNodeManifest.encode(value);
+        var reopened=RatisNodeManifest.decode(encoded); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
+        assertArrayEquals(definition.encode(),reopened.plan().importDefinition(range.groupId()).encode());
+        assertArrayEquals(configured.identityDigest(),reopened.plan().identityDigest());
+        assertEquals(RangeDescriptor.TopologyState.FENCED,reopened.plan().directory().ranges().getFirst().topologyState());
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,active,original.plan().catalogue(),original.plan().columns(),Set.of(),List.of(),List.of(definition),20));
+    }
     @Test void configuredPoolAndExportResourcesSurviveCanonicalManifestRoundTrip() {
         var original=manifest(false); var base=original.settings();
         var resources=new RatisNodeRuntime.ExportResources(

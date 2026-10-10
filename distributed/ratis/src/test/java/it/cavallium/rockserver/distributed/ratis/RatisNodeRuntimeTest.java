@@ -698,6 +698,28 @@ class RatisNodeRuntimeTest {
             } finally { continueNested.countDown(); node.close(); }
         }
     }
+    @Test void importPreparationDrainKeepsCatalogueAuthorityAliveUntilActualOwnerReadCompletes() throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1); var continueNested=new java.util.concurrent.CountDownLatch(1);
+        try (var env=new Env(root,true)) {
+            var fake=new FakeServer(); var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake);
+            try {
+                node.start(); var catalogue=fake.machines.get(RaftGroupId.valueOf(env.plan.catalogue().groupId()));
+                var imports=proofLane(catalogue,"importPublicationQueries"); var authority=proofLane(catalogue,"schemaAuthorityQueries");
+                assertNotSame(imports,authority); assertNotSame(imports,proofLane(catalogue,"proofQueries")); assertEquals(1,configuredProofThreads(imports));
+                var query=imports.submit(env.plan.catalogue().groupId(),new byte[]{1},RatisProofQueryService.IMPORT_PUBLICATION_BYTES,false,owned -> {
+                    entered.countDown(); if (!continueNested.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Nested import fixture timeout");
+                    return authority.submit(env.plan.catalogue().groupId(),new byte[]{2},128,false,request -> Message.EMPTY).get(5,java.util.concurrent.TimeUnit.SECONDS);
+                });
+                assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); query.cancel(false);
+                assertThrows(IOException.class,node::close); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(0,fake.closes);
+                assertEquals(1,imports.stats().jobs()); assertEquals(RatisProofQueryService.IMPORT_PUBLICATION_BYTES,imports.stats().bytes());
+                assertEquals(Message.EMPTY,authority.submit(env.plan.catalogue().groupId(),new byte[]{3},64,false,owned -> Message.EMPTY).get(5,java.util.concurrent.TimeUnit.SECONDS));
+                continueNested.countDown(); imports.stop().get(5,java.util.concurrent.TimeUnit.SECONDS); node.close();
+                assertEquals(RatisNodeRuntime.State.CLOSED,node.state()); assertEquals(1,fake.closes); assertEquals(0,imports.stats().jobs()); assertEquals(0,imports.stats().bytes());
+                assertTrue(imports.submit(env.plan.catalogue().groupId(),new byte[]{4},64,false,owned -> Message.EMPTY).isCompletedExceptionally());
+            } finally { continueNested.countDown(); node.close(); }
+        }
+    }
     @Test void runtimeAuthorityReaderRecoversExactAbortedOutcomeAfterAnotherCurrentHead() throws Exception {
         var outer=new RatisSessionEpochsTest(); var source=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
         var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());
