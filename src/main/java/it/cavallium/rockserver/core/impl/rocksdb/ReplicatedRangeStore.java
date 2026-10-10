@@ -4,6 +4,8 @@ import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
+import it.cavallium.rockserver.core.common.distributed.TopologyChange;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallProof;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof;
@@ -214,6 +216,8 @@ public final class ReplicatedRangeStore {
     private long retainedGateBytes;
     private volatile DistributedSchema logicalSchema;
     private volatile NativeSchemaFence activeSchemaFence;
+    private volatile NativeTopologyFreeze activeTopologyFreeze;
+    private volatile TopologyPreparation topologyPreparation;
     private volatile NativeSchemaInstallation activeSchemaInstallation;
     private volatile NativeSchemaActivationProof activeSchemaActivation;
     private volatile Map<UUID,NativeSchemaInstallProof> schemaInstallProofs=Map.of();
@@ -525,7 +529,7 @@ public final class ReplicatedRangeStore {
             recoverImportMetadata();
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied);
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);
         }
     }
 
@@ -606,7 +610,7 @@ public final class ReplicatedRangeStore {
         try {
             if (pendingInstallation != null || importPending()) throw new IllegalStateException("Installation remains incomplete or unpublished");
             try { recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); validateSnapshotHomeUsersUnchecked();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied); validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -615,6 +619,95 @@ public final class ReplicatedRangeStore {
         if (pendingInstallation != null || importPending() || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
             throw new IllegalStateException("Range is fenced");
         }
+    }
+
+    private byte[] topologyFreezeKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x60).array(); }
+    private void requireTopologyWritable() { if(activeTopologyFreeze!=null || topologyPreparation!=null) throw new IllegalStateException("Topology freeze blocks new writable admission"); }
+    private void requireTopologyDefinition(TopologyChange.Definition definition,byte[] admission) {
+        if(admission==null || admission.length!=32 || definition.kind()==TopologyChange.Kind.RELOCATE) throw new IllegalArgumentException("Topology FREEZE requires split/merge and exact admission");
+        var header=definition.header(); var schema=logicalSchema;
+        if(schema==null || catalogueScopeCompaction || homeRecoveryContext!=null || snapshotHomeContext!=null || activeSchemaFence!=null || schemaCaptureGate!=null || activeSchemaInstallation!=null && activeSchemaActivation==null || importPending()) throw new IllegalStateException("Topology FREEZE requires active qualified DATA generation");
+        schema.requireMatches(definition.sourceDirectory());
+        var parent=definition.parents().stream().filter(p -> p.groupId().equals(groupId)).findFirst().orElseThrow(() -> new IllegalArgumentException("Store is not a topology parent"));
+        if(parent.rangeEpoch()!=rangeEpoch || !header.domainId().equals(interval.domainId()) || !Arrays.equals(header.schemaDigest(),schemaDigest)
+                || !Arrays.equals(parent.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(parent.upperExclusive(),interval.upperExclusive())) throw new IllegalArgumentException("Topology parent differs from native ownership/schema/bounds");
+    }
+    private NativeTopologyFreeze loadTopologyFreeze(ApplyPosition cut) { return loadTopologyFreeze(cut,true); }
+    private NativeTopologyFreeze loadTopologyFreeze(ApplyPosition cut,boolean checkWork) {
+        NativeTopologyFreeze freeze=null; byte[] high=topologyFreezeKey(); high[16]=0x61;
+        try(var lower=new org.rocksdb.Slice(topologyFreezeKey());var upper=new org.rocksdb.Slice(high);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);var iterator=db.newIterator(state,options)) {
+            iterator.seekToFirst(); var sizing=new byte[0];
+            while(iterator.isValid()) { if(iterator.key(sizing)!=17 || iterator.value(sizing)>NativeTopologyFreeze.MAX_BYTES || freeze!=null) throw new IllegalArgumentException("Invalid native topology FREEZE namespace/count/budget"); freeze=NativeTopologyFreeze.decode(iterator.value()); iterator.next(); }
+            iterator.status();
+        } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover native topology FREEZE",failure); }
+        if(freeze==null) return null; freeze.requireCut(cut);
+        freeze.requireParent(groupId,rangeEpoch,interval.domainId(),schemaDigest,interval.lowerInclusive(),interval.upperExclusive());
+        if(activeSchemaFence!=null || catalogueScopeCompaction || homeRecoveryContext!=null || snapshotHomeContext!=null || checkWork && (preparedIndex.records().stream().anyMatch(p -> !isFinalized(p.preparation().transactionId())) || snapshotGates.values().stream().anyMatch(SnapshotGate::active))) throw new IllegalArgumentException("Frozen topology retains incompatible native work/role");
+        if(logicalSchema!=null && (!freeze.header().clusterId().equals(logicalSchema.clusterId()) || !freeze.header().databaseId().equals(logicalSchema.databaseId()) || freeze.header().schemaEpoch()!=logicalSchema.schemaEpoch())) throw new IllegalArgumentException("Frozen topology namespace differs from qualified schema");
+        return freeze;
+    }
+    private static final class TopologyPreparation {
+        final TopologyChange.Header header; final byte[] admission; int observers;
+        final java.util.concurrent.CompletableFuture<Void> ready=new java.util.concurrent.CompletableFuture<>();
+        TopologyPreparation(TopologyChange.Header header,byte[] admission) { this.header=header; this.admission=admission.clone(); }
+        void requireRequest(TopologyChange.Header header,byte[] admission) { if(!Arrays.equals(this.header.encode(),header.encode()) || !Arrays.equals(this.admission,admission)) throw new IllegalArgumentException("Topology preparation changed original admission"); }
+    }
+    public record TopologyFreezeState(NativeTopologyFreeze freeze,int writablePins,int preparedParticipants,int snapshotGates,boolean ready) {}
+    private TopologyFreezeState topologyFreezeStateUnderLane() {
+        int pins=trackedSnapshotPins.get(),prepared=(int)preparedIndex.records().stream().filter(p -> !isFinalized(p.preparation().transactionId())).count(),gates=(int)snapshotGates.values().stream().filter(SnapshotGate::active).count();
+        return new TopologyFreezeState(activeTopologyFreeze,pins,prepared,gates,(activeTopologyFreeze!=null || topologyPreparation!=null) && pendingInstallation==null && !importPending() && pins==0 && prepared==0 && gates==0);
+    }
+    public TopologyFreezeState topologyFreezeState() { enterNative(); applyLane.lock(); try { return topologyFreezeStateUnderLane(); } finally { applyLane.unlock(); leaveNative(); } }
+    public NativeTopologyFreeze topologyFreeze() { return activeTopologyFreeze; }
+    public NativeTopologyFreeze lookupTopologyFreeze(TopologyChange.Header header,byte[] admission) { var freeze=activeTopologyFreeze; if(freeze!=null) freeze.requireRequest(header,admission); return freeze; }
+    public final class TopologyFreezeGate implements AutoCloseable {
+        private final TopologyPreparation preparation; private volatile boolean closed;
+        private TopologyFreezeGate(TopologyPreparation preparation) { this.preparation=preparation; }
+        public TopologyFreezeState state() { enterNative(); applyLane.lock(); try { if(closed || preparation!=null && topologyPreparation!=preparation && activeTopologyFreeze==null) throw new IllegalStateException("Topology preparation released"); return topologyFreezeStateUnderLane(); } finally { applyLane.unlock(); leaveNative(); } }
+        public boolean ready() { return state().ready(); }
+        public java.util.concurrent.CompletionStage<Void> whenReady() {
+            applyLane.lock(); try { if(closed) throw new IllegalStateException("Topology preparation released"); return (preparation==null ? java.util.concurrent.CompletableFuture.<Void>completedFuture(null) : preparation.ready).minimalCompletionStage(); } finally { applyLane.unlock(); }
+        }
+        @Override public void close() {
+            boolean cancel=false; applyLane.lock();
+            try { if(closed) return; closed=true; if(preparation!=null && --preparation.observers==0 && topologyPreparation==preparation) { topologyPreparation=null; cancel=activeTopologyFreeze==null; } } finally { applyLane.unlock(); }
+            if(cancel) preparation.ready.completeExceptionally(new java.util.concurrent.CancellationException("Topology preparation released"));
+        }
+    }
+    private void signalTopologyDrain() {
+        var preparation=topologyPreparation;
+        if(preparation==null || preparation.ready.isDone() || applyLane.isHeldByCurrentThread() || nativeLifecycle.getReadHoldCount()!=0 || nativeLifecycle.isWriteLockedByCurrentThread()) return;
+        boolean ready; applyLane.lock();
+        try { ready=topologyPreparation==preparation && topologyFreezeStateUnderLane().ready(); } finally { applyLane.unlock(); }
+        if(ready) preparation.ready.complete(null);
+    }
+    /** Local preparation only. The adapter reserves/drains accepted proposal predecessors before calling this seam. */
+    public TopologyFreezeGate prepareTopologyFreeze(TopologyChange.Definition definition,byte[] admission) {
+        Objects.requireNonNull(definition); enterNative(); applyLane.lock();
+        try {
+            requireActive(); requireTopologyDefinition(definition,admission);
+            if(activeTopologyFreeze!=null) { activeTopologyFreeze.requireRequest(definition.header(),admission); return new TopologyFreezeGate(null); }
+            if(topologyPreparation==null) topologyPreparation=new TopologyPreparation(definition.header(),admission);
+            topologyPreparation.requireRequest(definition.header(),admission); if(topologyPreparation.observers>=16) throw new IllegalStateException("Topology preparation observer budget exhausted");
+            topologyPreparation.observers++; return new TopologyFreezeGate(topologyPreparation);
+        } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Trusted committed parent boundary; catalogue/membership authority is supplied by the adapter, never request bytes. */
+    public NativeTopologyFreeze applyTopologyFreeze(ApplyPosition position,TopologyChange.Definition definition,byte[] admission) throws RocksDBException {
+        Objects.requireNonNull(position); Objects.requireNonNull(definition); enterNative(); applyLane.lock();
+        try {
+            requireActive(); ensureReceiptUsage();
+            if(activeTopologyFreeze!=null) { activeTopologyFreeze.requireRequest(definition.header(),admission); if(position.index()<activeTopologyFreeze.position().index() || position.index()==activeTopologyFreeze.position().index() && position.term()!=activeTopologyFreeze.position().term()) throw new IllegalArgumentException("Topology callback changes original cut"); advanceCompletedMarker(position); return activeTopologyFreeze; }
+            requireTopologyDefinition(definition,admission);
+            // Followers replay the trusted committed seam without a volatile leader preparation object.
+            if(trackedSnapshotPins.get()!=0 || preparedIndex.records().stream().anyMatch(p -> !isFinalized(p.preparation().transactionId())) || snapshotGates.values().stream().anyMatch(SnapshotGate::active)) throw new IllegalStateException("Topology parent writable/native work has not drained");
+            if(topologyPreparation!=null) topologyPreparation.requireRequest(definition.header(),admission);
+            requireNext(position); var freeze=new NativeTopologyFreeze(definition.header(),groupId,position,NativeTopologyFreeze.boundsDigest(interval.lowerInclusive(),interval.upperExclusive()),admission); var history=prepareScopedWrites(false,List.of(),Map.of());
+            try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(cdc!=null) cdc.initialize(batch); batch.put(state,topologyFreezeKey(),freeze.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+            }
+            activeTopologyFreeze=freeze; publishScoped(position,history,false); applied=position; return freeze;
+        } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
 
     private byte[] schemaFenceKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x27).array(); }
@@ -665,6 +758,7 @@ public final class ReplicatedRangeStore {
                 if (position.index()<activeSchemaFence.position().index() || position.index()==activeSchemaFence.position().index() && position.term()!=activeSchemaFence.position().term()) throw new IllegalArgumentException("Schema fence callback regresses or changes original position");
                 advanceCompletedMarker(position); return activeSchemaFence;
             }
+            requireTopologyWritable();
             if(schemaPreparationPool!=null) schemaPreparationPool.requireCapacityFence(groupId,header);
             requireSchemaFenceSchema(proposed,logicalSchema);
             requireNext(position); var history=prepareScopedWrites(false,List.of(),Map.of());
@@ -691,6 +785,7 @@ public final class ReplicatedRangeStore {
         } finally { applyLane.unlock(); leaveNative(); }
     }
     void preflightSchemaCapacity(SchemaChange.Definition definition,int installBytes) throws RocksDBException {
+        requireTopologyWritable();
         if(importPending() || ownership.get(owner).state()!=RangeOwnership.State.ACTIVE || logicalSchema==null || homeRecoveryContext!=null || snapshotHomeContext!=null || activeSchemaFence!=null || activeSchemaInstallation!=null && activeSchemaActivation==null || !Arrays.equals(schemaDigest,definition.sourceSchema().digest())) throw new IllegalStateException("Capacity admission requires active qualified source DATA");
         var participant=definition.header().participants().stream().filter(p -> p.groupId().equals(groupId)).findFirst().orElseThrow(() -> new IllegalArgumentException("Group outside original capacity membership"));
         var descriptor=definition.sourceDirectory().ranges().stream().filter(p -> p.groupId().equals(groupId)).findFirst().orElseThrow();
@@ -874,6 +969,7 @@ public final class ReplicatedRangeStore {
         enterNative(); applyLane.lock();
         try {
             requireActive();
+            if(activeTopologyFreeze!=null) throw new IllegalStateException("Frozen DATA parent cannot become CATALOGUE");
             if (scopedHistory!=null) throw new IllegalStateException("DATA scoped history excludes catalogue scope compaction");
             catalogueScopeCompaction=true;
         } finally { applyLane.unlock(); leaveNative(); }
@@ -949,6 +1045,7 @@ public final class ReplicatedRangeStore {
                     || prefix>0 && (interval.lowerInclusive()!=null && interval.lowerInclusive().length!=prefix
                             || interval.upperExclusive()!=null && interval.upperExclusive().length!=prefix)) throw new IllegalArgumentException("Logical schema differs from native ownership");
             if (activeSchemaFence!=null && activeSchemaInstallation==null) requireSchemaFenceSchema(activeSchemaFence,schema);
+            if(activeTopologyFreeze!=null && (!activeTopologyFreeze.header().clusterId().equals(schema.clusterId()) || !activeTopologyFreeze.header().databaseId().equals(schema.databaseId()) || activeTopologyFreeze.header().schemaEpoch()!=schema.schemaEpoch())) throw new IllegalArgumentException("Topology FREEZE qualified schema changed");
             logicalSchema=schema; installedGeneration=new SchemaGeneration(schema,interval,columns,deterministicMergeColumns);
             for (var prepared:preparedIndex.records()) requirePreparation(prepared.preparation(),true);
         } finally { applyLane.unlock(); leaveNative(); }
@@ -999,13 +1096,19 @@ public final class ReplicatedRangeStore {
         }
         publishScoped(position,history,false); applied=position; return result;
     }
+    private boolean topologyAccountingControl(DistributedCommand command) {
+        return groupId.equals(command.groupId()) && rangeEpoch==command.rangeEpoch() && Arrays.equals(schemaDigest,command.schemaDigest())
+                && command.mutations().isEmpty() && command.predicates().isEmpty() && command.acceptance()==null && !command.transactionRejection()
+                && (command.kind()==DistributedCommand.Kind.DATA && command.acknowledgedThrough()>=0 || command.kind()==DistributedCommand.Kind.SESSION_FLOOR && command.minimumSessionEpoch()>=0);
+    }
     public void validate(DistributedCommand command) {
-        if(metadataSchemaControl(command) || activeSchemaFence==null && Arrays.equals(schemaDigest,command.schemaDigest())) { validateCommand(command,true); return; }
+        if(metadataSchemaControl(command) || topologyAccountingControl(command) && activeSchemaFence==null || activeTopologyFreeze==null && topologyPreparation==null && activeSchemaFence==null && Arrays.equals(schemaDigest,command.schemaDigest())) { validateCommand(command,true); return; }
         enterNative(); applyLane.lock();
         try {
             requireActive(); validateCommand(command,false);
             byte[] retained=db.get(receipts,receiptKey(command.operationId()));
             if(retained==null) {
+                requireTopologyWritable();
                 if(canonicalStaleSchemaControl(command)) { requireUnlocked(command); return; }
                 if(!Arrays.equals(command.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Historical schema has no saved DATA outcome");
                 throw new IllegalStateException("Schema change blocks new DATA admission");
@@ -1119,7 +1222,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(column); enterNative(); applyLane.lock();
         try {
             var context=new HomeRecoveryContext(cluster,database,column);
-            if (activeSchemaFence!=null || snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column)) || homeRecoveryContext!=null && !homeRecoveryContext.equals(context)) throw new IllegalArgumentException("HOME reservation context changed or column is not dedicated");
+            if (activeTopologyFreeze!=null || activeSchemaFence!=null || snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column)) || homeRecoveryContext!=null && !homeRecoveryContext.equals(context)) throw new IllegalArgumentException("HOME reservation context changed or column is not dedicated");
             for (var credit:homeRecoveryCredits.values()) if (!credit.cluster().equals(cluster) || !credit.database().equals(database) || !credit.column().equals(column)) throw new IllegalArgumentException("HOME reservation context differs from stored promises");
             for (var receipt:homeRecoveries.values()) {
                 var recovery=receipt.recovery(); if (!recovery.before().clusterId().equals(cluster) || !recovery.before().databaseId().equals(database) || !recovery.command().mutations().getFirst().columnId().equals(column)) throw new IllegalArgumentException("HOME receipt differs from configured context");
@@ -1281,7 +1384,7 @@ public final class ReplicatedRangeStore {
         var context=new HomeRecoveryContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column));
         enterNative(); applyLane.lock();
         try {
-            if (activeSchemaFence!=null || homeRecoveryContext!=null || !homeRecoveries.isEmpty() || !homeRecoveryCredits.isEmpty() || !columns.keySet().equals(Set.of(column)) || snapshotHomeContext!=null && !snapshotHomeContext.equals(context)) throw new IllegalArgumentException("Snapshot HOME role/column changed");
+            if (activeTopologyFreeze!=null || activeSchemaFence!=null || homeRecoveryContext!=null || !homeRecoveries.isEmpty() || !homeRecoveryCredits.isEmpty() || !columns.keySet().equals(Set.of(column)) || snapshotHomeContext!=null && !snapshotHomeContext.equals(context)) throw new IllegalArgumentException("Snapshot HOME role/column changed");
             var authority=sessionAuthority(null); if (authority!=null && (!authority.clusterId().equals(cluster) || !authority.databaseId().equals(database))) throw new IllegalArgumentException("Snapshot HOME session authority differs");
             validateSnapshotHomeUsers(null,context); snapshotHomeContext=context;
         } catch (RocksDBException failure) { throw new IllegalStateException("Cannot validate snapshot HOME",failure); }
@@ -1599,6 +1702,7 @@ public final class ReplicatedRangeStore {
                 if (!saved.equals(finalization)) throw new IllegalArgumentException("Finalization intent changed");
                 return new FinalizationEstimate(preparedCapacityUnderLane(),false,commit!=null ? commit.position() : abort.position(),false);
             }
+            if(activeTopologyFreeze!=null) throw new IllegalStateException("Frozen parent has no fresh finalization authority");
             var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(finalization.transactionId())).findFirst().orElse(null);
             if (prepared!=null) finalization.requirePrepared(prepared);
             else if (finalization.decision().phase()==TransactionStatus.Phase.COMMIT || finalization.participant().prepared()!=null) throw new IllegalStateException("Finalization requires missing native preparation");
@@ -1609,7 +1713,7 @@ public final class ReplicatedRangeStore {
             var rejected=rejectedIndex.get(finalization.transactionId()); if (rejected!=null) rejected.requireFinalization(finalization);
             requireFinalizationRejectionIdentity(finalization);
             var capacity=preparedCapacityUnderLane(); boolean newFence=prepared==null && rejected==null;
-            if (newFence) requireSchemaAdmission();
+            if (newFence) { requireTopologyWritable(); requireSchemaAdmission(); }
             if (newFence && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("Finalization capacity exhausted");
             return new FinalizationEstimate(capacity,newFence,null,false);
         } finally { applyLane.unlock(); leaveNative(); }
@@ -1742,6 +1846,7 @@ public final class ReplicatedRangeStore {
             requireActive(); ensureReceiptUsage(); var candidate=new CommittedParticipant(finalization,position); requireFinalization(finalization);
             if (abortedIndex.containsKey(finalization.transactionId())) throw new IllegalArgumentException("ABORT decision cannot become COMMIT");
             var saved=committedIndex.get(finalization.transactionId());
+            if(activeTopologyFreeze!=null && saved==null) throw new IllegalStateException("Frozen parent cannot accept fresh COMMIT");
             if (saved!=null && !saved.finalization().equals(finalization)) throw new IllegalArgumentException("COMMIT intent changed");
             requireFinalizationRejectionIdentity(finalization);
             var prepared=preparedIndex.records().stream().filter(p -> p.preparation().transactionId().equals(finalization.transactionId())).findFirst().orElseThrow(() -> new IllegalStateException("COMMIT requires native preparation"));
@@ -1949,7 +2054,7 @@ public final class ReplicatedRangeStore {
             requireActive(); var result=readSnapshotGateResult(fence,null,applied);
             if (result!=null && result.retired()) return new GateEstimate(gateCapacityUnderLane(),null,result.retirement());
             var saved=result==null ? null : result.gate();
-            if (saved==null) { requireSchemaAdmission(); requireGateIdentity(fence); requireUngated(fence.participant(groupId).scope()); requireGateCapacity(fence); }
+            if (saved==null) { requireTopologyWritable(); requireSchemaAdmission(); requireGateIdentity(fence); requireUngated(fence.participant(groupId).scope()); requireGateCapacity(fence); }
             return new GateEstimate(gateCapacityUnderLane(),saved,null);
         } finally { applyLane.unlock(); leaveNative(); }
     }
@@ -2135,7 +2240,7 @@ public final class ReplicatedRangeStore {
         if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied rejection lacks its receipt"); return ParticipantVote.negative(); }
         requireNext(position);
         if (saved==null && !abortedIndex.containsKey(preparation.transactionId())) {
-            requireSchemaAdmission();
+            requireTopologyWritable(); requireSchemaAdmission();
             var capacity=preparedCapacityUnderLane();
             if (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes()) throw new IllegalStateException("Rejected preparation capacity exhausted");
         }
@@ -2204,6 +2309,7 @@ public final class ReplicatedRangeStore {
         try {
             requireActive(); ensureReceiptUsage(); if (committedIndex.containsKey(finalization.transactionId())) throw new IllegalArgumentException("COMMIT decision cannot become ABORT"); var candidate=new AbortedParticipant(finalization,position); requireAbort(candidate);
             var saved=abortedIndex.get(finalization.transactionId());
+            if(activeTopologyFreeze!=null && saved==null) throw new IllegalStateException("Frozen parent cannot accept fresh ABORT");
             if (saved!=null && (!saved.finalization().operation().equals(finalization.operation()) || !Arrays.equals(saved.finalization().decisionDigest(),finalization.decisionDigest()))) throw new IllegalArgumentException("Participant decision changed");
             if (applied!=null && position.index()<=applied.index()) { if (saved==null) throw new IllegalStateException("Applied ABORT lacks its fence"); return saved; }
             requireNext(position);
@@ -2220,7 +2326,7 @@ public final class ReplicatedRangeStore {
                 requireFinalizationRejectionIdentity(finalization);
                 if (!prepared && finalization.participant().prepared()!=null) throw new IllegalStateException("Home reports missing native prepare evidence");
                 var capacity=preparedCapacityUnderLane();
-                if (!prepared && rejected==null) requireSchemaAdmission();
+                if (!prepared && rejected==null) { requireTopologyWritable(); requireSchemaAdmission(); }
                 if (!prepared && rejected==null && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("ABORT fence capacity exhausted");
             }
             var result=saved==null ? candidate : saved; var next=new HashMap<>(abortedIndex); next.put(finalization.transactionId(),result);
@@ -2343,7 +2449,7 @@ public final class ReplicatedRangeStore {
             if (applied==null || applied.index()==Long.MAX_VALUE || preparation.business().acceptance().snapshot().index()>applied.index()
                     || preparation.business().acceptance().snapshot().term()>applied.term()) throw new IllegalStateException("Rejection cannot follow its original cut");
             boolean additional=newParticipant(preparation.transactionId());
-            if (additional) requireSchemaAdmission();
+            if (additional) { requireTopologyWritable(); requireSchemaAdmission(); }
             if (additional && (capacity.count()>=MAX_PREPARED_PARTICIPANTS || FINALIZATION_RESERVATION>MAX_PREPARED_BYTES-capacity.bytes())) throw new IllegalStateException("Rejected preparation capacity exhausted");
             return new RejectionEstimate(capacity,null,additional);
         } finally { applyLane.unlock(); leaveNative(); }
@@ -2367,6 +2473,7 @@ public final class ReplicatedRangeStore {
             if (rejected!=null) { rejected.requirePreparation(preparation); return new PreparationEstimate(preparedCapacityUnderLane(),ParticipantVote.negative()); }
             var abort=abortedIndex.get(preparation.transactionId());
             if (abort!=null) { requireNegativeIdentity(preparation); abort.finalization().requirePreparation(preparation); return new PreparationEstimate(preparedCapacityUnderLane(),null); }
+            requireTopologyWritable();
             var id=business.operationId(); long minimum=minimumSessionEpoch(null); long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
             if (id.epoch()<minimum || id.sequence()<=floor || db.get(receipts,receiptKey(id))!=null || db.get(receipts,receiptKey(preparation.operation()))!=null
                     || sessionDecision(business,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepared identity is no longer eligible");
@@ -2414,12 +2521,12 @@ public final class ReplicatedRangeStore {
             }
             requireNext(position);
             var abort=abortedIndex.get(preparation.transactionId());
-            if (saved==null && abort==null && !rejectedIndex.containsKey(preparation.transactionId())) requireSchemaAdmission();
+            if (saved==null && abort==null && !rejectedIndex.containsKey(preparation.transactionId())) { requireTopologyWritable(); requireSchemaAdmission(); }
             if (saved==null && (abort!=null || rejectedIndex.containsKey(preparation.transactionId()) || gated(preparation.scope()))) {
                 return applyRejectedUnderLane(position,preparation);
             }
             if (saved==null) {
-                requireSchemaAdmission();
+                requireTopologyWritable(); requireSchemaAdmission();
                 var business=preparation.business(); var id=business.operationId(); long minimum=minimumSessionEpoch(null); long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
                 if (id.epoch()<minimum || id.sequence()<=floor || db.get(receipts,receiptKey(id))!=null || db.get(receipts,receiptKey(preparation.operation()))!=null
                         || sessionDecision(business,floor,sessionAuthority())!=CommandResult.Status.SUCCESS) throw new IllegalStateException("Prepared business/control identity is no longer eligible");
@@ -2468,8 +2575,11 @@ public final class ReplicatedRangeStore {
     public CurrentPoints readCurrentPoints(List<PhysicalPoint> points) throws RocksDBException { return readCurrentPoints(points,MAX_RESULT_BYTES); }
     /** Explicit bounded schema-authority control read; ordinary foreground reads retain their smaller reply budget. */
     public CurrentPoints readSchemaAuthorityPoints(List<PhysicalPoint> points) throws RocksDBException { return readCurrentPoints(points,MAX_SCHEMA_AUTHORITY_BYTES); }
-    private CurrentPoints readCurrentPoints(List<PhysicalPoint> points,int maximumBytes) throws RocksDBException {
-        points=List.copyOf(points); if (points.isEmpty() || points.size()>4) throw new IllegalArgumentException("Atomic point read requires 1..4 points");
+    public CurrentPoints readSchemaAuthorityPoints(List<PhysicalPoint> points,int[] maximumValueBytes) throws RocksDBException { return readCurrentPoints(points,MAX_SCHEMA_AUTHORITY_BYTES,Objects.requireNonNull(maximumValueBytes).clone()); }
+    private CurrentPoints readCurrentPoints(List<PhysicalPoint> points,int maximumBytes) throws RocksDBException { return readCurrentPoints(points,maximumBytes,null); }
+    private CurrentPoints readCurrentPoints(List<PhysicalPoint> points,int maximumBytes,int[] maximumValueBytes) throws RocksDBException {
+        points=List.copyOf(points);
+        if(maximumValueBytes!=null && (maximumValueBytes.length!=points.size() || Arrays.stream(maximumValueBytes).anyMatch(limit -> limit<=0))) throw new IllegalArgumentException("Atomic point value bounds differ from request"); if (points.isEmpty() || points.size()>4) throw new IllegalArgumentException("Atomic point read requires 1..4 points");
         long keyBytes=0; var spans=new ArrayList<TransactionScope.Span>(points.size());
         for (var point:points) { keyBytes+=point.key.length; if (keyBytes>TransactionScope.MAX_BOUND_BYTES) throw new IllegalArgumentException("Atomic point keys exceed budget"); spans.add(TransactionScope.Span.point(point.column,point.key)); }
         var scope=new TransactionScope(spans); enterNative(); applyLane.lock();
@@ -2478,10 +2588,11 @@ public final class ReplicatedRangeStore {
             byte[] marker=db.get(state,markerKey); ApplyPosition cut=marker==null ? null : decodePosition(marker);
             if (!Objects.equals(cut,applied)) throw new IllegalStateException("Atomic point marker differs from completed apply");
             var values=new ArrayList<byte[]>(points.size()); long valueBytes=0;
-            for (var point:points) {
+            for (int i=0;i<points.size();i++) {
+                var point=points.get(i);
                 // Read size before allocating an arbitrary native value into Java memory.
                 var cf=columns.get(point.column); int length=db.get(cf,point.key,new byte[0]);
-                if (length!=RocksDB.NOT_FOUND) { valueBytes+=length; if (valueBytes>maximumBytes) throw new IllegalStateException("Atomic point values exceed budget"); }
+                if (length!=RocksDB.NOT_FOUND) { if(maximumValueBytes!=null && length>maximumValueBytes[i]) throw new IllegalStateException("Atomic point value exceeds its control bound"); valueBytes+=length; if (valueBytes>maximumBytes) throw new IllegalStateException("Atomic point values exceed budget"); }
                 values.add(length==RocksDB.NOT_FOUND ? null : db.get(cf,point.key));
             }
             return new CurrentPoints(cut,values);
@@ -2541,9 +2652,10 @@ public final class ReplicatedRangeStore {
         try {
             requireActive();
             ensureReceiptUsage(); requireHomeRecoveryFree(command.operationId());
-            if(!metadataSchemaControl(command) && (activeSchemaFence!=null || !Arrays.equals(schemaDigest,command.schemaDigest()))) {
+            if(!metadataSchemaControl(command) && (activeTopologyFreeze!=null && !topologyAccountingControl(command) || activeSchemaFence!=null || !Arrays.equals(schemaDigest,command.schemaDigest()))) {
                 byte[] retained=db.get(receipts,receiptKey);
                 if(retained==null) {
+                    if(activeTopologyFreeze!=null) throw new IllegalStateException("Topology FREEZE blocks fresh DATA effects");
                     if(canonicalStaleSchemaControl(command)) return applyStaleSchemaControl(position,command);
                     if(!Arrays.equals(schemaDigest,command.schemaDigest())) throw new IllegalArgumentException("Historical schema has no saved DATA outcome");
                     throw new IllegalStateException("Schema change blocks new DATA operations");
@@ -2656,7 +2768,7 @@ public final class ReplicatedRangeStore {
             publishCdc.run();
             publishHomeCredit(creditChange); publishScoped(position,writes,false); applied = position;
             return saved == null ? stableResult : original;
-        } catch (RocksDBException | RuntimeException | Error failure) { if (activeSchemaFence==null) resetScopedUnderLane(); throw failure; }
+        } catch (RocksDBException | RuntimeException | Error failure) { if (activeSchemaFence==null && activeTopologyFreeze==null && topologyPreparation==null) resetScopedUnderLane(); throw failure; }
         finally { applyLane.unlock(); }
     }
 
@@ -2968,6 +3080,11 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if(topologyPreparation!=null) throw new IllegalStateException("Topology preparation owns native replacement admission");
+            if(activeTopologyFreeze!=null) {
+                var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visit(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); });
+                if(!activeTopologyFreeze.equals(incoming[0])) throw new IOException("Snapshot cannot discard/change native topology FREEZE");
+            }
             if(cdc!=null) cdc.validateImage(image,limits,expected.position());
             if(importBirth!=null) {
                 byte[][] incoming=new byte[3][];
@@ -3037,7 +3154,7 @@ public final class ReplicatedRangeStore {
                     recoverSchemaMetadata(expected.position());
                     if(cdc!=null) cdc.recover(expected.position(),cdcAuthorityTime());
                     validateReceiptUsage(expected.position());
-                    activeSchemaFence=loadSchemaFence(expected.position());
+                    activeSchemaFence=loadSchemaFence(expected.position()); activeTopologyFreeze=loadTopologyFreeze(expected.position(),false);
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);
@@ -3177,7 +3294,7 @@ public final class ReplicatedRangeStore {
     private ScopedHistoryPin captureTracked(TransactionScope scope,SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(scope); enterNative(); applyLane.lock(); ScopedSnapshot snapshot=null; RangeMutationHistory.Pin registration=null;
         try {
-            requireActive(); validateSnapshotScope(scope); ensureReceiptUsage(); requireUnlocked(scope);
+            requireActive(); requireTopologyWritable(); validateSnapshotScope(scope); ensureReceiptUsage(); requireUnlocked(scope);
             if (fence!=null) { requireSnapshotFence(fence); if (fence.operation().epoch()<minimumSessionEpoch(null)) throw new SnapshotRetentionExpiredException(); requireActiveGate(fence); }
             if (scopedHistory==null) throw new UnsupportedOperationException("Scoped mutation history is not enabled");
             if (applied==null || applied.term()==0) throw new IllegalStateException("Tracked snapshot requires a positive completed term");
@@ -3206,7 +3323,7 @@ public final class ReplicatedRangeStore {
         validateScopedCommand(pin,command);
         enterNative(); applyLane.lock();
         try {
-            requireActive();
+            requireActive(); requireTopologyWritable();
             requireUnlocked(pin.scope()); requireUngated(pin.scope());
             if (pin.validateUnderLane()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot failed serializable validation: "+pin.status());
             var id=command.operationId(); long minimum=minimumSessionEpoch(null);
@@ -3227,7 +3344,7 @@ public final class ReplicatedRangeStore {
         if (pin.owner()!=this) throw new IllegalArgumentException("Tracked snapshot belongs to another range");
         enterNative(); applyLane.lock();
         try {
-            requireActive(); requireUnlocked(pin.scope()); requireUngated(pin.scope());
+            requireActive(); requireTopologyWritable(); requireUnlocked(pin.scope()); requireUngated(pin.scope());
             if (pin.validateUnderLane()!=RangeMutationHistory.Status.ACTIVE) throw new IllegalStateException("Transaction snapshot failed serializable validation: "+pin.status());
             var accepted=DistributedCommand.readCertification(groupId,rangeEpoch,schemaDigest,operation,new TransactionAcceptance(pin.position(),generation,incarnation,pin.scope(),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
             validate(accepted); long minimum=minimumSessionEpoch(null); long floor=operation.epoch()<minimum ? -1 : acknowledgedThrough(operation,null);
@@ -3269,7 +3386,7 @@ public final class ReplicatedRangeStore {
         }
         /** Builds a bounded read-your-writes view at this exact cut, without applying or accepting anything. */
         public ScopedStaging stage(DistributedCommand command) throws RocksDBException {
-            requireReadable(); Objects.requireNonNull(command);
+            requireReadable(); Objects.requireNonNull(command); requireTopologyWritable();
             if (command.kind()!=DistributedCommand.Kind.DATA || command.mutations().isEmpty() && command.predicates().isEmpty()) throw new IllegalArgumentException("Expected business DATA for staging");
             ReplicatedRangeStore.this.validate(command); validateScopedCommand(this,command);
             if (logicalSchema!=null) validateLogical(command);
@@ -3544,7 +3661,7 @@ public final class ReplicatedRangeStore {
         }
     }
 
-    private void leaveNative() { nativeLifecycle.readLock().unlock(); signalSchemaCaptureDrain(); }
+    private void leaveNative() { nativeLifecycle.readLock().unlock(); signalSchemaCaptureDrain(); signalTopologyDrain(); }
 
     /**
      * Permanently closes borrowed native admission. Pool ownership stays intact
@@ -3837,7 +3954,7 @@ public final class ReplicatedRangeStore {
             catch (Throwable failure) { recordSnapshotReleaseFailure(failure); throw failure; }
             if (admissionLease != null) admissionLease.close();
             if (historyTracked) { trackedSnapshotScopeBytes.addAndGet(-historyScopeBytes); trackedSnapshotPins.decrementAndGet(); }
-            snapshotPins.decrementAndGet(); signalSchemaCaptureDrain();
+            snapshotPins.decrementAndGet(); signalSchemaCaptureDrain(); signalTopologyDrain();
         }
     }
 

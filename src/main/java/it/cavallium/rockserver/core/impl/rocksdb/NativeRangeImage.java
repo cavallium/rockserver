@@ -380,6 +380,7 @@ public final class NativeRangeImage {
         private final Map<UUID,SnapshotGate> gates=new HashMap<>();
         private long gateBytes,homeRecoveryBytes,homeCreditBytes;
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaFence schemaFence;
+        private it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze topologyFreeze;
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation schemaInstallation;
         private final Map<String,it.cavallium.rockserver.core.common.distributed.DistributedSchema> schemaHistory=new HashMap<>();
         private final List<byte[]> referencedSchemas=new ArrayList<>();
@@ -494,6 +495,13 @@ public final class NativeRangeImage {
                     } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema activation",failure); }
                 }
                 if(section==Section.STATE && key.length>16 && key[16]==0x29) throw new IOException("Uncompleted schema install cannot be exported");
+                if(section==Section.STATE && key.length>16 && key[16]==0x60) {
+                    try {
+                        if(key.length!=17 || topologyFreeze!=null) throw new IllegalArgumentException("Invalid topology FREEZE key/count");
+                        topologyFreeze=it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze.decode(value); topologyFreeze.requireCut(header.position());
+                        topologyFreeze.requireParent(header.owner().groupId(),header.owner().epoch(),header.interval().domainId(),header.schema(),header.interval().lowerInclusive(),header.interval().upperExclusive());
+                    } catch(IllegalArgumentException invalid) { throw new IOException("Invalid topology FREEZE image",invalid); }
+                }
                 if (section==Section.STATE && key.length>16 && key[16]==0x27) {
                     try {
                         if (key.length!=17 || schemaFence!=null) throw new IllegalArgumentException("Invalid schema fence key/count");
@@ -701,7 +709,7 @@ public final class NativeRangeImage {
                 if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
             }
             if (context!=null) {
-                if(schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null || importBirth!=null) throw new IOException("HOME image contains DATA schema/import lifecycle");
+                if(topologyFreeze!=null || schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null || importBirth!=null) throw new IOException("HOME image contains DATA schema/import lifecycle");
                 if (!header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership");
                 for (var receipt:homeRecoveries.values()) if (!receipt.recovery().before().clusterId().equals(context.cluster()) || !receipt.recovery().before().databaseId().equals(context.database()) || !receipt.recovery().command().mutations().getFirst().columnId().equals(context.column())) throw new IOException("Qualified HOME receipt database differs");
             }
@@ -742,6 +750,7 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            if(topologyFreeze!=null && (schemaFence!=null || prepared.stream().anyMatch(p -> !committed.containsKey(p.preparation().transactionId()) && !aborted.containsKey(p.preparation().transactionId())) || gates.values().stream().anyMatch(SnapshotGate::active))) throw new IOException("Frozen topology image contains unresolved native work");
             try { cdc.finish(header.owner(),header.position()); cdc.requireAuthorityClock(sessionAuthority==null ? -1 : sessionAuthority.logicalTimeMillis()); }
             catch(IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Invalid CDC image retention",invalid); }
             if(importFileReceipts!=importFileReceiptCount)throw new IOException("Import file result count differs from image inventory");

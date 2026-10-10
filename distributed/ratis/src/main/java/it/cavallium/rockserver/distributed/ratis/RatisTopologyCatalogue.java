@@ -59,6 +59,16 @@ public final class RatisTopologyCatalogue {
         return checked(operation,List.of(put(stateKey(next.header().intentId()),bytes),put(headKey(next.header().domainId()),bytes)),
                 List.of(predicate(stateKey(next.header().intentId()),expected.encode()),predicate(headKey(next.header().domainId()),expected.encode())));
     }
+    /** Commits exclusive administration authority; parent FREEZE still needs fresh native admission. */
+    public DistributedCommand prepareFencing(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead) {
+        expected.requireDefinition(definition);
+        if(expected.phase()!=TopologyChange.Phase.PREPARED) throw new IllegalArgumentException("Fencing requires PREPARED intent");
+        var next=expected.beginFencing(); var header=next.header(); byte[] bytes=next.encode();
+        return checked(operation,List.of(put(stateKey(header.intentId()),bytes),put(headKey(header.domainId()),bytes)),
+                List.of(predicate(stateKey(header.intentId()),expected.encode()),predicate(headKey(header.domainId()),expected.encode()),
+                        predicate(domainKey(header.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),predicate(identityKey(header.intentId()),definition.digest()),
+                        predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode())));
+    }
     public CommandResult execute(DistributedCommand command) throws IOException { validator.accept(command); try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))),8)); } catch(IllegalArgumentException invalid) { throw new IOException("Invalid topology command reply",invalid); } }
     private DistributedCommand checked(OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) { var command=new DistributedCommand(group,epoch,schema,operation,mutations,predicates); validator.accept(command); return command; }
     private Mutation put(byte[] key,byte[] value) { return new Mutation(Mutation.Kind.PUT,column,key,value); }
@@ -88,8 +98,14 @@ public final class RatisTopologyCatalogue {
                 if(previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.ABORTED) throw new IllegalArgumentException("Native topology execution authority is not configured");
                 return;
             }
-            if(command.predicates().get(0).expectedValue()!=null || !next.equals(TopologyChange.State.begin(header))) throw new IllegalArgumentException("Topology BEGIN must be initial");
-            var oldHead=command.predicates().get(1).expectedValue(); if(oldHead!=null) { var previous=TopologyChange.State.decode(oldHead); requireNamespace(previous.header(),cluster,database); if(!previous.header().domainId().equals(header.domainId()) || !previous.terminal()) throw new IllegalArgumentException("Topology predecessor is not terminal"); }
+            var oldState=command.predicates().get(0).expectedValue(); var oldHead=command.predicates().get(1).expectedValue();
+            if(oldState==null) {
+                if(!next.equals(TopologyChange.State.begin(header))) throw new IllegalArgumentException("Topology BEGIN must be initial");
+                if(oldHead!=null) { var previous=TopologyChange.State.decode(oldHead); requireNamespace(previous.header(),cluster,database); if(!previous.header().domainId().equals(header.domainId()) || !previous.terminal()) throw new IllegalArgumentException("Topology predecessor is not terminal"); }
+            } else {
+                var previous=TopologyChange.State.decode(oldState); next.requireSuccessorOf(previous);
+                if(!Arrays.equals(oldState,oldHead) || previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.FENCING) throw new IllegalArgumentException("Topology fencing requires exact prepared head/state");
+            }
             if(reader==null) throw new IllegalArgumentException("Topology immutable definition reader unavailable");
             var definition=TopologyChange.Definition.decode(reader.read(definitionKey(header.definitionDigest()))); header.requireDefinition(definition);
             guard(command.predicates().get(2),column,domainKey(header.domainId())); if(!Arrays.equals(command.predicates().get(2).expectedValue(),RangeDirectoryCodec.encode(definition.sourceDirectory()))) throw new IllegalArgumentException("Topology source directory differs");
@@ -100,8 +116,20 @@ public final class RatisTopologyCatalogue {
     }
     private static void mutation(Mutation mutation,byte[] key) { if(!Arrays.equals(mutation.key(),key)) throw new IllegalArgumentException("Topology mutation key differs"); }
     private static void guard(KeyPredicate predicate,UUID column,byte[] key) { if(predicate.bucket() || !predicate.columnId().equals(column) || !Arrays.equals(predicate.key(),key)) throw new IllegalArgumentException("Topology guard differs"); }
-    private static void requireDefinition(TopologyChange.Definition definition,UUID cluster,UUID database,byte[] digest) { requireNamespace(definition.header(),cluster,database); if(!Arrays.equals(definition.digest(),digest)) throw new IllegalArgumentException("Topology definition commitment differs"); }
+    private static void requireDefinition(TopologyChange.Definition definition,UUID cluster,UUID database,byte[] digest) {
+        requireNamespace(definition.header(),cluster,database);
+        if(!Arrays.equals(definition.digest(),digest)) throw new IllegalArgumentException("Topology definition commitment differs");
+        if(RangeDirectoryCodec.encodedSize(definition.sourceDirectory())>RatisCatalogue.MAX_DIRECTORY_BYTES || RangeDirectoryCodec.encodedSize(definition.targetDirectory())>RatisCatalogue.MAX_DIRECTORY_BYTES) throw new IllegalArgumentException("Topology source/target exceeds catalogue directory budget");
+    }
     private static void requireNamespace(TopologyChange.Header header,UUID cluster,UUID database) { if(!header.clusterId().equals(cluster) || !header.databaseId().equals(database)) throw new IllegalArgumentException("Foreign topology namespace"); }
+    /** Other administration owns the domain only while its topology head is absent or terminal. */
+    public static void requireAdministrationGuard(KeyPredicate predicate,RangeDirectory directory) {
+        if(predicate.bucket() || !Arrays.equals(predicate.key(),headKey(directory.domainId()))) throw new IllegalArgumentException("Missing topology administration guard");
+        if(predicate.expectedValue()!=null) {
+            var state=TopologyChange.State.decode(predicate.expectedValue()); requireNamespace(state.header(),directory.clusterId(),directory.databaseId());
+            if(!state.terminal() || !state.header().domainId().equals(directory.domainId())) throw new IllegalArgumentException("Active/foreign topology prevents other administration");
+        }
+    }
     public static byte[] stateKey(UUID id) { return idKey(STATE,id); }
     public static byte[] headKey(UUID id) { return idKey(HEAD,id); }
     public static byte[] identityKey(UUID id) { return idKey(IDENTITY,id); }

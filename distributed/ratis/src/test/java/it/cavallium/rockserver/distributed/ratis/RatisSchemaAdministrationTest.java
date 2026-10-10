@@ -269,7 +269,7 @@ class RatisSchemaAdministrationTest {
             var columns=new ArrayList<>(source.columns()); columns.add(column(8,new UUID(78,1),"added")); var target=next(source,columns);
             var schemaChange=new SchemaChange.Definition(new UUID(78,2),operation(),active,source,target);
             publishSchema(f,source); catalogue.execute(catalogue.prepare(operation(),null,active)); publishSchema(f,target); admin.execute(admin.prepareDefinition(operation(),schemaChange,null,null,null));
-            var schemaBegin=admin.prepareBegin(schemaChange,null,null,null); assertEquals(5,schemaBegin.predicates().size());
+            var schemaBegin=admin.prepareBegin(schemaChange,null,null,null); assertEquals(6,schemaBegin.predicates().size());
             var ranges=active.ranges().stream().map(r -> new RangeDescriptor(r.rangeId(),r.groupId(),r.rangeEpoch(),r.configurationVersion(),r.lowerInclusive(),r.upperExclusive(),RangeDescriptor.TopologyState.FENCED,r.replicas())).toList();
             var fenced=new RangeDirectory(active.clusterId(),active.databaseId(),active.domainId(),active.schemaEpoch(),active.schemaDigest(),active.generation()+1,active.columns(),active.routingPrefixBytes(),ranges); var fence=catalogue.prepare(operation(),active,fenced);
             UUID importId=new UUID(78,3); var manifests=new ArrayList<NativeSstImportManifest>();
@@ -294,7 +294,7 @@ class RatisSchemaAdministrationTest {
             var definition=new SchemaChange.Definition(new UUID(40,0),operation(),original,source,target); assertTrue(definition.encode().length>1900*1024);
             publishSchema(f,source); catalogue(client).execute(catalogue(client).prepare(operation(),null,original)); publishSchema(f,target);
             var publish=admin.prepareDefinition(operation(),definition,null,null,null); assertTrue(DistributedCommandCodec.encode(publish).length<=DistributedCommandCodec.MAX_ENCODED_BYTES); admin.execute(publish);
-            var begin=admin.prepareBegin(definition,null,null,null); assertEquals(5,begin.predicates().size()); assertTrue(DistributedCommandCodec.encode(begin).length<16*1024);
+            var begin=admin.prepareBegin(definition,null,null,null); assertEquals(6,begin.predicates().size()); assertTrue(DistributedCommandCodec.encode(begin).length<16*1024);
             assertEquals(CommandResult.Status.SUCCESS,admin.execute(begin).status()); var prepared=admin.readHead(source.domainId()); var manifest=admissions(definition);
             admin.execute(admin.prepareAdmissions(operation(),prepared,definition,manifest)); assertEquals(CommandResult.Status.SUCCESS,admin.executeFencing(admin.prepareFencing(operation(),prepared,definition,manifest)).status());
         }

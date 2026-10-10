@@ -63,12 +63,15 @@ public final class RatisRangeImportCatalogue {
     public DistributedCommand prepareAdmissionCommit(OperationId operation,RangeImportDefinition definition,RangeImportAdmission admission) { requireDefinitionIdentity(definition,cluster,database); admission.requireDefinition(definition); return prepareCommit(operation,ADMISSION_REF,admissionArtifact(admission)); }
     private DistributedCommand prepareCommit(OperationId operation,byte kind,Artifact artifact) { byte[] key=refKey(kind,artifact.digest()); return checked(operation,List.of(put(key,artifact.encode())),List.of(predicate(key,null))); }
     public DistributedCommand prepareBegin(OperationId operation,RangeImportDefinition definition,Head previous,RatisSchemaAdministration.Head schemaHead) {
+        return prepareBegin(operation,definition,previous,schemaHead,null);
+    }
+    public DistributedCommand prepareBegin(OperationId operation,RangeImportDefinition definition,Head previous,RatisSchemaAdministration.Head schemaHead,TopologyChange.State topologyHead) {
         requireDefinitionIdentity(definition,cluster,database); var head=Head.prepared(definition); byte[] key=headKey(head.domainId()),record=importKey(head.importId());
         if(previous!=null && (previous.phase()!=Phase.COMPLETE || !namespace(previous,head))) throw new IllegalArgumentException("Active or foreign import prevents a new import");
         var guard=predicate(RatisSchemaAdministration.headKey(head.domainId()),schemaHead==null ? null : schemaHead.encode()); RatisSchemaAdministration.requireTopologyGuard(guard,definition.sourceDirectory());
         // Check the eventual bulk envelope before native owners can receive this prepared intent.
         preparePublication(definition,new Head(head.clusterId(),head.databaseId(),head.domainId(),head.importId(),head.publication(),head.definitionDigest(),head.sourceDigest(),head.targetDigest(),Phase.PREPARED,null,null),null,schemaHead,new Artifact(new byte[32],1,1));
-        return checked(operation,List.of(put(key,head.encode()),put(record,head.encode())),List.of(predicate(key,previous==null ? null : previous.encode()),predicate(record,null),predicate(directoryKey(head.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),guard,predicate(definitionKey(definition.digest()),definitionArtifact(definition).encode())));
+        return checked(operation,List.of(put(key,head.encode()),put(record,head.encode())),List.of(predicate(key,previous==null ? null : previous.encode()),predicate(record,null),predicate(directoryKey(head.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),guard,predicate(definitionKey(definition.digest()),definitionArtifact(definition).encode()),predicate(RatisTopologyCatalogue.headKey(head.domainId()),topologyHead==null ? null : topologyHead.encode())));
     }
     public DistributedCommand preparePublication(RangeImportDefinition definition,Head prepared,RangeImportAdmission admission,RatisSchemaAdministration.Head schemaHead) { Objects.requireNonNull(admission).requireDefinition(definition); return preparePublication(definition,prepared,admission,schemaHead,admissionArtifact(admission)); }
     private DistributedCommand preparePublication(RangeImportDefinition definition,Head prepared,RangeImportAdmission admission,RatisSchemaAdministration.Head schemaHead,Artifact artifact) {
@@ -144,10 +147,10 @@ public final class RatisRangeImportCatalogue {
         };
     }
     private static void validateBegin(DistributedCommand command,Head next,ImmutableReader reader,boolean structural) {
-        if(command.mutations().size()!=2 || command.predicates().size()!=5) throw new IllegalArgumentException("Prepared import requires exact identity/directory/schema/artifact guards");
+        if(command.mutations().size()!=2 || command.predicates().size()!=6) throw new IllegalArgumentException("Prepared import requires exact identity/directory/schema/artifact guards");
         requireMutation(command,1,importKey(next.importId()),next.encode()); requirePredicate(command,0,headKey(next.domainId()),null,false); requirePredicate(command,1,importKey(next.importId()),null,true);
         byte[] previous=command.predicates().getFirst().expectedValue(); if(previous!=null) { var head=Head.decode(previous); if(head.phase()!=Phase.COMPLETE || !namespace(head,next)) throw new IllegalArgumentException("Active import prevents begin"); }
-        var source=directory(command.predicates().get(2),next); if(!Arrays.equals(source.payloadDigest(),next.sourceDigest())) throw new IllegalArgumentException("Import source changed"); RatisSchemaAdministration.requireTopologyGuard(command.predicates().get(3),source); requireArtifactPredicate(command.predicates().get(4),DEFINITION_REF,next.definitionDigest());
+        var source=directory(command.predicates().get(2),next); if(!Arrays.equals(source.payloadDigest(),next.sourceDigest())) throw new IllegalArgumentException("Import source changed"); RatisSchemaAdministration.requireTopologyGuard(command.predicates().get(3),source); requireArtifactPredicate(command.predicates().get(4),DEFINITION_REF,next.definitionDigest()); RatisTopologyCatalogue.requireAdministrationGuard(command.predicates().get(5),source);
         if(!structural) { var definition=definition(reader,next.definitionDigest(),next.clusterId(),next.databaseId()); next.requireDefinition(definition); if(!Arrays.equals(source.payloadDigest(),definition.sourceDirectory().payloadDigest())) throw new IllegalArgumentException("Prepared import differs from committed definition"); requireRef(command.predicates().get(4),definitionArtifact(definition)); }
     }
     private static void validatePublication(DistributedCommand command,Head next,ImmutableReader reader,boolean structural) {

@@ -36,7 +36,7 @@ public final class RatisCatalogueGenesis implements AutoCloseable {
             if (acquired==null) throw new IOException("Genesis intent already owned"); lock=acquired;
             if (Files.exists(this.journal)) {
                 var input=new DataInputStream(new ByteArrayInputStream(SessionJournalFiles.read(this.journal,MAX_BYTES)));
-                if (input.readInt()!=MAGIC || input.readInt()!=1 || !Arrays.equals(input.readNBytes(32),intent)) throw new IOException("Genesis intent changed");
+                if (input.readInt()!=MAGIC || !Arrays.equals(input.readNBytes(32),intent)) throw new IOException("Genesis intent changed");
                 int size=input.readInt(); if (size<0 || size>MAX_BYTES || size>input.available()-1) throw new IOException("Invalid genesis command size");
                 byte[] bytes=input.readNBytes(size); command=DistributedCommandCodec.decode(bytes); var id=command.operationId();
                 if (id.epoch()!=0 || id.sequence()!=0 || !Arrays.equals(bytes,DistributedCommandCodec.encode(prepare(id.sessionId())))) throw new IOException("Noncanonical genesis command");
@@ -73,13 +73,13 @@ public final class RatisCatalogueGenesis implements AutoCloseable {
         byte[] ledger=SessionEpochLedger.initial(d.clusterId(),d.databaseId(),initialTime).encode();
         var prepared=new DistributedCommand(c.groupId(),c.epoch(),c.schemaDigest(),new OperationId(session,0,0),
                 List.of(new Mutation(Mutation.Kind.PUT,c.directoryColumn(),uuid(d.domainId()),directory),new Mutation(Mutation.Kind.PUT,c.sessionsColumn(),uuid(d.databaseId()),ledger)),
-                List.of(new KeyPredicate(c.directoryColumn(),uuid(d.domainId()),null),new KeyPredicate(c.sessionsColumn(),uuid(d.databaseId()),null),new KeyPredicate(c.directoryColumn(),RatisSchemaAdministration.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisRangeImportCatalogue.headKey(d.domainId()),null)));
+                List.of(new KeyPredicate(c.directoryColumn(),uuid(d.domainId()),null),new KeyPredicate(c.sessionsColumn(),uuid(d.databaseId()),null),new KeyPredicate(c.directoryColumn(),RatisSchemaAdministration.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisRangeImportCatalogue.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisTopologyCatalogue.headKey(d.domainId()),null)));
         validator.accept(prepared); return prepared;
     }
     private void persist(CommandResult outcome) throws IOException {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
-            output.writeInt(MAGIC); output.writeInt(1); output.write(intent); byte[] encoded=DistributedCommandCodec.encode(command);
+            output.writeInt(MAGIC); output.write(intent); byte[] encoded=DistributedCommandCodec.encode(command);
             output.writeInt(encoded.length); output.write(encoded); output.writeByte(outcome==null ? 0 : outcome.status()==CommandResult.Status.SUCCESS ? 1 : outcome.status()==CommandResult.Status.CONFLICT ? 2 : 3);
             output.flush(); SessionJournalFiles.write(journal,bytes.toByteArray(),MAX_BYTES);
         } catch (IOException failure) { fenced=true; throw failure; }

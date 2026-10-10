@@ -3576,6 +3576,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     prepareImportApply(RatisRangeImportRpc.proposal(owned),generation);return Message.valueOf(ByteString.copyFrom(owned));
                 });
             }
+            if(kind==RatisTopologyAuthority.KIND){
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Topology authority requires configured fresh catalogue dispatcher");
+                checkCatalogueOwner();long generation=admissionGeneration.get();var owner=leadership();final long configurationStamp;
+                synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Topology authority waits for configuration apply");configurationStamp=schemaConfigurationStamp;}
+                return schemaAuthorityQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{
+                    checkCatalogueOwner();if(generation!=admissionGeneration.get() || leadership().term()!=owner.term())throw new IOException("Topology authority lost read-barrier owner");
+                    var view=RatisTopologyAuthority.readNative(store,schemaColumn,schemaCluster,schemaDatabase,RatisTopologyAuthority.decodeRequest(owned));
+                    checkCatalogueOwner();var current=leadership();
+                    synchronized(admissions){if(generation!=admissionGeneration.get() || current.term()!=owner.term() || view.cut().term()!=current.term()
+                            || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(view.cut(),store.applied()))throw new IOException("Topology authority cut/configuration changed");}
+                    return Message.valueOf(ByteString.copyFrom(RatisTopologyAuthority.reply(view)));
+                });
+            }
             if(kind==RatisRangeImportAuthority.KIND){
                 if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Import authority requires configured fresh catalogue dispatcher");
                 checkCatalogueOwner();long generation=admissionGeneration.get();var owner=leadership();final long configurationStamp;

@@ -32,6 +32,7 @@ public final class RatisRangeImportController implements AutoCloseable {
     private final RatisNodePlan.Catalogue binding;
     private final RaftClient client;
     private final RatisRangeImportCatalogue catalogue;
+    private final RatisTopologyCatalogue topology;
     private final RatisSchemaAdministration schema;
     private final DataPlane data;
     private final FileChannel lockChannel;
@@ -51,6 +52,7 @@ public final class RatisRangeImportController implements AutoCloseable {
         this.binding=Objects.requireNonNull(binding); this.client=Objects.requireNonNull(client); this.data=Objects.requireNonNull(data);
         if(!Files.isDirectory(this.root,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Import journal root absent");
         catalogue=new RatisRangeImportCatalogue(client,cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
+        topology=new RatisTopologyCatalogue(client,cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
         schema=new RatisSchemaAdministration(client,cluster,database,binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
         lockChannel=FileChannel.open(this.root.resolve("import-controller.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
         try { lock=lockChannel.tryLock(); if(lock==null) throw new IOException("Import journal root already owned"); }
@@ -114,7 +116,7 @@ public final class RatisRangeImportController implements AutoCloseable {
                 finish(h,result,cursor<chunks ? Phase.DEFINITION : Phase.BEGIN,cursor<chunks ? cursor+1 : 0);
             }
             case BEGIN -> {
-                var result=command(h,() -> { beforeRead(h,"begin-witness"); var prior=catalogue.readHead(d.sourceDirectory().domainId()); beforeRead(h,"schema-witness"); var guard=schema.readHead(d.sourceDirectory().domainId()); if(guard!=null) h.fields.put("schemaHead",guard.encode()); return catalogue.prepareBegin(next(h),d,prior,guard); });
+                var result=command(h,() -> { beforeRead(h,"begin-witness"); var prior=catalogue.readHead(d.sourceDirectory().domainId()); beforeRead(h,"schema-witness"); var guard=schema.readHead(d.sourceDirectory().domainId()); if(guard!=null) h.fields.put("schemaHead",guard.encode()); beforeRead(h,"topology-witness"); var topologyHead=topology.readHead(d.sourceDirectory().domainId()); return catalogue.prepareBegin(next(h),d,prior,guard,topologyHead); });
                 finish(h,result,Phase.FILES,0);
             }
             case FILES -> transfer(h);

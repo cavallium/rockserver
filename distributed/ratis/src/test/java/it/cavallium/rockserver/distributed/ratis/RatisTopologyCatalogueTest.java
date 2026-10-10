@@ -52,6 +52,24 @@ class RatisTopologyCatalogueTest {
             assertThrows(IllegalArgumentException.class,()->catalogue.prepareDefinition(f.operation(4),b,new RatisTopologyCatalogue.Capacity(1,RatisTopologyCatalogue.MAX_BYTES)));
         }
     }
+    @Test void fencingCommitsOnlyAgainstExactPreparedSourceAndSurvivesReopen() throws Exception {
+        var owner=owner(); TopologyChange.State fencedIntent;
+        try(var f=owner.new Fixture()) {
+            var source=source(f); f.seed(source); var definition=split(source,1,128); var catalogue=catalogue(f);
+            catalogue.execute(catalogue.prepareDefinition(f.operation(1),definition,null));
+            catalogue.execute(catalogue.prepareBegin(f.operation(2),definition,null,null,null));
+            var prepared=catalogue.readHead(source.domainId()); var fencing=catalogue.prepareFencing(f.operation(3),definition,prepared,null,null);
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(fencing).status());
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(fencing).status());
+            fencedIntent=catalogue.readHead(source.domainId()); assertEquals(TopologyChange.Phase.FENCING,fencedIntent.phase());
+            assertEquals(fencedIntent,catalogue.readIntent(definition.header().intentId()));
+            assertThrows(IllegalStateException.class,()->catalogue.prepareAbort(f.operation(4),fencedIntent));
+            var staleAbort=catalogue.prepareAbort(f.operation(5),prepared);
+            assertEquals(CommandResult.Status.CONFLICT,catalogue.execute(staleAbort).status());
+            assertEquals(fencedIntent,catalogue.readHead(source.domainId()));
+        }
+        try(var f=owner.new Fixture()) { assertEquals(fencedIntent,catalogue(f).readHead(fencedIntent.header().domainId())); }
+    }
     @Test void sourceDirectoryCasRejectsStaleIntentAndNativeStageAuthorityCannotBeForged() throws Exception {
         var owner=owner(); try(var f=owner.new Fixture()) {
             var source=source(f); f.seed(source); var catalogue=catalogue(f); var definition=split(source,1,128);

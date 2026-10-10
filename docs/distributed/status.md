@@ -894,15 +894,21 @@ server process, network/quorum probe, power-loss run or deployment was performed
 
 ## Required remaining work
 
-Topology now has a bounded canonical definition and staged quorum-proof model,
-plus native catalogue CAS for immutable intent reservation, PREPARED and explicit
-abort. Controlled native tests cover retry, conflicting reservations, stale source
-directories, reopen and image restoration. The focused topology/catalogue gate
-passes 29 tests in six classes (`/tmp/rockserver-topology-intent-value-gate.log`).
-No execution phase can be persisted through this catalogue adapter yet: committed
-parent freeze, metadata-only child birth, dynamic Ratis startup, qualified publication,
-activation and lineage handoff remain required. Relocation keeps its source writable
-and currently admits only intent preparation/abort.
+Topology has bounded definitions, staged quorum proofs and catalogue CAS for
+reservation, PREPARED, FENCING and explicit pre-fencing abort. Directory publication
+and schema/import starts mutually exclude active topology intents through exact
+head guards. A fresh catalogue query binds the definition, intent and source
+directory at one completed cut and rechecks leadership/configuration ownership.
+The trusted native FREEZE seam waits for actual writable owners, prepared work and
+snapshot gates to drain, then atomically persists the original parent cut. Readonly
+owners, outcome lookup and explicit receipt/epoch accounting remain available.
+Cold reopen and images preserve the fence; images cannot discard it.
+Combined focused validation passes 149 tests in 19 classes. Unchanged passing
+results from `/tmp/rockserver-topology-freeze-fixture-gate.log` are reused with the
+four repaired authority fixtures in `/tmp/rockserver-topology-authority-fixture-gate.log`.
+The DATA Ratis FREEZE admission/replay adapter, metadata-only child birth, dynamic
+group startup, qualified publication/activation and lineage handoff remain required.
+Relocation currently admits preparation/abort while its source stays writable.
 
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
   including consistent cross-group/unbounded pages, typed pin-loss errors and retained

@@ -74,7 +74,10 @@ public final class RatisSchemaAdministration {
         return prepareDefinition(operation,definition,previous,previousColumn,previousApi,null);
     }
     public DistributedCommand prepareDefinition(OperationId operation,SchemaChange.Definition definition,Head previous,byte[] previousColumn,byte[] previousApi,RatisRangeImportCatalogue.Head importHead) {
-        prepareBegin(definition,previous,previousColumn,previousApi,importHead);
+        return prepareDefinition(operation,definition,previous,previousColumn,previousApi,importHead,null);
+    }
+    public DistributedCommand prepareDefinition(OperationId operation,SchemaChange.Definition definition,Head previous,byte[] previousColumn,byte[] previousApi,RatisRangeImportCatalogue.Head importHead,TopologyChange.State topologyHead) {
+        prepareBegin(definition,previous,previousColumn,previousApi,importHead,topologyHead);
         byte[] key=definitionKey(definition.digest());
         return checked(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,definition.encode())),List.of(new KeyPredicate(column,key,null)));
     }
@@ -83,6 +86,9 @@ public final class RatisSchemaAdministration {
     }
     /** Null import owner is an exact absent-head predicate, never an unlocked absence assertion. */
     public DistributedCommand prepareBegin(SchemaChange.Definition definition,Head previous,byte[] previousColumn,byte[] previousApi,RatisRangeImportCatalogue.Head importHead) {
+        return prepareBegin(definition,previous,previousColumn,previousApi,importHead,null);
+    }
+    public DistributedCommand prepareBegin(SchemaChange.Definition definition,Head previous,byte[] previousColumn,byte[] previousApi,RatisRangeImportCatalogue.Head importHead,TopologyChange.State topologyHead) {
         var header=definition.header();
         long allocated=Math.max(previous==null ? 0 : previous.allocatedThrough(),Math.max(header.sourceMaximumApiId(),header.targetMaximumApiId()));
         var next=new Head(SchemaChange.Status.begin(header),allocated); byte[] key=headKey(header.domainId());
@@ -93,7 +99,8 @@ public final class RatisSchemaAdministration {
                         new KeyPredicate(column,directoryKey(header.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),
                         new KeyPredicate(column,RatisColumnIdentities.columnKey(header.changedColumnId()),previousColumn==null ? expected : previousColumn),
                         new KeyPredicate(column,RatisColumnIdentities.apiKey(header.changedApiId()),previousApi==null ? expected : previousApi),
-                        new KeyPredicate(column,RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode())));
+                        new KeyPredicate(column,RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode()),
+                        new KeyPredicate(column,RatisTopologyCatalogue.headKey(header.domainId()),topologyHead==null ? null : topologyHead.encode())));
     }
     public SchemaAdmissionManifest readAdmissions(SchemaChange.Definition definition,byte[] digest) throws IOException {
         byte[] value=read(admissionKey(digest),SchemaAdmissionManifest.MAX_BYTES); if (value==null) return null;
@@ -248,7 +255,7 @@ public final class RatisSchemaAdministration {
         }
     }
     private static void validateBegin(DistributedCommand command,Head next,Head previous,UUID cluster,UUID database,ImmutableReader reader,boolean structural) {
-        if (previous!=null && !previous.terminal() || command.mutations().size()!=1 || command.predicates().size()!=5) throw new IllegalArgumentException("Schema administration already active or invalid begin shape");
+        if (previous!=null && !previous.terminal() || command.mutations().size()!=1 || command.predicates().size()!=6) throw new IllegalArgumentException("Schema administration already active or invalid begin shape");
         var header=next.status().header(); var source=RangeDirectoryCodec.decode(command.predicates().get(1).expectedValue());
         if (!Arrays.equals(command.predicates().get(1).key(),directoryKey(header.domainId())) || !Arrays.equals(source.payloadDigest(),header.sourceDirectoryDigest())
                 || !source.clusterId().equals(header.clusterId()) || !source.databaseId().equals(header.databaseId()) || !source.domainId().equals(header.domainId())) throw new IllegalArgumentException("Schema begin changed original source directory");
@@ -261,6 +268,7 @@ public final class RatisSchemaAdministration {
         long prior=Math.max(previous==null ? 0 : previous.allocatedThrough(),header.sourceMaximumApiId());
         if (header.kind()==SchemaChange.Kind.CREATE_COLUMN && header.changedApiId()<=prior || next.allocatedThrough()!=Math.max(prior,header.targetMaximumApiId())) throw new IllegalArgumentException("Schema begin reuses or changes allocated column ID");
         RatisRangeImportCatalogue.requireTopologyGuard(command.predicates().get(4),source);
+        RatisTopologyCatalogue.requireAdministrationGuard(command.predicates().get(5),source);
         byte[] issued=null;
         for (int i=0;i<2;i++) {
             byte[] key=i==0 ? RatisColumnIdentities.columnKey(header.changedColumnId()) : RatisColumnIdentities.apiKey(header.changedApiId());
