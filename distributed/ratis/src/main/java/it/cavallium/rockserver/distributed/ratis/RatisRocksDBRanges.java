@@ -21,25 +21,29 @@ public final class RatisRocksDBRanges implements AutoCloseable {
     }
     public CompletableFuture<OwnedRead> open(long column,Keys lower,Keys upper,boolean reverse,Duration ttl,RequestContext context) {
         try {
-            var deadline=new Deadline(context); var binding=RatisLogicalClient.supported(schema,column); lower=bound(lower); upper=bound(upper);
-            byte[] low=RatisLogicalRangePages.bound(schema,binding.columnId(),lower),high=RatisLogicalRangePages.upperBound(schema,binding.columnId(),upper);
-            var scope=new TransactionScope(List.of(TransactionScope.Span.range(binding.columnId(),low,high))); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
-            RatisLogicalRangePages.validateBounds(scope,schema,column,lower,upper);
-            if (ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Range TTL must be whole milliseconds up to60seconds");
-            var owned=new OwnedRead(column,lower,upper,reverse);
-            synchronized (this) { if (closing || owners.size()>=MAX_OWNERS) throw new IOException("Readonly range ownership exhausted"); owners.add(owned); }
-            CompletableFuture<RatisRocksDBAdapter.Allocation> allocating;
-            try { allocating=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }
-            catch (Throwable failure) { owned.acquisition.completeExceptionally(failure); owned.remove(); return CompletableFuture.failedFuture(failure); }
-            allocating.thenCompose(allocation -> {
-                try { owned.lease=snapshots.open(allocation.snapshot(),allocation.identity().snapshot(),scope,ttl,deadline.remaining()); return owned.lease.completion(); }
-                catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
-            }).whenComplete((ignored,failure) -> {
-                if (failure==null) try { deadline.remaining(); owned.acquisition.complete(owned); } catch (Throwable expired) { failure=expired; }
-                if (failure!=null) { owned.acquisition.completeExceptionally(failure); owned.cleanup(); }
-            });
-            var view=owned.view(); view.whenComplete((ignored,failure) -> { if (view.isCancelled()) owned.cleanup(); }); return view;
+            var owned=openOwned(column,lower,upper,reverse,ttl,context); var view=owned.view();
+            view.whenComplete((ignored,failure) -> { if (view.isCancelled()) owned.cleanup(); }); return view;
         } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+    }
+    OwnedRead openOwned(long column,Keys lower,Keys upper,boolean reverse,Duration ttl,RequestContext context) throws Exception {
+        var deadline=new Deadline(context); var binding=RatisLogicalClient.supported(schema,column); lower=bound(lower); upper=bound(upper);
+        byte[] low=RatisLogicalRangePages.bound(schema,binding.columnId(),lower),high=RatisLogicalRangePages.upperBound(schema,binding.columnId(),upper);
+        var scope=new TransactionScope(List.of(TransactionScope.Span.range(binding.columnId(),low,high))); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
+        RatisLogicalRangePages.validateBounds(scope,schema,column,lower,upper);
+        if (ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Range TTL must be whole milliseconds up to60seconds");
+        var owned=new OwnedRead(column,lower,upper,reverse);
+        synchronized (this) { if (closing || owners.size()>=MAX_OWNERS) throw new IOException("Readonly range ownership exhausted"); owners.add(owned); }
+        CompletableFuture<RatisRocksDBAdapter.Allocation> allocating;
+        try { allocating=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }
+        catch (Throwable failure) { owned.acquisition.completeExceptionally(failure); owned.remove(); return owned; }
+        allocating.thenCompose(allocation -> {
+            try { owned.lease=snapshots.open(allocation.snapshot(),allocation.identity().snapshot(),scope,ttl,deadline.remaining()); return owned.lease.completion(); }
+            catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
+        }).whenComplete((ignored,failure) -> {
+            if (failure==null) try { deadline.remaining(); owned.acquisition.complete(owned); } catch (Throwable expired) { failure=expired; }
+            if (failure!=null) { owned.acquisition.completeExceptionally(failure); owned.cleanup(); }
+        });
+        return owned;
     }
     /** One independently consistent page, with cleanup retained through actual completion. */
     public CompletableFuture<RangePage<KV>> page(long column,Keys lower,Keys upper,boolean reverse,Keys resume,RangeBudget budget,RequestContext context) {
@@ -86,7 +90,8 @@ public final class RatisRocksDBRanges implements AutoCloseable {
         private int views,readers;
         private boolean removed,releaseRequested,released;
         OwnedRead(long column,Keys lower,Keys upper,boolean reverse) { this.column=column; this.lower=lower; this.upper=upper; this.reverse=reverse; }
-        private synchronized CompletableFuture<OwnedRead> view() { if (!acquisition.isDone() && views>=MAX_WAITERS) return CompletableFuture.failedFuture(new IOException("Range observer capacity exhausted")); if (!acquisition.isDone()) views++; return acquisition.copy(); }
+        final CompletableFuture<Void> drained=new CompletableFuture<>();
+        synchronized CompletableFuture<OwnedRead> view() { if (!acquisition.isDone() && views>=MAX_WAITERS) return CompletableFuture.failedFuture(new IOException("Range observer capacity exhausted")); if (!acquisition.isDone()) views++; return acquisition.copy(); }
         public CompletableFuture<RangePage<KV>> page(Keys resume,RangeBudget budget,RequestContext context) {
             return page(lower,upper,reverse,resume,budget,context);
         }
@@ -120,7 +125,7 @@ public final class RatisRocksDBRanges implements AutoCloseable {
                     .thenCompose(ignored -> lease==null ? CompletableFuture.completedFuture(null) : lease.release(context))
                     .thenRun(() -> { synchronized (this) { released=true; } });
         }
-        private void cleanup() {
+        void cleanup() {
             CompletableFuture<Void> attempt;
             synchronized (this) { if (removed || cleanup!=null) return; cleanup=attempt=new CompletableFuture<>(); }
             release(RequestContext.batch()).whenComplete((ignored,failure) -> {
@@ -133,7 +138,7 @@ public final class RatisRocksDBRanges implements AutoCloseable {
             synchronized (this) { if (removed) return; if (!acquisition.isDone() || readers!=0 || !released) throw new IOException("Readonly range work or release unresolved; ownership retained"); releaseRequested=true; }
             if (lease!=null) lease.close(); remove();
         }
-        private void remove() { synchronized (this) { removed=true; } synchronized (RatisRocksDBRanges.this) { owners.remove(this); } }
+        private void remove() { synchronized (this) { removed=true; } synchronized (RatisRocksDBRanges.this) { owners.remove(this); } drained.complete(null); }
     }
 
     private static Keys bound(Keys keys) { return keys==null || keys.keys().length==0 ? null : RatisLogicalRangePages.copy(keys); }

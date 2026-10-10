@@ -203,20 +203,54 @@ final class RatisRocksDBIterators {
         for (var entry:matching) drains.add(close(entry.id,context));
         return CompletableFuture.allOf(drains.toArray(CompletableFuture[]::new));
     }
+    record Acquisition(CompletableFuture<Resource> ready,CompletableFuture<Void> drained,Runnable retryCleanup) {
+        Acquisition(CompletableFuture<Resource> ready,CompletableFuture<Void> drained) { this(ready,drained,() -> {}); }
+        Acquisition { Objects.requireNonNull(ready); Objects.requireNonNull(drained); Objects.requireNonNull(retryCleanup); }
+    }
+    record OwnedStream(Flux<KV> observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
     Flux<KV> stream(long transaction,long column,Keys lower,Keys upper,boolean reverse,Supplier<CompletableFuture<Resource>> source,RequestContext context) {
-        return Flux.create(sink -> {
+        return Flux.defer(() -> streamOwned(transaction,column,lower,upper,reverse,() -> new Acquisition(Objects.requireNonNull(source.get()),CompletableFuture.completedFuture(null)),context).observer());
+    }
+    OwnedStream streamOwned(long transaction,long column,Keys lower,Keys upper,boolean reverse,Supplier<Acquisition> source,RequestContext context) {
+        var owner=new StreamSubscription();
+        var observer=Flux.<KV>create(sink -> {
+            synchronized (owner) {
+                if (owner.subscribed) { sink.error(new IllegalStateException("Owned stream already subscribed")); return; }
+                owner.subscribed=true;
+                if (owner.cancelled) { sink.complete(); return; }
+            }
             final Flow flow;
             try { flow=new Flow(transaction,column,copy(lower),copy(upper),reverse,new Deadline(context),sink); synchronized (this) { reserve(flow.charge); flows.add(flow); } }
-            catch (Throwable failure) { sink.error(failure); return; }
+            catch (Throwable failure) { owner.drained.complete(null); sink.error(failure); return; }
+            boolean cancelled;
+            synchronized (owner) { owner.flow=flow; cancelled=owner.cancelled; }
+            flow.drained.whenComplete((unused,failure) -> { if (failure==null) owner.drained.complete(null); else owner.drained.completeExceptionally(failure); });
             sink.onRequest(flow::request); sink.onCancel(flow::cancel);
-            CompletableFuture<Resource> actual; try { actual=source.get(); } catch (Throwable failure) { actual=CompletableFuture.failedFuture(failure); }
-            actual.whenComplete((resource,failure) -> { synchronized (flow) { flow.resource=resource; flow.acquiring=false; } if (failure!=null) flow.fail(unwrap(failure)); else flow.pump(); });
+            if (cancelled || sink.isCancelled()) flow.cancel();
+            boolean skip;
+            synchronized (flow) { skip=flow.stopped; if (skip) flow.acquiring=false; }
+            if (skip) { flow.cleanupFlow(); return; }
+            Acquisition actual; try { actual=Objects.requireNonNull(source.get()); } catch (Throwable failure) { actual=new Acquisition(CompletableFuture.failedFuture(failure),CompletableFuture.completedFuture(null)); }
+            synchronized (flow) { flow.sourceDrained=actual.drained(); flow.sourceCleanup=actual.retryCleanup(); }
+            actual.ready().whenComplete((resource,failure) -> { synchronized (flow) { flow.resource=resource; flow.acquiring=false; } if (failure!=null) flow.fail(unwrap(failure)); else flow.pump(); });
         },FluxSink.OverflowStrategy.ERROR);
+        return new OwnedStream(observer,owner.drained,owner::cancel);
+    }
+    private final class StreamSubscription {
+        final CompletableFuture<Void> drained=new CompletableFuture<>(); Flow flow; boolean subscribed,cancelled;
+        void cancel() {
+            Flow selected; boolean unused;
+            synchronized (this) { cancelled=true; selected=flow; unused=!subscribed; }
+            if (selected!=null) selected.cancel(); else if (unused) drained.complete(null);
+        }
     }
     private final class Flow {
         final long transaction,column,charge; final Keys lower,upper; final boolean reverse; final Deadline deadline; final FluxSink<KV> sink;
         final ArrayDeque<KV> buffered=new ArrayDeque<>(); Resource resource; Keys resume; long demand; boolean acquiring=true,busy,stopped,done,cleaning,disposed;
-        CompletableFuture<Void> drained=new CompletableFuture<>();
+        final CompletableFuture<Void> drained=new CompletableFuture<>();
+        CompletableFuture<Void> cleanupAttempt;
+        CompletableFuture<Void> sourceDrained=CompletableFuture.completedFuture(null);
+        Runnable sourceCleanup=() -> {};
         final java.util.concurrent.atomic.AtomicInteger pumping=new java.util.concurrent.atomic.AtomicInteger();
         Flow(long transaction,long column,Keys lower,Keys upper,boolean reverse,Deadline deadline,FluxSink<KV> sink) { this.transaction=transaction; this.column=column; this.lower=lower; this.upper=upper; this.reverse=reverse; this.deadline=deadline; this.sink=sink; charge=metadata(lower,upper)+RangeBudget.DEFAULT_MAX_BYTES; }
         void request(long count) { synchronized (this) { demand=count>=Long.MAX_VALUE-demand ? Long.MAX_VALUE : demand+count; } pump(); }
@@ -253,23 +287,40 @@ final class RatisRocksDBIterators {
             }
         }
         CompletableFuture<Void> cleanupFlow() {
-            final CompletableFuture<Void> proof;
+            final CompletableFuture<Void> proof; final Runnable retry; final boolean start;
             synchronized (this) {
                 if (disposed) return drained;
-                if (drained.isCompletedExceptionally() && !cleaning) drained=new CompletableFuture<>(); proof=drained;
-                if (acquiring || busy || cleaning) return proof; cleaning=true;
+                if (acquiring || busy) return drained;
+                retry=resource==null ? sourceCleanup : null;
+                start=!cleaning;
+                if (start) { cleaning=true; cleanupAttempt=new CompletableFuture<>(); }
+                proof=cleanupAttempt;
             }
+            if (retry!=null) try { retry.run(); } catch (Throwable failure) {
+                if (!start) return CompletableFuture.failedFuture(failure);
+                synchronized (this) { cleaning=false; } proof.completeExceptionally(failure); return proof;
+            }
+            if (!start) return proof;
             CompletableFuture<Void> actual;
-            try { actual=resource==null ? CompletableFuture.completedFuture(null) : resource.release(RequestContext.batch()); }
+            try { actual=resource==null ? sourceDrained : Objects.requireNonNull(resource.release(RequestContext.batch())); }
             catch (Throwable failure) { actual=CompletableFuture.failedFuture(failure); }
             actual.whenComplete((ignored,failure) -> {
                 if (failure==null) try { if (resource!=null) resource.closeLocal(); } catch (Throwable close) { failure=close; }
                 if (failure==null) synchronized (RatisRocksDBIterators.this) { if (flows.remove(this)) bytes-=charge; }
                 synchronized (this) { cleaning=false; if (failure==null) disposed=true; }
-                if (failure==null) proof.complete(null); else proof.completeExceptionally(unwrap(failure));
+                if (failure==null) { drained.complete(null); proof.complete(null); } else proof.completeExceptionally(unwrap(failure));
             });
             return proof;
         }
+    }
+    CompletableFuture<Void> retryStoppedFlowsCleanup() {
+        List<Flow> retained; synchronized (this) { retained=List.copyOf(flows); }
+        var attempts=new ArrayList<CompletableFuture<Void>>();
+        for (var flow:retained) {
+            boolean stopped; synchronized (flow) { stopped=flow.stopped && !flow.disposed; }
+            if (stopped) attempts.add(flow.cleanupFlow());
+        }
+        return CompletableFuture.allOf(attempts.toArray(CompletableFuture[]::new));
     }
     CompletableFuture<Void> closeAll(RequestContext context) {
         List<Entry> owners; List<Flow> streaming; synchronized (this) { closing=true; owners=List.copyOf(entries.values()); streaming=List.copyOf(flows); }

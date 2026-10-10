@@ -90,6 +90,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     }
     synchronized boolean ownsTransactionOrUpdate(long id) { return entries.containsKey(id); }
     boolean ownsIterator(long id) { return iterators.owns(id); }
+    CompletableFuture<Void> retryStoppedFlowsCleanup() { return iterators.retryStoppedFlowsCleanup(); }
     record OwnedDispatch(Object observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
     private static final class Tracking { final List<CompletableFuture<?>> actual=new ArrayList<>(); final List<Runnable> cancel=new ArrayList<>(); }
     private final ThreadLocal<Tracking> tracking=new ThreadLocal<>();
@@ -206,12 +207,31 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             });
         } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
     }
+    private RatisRocksDBIterators.Acquisition streamResource(long transaction,long column,Keys lower,Keys upper,boolean reverse,Deadline deadline) {
+        if (transaction!=0) return new RatisRocksDBIterators.Acquisition(resource(transaction,column,lower,upper,reverse,Duration.ofSeconds(60),deadline,true),CompletableFuture.completedFuture(null));
+        try {
+            if (ranges==null) throw unsupported();
+            var owner=ranges.openOwned(column,lower,upper,reverse,Duration.ofSeconds(60),deadline.remaining());
+            var ready=owner.view().thenApply(ignored -> (RatisRocksDBIterators.Resource)new RatisRocksDBIterators.Resource() {
+                public CompletableFuture<RangePage<KV>> page(Keys low,Keys high,boolean back,Keys resume,RangeBudget budget,RequestContext context) { return owner.page(low,high,back,resume,budget,context); }
+                public CompletableFuture<Void> release(RequestContext context) { return owner.release(context); }
+                public void closeLocal() throws IOException { owner.closeLocal(); }
+            });
+            return new RatisRocksDBIterators.Acquisition(ready,owner.drained,owner::cleanup);
+        } catch (Throwable failure) { return new RatisRocksDBIterators.Acquisition(CompletableFuture.failedFuture(failure),CompletableFuture.completedFuture(null)); }
+    }
     private Flux<KV> range(long transaction,long column,Keys lower,Keys upper,boolean reverse,RequestType.RequestTypeId type,RequestContext context) {
         if (type!=RequestType.RequestTypeId.ALL_IN_RANGE && type!=RequestType.RequestTypeId.ALL_IN_RANGE_NO_CACHE) return Flux.error(unsupported());
         schema.column(column); Keys low=copy(lower),high=copy(upper);
+        var tracker=tracking.get();
+        if (tracker!=null) {
+            var deadline=new Deadline(context);
+            var owned=iterators.streamOwned(transaction,column,low,high,reverse,() -> streamResource(transaction,column,low,high,reverse,deadline),deadline.remaining());
+            tracker.actual.add(owned.drained()); tracker.cancel.add(owned.cancelObserver()); return owned.observer();
+        }
         return Flux.defer(() -> {
             var deadline=new Deadline(context);
-            return iterators.stream(transaction,column,low,high,reverse,() -> resource(transaction,column,low,high,reverse,Duration.ofSeconds(60),deadline,true),deadline.remaining());
+            return iterators.streamOwned(transaction,column,low,high,reverse,() -> streamResource(transaction,column,low,high,reverse,deadline),deadline.remaining()).observer();
         });
     }
     private CompletableFuture<Long> open(Duration ttl,Deadline deadline) { return open(ttl,deadline,Mode.EXPLICIT); }
