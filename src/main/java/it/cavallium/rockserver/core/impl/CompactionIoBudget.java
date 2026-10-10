@@ -282,7 +282,6 @@ public final class CompactionIoBudget {
                 || compatibleShape(nativeBulkShapeInWindow, previousBulkTailShape);
         boolean stationary = !nonTailUnsafe && !unhealthyMean && !noForegroundProgress && !bulkNoProgress
                 && ownPointReliable && ownBulkReliable && bulkSafe
-                && (!pointReliable || lastPointMean == 0 || latency <= lastPointMean * 1.1)
                 && (!bulkComparable || !sameBulkShape || lastBulkMean == 0 || bulkLatency <= lastBulkMean * 1.1)
                 && (queueAnchor < 0 || queueMean <= queueAnchor + Math.max(2, queueAnchor * .2));
         if (stationary) {
