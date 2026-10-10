@@ -305,6 +305,8 @@ class CompactionReadaheadTest {
             var budgetField = controller.getClass().getDeclaredField("budget"); budgetField.setAccessible(true);
             var sizeField = CompactionIoBudget.class.getDeclaredField("readaheadBytes"); sizeField.setAccessible(true);
             ((CompactionIoBudget) budgetField.get(controller)).sample(input.next());
+            var tailField = CompactionIoBudget.class.getDeclaredField("pointTailBaseline"); tailField.setAccessible(true);
+            tailField.setDouble(budgetField.get(controller), input.pointTail);
             sizeField.setLong(budgetField.get(controller), 65536); // Isolate actuator lifetime from policy timing.
             var executorField = controller.getClass().getDeclaredField("executor"); executorField.setAccessible(true);
             var executor = (ScheduledExecutorService) executorField.get(controller);

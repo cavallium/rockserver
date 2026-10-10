@@ -74,12 +74,16 @@ public final class CompactionIoBudget {
             prefetchEvents, prefetchedBytes, settleUntil, probeHoldUntil, lastReadServiceNanos,
             recentReadBytes, recentReadMicros, recentReadCount;
     private double serviceRate, prefetchMean, priorPrefetchMean;
-    private double pointTailBaseline, bulkTailBaseline, pointTailCalibration, bulkTailCalibration,
-            bulkTailShape, bulkTailCalibrationShape, lastBulkTailShape, probeBulkTailShape;
+    private double pointTailBaseline, bulkTailBaseline, bulkTailShape, lastBulkTailShape, probeBulkTailShape;
     private long lastPointTail, lastBulkTail, probePointTail, probeBulkTail;
     private long pointTailWindow, bulkTailWindow, nativePoints, nativeBulks, nativeBulkKeys;
-    private int pointTailWindows, bulkTailWindows;
-    private boolean latencyUnsafe, tailUnsafe;
+    private boolean latencyUnsafe, tailUnsafe, nonTailUnsafe, tailCalibrationNeeded = true;
+    private int tailBlockWindows, tailBlocks;
+    private long tailOffProbeHoldUntil;
+    private long tailBlockPointMax, tailBlockBulkMax, firstPointMax, firstBulkMax;
+    private long tailBlockReads, tailBlockMicros, tailBlockKeys, tailBlockBulkMicros;
+    private double firstPointMean, firstBulkMean, tailBlockShape, firstTailShape;
+    private boolean tailBlockPointActive, tailBlockBulkActive;
     private double queueAnchor = -1, lastPointMean, lastBulkMean;
     private long queuedIntegral, safetyGrowthUntil;
     private int queueWorkers = -1, queueBadPolls, stableLoadedWindows;
@@ -156,7 +160,7 @@ public final class CompactionIoBudget {
         bulkCalls = bulkTime = bulkKeys = readSaturatedNanos = readPendingNanos = readQueuedNanos = readCompleted = 0;
         bulkEpochValid = true;
         pointTailWindow = bulkTailWindow = nativePoints = nativeBulks = nativeBulkKeys = 0;
-        latencyUnsafe = tailUnsafe = false;
+        latencyUnsafe = tailUnsafe = nonTailUnsafe = false;
         queuedIntegral = 0;
     }
 
@@ -193,8 +197,8 @@ public final class CompactionIoBudget {
                         || sample.nativeBulkCompletions < old.nativeBulkCompletions || sample.nativeBulkCompletions < 0
                         || sample.nativeBulkKeys < old.nativeBulkKeys || sample.nativeBulkKeys < 0)) {
                 pointTailBaseline = bulkTailBaseline = 0;
+                tailCalibrationNeeded = true; resetTailBlocks();
             }
-            pointTailWindows = bulkTailWindows = 0;
             lastPointMean = lastBulkMean = 0;
             reduceReadahead(0);
             return publishBudget();
@@ -233,7 +237,6 @@ public final class CompactionIoBudget {
             reduceReadahead(0);
             latencyUnsafe = true;
         }
-        long previousPointTail = lastPointTail, previousBulkTail = lastBulkTail;
         double previousBulkTailShape = lastBulkTailShape;
         long pointTailInWindow = pointTailWindow, bulkTailInWindow = bulkTailWindow;
         double nativeBulkShapeInWindow = nativeBulks > 0 ? (double) nativeBulkKeys / nativeBulks : 0;
@@ -246,8 +249,6 @@ public final class CompactionIoBudget {
         boolean bulkSafe = bulkIdle || bulkComparable && bulkHealthy;
         boolean pointTailActive = nativePoints > 0 || pointTailWindow > 0;
         boolean bulkTailActive = nativeBulks > 0 || bulkTailWindow > 0;
-        boolean tailsCalibrated = (!pointTailActive || pointTailBaseline > 0 && nativePoints >= 32)
-                && (bulkIdle && !bulkTailActive || bulkComparable && bulkTailBaseline > 0 && nativeBulks >= 32);
         boolean growthAllowed = !readGrowthVeto && bulkSafe; // Byte-rate demand remains a separate policy.
         boolean unhealthyMean = pointReliable && baseline > 0 && latency > baseline * 1.2
                 || bulkComparable && bulkBaseline > 0 && bulkLatency > bulkBaseline * 1.2;
@@ -257,13 +258,10 @@ public final class CompactionIoBudget {
                 || bulkComparable && nativeBulks >= 32 && nativeBulkShapeInWindow > 0 && bulkTailInWindow > 0;
         boolean sameBulkShape = previousBulkTailShape == 0 || nativeBulkShapeInWindow == 0
                 || compatibleShape(nativeBulkShapeInWindow, previousBulkTailShape);
-        boolean stationary = !latencyUnsafe && !unhealthyMean && !noForegroundProgress && !bulkNoProgress
+        boolean stationary = !nonTailUnsafe && !unhealthyMean && !noForegroundProgress && !bulkNoProgress
                 && ownPointReliable && ownBulkReliable && bulkSafe
                 && (!pointReliable || lastPointMean == 0 || latency <= lastPointMean * 1.1)
                 && (!bulkComparable || !sameBulkShape || lastBulkMean == 0 || bulkLatency <= lastBulkMean * 1.1)
-                && (pointTailInWindow == 0 || previousPointTail == 0 || pointTailInWindow <= previousPointTail * 1.1)
-                && (bulkTailInWindow == 0 || previousBulkTail == 0 || !sameBulkShape
-                        || bulkTailInWindow <= previousBulkTail * 1.1)
                 && (queueAnchor < 0 || queueMean <= queueAnchor + Math.max(2, queueAnchor * .2));
         if (stationary) {
             if (queueAnchor < 0) queueAnchor = queueMean; // Provisional until the second stationary window confirms it.
@@ -272,7 +270,10 @@ public final class CompactionIoBudget {
         } else stableLoadedWindows = 0;
         lastPointMean = pointReliable ? latency : 0;
         lastBulkMean = bulkComparable ? bulkLatency : 0;
-        updateForegroundTails(nativePoints >= 32, stationary, unhealthyMean);
+        updateForegroundTails(stationary && !unhealthyMean, pointTailActive, bulkTailActive);
+        boolean tailsCalibrated = !tailCalibrationNeeded
+                && (!pointTailActive || pointTailBaseline > 0 && nativePoints >= 32)
+                && (!bulkTailActive || bulkComparable && bulkTailBaseline > 0 && nativeBulks >= 32);
         pointHealthy = !pointReliable || baseline > 0 && latency <= baseline * 1.2;
         boolean readaheadGrowthAllowed = stableLoadedWindows >= 2 && tailsCalibrated && !latencyUnsafe
                 && sample.nanos >= safetyGrowthUntil;
@@ -370,7 +371,7 @@ public final class CompactionIoBudget {
                 || sample.nativeBulkKeys < old.nativeBulkKeys || sample.nativeBulkKeys < 0) {
             reduceReadahead(0);
             pointTailBaseline = bulkTailBaseline = 0;
-            pointTailWindows = bulkTailWindows = 0;
+            tailCalibrationNeeded = true; resetTailBlocks();
             latencyUnsafe = tailUnsafe = true;
             return;
         }
@@ -380,18 +381,21 @@ public final class CompactionIoBudget {
         long keys = sample.nativeBulkKeys - old.nativeBulkKeys;
         boolean bulkShapeMatches = calls > 0 && keys > 0 && compatibleShape((double) keys / calls, bulkTailShape);
         if (calls > 0 && keys > 0 && bulkTailBaseline > 0 && !bulkShapeMatches) {
-            bulkTailBaseline = 0; bulkTailWindows = 0;
+            bulkTailBaseline = 0;
+            tailCalibrationNeeded = true; resetTailBlocks();
             readWindowTracking = false;
             stableLoadedWindows = 0;
         }
         boolean bulkSlow = sample.bulkTailMicros > 0 && bulkTailBaseline > 0 && (bulkShapeMatches || calls == 0 || keys == 0)
                 && sample.bulkTailMicros > bulkTailBaseline * 1.2;
+        if ((readaheadBytes > 0 || appliedReadahead > 0)
+                && (sample.pointTailMicros > 0 && pointTailBaseline == 0
+                    || sample.bulkTailMicros > 0 && bulkTailBaseline == 0)) reduceReadahead(0);
         if (queueWorkers < 0) queueWorkers = sample.readWorkers;
         else if (queueWorkers != sample.readWorkers) {
             queueWorkers = sample.readWorkers;
             queueAnchor = -1;
             lastPointMean = lastBulkMean = 0;
-            pointTailWindows = bulkTailWindows = 0;
             reduceReadahead(0);
             clearReadWindow();
         }
@@ -408,53 +412,85 @@ public final class CompactionIoBudget {
                 }
             } else queueBadPolls = 0;
             // Oscillation below an unsafe anchor still cannot supply stationary growth evidence.
-            if (full && sample.latencyReadQueued > old.latencyReadQueued + deadband) latencyUnsafe = true;
+            if (full && sample.latencyReadQueued > old.latencyReadQueued + deadband) latencyUnsafe = nonTailUnsafe = true;
         }
         boolean noProgress = sample.foregroundPending && sample.foregroundCompletions == old.foregroundCompletions
                 && sample.nativePointCompletions == old.nativePointCompletions && calls == 0
                 || sample.bulkPending && calls == 0;
-        if (pointSlow || bulkSlow || noProgress) {
-            reduceReadahead(0); latencyUnsafe = true;
+        if (noProgress) reduceReadahead(0);
+        if (pointSlow || bulkSlow) {
+            boolean on = readaheadBytes > 0 || appliedReadahead > 0 || readaheadUnknown;
+            if (on) {
+                boolean otherUnsafe = nonTailUnsafe;
+                reduceReadahead(0);
+                nonTailUnsafe = otherUnsafe;
+            }
+            tailCalibrationNeeded = true;
+            latencyUnsafe = tailUnsafe = true;
         }
-        if (pointSlow || bulkSlow) tailUnsafe = true;
         nativePoints += sample.nativePointCompletions - old.nativePointCompletions;
         nativeBulks += calls;
         nativeBulkKeys += keys;
         pointTailWindow = Math.max(pointTailWindow, sample.pointTailMicros);
         bulkTailWindow = Math.max(bulkTailWindow, sample.bulkTailMicros);
     }
-    private void updateForegroundTails(boolean pointReliable, boolean healthy, boolean pressure) {
-        if (pressure || latencyUnsafe || !healthy) {
-            pointTailWindows = bulkTailWindows = 0;
+    private void resetTailBlocks() {
+        tailBlockWindows = tailBlocks = 0;
+        tailBlockPointMax = tailBlockBulkMax = firstPointMax = firstBulkMax = 0;
+        tailBlockReads = tailBlockMicros = tailBlockKeys = tailBlockBulkMicros = 0;
+        tailBlockShape = firstTailShape = firstPointMean = firstBulkMean = 0;
+    }
+    private void updateForegroundTails(boolean healthy, boolean pointActive, boolean bulkActive) {
+        // Maxima are noisy observations, not quantiles. Learn an envelope only with optional I/O OFF.
+        if (readaheadBytes != 0 || appliedReadahead != 0 || readaheadUnknown || readaheadSettling
+                || state == State.PROBE || previous.nanos < safetyGrowthUntil || !healthy) {
+            resetTailBlocks();
             return;
         }
-        if (pointReliable && pointTailWindow > 0) {
-            if (pointTailBaseline == 0) {
-                if (++pointTailWindows >= 2) pointTailBaseline = (pointTailCalibration + pointTailWindow) / 2;
-                else pointTailCalibration = pointTailWindow;
-            } else if (state == State.TRACKING || state == State.RECOVERY)
-                pointTailBaseline = pointTailBaseline * .9 + Math.min(pointTailBaseline, pointTailWindow) * .1;
-        } else pointTailWindows = 0;
-        if (bulkComparable && nativeBulks >= 32 && nativeBulkKeys > 0 && bulkTailWindow > 0) {
-            double shape = (double) nativeBulkKeys / nativeBulks;
-            if (bulkTailBaseline == 0 || !compatibleShape(shape, bulkTailShape)) {
-                if (bulkTailWindows == 0 || !compatibleShape(shape, bulkTailCalibrationShape)) {
-                    bulkTailWindows = 1;
-                    bulkTailCalibrationShape = shape;
-                    bulkTailCalibration = bulkTailWindow;
-                } else if (++bulkTailWindows >= 2) {
-                    bulkTailBaseline = (bulkTailCalibration + bulkTailWindow) / 2;
-                    bulkTailShape = shape;
-                }
-            } else if (state == State.TRACKING || state == State.RECOVERY)
-                bulkTailBaseline = bulkTailBaseline * .9 + Math.min(bulkTailBaseline, bulkTailWindow) * .1;
-        } else bulkTailWindows = 0;
+        if (!tailCalibrationNeeded) return;
+        if (tailOffProbeHoldUntil == 0) tailOffProbeHoldUntil = previous.nanos + 60_000_000_000L;
+        double shape = nativeBulks > 0 ? (double) nativeBulkKeys / nativeBulks : 0;
+        if (tailBlockWindows > 0 && (pointActive != tailBlockPointActive || bulkActive != tailBlockBulkActive
+                || bulkActive && !compatibleShape(shape, tailBlockShape))) resetTailBlocks();
+        if (tailBlockWindows == 0) {
+            tailBlockPointActive = pointActive;
+            tailBlockBulkActive = bulkActive;
+            tailBlockShape = shape;
+        }
+        tailBlockPointMax = Math.max(tailBlockPointMax, pointTailWindow);
+        tailBlockBulkMax = Math.max(tailBlockBulkMax, bulkTailWindow);
+        tailBlockReads += reads; tailBlockMicros += micros;
+        tailBlockKeys += bulkKeys; tailBlockBulkMicros += bulkTime;
+        if (++tailBlockWindows < 6) return;
+        double pointMean = tailBlockReads > 0 ? (double) tailBlockMicros / tailBlockReads : 0;
+        double bulkMean = tailBlockKeys > 0 ? (double) tailBlockBulkMicros / tailBlockKeys : 0;
+        if (tailBlocks == 0) {
+            firstPointMax = tailBlockPointMax; firstBulkMax = tailBlockBulkMax;
+            firstPointMean = pointMean; firstBulkMean = bulkMean; firstTailShape = shape;
+            tailBlocks = 1;
+        } else if ((firstPointMax > 0) == pointActive && (firstBulkMax > 0) == bulkActive
+                && (!pointActive || pointMean <= firstPointMean * 1.1)
+                && (!bulkActive || compatibleShape(shape, firstTailShape) && bulkMean <= firstBulkMean * 1.1)) {
+            pointTailBaseline = Math.max(firstPointMax, tailBlockPointMax);
+            bulkTailBaseline = Math.max(firstBulkMax, tailBlockBulkMax);
+            bulkTailShape = shape;
+            tailCalibrationNeeded = false;
+            tailOffProbeHoldUntil = 0;
+            // The obsolete tail reference alone must not veto this qualified OFF epoch.
+            latencyUnsafe = nonTailUnsafe; tailUnsafe = false;
+            resetTailBlocks();
+            return;
+        } else {
+            resetTailBlocks();
+            return;
+        }
+        tailBlockWindows = 0;
+        tailBlockPointMax = tailBlockBulkMax = tailBlockReads = tailBlockMicros = tailBlockKeys = tailBlockBulkMicros = 0;
     }
     private static boolean compatibleShape(double shape, double reference) {
         return reference > 0 && Math.abs(shape / reference - 1) <= .25;
     }
     private void invalidateBulk() {
-        bulkTailWindows = 0;
         reduceReadahead(0);
         bulkBaseline = 0; bulkCalibrationWindows = bulkIdleWindows = readClearWindows = 0;
         bulkComparable = bulkHealthy = false;
@@ -531,6 +567,8 @@ public final class CompactionIoBudget {
     private void reduceReadahead(long limit) {
         boolean unsafe = limit == 0 || limit < readaheadBytes;
         if (unsafe) {
+            nonTailUnsafe = true;
+            resetTailBlocks();
             safetyGrowthUntil = Math.max(safetyGrowthUntil, previous.nanos + 60_000_000_000L);
             stableLoadedWindows = queueBadPolls = 0;
             reliableGrowthWindows = 0;
@@ -555,6 +593,8 @@ public final class CompactionIoBudget {
         previousReadWindowReliable = prefetchPopulationStable = false;
     }
     private boolean rateProbeBlocked() {
+        if (!readaheadUnknown && readaheadBytes != appliedReadahead) return true;
+        if ((tailBlockWindows > 0 || tailBlocks > 0) && previous.nanos < tailOffProbeHoldUntil) return true;
         if (!readaheadSettling && !readaheadUnknown) return false;
         if (previous.nanos >= probeHoldUntil) return false;
         return previous.nanos < settleUntil || !prefetchPopulationStable;
@@ -672,6 +712,8 @@ public final class CompactionIoBudget {
         clearReadWindow();
     }
     private void beginProbe(double latency, double foregroundRate) {
+        tailOffProbeHoldUntil = 0;
+        resetTailBlocks();
         long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
         // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
         if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
