@@ -2,14 +2,11 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.util.*;
+import it.cavallium.rockserver.core.common.cdc.DistributedCdcSubscriptions;
+import it.cavallium.rockserver.core.common.cdc.DistributedCdcSubscriptions.Envelope;
 
 /** One bounded, caller-acknowledged lineage batch. Original envelopes stay private to the journal/controller. */
 public final class RatisCdcSubscriptionBatch {
-    public record Envelope(ApplyPosition position,byte[] schemaDigest,OperationId operation,ParticipantFinalization transaction,
-            List<DistributedCdcRecord.Event> events) {
-        public Envelope { Objects.requireNonNull(position); Objects.requireNonNull(operation); if(schemaDigest.length!=32 || events.isEmpty()) throw new IllegalArgumentException("Invalid CDC projected envelope"); schemaDigest=schemaDigest.clone(); events=List.copyOf(events); }
-        @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
-    }
     private final UUID id;
     private final DistributedCdcSubscription.Definition definition;
     private final RatisCdcPollRpc.Result result;
@@ -33,6 +30,7 @@ public final class RatisCdcSubscriptionBatch {
         }
         return List.copyOf(projected);
     }
+    public DistributedCdcSubscriptions.Batch projected() { return new DistributedCdcSubscriptions.Batch(id,definition,lineage(),from(),next(),cut(),envelopes()); }
     public UUID id() { return id; }
     public DistributedCdcSubscription.Definition definition() { return definition; }
     public DistributedCdcCheckpoint.Lineage lineage() { return result.request().binding().lineage(); }

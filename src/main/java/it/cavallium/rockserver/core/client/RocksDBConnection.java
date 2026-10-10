@@ -16,6 +16,13 @@ public interface RocksDBConnection extends Closeable {
 	 */
 	URI getUrl();
 
+	/** Vector CDC lifecycle; each operation requires its caller's workload and timeout policy. */
+	default it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() {
+		throw it.cavallium.rockserver.core.common.RocksDBException.of(
+				it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED,
+				"Distributed CDC subscriptions are unavailable through this connection");
+	}
+
 	/** Return the effective backend features and limits supported through this connection. */
 	RockserverCapabilities getCapabilities();
 

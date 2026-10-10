@@ -68,7 +68,8 @@ public final class Mutation {
 
     public boolean bucket() { return kind==Kind.BUCKET_PUT || kind==Kind.BUCKET_DELETE || kind==Kind.BUCKET_MERGE; }
     public List<byte[]> memberKeys() { return copyMembers(memberKeys); }
-    int encodedSize() { return 26 + key.length + (value == null ? 0 : value.length) + (bucket() ? memberBytes(memberKeys) : 0); }
+    /** Canonical size without copying keys, values, or bucket members. */
+    public int encodedSize() { return 26 + key.length + (value == null ? 0 : value.length) + (bucket() ? memberBytes(memberKeys) : 0); }
 
     static int memberBytes(List<byte[]> members) {
         if (members==null || members.isEmpty() || members.size()>DistributedSchemaCodec.MAX_KEY_COMPONENTS) throw new IllegalArgumentException("Invalid bucket member component count");

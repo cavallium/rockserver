@@ -32,6 +32,9 @@ public class LoggingClient implements RocksDBConnection {
 	}
 
 	@Override
+	public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { return client.getDistributedCdcApi(); }
+
+	@Override
 	public URI getUrl() {
 		return client.getUrl();
 	}

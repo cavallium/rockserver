@@ -17,7 +17,7 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
     public static final int MAX_JOBS=8,MAX_METADATA_BYTES=RatisSchemaClientJournal.MAX_BYTES;
     public static final long MAX_PENDING_REPLY_BYTES=(long)MAX_JOBS*RatisCdcPollRpc.MAX_REPLY_BYTES;
     public enum Phase { CREATE, ACTIVE, CLOSING, CLOSED, CONFLICT }
-    public record Poll(RatisCdcPollRpc.Outcome outcome,RatisCdcSubscriptionBatch batch,int requiredBytes,
+    public record Poll(DistributedCdcCheckpoint.Lineage lineage,RatisCdcPollRpc.Outcome outcome,RatisCdcSubscriptionBatch batch,int requiredBytes,
                        DistributedCdcCheckpoint.Cursor floor,ApplyPosition cut) {}
     public static final class Conflict extends IOException {
         private Conflict(String action) { super("Frozen CDC "+action+" command conflicted; reopen does not rebase it"); }
@@ -94,7 +94,7 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
             var request=request(h); save(h);
             var result=routed.pollCdcDirectory(h.source,request.binding().lineage(),request.from(),request.maxRecords(),request.maxBytes());
             byte[] reply=RatisCdcPollRpc.reply(result); RatisCdcPollRpc.decodeReply(reply,request); h.fields.put("pollReply",reply); save(h);
-            if(result.outcome()!=RatisCdcPollRpc.Outcome.DATA) return new Poll(result.outcome(),null,result.requiredBytes(),result.floor(),result.cut());
+            if(result.outcome()!=RatisCdcPollRpc.Outcome.DATA) return new Poll(result.request().binding().lineage(),result.outcome(),null,result.requiredBytes(),result.floor(),result.cut());
             deliver(h); return batch(h);
         } finally { end(); }
     }
@@ -205,7 +205,7 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
     }
     private Poll batch(Handle h) {
         var result=result(h); var batch=new RatisCdcSubscriptionBatch(UUID.fromString(text(h,"batchId")),DistributedCdcSubscription.decode(h.fields.get("batchState")),result);
-        return new Poll(result.outcome(),batch,0,result.floor(),result.cut());
+        return new Poll(result.request().binding().lineage(),result.outcome(),batch,0,result.floor(),result.cut());
     }
     private void finishBatch(Handle h) { text(h,"lastAck",text(h,"batchId")); number(h,"lineage",Math.incrementExact(number(h,"lineage"))); clearPoll(h); }
     private static void clearPoll(Handle h) { for(var field:List.of("pollRequest","pollReply","batchState","batchId","batchReady")) h.fields.remove(field); }

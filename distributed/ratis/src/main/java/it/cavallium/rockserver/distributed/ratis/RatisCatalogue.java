@@ -45,7 +45,7 @@ public final class RatisCatalogue {
         byte[] key = key(domainId);
         var request=ScopedTransactionRpc.pointRequest(columnId,key);
         byte[] encoded;
-        try { encoded=ScopedTransactionRpc.pointValue(content(client.io().sendReadOnly(message(request))),MAX_DIRECTORY_BYTES); }
+        try { encoded=ScopedTransactionRpc.pointValue(content(client.io().sendReadOnly(message(request)),ScopedTransactionRpc.HEADER_BYTES+4+MAX_DIRECTORY_BYTES),MAX_DIRECTORY_BYTES); }
         catch (IllegalArgumentException malformed) { throw new IOException("Invalid catalogue read reply",malformed); }
         if (encoded==null) return null;
         try {
@@ -88,7 +88,7 @@ public final class RatisCatalogue {
 
     public CommandResult execute(DistributedCommand command) throws IOException {
         validator.accept(command);
-        try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))))); }
+        try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))),CommandResult.MAX_BYTES)); }
         catch (IllegalArgumentException malformed) { throw new IOException("Invalid catalogue command reply", malformed); }
     }
 
@@ -204,9 +204,10 @@ public final class RatisCatalogue {
         return ByteBuffer.allocate(16).putLong(domain.getMostSignificantBits()).putLong(domain.getLeastSignificantBits()).array();
     }
     private static Message message(byte[] bytes) { return Message.valueOf(ByteString.copyFrom(bytes)); }
-    private static byte[] content(RaftClientReply reply) throws IOException {
-        if (!reply.isSuccess()) throw new IOException("Catalogue request failed", reply.getException());
+    private static byte[] content(RaftClientReply reply,int maximum) throws IOException {
+        if (reply==null || !reply.isSuccess()) throw new IOException("Catalogue request failed", reply==null ? null : reply.getException());
         if (reply.getMessage() == null) throw new IOException("Missing catalogue reply");
-        return reply.getMessage().getContent().toByteArray();
+        var bytes=reply.getMessage().getContent(); if(bytes.size()>maximum) throw new IOException("Catalogue reply exceeds operation budget");
+        return bytes.toByteArray();
     }
 }

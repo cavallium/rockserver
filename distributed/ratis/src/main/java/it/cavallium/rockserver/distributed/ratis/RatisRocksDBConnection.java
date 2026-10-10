@@ -71,7 +71,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         };
     }
     private final URI uri; private final Path root; private final RWScheduler clock; private final RatisRoutedClient routed; private final Limits limits;
-    private final FileChannel ownership; private final FileLock lock; private final RatisSchemaJobBridge schemas; private final RatisGenerationRegistry generations;
+    private final FileChannel ownership; private final FileLock lock; private final RatisSchemaJobBridge schemas; private final RatisCdcBridge cdc; private final RatisGenerationRegistry generations;
     private final ExecutorService dataLane; private final List<AutoCloseable> ownedDependencies; private final RatisOperatorCatalogue operators;
     private volatile Thread dataWorker;
     private final java.util.concurrent.locks.ReentrantLock closeOwner=new java.util.concurrent.locks.ReentrantLock();
@@ -79,15 +79,17 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     /** All supplied transports/schedulers/allocators are borrowed unless listed in ownedDependencies. Factory generations are owned. */
     public RatisRocksDBConnection(URI uri,Path root,DistributedSchema initial,RatisRoutedClient routed,RWScheduler scheduler,RatisNodePlan.Catalogue binding,RaftClient catalogue,RatisSchemaReplicaClient replicas,RatisOperatorCatalogue operators,RatisSchemaClient.TrustedOperatorResolver resolver,GenerationFactory factory,Limits limits,List<AutoCloseable> ownedDependencies) throws IOException {
         this.uri=Objects.requireNonNull(uri); this.root=root.toAbsolutePath().normalize(); this.routed=Objects.requireNonNull(routed); clock=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits); this.ownedDependencies=List.copyOf(ownedDependencies); this.operators=operators;
-        Files.createDirectories(this.root); boolean used=Files.exists(this.root.resolve("connection.lock"),LinkOption.NOFOLLOW_LINKS); ownership=FileChannel.open(this.root.resolve("connection.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS); FileLock acquired=null; RatisSchemaJobBridge bridge=null; RatisGenerationRegistry registry=null;
+        Files.createDirectories(this.root); boolean used=Files.exists(this.root.resolve("connection.lock"),LinkOption.NOFOLLOW_LINKS); ownership=FileChannel.open(this.root.resolve("connection.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS); FileLock acquired=null; RatisSchemaJobBridge bridge=null; RatisGenerationRegistry registry=null; RatisCdcBridge cdcBridge=null;
         try {
             try { acquired=ownership.tryLock(); } catch (OverlappingFileLockException conflict) { throw new IOException("Connection root already owned",conflict); } if (acquired==null) throw new IOException("Connection root already owned"); lock=acquired;
             var ids=this.root.resolve("handles"); if (used && !Files.exists(ids,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Original connection handle state is missing"); if (Files.exists(ids,LinkOption.NOFOLLOW_LINKS)) { byte[] value=SessionJournalFiles.read(ids,64); if (value.length!=8) throw new IOException("Invalid handle reservation"); nextId=idLimit=ByteBuffer.wrap(value).getLong(); if (nextId<1) throw new IOException("Invalid handle high-water mark"); } else { nextId=idLimit=1; SessionJournalFiles.write(ids,ByteBuffer.allocate(8).putLong(1).array(),64); }
             var trusted=resolver==null ? (RatisSchemaClient.TrustedOperatorResolver)(name,className,sha,revision) -> { throw new IOException("Trusted operator resolver unavailable"); } : resolver;
             Path sdk=Files.createDirectories(this.root.resolve("schema")); var capacity=new RatisGenerationRegistry.Capacity(this.root.resolve("generation-capacity"),Files.createDirectories(this.root.resolve("generations")),sdk,limits.generations(),used); bridge=new RatisSchemaJobBridge(Files.createDirectories(this.root.resolve("requests")),sdk,clock,checkpoint -> new RatisSchemaClient(sdk,initial.clusterId(),initial.databaseId(),initial.domainId(),binding,catalogue,routed,replicas,operators,(path,fields) -> capacity.checkpoint(path,fields,checkpoint)),trusted,routed,limits.schemaRequests(),limits.queuedSchema(),limits.schemaBytes());
             registry=new RatisGenerationRegistry(Files.createDirectories(this.root.resolve("generations")),routed,new RatisSchemaCatalogue(catalogue,initial.clusterId(),initial.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn()),factory,this::nextHandle,limits.generations(),initial,capacity);
-            schemas=bridge; generations=registry;
-        } catch (Throwable failure) { if (registry!=null) try { registry.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); } if (bridge!=null) try { bridge.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); } if (acquired!=null) acquired.release(); ownership.close(); if (failure instanceof IOException io) throw io; throw new IOException("Connection open failed",failure); }
+            var directories=new RatisCatalogue(catalogue,initial.clusterId(),initial.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
+            cdcBridge=new RatisCdcBridge(new RatisCdcSubscriptionController(Files.createDirectories(this.root.resolve("cdc")),initial.clusterId(),initial.databaseId(),binding,catalogue,routed),clock,directories::read);
+            schemas=bridge; generations=registry; cdc=cdcBridge;
+        } catch (Throwable failure) { if(cdcBridge!=null) try { cdcBridge.close(); } catch(Exception cleanup) { failure.addSuppressed(cleanup); } if (registry!=null) try { registry.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); } if (bridge!=null) try { bridge.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); } if (acquired!=null) acquired.release(); ownership.close(); if (failure instanceof IOException io) throw io; throw new IOException("Connection open failed",failure); }
         dataLane=Executors.newSingleThreadExecutor(task -> Thread.ofPlatform().daemon(true).name("ratis-connection-dispatch").unstarted(() -> { dataWorker=Thread.currentThread(); task.run(); }));
     }
     private synchronized long nextHandle() {
@@ -97,6 +99,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         }
         return nextId++;
     }
+    @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { requireOpen(); return cdc; }
     @Override public URI getUrl() { return uri; }
     @Override public RockserverCapabilities getCapabilities() { return new RockserverCapabilities(RockserverCapabilities.BackendMode.DISTRIBUTED,RockserverCapabilities.RawScanMode.UNSUPPORTED,RangeBudget.DEFAULT_MAX_ITEMS,RangeBudget.DEFAULT_MAX_BYTES); }
     public List<RatisSchemaRequests.Status> pendingSchemaRequests() { return schemas.pending(); }
@@ -249,11 +252,11 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         if (closeOwner.isHeldByCurrentThread()) throw new IOException("Connection close cannot recursively tear down an owned dependency");
         closeOwner.lock();
         try {
-        synchronized (this) { if (closed) return; stopping=true; }
+        synchronized (this) { if (closed) return; cdc.stopAdmission(); stopping=true; }
         // Retry only already stopped stream cleanup; actual owners remain charged through its drain.
         for(var generation:generations.all()) generation.generation().adapter().retryStoppedFlowsCleanup();
         synchronized(this) { if(dataOwners!=0) throw new IOException("Connection DATA/refresh work active; ownership retained"); }
-        schemas.close(); generations.close();
+        cdc.close(); schemas.close(); generations.close();
         while (dependencyClosed<ownedDependencies.size()) { try { ownedDependencies.get(dependencyClosed).close(); dependencyClosed++; } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Owned dependency close failed",failure); } }
         dataLane.shutdown(); lock.release(); ownership.close(); synchronized (this) { closed=true; }
         } finally { closeOwner.unlock(); }

@@ -102,19 +102,20 @@ class RatisRocksDBConnectionTest {
     @Test void cancelledStreamReleaseFailureCanRetryThroughConnectionCloseWithoutLosingOwnership() throws Exception {
         try(var f=new Fixture()) {
             var snapshots=mock(RatisSnapshotClient.class); var lease=mock(RatisSnapshotClient.Lease.class); f.suppliedSnapshots=snapshots;
-            var reading=new CompletableFuture<RangePage<KV>>(); var releasing=new CompletableFuture<Void>(); var requested=new CountDownLatch(1); var calls=new AtomicInteger(); var closes=new AtomicInteger();
+            var reading=new CompletableFuture<RangePage<KV>>(); var releasing=new CompletableFuture<Void>(); var requested=new CountDownLatch(1); var releaseStarted=new CountDownLatch(1); var calls=new AtomicInteger(); var closes=new AtomicInteger();
             when(lease.completion()).thenReturn(CompletableFuture.completedFuture(null));
             when(lease.page(anyLong(),any(),any(),anyBoolean(),any(),any(),any())).thenAnswer(call -> { requested.countDown(); return reading; });
-            when(lease.release(any())).thenAnswer(call -> calls.incrementAndGet()==1 ? CompletableFuture.failedFuture(new IOException("Unknown release outcome")) : releasing);
+            when(lease.release(any())).thenAnswer(call -> { int count=calls.incrementAndGet(); releaseStarted.countDown(); return count==1 ? CompletableFuture.failedFuture(new IOException("Unknown release outcome")) : releasing; });
             doAnswer(call -> { closes.incrementAndGet(); return null; }).when(lease).close(); when(snapshots.open(any(),any(),any(),any(),any())).thenReturn(lease);
-            var connection=f.open(1); var observer=new RatisRocksDBIteratorLifecycleTest.Observer();
+            var connection=f.open(1); var cdc=connection.getDistributedCdcApi(); var observer=new RatisRocksDBIteratorLifecycleTest.Observer();
             try {
                 Flux.from(connection.getAsyncApi(RequestContext.batch()).getRangeAsync(0,71,key(1),key(3),false,RequestType.<KV>allInRange())).subscribe(observer);
                 assertTrue(requested.await(5,TimeUnit.SECONDS)); observer.subscription.get().cancel();
                 reading.complete(new RangePage<>(List.of(new KV(key(1),value(1))),key(1),false));
-                assertEquals(1,calls.get()); assertEquals(0,closes.get());
+                assertTrue(releaseStarted.await(5,TimeUnit.SECONDS)); assertEquals(1,calls.get()); assertEquals(0,closes.get());
                 var rejected=assertThrows(ExecutionException.class,() -> await(connection.getAsyncApi(RequestContext.batch()).getAsync(0,71,key(1),RequestType.<Buf>current()))); assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,assertInstanceOf(RocksDBException.class,rejected.getCause()).getErrorUniqueId());
                 assertThrows(IOException.class,connection::close); assertEquals(2,calls.get()); assertEquals(0,closes.get());
+                assertInstanceOf(RejectedExecutionException.class,assertThrows(ExecutionException.class,()->await(cdc.context(f.direct.f.directory.domainId(),RequestContext.batch()))).getCause());
                 releasing.complete(null); connection.close(); assertEquals(1,closes.get()); assertTrue(observer.values.isEmpty());
             } finally { reading.complete(new RangePage<>(List.of(),null,false)); releasing.complete(null); connection.close(); }
         }
@@ -270,4 +271,23 @@ class RatisRocksDBConnectionTest {
             }
         }
     }
+    @Test void commonConnectionOwnsPublicCdcContextAndSubscriptionJournalAcrossReopen() throws Exception {
+        try(var f=new Fixture()) {
+            UUID id=new UUID(70,900),incarnation=new UUID(71,900); DistributedCdcSubscription.Definition definition;
+            try(var connection=f.open(8)) {
+                var api=new it.cavallium.rockserver.core.client.LoggingClient(connection).getDistributedCdcApi();
+                var source=await(api.context(f.direct.f.directory.domainId(),RequestContext.batch()));
+                assertArrayEquals(RangeDirectoryCodec.encode(f.direct.f.directory),RangeDirectoryCodec.encode(source));
+                var cursors=new HashMap<DistributedCdcCheckpoint.Lineage,DistributedCdcCheckpoint.Cursor>();
+                for(var range:source.ranges()) cursors.put(new DistributedCdcCheckpoint.Lineage(range.rangeId(),range.groupId(),range.rangeEpoch()),DistributedCdcCheckpoint.Cursor.beginning());
+                definition=DistributedCdcSubscription.Definition.create(id,incarnation,source,source.columns(),new DistributedCdcCheckpoint(cursors));
+                assertEquals(definition,await(api.create(definition,RequestContext.batch())).state().definition());
+            }
+            try(var connection=f.open(8)) {
+                var api=connection.getDistributedCdcApi(); assertEquals(definition,await(api.recover(id,RequestContext.batch())).state().definition());
+                var closed=await(api.closeSubscription(id,RequestContext.batch())); assertEquals(DistributedCdcSubscription.Phase.CLOSED,closed.state().phase()); assertEquals(definition.start(),closed.state().checkpoint());
+            }
+        }
+    }
+
 }
