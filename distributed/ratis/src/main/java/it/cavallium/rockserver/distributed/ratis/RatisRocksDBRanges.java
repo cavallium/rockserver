@@ -45,31 +45,40 @@ public final class RatisRocksDBRanges implements AutoCloseable {
         });
         return owned;
     }
-    /** One independently consistent page, with cleanup retained through actual completion. */
+    record OwnedResult<T>(CompletableFuture<T> observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
+    /** One independently consistent page; failed acquisition retains its hidden owner until cleanup. */
     public CompletableFuture<RangePage<KV>> page(long column,Keys lower,Keys upper,boolean reverse,Keys resume,RangeBudget budget,RequestContext context) {
+        return pageOwned(column,lower,upper,reverse,resume,budget,context).observer();
+    }
+    OwnedResult<RangePage<KV>> pageOwned(long column,Keys lower,Keys upper,boolean reverse,Keys resume,RangeBudget budget,RequestContext context) {
         var deadline=new Deadline(context);
-        CompletableFuture<RangePage<KV>> actual=open(column,lower,upper,reverse,Duration.ofSeconds(60),deadline.remaining()).thenCompose(owner -> {
-            CompletableFuture<RangePage<KV>> reading;
-            try { reading=owner.page(resume,budget,deadline.remaining()); }
-            catch (Throwable failure) { reading=CompletableFuture.failedFuture(failure); }
-            return completeAndRelease(owner,reading);
+        return readOwned(column,lower,upper,reverse,deadline,owner -> {
+            try { return owner.page(resume,budget,deadline.remaining()); }
+            catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
         });
-        return actual.copy();
     }
     public CompletableFuture<FirstAndLast<KV>> firstAndLast(long column,Keys lower,Keys upper,boolean reverse,RequestContext context) {
+        return firstAndLastOwned(column,lower,upper,reverse,context).observer();
+    }
+    OwnedResult<FirstAndLast<KV>> firstAndLastOwned(long column,Keys lower,Keys upper,boolean reverse,RequestContext context) {
         var deadline=new Deadline(context);
-        var actual=open(column,lower,upper,reverse,Duration.ofSeconds(60),deadline.remaining()).thenCompose(owner -> {
-            CompletableFuture<FirstAndLast<KV>> reading;
+        return readOwned(column,lower,upper,reverse,deadline,owner -> {
             try {
                 var budget=new RangeBudget(1,RangeBudget.DEFAULT_MAX_BYTES);
-                reading=owner.page(null,budget,deadline.remaining()).thenCompose(first -> first.items().isEmpty()
+                return owner.page(null,budget,deadline.remaining()).thenCompose(first -> first.items().isEmpty()
                         ? CompletableFuture.completedFuture(new FirstAndLast<KV>(null,null))
-                        : owner.page(owner.lower,owner.upper,!reverse,null,budget,deadline.remaining())
-                            .thenApply(last -> new FirstAndLast<>(first.items().getFirst(),last.items().getFirst())));
-            } catch (Throwable failure) { reading=CompletableFuture.failedFuture(failure); }
-            return completeAndRelease(owner,reading);
+                        : owner.page(owner.lower,owner.upper,!reverse,null,budget,deadline.remaining()).thenApply(last -> new FirstAndLast<>(first.items().getFirst(),last.items().getFirst())));
+            } catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
         });
-        return actual.copy();
+    }
+    private <T> OwnedResult<T> readOwned(long column,Keys lower,Keys upper,boolean reverse,Deadline deadline,java.util.function.Function<OwnedRead,CompletableFuture<T>> reading) {
+        try {
+            var owner=openOwned(column,lower,upper,reverse,Duration.ofSeconds(60),deadline.remaining());
+            var actual=owner.view().thenCompose(ignored -> completeAndRelease(owner,reading.apply(owner))); var observer=actual.copy();
+            Runnable cancel=() -> { observer.cancel(false); owner.cleanup(); };
+            observer.whenComplete((value,failure) -> { if (observer.isCancelled()) owner.cleanup(); });
+            return new OwnedResult<>(observer,owner.drained,cancel);
+        } catch (Throwable failure) { return new OwnedResult<>(CompletableFuture.failedFuture(failure),CompletableFuture.completedFuture(null),() -> {}); }
     }
     private <T> CompletableFuture<T> completeAndRelease(OwnedRead owner,CompletableFuture<T> reading) {
         var result=new CompletableFuture<T>();
@@ -87,8 +96,9 @@ public final class RatisRocksDBRanges implements AutoCloseable {
         private volatile RatisSnapshotClient.Lease lease;
         private CompletableFuture<Void> cleanup;
         private CompletableFuture<Void> idle=CompletableFuture.completedFuture(null);
-        private int views,readers;
-        private boolean removed,releaseRequested,released;
+        private int views,readers,releaseObservers;
+        private CompletableFuture<Void> releaseAttempt;
+        private boolean removed,releaseRequested,released,localClosing;
         OwnedRead(long column,Keys lower,Keys upper,boolean reverse) { this.column=column; this.lower=lower; this.upper=upper; this.reverse=reverse; }
         final CompletableFuture<Void> drained=new CompletableFuture<>();
         synchronized CompletableFuture<OwnedRead> view() { if (!acquisition.isDone() && views>=MAX_WAITERS) return CompletableFuture.failedFuture(new IOException("Range observer capacity exhausted")); if (!acquisition.isDone()) views++; return acquisition.copy(); }
@@ -119,11 +129,27 @@ public final class RatisRocksDBRanges implements AutoCloseable {
             return result.copy();
         }
         public CompletableFuture<Void> release(RequestContext context) {
-            CompletableFuture<Void> drained;
-            synchronized (this) { if (removed) return CompletableFuture.completedFuture(null); releaseRequested=true; drained=idle; }
-            return acquisition.handle((value,failure) -> value).thenCompose(ignored -> drained)
-                    .thenCompose(ignored -> lease==null ? CompletableFuture.completedFuture(null) : lease.release(context))
-                    .thenRun(() -> { synchronized (this) { released=true; } });
+            final CompletableFuture<Void> attempt,idleAtRelease; final boolean start;
+            synchronized (this) {
+                if (removed) return CompletableFuture.completedFuture(null);
+                if (releaseObservers>=MAX_WAITERS) return CompletableFuture.failedFuture(new IOException("Readonly range release observer capacity exhausted"));
+                releaseRequested=true; idleAtRelease=idle; start=releaseAttempt==null;
+                if (start) releaseAttempt=new CompletableFuture<>(); attempt=releaseAttempt; releaseObservers++;
+            }
+            if (start) {
+                acquisition.handle((value,failure) -> value).thenCompose(ignored -> idleAtRelease)
+                        .thenCompose(ignored -> lease==null ? CompletableFuture.completedFuture(null) : lease.release(context))
+                        .whenComplete((ignored,failure) -> {
+                            synchronized (this) {
+                                if (failure==null) released=true;
+                                else if (releaseAttempt==attempt) releaseAttempt=null;
+                            }
+                            if (failure==null) attempt.complete(null); else attempt.completeExceptionally(failure);
+                        });
+            }
+            var view=attempt.copy();
+            attempt.whenComplete((ignored,failure) -> { synchronized (this) { releaseObservers--; } });
+            return view;
         }
         void cleanup() {
             CompletableFuture<Void> attempt;
@@ -135,8 +161,13 @@ public final class RatisRocksDBRanges implements AutoCloseable {
             });
         }
         public void closeLocal() throws IOException {
-            synchronized (this) { if (removed) return; if (!acquisition.isDone() || readers!=0 || !released) throw new IOException("Readonly range work or release unresolved; ownership retained"); releaseRequested=true; }
-            if (lease!=null) lease.close(); remove();
+            synchronized (this) {
+                if (removed) return;
+                if (!acquisition.isDone() || readers!=0 || !released || localClosing) throw new IOException("Readonly range work, release or local cleanup unresolved; ownership retained");
+                releaseRequested=true; localClosing=true;
+            }
+            try { if (lease!=null) lease.close(); remove(); }
+            finally { synchronized (this) { localClosing=false; } }
         }
         private void remove() { synchronized (this) { removed=true; } synchronized (RatisRocksDBRanges.this) { owners.remove(this); } drained.complete(null); }
     }
@@ -146,6 +177,15 @@ public final class RatisRocksDBRanges implements AutoCloseable {
         final RequestContext context; final long start=System.nanoTime();
         Deadline(RequestContext context) { this.context=Objects.requireNonNull(context); }
         RequestContext remaining() { if (!context.hasTimeout()) return context; long remaining=context.timeoutNanos()-(System.nanoTime()-start); if (remaining<=0) throw new CompletionException(new TimeoutException("Range request deadline expired")); return new RequestContext(context.profile(),remaining); }
+    }
+    CompletableFuture<Void> retryRetiredReadsCleanup() {
+        List<OwnedRead> retained; synchronized (this) { retained=List.copyOf(owners); }
+        var drains=new ArrayList<CompletableFuture<Void>>();
+        for (var owner:retained) {
+            boolean retired; synchronized (owner) { retired=!owner.removed && (owner.releaseRequested || owner.acquisition.isCompletedExceptionally()); }
+            if (retired) { owner.cleanup(); drains.add(owner.drained); }
+        }
+        return CompletableFuture.allOf(drains.toArray(CompletableFuture[]::new));
     }
     @Override public void close() throws IOException {
         List<OwnedRead> retained; synchronized (this) { closing=true; retained=List.copyOf(owners); }

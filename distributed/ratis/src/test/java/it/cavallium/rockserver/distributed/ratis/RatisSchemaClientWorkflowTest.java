@@ -44,6 +44,7 @@ class RatisSchemaClientWorkflowTest {
         final Set<DistributedSchema.Operator> admittedOperators=new HashSet<>();
         final List<byte[]> operatorWrites=new ArrayList<>();
         java.util.function.Consumer<DistributedCommand> beforeOperatorWrite=command -> {};
+        java.util.function.Consumer<DistributedCommand> beforeDataCommand=command -> {};
         boolean loseOperatorBeginReply;
         Fixture(Path root,boolean listener) throws Exception { this(root,listener,null); }
         Fixture(Path root,boolean listener,DistributedSchema.Operator admitted) throws Exception {
@@ -80,7 +81,7 @@ class RatisSchemaClientWorkflowTest {
             catalogue=new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,members);
             routed=new RatisRoutedClient(initialDirectory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) throws IOException { try(var pin=peers.getFirst().store.capture()) { return pin.get(column,key); } catch(Exception failure) { throw new IOException(failure); } }
-                public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException { try { var result=CommandResult.decode(peers.getFirst().store.apply(peers.getFirst().next(),command)); if(!lagging) for(int i=1;i<peers.size();i++) peers.get(i).store.apply(peers.get(i).next(),command); return result; } catch(Exception failure) { throw new IOException(failure); } }
+                public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException { try { beforeDataCommand.accept(command); var result=CommandResult.decode(peers.getFirst().store.apply(peers.getFirst().next(),command)); if(!lagging) for(int i=1;i<peers.size();i++) peers.get(i).store.apply(peers.get(i).next(),command); return result; } catch(Exception failure) { throw new IOException(failure); } }
                 public byte[] transaction(RangeDescriptor descriptor,byte[] bytes,boolean fresh) throws IOException {
                     try {
                         int kind=ScopedTransactionRpc.kind(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);

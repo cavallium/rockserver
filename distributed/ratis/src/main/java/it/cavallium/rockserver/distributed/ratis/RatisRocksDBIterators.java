@@ -52,7 +52,8 @@ final class RatisRocksDBIterators {
     private static final class Entry {
         final long id,transaction,column,opened=System.nanoTime(),ttl,bytes; final Keys lower,upper; final boolean reverse;
         Resource resource; boolean acquiring=true,closed,exhausted,cleaning,disposed; Keys resume,seek; Task active;
-        CompletableFuture<Void> drained=new CompletableFuture<>();
+        final CompletableFuture<Void> drained=new CompletableFuture<>(),openingDrained=new CompletableFuture<>();
+        CompletableFuture<Void> cleanupAttempt,sourceDrained=CompletableFuture.completedFuture(null); Runnable sourceCleanup=() -> {};
         Entry(long id,long transaction,long column,Keys lower,Keys upper,boolean reverse,long ttl,long bytes) { this.id=id; this.transaction=transaction; this.column=column; this.lower=lower; this.upper=upper; this.reverse=reverse; this.ttl=ttl; this.bytes=bytes; }
     }
     private record Advance(long skip,long take,RequestType.RequestTypeId type) {}
@@ -68,22 +69,30 @@ final class RatisRocksDBIterators {
     private synchronized void reserve(long charge) {
         if (closing || entries.size()+flows.size()>=MAX_ITERATORS || charge>MAX_BYTES-bytes) throw RocksDBException.of(SERVER_OVERLOADED,"Iterator entry/byte capacity exhausted"); bytes+=charge;
     }
+    record OwnedOpen(CompletableFuture<Long> observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
     CompletableFuture<Long> open(long transaction,long column,Keys lower,Keys upper,boolean reverse,Duration ttl,Supplier<CompletableFuture<Resource>> source,RequestContext context) {
+        return openOwned(transaction,column,lower,upper,reverse,ttl,() -> new Acquisition(Objects.requireNonNull(source.get()),CompletableFuture.completedFuture(null)),context).observer();
+    }
+    OwnedOpen openOwned(long transaction,long column,Keys lower,Keys upper,boolean reverse,Duration ttl,Supplier<Acquisition> source,RequestContext context) {
         try {
             expire(); Objects.requireNonNull(ttl); if (ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0) throw new IllegalArgumentException("Iterator TTL must be positive and at most60seconds");
             Keys low=copy(lower),high=copy(upper); long charge=metadata(low,high); final Entry entry;
             synchronized (this) { long id=handleIds.getAsLong(); if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); reserve(charge); entry=new Entry(id,transaction,column,low,high,reverse,ttl.toNanos(),charge); entries.put(id,entry); }
             var view=new CompletableFuture<Long>(); var deadline=new Deadline(context);
-            CompletableFuture<Resource> actual;
-            try { actual=source.get(); } catch (Throwable failure) { actual=CompletableFuture.failedFuture(failure); }
-            actual.whenComplete((resource,failure) -> {
+            entry.drained.thenRun(() -> entry.openingDrained.complete(null));
+            Acquisition actual;
+            try { actual=Objects.requireNonNull(source.get()); } catch (Throwable failure) { actual=new Acquisition(CompletableFuture.failedFuture(failure),CompletableFuture.completedFuture(null)); }
+            synchronized (entry) { entry.sourceDrained=actual.drained(); entry.sourceCleanup=actual.retryCleanup(); }
+            actual.ready().whenComplete((resource,failure) -> {
                 synchronized (entry) { entry.resource=resource; entry.acquiring=false; if (view.isCancelled() || failure!=null) entry.closed=true; }
                 if (failure!=null) view.completeExceptionally(unwrap(failure));
                 else try { deadline.remaining(); if (expired(entry) || entry.closed) { entry.closed=true; view.completeExceptionally(RocksDBException.of(TX_NOT_FOUND,"Iterator expired before publication")); } else if (!view.complete(entry.id)) entry.closed=true; } catch (Throwable expired) { entry.closed=true; view.completeExceptionally(expired); }
-                if (entry.closed) cleanup(entry);
+                if (entry.closed) cleanup(entry); else entry.openingDrained.complete(null);
             });
-            return view;
-        } catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
+            Runnable cancel=() -> { view.cancel(false); synchronized (entry) { entry.closed=true; } cleanup(entry); };
+            view.whenComplete((id,failure) -> { if (view.isCancelled()) { synchronized (entry) { entry.closed=true; } cleanup(entry); } });
+            return new OwnedOpen(view,entry.openingDrained,cancel);
+        } catch (Throwable failure) { return new OwnedOpen(CompletableFuture.failedFuture(failure),CompletableFuture.completedFuture(null),() -> {}); }
     }
     private void expire() {
         List<Entry> owners; synchronized (this) { owners=List.copyOf(entries.values()); }
@@ -179,20 +188,27 @@ final class RatisRocksDBIterators {
         return cleanup(entry);
     }
     private CompletableFuture<Void> cleanup(Entry entry) {
-        final CompletableFuture<Void> proof;
+        final CompletableFuture<Void> proof; final Runnable retry; final boolean start;
         synchronized (entry) {
             if (entry.disposed) return entry.drained;
-            if (entry.drained.isCompletedExceptionally() && !entry.cleaning) entry.drained=new CompletableFuture<>(); proof=entry.drained;
-            if (entry.active!=null || entry.acquiring || entry.cleaning) return proof; entry.cleaning=true;
+            if (entry.active!=null || entry.acquiring) return entry.drained;
+            retry=entry.resource==null ? entry.sourceCleanup : null; start=!entry.cleaning;
+            if (start) { entry.cleaning=true; entry.cleanupAttempt=new CompletableFuture<>(); }
+            proof=entry.cleanupAttempt;
         }
+        if (retry!=null) try { retry.run(); } catch (Throwable failure) {
+            if (!start) return CompletableFuture.failedFuture(failure);
+            synchronized (entry) { entry.cleaning=false; } proof.completeExceptionally(failure); return proof;
+        }
+        if (!start) return proof;
         CompletableFuture<Void> actual;
-        try { actual=entry.resource==null ? CompletableFuture.completedFuture(null) : entry.resource.release(RequestContext.batch()); }
+        try { actual=entry.resource==null ? entry.sourceDrained : Objects.requireNonNull(entry.resource.release(RequestContext.batch())); }
         catch (Throwable failure) { actual=CompletableFuture.failedFuture(failure); }
         actual.whenComplete((ignored,failure) -> {
             if (failure==null) try { if (entry.resource!=null) entry.resource.closeLocal(); } catch (Throwable close) { failure=close; }
             if (failure==null) synchronized (this) { if (entries.remove(entry.id,entry)) bytes-=entry.bytes; }
             synchronized (entry) { entry.cleaning=false; if (failure==null) entry.disposed=true; }
-            if (failure==null) proof.complete(null); else proof.completeExceptionally(unwrap(failure));
+            if (failure==null) { entry.drained.complete(null); proof.complete(null); } else proof.completeExceptionally(unwrap(failure));
         });
         return proof;
     }
@@ -314,12 +330,13 @@ final class RatisRocksDBIterators {
         }
     }
     CompletableFuture<Void> retryStoppedFlowsCleanup() {
-        List<Flow> retained; synchronized (this) { retained=List.copyOf(flows); }
+        List<Flow> retained; List<Entry> retired; synchronized (this) { retained=List.copyOf(flows); retired=List.copyOf(entries.values()); }
         var attempts=new ArrayList<CompletableFuture<Void>>();
         for (var flow:retained) {
             boolean stopped; synchronized (flow) { stopped=flow.stopped && !flow.disposed; }
             if (stopped) attempts.add(flow.cleanupFlow());
         }
+        for (var entry:retired) { boolean closed; synchronized (entry) { closed=entry.closed && !entry.disposed; } if (closed) attempts.add(cleanup(entry)); }
         return CompletableFuture.allOf(attempts.toArray(CompletableFuture[]::new));
     }
     CompletableFuture<Void> closeAll(RequestContext context) {
