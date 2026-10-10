@@ -104,7 +104,7 @@ public final class ReplicatedRangeStore {
             var lineage=new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(rangeId,groupId,rangeEpoch);
             if(cdc!=null) { if(!cdc.lineage().equals(lineage)) throw new IllegalStateException("CDC lineage changed"); return; }
             var candidate=new NativeRangeCdc(db,state,lineage);
-            if(pendingInstallation==null) candidate.recover(applied);
+            if(pendingInstallation==null) candidate.recover(applied,cdcAuthorityTime());
             cdc=candidate;
         } finally { applyLane.unlock(); leaveNative(); }
     }
@@ -449,7 +449,7 @@ public final class ReplicatedRangeStore {
             Runnable publishCdc=()->{};
             try(var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
                 if(cdc!=null) cdc.initialize(batch);
-                if(cdc!=null) publishCdc=cdc.importedBaseline(batch,authority.position());
+                if(cdc!=null) publishCdc=cdc.importedBaseline(batch,authority.position(),cdcAuthorityTime());
                 batch.put(state,importKey(0x43),authority.encode()); batch.put(state,markerKey,encodePosition(authority.position())); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),authority.position())); db.write(options,batch);
             }
             publishCdc.run();
@@ -2628,7 +2628,12 @@ public final class ReplicatedRangeStore {
                     if (installUserEffects) for (var entry:bucketEffects.entrySet()) batch.put(columns.get(entry.getKey().column),entry.getKey().key,entry.getValue().encode());
                     if(cdc!=null && installUserEffects && !command.mutations().isEmpty()) publishCdc=cdc.append(batch,
                             new it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord(cdc.lineage(),position,command,null));
-                    if (acceptMaintenance && command.sessionControl()!=null) installSessionControl(batch,command.sessionControl());
+                    if (acceptMaintenance && command.sessionControl()!=null) {
+                        var control=command.sessionControl();
+                        var clock=effectiveAuthority(control,authority).logicalTimeMillis();
+                        installSessionControl(batch,control);
+                        if(cdc!=null) publishCdc=cdc.advanceClock(batch,clock);
+                    }
                     if (effectiveMinimum > currentEpochFloor) {
                         batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(effectiveMinimum).array());
                         batch.deleteRange(state, bindingPrefix(), bindingKey(effectiveMinimum));
@@ -2659,6 +2664,7 @@ public final class ReplicatedRangeStore {
     private byte[] bindingPrefix() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x14).array(); }
     private byte[] bindingKey(long epoch) { return ByteBuffer.allocate(25).put(bindingPrefix()).putLong(epoch).array(); }
     private SessionAuthority sessionAuthority() throws RocksDBException { return sessionAuthority(null); }
+    private long cdcAuthorityTime() throws RocksDBException { var authority=sessionAuthority(); return authority==null ? -1 : authority.logicalTimeMillis(); }
     private SessionAuthority sessionAuthority(ReadOptions options) throws RocksDBException {
         byte[] bytes=options==null ? db.get(state,authorityKey()) : db.get(state,options,authorityKey());
         if (bytes==null) return null;
@@ -3029,7 +3035,7 @@ public final class ReplicatedRangeStore {
                     writer.flush();
                     // The current image supplies counters bound to its completed position; never normalize imported state.
                     recoverSchemaMetadata(expected.position());
-                    if(cdc!=null) cdc.recover(expected.position());
+                    if(cdc!=null) cdc.recover(expected.position(),cdcAuthorityTime());
                     validateReceiptUsage(expected.position());
                     activeSchemaFence=loadSchemaFence(expected.position());
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();

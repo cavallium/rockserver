@@ -742,7 +742,7 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
-            try { cdc.finish(header.owner(),header.position()); }
+            try { cdc.finish(header.owner(),header.position()); cdc.requireAuthorityClock(sessionAuthority==null ? -1 : sessionAuthority.logicalTimeMillis()); }
             catch(IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Invalid CDC image retention",invalid); }
             if(importFileReceipts!=importFileReceiptCount)throw new IOException("Import file result count differs from image inventory");
             if(importBirth!=null && (importReceipt==null || importActivation==null))throw new IOException("Unpublished import cannot become a native image");

@@ -9,44 +9,70 @@ import org.rocksdb.*;
 final class NativeRangeCdc {
     static final int MAX_RECORDS=4096;
     static final long MAX_RETAINED_BYTES=64L*1024*1024;
+    static final long MAX_AGE_MILLIS=24L*60*60*1000;
+    private static final long ROW_OVERHEAD=58;
     private final RocksDB db;
     private final ColumnFamilyHandle state;
-    private final byte[] prefix,summaryKey;
+    private final byte[] prefix,summaryKey,agePrefix;
     private final DistributedCdcCheckpoint.Lineage lineage;
-    private record Entry(long term,int bytes,int mutations) {}
+    private record Entry(long term,int bytes,int mutations,long age) {}
     private TreeMap<Long,Entry> sizes=new TreeMap<>();
-    private long retainedBytes;
+    private long retainedBytes,lastClock=-1;
     private boolean initialized;
     private DistributedCdcCheckpoint.Cursor floor=DistributedCdcCheckpoint.Cursor.beginning();
 
-    /** Bounded image metadata validation; no retained event payloads or native handles. */
+    /** Bounded image metadata validation; only event metadata and matching age cells survive this scan. */
     static final class ImageState {
         DistributedCdcCheckpoint.Lineage lineage;
-        private int count; private long bytes,firstIndex=-1,lastIndex=-1,lastTerm;
+        private final TreeMap<Long,Entry> records=new TreeMap<>();
+        private final TreeMap<Long,Long> ages=new TreeMap<>();
+        private long bytes,lastTerm;
         private byte[] summary;
+        private DistributedCdcCheckpoint.Cursor floor=DistributedCdcCheckpoint.Cursor.beginning();
+        private long clock=-1;
         void accept(byte[] key,byte[] value,RangeOwnership.Owner owner,ApplyPosition cut) {
-            if(key.length<=16 || key[16]!=0x50 && key[16]!=0x51) return;
+            if(key.length<=16 || key[16]!=0x50 && key[16]!=0x51 && key[16]!=0x52) return;
             if(key[16]==0x50) {
-                if(key.length!=25 || count>=MAX_RECORDS || value.length>DistributedCdcRecord.MAX_BYTES) throw new IllegalArgumentException("Invalid CDC image record shape/capacity");
+                if(key.length!=25 || records.size()>=MAX_RECORDS || value.length>DistributedCdcRecord.MAX_BYTES) throw new IllegalArgumentException("Invalid CDC image record shape/capacity");
                 var record=DistributedCdcRecord.decode(value); var actual=record.lineage();
                 if(!actual.groupId().equals(owner.groupId()) || actual.rangeEpoch()!=owner.epoch() || lineage!=null && !lineage.equals(actual)) throw new IllegalArgumentException("CDC image lineage changed");
                 lineage=actual; long index=record.position().index();
-                if(ByteBuffer.wrap(key,17,8).getLong()!=index || lastIndex>=index || lastTerm>record.position().term()) throw new IllegalArgumentException("CDC image order/entry identity changed");
-                requireCursorCut(record.end(),cut); if(count==0) firstIndex=index; lastIndex=index; lastTerm=record.position().term(); count++;
-                bytes+=25L+value.length; if(bytes>MAX_RETAINED_BYTES) throw new IllegalArgumentException("CDC image byte capacity exceeded");
+                if(ByteBuffer.wrap(key,17,8).getLong()!=index || !records.isEmpty() && records.lastKey()>=index || lastTerm>record.position().term()) throw new IllegalArgumentException("CDC image order/entry identity changed");
+                requireCursorCut(record.end(),cut); lastTerm=record.position().term();
+                records.put(index,new Entry(record.position().term(),value.length,record.command().mutations().size(),-1));
+                bytes+=ROW_OVERHEAD+value.length; if(bytes>MAX_RETAINED_BYTES) throw new IllegalArgumentException("CDC image byte capacity exceeded");
+            } else if(key[16]==0x51) {
+                if(key.length!=17 || summary!=null || value.length!=80) throw new IllegalArgumentException("Invalid CDC image retention summary"); summary=value.clone();
             } else {
-                if(key.length!=17 || summary!=null || value.length!=72) throw new IllegalArgumentException("Invalid CDC image retention summary"); summary=value.clone();
+                if(key.length!=25 || value.length!=8 || ages.size()>=MAX_RECORDS) throw new IllegalArgumentException("Invalid CDC age cell shape/capacity");
+                long index=ByteBuffer.wrap(key,17,8).getLong(),age=ByteBuffer.wrap(value).getLong();
+                if(index<0 || age < -1 || !ages.isEmpty() && ages.lastKey()>=index || ages.put(index,age)!=null) throw new IllegalArgumentException("Invalid CDC age cell order/identity");
             }
         }
         void finish(RangeOwnership.Owner owner,ApplyPosition cut) {
-            if(summary==null) { if(count!=0) throw new IllegalArgumentException("CDC image records lack retention summary"); return; }
+            if(summary==null) { if(!records.isEmpty() || !ages.isEmpty()) throw new IllegalArgumentException("CDC image rows lack retention summary"); return; }
             var input=ByteBuffer.wrap(summary); var actual=new DistributedCdcCheckpoint.Lineage(uuid(input),uuid(input),input.getLong());
-            var floor=new DistributedCdcCheckpoint.Cursor(new ApplyPosition(input.getLong(),input.getLong()),input.getInt());
+            floor=new DistributedCdcCheckpoint.Cursor(new ApplyPosition(input.getLong(),input.getLong()),input.getInt());
+            int count=input.getInt(); long declaredBytes=input.getLong(); clock=input.getLong();
             if(!actual.groupId().equals(owner.groupId()) || actual.rangeEpoch()!=owner.epoch() || lineage!=null && !lineage.equals(actual)
-                    || input.getInt()!=count || input.getLong()!=bytes || !floor.equals(DistributedCdcCheckpoint.Cursor.beginning()) && floor.mutationOrdinal()!=DistributedCommandCodec.MAX_MUTATIONS)
-                throw new IllegalArgumentException("CDC image summary differs from retained rows");
+                    || count!=records.size() || declaredBytes!=bytes || clock < -1 || !floor.equals(DistributedCdcCheckpoint.Cursor.beginning()) && floor.mutationOrdinal()!=DistributedCommandCodec.MAX_MUTATIONS
+                    || !records.keySet().equals(ages.keySet())) throw new IllegalArgumentException("CDC image summary/age cells differ from retained rows");
             requireCursorCut(floor,cut);
-            if(count>0 && floor.position().term()!=0 && floor.position().index()>=firstIndex) throw new IllegalArgumentException("CDC image rows precede eviction floor"); lineage=actual;
+            if(!records.isEmpty() && floor.position().term()!=0 && floor.position().index()>=records.firstKey()) throw new IllegalArgumentException("CDC image rows precede eviction floor");
+            long previous=-1; boolean pending=false;
+            for(var entry:ages.entrySet()) {
+                long age=entry.getValue();
+                if(age==-1) pending=true;
+                else {
+                    if(pending || age<previous || age>clock || clock-age>=MAX_AGE_MILLIS) throw new IllegalArgumentException("CDC ages differ from committed clock/order");
+                    previous=age;
+                }
+                var record=records.get(entry.getKey()); records.put(entry.getKey(),new Entry(record.term(),record.bytes(),record.mutations(),age));
+            }
+            lineage=actual;
+        }
+        void requireAuthorityClock(long authorityClock) {
+            if(authorityClock < -1 || summary!=null && clock!=authorityClock) throw new IllegalArgumentException("CDC retention clock differs from persisted authority");
         }
     }
     void validateImage(java.nio.file.Path image,NativeRangeImage.Limits limits,ApplyPosition cut) throws java.io.IOException {
@@ -63,38 +89,28 @@ final class NativeRangeCdc {
         this.db=db; this.state=state; this.lineage=lineage;
         var group=lineage.groupId();
         prefix=ByteBuffer.allocate(17).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).put((byte)0x50).array();
-        summaryKey=prefix.clone(); summaryKey[16]=0x51;
+        summaryKey=prefix.clone(); summaryKey[16]=0x51; agePrefix=prefix.clone(); agePrefix[16]=0x52;
     }
     private byte[] key(long index) { return ByteBuffer.allocate(25).put(prefix).putLong(index).array(); }
-    void recover(ApplyPosition cut) throws RocksDBException {
-        var recovered=new TreeMap<Long,Entry>(); long bytes=0; var validation=new ImageState(); var owner=new RangeOwnership.Owner(lineage.groupId(),lineage.rangeEpoch());
-        try(var low=new Slice(prefix);var high=new Slice(summaryKey);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high);var iterator=db.newIterator(state,options)) {
+    private byte[] ageKey(long index) { return ByteBuffer.allocate(25).put(agePrefix).putLong(index).array(); }
+    void recover(ApplyPosition cut,long baselineClock) throws RocksDBException {
+        if(baselineClock < -1) throw new IllegalArgumentException("Invalid CDC baseline clock");
+        var validation=new ImageState(); var owner=new RangeOwnership.Owner(lineage.groupId(),lineage.rangeEpoch());
+        byte[] upper=prefix.clone(); upper[16]=0x53;
+        try(var low=new Slice(prefix);var high=new Slice(upper);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high);var iterator=db.newIterator(state,options)) {
             iterator.seekToFirst(); var sizing=new byte[0];
             while(iterator.isValid()) {
-                if(recovered.size()>=MAX_RECORDS || iterator.key(sizing)!=25 || iterator.value(sizing)>DistributedCdcRecord.MAX_BYTES) throw new IllegalStateException("CDC recovery capacity/shape exceeded");
-                byte[] encoded=iterator.value(); var record=DistributedCdcRecord.decode(encoded); requireRecord(record,cut);
-                validation.accept(iterator.key(),encoded,owner,cut);
-                if(!Arrays.equals(iterator.key(),key(record.position().index())) || recovered.put(record.position().index(),new Entry(record.position().term(),encoded.length,record.command().mutations().size()))!=null) throw new IllegalStateException("CDC record key changed");
-                bytes+=25L+encoded.length; if(bytes>MAX_RETAINED_BYTES) throw new IllegalStateException("CDC recovery byte capacity exceeded"); iterator.next();
+                int keyBytes=iterator.key(sizing),valueBytes=iterator.value(sizing);
+                if(keyBytes!=17 && keyBytes!=25 || valueBytes>DistributedCdcRecord.MAX_BYTES) throw new IllegalStateException("CDC recovery capacity/shape exceeded");
+                validation.accept(iterator.key(),iterator.value(),owner,cut); iterator.next();
             }
             iterator.status();
         }
-        byte[] summary=db.get(state,summaryKey); var recoveredFloor=DistributedCdcCheckpoint.Cursor.beginning();
-        if(summary!=null) validation.accept(summaryKey,summary,owner,cut);
-        validation.finish(owner,cut);
-        if(summary==null) {
-            if(!recovered.isEmpty()) throw new IllegalStateException("CDC records lack retention summary");
-            if(cut!=null) recoveredFloor=DistributedCdcCheckpoint.Cursor.after(cut);
-        }
-        else {
-            if(summary.length!=72) throw new IllegalStateException("Invalid CDC retention summary");
-            var input=ByteBuffer.wrap(summary); var stored=new DistributedCdcCheckpoint.Lineage(uuid(input),uuid(input),input.getLong());
-            recoveredFloor=new DistributedCdcCheckpoint.Cursor(new ApplyPosition(input.getLong(),input.getLong()),input.getInt());
-            if(!lineage.equals(stored) || input.getInt()!=recovered.size() || input.getLong()!=bytes) throw new IllegalStateException("CDC retention summary differs from rows");
-            requireCursorCut(recoveredFloor,cut);
-            if(!recovered.isEmpty() && recoveredFloor.position().term()!=0 && recovered.firstKey()<=recoveredFloor.position().index()) throw new IllegalStateException("CDC retained rows precede eviction floor");
-        }
-        sizes=recovered; retainedBytes=bytes; floor=recoveredFloor; initialized=summary!=null;
+        validation.finish(owner,cut); validation.requireAuthorityClock(baselineClock);
+        if(validation.lineage!=null && !lineage.equals(validation.lineage)) throw new IllegalStateException("CDC recovered lineage differs");
+        sizes=validation.records; retainedBytes=validation.bytes; lastClock=validation.summary==null ? baselineClock : validation.clock;
+        floor=validation.summary==null && cut!=null ? DistributedCdcCheckpoint.Cursor.after(cut) : validation.floor;
+        initialized=validation.summary!=null;
     }
     private void requireRecord(DistributedCdcRecord record,ApplyPosition cut) {
         if(!record.lineage().equals(lineage)) throw new IllegalStateException("CDC record lineage differs"); requireCursorCut(record.end(),cut);
@@ -107,30 +123,55 @@ final class NativeRangeCdc {
     /** Prepare bounded evictions in the same native batch; publish bookkeeping only after db.write returns. */
     Runnable append(WriteBatch batch,DistributedCdcRecord record) throws RocksDBException {
         if(!lineage.equals(record.lineage()) || sizes.containsKey(record.position().index()) || !sizes.isEmpty() && sizes.lastKey()>=record.position().index()) throw new IllegalArgumentException("CDC append is not new ordered progress");
-        byte[] encoded=record.encode(); long bytes=retainedBytes+25L+encoded.length; var nextFloor=floor;
+        byte[] encoded=record.encode(); long bytes=retainedBytes+ROW_OVERHEAD+encoded.length; var nextFloor=floor;
         var evictions=new ArrayList<Long>(); var candidates=sizes.entrySet().iterator();
         while(sizes.size()-evictions.size()>=MAX_RECORDS || bytes>MAX_RETAINED_BYTES) {
             if(!candidates.hasNext()) throw new IllegalArgumentException("CDC record exceeds retention capacity");
             var first=candidates.next(); evictions.add(first.getKey());
-            bytes-=25L+first.getValue().bytes(); nextFloor=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(first.getValue().term(),first.getKey())); batch.delete(state,key(first.getKey()));
+            bytes-=ROW_OVERHEAD+first.getValue().bytes(); nextFloor=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(first.getValue().term(),first.getKey())); batch.delete(state,key(first.getKey())); batch.delete(state,ageKey(first.getKey()));
         }
-        batch.put(state,key(record.position().index()),encoded);
-        batch.put(state,summaryKey,summary(nextFloor,sizes.size()-evictions.size()+1,bytes)); long publishedBytes=bytes; var publishedFloor=nextFloor;
-        var metadata=new Entry(record.position().term(),encoded.length,record.command().mutations().size());
+        batch.put(state,key(record.position().index()),encoded); batch.put(state,ageKey(record.position().index()),ByteBuffer.allocate(8).putLong(-1).array());
+        batch.put(state,summaryKey,summary(nextFloor,sizes.size()-evictions.size()+1,bytes,lastClock)); long publishedBytes=bytes; var publishedFloor=nextFloor;
+        var metadata=new Entry(record.position().term(),encoded.length,record.command().mutations().size(),-1);
         return ()->{ evictions.forEach(sizes::remove); sizes.put(record.position().index(),metadata); retainedBytes=publishedBytes; floor=publishedFloor; initialized=true; };
     }
-    private byte[] summary(DistributedCdcCheckpoint.Cursor floor,int count,long bytes) {
-        var summary=ByteBuffer.allocate(72); uuid(summary,lineage.rangeId()); uuid(summary,lineage.groupId()); summary.putLong(lineage.rangeEpoch());
-        return summary.putLong(floor.position().term()).putLong(floor.position().index()).putInt(floor.mutationOrdinal()).putInt(count).putLong(bytes).array();
+    /** Evict cached anchored metadata, then anchor pending cohorts only at a strictly newer committed tick. */
+    Runnable advanceClock(WriteBatch batch,long logicalTimeMillis) throws RocksDBException {
+        if(logicalTimeMillis<0) throw new IllegalArgumentException("Negative CDC logical clock");
+        if(logicalTimeMillis<=lastClock) return ()->{};
+        var first=sizes.firstEntry(); var last=sizes.lastEntry();
+        // Anchors are ordered and pending rows form a suffix; unchanged ticks need no map copy.
+        if(last==null || last.getValue().age()!=-1 && logicalTimeMillis-first.getValue().age()<MAX_AGE_MILLIS) {
+            batch.put(state,summaryKey,summary(floor,sizes.size(),retainedBytes,logicalTimeMillis));
+            return ()->{ lastClock=logicalTimeMillis; initialized=true; };
+        }
+        var next=new TreeMap<Long,Entry>(); var nextFloor=floor; long bytes=retainedBytes;
+        for(var row:sizes.entrySet()) {
+            long index=row.getKey(); var entry=row.getValue();
+            if(entry.age()>=0 && logicalTimeMillis-entry.age()>=MAX_AGE_MILLIS) {
+                batch.delete(state,key(index)); batch.delete(state,ageKey(index)); bytes-=ROW_OVERHEAD+entry.bytes();
+                nextFloor=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(entry.term(),index));
+            } else {
+                if(entry.age()==-1) { entry=new Entry(entry.term(),entry.bytes(),entry.mutations(),logicalTimeMillis); batch.put(state,ageKey(index),ByteBuffer.allocate(8).putLong(logicalTimeMillis).array()); }
+                next.put(index,entry);
+            }
+        }
+        batch.put(state,summaryKey,summary(nextFloor,next.size(),bytes,logicalTimeMillis)); long publishedBytes=bytes; var publishedFloor=nextFloor;
+        return ()->{ sizes=next; retainedBytes=publishedBytes; floor=publishedFloor; lastClock=logicalTimeMillis; initialized=true; };
+    }
+    private byte[] summary(DistributedCdcCheckpoint.Cursor floor,int count,long bytes,long clock) {
+        var summary=ByteBuffer.allocate(80); uuid(summary,lineage.rangeId()); uuid(summary,lineage.groupId()); summary.putLong(lineage.rangeEpoch());
+        return summary.putLong(floor.position().term()).putLong(floor.position().index()).putInt(floor.mutationOrdinal()).putInt(count).putLong(bytes).putLong(clock).array();
     }
     Runnable initialize(WriteBatch batch) throws RocksDBException {
         if(initialized) return ()->{};
-        batch.put(state,summaryKey,summary(floor,0,0)); return ()->initialized=true;
+        batch.put(state,summaryKey,summary(floor,0,0,lastClock)); return ()->initialized=true;
     }
-    Runnable importedBaseline(WriteBatch batch,ApplyPosition cut) throws RocksDBException {
+    Runnable importedBaseline(WriteBatch batch,ApplyPosition cut,long baselineClock) throws RocksDBException {
+        if(baselineClock < -1) throw new IllegalArgumentException("Invalid imported CDC baseline clock");
         if(!sizes.isEmpty()) throw new IllegalStateException("Imported range already has CDC events");
         var nextFloor=DistributedCdcCheckpoint.Cursor.after(cut);
-        batch.put(state,summaryKey,summary(nextFloor,0,0)); return ()->{ floor=nextFloor; initialized=true; };
+        batch.put(state,summaryKey,summary(nextFloor,0,0,baselineClock)); return ()->{ floor=nextFloor; lastClock=baselineClock; initialized=true; };
     }
     ReplicatedRangeStore.CdcPage poll(DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes,ApplyPosition cut) throws RocksDBException {
         requireCursorCut(from,cut);

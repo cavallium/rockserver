@@ -80,6 +80,8 @@ class NativeDistributedCdcTest {
             assertEquals(floor,page.floor()); assertEquals(1,page.records().size()); assertEquals(new ApplyPosition(1,1),page.records().getFirst().position());
             assertEquals(DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,1)),page.next());
             assertEquals(1,f.store.receiptUsage().retainedCount());
+            var nativeState=state(f); assertNull(nativeState.db().get(nativeState.state(),cell(0x50,0))); assertNull(nativeState.db().get(nativeState.state(),cell(0x52,0)));
+            assertNotNull(nativeState.db().get(nativeState.state(),cell(0x52,1)));
         }
         try(var f=outer.new Fixture(root.resolve("retention"),true)) {
             f.store.enableCdc(outer.group);
@@ -160,7 +162,7 @@ class NativeDistributedCdcTest {
             var dbField=ReplicatedRangeStore.class.getDeclaredField("db"); var stateField=ReplicatedRangeStore.class.getDeclaredField("state");
             dbField.setAccessible(true); stateField.setAccessible(true);
             var db=(org.rocksdb.RocksDB)dbField.get(f.store); var state=(org.rocksdb.ColumnFamilyHandle)stateField.get(f.store);
-            byte[] key=java.nio.ByteBuffer.allocate(17).putLong(outer.group.getMostSignificantBits()).putLong(outer.group.getLeastSignificantBits()).put((byte)0x51).array();
+            byte[] key=cell(0x51,0);
             byte[] summary=db.get(state,key); java.nio.ByteBuffer.wrap(summary).putInt(60,2); db.put(state,key,summary);
             try(var pin=f.store.capture()) {
                 assertThrows(java.io.IOException.class,()->NativeRangeImage.write(root.resolve("invalid-image"),pin,f.store.ownership().interval(),new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4)));
@@ -206,6 +208,138 @@ class NativeDistributedCdcTest {
         try(var f=outer.new Fixture(source,true)) {
             f.store.enableCdc(outer.group); var idle=poll(f,endpoint);
             assertTrue(idle.fromVerified()); assertEquals(endpoint,idle.next());
+        }
+    }
+
+    private static final long DAY=24L*60*60*1000;
+    private record NativeState(org.rocksdb.RocksDB db,org.rocksdb.ColumnFamilyHandle state) {}
+    NativeState state(NativeBucketApplyTest.Fixture f) throws Exception {
+        var db=ReplicatedRangeStore.class.getDeclaredField("db"); var state=ReplicatedRangeStore.class.getDeclaredField("state"); db.setAccessible(true); state.setAccessible(true);
+        return new NativeState((org.rocksdb.RocksDB)db.get(f.store),(org.rocksdb.ColumnFamilyHandle)state.get(f.store));
+    }
+    byte[] cell(int tag,long index) {
+        var out=java.nio.ByteBuffer.allocate(tag==0x51 ? 17 : 25).putLong(outer.group.getMostSignificantBits()).putLong(outer.group.getLeastSignificantBits()).put((byte)tag);
+        if(tag!=0x51) out.putLong(index); return out.array();
+    }
+    long age(NativeBucketApplyTest.Fixture f,long index) throws Exception { var nativeState=state(f); return java.nio.ByteBuffer.wrap(nativeState.db().get(nativeState.state(),cell(0x52,index))).getLong(); }
+    DistributedCommand tick(NativeBucketApplyTest.Fixture f,long generation,long time,boolean bind) {
+        var authority=new SessionAuthority(outer.cluster,outer.database,generation,time,1);
+        var control=bind ? new RangeSessionControl(authority,new SessionEpochLedger.Grant(1,outer.session,0,DAY),4096) : new RangeSessionControl(authority,null,0);
+        return DistributedCommand.sessionControl(outer.group,1,f.schema.digest(),new OperationId(UUID.randomUUID(),1,0),control,-1);
+    }
+    void clock(NativeBucketApplyTest.Fixture f,long index,long generation,long time) throws Exception { assertEquals(CommandResult.Status.SUCCESS,f.apply(index,tick(f,generation,time,false)).status()); }
+    @Test void committedZeroClockAnchorsPendingAndCatchupPreservesTheNewCohortUntilExactAgeBoundary() throws Exception {
+        try(var f=outer.new Fixture(root.resolve("logical-age"),true)) {
+            f.store.enableCdc(outer.group); f.apply(0,helper.put(f,0,1,9)); assertEquals(-1,age(f,0)); f.store.enableSessionControls();
+            assertEquals(CommandResult.Status.SUCCESS,f.apply(1,tick(f,1,0,true)).status()); assertEquals(0,age(f,0));
+            f.apply(2,helper.put(f,1,2,8)); assertEquals(-1,age(f,2)); clock(f,3,2,0); assertEquals(-1,age(f,2));
+            clock(f,4,1,0); assertEquals(-1,age(f,2)); assertEquals(2,poll(f,DistributedCdcCheckpoint.Cursor.beginning()).records().size());
+            var catchup=tick(f,3,DAY,false); assertEquals(CommandResult.Status.SUCCESS,f.apply(5,catchup).status());
+            var floor=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0)); assertThrows(CdcGapDetectedException.class,()->poll(f,DistributedCdcCheckpoint.Cursor.beginning()));
+            assertEquals(1,poll(f,floor).records().size()); assertEquals(DAY,age(f,2));
+            clock(f,6,4,DAY); f.apply(7,catchup); assertEquals(DAY,age(f,2));
+            clock(f,8,5,2*DAY-1); assertEquals(1,poll(f,floor).records().size()); clock(f,9,6,2*DAY);
+            var emptyFloor=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2)); assertTrue(poll(f,emptyFloor).records().isEmpty()); assertEquals(emptyFloor,poll(f,emptyFloor).floor());
+            var nativeState=state(f); assertNull(nativeState.db().get(nativeState.state(),cell(0x50,2))); assertNull(nativeState.db().get(nativeState.state(),cell(0x52,2)));
+        }
+    }
+    @Test void logicalClockAndAgeCellsSurviveReopenAndNativeImageImport() throws Exception {
+        Path source=root.resolve("age-source"),image=root.resolve("age-image"); var limits=new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4);
+        try(var f=outer.new Fixture(source,true)) {
+            f.store.enableCdc(outer.group); f.apply(0,helper.put(f,0,1,9)); f.store.enableSessionControls(); f.apply(1,tick(f,1,0,true)); f.apply(2,helper.put(f,1,2,8)); clock(f,3,2,DAY);
+            NativeRangeImage.write(image,f.store,limits);
+        }
+        for(boolean install:new boolean[]{false,true}) try(var f=outer.new Fixture(install ? root.resolve("age-target") : source,true)) {
+            f.store.enableCdc(outer.group); if(install) { f.store.fence(); f.store.installSnapshot(image,limits); f.store.activate(); }
+            f.store.enableSessionControls(); var floor=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0)); assertEquals(DAY,age(f,2)); clock(f,4,3,DAY); assertEquals(DAY,age(f,2));
+            clock(f,5,4,2*DAY); assertTrue(poll(f,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2))).records().isEmpty());
+            assertThrows(CdcGapDetectedException.class,()->poll(f,floor));
+        }
+    }
+    @Test void byteRetentionChargesAgeRowsAndDeletesTheirCellsWithTheirEvents() throws Exception {
+        try(var f=outer.new Fixture(root.resolve("age-bytes"),true)) {
+            f.store.enableCdc(outer.group); byte[] value=new byte[2_000_000];
+            for(int i=0;i<34;i++) f.apply(i,new DistributedCommand(outer.group,1,f.schema.digest(),new OperationId(outer.session,1,i),List.of(new Mutation(Mutation.Kind.PUT,outer.fixed,new byte[]{1},value))));
+            var nativeState=state(f); byte[] summary=nativeState.db().get(nativeState.state(),cell(0x51,0)); assertEquals(80,summary.length);
+            var fields=java.nio.ByteBuffer.wrap(summary); int count=fields.getInt(60); long bytes=fields.getLong(64); assertTrue(count<34); assertTrue(bytes<=64L*1024*1024);
+            long floor=fields.getLong(48); long expected=0;
+            for(long i=0;i<34;i++) { byte[] record=nativeState.db().get(nativeState.state(),cell(0x50,i)),age=nativeState.db().get(nativeState.state(),cell(0x52,i)); if(i<=floor) { assertNull(record); assertNull(age); } else { assertNotNull(record); assertEquals(8,age.length); expected+=58L+record.length; } }
+            assertEquals(expected,bytes);
+        }
+    }
+    @Test void ageEvictionUsesCachedMetadataWithoutDecodingExpiredPayload() throws Exception {
+        Path path=root.resolve("expired-payload");
+        try(var f=outer.new Fixture(path,true)) {
+            f.store.enableCdc(outer.group); f.apply(0,helper.put(f,0,1,9)); f.store.enableSessionControls(); f.apply(1,tick(f,1,0,true)); var nativeState=state(f);
+            nativeState.db().put(nativeState.state(),cell(0x50,0),new byte[]{0}); clock(f,2,2,DAY);
+            assertNull(nativeState.db().get(nativeState.state(),cell(0x50,0))); assertNull(nativeState.db().get(nativeState.state(),cell(0x52,0)));
+            assertTrue(poll(f,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0))).records().isEmpty());
+        }
+        try(var f=outer.new Fixture(path,true)) { f.store.enableCdc(outer.group); assertTrue(poll(f,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0))).records().isEmpty()); }
+    }
+    @Test void malformedMissingOrOutOfOrderAgeCellsRejectCurrentFormatRecoveryAndImage() throws Exception {
+        for(int corruption=0;corruption<5;corruption++) {
+            Path path=root.resolve("bad-age-"+corruption);
+            try(var f=outer.new Fixture(path,true)) {
+                f.store.enableCdc(outer.group); f.apply(0,helper.put(f,0,1,9)); f.store.enableSessionControls(); f.apply(1,tick(f,1,0,true)); f.apply(2,helper.put(f,1,2,8));
+                var nativeState=state(f);
+                switch(corruption) {
+                    case 0 -> nativeState.db().delete(nativeState.state(),cell(0x52,0));
+                    case 1 -> nativeState.db().put(nativeState.state(),cell(0x52,3),java.nio.ByteBuffer.allocate(8).putLong(-1).array());
+                    case 2 -> nativeState.db().put(nativeState.state(),cell(0x52,0),new byte[7]);
+                    case 3 -> { nativeState.db().put(nativeState.state(),cell(0x52,0),java.nio.ByteBuffer.allocate(8).putLong(-1).array()); nativeState.db().put(nativeState.state(),cell(0x52,2),java.nio.ByteBuffer.allocate(8).putLong(0).array()); }
+                    case 4 -> nativeState.db().put(nativeState.state(),cell(0x52,0),java.nio.ByteBuffer.allocate(8).putLong(1).array());
+                }
+                try(var pin=f.store.capture()) { assertThrows(java.io.IOException.class,()->NativeRangeImage.write(root.resolve("bad-age-image-"+path.getFileName()),pin,f.store.ownership().interval(),new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4))); }
+            }
+            try(var f=outer.new Fixture(path,true)) { assertThrows(IllegalArgumentException.class,()->f.store.enableCdc(outer.group)); }
+        }
+    }
+
+    @Test void enablingCdcAfterAnExistingAuthorityDoesNotAnchorPendingWritesOnTheOldClock() throws Exception {
+        Path path=root.resolve("authority-baseline"); var baseline=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0));
+        try(var f=outer.new Fixture(path,true)) {
+            f.store.enableSessionControls(); var authority=new SessionAuthority(outer.cluster,outer.database,1,100,1);
+            var control=new RangeSessionControl(authority,new SessionEpochLedger.Grant(1,outer.session,100,100+DAY),4096);
+            var binding=DistributedCommand.sessionControl(outer.group,1,f.schema.digest(),new OperationId(UUID.randomUUID(),1,0),control,-1);
+            assertEquals(CommandResult.Status.SUCCESS,f.apply(0,binding).status()); f.store.enableCdc(outer.group);
+            f.apply(1,helper.put(f,0,1,9)); assertEquals(-1,age(f,1)); clock(f,2,2,100); assertEquals(-1,age(f,1));
+        }
+        try(var f=outer.new Fixture(path,true)) {
+            f.store.enableCdc(outer.group); f.store.enableSessionControls(); clock(f,3,3,100); assertEquals(-1,age(f,1));
+            clock(f,4,4,100+10*DAY); var page=poll(f,baseline); assertEquals(1,page.records().size()); assertEquals(baseline,page.floor()); assertEquals(100+10*DAY,age(f,1));
+        }
+    }
+
+    @Test void imageWithoutCdcSeedsItsImportedBaselineFromThePersistedAuthority() throws Exception {
+        Path image=root.resolve("authority-only-image"); var limits=new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4);
+        try(var f=outer.new Fixture(root.resolve("authority-only-source"),true)) {
+            f.store.enableSessionControls(); var authority=new SessionAuthority(outer.cluster,outer.database,1,100,1);
+            var control=new RangeSessionControl(authority,new SessionEpochLedger.Grant(1,outer.session,100,100+DAY),4096);
+            f.apply(0,DistributedCommand.sessionControl(outer.group,1,f.schema.digest(),new OperationId(UUID.randomUUID(),1,0),control,-1));
+            NativeRangeImage.write(image,f.store,limits);
+        }
+        try(var f=outer.new Fixture(root.resolve("authority-only-target"),true)) {
+            f.store.enableCdc(outer.group); f.store.fence(); f.store.installSnapshot(image,limits); f.store.activate(); f.store.enableSessionControls();
+            var baseline=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0)); f.apply(1,helper.put(f,0,1,9)); clock(f,2,2,100); assertEquals(-1,age(f,1));
+            clock(f,3,3,100+10*DAY); assertEquals(1,poll(f,baseline).records().size()); assertEquals(baseline,poll(f,baseline).floor());
+        }
+    }
+
+    @Test void pendingCohortClockMustMatchPersistedAuthorityInImageAndReopen() throws Exception {
+        for(long forged:new long[]{50,100+DAY}) {
+            Path path=root.resolve("forged-clock-"+forged);
+            try(var f=outer.new Fixture(path,true)) {
+                f.store.enableSessionControls();
+                var authority=new SessionAuthority(outer.cluster,outer.database,1,100,1);
+                var control=new RangeSessionControl(authority,new SessionEpochLedger.Grant(1,outer.session,100,100+DAY),4096);
+                f.apply(0,DistributedCommand.sessionControl(outer.group,1,f.schema.digest(),new OperationId(UUID.randomUUID(),1,0),control,-1));
+                f.store.enableCdc(outer.group); f.apply(1,helper.put(f,0,1,9)); assertEquals(-1,age(f,1));
+                var nativeState=state(f); byte[] key=cell(0x51,0);
+                byte[] summary=nativeState.db().get(nativeState.state(),key); java.nio.ByteBuffer.wrap(summary).putLong(72,forged); nativeState.db().put(nativeState.state(),key,summary);
+                try(var pin=f.store.capture()) { assertThrows(java.io.IOException.class,()->NativeRangeImage.write(root.resolve("forged-clock-image-"+forged),pin,f.store.ownership().interval(),new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,4))); }
+            }
+            try(var f=outer.new Fixture(path,true)) { assertThrows(IllegalArgumentException.class,()->f.store.enableCdc(outer.group)); }
         }
     }
 
