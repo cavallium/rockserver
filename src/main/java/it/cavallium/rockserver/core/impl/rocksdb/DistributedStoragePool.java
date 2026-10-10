@@ -72,6 +72,77 @@ public final class DistributedStoragePool implements AutoCloseable {
         Binding(String name,boolean mergeAdmitted) { this(name,mergeAdmitted,BirthKind.BOOTSTRAP,BOOTSTRAP_BIRTH); }
     }
     private boolean birthsDurable=true;
+    private static final byte[] OWNERSHIP_HISTORY_KEY="OWNERSHIP-HISTORY".getBytes(StandardCharsets.US_ASCII);
+    private static final int MAX_OWNERSHIP_HISTORY=4096,MAX_OWNERSHIP_BYTES=8*1024*1024;
+    private record HistoricalOwner(RangeOwnership.Owner owner,RangeOwnership.Interval interval) {}
+    private List<HistoricalOwner> ownershipHistory=List.of();
+    private boolean ownershipHistoryDurable=true;
+    // Exact unpublished claims survive unknown native completion and block identity substitution.
+    private final Map<UUID,NativeSstImportManifest> newImportReservations=new HashMap<>();
+    @FunctionalInterface public interface ImportBirthForceObserver { void boundary(boolean afterPersistence) throws RocksDBException; }
+    private volatile ImportBirthForceObserver importBirthForceObserver=after -> {};
+    public void importBirthForceObserver(ImportBirthForceObserver observer) { importBirthForceObserver=Objects.requireNonNull(observer); }
+    private byte[] encodeOwnershipHistory(List<HistoricalOwner> records) throws IOException {
+        long size=8;
+        for(var record:records) { size+=52L+16L*record.interval().columns().size(); for(var bound:new byte[][]{record.interval().lowerInclusive(),record.interval().upperExclusive()}) { if(bound!=null && bound.length>RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IOException("Ownership bound exceeds directory capacity"); size+=bound==null?0:bound.length; } if(size>MAX_OWNERSHIP_BYTES)throw new IOException("Native ownership history byte capacity exhausted"); }
+        var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(0x4f574e48); out.writeInt(records.size());
+        for(var record:records) {
+            out.writeLong(record.owner().groupId().getMostSignificantBits()); out.writeLong(record.owner().groupId().getLeastSignificantBits()); out.writeLong(record.owner().epoch());
+            out.writeLong(record.interval().domainId().getMostSignificantBits()); out.writeLong(record.interval().domainId().getLeastSignificantBits());
+            var columns=record.interval().columns().stream().sorted(java.util.Comparator.comparing(UUID::toString)).toList(); out.writeInt(columns.size()); for(var column:columns) { out.writeLong(column.getMostSignificantBits()); out.writeLong(column.getLeastSignificantBits()); }
+            for(var bound:new byte[][]{record.interval().lowerInclusive(),record.interval().upperExclusive()}) { if(bound!=null && bound.length>RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IOException("Ownership bound exceeds directory capacity"); out.writeInt(bound==null?-1:bound.length); if(bound!=null)out.write(bound); }
+        }
+        if(bytes.size()>MAX_OWNERSHIP_BYTES)throw new IOException("Native ownership history byte capacity exhausted"); return bytes.toByteArray();
+    }
+    private void recoverOwnershipHistory() {
+        try {
+            byte[] bytes=loaded.db().get().get(handles.get(STATE_COLUMN),OWNERSHIP_HISTORY_KEY); if(bytes==null)return;
+            if(bytes.length>MAX_OWNERSHIP_BYTES)throw new IOException("Ownership history exceeds bound"); var in=new DataInputStream(new ByteArrayInputStream(bytes)); if(in.readInt()!=0x4f574e48)throw new IOException("Invalid ownership history"); int count=in.readInt(); if(count<0 || count>MAX_OWNERSHIP_HISTORY)throw new IOException("Ownership history count bound");
+            var records=new ArrayList<HistoricalOwner>(); var unique=new HashSet<HistoricalOwner>();
+            for(int i=0;i<count;i++) {
+                var owner=new RangeOwnership.Owner(new UUID(in.readLong(),in.readLong()),in.readLong()); UUID domain=new UUID(in.readLong(),in.readLong()); int n=in.readInt(); if(n<0 || n>4096)throw new IOException("Ownership columns exceed bound"); var columns=new HashSet<UUID>(); String previous=null;
+                for(int c=0;c<n;c++) { UUID column=new UUID(in.readLong(),in.readLong()); if(previous!=null && previous.compareTo(column.toString())>=0 || !columns.add(column))throw new IOException("Noncanonical ownership columns"); previous=column.toString(); }
+                byte[][] bounds=new byte[2][]; for(int b=0;b<2;b++) { int size=in.readInt(); if(size==-1)continue; if(size<0 || size>RangeDirectoryCodec.MAX_ENCODED_BYTES || size>in.available())throw new IOException("Ownership bound exceeds capacity"); bounds[b]=in.readNBytes(size); }
+                var record=new HistoricalOwner(owner,new RangeOwnership.Interval(domain,columns,bounds[0],bounds[1])); if(!unique.add(record))throw new IOException("Duplicate ownership history"); records.add(record);
+            }
+            if(in.available()!=0 || !Arrays.equals(bytes,encodeOwnershipHistory(records)))throw new IOException("Noncanonical ownership history"); ownershipHistory=List.copyOf(records);
+        } catch(IOException|RocksDBException|IllegalArgumentException failure) { throw new IllegalStateException("Cannot recover native ownership history",failure); }
+    }
+    private List<HistoricalOwner> proposedOwnershipHistory(RangeOwnership.Owner owner,RangeOwnership.Interval interval) {
+        var next=new ArrayList<>(ownershipHistory); int match=-1;
+        for(int i=0;i<next.size();i++) { var existing=next.get(i); if(existing.owner().equals(owner) && existing.interval().domainId().equals(interval.domainId()) && Arrays.equals(existing.interval().lowerInclusive(),interval.lowerInclusive()) && Arrays.equals(existing.interval().upperExclusive(),interval.upperExclusive())) { match=i; break; } }
+        if(match>=0) { var columns=new HashSet<>(next.get(match).interval().columns()); columns.addAll(interval.columns()); interval=new RangeOwnership.Interval(interval.domainId(),columns,interval.lowerInclusive(),interval.upperExclusive()); }
+        var record=new HistoricalOwner(owner,interval); if(match<0)next.add(record); else next.set(match,record);
+        if(next.size()>MAX_OWNERSHIP_HISTORY)throw new IllegalStateException("Native ownership history count exhausted");
+        return List.copyOf(next);
+    }
+    private void retainOwnershipHistory(RangeOwnership.Owner owner,RangeOwnership.Interval interval) throws RocksDBException {
+        var next=proposedOwnershipHistory(owner,interval);
+        try { byte[] encoded=encodeOwnershipHistory(next); if(next.equals(ownershipHistory) && ownershipHistoryDurable)return; ownershipHistory=next; ownershipHistoryDurable=false; try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(handles.get(STATE_COLUMN),OWNERSHIP_HISTORY_KEY,encoded); for(var pending:newImportReservations.values())batch.put(handles.get(STATE_COLUMN),groupSchemaKey(pending.groupId(),0x40),pending.encode()); if(!newImportReservations.isEmpty())batch.put(handles.get(STATE_COLUMN),BIRTHS_KEY,encodeBirthRegistry(bindings)); loaded.db().get().write(options,batch); } ownershipHistoryDurable=true; if(!newImportReservations.isEmpty())birthsDurable=true; }
+        catch(IOException failure) { throw new IllegalStateException("Native ownership history exhausted",failure); }
+    }
+    private void forceNewImportBirth(NativeSstImportManifest manifest,RangeOwnership.Owner owner,RangeOwnership.Interval interval) throws RocksDBException {
+        var next=proposedOwnershipHistory(owner,interval); var proposedBindings=proposedBirths(manifest.physicalNames(),manifest.mergeColumns(),BOOTSTRAP_BIRTH,Set.of()); final byte[] history,births;
+        try { history=encodeOwnershipHistory(next); births=encodeBirthRegistry(proposedBindings); } catch(IOException invalid) { throw new IllegalStateException("Native import ownership/binding capacity exhausted",invalid); }
+        boolean reserved=newImportReservations.containsKey(owner.groupId());
+        if(!reserved) { ownership.register(owner,interval,RangeOwnership.State.FENCED); newImportReservations.put(owner.groupId(),manifest); }
+        else { var held=ownership.get(owner); if(held.state()!=RangeOwnership.State.FENCED || !held.interval().equals(interval))throw new IllegalStateException("Unpublished import reservation changed"); }
+        ownershipHistory=next; ownershipHistoryDurable=false; bindings.clear(); bindings.putAll(proposedBindings); birthsDurable=false;
+        try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)) {
+            batch.put(handles.get(STATE_COLUMN),OWNERSHIP_HISTORY_KEY,history); batch.put(handles.get(STATE_COLUMN),BIRTHS_KEY,births); for(var pending:newImportReservations.values())batch.put(handles.get(STATE_COLUMN),groupSchemaKey(pending.groupId(),0x40),pending.encode());
+            importBirthForceObserver.boundary(false); loaded.db().get().write(options,batch); importBirthForceObserver.boundary(true); ownershipHistoryDurable=true; birthsDurable=true;
+        }
+    }
+    private void requireVirginHistory(RangeOwnership.Interval interval) throws RocksDBException {
+        for(var record:ownershipHistory) { var previous=record.interval(); if(java.util.Collections.disjoint(interval.columns(),previous.columns()))continue;
+            if((interval.upperExclusive()==null || previous.lowerInclusive()==null || Arrays.compareUnsigned(previous.lowerInclusive(),interval.upperExclusive())<0) && (previous.upperExclusive()==null || interval.lowerInclusive()==null || Arrays.compareUnsigned(interval.lowerInclusive(),previous.upperExclusive())<0))throw new IllegalStateException("NEW import overlaps historical native ownership");
+        }
+        var known=new HashSet<UUID>(); ownershipHistory.forEach(record->known.add(record.owner().groupId()));
+        for(var cf:List.of(handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN)))try(var iterator=loaded.db().get().newIterator(cf)) { for(iterator.seekToFirst();iterator.isValid();iterator.next()) { byte[] key=iterator.key(); if(key.length<16 || key.length==OWNERSHIP_HISTORY_KEY.length && Arrays.equals(key,OWNERSHIP_HISTORY_KEY))continue;
+                boolean groupKey=cf==handles.get(RECEIPTS_COLUMN) || key.length==16 || key.length>16 && key[16]>=1 && key[16]<=0x7f;
+                if(groupKey) { var b=ByteBuffer.wrap(key); if(!known.contains(new UUID(b.getLong(),b.getLong())))throw new IllegalStateException("Unknown preexisting native group lacks ownership-history authority"); }
+            } iterator.status(); }
+    }
     private static final byte[] CAPACITY_KEY="SCHEMA-CAPACITY".getBytes(StandardCharsets.US_ASCII);
     private volatile Map<UUID,SchemaCapacityClaims.Claim> capacityClaims=Map.of();
     private volatile boolean capacityDurable=true;
@@ -466,20 +537,21 @@ public final class DistributedStoragePool implements AutoCloseable {
         };
     }
     private void reserveBirths(Map<UUID,String> names,Set<UUID> merges,UUID change,Set<UUID> fresh) throws RocksDBException {
+        if(!newImportReservations.isEmpty() && !birthsDurable)throw new IllegalStateException("Unknown import birth completion requires exact retry before CF mutation");
         var next=proposedBirths(names,merges,change,fresh);
         if(next.equals(bindings) && birthsDurable) return;
         try {
-            var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes); output.writeInt(next.size());
-            for(var id:next.keySet().stream().sorted().toList()) {
-                var binding=next.get(id); output.writeLong(id.getMostSignificantBits()); output.writeLong(id.getLeastSignificantBits());
-                output.writeLong(binding.birthChange().getMostSignificantBits()); output.writeLong(binding.birthChange().getLeastSignificantBits()); output.writeByte(binding.birthKind().ordinal()+1); output.writeBoolean(binding.mergeAdmitted()); output.writeUTF(binding.name());
-            }
-            output.flush(); if(bytes.size()>MAX_BINDING_BYTES) throw new IllegalStateException("Native CF birth byte budget exhausted");
+            byte[] bytes=encodeBirthRegistry(next);
             // Unknown native completion keeps every proposed reservation until a successful force.
             birthsDurable=false; bindings.clear(); bindings.putAll(next);
-            try(var options=new org.rocksdb.WriteOptions().setSync(true).setDisableWAL(false)) { loaded.db().get().put(handles.get(STATE_COLUMN),options,BIRTHS_KEY,bytes.toByteArray()); }
+            try(var options=new org.rocksdb.WriteOptions().setSync(true).setDisableWAL(false)) { loaded.db().get().put(handles.get(STATE_COLUMN),options,BIRTHS_KEY,bytes); }
             birthsDurable=true;
         } catch(IOException impossible) { throw new AssertionError(impossible); }
+    }
+    private static byte[] encodeBirthRegistry(Map<UUID,Binding> bindings) throws IOException {
+        var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes); output.writeInt(bindings.size());
+        for(var id:bindings.keySet().stream().sorted().toList()) { var binding=bindings.get(id); output.writeLong(id.getMostSignificantBits()); output.writeLong(id.getLeastSignificantBits()); output.writeLong(binding.birthChange().getMostSignificantBits()); output.writeLong(binding.birthChange().getLeastSignificantBits()); output.writeByte(binding.birthKind().ordinal()+1); output.writeBoolean(binding.mergeAdmitted()); output.writeUTF(binding.name()); }
+        output.flush(); if(bytes.size()>MAX_BINDING_BYTES)throw new IllegalStateException("Native CF birth byte budget exhausted"); return bytes.toByteArray();
     }
 
     private DistributedStoragePool(RocksDBLoader.LoadedDb loaded, GlobalDatabaseConfig globalConfig, Logger logger, DistributedOperatorArtifacts artifacts) {
@@ -490,6 +562,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         loaded.db().getStartupColumns().forEach((descriptor, handle) ->
                 handles.put(new String(descriptor.getName(), StandardCharsets.US_ASCII), handle));
         recoverBirths();
+        recoverOwnershipHistory();
         recoverCapacityClaims();
     }
 
@@ -638,6 +711,18 @@ public final class DistributedStoragePool implements AutoCloseable {
     public ReplicatedRangeStore openRange(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
             byte[] schemaDigest, Map<UUID, String> physicalColumns, Set<UUID> admittedMergeColumns)
             throws RocksDBException {
+        return openRange(owner,interval,schemaDigest,physicalColumns,admittedMergeColumns,null,null);
+    }
+
+    /** Creates only a virgin manifest-bound fenced owner; never temporarily publishes ACTIVE ownership. */
+    public ReplicatedRangeStore openNewFencedRange(NativeSstImportManifest manifest,DistributedSchema schema) throws RocksDBException {
+        manifest.requireSchema(schema);
+        var store=openRange(new RangeOwnership.Owner(manifest.groupId(),manifest.rangeEpoch()),new RangeOwnership.Interval(manifest.domainId(),manifest.physicalNames().keySet(),manifest.lowerInclusive(),manifest.upperExclusive()),schema.digest(),manifest.physicalNames(),manifest.mergeColumns(),manifest,schema);
+        store.enableLogicalSchema(schema); return store;
+    }
+
+    private ReplicatedRangeStore openRange(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
+            byte[] schemaDigest,Map<UUID,String> physicalColumns,Set<UUID> admittedMergeColumns,NativeSstImportManifest newImport,DistributedSchema importSchema) throws RocksDBException {
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(interval, "interval");
         final byte[] bootstrapSchema=schemaDigest.clone();
@@ -660,6 +745,31 @@ public final class DistributedStoragePool implements AutoCloseable {
         try {
             synchronized (admission) {
                 if (closing) throw new IllegalStateException("Pool is closing");
+            }
+            byte[] importBirth=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x40));
+            var heldImport=newImportReservations.get(owner.groupId());
+            if(heldImport!=null && (newImport==null || !Arrays.equals(heldImport.encode(),newImport.encode())))throw new IllegalArgumentException("Unpublished native import requires exact original-manifest retry");
+            if(newImport!=null) {
+                for(var entry:physicalColumns.entrySet()) {
+                    var binding=bindings.get(entry.getKey()); if(binding!=null && (!binding.name().equals(entry.getValue()) || binding.mergeAdmitted()!=admittedMergeColumns.contains(entry.getKey())))throw new IllegalArgumentException("Import column binding differs from native birth");
+                    if(bindings.entrySet().stream().anyMatch(other->!other.getKey().equals(entry.getKey()) && other.getValue().name().equals(entry.getValue())))throw new IllegalArgumentException("Import physical column alias is already bound");
+                }
+                try { if(artifacts.qualified())artifacts.validate(importSchema,physicalColumns); else if(!admittedMergeColumns.isEmpty())throw new IllegalArgumentException("NEW operator import requires trusted artifact staging"); }
+                catch(IOException invalid) { throw new IllegalArgumentException("Import artifact bindings differ",invalid); }
+                for(var entry:physicalColumns.entrySet()) {
+                    if(handles.containsKey(entry.getValue())) { if((loaded.mergeOperators().get(entry.getValue())!=null)!=admittedMergeColumns.contains(entry.getKey()))throw new IllegalArgumentException("Import configured operator differs"); SSTWriter.rejectUnsafeMultiPathIngestion(loaded.definitiveColumnFamilyOptionsMap().get(entry.getValue()),false); }
+                    else try(var prepared=new PreparedColumn(entry.getValue())) { if((prepared.options.mergeOperator()!=null)!=admittedMergeColumns.contains(entry.getKey()))throw new IllegalArgumentException("Import configured operator differs"); SSTWriter.rejectUnsafeMultiPathIngestion(prepared.options.options(),false); }
+                }
+                if(importBirth!=null) { if(!Arrays.equals(importBirth,newImport.encode()))throw new IllegalArgumentException("NEW import identity changed"); if(loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x43))!=null)throw new IllegalStateException("Published import is not a NEW target"); }
+                else if(heldImport==null) {
+                    requireVirginHistory(interval);
+                    byte[] prefix=ByteBuffer.allocate(16).putLong(owner.groupId().getMostSignificantBits()).putLong(owner.groupId().getLeastSignificantBits()).array();
+                    for(var cf:List.of(handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN))) try(var iterator=loaded.db().get().newIterator(cf)) { iterator.seek(prefix); if(iterator.isValid() && startsWith(iterator.key(),prefix))throw new IllegalStateException("NEW import cannot adopt historical group metadata"); iterator.status(); }
+                    for(String name:physicalColumns.values()) { var cf=handles.get(name); if(cf==null)continue; try(var iterator=loaded.db().get().newIterator(cf)) { if(interval.lowerInclusive()==null)iterator.seekToFirst(); else iterator.seek(interval.lowerInclusive()); if(iterator.isValid() && (interval.upperExclusive()==null || Arrays.compareUnsigned(iterator.key(),interval.upperExclusive())<0))throw new IllegalStateException("NEW import interval contains historical user data"); iterator.status(); } }
+                }
+                for(var existing:ranges)if(existing.ownership().owner().equals(owner))return existing;
+                forceNewImportBirth(newImport,owner,interval);
+                importBirth=newImport.encode();
             }
             var checkpoint=recoverSchema(owner.groupId());
             if(checkpoint.current()!=null) {
@@ -725,6 +835,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 rangeColumns.put(entry.getKey(), handle);
             }
             pressureColumns = List.copyOf(handles.values());
+            retainOwnershipHistory(owner,interval);
             if(recoveryOwnership==null && recoveryTransition==null) {
                 for(var origin:schemaOrigins.values()) if(origin.sourceSchema().domainId().equals(interval.domainId())
                         && Arrays.equals(origin.sourceSchema().digest(),schema) && origin.sourceSchema().columnIds().equals(interval.columns())
@@ -732,7 +843,9 @@ public final class DistributedStoragePool implements AutoCloseable {
                     recoveryTransition=ownership.beginSchemaTransition(origin.changeId(),interval.domainId(),origin.sourceSchema().columnIds(),origin.targetSchema().columnIds()); break;
                 }
             }
-            if(recoveryOwnership!=null) ownership.registerRecoveredSchema(owner,interval,RangeOwnership.State.FENCED,recoveryOwnership);
+            if(newImport!=null) { /* Already registered fenced before native birth. */ }
+            else if(importBirth!=null) ownership.register(owner,interval,RangeOwnership.State.FENCED);
+            else if(recoveryOwnership!=null) ownership.registerRecoveredSchema(owner,interval,RangeOwnership.State.FENCED,recoveryOwnership);
             else if(recoveryTransition==null) ownership.register(owner, interval, RangeOwnership.State.ACTIVE);
             else ownership.registerSchema(owner,interval,RangeOwnership.State.FENCED,recoveryTransition);
             try {
@@ -741,7 +854,9 @@ public final class DistributedStoragePool implements AutoCloseable {
                 store.configureSnapshotAdmission(snapshotAdmission); store.configureSchemaPreparationPool(this);
                 for(var entry:names.entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),merges.contains(entry.getKey())));
                 ranges.add(store);
-                if(recoveryOwnership!=null || recoveryTransition!=null) ownership.activate(owner);
+                if(newImport!=null)newImportReservations.remove(owner.groupId());
+                if((recoveryOwnership!=null || recoveryTransition!=null) && importBirth==null) ownership.activate(owner);
+                if(newImport==null && importBirth!=null && !store.importPending()) ownership.activate(owner);
                 if(recovered!=null) {
                     for(var entry:recovered.sourceNames().entrySet()) if(!recovered.targetNames().containsKey(entry.getKey())) {
                         bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),recovered.sourceMerges().contains(entry.getKey()))); deferredDrops.add(entry.getKey()); deletionOrigins.put(entry.getKey(),recovered.definition());
@@ -765,6 +880,41 @@ public final class DistributedStoragePool implements AutoCloseable {
         } finally {
             nativeMutation.release();
         }
+    }
+
+    private static boolean startsWith(byte[] key,byte[] prefix) { return key.length>=prefix.length && Arrays.equals(key,0,prefix.length,prefix,0,prefix.length); }
+
+    /** Trusted local source paths are copied to forced immutable pool-owned originals before native mutation. */
+    public NativeSstImportManifest.Receipt importSst(ReplicatedRangeStore store,NativeSstImportManifest manifest,Map<UUID,Path> originals,ApplyPosition position) throws IOException,RocksDBException {
+        return importSst(store,manifest,originals,position,stage -> {});
+    }
+    public NativeSstImportManifest.Receipt importSst(ReplicatedRangeStore store,NativeSstImportManifest manifest,Map<UUID,Path> originals,ApplyPosition position,NativeRangeSstImport.Observer observer) throws IOException,RocksDBException {
+        nativeMutation.acquireUninterruptibly();
+        try {
+            synchronized(admission) { if(closing || !ranges.contains(store))throw new IllegalStateException("Import store is not owned by this open pool"); }
+            if(store.importReceipt()!=null)return store.installSstUnderPool(manifest,position,()->{},(db,columns)->{},observer);
+            var schema=store.installedSchema(); manifest.requireSchema(schema);
+            var actualNames=new HashMap<UUID,String>(); for(var column:store.ownership().interval().columns())actualNames.put(column,Objects.requireNonNull(bindings.get(column)).name());
+            if(!manifest.physicalNames().equals(actualNames))throw new IllegalArgumentException("Import physical bindings differ");
+            Path root=loaded.definitiveDbPath().resolve("range-imports");
+            return store.installSstUnderPool(manifest,position,() -> {
+                NativeRangeSstImport.retain(root,manifest,originals);
+                for(var column:manifest.columns()) {
+                    var config=loaded.definitiveColumnFamilyOptionsMap().get(column.physicalName()); SSTWriter.rejectUnsafeMultiPathIngestion(config,false);
+                    try(var options=new org.rocksdb.Options(loaded.dbOptions(),config)) { for(var file:column.files())NativeRangeSstImport.qualify(NativeRangeSstImport.original(root,manifest,file),file,manifest,column.columnId(),schema,options); }
+                }
+                observer.at(NativeRangeSstImport.Stage.ORIGINALS_FORCED);
+            },(db,columns) -> {
+                try(var options=new org.rocksdb.IngestExternalFileOptions().setMoveFiles(false).setIngestBehind(false).setWriteGlobalSeqno(false).setSnapshotConsistency(true).setAllowGlobalSeqNo(true).setAllowBlockingFlush(true)) {
+                    for(var column:manifest.columns()) { if(!column.files().isEmpty())db.ingestExternalFile(columns.get(column.columnId()),column.files().stream().map(file->NativeRangeSstImport.original(root,manifest,file).toString()).toList(),options); observer.at(NativeRangeSstImport.Stage.COLUMN_INGESTED); }
+                }
+                for(var column:manifest.columns())for(var file:column.files())NativeRangeSstImport.verifyBytes(NativeRangeSstImport.original(root,manifest,file),file);
+            },observer);
+        } finally { nativeMutation.release(); }
+    }
+
+    public void activateImport(ReplicatedRangeStore store,NativeRangeSstImport.Activation authority) throws RocksDBException {
+        nativeMutation.acquireUninterruptibly(); try { synchronized(admission) { if(closing || !ranges.contains(store))throw new IllegalStateException("Import store not owned"); } store.activateImportUnderPool(authority); } finally { nativeMutation.release(); }
     }
 
     public Map<UUID,String> schemaPhysicalNames(ReplicatedRangeStore store) {
@@ -1013,6 +1163,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             catch(IOException failure) { throw new IllegalStateException("Cannot publish committed native operator bindings",failure); }
         }
         reserveBirths(record.targetNames(),record.targetMerges(),definition.changeId(),fresh);
+        var currentOwner=store.ownership(); retainOwnershipHistory(currentOwner.owner(),new RangeOwnership.Interval(currentOwner.interval().domainId(),record.targetNames().keySet(),currentOwner.interval().lowerInclusive(),currentOwner.interval().upperExclusive()));
         schemaOrigins.put(definition.sourceSchema().domainId(),definition);
         var result=store.installSchema(record,transition,observer,() -> {
             var target=new HashMap<UUID,ColumnFamilyHandle>();

@@ -388,6 +388,9 @@ public final class NativeRangeImage {
         private final List<it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation> schemaInstallations=new ArrayList<>();
         private final Map<UUID,it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof> schemaActivations=new HashMap<>();
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof currentSchemaActivation;
+        private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest importBirth;
+        private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.Receipt importReceipt;
+        private NativeRangeSstImport.Activation importActivation;
         private boolean acceptSchema(byte[] digest) { referencedSchemas.add(digest.clone()); return true; }
         private int homeCreditCount;
         private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
@@ -444,6 +447,15 @@ public final class NativeRangeImage {
                             schemaHistory.put(java.util.HexFormat.of().formatHex(definition.targetSchema().digest()),definition.targetSchema());
                         }
                     } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema generation",failure); }
+                }
+                if(section==Section.STATE && key.length>16 && key[16]>=0x40 && key[16]<=0x43) {
+                    try {
+                        if(key.length!=17 || key[16]==0x41)throw new IllegalArgumentException("Incomplete or malformed import image");
+                        if(key[16]==0x40) { if(importBirth!=null)throw new IllegalArgumentException("Duplicate import birth"); importBirth=it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.decode(value);
+                            if(!importBirth.groupId().equals(header.owner().groupId()) || importBirth.rangeEpoch()!=header.owner().epoch() || !importBirth.domainId().equals(header.interval().domainId()) || !Arrays.equals(importBirth.lowerInclusive(),lower) || !Arrays.equals(importBirth.upperExclusive(),upper))throw new IllegalArgumentException("Import image birth differs from ownership");
+                        } else if(key[16]==0x42) { if(importBirth==null || importReceipt!=null)throw new IllegalArgumentException("Import receipt lacks birth"); importReceipt=it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.Receipt.decode(value); importReceipt.requireManifest(importBirth); importReceipt.requireCut(header.position()); }
+                        else { if(importReceipt==null || importActivation!=null)throw new IllegalArgumentException("Import activation lacks receipt"); importActivation=NativeRangeSstImport.Activation.decode(value); if(!Arrays.equals(importActivation.receipt().encode(),importReceipt.encode()))throw new IllegalArgumentException("Import activation differs from receipt"); importActivation.requireCut(header.position()); }
+                    } catch(IllegalArgumentException invalid) { throw new IOException("Invalid import image metadata",invalid); }
                 }
                 if(section==Section.STATE && key.length>16 && (key[16]==0x2b || key[16]==0x2c)) {
                     try {
@@ -665,7 +677,7 @@ public final class NativeRangeImage {
                 if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
             }
             if (context!=null) {
-                if(schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null) throw new IOException("HOME image contains DATA schema lifecycle");
+                if(schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null || importBirth!=null) throw new IOException("HOME image contains DATA schema/import lifecycle");
                 if (!header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership");
                 for (var receipt:homeRecoveries.values()) if (!receipt.recovery().before().clusterId().equals(context.cluster()) || !receipt.recovery().before().databaseId().equals(context.database()) || !receipt.recovery().command().mutations().getFirst().columnId().equals(context.column())) throw new IOException("Qualified HOME receipt database differs");
             }
@@ -706,6 +718,7 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            if(importBirth!=null && (importReceipt==null || importActivation==null))throw new IOException("Unpublished import cannot become a native image");
             if(schemaInstallation==null && (!schemaActivations.isEmpty() || currentSchemaActivation!=null)) throw new IOException("Activation history lacks installed generation");
             for(var digest:referencedSchemas) if(!Arrays.equals(digest,header.schema()) && !schemaHistory.containsKey(java.util.HexFormat.of().formatHex(digest))) throw new IOException("Historical schema metadata missing");
             if(schemaInstallation!=null) {
@@ -725,6 +738,11 @@ public final class NativeRangeImage {
                     var old=schemaHistory.get(java.util.HexFormat.of().formatHex(prepared.preparation().business().schemaDigest()));
                     if(old==null || prepared.preparation().scope().spans().stream().anyMatch(span -> !old.columnIds().contains(span.columnId()))) throw new IOException("Historical preparation columns differ");
                 }
+            }
+            if(importBirth!=null && (!Arrays.equals(importBirth.schemaDigest(),header.schema()) || !importBirth.physicalNames().keySet().equals(header.interval().columns()) || !importBirth.mergeColumns().equals(header.mergeColumns()))) {
+                boolean qualified=false;
+                for(var record:schemaInstallations) if(Arrays.equals(record.definition().sourceSchema().digest(),importBirth.schemaDigest()) && record.sourceNames().equals(importBirth.physicalNames()) && record.sourceMerges().equals(importBirth.mergeColumns()) && record.fence().position().index()>importActivation.position().index() && record.fence().position().term()>=importActivation.position().term()) { qualified=true; break; }
+                if(!qualified)throw new IOException("Historical import image birth lacks qualified subsequent schema lifecycle");
             }
             if (!marker) throw new IOException("Image has no applied marker");
             if (homeRecoveries.size()+homeCreditCount>ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeRecoveryBytes+homeCreditBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES) throw new IOException("HOME image actual/future capacity exceeded");

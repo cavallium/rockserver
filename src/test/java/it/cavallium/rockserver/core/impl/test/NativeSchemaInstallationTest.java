@@ -228,7 +228,7 @@ class NativeSchemaInstallationTest {
                 UUID foreign=UUID.randomUUID();
                 assertThrows(IllegalArgumentException.class,() -> pool.openRange(new RangeOwnership.Owner(UUID.randomUUID(),1),new RangeOwnership.Interval(UUID.randomUUID(),Set.of(foreign),null,null),new byte[32],Map.of(foreign,"new"),Set.of()));
                 assertArrayEquals(target.digest(),pool.installSchema(store,new ApplyPosition(1,2),change,Map.of(column,"data",added,"new"),Set.of()).definition().targetSchema().digest());
-                org.mockito.Mockito.verify(failingDb,org.mockito.Mockito.times(2)).put(org.mockito.ArgumentMatchers.any(org.rocksdb.ColumnFamilyHandle.class),org.mockito.ArgumentMatchers.any(org.rocksdb.WriteOptions.class),org.mockito.ArgumentMatchers.any(byte[].class),org.mockito.ArgumentMatchers.any(byte[].class));
+                org.mockito.Mockito.verify(failingDb,org.mockito.Mockito.times(2)).put(org.mockito.ArgumentMatchers.any(org.rocksdb.ColumnFamilyHandle.class),org.mockito.ArgumentMatchers.any(org.rocksdb.WriteOptions.class),org.mockito.AdditionalMatchers.aryEq("CF-BIRTH".getBytes(java.nio.charset.StandardCharsets.US_ASCII)),org.mockito.ArgumentMatchers.any(byte[].class));
             } finally { dbField.set(loaded.db(),nativeDb); }
         }
         }

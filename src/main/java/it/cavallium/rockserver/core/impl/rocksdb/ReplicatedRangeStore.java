@@ -7,6 +7,7 @@ import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallProof;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof;
+import it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest;
 import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.common.distributed.HomeRecovery;
 import it.cavallium.rockserver.core.common.distributed.HomeRecoveryReceipt;
@@ -300,6 +301,81 @@ public final class ReplicatedRangeStore {
     private final ColumnFamilyHandle state;
     private final ColumnFamilyHandle receipts;
     private final byte[] markerKey;
+    private volatile NativeSstImportManifest importBirth;
+    private volatile NativeSstImportManifest.Intent importIntent;
+    private volatile NativeSstImportManifest.Receipt importReceipt;
+    private volatile NativeRangeSstImport.Activation importActivation;
+    public boolean importPending() { return importBirth!=null && importActivation==null; }
+    public NativeSstImportManifest.Receipt importReceipt() { return importReceipt; }
+    private byte[] importKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
+    private void recoverImportMetadata() throws RocksDBException {
+        byte[] birth=db.get(state,importKey(0x40)),intent=db.get(state,importKey(0x41)),receipt=db.get(state,importKey(0x42)),activation=db.get(state,importKey(0x43));
+        if(birth==null) { if(intent!=null || receipt!=null || activation!=null)throw new IllegalStateException("Import metadata lacks virgin birth"); return; }
+        var manifest=NativeSstImportManifest.decode(birth);
+        if(!manifest.groupId().equals(groupId) || manifest.rangeEpoch()!=rangeEpoch || !manifest.domainId().equals(interval.domainId()) || !Arrays.equals(manifest.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(manifest.upperExclusive(),interval.upperExclusive()))throw new IllegalStateException("Import birth differs from store geometry");
+        if(intent!=null) { importIntent=NativeSstImportManifest.Intent.decode(intent); if(!Arrays.equals(importIntent.manifest().encode(),birth))throw new IllegalStateException("Import intent differs from birth"); requireNext(importIntent.position()); }
+        importBirth=manifest;
+        if(receipt!=null) { importReceipt=NativeSstImportManifest.Receipt.decode(receipt); importReceipt.requireManifest(manifest); if(intent!=null)throw new IllegalStateException("Installed import retains intent"); importReceipt.requireCut(applied); }
+        if(activation!=null) { importActivation=NativeRangeSstImport.Activation.decode(activation); if(importReceipt==null || !Arrays.equals(importActivation.receipt().encode(),importReceipt.encode()))throw new IllegalStateException("Import activation differs from receipt"); importActivation.requireCut(applied); }
+        boolean current=Arrays.equals(manifest.schemaDigest(),schemaDigest) && manifest.physicalNames().keySet().equals(columns.keySet()) && manifest.mergeColumns().equals(deterministicMergeColumns);
+        if(!current) {
+            if(importActivation==null)throw new IllegalStateException("Unpublished import schema changed");
+            boolean qualified=false;
+            for(var change:schemaInstallProofs.keySet()) { var record=NativeSchemaInstallation.decode(db.get(state,schemaHistoryKey(change)));
+                if(Arrays.equals(record.definition().sourceSchema().digest(),manifest.schemaDigest()) && record.sourceNames().equals(manifest.physicalNames()) && record.sourceMerges().equals(manifest.mergeColumns()) && record.fence().position().index()>importActivation.position().index() && record.fence().position().term()>=importActivation.position().term()) { qualified=true; break; }
+            }
+            if(!qualified)throw new IllegalStateException("Historical import birth lacks subsequent qualified schema lifecycle");
+        }
+        if(importPending() && ownership.get(owner).state()==RangeOwnership.State.ACTIVE)ownership.fence(owner);
+    }
+    @FunctionalInterface interface ImportQualification { void run() throws IOException,RocksDBException; }
+    @FunctionalInterface interface ImportIngestion { void run(RocksDB database,Map<UUID,ColumnFamilyHandle> columns) throws IOException,RocksDBException; }
+    NativeSstImportManifest.Receipt installSstUnderPool(NativeSstImportManifest manifest,ApplyPosition position,ImportQualification qualification,ImportIngestion ingestion,NativeRangeSstImport.Observer observer) throws IOException,RocksDBException {
+        nativeLifecycle.writeLock().lock(); applyLane.lock();
+        try {
+            if(closing || pendingInstallation!=null || importBirth==null || !Arrays.equals(importBirth.encode(),manifest.encode()))throw new IllegalStateException("Import requires exact virgin native birth");
+            if(importReceipt==null && importIntent!=null) {
+                // A sync final write may have completed before throwing. Re-force its atomic proof before retrying,
+                // rather than writing a new intent beside an already completed receipt.
+                byte[] completed=db.get(state,importKey(0x42));
+                if(completed!=null) {
+                    var saved=NativeSstImportManifest.Receipt.decode(completed); saved.requireManifest(manifest);
+                    byte[] marker=db.get(state,markerKey),usage=db.get(state,usageKey); if(marker==null || usage==null || db.get(state,importKey(0x41))!=null)throw new IllegalStateException("Import completion lacks atomic native marker");
+                    var cut=decodePosition(marker); saved.requireCut(cut);
+                    if(!saved.position().equals(importIntent.position()) || !cut.equals(saved.position()))throw new IllegalStateException("Unknown import completion changed original position");
+                    try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(state,importKey(0x42),completed); batch.put(state,markerKey,marker); batch.put(state,usageKey,usage); db.write(options,batch); }
+                    importReceipt=saved; importIntent=null; applied=cut;
+                }
+            }
+            if(importReceipt!=null) { importReceipt.requireManifest(manifest); importReceipt.requireCut(position); if(applied==null || position.index()>applied.index())applyNoopUnderAdmission(position,null); return importReceipt; }
+            if(ownership.get(owner).state()!=RangeOwnership.State.FENCED || snapshotPins.get()!=0 || !preparedIndex.records().isEmpty() || !snapshotGates.isEmpty())throw new IllegalStateException("Import target must be unpinned NEW fenced owner");
+            requireNext(position); if(importIntent!=null && !importIntent.position().equals(position))throw new IllegalArgumentException("Import retry changes original pending apply position"); qualification.run();
+            try(var lease=ownership.claimInstall(owner)) {
+                importIntent=new NativeSstImportManifest.Intent(manifest,position);
+                try(var options=new WriteOptions().setDisableWAL(false).setSync(true)) { db.put(state,options,importKey(0x41),importIntent.encode()); }
+                observer.at(NativeRangeSstImport.Stage.INTENT_FORCED);
+                try(var writer=new InstallWriter(batches -> {})) { for(var cf:columns.values())clearForInstall(cf,interval.lowerInclusive(),interval.upperExclusive(),null,writer); writer.flush(); }
+                db.flushWal(true); observer.at(NativeRangeSstImport.Stage.INTERVAL_RESET);
+                ingestion.run(db,columns);
+                try(var flush=new org.rocksdb.FlushOptions().setWaitForFlush(true)) { if(!columns.isEmpty())db.flush(flush,new ArrayList<>(columns.values())); }
+                db.flushWal(true); observer.at(NativeRangeSstImport.Stage.DATA_DURABLE);
+                var receipt=new NativeSstImportManifest.Receipt(manifest.importId(),groupId,rangeEpoch,manifest.digest(),position);
+                try(var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(state,importKey(0x42),receipt.encode()); batch.delete(state,importKey(0x41)); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch); }
+                importIntent=null; importReceipt=receipt; applied=position; observer.at(NativeRangeSstImport.Stage.RECEIPT_FORCED); return receipt;
+            }
+        } finally { applyLane.unlock(); nativeLifecycle.writeLock().unlock(); }
+    }
+    void activateImportUnderPool(NativeRangeSstImport.Activation authority) throws RocksDBException {
+        nativeLifecycle.writeLock().lock(); applyLane.lock();
+        try {
+            requireSnapshotReleaseHealthy(); if(closing || pendingInstallation!=null)throw new IllegalStateException("Import activation native admission is closed");
+            if(importReceipt==null || !Arrays.equals(importReceipt.encode(),authority.receipt().encode()))throw new IllegalArgumentException("Import activation requires original installed receipt");
+            if(importActivation!=null) { if(!Arrays.equals(importActivation.encode(),authority.encode()))throw new IllegalArgumentException("Import activation changed"); return; }
+            if(ownership.get(owner).state()!=RangeOwnership.State.FENCED || snapshotPins.get()!=0)throw new IllegalStateException("Import activation requires fenced owner"); requireNext(authority.position());
+            try(var batch=new WriteBatch(); var options=new WriteOptions().setDisableWAL(false).setSync(true)) { batch.put(state,importKey(0x43),authority.encode()); batch.put(state,markerKey,encodePosition(authority.position())); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),authority.position())); db.write(options,batch); }
+            importActivation=authority; applied=authority.position(); ownership.activate(owner);
+        } finally { applyLane.unlock(); nativeLifecycle.writeLock().unlock(); }
+    }
     private final byte[] installingKey;
     private final byte[] configurationKey;
     private final byte[] usageKey;
@@ -366,6 +442,7 @@ public final class ReplicatedRangeStore {
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
         } else {
             recoverSchemaMetadata();
+            recoverImportMetadata();
             ensureReceiptUsage();
             validateReceiptUsage(applied);
             homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied);
@@ -447,7 +524,7 @@ public final class ReplicatedRangeStore {
     private void activateUnderAdmission() {
         applyLane.lock();
         try {
-            if (pendingInstallation != null) throw new IllegalStateException("Installation remains incomplete");
+            if (pendingInstallation != null || importPending()) throw new IllegalStateException("Installation remains incomplete or unpublished");
             try { recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
             homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
@@ -455,7 +532,7 @@ public final class ReplicatedRangeStore {
     }
 
     private void requireActive() {
-        if (pendingInstallation != null || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
+        if (pendingInstallation != null || importPending() || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
             throw new IllegalStateException("Range is fenced");
         }
     }
@@ -533,7 +610,7 @@ public final class ReplicatedRangeStore {
         } finally { applyLane.unlock(); leaveNative(); }
     }
     void preflightSchemaCapacity(SchemaChange.Definition definition,int installBytes) throws RocksDBException {
-        if(ownership.get(owner).state()!=RangeOwnership.State.ACTIVE || logicalSchema==null || homeRecoveryContext!=null || snapshotHomeContext!=null || activeSchemaFence!=null || activeSchemaInstallation!=null && activeSchemaActivation==null || !Arrays.equals(schemaDigest,definition.sourceSchema().digest())) throw new IllegalStateException("Capacity admission requires active qualified source DATA");
+        if(importPending() || ownership.get(owner).state()!=RangeOwnership.State.ACTIVE || logicalSchema==null || homeRecoveryContext!=null || snapshotHomeContext!=null || activeSchemaFence!=null || activeSchemaInstallation!=null && activeSchemaActivation==null || !Arrays.equals(schemaDigest,definition.sourceSchema().digest())) throw new IllegalStateException("Capacity admission requires active qualified source DATA");
         var participant=definition.header().participants().stream().filter(p -> p.groupId().equals(groupId)).findFirst().orElseThrow(() -> new IllegalArgumentException("Group outside original capacity membership"));
         var descriptor=definition.sourceDirectory().ranges().stream().filter(p -> p.groupId().equals(groupId)).findFirst().orElseThrow();
         if(participant.rangeEpoch()!=rangeEpoch || !interval.domainId().equals(definition.sourceSchema().domainId()) || !interval.columns().equals(definition.sourceSchema().columnIds()) || !Arrays.equals(interval.lowerInclusive(),descriptor.lowerInclusive()) || !Arrays.equals(interval.upperExclusive(),descriptor.upperExclusive())) throw new IllegalArgumentException("Capacity admission differs from native source lineage/bounds");
@@ -2722,6 +2799,7 @@ public final class ReplicatedRangeStore {
     private void applyNoopUnderAdmission(ApplyPosition position, byte[] configuration) throws RocksDBException {
         applyLane.lock();
         try {
+            if(importIntent!=null && position.index()>=importIntent.position().index())throw new IllegalStateException("Pending native import owns its original committed apply position");
             var current = ownership.get(owner).state();
             if (pendingInstallation != null || (current != RangeOwnership.State.ACTIVE && current != RangeOwnership.State.FENCED)) {
                 throw new IllegalStateException("Range cannot complete Raft accounting");
@@ -2764,6 +2842,7 @@ public final class ReplicatedRangeStore {
 
     private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
             InstallationObserver observer) throws IOException, RocksDBException {
+        if(importPending()) throw new IllegalStateException("Unpublished native import cannot be replaced by snapshot replay");
         var context=homeRecoveryContext;
         var snapshotContext=snapshotHomeContext;
         var expected = snapshotContext!=null ? NativeRangeImage.inspectSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column()) : context==null ? NativeRangeImage.inspect(image, limits) : NativeRangeImage.inspectHomeRecoveryReservations(image,limits,context.cluster(),context.database(),context.column());
@@ -2775,6 +2854,11 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if(importBirth!=null) {
+                byte[][] incoming=new byte[3][];
+                NativeRangeImage.visit(image,limits,(section,column,key,value)->{ if(section==NativeRangeImage.Section.STATE && key.length==17) { if(key[16]==0x40)incoming[0]=value; if(key[16]==0x42)incoming[1]=value; if(key[16]==0x43)incoming[2]=value; } });
+                if(!Arrays.equals(importBirth.encode(),incoming[0]) || importReceipt==null || !Arrays.equals(importReceipt.encode(),incoming[1]) || importActivation==null || !Arrays.equals(importActivation.encode(),incoming[2]))throw new IOException("Snapshot cannot discard or change native import publication evidence");
+            }
             if(schemaPreparationPool!=null) schemaPreparationPool.validateSnapshotCapacity(this,image,limits);
             if(activeSchemaFence!=null || activeSchemaInstallation!=null || activeSchemaActivation!=null) {
                 var incoming=new NativeSchemaFence[1]; var incomingInstall=new NativeSchemaInstallation[1]; var incomingActivation=new NativeSchemaActivationProof[1];
@@ -2847,6 +2931,7 @@ public final class ReplicatedRangeStore {
                         db.write(options, batch);
                     }
                     publishScoped(expected.position(),prepareScopedWrites(false,List.of(),Map.of()),false); applied = expected.position();
+                    recoverImportMetadata();
                     installationGeneration++;
                     pendingInstallation = null;
                     return actual;
@@ -2948,7 +3033,7 @@ public final class ReplicatedRangeStore {
     }
 
     /** Memory-only admission state; no native reads or snapshot acquisition. */
-    public boolean admissionOpen() { return !closing && pendingInstallation==null && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
+    public boolean admissionOpen() { return !closing && pendingInstallation==null && !importPending() && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
     /** Memory-only scope validation before entering the short proposal coordination lane. */
     public void validateScope(TransactionScope scope) {
         Objects.requireNonNull(scope); requireSchemaAdmission(); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);
