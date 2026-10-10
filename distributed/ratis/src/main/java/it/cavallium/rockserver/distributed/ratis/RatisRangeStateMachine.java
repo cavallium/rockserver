@@ -223,6 +223,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var descriptor=rangeImportApply.definition().sourceDirectory().ranges().stream()
                     .filter(range -> range.groupId().equals(rangeImportApply.groupId())).findFirst().orElseThrow();
             requireSchemaMembership(descriptor,configuration.data());
+            if(initialGroup.getPeers().stream().anyMatch(peer->peer.getDataStreamAddress()!=null && !peer.getDataStreamAddress().isEmpty())) {
+                var expected=new java.util.TreeMap<String,String>(); var actual=new java.util.TreeMap<String,String>();
+                for(var peer:initialGroup.getPeers())expected.put(peer.getId().toString(),java.util.Objects.toString(peer.getDataStreamAddress(),""));
+                var nativeConfiguration=RaftConfigurationProto.parseFrom(configuration.data());
+                for(var peer:nativeConfiguration.getPeersList())actual.put(peer.getId().toStringUtf8(),peer.getDataStreamAddress());
+                for(var peer:nativeConfiguration.getListenersList())actual.put(peer.getId().toStringUtf8(),peer.getDataStreamAddress());
+                if(!expected.equals(actual))throw new IOException("Native import streaming membership differs from frozen endpoints");
+            }
             if(record instanceof RatisRangeImportRecord.Install install)rangeImportApply.validateInstallProposal(install);
             else if(record instanceof RatisRangeImportRecord.Activate activate)rangeImportApply.validateActivationProposal(activate,rangeImportPublication);
             var current=leadership();

@@ -64,7 +64,7 @@ class RatisRangeImportApplyTest {
                     .setOption(org.apache.ratis.server.storage.RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB)
                     .setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build()) {
             storage.initialize(); var store=pool.openNewFencedRange(input.manifest(),input.schema()); var install=publish(files,input);
-            var peer=org.apache.ratis.protocol.RaftPeer.newBuilder().setId("fixture").setAddress("127.0.0.1:9999").build();
+            var peer=org.apache.ratis.protocol.RaftPeer.newBuilder().setId("local").setAddress("127.0.0.1:9999").setDataStreamAddress("127.0.0.1:9997").build();
             var raft=org.apache.ratis.protocol.RaftGroup.valueOf(org.apache.ratis.protocol.RaftGroupId.valueOf(group),peer);
             var machine=new RatisRangeStateMachine(store,raft,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),command->{},command->{},leader::get);
             var published=publication(input);
@@ -77,7 +77,7 @@ class RatisRangeImportApplyTest {
             });
             machine.initialize(server,raft.getGroupId(),storage);
             var owner=input.definition().sourceDirectory().ranges().getFirst().replicas().getFirst();
-            var member=org.apache.ratis.protocol.RaftPeer.newBuilder().setId(owner.peerId()).setAddress(owner.address()).build();
+            var member=org.apache.ratis.protocol.RaftPeer.newBuilder().setId(owner.peerId()).setAddress(owner.address()).setDataStreamAddress("127.0.0.1:9997").build();
             var membership=org.apache.ratis.proto.RaftProtos.RaftConfigurationProto.newBuilder().addPeers(member.getRaftPeerProto()).build();
             machine.notifyConfigurationChanged(1,0,membership); machine.notifyTermIndexUpdated(1,0); machine.notifyTermIndexUpdated(1,1);
             try {
@@ -111,7 +111,7 @@ class RatisRangeImportApplyTest {
                 machine.notifyTermIndexUpdated(2,6); machine.queryLinearizable(message(RatisRangeImportRpc.prepare(activate))).get(5,TimeUnit.SECONDS);
                 var replacement=proposal(machine,activate); assertNull(replacement.getException()); machine.preAppendTransaction(replacement); replacement.initLogEntry(2,7);
                 assertArrayEquals(proof,machine.applyTransaction(replacement).get(5,TimeUnit.SECONDS).getContent().toByteArray()); assertEquals(2,reads.get());
-                var changed=org.apache.ratis.protocol.RaftPeer.newBuilder().setId(owner.peerId()).setAddress("127.0.0.1:9998").build();
+                var changed=org.apache.ratis.protocol.RaftPeer.newBuilder().setId(owner.peerId()).setAddress(owner.address()).setDataStreamAddress("127.0.0.1:9996").build();
                 machine.notifyConfigurationChanged(2,8,org.apache.ratis.proto.RaftProtos.RaftConfigurationProto.newBuilder().addPeers(changed.getRaftPeerProto()).build()); machine.notifyTermIndexUpdated(2,8);
                 assertThrows(ExecutionException.class,()->machine.queryLinearizable(message(RatisRangeImportRpc.prepare(activate))).get(5,TimeUnit.SECONDS)); assertEquals(2,reads.get());
                 machine.notifyConfigurationChanged(2,9,membership); machine.notifyTermIndexUpdated(2,9);

@@ -48,6 +48,7 @@ public final class RatisNodePlan {
     private final List<Home> homes;
     private final List<RangeImportDefinition> imports;
     private final Map<UUID,RangeImportDefinition> groupImports;
+    private final Map<String,String> streamAddresses;
     private final Map<UUID,Role> roles;
     private final Map<UUID,Home> groupHomes;
     private final String peerId,address;
@@ -64,6 +65,10 @@ public final class RatisNodePlan {
     }
     public RatisNodePlan(UUID nodeId,UUID nodeIncarnation,RangeDirectory directory,Catalogue catalogue,
             Map<UUID,String> columns,Set<UUID> merges,List<Home> homes,Collection<RangeImportDefinition> imports,int maxLocalGroups) {
+        this(nodeId,nodeIncarnation,directory,catalogue,columns,merges,homes,imports,Map.of(),maxLocalGroups);
+    }
+    public RatisNodePlan(UUID nodeId,UUID nodeIncarnation,RangeDirectory directory,Catalogue catalogue,
+            Map<UUID,String> columns,Set<UUID> merges,List<Home> homes,Collection<RangeImportDefinition> imports,Map<String,String> streamAddresses,int maxLocalGroups) {
         this.nodeId=Objects.requireNonNull(nodeId); this.nodeIncarnation=Objects.requireNonNull(nodeIncarnation);
         this.directory=Objects.requireNonNull(directory); this.catalogue=Objects.requireNonNull(catalogue);
         this.columns=Map.copyOf(columns); this.merges=Set.copyOf(merges); this.homes=homes.stream().sorted(Comparator.comparing(Home::role)).toList();
@@ -106,6 +111,17 @@ public final class RatisNodePlan {
         if (local==null || !local.incarnation().equals(nodeIncarnation) || groups.isEmpty() || groups.size()>maxLocalGroups) {
             throw new IllegalArgumentException("Node has no current placement or exceeds local group budget");
         }
+        this.streamAddresses=Map.copyOf(streamAddresses);
+        if(!this.streamAddresses.isEmpty()) {
+            if(this.streamAddresses.size()>4096 || !this.streamAddresses.keySet().equals(peers.keySet()))throw new IllegalArgumentException("Stream endpoints must cover every frozen peer");
+            var streams=new HashSet<String>();
+            for(var entry:this.streamAddresses.entrySet()) {
+                var server=peers.get(entry.getKey());
+                new ReplicaDescriptor(server.node(),server.incarnation(),server.node(),server.peer(),entry.getValue(),ReplicaDescriptor.Role.VOTER);
+                if(!streams.add(entry.getValue()) || endpoints.containsKey(entry.getValue()))throw new IllegalArgumentException("Stream endpoint overlaps another stream or Raft endpoint");
+            }
+            groups.replaceAll((id,group)->streaming(group));
+        }
         peerId=local.peer(); address=local.address(); localGroups=List.copyOf(groups.values()); identity=digest();
     }
     private void inspect(UUID group,List<ReplicaDescriptor> replicas,Map<UUID,Server> nodes,Map<String,Server> peers,
@@ -138,6 +154,12 @@ public final class RatisNodePlan {
     public Set<UUID> merges() { return merges; }
     public List<Home> homes() { return homes; }
     public List<RangeImportDefinition> imports() { return imports; }
+    public Map<String,String> streamAddresses() { return streamAddresses; }
+    private RaftGroup streaming(RaftGroup group) {
+        if(streamAddresses.isEmpty())return group;
+        return RaftGroup.valueOf(group.getGroupId(),group.getPeers().stream().map(peer->RaftPeer.newBuilder(peer)
+                .setDataStreamAddress(streamAddresses.get(peer.getId().toString())).build()).toList());
+    }
     public RangeImportDefinition importDefinition(UUID group) { role(group); return groupImports.get(group); }
     public Role role(UUID group) { var role=roles.get(group); if (role==null) throw new IllegalArgumentException("Unplanned Raft group"); return role; }
     public Home home(UUID group) { role(group); return groupHomes.get(group); }
@@ -149,7 +171,7 @@ public final class RatisNodePlan {
     public String peerId() { return peerId; }
     public String address() { return address; }
     public List<RaftGroup> localGroups() { return localGroups; }
-    public RaftGroup catalogueGroup() { return catalogue.raftGroup(); }
+    public RaftGroup catalogueGroup() { return streaming(catalogue.raftGroup()); }
     public byte[] identityDigest() { return identity.clone(); }
 
     private byte[] digest() {
@@ -170,6 +192,7 @@ public final class RatisNodePlan {
                 uuid(output,home.column()); byte[] name=home.physicalName().getBytes(StandardCharsets.US_ASCII); output.writeInt(name.length); output.write(name);
             }
             output.writeInt(imports.size()); for(var definition:imports) output.write(definition.digest());
+            output.writeInt(streamAddresses.size()); for(var peer:streamAddresses.keySet().stream().sorted().toList()){output.writeUTF(peer);output.writeUTF(streamAddresses.get(peer));}
             output.writeInt(localGroups.size());
             for (var group:localGroups) {
                 UUID id=group.getGroupId().getUuid(); uuid(output,id); output.writeByte(role(id).ordinal());

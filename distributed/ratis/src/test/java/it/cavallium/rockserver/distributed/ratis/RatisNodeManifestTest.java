@@ -17,6 +17,24 @@ import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class RatisNodeManifestTest {
+    @Test void explicitStreamEndpointSurvivesManifestAndConfiguresFiniteProviderWithoutStartingIt() throws Exception {
+        var original=manifest(false); var base=original.plan(); var addresses=Map.of("local","127.0.0.1:9101");
+        var plan=new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),base.directory(),base.catalogue(),base.columns(),base.merges(),base.homes(),base.imports(),addresses,base.localGroups().size());
+        var encoded=RatisNodeManifest.encode(new RatisNodeManifest(original.schema(),plan,original.settings(),original.readThreads(),original.writeThreads()));
+        var reopened=RatisNodeManifest.decode(encoded).plan(); assertEquals(addresses,reopened.streamAddresses()); assertArrayEquals(plan.identityDigest(),reopened.identityDigest());
+        assertFalse(Arrays.equals(base.identityDigest(),plan.identityDigest()));
+        for(var group:reopened.localGroups())for(var peer:group.getPeers())assertEquals(addresses.get(peer.getId().toString()),peer.getDataStreamAddress());
+        var properties=new org.apache.ratis.conf.RaftProperties(); RatisStreamingTransport.server(reopened,properties);
+        assertEquals(org.apache.ratis.datastream.SupportedDataStreamType.NETTY,org.apache.ratis.RaftConfigKeys.DataStream.type(properties,ignored->{}));
+        assertEquals("127.0.0.1",org.apache.ratis.netty.NettyConfigKeys.DataStream.host(properties)); assertEquals(9101,org.apache.ratis.netty.NettyConfigKeys.DataStream.port(properties));
+        assertEquals(2,org.apache.ratis.netty.NettyConfigKeys.DataStream.Server.workerGroupSize(properties));
+        assertFalse(org.apache.ratis.server.RaftServerConfigKeys.DataStream.asyncRequestThreadPoolCached(properties)); assertEquals(2,org.apache.ratis.server.RaftServerConfigKeys.DataStream.asyncWriteThreadPoolSize(properties));
+        assertEquals(1,org.apache.ratis.netty.NettyConfigKeys.DataStream.Client.workerGroupSize(properties));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),base.directory(),base.catalogue(),base.columns(),base.merges(),base.homes(),base.imports(),Map.of("other","127.0.0.1:9101"),base.localGroups().size()));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),base.directory(),base.catalogue(),base.columns(),base.merges(),base.homes(),base.imports(),Map.of("local",base.address()),base.localGroups().size()));
+        var disabled=new org.apache.ratis.conf.RaftProperties(); RatisStreamingTransport.server(base,disabled);
+        assertEquals(org.apache.ratis.datastream.SupportedDataStreamType.DISABLED,org.apache.ratis.RaftConfigKeys.DataStream.type(disabled,ignored->{}));
+    }
     private static final UUID CLUSTER=new UUID(0,1), DATABASE=new UUID(0,2), DOMAIN=new UUID(0,3), A=new UUID(0,4), B=new UUID(Long.MIN_VALUE,5);
     private static final UUID NODE=new UUID(0,6), INCARNATION=new UUID(0,7), CATALOGUE=new UUID(0,8), DIRECTORY_COLUMN=new UUID(0,9), SESSIONS_COLUMN=new UUID(0,10);
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
@@ -52,6 +70,7 @@ class RatisNodeManifestTest {
         var definition=new RangeImportDefinition(job,new OperationId(UUID.randomUUID(),1,0),fenced,List.of(nativeManifest));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,fenced,original.plan().catalogue(),original.plan().columns(),Set.of(),20));
         var configured=new RatisNodePlan(NODE,INCARNATION,fenced,original.plan().catalogue(),original.plan().columns(),Set.of(),List.of(),List.of(definition),20);
+        assertThrows(IOException.class,()->RatisStreamingTransport.server(configured,new org.apache.ratis.conf.RaftProperties()));
         var value=new RatisNodeManifest(original.schema(),configured,settings(),3,5); byte[] encoded=RatisNodeManifest.encode(value);
         var reopened=RatisNodeManifest.decode(encoded); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
         assertArrayEquals(definition.encode(),reopened.plan().importDefinition(range.groupId()).encode());
