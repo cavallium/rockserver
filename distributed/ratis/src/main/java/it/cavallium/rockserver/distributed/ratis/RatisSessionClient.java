@@ -124,6 +124,12 @@ public final class RatisSessionClient {
         return retain(prepared);
     }
     public Pending prepare(List<Mutation> mutations) { return prepare(mutations,List.of()); }
+    /** The caller has forced the complete request; its schema and route cannot be rebased. */
+    public synchronized Pending prepareAt(RangeDirectory original,List<Mutation> mutations,List<KeyPredicate> predicates) {
+        requireCapacity();
+        var id=new OperationId(grant.sessionId(),grant.epoch(),nextSequence);
+        return retain(routed.prepareAt(original,id,mutations,predicates,acknowledgedThrough));
+    }
 
     /** Allocates an identity/route whose base command can never execute before explicit acceptance. */
     public synchronized Pending prepareTransactionIntent(List<Mutation> mutations,List<KeyPredicate> predicates) {

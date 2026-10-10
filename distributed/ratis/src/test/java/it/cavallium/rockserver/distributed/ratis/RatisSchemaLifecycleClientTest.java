@@ -77,6 +77,20 @@ class RatisSchemaLifecycleClientTest {
         }
     }
 
+    @Test void qualifiedHistoricalSchemaReopenRetainsOriginalUnallocatedRequestRoute() throws Exception {
+        var wire=new Transport(); var definition=wire.definition;
+        try (var client=new RatisRoutedClient(definition.targetDirectory(),wire)) {
+            assertThrows(IllegalArgumentException.class,() -> client.requireKnownSchema(definition.sourceSchema()));
+            client.refreshSchema(definition,wire.activation);
+            assertArrayEquals(definition.targetDirectory().payloadDigest(),client.directory().payloadDigest());
+            assertArrayEquals(definition.sourceDirectory().payloadDigest(),client.directory(definition.sourceSchema()).payloadDigest());
+            var old=client.prepareAt(client.directory(definition.sourceSchema()),new OperationId(new UUID(91,1),1,0),List.of(new Mutation(Mutation.Kind.PUT,helper.column,new byte[8],new byte[]{1})),List.of(),-1);
+            assertArrayEquals(definition.sourceSchema().digest(),old.command().schemaDigest());
+            assertEquals(definition.sourceDirectory().ranges().getFirst(),old.descriptor());
+            var forged=new RangeDirectory(definition.sourceDirectory().clusterId(),definition.sourceDirectory().databaseId(),definition.sourceDirectory().domainId(),definition.sourceDirectory().schemaEpoch(),definition.sourceDirectory().schemaDigest(),99,definition.sourceDirectory().columns(),definition.sourceDirectory().routingPrefixBytes(),definition.sourceDirectory().ranges());
+            assertThrows(IllegalArgumentException.class,() -> client.prepareAt(forged,new OperationId(new UUID(91,1),1,1),old.command().mutations(),List.of(),-1));
+        }
+    }
     @Test void schemaViewBudgetIncludesBootstrapAndAllSixtyFourNativeTransitions() throws Exception {
         var wire=new Transport(); var source=wire.definition.sourceSchema(); long nextApi=2;
         try (var client=new RatisRoutedClient(wire.definition.sourceDirectory(),wire)) {

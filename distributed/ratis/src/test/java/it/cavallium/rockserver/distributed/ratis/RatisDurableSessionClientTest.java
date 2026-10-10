@@ -13,6 +13,26 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Durable user-window/native composition; no server process, network or power-loss acceptance. */
 class RatisDurableSessionClientTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    @Test void originalQualifiedSchemaPreparationIsForcedAndReopensWithoutResequencing() throws Exception {
+        var helper=new RatisSchemaLifecycleClientTest(); var wire=helper.new Transport(); var source=wire.definition.sourceDirectory();
+        var ledger=SessionEpochLedger.initial(source.clusterId(),source.databaseId(),10).issue(new UUID(93,1),1000);
+        Path path=root.resolve("original-schema.bin"); byte[] bytes;
+        try (var routed=new RatisRoutedClient(source,wire)) {
+            routed.refreshSchema(wire.definition,wire.activation);
+            try (var client=RatisDurableSessionClient.create(path,routed,ledger,ledger.grants().getFirst(),RatisSessionClient.Limits.defaults())) {
+                var forged=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.schemaDigest(),99,source.columns(),source.routingPrefixBytes(),source.ranges());
+                var changes=List.of(new Mutation(Mutation.Kind.PUT,source.columns().iterator().next(),new byte[8],new byte[]{1}));
+                assertThrows(IllegalArgumentException.class,() -> client.prepareAt(forged,changes,List.of()));
+                var pending=client.prepareAt(source,changes,List.of()); assertEquals(0,pending.command().operationId().sequence());
+                assertArrayEquals(source.schemaDigest(),pending.command().schemaDigest()); bytes=DistributedCommandCodec.encode(pending.command());
+            }
+            try (var client=RatisDurableSessionClient.reopen(path,routed)) {
+                var pending=client.pending().getFirst(); assertArrayEquals(bytes,DistributedCommandCodec.encode(pending.command()));
+                assertEquals(source.ranges().getFirst(),pending.descriptor());
+                assertArrayEquals(wire.definition.targetDirectory().schemaDigest(),routed.directory().schemaDigest());
+            }
+        }
+    }
     @Test void preparedReopenLostNativeReplyConsumedHoleAndDurableAckNeverResequence() throws Exception {
         try (var f=new RatisSessionPropagationTest.Fixture(root)) {
             Path path=root.resolve("window.bin"); byte[] frozen;

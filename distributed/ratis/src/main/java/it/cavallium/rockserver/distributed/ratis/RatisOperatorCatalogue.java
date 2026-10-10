@@ -12,7 +12,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Immutable artifact chunks and permanent semantic name/revision bindings. The client is borrowed. */
 public final class RatisOperatorCatalogue {
-    private static final byte UPLOAD=0x70,CHUNK=0x71,PROOF=0x72,PUBLISHED=0x73,ARTIFACT=0x74,NAME=0x75,BUDGET=0x76;
+    private static final byte UPLOAD=0x70,CHUNK=0x71,PROOF=0x72,PUBLISHED=0x73,ARTIFACT=0x74,NAME=0x75,BUDGET=0x76,NAME_SHA=0x77;
     @FunctionalInterface public interface AdmissionPolicy { void requireAdmitted(OperatorUpload upload); }
     /** Reads committed native catalogue values; publication verifies bytes without executing an artifact. */
     @FunctionalInterface public interface ArtifactReader { byte[] read(byte[] key); }
@@ -52,7 +52,24 @@ public final class RatisOperatorCatalogue {
     /** The first immutable complete artifact publication for this SHA; descriptors also have name/revision bindings. */
     public OperatorUpload readBySha(byte[] sha) throws IOException {
         var result=upload(read(artifactKey(sha),OperatorUpload.MAX_BYTES));
-        if(result!=null && !Arrays.equals(result.operator().artifactSha256(),sha)) throw new IOException("Operator artifact SHA differs from binding"); return result;
+        if(result!=null && !Arrays.equals(result.operator().artifactSha256(),sha)) throw new IOException("Operator artifact SHA differs from binding");
+        requirePublishedArtifact(result); return result;
+    }
+    /** First immutable publication for this semantic name and artifact, including its actual allocated revision. */
+    public OperatorUpload readByNameSha(String name,byte[] sha) throws IOException {
+        var result=upload(read(nameShaKey(name,sha),OperatorUpload.MAX_BYTES));
+        if(result!=null && (!result.operator().name().equals(name) || !Arrays.equals(result.operator().artifactSha256(),sha))) throw new IOException("Operator name/SHA differs from binding");
+        requirePublishedArtifact(result); return result;
+    }
+    private void requirePublishedArtifact(OperatorUpload upload) throws IOException {
+        if(upload==null) return;
+        var published=readPublished(upload.operator().name(),upload.operator().version());
+        if(published==null || !Arrays.equals(published.encode(),upload.encode())) throw new IOException("Operator lookup lacks original immutable name/revision publication");
+        try {
+            var chunks=new ArrayList<byte[]>();
+            for(int i=0;i<upload.chunks().size();i++) chunks.add(readChunk(upload,i));
+            upload.requireArtifact(chunks);
+        } catch(IllegalArgumentException | NullPointerException invalid) { throw new IOException("Published operator artifact is incomplete or corrupt",invalid); }
     }
     public NameHead readNameHead(String name) throws IOException {
         byte[] value=read(nameKey(name),56);
@@ -84,13 +101,16 @@ public final class RatisOperatorCatalogue {
                 List.of(predicate(uploadKey(upload.uploadId()),upload.encode()),predicate(chunkKey(upload.uploadId(),index),null),predicate(proofKey(upload.uploadId(),index),null)));
     }
     /** Existing SHA publication is a frozen witness, enabling multiple descriptors for the same admitted artifact. */
-    public DistributedCommand preparePublication(OperationId operation,OperatorUpload upload,OperatorUpload previousArtifact) {
+    public DistributedCommand preparePublication(OperationId operation,OperatorUpload upload,OperatorUpload previousArtifact,OperatorUpload previousNameSha) {
         byte[] binding=previousArtifact==null ? upload.encode() : previousArtifact.encode();
         var predicates=new ArrayList<KeyPredicate>(); predicates.add(predicate(uploadKey(upload.uploadId()),upload.encode()));
         predicates.add(predicate(publishedKey(upload.operator().name(),upload.operator().version()),null));
         predicates.add(predicate(artifactKey(upload.operator().artifactSha256()),previousArtifact==null ? null : binding));
+        byte[] nameBinding=previousNameSha==null ? upload.encode() : previousNameSha.encode();
+        predicates.add(predicate(nameShaKey(upload.operator().name(),upload.operator().artifactSha256()),previousNameSha==null ? null : nameBinding));
         for(int i=0;i<upload.chunks().size();i++) predicates.add(predicate(proofKey(upload.uploadId(),i),chunkProof(upload,i)));
-        return checked(operation,List.of(put(publishedKey(upload.operator().name(),upload.operator().version()),upload.encode()),put(artifactKey(upload.operator().artifactSha256()),binding)),predicates);
+        return checked(operation,List.of(put(publishedKey(upload.operator().name(),upload.operator().version()),upload.encode()),put(artifactKey(upload.operator().artifactSha256()),binding),
+                put(nameShaKey(upload.operator().name(),upload.operator().artifactSha256()),nameBinding)),predicates);
     }
     public CommandResult execute(DistributedCommand command) throws IOException {
         validator.accept(command);
@@ -109,7 +129,7 @@ public final class RatisOperatorCatalogue {
     }
     public static boolean isCommand(DistributedCommand command) {
         if(command.mutations().isEmpty()) return false; byte[] key=command.mutations().getFirst().key();
-        return key.length>0 && key.length!=16 && key[0]>=UPLOAD && key[0]<=BUDGET;
+        return key.length>0 && key.length!=16 && key[0]>=UPLOAD && key[0]<=NAME_SHA;
     }
     public static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,
                                                         Limits limits,AdmissionPolicy policy,ArtifactReader reader) {
@@ -145,14 +165,19 @@ public final class RatisOperatorCatalogue {
         predicate(command,1,chunkKey(upload.uploadId(),index),null); predicate(command,2,proofKey(upload.uploadId(),index),null);
     }
     private static void validatePublication(DistributedCommand command,UUID cluster,UUID database,AdmissionPolicy policy,ArtifactReader reader) {
-        var upload=OperatorUpload.decode(command.mutations().getFirst().value()); requireIdentity(upload,cluster,database); policy.requireAdmitted(upload); shape(command,2,3+upload.chunks().size());
+        var upload=OperatorUpload.decode(command.mutations().getFirst().value()); requireIdentity(upload,cluster,database); policy.requireAdmitted(upload); shape(command,3,4+upload.chunks().size());
         mutation(command,0,publishedKey(upload.operator().name(),upload.operator().version()),upload.encode()); predicate(command,0,uploadKey(upload.uploadId()),upload.encode()); predicate(command,1,publishedKey(upload.operator().name(),upload.operator().version()),null);
         byte[] prior=command.predicates().get(2).expectedValue(),binding=prior==null ? upload.encode() : prior;
         var artifact=OperatorUpload.decode(binding); requireIdentity(artifact,cluster,database);
         if(!Arrays.equals(artifact.operator().artifactSha256(),upload.operator().artifactSha256())) throw new IllegalArgumentException("Artifact lookup changed SHA ownership");
         mutation(command,1,artifactKey(upload.operator().artifactSha256()),binding); key(command,2,artifactKey(upload.operator().artifactSha256()));
+        byte[] priorName=command.predicates().get(3).expectedValue(),nameBinding=priorName==null ? upload.encode() : priorName;
+        var named=OperatorUpload.decode(nameBinding); requireIdentity(named,cluster,database);
+        if(!named.operator().name().equals(upload.operator().name()) || !Arrays.equals(named.operator().artifactSha256(),upload.operator().artifactSha256())) throw new IllegalArgumentException("Name/SHA lookup changes semantic ownership");
+        if(priorName!=null && !Arrays.equals(reader.read(publishedKey(named.operator().name(),named.operator().version())),priorName)) throw new IllegalArgumentException("Name/SHA witness lacks original published revision");
+        mutation(command,2,nameShaKey(upload.operator().name(),upload.operator().artifactSha256()),nameBinding); key(command,3,nameShaKey(upload.operator().name(),upload.operator().artifactSha256()));
         var chunks=new ArrayList<byte[]>();
-        for(int i=0;i<upload.chunks().size();i++) { predicate(command,3+i,proofKey(upload.uploadId(),i),chunkProof(upload,i)); byte[] chunk=reader.read(chunkKey(upload.uploadId(),i)); if(chunk==null) throw new IllegalStateException("Operator artifact is incomplete"); chunks.add(chunk); }
+        for(int i=0;i<upload.chunks().size();i++) { predicate(command,4+i,proofKey(upload.uploadId(),i),chunkProof(upload,i)); byte[] chunk=reader.read(chunkKey(upload.uploadId(),i)); if(chunk==null) throw new IllegalStateException("Operator artifact is incomplete"); chunks.add(chunk); }
         upload.requireArtifact(chunks);
     }
     private static void shape(DistributedCommand command,int mutations,int predicates) { if(command.mutations().size()!=mutations || command.predicates().size()!=predicates) throw new IllegalArgumentException("Invalid operator catalogue command shape"); }
@@ -167,6 +192,10 @@ public final class RatisOperatorCatalogue {
     public static byte[] nameKey(String name) { return digestKey(NAME,OperatorUpload.sha256(nameBytes(name))); }
     public static byte[] publishedKey(String name,long revision) { if(revision<0) throw new IllegalArgumentException("Negative revision"); return ByteBuffer.allocate(41).put(PUBLISHED).put(OperatorUpload.sha256(nameBytes(name))).putLong(revision).array(); }
     public static byte[] artifactKey(byte[] sha) { return digestKey(ARTIFACT,sha); }
+    public static byte[] nameShaKey(String name,byte[] sha) {
+        if(sha==null || sha.length!=32) throw new IllegalArgumentException("Invalid SHA key");
+        return ByteBuffer.allocate(65).put(NAME_SHA).put(OperatorUpload.sha256(nameBytes(name))).put(sha).array();
+    }
     public static byte[] budgetKey(UUID database) { return uuidKey(BUDGET,database); }
     private static byte[] uuidKey(byte tag,UUID uuid) { return ByteBuffer.allocate(17).put(tag).putLong(uuid.getMostSignificantBits()).putLong(uuid.getLeastSignificantBits()).array(); }
     private static byte[] indexed(byte tag,UUID uuid,int index) { if(index<0 || index>=8) throw new IllegalArgumentException("Invalid operator chunk index"); return ByteBuffer.allocate(21).put(tag).putLong(uuid.getMostSignificantBits()).putLong(uuid.getLeastSignificantBits()).putInt(index).array(); }

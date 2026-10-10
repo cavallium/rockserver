@@ -901,6 +901,13 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
 
     public synchronized RangeDirectory directory() { return directory; }
+    /** Select only a current or ACTIVATE-qualified historical schema, never a caller-selected route. */
+    public synchronized RangeDirectory directory(DistributedSchema schema) {
+        requireOpen(); Objects.requireNonNull(schema);
+        RangeDirectory known=Arrays.equals(directory.schemaDigest(),schema.digest()) ? directory : schemaView(schema.digest());
+        schema.requireMatches(known); return known;
+    }
+    public void requireKnownSchema(DistributedSchema schema) { directory(schema); }
     RangeDirectory bootstrapDirectory() { return identity; }
 
     public synchronized void refresh(RangeDirectory next) {
@@ -920,7 +927,13 @@ public final class RatisRoutedClient implements AutoCloseable {
         requireOpen(); Objects.requireNonNull(definition); Objects.requireNonNull(activation);
         requireNamespace(definition.sourceDirectory()); activation.requireHeader(definition.header());
         var target=definition.targetDirectory();
-        if (acceptedSchemas.stream().anyMatch(known -> sameSchema(known,target)) && directory.generation()>=target.generation()) return;
+        if (acceptedSchemas.stream().anyMatch(known -> sameSchema(known,target)) && directory.generation()>=target.generation()) {
+            if (acceptedSchemas.stream().noneMatch(known -> sameSchema(known,definition.sourceDirectory()))) {
+                if (acceptedSchemas.size()>=65) throw new IllegalStateException("Routed schema history budget exhausted");
+                var schemas=new java.util.ArrayList<>(acceptedSchemas); schemas.add(definition.sourceDirectory()); acceptedSchemas=List.copyOf(schemas);
+            }
+            return;
+        }
         if (!sameSchema(directory,definition.sourceDirectory()) || directory.generation()>definition.sourceDirectory().generation()
                 || target.generation()<=directory.generation()) throw new IllegalArgumentException("Schema activation does not follow current routing");
         if (acceptedSchemas.size()>=65) throw new IllegalStateException("Routed schema history budget exhausted");
@@ -981,7 +994,15 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     private PreparedCommand prepareInternal(OperationId operation, List<Mutation> mutations,
                                              List<KeyPredicate> predicates, long acknowledgedThrough) {
-        RangeDirectory observed = current();
+        return prepareInternal(current(),operation,mutations,predicates,acknowledgedThrough);
+    }
+    /** Resume a forced complete request using its exact locally qualified original directory. */
+    public synchronized PreparedCommand prepareAt(RangeDirectory original,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,long acknowledgedThrough) {
+        requireOpen(); requireIdentity(Objects.requireNonNull(original));
+        if (!Arrays.equals(original.payloadDigest(),directory.payloadDigest()) && acceptedSchemas.stream().noneMatch(known -> Arrays.equals(known.payloadDigest(),original.payloadDigest()))) throw new IllegalArgumentException("Original directory was not qualified for this client");
+        return prepareInternal(original,operation,mutations,predicates,acknowledgedThrough);
+    }
+    private PreparedCommand prepareInternal(RangeDirectory observed,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,long acknowledgedThrough) {
         Objects.requireNonNull(operation, "operation");
         Objects.requireNonNull(mutations, "mutations");
         Objects.requireNonNull(predicates, "predicates");

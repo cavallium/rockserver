@@ -89,9 +89,9 @@ class RatisOperatorCatalogueTest {
             f.loseReply=true; assertThrows(IOException.class,() -> f.catalogue.execute(begin)); f.loseReply=false;
             assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(begin).status()); assertArrayEquals(frozen,DistributedCommandCodec.encode(begin));
             assertNull(f.catalogue.readPublished("sum",0)); assertNull(f.catalogue.readBySha(upload.operator().artifactSha256()));
-            assertThrows(IllegalStateException.class,() -> f.catalogue.preparePublication(operation(),upload,null));
+            assertThrows(IllegalStateException.class,() -> f.catalogue.preparePublication(operation(),upload,null,null));
             f.chunks(upload,bytes);
-            var publication=f.catalogue.preparePublication(operation(),upload,null); published=DistributedCommandCodec.encode(publication);
+            var publication=f.catalogue.preparePublication(operation(),upload,null,null); published=DistributedCommandCodec.encode(publication);
             f.loseReply=true; assertThrows(IOException.class,() -> f.catalogue.execute(publication)); f.loseReply=false;
             assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(publication).status()); assertArrayEquals(published,DistributedCommandCodec.encode(publication));
             assertArrayEquals(upload.encode(),f.catalogue.readBySha(upload.operator().artifactSha256()).encode());
@@ -112,12 +112,36 @@ class RatisOperatorCatalogueTest {
             assertEquals(CommandResult.Status.CONFLICT,f.catalogue.execute(losing).status()); assertEquals(CommandResult.Status.CONFLICT,f.catalogue.execute(losing).status());
             assertNull(f.catalogue.readUpload(b.uploadId())); assertEquals(a.uploadId(),f.catalogue.readNameHead("sum").uploadId());
             var next=upload(new UUID(91,3),"sum",1,bytes); f.begin(next); f.chunks(a,bytes); f.chunks(next,bytes);
-            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.preparePublication(operation(),a,null)).status());
+            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.preparePublication(operation(),a,null,null)).status());
             var witness=f.catalogue.readBySha(a.operator().artifactSha256());
-            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.preparePublication(operation(),next,witness)).status());
+            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.preparePublication(operation(),next,witness,f.catalogue.readByNameSha(next.operator().name(),next.operator().artifactSha256()))).status());
             assertArrayEquals(a.encode(),f.catalogue.readPublished("sum",0).encode()); assertArrayEquals(next.encode(),f.catalogue.readPublished("sum",1).encode());
             assertArrayEquals(a.encode(),f.catalogue.readBySha(a.operator().artifactSha256()).encode());
             assertThrows(IllegalArgumentException.class,() -> f.catalogue.prepareBegin(operation(),b,f.catalogue.readNameHead("sum"),f.catalogue.readBudget()));
+        }
+    }
+    @Test void nameShaIndexesAreIndependentImmutableAndReadersVerifyPublishedBytes() throws Exception {
+        byte[] bytes={1,2,3}; var first=upload(new UUID(95,1),"first",0,bytes); var second=upload(new UUID(95,2),"second",0,bytes);
+        try(var f=new Fixture()) {
+            f.begin(first); f.chunks(first,bytes);
+            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(f.catalogue.preparePublication(operation(),first,null,null)).status());
+            f.begin(second); f.chunks(second,bytes);
+            var publication=f.catalogue.preparePublication(operation(),second,f.catalogue.readBySha(second.operator().artifactSha256()),null);
+            assertEquals(3,publication.mutations().size()); assertTrue(DistributedCommandCodec.encode(publication).length<=DistributedCommandCodec.MAX_ENCODED_BYTES);
+            var invalid=new ArrayList<>(publication.mutations()); invalid.set(2,new Mutation(Mutation.Kind.PUT,outer.directoryColumn,RatisOperatorCatalogue.nameShaKey("second",second.operator().artifactSha256()),first.encode()));
+            assertThrows(IllegalArgumentException.class,() -> f.validator.accept(new DistributedCommand(outer.catalogue,1,new byte[32],operation(),invalid,publication.predicates())));
+            assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(publication).status());
+            assertArrayEquals(first.encode(),f.catalogue.readByNameSha("first",first.operator().artifactSha256()).encode());
+            assertArrayEquals(second.encode(),f.catalogue.readByNameSha("second",second.operator().artifactSha256()).encode());
+            assertArrayEquals(first.encode(),f.catalogue.readBySha(first.operator().artifactSha256()).encode());
+            // Simulate corrupt native content below the composed protocol validator.
+            var corrupt=new DistributedCommand(outer.catalogue,1,new byte[32],operation(),List.of(new Mutation(Mutation.Kind.PUT,outer.directoryColumn,RatisOperatorCatalogue.nameShaKey("second",second.operator().artifactSha256()),first.encode())));
+            f.nativeFixture.store.apply(new ApplyPosition(1,f.nativeFixture.next.getAndIncrement()),corrupt);
+            assertThrows(IOException.class,() -> f.catalogue.readByNameSha("second",second.operator().artifactSha256()));
+            var restore=new DistributedCommand(outer.catalogue,1,new byte[32],operation(),List.of(new Mutation(Mutation.Kind.PUT,outer.directoryColumn,RatisOperatorCatalogue.nameShaKey("second",second.operator().artifactSha256()),second.encode()),new Mutation(Mutation.Kind.PUT,outer.directoryColumn,RatisOperatorCatalogue.chunkKey(second.uploadId(),0),new byte[]{1,2,4})));
+            f.nativeFixture.store.apply(new ApplyPosition(1,f.nativeFixture.next.getAndIncrement()),restore);
+            assertThrows(IOException.class,() -> f.catalogue.readByNameSha("second",second.operator().artifactSha256()));
+            assertArrayEquals(first.encode(),f.catalogue.readByNameSha("first",first.operator().artifactSha256()).encode());
         }
     }
     @Test void localAdmissionByteBudgetsAndChunkContentAreEnforced() throws Exception {
@@ -155,7 +179,7 @@ class RatisOperatorCatalogueTest {
         byte[] bytes={10,11,12}; var upload=upload(new UUID(95,1),"sum",0,bytes);
         try(var f=new Fixture()) {
             f.begin(upload); f.chunks(upload,bytes);
-            var publication=f.catalogue.preparePublication(operation(),upload,null);
+            var publication=f.catalogue.preparePublication(operation(),upload,null,null);
             // Controlled corruption fixture bypasses catalogue validation while retaining the original completion marker.
             var corrupt=new DistributedCommand(outer.catalogue,1,new byte[32],operation(),
                     List.of(new Mutation(Mutation.Kind.PUT,outer.directoryColumn,RatisOperatorCatalogue.chunkKey(upload.uploadId(),0),new byte[]{10,11,13})),List.of());
@@ -171,7 +195,7 @@ class RatisOperatorCatalogueTest {
         var bad=new OperatorUpload(proper.uploadId(),outer.cluster,outer.database,descriptor,bytes.length,proper.chunks());
         try(var f=new Fixture()) {
             f.begin(bad); f.chunks(bad,bytes);
-            assertThrows(IllegalArgumentException.class,() -> f.catalogue.preparePublication(operation(),bad,null));
+            assertThrows(IllegalArgumentException.class,() -> f.catalogue.preparePublication(operation(),bad,null,null));
             assertNull(f.catalogue.readPublished("sum",0)); assertNull(f.catalogue.readBySha(wrongSha));
         }
     }

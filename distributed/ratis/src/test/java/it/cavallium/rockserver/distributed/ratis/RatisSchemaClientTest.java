@@ -42,6 +42,20 @@ class RatisSchemaClientTest {
         RatisSchemaClient client(Path journals) throws IOException { return new RatisSchemaClient(journals,outer.cluster,outer.database,directory.domainId(),catalogue,client,routed,replicas,null); }
         public void close() throws Exception { replicas.close(); routed.close(); nativeStore.close(); }
     }
+    @Test void assignedRequestIdsAreCheckpointedAndExistingJournalsCannotBeOverwritten() throws Exception {
+        try(var f=new Fixture(root)) {
+            Path journals=Files.createDirectory(root.resolve("journals")); UUID request=UUID.randomUUID(); byte[] original;
+            try(var client=f.client(journals)) {
+                var handle=client.prepareDeleteIfExists(request,"missing"); assertEquals(request,handle.requestId());
+                original=Files.readAllBytes(journals.resolve(request+".request"));
+                assertThrows(IOException.class,() -> client.prepareCreate(request,"other",shape())); assertArrayEquals(original,Files.readAllBytes(journals.resolve(request+".request")));
+            }
+            try(var client=f.client(journals)) {
+                assertThrows(IOException.class,() -> client.prepareDelete(request,7)); assertArrayEquals(original,Files.readAllBytes(journals.resolve(request+".request")));
+                assertEquals(request,client.reopen(request).requestId());
+            }
+        }
+    }
     @Test void existingCreateAndAbsentDeleteAreDurableAndDoNotAllocate() throws Exception {
         try (var f=new Fixture(root)) {
             Path journals=Files.createDirectory(root.resolve("journals")); UUID existing,absent;

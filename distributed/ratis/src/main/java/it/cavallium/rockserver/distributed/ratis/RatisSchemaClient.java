@@ -16,6 +16,10 @@ public final class RatisSchemaClient implements AutoCloseable {
     public enum Phase { ALLOCATE, SCHEMA, DEFINITION, BEGIN, ARTIFACTS, CAPACITY, ADMISSIONS, FENCING, FENCE, INSTALL, PUBLISH, ACTIVATE, RETIRE, CLEANUP, DONE, ABORTED, CONFLICT, OPERATOR_BEGIN, OPERATOR_CHUNKS, OPERATOR_PUBLISH }
     public record Result(long columnId,boolean changed,boolean aborted,boolean cleanupPending) {}
     public record Progress(UUID requestId,Phase phase,Result result) {}
+    /** Trusted local policy supplies codecs and deterministic contract for the exact requested allocation. */
+    @FunctionalInterface public interface TrustedOperatorResolver {
+        DistributedSchema.Operator resolve(String name,String className,byte[] sha256,long requestedRevision) throws IOException;
+    }
     private final Path root;
     private final UUID cluster,database,domain;
     private final RaftClient client;
@@ -35,6 +39,7 @@ public final class RatisSchemaClient implements AutoCloseable {
     private boolean closed,busy,fenced;
     public final class Handle implements AutoCloseable {
         private final UUID id; private final Map<String,byte[]> fields; private boolean released;
+        private TrustedOperatorResolver operatorResolver;
         private Handle(UUID id,Map<String,byte[]> fields) { this.id=id; this.fields=fields; }
         public UUID requestId() { return id; }
         public Phase phase() { return Phase.valueOf(text("phase")); }
@@ -62,11 +67,13 @@ public final class RatisSchemaClient implements AutoCloseable {
         catch (IOException|RuntimeException failure) { lockChannel.close(); throw failure; }
     }
     public Handle prepareCreate(String name,ColumnSchema schema) throws IOException { return prepareCreate(name,schema,null); }
-    public synchronized Handle prepareCreate(String name,ColumnSchema schema,OperatorUpload upload) throws IOException {
-        requireIdle(); var source=source(); var old=source.schema.columns().stream().filter(column -> column.name().equals(name)).findFirst().orElse(null);
+    public Handle prepareCreate(String name,ColumnSchema schema,OperatorUpload upload) throws IOException { return prepareCreate(UUID.randomUUID(),name,schema,upload); }
+    public Handle prepareCreate(UUID request,String name,ColumnSchema schema) throws IOException { return prepareCreate(request,name,schema,null); }
+    public synchronized Handle prepareCreate(UUID request,String name,ColumnSchema schema,OperatorUpload upload) throws IOException {
+        requireNewRequest(request); var source=source(); var old=source.schema.columns().stream().filter(column -> column.name().equals(name)).findFirst().orElse(null);
         if (old!=null) {
             if (!old.schema().equals(schema) || upload!=null && !Objects.equals(old.operator(),upload.operator())) throw new IllegalArgumentException("Existing column definition differs");
-            return initial(source,"CREATE",old.columnId(),old.apiId(),null,null,null,false);
+            return initial(request,source,"CREATE",old.columnId(),old.apiId(),null,null,null,false);
         }
         if (source.schema.columns().size()>=RangeDirectoryCodec.MAX_COLUMNS) throw new IllegalArgumentException("Schema column capacity exhausted");
         UUID column=UUID.randomUUID(); var desired=new DistributedSchema(cluster,database,domain,source.schema.schemaEpoch()+1,source.schema.routingPrefixBytes(),List.of(new DistributedSchema.Column(1,column,name,schema,upload==null ? null : upload.operator())));
@@ -74,33 +81,67 @@ public final class RatisSchemaClient implements AutoCloseable {
             if (operators==null) throw new IOException("Operator catalogue unavailable"); var published=operators.readPublished(upload.operator().name(),upload.operator().version());
             if (published==null || !Arrays.equals(published.encode(),upload.encode())) throw new IOException("Operator upload is not published");
         }
-        return initial(source,"CREATE",column,0,DistributedSchemaCodec.encode(desired),upload,null,true);
+        return initial(request,source,"CREATE",column,0,DistributedSchemaCodec.encode(desired),upload,null,true);
     }
-    public synchronized Handle prepareUpload(DistributedSchema.Operator operator,byte[] artifact) throws IOException {
-        requireIdle(); if (operators==null) throw new IOException("Operator catalogue unavailable");
+    public Handle prepareUpload(DistributedSchema.Operator operator,byte[] artifact) throws IOException { return prepareUpload(UUID.randomUUID(),operator,artifact); }
+    public synchronized Handle prepareUpload(UUID request,DistributedSchema.Operator operator,byte[] artifact) throws IOException {
+        requireNewRequest(request); if (operators==null) throw new IOException("Operator catalogue unavailable");
         var upload=OperatorUpload.create(UUID.randomUUID(),cluster,database,operator,artifact); var source=source();
-        return initial(source,"UPLOAD",UUID.randomUUID(),0,null,upload,artifact,true);
+        return initial(request,source,"UPLOAD",UUID.randomUUID(),0,null,upload,artifact,true);
+    }
+    public Handle prepareUpload(String name,String className,byte[] artifact,TrustedOperatorResolver resolver) throws IOException {
+        return prepareUpload(UUID.randomUUID(),name,className,artifact,resolver);
+    }
+    public synchronized Handle prepareUpload(UUID request,String name,String className,byte[] artifact,TrustedOperatorResolver resolver) throws IOException {
+        requireNewRequest(request); Objects.requireNonNull(resolver);
+        if (operators==null) throw new IOException("Operator catalogue unavailable");
+        if (name==null || name.isBlank() || className==null || className.isBlank() || artifact==null || artifact.length==0 || artifact.length>OperatorUpload.MAX_ARTIFACT_BYTES) throw new IllegalArgumentException("Invalid common operator upload");
+        byte[] sha=OperatorUpload.sha256(artifact); var published=operators.readByNameSha(name,sha); var source=source();
+        if (published!=null) return initial(request,source,"UPLOAD",UUID.randomUUID(),0,null,published,null,false);
+        var previous=operators.readNameHead(name); long revision=previous==null ? 0 : Math.addExact(previous.revision(),1);
+        var operator=resolveOperator(resolver,name,className,sha,revision);
+        var upload=OperatorUpload.create(UUID.randomUUID(),cluster,database,operator,artifact);
+        var fields=new HashMap<String,byte[]>(); fields.put("commonUpload",new byte[]{1});
+        if (previous!=null) fields.put("operatorNameWitness",previous.encode());
+        return initial(request,source,"UPLOAD",UUID.randomUUID(),0,null,upload,artifact,true,fields,resolver);
+    }
+    private static DistributedSchema.Operator resolveOperator(TrustedOperatorResolver resolver,String name,String className,byte[] sha,long revision) throws IOException {
+        var operator=Objects.requireNonNull(resolver.resolve(name,className,sha.clone(),revision),"Trusted operator resolver returned no descriptor");
+        if (!operator.name().equals(name) || !operator.className().equals(className) || operator.version()!=revision || !Arrays.equals(operator.artifactSha256(),sha)) throw new IllegalArgumentException("Trusted operator descriptor differs from exact name/class/SHA/allocation");
+        return operator;
+    }
+    public synchronized Long checkOperator(String name,byte[] sha) throws IOException {
+        requireIdle(); if (operators==null) return null; var upload=operators.readByNameSha(name,sha); return upload==null ? null : upload.operator().version();
     }
     public synchronized boolean checkOperator(String name,long revision) throws IOException {
         requireIdle(); if (operators==null) return false; var upload=operators.readPublished(name,revision); if(upload==null) return false;
         var chunks=new ArrayList<byte[]>(); for(int i=0;i<upload.chunks().size();i++) chunks.add(operators.readChunk(upload,i)); upload.requireArtifact(chunks); return true;
     }
-    public synchronized Handle prepareDelete(long apiId) throws IOException {
-        requireIdle(); var source=source(); var column=source.schema.column(apiId); return initial(source,"DELETE",column.columnId(),column.apiId(),null,null,null,true);
+    public Handle prepareDelete(long apiId) throws IOException { return prepareDelete(UUID.randomUUID(),apiId); }
+    public synchronized Handle prepareDelete(UUID request,long apiId) throws IOException {
+        requireNewRequest(request); var source=source(); var column=source.schema.column(apiId); return initial(request,source,"DELETE",column.columnId(),column.apiId(),null,null,null,true);
     }
-    public synchronized Handle prepareDeleteIfExists(String name) throws IOException {
-        requireIdle(); var source=source(); var column=source.schema.columns().stream().filter(c -> c.name().equals(name)).findFirst().orElse(null);
-        return initial(source,"DELETE",column==null ? UUID.randomUUID() : column.columnId(),column==null ? 0 : column.apiId(),null,null,null,column!=null);
+    public Handle prepareDeleteIfExists(String name) throws IOException { return prepareDeleteIfExists(UUID.randomUUID(),name); }
+    public synchronized Handle prepareDeleteIfExists(UUID request,String name) throws IOException {
+        requireNewRequest(request); var source=source(); var column=source.schema.columns().stream().filter(c -> c.name().equals(name)).findFirst().orElse(null);
+        return initial(request,source,"DELETE",column==null ? UUID.randomUUID() : column.columnId(),column==null ? 0 : column.apiId(),null,null,null,column!=null);
+    }
+    private void requireNewRequest(UUID request) throws IOException {
+        requireIdle(); Objects.requireNonNull(request);
+        if (handles.containsKey(request) || Files.exists(path(request))) throw new IOException("Schema request already exists; reopen original request");
     }
     private record Source(RangeDirectory directory,DistributedSchema schema) {}
     private Source source() throws IOException {
         var directory=catalogue.read(domain); if (directory==null) throw new IOException("Domain directory absent"); var schema=schemas.read(directory.schemaDigest());
         if (schema==null) throw new IOException("Published schema absent"); schema.requireMatches(directory); return new Source(directory,schema);
     }
-    private Handle initial(Source source,String kind,UUID column,long api,byte[] desired,OperatorUpload upload,byte[] artifact,boolean changed) throws IOException {
+    private Handle initial(UUID request,Source source,String kind,UUID column,long api,byte[] desired,OperatorUpload upload,byte[] artifact,boolean changed) throws IOException {
+        return initial(request,source,kind,column,api,desired,upload,artifact,changed,Map.of(),null);
+    }
+    private Handle initial(UUID request,Source source,String kind,UUID column,long api,byte[] desired,OperatorUpload upload,byte[] artifact,boolean changed,Map<String,byte[]> extra,TrustedOperatorResolver resolver) throws IOException {
         if (handles.size()>=MAX_HANDLES) throw new IOException("Schema handles exhausted");
         try (var files=Files.list(root)) { if (files.filter(p -> p.getFileName().toString().endsWith(".request")).count()>=MAX_REQUESTS) throw new IOException("Schema durable request capacity exhausted"); }
-        UUID request=UUID.randomUUID(); var h=new Handle(request,new HashMap<>()); var identity=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(identity,request); h.fields.put("requestId",identity.array()); h.text("namespace",cluster+"/"+database+"/"+domain); h.fields.put("catalogueBinding",catalogueBinding()); h.text("kind",kind); h.text("column",column.toString());
+        var h=new Handle(request,new HashMap<>()); h.operatorResolver=resolver; extra.forEach((key,value) -> h.fields.put(key,value.clone())); var identity=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(identity,request); h.fields.put("requestId",identity.array()); h.text("namespace",cluster+"/"+database+"/"+domain); h.fields.put("catalogueBinding",catalogueBinding()); h.text("kind",kind); h.text("column",column.toString());
         h.number("api",api); h.number("sequence",0); h.number("cursor",0); h.number("uploadCursor",0); h.number("changed",changed ? 1 : 0); h.number("aborted",0); h.text("phase",!changed ? Phase.DONE.name() : kind.equals("CREATE") ? Phase.ALLOCATE.name() : kind.equals("UPLOAD") ? Phase.OPERATOR_BEGIN.name() : Phase.SCHEMA.name());
         h.fields.put("sourceDirectory",RangeDirectoryCodec.encode(source.directory)); h.fields.put("sourceSchema",DistributedSchemaCodec.encode(source.schema));
         if (desired!=null) h.fields.put("desired",desired); if (upload!=null) h.fields.put("upload",upload.encode()); if (artifact!=null) h.fields.put("artifact",artifact.clone()); save(h); handles.put(request,h); return h;
@@ -111,12 +152,15 @@ public final class RatisSchemaClient implements AutoCloseable {
         try { validateRecovered(h); } catch(RuntimeException malformed) { throw new IOException("Invalid owned schema request journal",malformed); }
         handles.put(request,h); return h;
     }
+    public synchronized Handle reopen(UUID request,TrustedOperatorResolver resolver) throws IOException {
+        var handle=reopen(request); handle.operatorResolver=Objects.requireNonNull(resolver); return handle;
+    }
     public synchronized Result completed(Handle handle) { requireHandle(handle); return busy ? null : result(handle); }
     private Result result(Handle handle) {
         if(closed || fenced || !lock.isValid() || handle.phase()!=Phase.DONE && handle.phase()!=Phase.CLEANUP && handle.phase()!=Phase.ABORTED) return null;
         refreshCompleted(handle); return new Result(handle.number("api"),handle.number("changed")!=0 && handle.number("aborted")==0,handle.number("aborted")!=0,handle.phase()==Phase.CLEANUP);
     }
-    public synchronized OperatorUpload uploaded(Handle handle) { requireHandle(handle); return !busy && !closed && !fenced && lock.isValid() && handle.text("kind").equals("UPLOAD") && handle.phase()==Phase.DONE ? OperatorUpload.decode(handle.fields.get("upload")) : null; }
+    public synchronized OperatorUpload uploaded(Handle handle) { requireHandle(handle); return !busy && !closed && !fenced && lock.isValid() && handle.text("kind").equals("UPLOAD") && handle.phase()==Phase.DONE ? OperatorUpload.decode(handle.fields.get(handle.fields.containsKey("publishedUpload") ? "publishedUpload" : "upload")) : null; }
     private void refreshCompleted(Handle h) {
         if(h.number("aborted")!=0 || !h.fields.containsKey("definition") || h.phase()!=Phase.CLEANUP && h.phase()!=Phase.DONE) return;
         var first=definition(h).sourceDirectory().ranges().getFirst().groupId(); var bytes=h.fields.get("activation/"+first); if(bytes!=null) routed.refreshSchema(definition(h),NativeSchemaActivationProof.decode(bytes));
@@ -231,7 +275,7 @@ public final class RatisSchemaClient implements AutoCloseable {
             case ACTIVATE -> activate(h);
             case RETIRE -> success(h,command(h,() -> administration.prepareAdvance(next(h),head(h),head(h).status().retire()),administration::execute),Phase.CLEANUP);
             case CLEANUP -> cleanup(h);
-            case OPERATOR_BEGIN -> { var upload=OperatorUpload.decode(h.fields.get("upload")); success(h,command(h,() -> operators.prepareBegin(next(h),upload,operators.readNameHead(upload.operator().name()),operators.readBudget()),operators::execute),Phase.OPERATOR_CHUNKS); }
+            case OPERATOR_BEGIN -> operatorBegin(h);
             case OPERATOR_CHUNKS -> {
                 var upload=OperatorUpload.decode(h.fields.get("upload")); int index=(int)h.number("uploadCursor");
                 if (index==upload.chunks().size()) { phase(h,Phase.OPERATOR_PUBLISH); return; }
@@ -239,7 +283,7 @@ public final class RatisSchemaClient implements AutoCloseable {
                 var result=command(h,() -> operators.prepareChunk(next(h),upload,index,chunk),operators::execute);
                 if(result.status()==CommandResult.Status.SUCCESS) { h.number("uploadCursor",index+1); phase(h,Phase.OPERATOR_CHUNKS); } else phase(h,Phase.CONFLICT);
             }
-            case OPERATOR_PUBLISH -> { var upload=OperatorUpload.decode(h.fields.get("upload")); success(h,command(h,() -> operators.preparePublication(next(h),upload,operators.readBySha(upload.operator().artifactSha256())),operators::execute),Phase.DONE); }
+            case OPERATOR_PUBLISH -> operatorPublish(h);
             default -> throw new IllegalStateException("Unexpected schema client phase");
         }
     }
@@ -297,6 +341,36 @@ public final class RatisSchemaClient implements AutoCloseable {
         var proof=NativeSchemaActivationProof.decode(h.fields.get(proofKey));
         success(h,command(h,() -> { var before=head(h); return administration.prepareAdvance(next(h),before,before.status().activated(group,proof.position())); },administration::execute),Phase.ACTIVATE);
     }
+    private void operatorPublish(Handle h) throws IOException {
+        var upload=OperatorUpload.decode(h.fields.get("upload"));
+        var result=command(h,() -> operators.preparePublication(next(h),upload,operators.readBySha(upload.operator().artifactSha256()),
+                operators.readByNameSha(upload.operator().name(),upload.operator().artifactSha256())),operators::execute);
+        if (result.status()==CommandResult.Status.SUCCESS) { phase(h,Phase.DONE); return; }
+        if (result.status()!=CommandResult.Status.CONFLICT || !h.fields.containsKey("commonUpload")) { phase(h,Phase.CONFLICT); return; }
+        var published=operators.readByNameSha(upload.operator().name(),upload.operator().artifactSha256());
+        if (published!=null) { h.fields.put("publishedUpload",published.encode()); h.number("changed",0); phase(h,Phase.DONE); }
+        else phase(h,Phase.OPERATOR_PUBLISH); // Only a forced no-effects result permits new immutable lookup witnesses.
+    }
+    private void operatorBegin(Handle h) throws IOException {
+        var upload=OperatorUpload.decode(h.fields.get("upload")); boolean common=h.fields.containsKey("commonUpload");
+        var result=command(h,() -> operators.prepareBegin(next(h),upload,common
+                ? (h.fields.containsKey("operatorNameWitness") ? RatisOperatorCatalogue.NameHead.decode(h.fields.get("operatorNameWitness")) : null)
+                : operators.readNameHead(upload.operator().name()),operators.readBudget()),operators::execute);
+        if (result.status()==CommandResult.Status.SUCCESS) { phase(h,Phase.OPERATOR_CHUNKS); return; }
+        if (result.status()!=CommandResult.Status.CONFLICT || !common) { phase(h,Phase.CONFLICT); return; }
+        // The forced CONFLICT receipt proves this original BEGIN had no effects. Unknown replies retain its exact manifest/witness/operation.
+        var published=operators.readByNameSha(upload.operator().name(),upload.operator().artifactSha256());
+        if (published!=null) {
+            h.fields.put("publishedUpload",published.encode()); h.number("changed",0); phase(h,Phase.DONE); return;
+        }
+        if (h.operatorResolver==null) throw new IOException("Confirmed operator allocation conflict requires the original trusted resolver");
+        var previous=operators.readNameHead(upload.operator().name()); long revision=previous==null ? 0 : Math.addExact(previous.revision(),1);
+        var operator=resolveOperator(h.operatorResolver,upload.operator().name(),upload.operator().className(),upload.operator().artifactSha256(),revision);
+        var revised=OperatorUpload.create(upload.uploadId(),cluster,database,operator,h.fields.get("artifact"));
+        h.fields.put("upload",revised.encode());
+        if (previous==null) h.fields.remove("operatorNameWitness"); else h.fields.put("operatorNameWitness",previous.encode());
+        phase(h,Phase.OPERATOR_BEGIN);
+    }
     private void cleanup(Handle h) throws IOException {
         var all=owners(h); int index=(int)(h.number("cursor")%all.size()); var owner=all.get(index); String key="released/"+owner.binding().groupId()+"/"+owner.replica().replicaId();
         if(!h.fields.containsKey(key)) {
@@ -327,6 +401,20 @@ public final class RatisSchemaClient implements AutoCloseable {
         var source=sourceSchema(h); var directory=sourceDirectory(h); source.requireMatches(directory);
         if(!source.clusterId().equals(cluster) || !source.databaseId().equals(database) || !source.domainId().equals(domain) || h.number("sequence")<0) throw new IllegalArgumentException("Schema source namespace/sequence changed");
         h.phase();
+        if(h.fields.containsKey("upload")) {
+            var upload=OperatorUpload.decode(h.fields.get("upload"));
+            if(!upload.clusterId().equals(cluster) || !upload.databaseId().equals(database)) throw new IllegalArgumentException("Operator upload namespace changed");
+            if(h.fields.containsKey("artifact") && !Arrays.equals(upload.encode(),OperatorUpload.create(upload.uploadId(),cluster,database,upload.operator(),h.fields.get("artifact")).encode())) throw new IllegalArgumentException("Operator upload artifact differs from frozen manifest");
+        }
+        if(h.fields.containsKey("publishedUpload")) {
+            var original=OperatorUpload.decode(h.fields.get("upload")); var published=OperatorUpload.decode(h.fields.get("publishedUpload"));
+            if(!h.text("kind").equals("UPLOAD") || !published.clusterId().equals(cluster) || !published.databaseId().equals(database)
+                    || !published.operator().name().equals(original.operator().name()) || !Arrays.equals(published.operator().artifactSha256(),original.operator().artifactSha256())) throw new IllegalArgumentException("Published upload result changed original name/SHA");
+        }
+        if(h.fields.containsKey("commonUpload")) {
+            if(!h.text("kind").equals("UPLOAD") || !Arrays.equals(h.fields.get("commonUpload"),new byte[]{1})) throw new IllegalArgumentException("Invalid common upload request");
+            if(h.fields.containsKey("operatorNameWitness")) RatisOperatorCatalogue.NameHead.decode(h.fields.get("operatorNameWitness"));
+        }
         if(h.fields.containsKey("definition")) {
             var definition=definition(h);
             if(!definition.changeId().equals(h.id) || !definition.beginOperation().sessionId().equals(h.id) || definition.beginOperation().epoch()!=0

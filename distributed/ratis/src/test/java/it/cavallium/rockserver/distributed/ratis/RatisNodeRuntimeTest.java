@@ -644,7 +644,7 @@ class RatisNodeRuntimeTest {
                 policy.set(new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true)); validator.accept(operatorBegin);
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,4),operatorBegin)).status());
                 var chunk=catalogue.prepareChunk(env.outer.operation(103),upload,0,jar); validator.accept(chunk); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,5),chunk)).status());
-                var publication=catalogue.preparePublication(env.outer.operation(104),upload,null); validator.accept(publication); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,6),publication)).status());
+                var publication=catalogue.preparePublication(env.outer.operation(104),upload,null,null); validator.accept(publication); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,6),publication)).status());
                 assertArrayEquals(upload.encode(),store.readCurrentPoint(c.directoryColumn(),RatisOperatorCatalogue.publishedKey(descriptor.name(),descriptor.version())));
                 assertThrows(IOException.class,() -> RatisNodeRuntime.SchemaReplicaConfig.defaults().policy().admit(descriptor));
             }

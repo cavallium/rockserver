@@ -41,20 +41,28 @@ class RatisSchemaClientWorkflowTest {
         final DistributedSchema initial; final RangeDirectory initialDirectory; final List<Peer> peers=new ArrayList<>();
         final RatisRoutedClient routed; final RatisSchemaReplicaClient replicas; final RatisOperatorCatalogue operators;
         boolean lagging,nonforced; String losePhase; boolean lost;
+        final Set<DistributedSchema.Operator> admittedOperators=new HashSet<>();
+        final List<byte[]> operatorWrites=new ArrayList<>();
+        java.util.function.Consumer<DistributedCommand> beforeOperatorWrite=command -> {};
+        boolean loseOperatorBeginReply;
         Fixture(Path root,boolean listener) throws Exception { this(root,listener,null); }
         Fixture(Path root,boolean listener,DistributedSchema.Operator admitted) throws Exception {
             metadata=outer.new Fixture(root.resolve("metadata"));
             var borrowed=new RatisSchemaAdministrationTest().client(metadata);
-            var policy=(RatisOperatorCatalogue.AdmissionPolicy)upload -> { if(admitted==null || !admitted.equals(upload.operator())) throw new IllegalArgumentException("Unconfigured operator tuple"); };
+            if(admitted!=null) admittedOperators.add(admitted);
+            var policy=(RatisOperatorCatalogue.AdmissionPolicy)upload -> { if(!admittedOperators.contains(upload.operator())) throw new IllegalArgumentException("Unconfigured operator tuple"); };
             var limits=new RatisOperatorCatalogue.Limits(16,64L*1024*1024);
             var operatorValidator=RatisOperatorCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,limits,policy,key -> { try { return metadata.store.readCurrentPoint(outer.directoryColumn,key); } catch(Exception failure) { throw new IllegalStateException(failure); } });
             var validator=RatisCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,operatorValidator,key -> { try { return metadata.store.readCurrentPoint(outer.directoryColumn,key); } catch(Exception failure) { throw new IllegalStateException(failure); } });
             var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args) -> {
                 if(!method.getName().equals("send")) return method.invoke(borrowed.io(),args);
-                var command=DistributedCommandCodec.decode(((Message)args[0]).getContent().toByteArray()); validator.accept(command); byte[] result=metadata.store.apply(new ApplyPosition(1,metadata.next.getAndIncrement()),command);
+                var command=DistributedCommandCodec.decode(((Message)args[0]).getContent().toByteArray()); validator.accept(command);
+                if(RatisOperatorCatalogue.isCommand(command)) { operatorWrites.add(DistributedCommandCodec.encode(command)); beforeOperatorWrite.accept(command); }
+                byte[] result=metadata.store.apply(new ApplyPosition(1,metadata.next.getAndIncrement()),command);
                 if(RatisSchemaAdministration.isCommand(command) && command.mutations().getFirst().key().length==17) {
                     var phase=RatisSchemaAdministration.Head.decode(command.mutations().getFirst().value()).status().phase(); result=maybeLose(phase.name(),result);
                 }
+                if(loseOperatorBeginReply && RatisOperatorCatalogue.isCommand(command) && command.mutations().getFirst().key()[0]==0x70) { loseOperatorBeginReply=false; result=new byte[4]; }
                 if(metadata.writeOverride!=null) result=metadata.writeOverride;
                 return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("fixture")).setGroupId(RaftGroupId.valueOf(outer.catalogue)).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(result))).build();
             });
@@ -141,6 +149,97 @@ class RatisSchemaClientWorkflowTest {
             String entry=AppendOperator.class.getName().replace('.','/')+".class"; out.putNextEntry(new java.util.jar.JarEntry(entry));
             try(var in=AppendOperator.class.getClassLoader().getResourceAsStream(entry)) { out.write(in.readAllBytes()); } out.closeEntry();
         } return bytes.toByteArray();
+    }
+    @Test void commonUploadIndexesEachNameAndDeduplicatesCompleteContentWithoutNewAllocation() throws Exception {
+        byte[] jar=jar(),sha=OperatorUpload.sha256(jar); String type=AppendOperator.class.getName();
+        var initial=new DistributedSchema.Operator("append",0,type,sha,1,1,"append-contract",1);
+        try(var f=new Fixture(root,false,initial)) {
+            Path journals=Files.createDirectory(root.resolve("journals"));
+            RatisSchemaClient.TrustedOperatorResolver resolver=(name,className,hash,revision) -> {
+                var operator=new DistributedSchema.Operator(name,revision,className,hash,1,1,"append-contract",1); f.admittedOperators.add(operator); return operator;
+            };
+            try(var client=f.client(journals)) {
+                assertNull(client.checkOperator("append",sha));
+                for(String name:List.of("append","other")) {
+                    var handle=client.prepareUpload(name,type,jar,resolver); f.advance(client,handle);
+                    assertEquals(0,client.uploaded(handle).operator().version()); assertEquals(0L,client.checkOperator(name,sha));
+                }
+                long writes=f.metadata.next.get(); var budget=f.operators.readBudget();
+                var repeated=client.prepareUpload("other","another.Class",jar,(name,className,hash,revision) -> { throw new AssertionError("Dedup must precede descriptor allocation"); });
+                assertEquals(RatisSchemaClient.Phase.DONE,repeated.phase()); assertEquals(0,client.uploaded(repeated).operator().version());
+                f.advance(client,repeated); assertEquals(writes,f.metadata.next.get()); assertEquals(budget,f.operators.readBudget());
+                assertEquals("append",f.operators.readBySha(sha).operator().name()); assertEquals("other",f.operators.readByNameSha("other",sha).operator().name());
+            }
+        }
+    }
+    @Test void concurrentOtherNamePublicationRetriesOnlyDefinitiveNoEffectsWitnessConflict() throws Exception {
+        byte[] jar=jar(),sha=OperatorUpload.sha256(jar); String type=AppendOperator.class.getName();
+        var initial=new DistributedSchema.Operator("append",0,type,sha,1,1,"append-contract",1);
+        try(var f=new Fixture(root,false,initial)) {
+            Path journals=Files.createDirectory(root.resolve("journals"));
+            var other=new DistributedSchema.Operator("other",0,type,sha,1,1,"append-contract",1); f.admittedOperators.add(other);
+            var inserted=new java.util.concurrent.atomic.AtomicBoolean();
+            f.beforeOperatorWrite=command -> {
+                if(command.mutations().getFirst().key()[0]!=0x73 || !inserted.compareAndSet(false,true)) return;
+                try {
+                    var upload=OperatorUpload.create(UUID.randomUUID(),f.outer.cluster,f.outer.database,other,jar);
+                    assertEquals(CommandResult.Status.SUCCESS,f.operators.execute(f.operators.prepareBegin(f.outer.operation(500),upload,null,f.operators.readBudget())).status());
+                    assertEquals(CommandResult.Status.SUCCESS,f.operators.execute(f.operators.prepareChunk(f.outer.operation(501),upload,0,jar)).status());
+                    assertEquals(CommandResult.Status.SUCCESS,f.operators.execute(f.operators.preparePublication(f.outer.operation(502),upload,null,null)).status());
+                } catch(IOException failure) { throw new java.io.UncheckedIOException(failure); }
+            };
+            try(var client=f.client(journals)) {
+                var handle=client.prepareUpload("append",type,jar,(name,className,hash,revision) -> initial); f.advance(client,handle);
+                assertEquals(0,client.uploaded(handle).operator().version()); assertEquals(0L,client.checkOperator("append",sha)); assertEquals(0L,client.checkOperator("other",sha));
+                var publicationAttempts=f.operatorWrites.stream().filter(bytes -> DistributedCommandCodec.decode(bytes).mutations().getFirst().key()[0]==0x73)
+                        .map(DistributedCommandCodec::decode).filter(command -> OperatorUpload.decode(command.mutations().getFirst().value()).operator().name().equals("append")).toList();
+                assertEquals(2,publicationAttempts.size());
+                assertArrayEquals(publicationAttempts.getFirst().mutations().getFirst().value(),publicationAttempts.getLast().mutations().getFirst().value());
+                assertNull(publicationAttempts.getFirst().predicates().get(2).expectedValue()); assertNotNull(publicationAttempts.getLast().predicates().get(2).expectedValue());
+            }
+        }
+    }
+    @Test void definiteNameConflictReallocatesButUnknownBeginReopensExactOriginalInputs() throws Exception {
+        byte[] jar=jar(),sha=OperatorUpload.sha256(jar); String type=AppendOperator.class.getName();
+        var initial=new DistributedSchema.Operator("append",0,type,sha,1,1,"append-contract",1);
+        try(var f=new Fixture(root,false,initial)) {
+            Path journals=Files.createDirectory(root.resolve("journals"));
+            var resolutions=new ArrayList<Long>();
+            RatisSchemaClient.TrustedOperatorResolver resolver=(name,className,hash,revision) -> {
+                resolutions.add(revision); var operator=new DistributedSchema.Operator(name,revision,className,hash,1,1,"append-contract",1); f.admittedOperators.add(operator); return operator;
+            };
+            UUID request=UUID.randomUUID(),uploadId;
+            try(var client=f.client(journals)) {
+                var handle=client.prepareUpload(request,"append",type,jar,resolver); assertEquals(request,handle.requestId());
+                uploadId=OperatorUpload.decode(RatisSchemaClientJournal.read(journals.resolve(request+".request")).get("upload")).uploadId();
+                var inserted=new java.util.concurrent.atomic.AtomicBoolean();
+                f.beforeOperatorWrite=command -> {
+                    if(command.mutations().getFirst().key()[0]!=0x70 || !inserted.compareAndSet(false,true)) return;
+                    try {
+                        var competitor=OperatorUpload.create(UUID.randomUUID(),f.outer.cluster,f.outer.database,initial,jar);
+                        var begin=f.operators.prepareBegin(f.outer.operation(500),competitor,null,f.operators.readBudget());
+                        assertEquals(CommandResult.Status.SUCCESS,f.operators.execute(begin).status());
+                    } catch(IOException failure) { throw new java.io.UncheckedIOException(failure); }
+                };
+                client.advance(handle,1); assertEquals(RatisSchemaClient.Phase.OPERATOR_BEGIN,handle.phase());
+                var revised=OperatorUpload.decode(RatisSchemaClientJournal.read(journals.resolve(request+".request")).get("upload"));
+                assertEquals(uploadId,revised.uploadId()); assertEquals(1,revised.operator().version()); assertEquals(List.of(0L,1L),resolutions);
+                f.beforeOperatorWrite=command -> {}; f.advance(client,handle); assertEquals(1,client.uploaded(handle).operator().version());
+            }
+        }
+        try(var f=new Fixture(root.resolve("unknown"),false,initial)) {
+            Path journals=Files.createDirectory(root.resolve("unknown-journals")); UUID request=UUID.randomUUID(); byte[] frozen;
+            RatisSchemaClient.TrustedOperatorResolver resolver=(name,className,hash,revision) -> initial;
+            try(var client=f.client(journals)) {
+                var handle=client.prepareUpload(request,"append",type,jar,resolver); f.loseOperatorBeginReply=true;
+                assertThrows(IOException.class,() -> client.advance(handle,1)); frozen=RatisSchemaClientJournal.read(journals.resolve(request+".request")).get("pendingCommand");
+            }
+            try(var client=f.client(journals)) {
+                var handle=client.reopen(request,(name,className,hash,revision) -> { throw new AssertionError("Unknown BEGIN must retain original descriptor"); });
+                f.advance(client,handle); assertEquals(0,client.uploaded(handle).operator().version());
+                assertArrayEquals(frozen,f.operatorWrites.get(1)); assertEquals(0L,client.checkOperator("append",sha));
+            }
+        }
     }
     @Test void uploadCheckOperatorCreateMergeAndReopenUseTheCompleteDurableFrontend() throws Exception {
         byte[] jar=jar(); var operator=new DistributedSchema.Operator("append",0,AppendOperator.class.getName(),OperatorUpload.sha256(jar),1,1,"append-contract",1);
