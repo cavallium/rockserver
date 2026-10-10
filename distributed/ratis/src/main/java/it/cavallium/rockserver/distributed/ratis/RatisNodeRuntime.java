@@ -88,6 +88,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisProofQueryService proofQueries;
     private RatisProofQueryService authorityQueries;
     private RatisProofQueryService importPublicationQueries;
+    private final Map<UUID,RatisReferencedFiles> importFiles=new LinkedHashMap<>();
+    private ThreadPoolExecutor importFileIo;
     private RatisExportSourceService exportSources;
     private RatisSchemaReplicaService schemaReplicas;
     private RatisSchemaReplicaClient schemaFencingReplicas;
@@ -155,6 +157,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         this.plan=Objects.requireNonNull(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
         this.routed=Objects.requireNonNull(routed); this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
         this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); schemaReplicaConfig=Objects.requireNonNull(replicas); logicalSchema=schema; this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
+        if (!plan.imports().isEmpty() && schema==null) throw new IllegalArgumentException("Planned native imports require their qualified logical schema");
         if (recoveries!=null) {
             recoveries.homes().requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
             var home=plan.home(RatisNodePlan.Role.TRANSACTION_HOME); if (home!=null) recoveries.homes().requireDirectoryBinding(home.directory());
@@ -199,7 +202,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }
         } else {
             if (startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Node identity is absent; explicit placement initialization is required");
-            for (String directory:List.of("native","raft","sessions","recovery","schema-replicas")) {
+            for (String directory:List.of("native","raft","sessions","recovery","schema-replicas","referenced-files")) {
                 Path path=root.resolve(directory);
                 if (Files.exists(path)) try (var entries=Files.list(path)) { if (entries.findAny().isPresent()) throw new IOException("Unidentified node data must not be adopted"); }
             }
@@ -244,6 +247,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
             schemaReplicas=new RatisSchemaReplicaService(nativePath,root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());
         if (plan.localGroups().stream().anyMatch(group -> plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE))
             schemaFencingReplicas=Objects.requireNonNull(replicaFactory.create());
+        if (plan.localGroups().stream().anyMatch(group -> plan.importDefinition(group.getGroupId().getUuid())!=null))
+            importFileIo=new ThreadPoolExecutor(2,2,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(32),
+                    Thread.ofPlatform().daemon(true).name("ratis-import-file-",0).factory(),new ThreadPoolExecutor.AbortPolicy());
         try {
             for (var group:plan.localGroups()) {
                 var id=group.getGroupId().getUuid(); RatisRangeStateMachine machine;
@@ -263,8 +269,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 } else {
                     var directory=plan.groupDirectory(id); var descriptor=plan.groupDescriptor(id); var home=plan.home(id);
                     var bindings=home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
-                    var store=pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
-                            directory.schemaDigest(),bindings,home==null ? plan.merges() : Set.of());
+                    var importDefinition=plan.importDefinition(id);
+                    var store=importDefinition==null ? pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
+                            directory.schemaDigest(),bindings,home==null ? plan.merges() : Set.of())
+                            : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchema)
+                            : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchema);
                     java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
@@ -273,7 +282,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         store.enableLogicalSchema(effectiveSchema==null ? logicalSchema : effectiveSchema);
                     }
                     var effectiveDirectory=role==RatisNodePlan.Role.DATA && store.schemaInstallation()!=null
-                            ? store.schemaInstallation().definition().targetDirectory() : directory;
+                            ? store.schemaInstallation().definition().targetDirectory()
+                            : importDefinition==null ? directory : importDefinition.targetDirectory();
+                    // Bind future session controls to the frozen published placement; the native import fence
+                    // still rejects DATA/control admission until the exact catalogue activation is applied.
                     machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),validator,epochs,effectiveDirectory,settings.retention());
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
                         machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
@@ -284,6 +296,15 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
                     }
                     else { machine.role(role); machine.schemaStorage(pool); machine.schemaActivated(this::observeSchemaActivation); var authority=epochs.schemaAuthority(); machine.schemaAuthority((header,digest) -> readSchemaAuthority(authority,header,digest),effectiveDirectory); machine.schemaReplicas(schemaReplicas,ownReplica(descriptor)); if (captureHomes!=null) machine.snapshotHomes(captureHomes); if (transactionHomes!=null) { machine.transactionHomes(transactionHomes); machine.snapshotRecovery(this::recoverParticipant,snapshotHelp); } }
+                    if (importDefinition!=null) {
+                        var limits=new RatisReferencedFiles.Limits(4096,8,32,
+                                it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES,
+                                it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_TOTAL_BYTES
+                                        +it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES);
+                        var files=new RatisReferencedFiles(root.resolve("referenced-files").resolve(id.toString()),id,limits,importFileIo);
+                        importFiles.put(id,files); machine.referencedFiles(files);
+                        machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority());
+                    }
                 }
                 machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
@@ -525,6 +546,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for (var machine:machines.values()) machine.beginShutdown();
             if (server!=null && !serverClosed) { server.close(); serverClosed=true; }
             for (var machine:machines.values()) machine.awaitNativeReaders(settings.shutdownTimeout());
+            for (var files:importFiles.values()) files.close();
+            if (importFileIo!=null) {
+                importFileIo.shutdown();
+                try { if (!importFileIo.awaitTermination(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS)) throw new IOException("Import file executor did not drain"); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Import file drain interrupted",interrupted); }
+            }
             if (schemaFencingReplicas!=null && !schemaFencingReplicasClosed) { schemaFencingReplicas.close(); schemaFencingReplicasClosed=true; }
             if (pool!=null && !poolClosed) { pool.close(); poolClosed=true; }
             for (var client:homeClients.values()) client.close();

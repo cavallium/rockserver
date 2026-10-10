@@ -720,6 +720,43 @@ class RatisNodeRuntimeTest {
             } finally { continueNested.countDown(); node.close(); }
         }
     }
+    @Test void plannedImportStartsAndRecoversFencedWithDurableGroupFilesAndRetainedReaderDrain() throws Exception {
+        var outer=new RatisSessionEpochsTest();
+        var schema=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
+        try (var env=new Env(root,false,schema.digest())) {
+            var original=env.plan.directory(); var target=original.ranges().getFirst(); var ranges=new ArrayList<>(original.ranges());
+            ranges.set(0,new RangeDescriptor(target.rangeId(),target.groupId(),target.rangeEpoch(),target.configurationVersion(),target.lowerInclusive(),target.upperExclusive(),RangeDescriptor.TopologyState.FENCED,target.replicas()));
+            var directory=new RangeDirectory(original.clusterId(),original.databaseId(),original.domainId(),original.schemaEpoch(),original.schemaDigest(),original.generation(),original.columns(),original.routingPrefixBytes(),ranges);
+            var manifest=new NativeSstImportManifest(UUID.randomUUID(),target.groupId(),target.rangeEpoch(),directory.domainId(),schema.digest(),target.lowerInclusive(),target.upperExclusive(),List.of(new NativeSstImportManifest.Column(outer.data,"data",false,List.of())));
+            var definition=new RangeImportDefinition(manifest.importId(),new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));
+            var plan=new RatisNodePlan(env.plan.nodeId(),env.plan.nodeIncarnation(),directory,env.plan.catalogue(),env.plan.columns(),env.plan.merges(),List.of(),List.of(definition),2);
+            try (var routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor range,UUID column,byte[] key) { throw new AssertionError(); }
+                public CommandResult command(RangeDescriptor range,DistributedCommand command) { throw new AssertionError(); }
+                public void close() {}
+            })) {
+                var fake=new FakeServer(); var field=RatisRangeStateMachine.class.getDeclaredField("store"); field.setAccessible(true);
+                var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,schema,null);
+                RatisReferencedFiles.Reader retained=null;
+                try {
+                    var machine=fake.machines.get(RaftGroupId.valueOf(target.groupId())); var store=(ReplicatedRangeStore)field.get(machine);
+                    assertTrue(store.importPending()); assertEquals(RangeOwnership.State.FENCED,store.ownership().state());
+                    node.start(); assertTrue(store.importPending()); assertEquals(RangeOwnership.State.FENCED,store.ownership().state()); assertTrue(machine.query(Message.EMPTY).isCompletedExceptionally());
+                    var files=(RatisReferencedFiles)machine.data();
+                    files.write(RatisReferencedFilesTest.entry(target.groupId(),UUID.randomUUID(),1,1,manifest.encode(),true)).get(5,java.util.concurrent.TimeUnit.SECONDS); files.flush(1).get(5,java.util.concurrent.TimeUnit.SECONDS);
+                    retained=files.pin(files.reference(1,1)); assertArrayEquals(manifest.encode(),retained.read().toByteArray());
+                    assertThrows(IOException.class,node::close); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(1,fake.closes);
+                    retained.close(); retained=null; node.close(); assertEquals(RatisNodeRuntime.State.CLOSED,node.state());
+                } finally { if(retained!=null)retained.close(); node.close(); }
+                fake.storages.clear();
+                try (var recovered=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.RECOVER,fake::create,schema,null)) {
+                    recovered.start(); var machine=fake.machines.get(RaftGroupId.valueOf(target.groupId())); var store=(ReplicatedRangeStore)field.get(machine);
+                    assertTrue(store.importPending()); assertEquals(RangeOwnership.State.FENCED,store.ownership().state());
+                    var files=(RatisReferencedFiles)machine.data(); try(var reader=files.pin(files.reference(1,1))) { assertArrayEquals(manifest.encode(),reader.read().toByteArray()); }
+                }
+            }
+        }
+    }
     @Test void runtimeAuthorityReaderRecoversExactAbortedOutcomeAfterAnotherCurrentHead() throws Exception {
         var outer=new RatisSessionEpochsTest(); var source=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
         var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());

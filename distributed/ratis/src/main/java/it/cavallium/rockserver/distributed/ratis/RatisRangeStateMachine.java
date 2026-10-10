@@ -1170,7 +1170,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             activateRecoveredOwner();
             if (role==RatisNodePlan.Role.DATA && !store.importPending()) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
             else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
-            if (enableSessionControls) store.enableSessionControls();
+            if (enableSessionControls && !store.importPending()) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
         } catch (Exception failure) { throw failRecovery(failure); }
     }
@@ -1504,7 +1504,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 activateRecoveredOwner();
                 if (role==RatisNodePlan.Role.DATA && !store.importPending()) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
                 else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
-                if (enableSessionControls) store.enableSessionControls();
+                if (enableSessionControls && !store.importPending()) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
                     for (var terminal:verifiedAdmissions.terminalScopes()) if (admissions.get(terminal.id)==terminal) retirePreparationScope(terminal);
