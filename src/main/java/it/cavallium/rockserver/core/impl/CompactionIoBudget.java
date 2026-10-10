@@ -100,7 +100,8 @@ public final class CompactionIoBudget {
     private long tailBlockReads, tailBlockPointNanos, tailBlockKeys, tailBlockBulkMicros;
     private double firstPointMean, firstBulkMean, tailBlockShape, firstTailShape;
     private boolean tailBlockPointActive, tailBlockBulkActive;
-    private double queueAnchor = -1, lastPointMean, lastBulkMean;
+    private double queueAnchor = -1, lastBulkMean;
+    private volatile double lastPointMean;
     private long queuedIntegral, safetyGrowthUntil;
     private int queueWorkers = -1, queueBadPolls, stableLoadedWindows;
     private long priorReadahead;
@@ -165,6 +166,7 @@ public final class CompactionIoBudget {
     }
     public double bulkBaselineMicrosPerKey() { return bulkBaseline; }
     public double baselineReadMicros() { return baseline; }
+    public double pointReadMicros() { double mean = lastPointMean; return mean > 0 ? mean : Double.NaN; }
     public long shutdownBudget() { return shutdownBudget; }
     public State state() { return state; }
     private static long bound(double value) {

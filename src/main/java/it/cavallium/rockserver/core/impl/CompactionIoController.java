@@ -46,6 +46,10 @@ final class CompactionIoController implements AutoCloseable {
                         .tag("db", name).baseUnit("bytes/second").register(registry),
                 Gauge.builder("rockserver.compaction.io.baseline.read.micros", budget, CompactionIoBudget::baselineReadMicros)
                         .tag("db", name).baseUnit("microseconds").register(registry),
+                Gauge.builder("rockserver.compaction.io.point.read.micros", budget, CompactionIoBudget::pointReadMicros)
+                        .tag("db", name).baseUnit("microseconds")
+                        .description("Last qualified completed ~5s mean of owned point lookups, excluding scheduler queue and pinned consumer lease time")
+                        .register(registry),
                 Gauge.builder("rockserver.compaction.io.state", budget, b -> b.state().ordinal())
                         .tag("db", name).register(registry),
                 Gauge.builder("rockserver.compaction.io.readahead", appliedReadahead, AtomicLong::doubleValue)

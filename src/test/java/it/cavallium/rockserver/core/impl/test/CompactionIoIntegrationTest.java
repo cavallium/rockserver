@@ -475,6 +475,57 @@ class CompactionIoIntegrationTest {
             } finally { loaded.db().close(); loaded.refs().close(); }
         }
     }
+    @Test void ownedPointMeanGaugePublishesQualifiedWindowsClearsMissingDataAndIsRemovedOnClose() throws Exception {
+        RocksDBLoader.loadLibrary();
+        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        var pointCalls = new java.util.concurrent.atomic.AtomicInteger(8);
+        var valid = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var fail = new java.util.concurrent.atomic.AtomicBoolean();
+        long[] totals = {System.nanoTime(), 0, 0, 0};
+        java.util.function.Supplier<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sample = () -> {
+            if (fail.get()) throw new IllegalStateException("injected mean-gauge sampling failure");
+            totals[0] += 1_000_000_000L; totals[1] += pointCalls.get();
+            totals[2] += pointCalls.get() * 123000L; totals[3] += 1_000_000L;
+            return new it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample(totals[0], 0, 0, totals[3],
+                    true, false, false, valid.get(), true, totals[1], true, false,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
+                    123, 0, totals[1], 0, 0, totals[2]);
+        };
+        try (var limiter = new org.rocksdb.RateLimiter(1_000_000, 100_000,
+                org.rocksdb.RateLimiter.DEFAULT_FAIRNESS, org.rocksdb.RateLimiterMode.ALL_IO, false)) {
+            var type = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController");
+            var constructor = type.getDeclaredConstructor(String.class, org.rocksdb.RateLimiter.class,
+                    java.util.function.Supplier.class, io.micrometer.core.instrument.MeterRegistry.class,
+                    long.class, java.util.function.LongUnaryOperator.class, boolean.class);
+            constructor.setAccessible(true);
+            try (var controller = (AutoCloseable) constructor.newInstance("point-mean-gauge", limiter, sample, registry,
+                    0L, (java.util.function.LongUnaryOperator) size -> size, false)) {
+                var executorField = type.getDeclaredField("executor"); executorField.setAccessible(true);
+                var executor = (ScheduledExecutorService) executorField.get(controller);
+                var pollField = type.getDeclaredField("poll"); pollField.setAccessible(true);
+                var poll = (Runnable) pollField.get(controller);
+                var gauge = registry.get("rockserver.compaction.io.point.read.micros").tag("db", "point-mean-gauge").gauge();
+                assertTrue(Double.isNaN(gauge.value()));
+                assertEquals("microseconds", gauge.getId().getBaseUnit());
+                for (int i = 0; i < 6; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertEquals(123, gauge.value(), .001);
+                pointCalls.set(1);
+                for (int i = 0; i < 5; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertTrue(Double.isNaN(gauge.value()), "below-quorum data must not remain a measured mean");
+                pointCalls.set(8);
+                for (int i = 0; i < 5; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertEquals(123, gauge.value(), .001);
+                valid.set(false); executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertTrue(Double.isNaN(gauge.value()));
+                valid.set(true);
+                for (int i = 0; i < 6; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertEquals(123, gauge.value(), .001);
+                fail.set(true); executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertTrue(Double.isNaN(gauge.value()), "controller exception must clear stale mean publication");
+            }
+            assertNull(registry.find("rockserver.compaction.io.point.read.micros").gauge());
+        } finally { registry.close(); }
+    }
     @Test void failedSamplerRestoresNativeProbeBudget(@TempDir Path root) throws Exception {
         RocksDBLoader.loadLibrary();
         var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
