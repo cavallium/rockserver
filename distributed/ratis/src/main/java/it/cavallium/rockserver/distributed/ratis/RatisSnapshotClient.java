@@ -34,6 +34,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         return data.restoreSnapshotTarget(fence,owner.route(),owner.replica(),capture.ownerIncarnation());
     }
     private final DistributedSchema schema;
+    private final RangeDirectory directory;
     private final RatisSnapshotFences homes;
     private final RatisRoutedClient data;
     private final RWScheduler scheduler;
@@ -48,7 +49,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     }
     RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode) {
         this.mode=Objects.requireNonNull(mode); this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
-        schema.requireMatches(data.directory()); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
+        data.requireKnownSchema(schema); directory=data.directory(schema); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
     }
     RatisSnapshotCaptureRequest.Mode captureMode() { return mode; }
     public byte[] identityDigest() {
@@ -62,7 +63,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         var home=homes.route(expected.fenceId());
         if (!home.groupId().equals(expected.homeGroup()) || home.rangeEpoch()!=expected.homeEpoch()) throw new IOException("Frozen source HOME placement changed");
         final RatisSnapshotPlan plan;
-        try { plan=RatisSnapshotPlan.frozen(data.directory(),expected); }
+        try { plan=RatisSnapshotPlan.frozen(directory,expected); }
         catch (IllegalArgumentException invalid) { throw new IOException("Frozen source definition differs from current cached projection",invalid); }
         long bytes=64*1024L+3L*expected.encode().length+128*1024L*plan.routes().size(); for (var route:plan.routes()) bytes+=2L*SessionWindowJournal.routeSize(route);
         if (bytes>RatisDurableSnapshot.MAX_BYTES) throw new IOException("Snapshot retained metadata exceeds journal capacity");
@@ -77,7 +78,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     public RatisSnapshotPlan plan(Identity identity,TransactionScope scope) {
         Objects.requireNonNull(identity); Objects.requireNonNull(scope);
         var home=homes.route(identity.fence());
-        return RatisSnapshotPlan.create(data.directory(),scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
+        return RatisSnapshotPlan.create(directory,scope,identity.fence(),identity.business(),home.groupId(),home.rangeEpoch(),identity.firstControl());
     }
     public Lease open(Path path,Identity identity,TransactionScope scope,Duration ttl,RequestContext context) throws IOException {
         long deadline=scheduler.resolveMonotonicDeadline(context); Objects.requireNonNull(identity); validateTtl(ttl);
@@ -363,7 +364,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
         synchronized RatisTransactionPlan.Accepted preparedPrefix(RatisAtomicClient.Identity identity) throws IOException {
             if (mode!=RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED || commitFrozen) throw new IOException("Writable commit unavailable");
             owners(); requireIdleControl();
-            var prefix=stagedPrefix==null ? RatisTransactionPlan.captured(data.directory(),identity.business(),List.of(),List.of(),snapshot()) : stagedPrefix;
+            var prefix=stagedPrefix==null ? RatisTransactionPlan.captured(directory,identity.business(),List.of(),List.of(),snapshot()) : stagedPrefix;
             if (!prefix.operation().equals(identity.business())) throw new IllegalArgumentException("Commit business differs from staged prefix");
             var accepted=new LinkedHashMap<UUID,DistributedCommand>(); var prepares=new LinkedHashMap<UUID,OperationId>(); var finalizes=new LinkedHashMap<UUID,OperationId>(); int n=0;
             for (var part:prefix.partitions()) {

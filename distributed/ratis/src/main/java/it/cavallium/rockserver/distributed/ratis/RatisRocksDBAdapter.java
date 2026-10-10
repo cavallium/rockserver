@@ -14,7 +14,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import static it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.*;
 
-/** Bounded transaction/update bridge with optional direct point operations. Advanced operations remain unsupported. */
+/** Bounded transaction/update bridge and native direct point operations. */
 public final class RatisRocksDBAdapter implements AutoCloseable {
     public static final int MAX_TRANSACTIONS=16,MAX_WAITERS=16;
     public record Allocation(Path snapshot,Path commit,RatisTransactionClient.Identity identity) {
@@ -29,6 +29,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private final RatisRocksDBDirect direct;
     private final RatisRocksDBRanges ranges;
     private final RatisRocksDBIterators iterators;
+    private final java.util.function.LongSupplier handleIds;
     private final Map<Long,Entry> entries=new LinkedHashMap<>();
     private boolean closing;
     private enum Mode { EXPLICIT, UPDATE }
@@ -59,13 +60,13 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     }
     private record ReadCall(String kind,long column,List<Keys> keys,RequestType.RequestTypeId type,Object bounds) {}
     private static final class WriteCall {
-        final long column; final List<Keys> keys; final List<Buf> values; final RequestType.RequestTypeId type; final boolean delete,multi;
+        final long column; final List<Keys> keys; final List<Buf> values; final RequestType.RequestTypeId type; final RatisRocksDBDirect.WriteKind kind; final boolean multi;
         final List<RatisLogicalClient.Change> prefix,basePrefix; final int firstResult;
-        WriteCall(long column,List<Keys> keys,List<Buf> values,RequestType.RequestTypeId type,boolean delete,boolean multi,List<RatisLogicalClient.Change> prefix,List<RatisLogicalClient.Change> basePrefix,int firstResult) {
-            this.column=column; this.keys=keys; this.values=values; this.type=type; this.delete=delete; this.multi=multi; this.prefix=prefix; this.basePrefix=basePrefix; this.firstResult=firstResult;
+        WriteCall(long column,List<Keys> keys,List<Buf> values,RequestType.RequestTypeId type,RatisRocksDBDirect.WriteKind kind,boolean multi,List<RatisLogicalClient.Change> prefix,List<RatisLogicalClient.Change> basePrefix,int firstResult) {
+            this.column=column; this.keys=keys; this.values=values; this.type=type; this.kind=kind; this.multi=multi; this.prefix=prefix; this.basePrefix=basePrefix; this.firstResult=firstResult;
         }
         boolean same(WriteCall other) {
-            if (column!=other.column || type!=other.type || delete!=other.delete || multi!=other.multi || !keys.equals(other.keys) || values.size()!=other.values.size()) return false;
+            if (column!=other.column || type!=other.type || kind!=other.kind || multi!=other.multi || !keys.equals(other.keys) || values.size()!=other.values.size()) return false;
             for (int n=0;n<values.size();n++) if (!Utils.valueEquals(values.get(n),other.values.get(n))) return false;
             return true;
         }
@@ -82,7 +83,29 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         }
     }
     public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges) {
-        this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); schema.requireMatches(directory); iterators=new RatisRocksDBIterators(schema);
+        this(schema,directory,transactions,allocations,direct,ranges,new java.util.concurrent.atomic.AtomicLong(ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE/2))::incrementAndGet);
+    }
+    public RatisRocksDBAdapter(DistributedSchema schema,RangeDirectory directory,RatisTransactionClient transactions,AllocationSource allocations,RatisRocksDBDirect direct,RatisRocksDBRanges ranges,java.util.function.LongSupplier handleIds) {
+        this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); this.handleIds=Objects.requireNonNull(handleIds); schema.requireMatches(directory); iterators=new RatisRocksDBIterators(schema,handleIds);
+    }
+    synchronized boolean ownsTransactionOrUpdate(long id) { return entries.containsKey(id); }
+    boolean ownsIterator(long id) { return iterators.owns(id); }
+    record OwnedDispatch(Object observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
+    private static final class Tracking { final List<CompletableFuture<?>> actual=new ArrayList<>(); final List<Runnable> cancel=new ArrayList<>(); }
+    private final ThreadLocal<Tracking> tracking=new ThreadLocal<>();
+    OwnedDispatch dispatchOwned(RocksDBAPICommand<?,?,?> request,RequestContext context) {
+        var tracker=new Tracking(); tracking.set(tracker);
+        try {
+            Object observer=api(context).requestAsync(request);
+            if (tracker.actual.isEmpty() && observer instanceof CompletableFuture<?> future) tracker.actual.add(future.handle((value,failure) -> null));
+            var drained=CompletableFuture.allOf(tracker.actual.stream().map(future -> future.handle((value,failure) -> null)).toArray(CompletableFuture[]::new));
+            return new OwnedDispatch(observer,drained,() -> tracker.cancel.forEach(Runnable::run));
+        } finally { tracking.remove(); }
+    }
+    private void track(CompletableFuture<?> actual) { var tracker=tracking.get(); if (tracker!=null) tracker.actual.add(actual); }
+    private CompletableFuture<Object> directView(CompletableFuture<Object> source,java.util.function.Function<Object,Object> mapper) {
+        var actual=direct.actualCompletion(source); track(actual); var view=source.thenApply(mapper); var tracker=tracking.get(); if (tracker!=null) tracker.cancel.add(() -> view.cancel(false));
+        view.whenComplete((value,failure) -> { if (view.isCancelled()) source.cancel(false); }); return view;
     }
     public RocksDBAsyncAPI api(RequestContext context) {
         Objects.requireNonNull(context);
@@ -111,10 +134,12 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         }
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Get<?> get) return get(get.transactionOrUpdateId(),get.columnId(),get.keys(),get.requestType().getRequestTypeId(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.ExistsMulti exists) return exists(exists.transactionId(),exists.columnId(),exists.keys(),deadline);
-        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Put<?> put) return write(put.transactionOrUpdateId(),put.columnId(),List.of(put.keys()),Collections.singletonList(put.value()),put.requestType().getRequestTypeId(),false,false,deadline);
-        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Delete<?> delete) return write(delete.transactionOrUpdateId(),delete.columnId(),List.of(delete.keys()),Collections.singletonList(null),delete.requestType().getRequestTypeId(),true,false,deadline);
-        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti<?> put) return write(put.transactionOrUpdateId(),put.columnId(),put.keys(),put.values(),put.requestType().getRequestTypeId(),false,true,deadline);
-        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti<?> delete) return write(delete.transactionOrUpdateId(),delete.columnId(),delete.keys(),Collections.nCopies(delete.keys().size(),null),delete.requestType().getRequestTypeId(),true,true,deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Put<?> put) return write(put.transactionOrUpdateId(),put.columnId(),List.of(put.keys()),Collections.singletonList(put.value()),put.requestType().getRequestTypeId(),RatisRocksDBDirect.WriteKind.PUT,false,deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Delete<?> delete) return write(delete.transactionOrUpdateId(),delete.columnId(),List.of(delete.keys()),Collections.singletonList(null),delete.requestType().getRequestTypeId(),RatisRocksDBDirect.WriteKind.DELETE,false,deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutMulti<?> put) return write(put.transactionOrUpdateId(),put.columnId(),put.keys(),put.values(),put.requestType().getRequestTypeId(),RatisRocksDBDirect.WriteKind.PUT,true,deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteMulti<?> delete) return write(delete.transactionOrUpdateId(),delete.columnId(),delete.keys(),Collections.nCopies(delete.keys().size(),null),delete.requestType().getRequestTypeId(),RatisRocksDBDirect.WriteKind.DELETE,true,deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.Merge<?> merge) return write(merge.transactionOrUpdateId(),merge.columnId(),List.of(merge.keys()),List.of(merge.value()),merge.requestType().getRequestTypeId(),RatisRocksDBDirect.WriteKind.MERGE,false,deadline);
+        if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeMulti<?> merge) return write(merge.transactionOrUpdateId(),merge.columnId(),merge.keys(),merge.values(),merge.requestType().getRequestTypeId(),RatisRocksDBDirect.WriteKind.MERGE,true,deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.GetRangePage<?> page) {
             var type=page.requestType().getRequestTypeId(); if (type!=RequestType.RequestTypeId.ALL_IN_RANGE && type!=RequestType.RequestTypeId.ALL_IN_RANGE_NO_CACHE) throw unsupported();
             schema.column(page.columnId()); var bounds=new PageBounds(copy(page.startKeysInclusive()),copy(page.endKeysExclusive()),page.reverse(),copy(page.resumeAfter()),page.budget());
@@ -196,7 +221,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             var scope=new TransactionScope(schema.columns().stream().map(column -> TransactionScope.Span.range(column.columnId(),null,null)).toList()); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
             final Entry entry;
             synchronized (this) { if (closing || entries.size()>=MAX_TRANSACTIONS) throw RocksDBException.of(SERVER_OVERLOADED,"Transaction ID capacity exhausted");
-                long id; do { id=ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE); } while (entries.containsKey(id)); entry=new Entry(id,mode); entries.put(entry.id,entry); }
+                long id=handleIds.getAsLong(); if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); entry=new Entry(id,mode); entries.put(entry.id,entry); }
             var view=new CompletableFuture<Long>();
             CompletableFuture<Allocation> allocation;
             try { allocation=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }
@@ -243,14 +268,14 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             synchronized (entry) { if (entry.active==operation) entry.active=null; }
             if (failure==null) operation.result.complete(value); else operation.result.completeExceptionally(unwrap(failure));
         });
-        return operation.view();
+        track(operation.result); return operation.view();
     }
     private CompletableFuture<?> get(long id,long column,Keys key,RequestType.RequestTypeId type,Deadline deadline) {
         if (type!=RequestType.RequestTypeId.CURRENT && type!=RequestType.RequestTypeId.EXISTS && type!=RequestType.RequestTypeId.FOR_UPDATE && type!=RequestType.RequestTypeId.NOTHING) throw unsupported();
         if (id==0 && type==RequestType.RequestTypeId.FOR_UPDATE) return initialUpdate(column,key,deadline);
         if (id==0 && direct!=null) {
             var shape=schema.column(column); schema.encodeLogicalKey(shape.columnId(),Objects.requireNonNull(key));
-            return direct.get(column,copy(key),type,deadline.remaining()).thenApply(value -> { deadline.remaining(); return expose(value); });
+            return directView(direct.get(column,copy(key),type,deadline.remaining()),value -> { deadline.remaining(); return expose(value); });
         }
         if (id<=0) throw unsupported(); var shape=schema.column(column); schema.encodeLogicalKey(shape.columnId(),Objects.requireNonNull(key)); var frozen=copy(key);
         if (!shape.schema().hasValue() && (type==RequestType.RequestTypeId.CURRENT || type==RequestType.RequestTypeId.FOR_UPDATE)) throw RocksDBException.of(VALUE_MUST_BE_NULL,"This callback requires a value-bearing column");
@@ -310,8 +335,9 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             return result.thenApply(values -> { deadline.remaining(); return List.copyOf(values); });
         });
     }
-    private CompletableFuture<?> write(long id,long column,List<Keys> keys,List<Buf> values,RequestType.RequestTypeId type,boolean delete,boolean multi,Deadline deadline) throws Exception {
-        if (!(type==RequestType.RequestTypeId.NOTHING || type==RequestType.RequestTypeId.PREVIOUS || type==RequestType.RequestTypeId.PREVIOUS_PRESENCE || !delete && (type==RequestType.RequestTypeId.DELTA || type==RequestType.RequestTypeId.CHANGED || type==RequestType.RequestTypeId.ENSURE))) throw unsupported();
+    private CompletableFuture<?> write(long id,long column,List<Keys> keys,List<Buf> values,RequestType.RequestTypeId type,RatisRocksDBDirect.WriteKind kind,boolean multi,Deadline deadline) throws Exception {
+        if (kind==RatisRocksDBDirect.WriteKind.MERGE ? type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.MERGED
+                : !(type==RequestType.RequestTypeId.NOTHING || type==RequestType.RequestTypeId.PREVIOUS || type==RequestType.RequestTypeId.PREVIOUS_PRESENCE || kind==RatisRocksDBDirect.WriteKind.PUT && (type==RequestType.RequestTypeId.DELTA || type==RequestType.RequestTypeId.CHANGED || type==RequestType.RequestTypeId.ENSURE))) throw unsupported();
         var shape=schema.column(column); if (values==null && !shape.schema().hasValue()) values=Collections.nCopies(keys.size(),null); if (keys.size()!=values.size()) throw new IllegalArgumentException("Keys and values differ in count");
         if (keys.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Write exceeds item budget");
         long input=0; for (var key:keys) for (var component:key.keys()) { input+=Objects.requireNonNull(component).size(); if (input>RatisTransactionPlan.MAX_BYTES) throw new IllegalArgumentException("Write input exceeds prefix byte budget"); }
@@ -321,19 +347,27 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         var frozenKeys=keys.stream().map(RatisRocksDBAdapter::copy).toList(); var frozenValues=values.stream().map(value -> value==null ? null : Buf.wrap(value.toByteArray())).toList();
         for (int n=0;n<frozenKeys.size();n++) {
             schema.encodeLogicalKey(shape.columnId(),frozenKeys.get(n));
-            if (!delete && (shape.schema().hasValue() ? frozenValues.get(n)==null : frozenValues.get(n)!=null)) throw RocksDBException.of(shape.schema().hasValue() ? UNEXPECTED_NULL_VALUE : VALUE_MUST_BE_NULL,"Value differs from column shape");
+            if (kind==RatisRocksDBDirect.WriteKind.MERGE && (shape.operator()==null || frozenValues.get(n)==null)) throw RocksDBException.of(PUT_INVALID_REQUEST,"MERGE requires a qualified operator and operand");
+            if (kind==RatisRocksDBDirect.WriteKind.PUT && (shape.schema().hasValue() ? frozenValues.get(n)==null : frozenValues.get(n)!=null)) throw RocksDBException.of(shape.schema().hasValue() ? UNEXPECTED_NULL_VALUE : VALUE_MUST_BE_NULL,"Value differs from column shape");
         }
         boolean returns=type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE;
-        if (id==0 && direct!=null) return direct.writeSequence(column,frozenKeys,frozenValues,delete,type,multi,deadline.remaining()).thenApply(RatisRocksDBAdapter::expose);
+        if (id==0 && direct!=null) return directView(direct.writeSequence(column,frozenKeys,frozenValues,kind,type,multi,deadline.remaining()),RatisRocksDBAdapter::expose);
         var entry=entry(id);
         final WriteCall request;
         synchronized (entry) {
-            if (entry.mode==Mode.UPDATE && (type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE || delete && type!=RequestType.RequestTypeId.NOTHING)) throw RocksDBException.of(PUT_INVALID_REQUEST,"Implicit updates do not permit previous-value callbacks");
+            if (entry.mode==Mode.UPDATE && (kind==RatisRocksDBDirect.WriteKind.MERGE || type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE || kind==RatisRocksDBDirect.WriteKind.DELETE && type!=RequestType.RequestTypeId.NOTHING)) throw RocksDBException.of(PUT_INVALID_REQUEST,"Implicit updates do not permit previous-value callbacks");
             if (entry.mode==Mode.UPDATE && entry.needsReread) throw new RocksDBRetryException();
             if (entry.commit!=null && entry.mode!=Mode.UPDATE) throw new IOException("Transaction commit already frozen");
             var changes=new ArrayList<>(entry.prefix);
-            for (int n=0;n<frozenKeys.size();n++) changes.add(delete ? RatisLogicalClient.Change.delete(column,frozenKeys.get(n),returns ? Mutation.ReturnMode.PREVIOUS : Mutation.ReturnMode.NONE) : RatisLogicalClient.Change.put(column,frozenKeys.get(n),frozenValues.get(n),returns ? Mutation.ReturnMode.PREVIOUS : Mutation.ReturnMode.NONE));
-            var candidate=new WriteCall(column,frozenKeys,frozenValues,type,delete,multi,List.copyOf(changes),entry.prefix,entry.returned);
+            for (int n=0;n<frozenKeys.size();n++) {
+                var mode=!returns ? Mutation.ReturnMode.NONE : kind==RatisRocksDBDirect.WriteKind.MERGE ? Mutation.ReturnMode.CURRENT : Mutation.ReturnMode.PREVIOUS;
+                changes.add(switch (kind) {
+                    case PUT -> RatisLogicalClient.Change.put(column,frozenKeys.get(n),frozenValues.get(n),mode);
+                    case DELETE -> RatisLogicalClient.Change.delete(column,frozenKeys.get(n),mode);
+                    case MERGE -> RatisLogicalClient.Change.merge(column,frozenKeys.get(n),frozenValues.get(n),mode);
+                });
+            }
+            var candidate=new WriteCall(column,frozenKeys,frozenValues,type,kind,multi,List.copyOf(changes),entry.prefix,entry.returned);
             if (entry.mode==Mode.UPDATE && entry.updateWrite!=null) {
                 if (!entry.updateWrite.same(candidate)) throw new IOException("Resume the exact uncertain update write"); request=entry.updateWrite;
             } else request=candidate;
@@ -359,8 +393,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
                 for (var part:plan.partitions()) { var result=results.get(part.route().groupId()); if (result==null || result.valueCount()!=part.resultPositions().size()) throw new CompletionException(new IOException("Stage result mapping changed")); for (int n=0;n<result.valueCount();n++) ordered.put(part.resultPositions().get(n),result.value(n)); }
                 var returned=new ArrayList<Object>();
                 for (int n=0;n<pending.keys.size();n++) {
-                    byte[] raw=returns ? ordered.get(pending.firstResult+n) : null; Buf previous=raw==null ? null : Buf.wrap(raw); Buf current=pending.delete ? null : shape.schema().hasValue() ? pending.values.get(n) : Buf.wrap(new byte[0]);
-                    returned.add(switch (pending.type) { case PREVIOUS -> previous; case PREVIOUS_PRESENCE -> raw!=null; case DELTA -> new Delta<>(previous,current); case CHANGED -> !Utils.valueEquals(previous,current); default -> null; });
+                    byte[] raw=returns ? ordered.get(pending.firstResult+n) : null; Buf previous=raw==null ? null : Buf.wrap(raw); Buf current=pending.kind==RatisRocksDBDirect.WriteKind.DELETE ? null : shape.schema().hasValue() ? pending.values.get(n) : Buf.wrap(new byte[0]);
+                    returned.add(switch (pending.type) { case PREVIOUS,MERGED -> previous; case PREVIOUS_PRESENCE -> raw!=null; case DELTA -> new Delta<>(previous,current); case CHANGED -> !Utils.valueEquals(previous,current); default -> null; });
                 }
                 deadline.remaining();
                 synchronized (entry) { entry.prefix=pending.prefix; entry.returned=pending.firstResult+(returns ? pending.keys.size() : 0); entry.pending=null; entry.revision++; }

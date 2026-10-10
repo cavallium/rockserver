@@ -82,13 +82,13 @@ class RatisRocksDBDirectTest {
     @Test void durableDirectPendingSurvivesFrontendReopenWithoutNewIdentity() throws Exception {
         try (var x=new Fixture()) {
             x.lose.set(true); var key=RatisAtomicClientTest.key(2); var value=RatisAtomicClientTest.value(9);
-            assertThrows(ExecutionException.class,() -> x.direct.write(71,key,value,false,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch()).get(5,TimeUnit.SECONDS));
+            assertThrows(ExecutionException.class,() -> x.direct.write(71,key,value,RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch()).get(5,TimeUnit.SECONDS));
             var original=x.session.pending().getFirst().command().operationId();
             x.direct.close(); x.session.close();
             try (var reopened=RatisDurableSessionClient.reopen(x.window,x.f.data); var direct=new RatisRocksDBDirect(x.f.schema,x.f.data,reopened,x.f.scheduler,x.journal)) {
                 assertEquals(original,reopened.pending().getFirst().command().operationId());
-                assertThrows(ExecutionException.class,() -> direct.write(71,key,value,false,RequestType.RequestTypeId.CHANGED,RequestContext.batch()).get(5,TimeUnit.SECONDS));
-                assertNull(direct.write(71,key,value,false,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch()).get(5,TimeUnit.SECONDS));
+                assertThrows(ExecutionException.class,() -> direct.write(71,key,value,RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.CHANGED,RequestContext.batch()).get(5,TimeUnit.SECONDS));
+                assertNull(direct.write(71,key,value,RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch()).get(5,TimeUnit.SECONDS));
                 assertTrue(reopened.pending().isEmpty()); assertArrayEquals(new byte[]{9},x.f.get(71,key));
             }
         }
@@ -98,13 +98,13 @@ class RatisRocksDBDirectTest {
             var entered=new CountDownLatch(1); var release=new CountDownLatch(1);
             x.direct.afterAcknowledgement(() -> { entered.countDown(); try { if (!release.await(5,TimeUnit.SECONDS)) throw new AssertionError("ACK barrier timed out"); } catch (InterruptedException interrupted) { throw new AssertionError(interrupted); } });
             var key=RatisAtomicClientTest.key(2); var value=RatisAtomicClientTest.value(9);
-            var pending=x.direct.write(71,key,value,false,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch(Duration.ofMillis(500)));
+            var pending=x.direct.write(71,key,value,RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch(Duration.ofMillis(500)));
             try { assertTrue(entered.await(5,TimeUnit.SECONDS)); assertTrue(x.session.pending().isEmpty()); assertThrows(IOException.class,x.direct::close); Thread.sleep(550); }
             finally { release.countDown(); }
             assertThrows(ExecutionException.class,() -> pending.get(5,TimeUnit.SECONDS)); int effects=x.f.writes();
             x.abandoned=true; x.direct.close(); x.session.close();
             try (var reopened=RatisDurableSessionClient.reopen(x.window,x.f.data); var direct=new RatisRocksDBDirect(x.f.schema,x.f.data,reopened,x.f.scheduler,x.journal)) {
-                assertNull(direct.write(71,key,value,false,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch()).get(5,TimeUnit.SECONDS));
+                assertNull(direct.write(71,key,value,RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.PREVIOUS,RequestContext.batch()).get(5,TimeUnit.SECONDS));
                 assertEquals(effects,x.f.writes()); assertArrayEquals(new byte[]{9},x.f.get(71,key));
             }
         }
@@ -118,7 +118,7 @@ class RatisRocksDBDirectTest {
                 assertEquals(CommandResult.Status.SUCCESS,x.f.data.execute(x.f.data.prepareSessionControl(clock)).status());
             }
             for (int key:new int[]{2,3}) {
-                var failure=assertThrows(ExecutionException.class,() -> x.direct.write(71,RatisAtomicClientTest.key(key),RatisAtomicClientTest.value(9),false,RequestType.RequestTypeId.NOTHING,RequestContext.batch()).get(5,TimeUnit.SECONDS));
+                var failure=assertThrows(ExecutionException.class,() -> x.direct.write(71,RatisAtomicClientTest.key(key),RatisAtomicClientTest.value(9),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,RequestContext.batch()).get(5,TimeUnit.SECONDS));
                 assertInstanceOf(RocksDBException.class,failure.getCause());
                 assertTrue(x.session.pending().isEmpty(),"A durably known no-effects result must not wedge later requests");
             }

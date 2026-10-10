@@ -37,6 +37,7 @@ public final class RatisAtomicClient implements AutoCloseable {
     }
     public record Stats(int operations,long bytes) {}
     private final DistributedSchema schema;
+    private final RangeDirectory directory;
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
     private final RWScheduler scheduler;
@@ -49,13 +50,13 @@ public final class RatisAtomicClient implements AutoCloseable {
     /** Clients, scheduler, and grant maintenance are borrowed. Install adequate DATA/HOME grant windows before use. */
     public RatisAtomicClient(DistributedSchema schema,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
         this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
-        schema.requireMatches(data.directory()); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
+        data.requireKnownSchema(schema); directory=data.directory(schema); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
         try { binding=java.security.MessageDigest.getInstance("SHA-256").digest(java.nio.ByteBuffer.allocate(96).put(schema.digest()).put(homes.identityDigest()).put(data.sessionIdentityDigest()).array()); }
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
     public Operation executeAtomic(Path journal,Identity identity,List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions,Duration ttl,RequestContext context) throws IOException {
         long deadline=scheduler.resolveMonotonicDeadline(context);
-        var plan=RatisTransactionPlan.logical(schema,data.directory(),identity.business(),changes,conditions);
+        var plan=RatisTransactionPlan.logical(schema,directory,identity.business(),changes,conditions);
         return executePlan(journal,identity,plan,ttl,context,deadline);
     }
     /** Submit a fully frozen captured projection without staging again or opening replacement cuts. */
@@ -83,7 +84,7 @@ public final class RatisAtomicClient implements AutoCloseable {
     }
     Operation executePlan(Path journal,Identity identity,RatisTransactionPlan plan,Duration ttl,RequestContext context,long deadline) throws IOException {
         Objects.requireNonNull(identity); Objects.requireNonNull(plan); Objects.requireNonNull(ttl); Objects.requireNonNull(context);
-        if (!identity.business().equals(plan.operation()) || !Arrays.equals(data.directory().payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Atomic plan/TTL differs from frozen request");
+        if (!identity.business().equals(plan.operation()) || !Arrays.equals(directory.payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Atomic plan/TTL differs from frozen request");
         var operation=admit(journal,identity,plan,ttl,estimate(plan)); operation.beginExecution(context,deadline); return operation;
     }
     /** Reopening reads the existing journal on a workload thread and never opens replacement server captures. */

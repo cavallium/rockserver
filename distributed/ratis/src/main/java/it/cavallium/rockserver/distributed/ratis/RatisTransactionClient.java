@@ -27,6 +27,7 @@ public final class RatisTransactionClient implements AutoCloseable {
     }
     public record Stats(RatisSnapshotClient.Stats snapshots,RatisAtomicClient.Stats commits) {}
     private final DistributedSchema schema;
+    private final RangeDirectory directory;
     private final RatisRoutedClient data;
     private final RatisSnapshotClient snapshots;
     private final RatisAtomicClient commits;
@@ -37,7 +38,7 @@ public final class RatisTransactionClient implements AutoCloseable {
     /** Infrastructure and grant maintenance are borrowed; only the bounded client wrappers are owned. */
     public RatisTransactionClient(DistributedSchema schema,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,
                                   RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
-        this.schema=Objects.requireNonNull(schema); this.data=Objects.requireNonNull(data); Objects.requireNonNull(limits);
+        this.schema=Objects.requireNonNull(schema); this.data=Objects.requireNonNull(data); Objects.requireNonNull(limits); data.requireKnownSchema(schema); directory=data.directory(schema);
         snapshots=new RatisSnapshotClient(schema,snapshotHomes,data,scheduler,limits.snapshots(),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);
         commits=new RatisAtomicClient(schema,transactionHomes,data,scheduler,limits.commits());
     }
@@ -116,7 +117,7 @@ public final class RatisTransactionClient implements AutoCloseable {
                 requireLease(); requireOpen(); if (operation!=null) throw new IOException("Commit already owns the frozen prefix");
                 changes=List.copyOf(changes); conditions=List.copyOf(conditions);
                 var physical=changes.isEmpty() && conditions.isEmpty() ? null : RatisLogicalClient.plan(schema,changes,conditions,RatisTransactionPlan.MAX_BYTES);
-                var plan=RatisTransactionPlan.captured(data.directory(),identity.commit().business(),physical==null ? List.of() : physical.mutations(),physical==null ? List.of() : physical.predicates(),snapshot.snapshot());
+                var plan=RatisTransactionPlan.captured(directory,identity.commit().business(),physical==null ? List.of() : physical.mutations(),physical==null ? List.of() : physical.predicates(),snapshot.snapshot());
                 return snapshot.stagePrefix(plan,context);
             } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
         }

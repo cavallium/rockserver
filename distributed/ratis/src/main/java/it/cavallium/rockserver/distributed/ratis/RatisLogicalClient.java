@@ -11,10 +11,10 @@ import java.util.*;
  * Cached-schema logical point operations for one domain. Borrows the routed client and owns one
  * newly issued session sequence window. Prepared identities survive uncertain replies in this
  * instance; use RatisDurableLogicalSession for recovery across restart.
- * Operators, scans and transactions require their own distributed protocols.
+ * Native operator admission belongs to the activated schema and replicated storage owner.
  */
 public final class RatisLogicalClient {
-    /** Ordered PUT/DELETE input. Logical keys and values are copied at construction. */
+    /** Ordered PUT/DELETE/MERGE input. Logical keys and values are copied at construction. */
     public static final class Change {
         private final long column;
         private final Keys keys;
@@ -28,6 +28,9 @@ public final class RatisLogicalClient {
         }
         public static Change put(long column,Keys keys,Buf value,Mutation.ReturnMode returns) {
             return new Change(column,keys,value,Mutation.Kind.PUT,returns);
+        }
+        public static Change merge(long column,Keys keys,Buf operand,Mutation.ReturnMode returns) {
+            return new Change(column,keys,Objects.requireNonNull(operand),Mutation.Kind.MERGE,returns);
         }
         public static Change delete(long column,Keys keys,Mutation.ReturnMode returns) {
             return new Change(column,keys,null,Mutation.Kind.DELETE,returns);
@@ -52,13 +55,14 @@ public final class RatisLogicalClient {
         public RangeDescriptor descriptor() { return pending.descriptor(); }
     }
     private final DistributedSchema schema;
+    private final RangeDirectory directory;
     private final RatisRoutedClient routed;
     private final RatisSessionClient session;
 
     public RatisLogicalClient(DistributedSchema schema,RatisRoutedClient routed,SessionEpochLedger issuance,
                               SessionEpochLedger.Grant grant,RatisSessionClient.Limits limits) {
         this.schema=Objects.requireNonNull(schema); this.routed=Objects.requireNonNull(routed);
-        schema.requireMatches(routed.directory());
+        routed.requireKnownSchema(schema); directory=routed.directory(schema);
         session=new RatisSessionClient(routed,issuance,grant,limits);
     }
     public DistributedSchema schema() { return schema; }
@@ -83,12 +87,15 @@ public final class RatisLogicalClient {
     public Pending preparePut(long column,Keys keys,Buf value,Mutation.ReturnMode returns) {
         return prepare(List.of(Change.put(column,keys,value,returns)),List.of());
     }
+    public Pending prepareMerge(long column,Keys keys,Buf operand,Mutation.ReturnMode returns) {
+        return prepare(List.of(Change.merge(column,keys,operand,returns)),List.of());
+    }
     public Pending prepareDelete(long column,Keys keys,Mutation.ReturnMode returns) {
         return prepare(List.of(Change.delete(column,keys,returns)),List.of());
     }
     /** One atomic same-range plan. Cross-range inputs are rejected before allocation or any RPC. */
     public Pending prepare(List<Change> changes,List<Condition> conditions) {
-        var plan=plan(schema,changes,conditions); return new Pending(this,session.prepare(plan.mutations(),plan.predicates()));
+        var plan=plan(schema,changes,conditions); return new Pending(this,session.prepareAt(directory,plan.mutations(),plan.predicates()));
     }
     record Plan(List<Mutation> mutations,List<KeyPredicate> predicates) {}
     static Plan plan(DistributedSchema schema,List<Change> changes,List<Condition> conditions) {
@@ -104,11 +111,18 @@ public final class RatisLogicalClient {
         long bytes=0;
         for (var change:changes) {
             var column=supported(schema,change.column); var encoded=schema.encodeLogicalKey(column.columnId(),change.keys); var key=encoded.physicalKey(); var members=encoded.variableKeys();
-            byte[] value=change.kind==Mutation.Kind.DELETE ? null : storedValue(column,change.value);
+            byte[] value;
+            if (change.kind==Mutation.Kind.MERGE) {
+                if (column.operator()==null) throw new IllegalArgumentException("MERGE requires an operator-bearing column");
+                value=Objects.requireNonNull(change.value,"MERGE operand required");
+            } else value=change.kind==Mutation.Kind.DELETE ? null : storedValue(column,change.value);
             bytes+=26L+key.length+(value==null ? 0 : value.length)+memberBytes(members); if (bytes>maxBytes) throw new IllegalArgumentException("Logical plan exceeds byte budget");
-            if (column.schema().variableLengthKeysCount()!=0) mutations.add(change.kind==Mutation.Kind.PUT
-                    ? Mutation.bucketPut(column.columnId(),key,members,value,change.returns)
-                    : Mutation.bucketDelete(column.columnId(),key,members,change.returns));
+            if (column.schema().variableLengthKeysCount()!=0) mutations.add(switch (change.kind) {
+                case PUT -> Mutation.bucketPut(column.columnId(),key,members,value,change.returns);
+                case DELETE -> Mutation.bucketDelete(column.columnId(),key,members,change.returns);
+                case MERGE -> Mutation.bucketMerge(column.columnId(),key,members,value,change.returns);
+                default -> throw new IllegalArgumentException("Invalid logical point effect");
+            });
             else mutations.add(new Mutation(change.kind,column.columnId(),key,value,change.returns));
         }
         for (var condition:conditions) {
@@ -139,9 +153,7 @@ public final class RatisLogicalClient {
         return pending.pending;
     }
     static DistributedSchema.Column supported(DistributedSchema schema,long column) {
-        var binding=schema.column(column);
-        if (binding.operator()!=null) throw new UnsupportedOperationException("Logical operator operations require verified distributed operator activation");
-        return binding;
+        return schema.column(column);
     }
     private static byte[] storedValue(DistributedSchema.Column column,byte[] value) {
         if (column.schema().hasValue()) {

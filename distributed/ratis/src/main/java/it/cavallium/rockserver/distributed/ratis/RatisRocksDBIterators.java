@@ -23,6 +23,7 @@ final class RatisRocksDBIterators {
     }
     record Stats(int iterators,int streams,long bytes) {}
     private final DistributedSchema schema;
+    private final java.util.function.LongSupplier handleIds;
     private final Map<Long,Entry> entries=new LinkedHashMap<>();
     private final Set<Flow> flows=new HashSet<>();
     private long bytes;
@@ -56,7 +57,9 @@ final class RatisRocksDBIterators {
     }
     private record Advance(long skip,long take,RequestType.RequestTypeId type) {}
     private record Progress(Keys resume,boolean exhausted,List<KV> taken) {}
-    RatisRocksDBIterators(DistributedSchema schema) { this.schema=Objects.requireNonNull(schema); }
+    RatisRocksDBIterators(DistributedSchema schema) { this(schema,new java.util.concurrent.atomic.AtomicLong(ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE/2))::incrementAndGet); }
+    RatisRocksDBIterators(DistributedSchema schema,java.util.function.LongSupplier handleIds) { this.schema=Objects.requireNonNull(schema); this.handleIds=Objects.requireNonNull(handleIds); }
+    synchronized boolean owns(long id) { return entries.containsKey(id); }
     synchronized Stats stats() { return new Stats(entries.size(),flows.size(),bytes); }
     private long metadata(Keys lower,Keys upper) {
         long size=65536; for (var keys:Arrays.asList(lower,upper)) if (keys!=null) for (var part:keys.keys()) size+=2L*part.size()+8;
@@ -69,7 +72,7 @@ final class RatisRocksDBIterators {
         try {
             expire(); Objects.requireNonNull(ttl); if (ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0) throw new IllegalArgumentException("Iterator TTL must be positive and at most60seconds");
             Keys low=copy(lower),high=copy(upper); long charge=metadata(low,high); final Entry entry;
-            synchronized (this) { reserve(charge); long id; do { id=ThreadLocalRandom.current().nextLong(1,Long.MAX_VALUE); } while (entries.containsKey(id)); entry=new Entry(id,transaction,column,low,high,reverse,ttl.toNanos(),charge); entries.put(id,entry); }
+            synchronized (this) { long id=handleIds.getAsLong(); if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); reserve(charge); entry=new Entry(id,transaction,column,low,high,reverse,ttl.toNanos(),charge); entries.put(id,entry); }
             var view=new CompletableFuture<Long>(); var deadline=new Deadline(context);
             CompletableFuture<Resource> actual;
             try { actual=source.get(); } catch (Throwable failure) { actual=CompletableFuture.failedFuture(failure); }
