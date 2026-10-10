@@ -85,21 +85,21 @@ class RatisCdcPollTest {
         var record=new DistributedCdcRecord(binding.lineage(),new ApplyPosition(1,1),command,null);
         var partial=new RatisCdcPollRpc.Request(binding,new DistributedCdcCheckpoint.Cursor(new ApplyPosition(1,1),0),2,4096);
         assertEquals(partial,RatisCdcPollRpc.decodeRequest(RatisCdcPollRpc.request(partial)));
-        var result=new RatisCdcPollRpc.Result(partial,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(2,3),DistributedCdcCheckpoint.Cursor.beginning(),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,3)),0,List.of(record));
+        var result=new RatisCdcPollRpc.Result(partial,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(2,3),DistributedCdcCheckpoint.Cursor.beginning(),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,3)),true,0,List.of(record));
         byte[] encoded=RatisCdcPollRpc.reply(result); var decoded=RatisCdcPollRpc.decodeReply(encoded,partial);
         assertEquals(command.mutations(),decoded.records().getFirst().command().mutations()); assertEquals(partial.from(),decoded.request().from());
         var different=new RatisCdcPollRpc.Request(binding,DistributedCdcCheckpoint.Cursor.beginning(),2,4096);
         assertThrows(IllegalArgumentException.class,()->RatisCdcPollRpc.decodeReply(encoded,different));
-        byte[] count=encoded.clone(); ByteBuffer.wrap(count).putInt(ScopedTransactionRpc.HEADER_BYTES+93,Integer.MAX_VALUE);
+        byte[] count=encoded.clone(); ByteBuffer.wrap(count).putInt(ScopedTransactionRpc.HEADER_BYTES+94,Integer.MAX_VALUE);
         assertThrows(IllegalArgumentException.class,()->RatisCdcPollRpc.decodeReply(count,partial));
         byte[] size=encoded.clone(); ByteBuffer.wrap(size).putInt(RatisCdcPollRpc.REPLY_BASE_BYTES,Integer.MAX_VALUE);
         assertThrows(IllegalArgumentException.class,()->RatisCdcPollRpc.decodeReply(size,partial));
         assertThrows(IllegalArgumentException.class,()->RatisCdcPollRpc.decodeReply(Arrays.copyOf(encoded,encoded.length-1),partial));
-        assertThrows(IllegalArgumentException.class,()->new RatisCdcPollRpc.Result(partial,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(2,0),result.floor(),result.next(),0,List.of(record)));
-        var gap=new RatisCdcPollRpc.Result(different,RatisCdcPollRpc.Outcome.GAP,new ApplyPosition(2,3),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,1)),different.from(),0,List.of());
+        assertThrows(IllegalArgumentException.class,()->new RatisCdcPollRpc.Result(partial,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(2,0),result.floor(),result.next(),true,0,List.of(record)));
+        var gap=new RatisCdcPollRpc.Result(different,RatisCdcPollRpc.Outcome.GAP,new ApplyPosition(2,3),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,1)),different.from(),false,0,List.of());
         var decodedGap=RatisCdcPollRpc.decodeReply(RatisCdcPollRpc.reply(gap),different);
         assertEquals(RatisCdcPollRpc.Outcome.GAP,decodedGap.outcome()); assertEquals(gap.floor(),decodedGap.floor()); assertEquals(different.from(),decodedGap.next());
-        assertThrows(IllegalArgumentException.class,()->new RatisCdcPollRpc.Result(different,RatisCdcPollRpc.Outcome.GAP,gap.cut(),DistributedCdcCheckpoint.Cursor.beginning(),gap.next(),0,List.of()));
+        assertThrows(IllegalArgumentException.class,()->new RatisCdcPollRpc.Result(different,RatisCdcPollRpc.Outcome.GAP,gap.cut(),DistributedCdcCheckpoint.Cursor.beginning(),gap.next(),false,0,List.of()));
     }
 
     @Test void routedPollUsesFreshFrozenCursorAndDoesNotRebaseForeignLineage() throws Exception {
@@ -115,7 +115,7 @@ class RatisCdcPollTest {
                 assertTrue(fresh); assertEquals(descriptor,range); requests.add(encoded.clone());
                 if(lost.getAndSet(false)) throw new IOException("Lost read reply");
                 var request=RatisCdcPollRpc.decodeRequest(encoded);
-                return RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(request,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(1,0),DistributedCdcCheckpoint.Cursor.beginning(),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0)),0,List.of()));
+                return RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(request,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(1,0),DistributedCdcCheckpoint.Cursor.beginning(),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0)),true,0,List.of()));
             }
         };
         try(var client=new RatisRoutedClient(directory,transport)) {

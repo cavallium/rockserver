@@ -8,7 +8,7 @@ import java.util.*;
 /** Current whole-envelope CDC poll, bound to namespace, lineage and original cursor. */
 public final class RatisCdcPollRpc {
     public static final int KIND=81,REQUEST_BYTES=ScopedTransactionRpc.HEADER_BYTES+116;
-    public static final int REPLY_BASE_BYTES=ScopedTransactionRpc.HEADER_BYTES+97,MAX_REPLY_BYTES=8*1024*1024,MAX_RECORDS=256;
+    public static final int REPLY_BASE_BYTES=ScopedTransactionRpc.HEADER_BYTES+98,MAX_REPLY_BYTES=8*1024*1024,MAX_RECORDS=256;
     public enum Outcome { DATA, GAP, TOO_LARGE }
     private RatisCdcPollRpc() {}
     public record Binding(UUID clusterId,UUID databaseId,UUID domainId,DistributedCdcCheckpoint.Lineage lineage) {
@@ -21,14 +21,14 @@ public final class RatisCdcPollRpc {
         }
     }
     public record Result(Request request,Outcome outcome,ApplyPosition cut,DistributedCdcCheckpoint.Cursor floor,
-            DistributedCdcCheckpoint.Cursor next,int requiredBytes,List<DistributedCdcRecord> records) {
+            DistributedCdcCheckpoint.Cursor next,boolean fromVerified,int requiredBytes,List<DistributedCdcRecord> records) {
         public Result {
             Objects.requireNonNull(request); Objects.requireNonNull(outcome); Objects.requireNonNull(cut); Objects.requireNonNull(floor); Objects.requireNonNull(next); records=List.copyOf(records);
             if(cut.term()==0 || records.size()>request.maxRecords()) throw new IllegalArgumentException("Invalid CDC reply cut/count");
             var end=DistributedCdcCheckpoint.Cursor.after(cut);
             if(!end.covers(floor) || !end.covers(next) || !end.covers(request.from()) || !next.covers(request.from())) throw new IllegalArgumentException("CDC reply cursor exceeds cut or regresses");
             if(outcome==Outcome.GAP) {
-                if(request.from().covers(floor) || !next.equals(request.from()) || requiredBytes!=0 || !records.isEmpty()) throw new IllegalArgumentException("Invalid CDC gap reply");
+                if(fromVerified || request.from().covers(floor) || !next.equals(request.from()) || requiredBytes!=0 || !records.isEmpty()) throw new IllegalArgumentException("Invalid CDC gap reply");
             } else {
                 if(!request.from().covers(floor)) throw new IllegalArgumentException("CDC data/budget reply crosses a retention gap");
                 if(outcome==Outcome.TOO_LARGE) {
@@ -58,13 +58,13 @@ public final class RatisCdcPollRpc {
     }
     public static byte[] reply(Request request,ReplicatedRangeStore.CdcPage page) {
         if(!request.binding().lineage().equals(page.lineage())) throw new IllegalArgumentException("CDC native page lineage differs");
-        return reply(new Result(request,Outcome.DATA,page.cut(),page.floor(),page.next(),0,page.records()));
+        return reply(new Result(request,Outcome.DATA,page.cut(),page.floor(),page.next(),page.fromVerified(),0,page.records()));
     }
     public static byte[] reply(Result result) {
         int size=REPLY_BASE_BYTES-ScopedTransactionRpc.HEADER_BYTES;
         for(var record:result.records()) size+=4+record.encodedSize();
         var bytes=ByteBuffer.allocate(size).put(RangeImportAdmission.sha256(request(result.request())));
-        bytes.put((byte)result.outcome().ordinal()).putLong(result.cut().term()).putLong(result.cut().index()); cursor(bytes,result.floor()); cursor(bytes,result.next()); bytes.putInt(result.requiredBytes()).putInt(result.records().size());
+        bytes.put((byte)result.outcome().ordinal()).putLong(result.cut().term()).putLong(result.cut().index()); cursor(bytes,result.floor()); cursor(bytes,result.next()); bytes.put((byte)(result.fromVerified()?1:0)).putInt(result.requiredBytes()).putInt(result.records().size());
         for(var record:result.records()) { byte[] encoded=record.encode(); bytes.putInt(encoded.length).put(encoded); }
         return ScopedTransactionRpc.frame(KIND,bytes.array());
     }
@@ -74,7 +74,8 @@ public final class RatisCdcPollRpc {
         var bytes=ByteBuffer.wrap(packet.body()); byte[] digest=new byte[32]; bytes.get(digest);
         if(!Arrays.equals(digest,RangeImportAdmission.sha256(request(request)))) throw new IllegalArgumentException("CDC reply crossed request binding");
         int tag=bytes.get()&255; if(tag>=Outcome.values().length) throw new IllegalArgumentException("Invalid CDC reply outcome"); var outcome=Outcome.values()[tag];
-        var cut=new ApplyPosition(bytes.getLong(),bytes.getLong()); var floor=cursor(bytes); var next=cursor(bytes); int required=bytes.getInt(),count=bytes.getInt();
+        var cut=new ApplyPosition(bytes.getLong(),bytes.getLong()); var floor=cursor(bytes); var next=cursor(bytes); int verified=bytes.get()&255;
+        if(verified>1) throw new IllegalArgumentException("Invalid CDC cursor witness"); int required=bytes.getInt(),count=bytes.getInt();
         if(count<0 || count>request.maxRecords() || count>bytes.remaining()/(4+DistributedCdcRecord.HEADER_BYTES+DistributedCommandCodec.HEADER_BYTES)) throw new IllegalArgumentException("Invalid CDC reply record count");
         var records=new ArrayList<DistributedCdcRecord>(count);
         for(int i=0;i<count;i++) {
@@ -82,7 +83,7 @@ public final class RatisCdcPollRpc {
             if(size<DistributedCdcRecord.HEADER_BYTES+DistributedCommandCodec.HEADER_BYTES || size>DistributedCdcRecord.MAX_BYTES || size>bytes.remaining()) throw new IllegalArgumentException("Invalid CDC record length");
             byte[] record=new byte[size]; bytes.get(record); records.add(DistributedCdcRecord.decode(record));
         }
-        if(bytes.hasRemaining()) throw new IllegalArgumentException("Trailing CDC reply bytes"); return new Result(request,outcome,cut,floor,next,required,records);
+        if(bytes.hasRemaining()) throw new IllegalArgumentException("Trailing CDC reply bytes"); return new Result(request,outcome,cut,floor,next,verified==1,required,records);
     }
     private static void cursor(ByteBuffer bytes,DistributedCdcCheckpoint.Cursor cursor) { bytes.putLong(cursor.position().term()).putLong(cursor.position().index()).putInt(cursor.mutationOrdinal()); }
     private static DistributedCdcCheckpoint.Cursor cursor(ByteBuffer bytes) { return new DistributedCdcCheckpoint.Cursor(new ApplyPosition(bytes.getLong(),bytes.getLong()),bytes.getInt()); }

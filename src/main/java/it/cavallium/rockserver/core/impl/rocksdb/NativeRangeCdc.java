@@ -13,7 +13,7 @@ final class NativeRangeCdc {
     private final ColumnFamilyHandle state;
     private final byte[] prefix,summaryKey;
     private final DistributedCdcCheckpoint.Lineage lineage;
-    private record Entry(long term,int bytes) {}
+    private record Entry(long term,int bytes,int mutations) {}
     private TreeMap<Long,Entry> sizes=new TreeMap<>();
     private long retainedBytes;
     private boolean initialized;
@@ -74,7 +74,7 @@ final class NativeRangeCdc {
                 if(recovered.size()>=MAX_RECORDS || iterator.key(sizing)!=25 || iterator.value(sizing)>DistributedCdcRecord.MAX_BYTES) throw new IllegalStateException("CDC recovery capacity/shape exceeded");
                 byte[] encoded=iterator.value(); var record=DistributedCdcRecord.decode(encoded); requireRecord(record,cut);
                 validation.accept(iterator.key(),encoded,owner,cut);
-                if(!Arrays.equals(iterator.key(),key(record.position().index())) || recovered.put(record.position().index(),new Entry(record.position().term(),encoded.length))!=null) throw new IllegalStateException("CDC record key changed");
+                if(!Arrays.equals(iterator.key(),key(record.position().index())) || recovered.put(record.position().index(),new Entry(record.position().term(),encoded.length,record.command().mutations().size()))!=null) throw new IllegalStateException("CDC record key changed");
                 bytes+=25L+encoded.length; if(bytes>MAX_RETAINED_BYTES) throw new IllegalStateException("CDC recovery byte capacity exceeded"); iterator.next();
             }
             iterator.status();
@@ -116,7 +116,7 @@ final class NativeRangeCdc {
         }
         batch.put(state,key(record.position().index()),encoded);
         batch.put(state,summaryKey,summary(nextFloor,sizes.size()-evictions.size()+1,bytes)); long publishedBytes=bytes; var publishedFloor=nextFloor;
-        var metadata=new Entry(record.position().term(),encoded.length);
+        var metadata=new Entry(record.position().term(),encoded.length,record.command().mutations().size());
         return ()->{ evictions.forEach(sizes::remove); sizes.put(record.position().index(),metadata); retainedBytes=publishedBytes; floor=publishedFloor; initialized=true; };
     }
     private byte[] summary(DistributedCdcCheckpoint.Cursor floor,int count,long bytes) {
@@ -134,14 +134,17 @@ final class NativeRangeCdc {
     }
     ReplicatedRangeStore.CdcPage poll(DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes,ApplyPosition cut) throws RocksDBException {
         requireCursorCut(from,cut);
-        if(!from.covers(floor)) throw new ReplicatedRangeStore.CdcGap(new ReplicatedRangeStore.CdcPage(lineage,cut,floor,from,List.of()));
+        if(!from.covers(floor)) throw new ReplicatedRangeStore.CdcGap(new ReplicatedRangeStore.CdcPage(lineage,cut,floor,from,false,List.of()));
+        var boundary=sizes.get(from.position().index());
+        boolean verified=from.equals(DistributedCdcCheckpoint.Cursor.beginning()) || cut!=null && from.equals(DistributedCdcCheckpoint.Cursor.after(cut))
+                || boundary!=null && boundary.term()==from.position().term() && (from.mutationOrdinal()==DistributedCommandCodec.MAX_MUTATIONS || from.mutationOrdinal()<boundary.mutations());
         var records=new ArrayList<DistributedCdcRecord>(); int bytes=0; var next=from;
         for(var entry:sizes.tailMap(from.position().index(),true).entrySet()) {
             long index=entry.getKey(); var metadata=entry.getValue(); var end=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(metadata.term(),index));
             if(from.covers(end)) continue;
             int charge=4+metadata.bytes();
             if(charge>maxBytes-bytes) {
-                if(records.isEmpty()) throw new ReplicatedRangeStore.CdcTooLarge(new ReplicatedRangeStore.CdcPage(lineage,cut,floor,from,List.of()),charge);
+                if(records.isEmpty()) throw new ReplicatedRangeStore.CdcTooLarge(new ReplicatedRangeStore.CdcPage(lineage,cut,floor,from,verified,List.of()),charge);
                 break;
             }
             var record=DistributedCdcRecord.decode(db.get(state,key(index))); requireRecord(record,cut);
@@ -149,7 +152,7 @@ final class NativeRangeCdc {
             records.add(record); bytes+=charge; next=record.end(); if(records.size()==maxRecords) break;
         }
         if(records.size()<maxRecords && (sizes.isEmpty() || next.position().index()>=sizes.lastKey()) && cut!=null) next=DistributedCdcCheckpoint.Cursor.after(cut);
-        return new ReplicatedRangeStore.CdcPage(lineage,cut,floor,next,records);
+        return new ReplicatedRangeStore.CdcPage(lineage,cut,floor,next,verified,records);
     }
     DistributedCdcCheckpoint.Lineage lineage() { return lineage; }
     private static UUID uuid(ByteBuffer bytes) { return new UUID(bytes.getLong(),bytes.getLong()); }

@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.config.DatabaseConfig;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectory;
+import it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec;
 import it.cavallium.rockserver.core.common.distributed.SchemaChange;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
@@ -272,6 +273,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     machine.schemaFencingReplicaClient(schemaFencingReplicas);
                     machine.schemaAuthorityQueries(authorityQueries);
                     machine.importPublicationQueries(importPublicationQueries);
+                    var cdcAuthority=new RatisCdcDeliveryAuthority(routed,domain->{
+                        byte[] key=java.nio.ByteBuffer.allocate(16).putLong(domain.getMostSignificantBits()).putLong(domain.getLeastSignificantBits()).array();
+                        byte[] value=committedCatalogueValue(store,c.directoryColumn(),key);
+                        return value==null ? null : RangeDirectoryCodec.decode(value);
+                    });
+                    machine.cdcDeliveryAdmission(cdcAuthority::validate);
                     machine.importPublicationAdmission(command->{
                         if(RatisRangeImportCatalogue.isPublication(command))RatisRangeImportCatalogue.admitPublication(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::receipt);
                         else RatisRangeImportCatalogue.admitCompletion(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::activation);

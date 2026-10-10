@@ -44,7 +44,13 @@ public final class RatisRoutedClient implements AutoCloseable {
     /** Returns whole envelopes; consumers skip event cursors covered by from. GAP requires snapshot resynchronization. */
     public RatisCdcPollRpc.Result pollCdc(it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,
             it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes) throws IOException {
-        Objects.requireNonNull(lineage); var directory=current();
+        return pollCdcDirectory(current(),lineage,from,maxRecords,maxBytes);
+    }
+    /** Trusted catalogue authority routes other domains in this database using native directory witnesses. */
+    RatisCdcPollRpc.Result pollCdcDirectory(RangeDirectory directory,it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,
+            it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes) throws IOException {
+        Objects.requireNonNull(lineage); Objects.requireNonNull(directory);
+        if(!identity.clusterId().equals(directory.clusterId()) || !identity.databaseId().equals(directory.databaseId())) throw new IllegalArgumentException("Foreign CDC database directory");
         var descriptor=directory.ranges().stream().filter(range->range.groupId().equals(lineage.groupId()) && range.rangeId().equals(lineage.rangeId())
                 && range.rangeEpoch()==lineage.rangeEpoch() && range.topologyState()==RangeDescriptor.TopologyState.ACTIVE).findFirst()
                 .orElseThrow(()->new IllegalArgumentException("CDC lineage is outside the current active directory"));

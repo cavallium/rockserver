@@ -3529,10 +3529,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         page=data; reply=RatisCdcPollRpc.reply(ownedPoll,data);
                     } catch(ReplicatedRangeStore.CdcGap gap) {
                         var status=gap.page(); page=status;
-                        reply=RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(ownedPoll,RatisCdcPollRpc.Outcome.GAP,status.cut(),status.floor(),status.next(),0,List.of()));
+                        reply=RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(ownedPoll,RatisCdcPollRpc.Outcome.GAP,status.cut(),status.floor(),status.next(),false,0,List.of()));
                     } catch(ReplicatedRangeStore.CdcTooLarge large) {
                         var status=large.page(); page=status;
-                        reply=RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(ownedPoll,RatisCdcPollRpc.Outcome.TOO_LARGE,status.cut(),status.floor(),status.next(),RatisCdcPollRpc.REPLY_BASE_BYTES+large.requiredPayloadBytes(),List.of()));
+                        reply=RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(ownedPoll,RatisCdcPollRpc.Outcome.TOO_LARGE,status.cut(),status.floor(),status.next(),status.fromVerified(),RatisCdcPollRpc.REPLY_BASE_BYTES+large.requiredPayloadBytes(),List.of()));
                     }
                     checkTransactionOwner(); var current=leadership();
                     synchronized(admissions){if(generation!=admissionGeneration.get() || current.term()!=leader.term() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || page.cut()==null || page.cut().term()!=current.term())throw new IOException("CDC poll lost native cut/configuration");}

@@ -182,4 +182,15 @@ class NativeDistributedCdcTest {
             assertThrows(IllegalArgumentException.class,()->poll(f,DistributedCdcCheckpoint.Cursor.beginning()));
         }
     }
+    @Test void cursorWitnessRequiresActualMutationOrCurrentCompletedBoundary() throws Exception {
+        try(var f=outer.new Fixture(root.resolve("witness"),true)) {
+            f.store.enableCdc(outer.group); f.store.applyNoop(new ApplyPosition(1,0)); f.apply(1,helper.put(f,0,1,9)); f.store.applyNoop(new ApplyPosition(1,2));
+            var event=new DistributedCdcCheckpoint.Cursor(new ApplyPosition(1,1),0);
+            assertTrue(poll(f,event).fromVerified());
+            assertTrue(poll(f,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,1))).fromVerified());
+            assertTrue(poll(f,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2))).fromVerified());
+            assertFalse(poll(f,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0))).fromVerified());
+            assertFalse(poll(f,new DistributedCdcCheckpoint.Cursor(new ApplyPosition(1,1),1)).fromVerified());
+        }
+    }
 }

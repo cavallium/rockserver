@@ -24,23 +24,28 @@ class RatisCdcDeliveryAdmissionTest {
                 .setType(RaftClientRequest.writeRequestType()).setMessage(message(DistributedCommandCodec.encode(command))).build());
     }
     @Test void qualifiedDeliveryPersistsBeforeAckAndExactRetriesNeedNoNewSourceRead() throws Exception {
-        var source=new AtomicReference<RatisRetentionAdmissionTest.Fixture>(); var checks=new AtomicInteger(); var unavailable=new AtomicBoolean();
+        var authority=new AtomicReference<RatisCdcDeliveryAuthority>(); var checks=new AtomicInteger(); var unavailable=new AtomicBoolean();
         var helper=new RatisImportPublicationAdmissionTest(); helper.root=root.resolve("catalogue");
         try(var f=helper.new Fixture(null,machine->machine.cdcDeliveryAdmission(command->{
             if(unavailable.get()) throw new IOException("Source unavailable"); checks.incrementAndGet();
-            var data=source.get(); var next=DistributedCdcSubscription.decode(command.mutations().getFirst().value()); var old=DistributedCdcSubscription.decode(command.predicates().getFirst().expectedValue());
-            var lineage=new DistributedCdcCheckpoint.Lineage(RANGE,data.groupId,1);
-            if(!next.delivered().cursors().keySet().equals(Set.of(lineage)) || !next.definition().domainId().equals(data.groupId)) throw new IOException("Foreign delivery source");
-            final it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.CdcPage page;
-            try { page=data.store.pollCdc(lineage,old.delivered().cursors().get(lineage),256,8*1024*1024); }
-            catch(org.rocksdb.RocksDBException failure) { throw new IOException("Native source unavailable",failure); }
-            if(!page.next().covers(next.delivered().cursors().get(lineage))) throw new IOException("Delivery exceeds native source");
+            authority.get().validate(command);
         })); var data=new RatisRetentionAdmissionTest.Fixture(root.resolve("source"),RatisRangeStateMachine.RetentionLimits.defaults(),command->{},System::nanoTime,null,
                 machine->machine.cdcBinding(f.catalogue.outer.cluster,f.catalogue.outer.database,RANGE))) {
-            source.set(data); data.apply(data.propose(data.put(0)),1);
+            data.apply(data.propose(data.put(0)),1);
             var owner=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"fixture","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
             var range=new RangeDescriptor(RANGE,data.groupId,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(owner));
             var directory=new RangeDirectory(f.catalogue.outer.cluster,f.catalogue.outer.database,data.groupId,1,new byte[32],1,Set.of(data.column),0,List.of(range));
+            try(var client=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
+                public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { throw new AssertionError(); }
+                public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { throw new AssertionError(); }
+                public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean fresh) throws IOException {
+                    assertTrue(fresh); assertEquals(data.groupId,descriptor.groupId());
+                    try { return data.machine.queryLinearizable(message(request)).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
+                    catch(InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
+                    catch(ExecutionException | TimeoutException failure) { throw new IOException(failure); }
+                }
+            })) {
+            authority.set(new RatisCdcDeliveryAuthority(client,domain->directory));
             byte[] key=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();
             var seed=new DistributedCommand(f.catalogue.outer.catalogue,1,new byte[32],new OperationId(new UUID(9,601),1,0),List.of(new Mutation(Mutation.Kind.PUT,f.catalogue.outer.directoryColumn,key,RangeDirectoryCodec.encode(directory))));
             f.catalogue.nativeCatalogue.store.apply(new ApplyPosition(1,f.catalogue.nativeCatalogue.next.getAndIncrement()),seed);
@@ -68,6 +73,15 @@ class RatisCdcDeliveryAdmissionTest {
             var fresh=catalogue.prepareDelivery(f.catalogue.operation(704),confirmed,ahead);
             assertThrows(ExecutionException.class,()->f.machine.queryLinearizable(message(RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.PREPARE,fresh))).get(5,TimeUnit.SECONDS));
             assertEquals(0,f.machine.importPublicationStats().holds()); assertEquals(confirmed,catalogue.read(definition.subscriptionId()));
+            unavailable.set(false);
+            for(int i=1;i<4096;i++) data.apply(data.propose(data.put(i)),i+1L);
+            data.apply(data.propose(data.ack(10000,4095)),4097);
+            data.apply(data.propose(data.put(4096)),4098); data.apply(data.propose(data.put(4097)),4099);
+            var afterGap=confirmed.delivered().advance(lineage,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,4099)));
+            var gapClaim=catalogue.prepareDelivery(f.catalogue.operation(705),confirmed,afterGap);
+            assertThrows(ExecutionException.class,()->f.machine.queryLinearizable(message(RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.PREPARE,gapClaim))).get(5,TimeUnit.SECONDS));
+            assertEquals(0,f.machine.importPublicationStats().holds()); assertEquals(confirmed,catalogue.read(definition.subscriptionId()));
+            }
         }
     }
     @Test void conditionalDataKeysCannotEnterTheCatalogueDeliveryClassifier() throws Exception {

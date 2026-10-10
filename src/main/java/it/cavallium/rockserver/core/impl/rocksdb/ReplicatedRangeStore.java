@@ -111,7 +111,7 @@ public final class ReplicatedRangeStore {
     public record CdcPage(it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,ApplyPosition cut,
             it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor floor,
             it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor next,
-            List<it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord> records) {
+            boolean fromVerified,List<it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord> records) {
         public CdcPage { records=List.copyOf(records); }
     }
     public static final class CdcGap extends it.cavallium.rockserver.core.common.CdcGapDetectedException {
