@@ -423,6 +423,27 @@ class CompactionBulkFeedbackTest {
                     "tail-only permission cannot erase concurrent non-tail safety evidence");
         }
     }
+    @Test void newlyActiveOwnLaneStartsOffCalibrationFromPositiveAndAlreadyOffCaps() throws Exception {
+        for (boolean newPoint : new boolean[]{true, false}) {
+            for (boolean alreadyOff : new boolean[]{true, false}) {
+                var t = new Trace();
+                if (newPoint) t.point = false; else t.calls = 0;
+                t.seconds(600); assertTrue(t.applied > 0);
+                var reference = CompactionIoBudget.class.getDeclaredField(newPoint ? "pointTailBaseline" : "bulkTailBaseline");
+                reference.setAccessible(true); assertEquals(0, reference.getDouble(t.p));
+                if (alreadyOff) {
+                    t.compReadMicros = (long) t.compReadCalls * 100000;
+                    t.step(); assertEquals(0, t.applied); t.compReadMicros = 250000;
+                }
+                if (newPoint) t.point = true; else t.calls = 120;
+                t.step(); assertEquals(0, t.applied, "an uncalibrated new lane must protect the live cap");
+                t.seconds(60); assertEquals(0, reference.getDouble(t.p), "cooldown plus an incomplete OFF epoch cannot learn");
+                t.seconds(180);
+                assertTrue(reference.getDouble(t.p) > 0, "both complete OFF blocks must learn the newly active lane");
+                assertTrue(t.applied >= 65536, "a calibrated new lane must permit bounded regrowth");
+            }
+        }
+    }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;
         t.step(); assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());

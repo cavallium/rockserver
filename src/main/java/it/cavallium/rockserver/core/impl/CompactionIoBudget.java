@@ -388,9 +388,14 @@ public final class CompactionIoBudget {
         }
         boolean bulkSlow = sample.bulkTailMicros > 0 && bulkTailBaseline > 0 && (bulkShapeMatches || calls == 0 || keys == 0)
                 && sample.bulkTailMicros > bulkTailBaseline * 1.2;
-        if ((readaheadBytes > 0 || appliedReadahead > 0)
-                && (sample.pointTailMicros > 0 && pointTailBaseline == 0
-                    || sample.bulkTailMicros > 0 && bulkTailBaseline == 0)) reduceReadahead(0);
+        boolean missingOwnReference = pointTailBaseline == 0
+                && (sample.pointTailMicros > 0 || sample.nativePointCompletions > old.nativePointCompletions)
+                || bulkTailBaseline == 0 && (sample.bulkTailMicros > 0 || calls > 0);
+        if (missingOwnReference) {
+            if (!tailCalibrationNeeded) resetTailBlocks();
+            tailCalibrationNeeded = true;
+            if (readaheadBytes > 0 || appliedReadahead > 0) reduceReadahead(0);
+        }
         if (queueWorkers < 0) queueWorkers = sample.readWorkers;
         else if (queueWorkers != sample.readWorkers) {
             queueWorkers = sample.readWorkers;
