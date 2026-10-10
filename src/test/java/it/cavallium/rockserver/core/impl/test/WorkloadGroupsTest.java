@@ -87,6 +87,25 @@ class WorkloadGroupsTest {
 				slow.copyPoolTelemetry(RWScheduler.Pool.READ, legacyTelemetry);
 				assertEquals(1, legacyTelemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()]);
 				assertNull(async.getAsync(0, hotId, KEY, RequestType.current()).get(5, SECONDS));
+				assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+					while (root.poolSnapshot(RWScheduler.Pool.READ).outstandingTasks() != 0) Thread.sleep(10);
+				});
+				long completed = root.poolSnapshot(RWScheduler.Pool.READ).completedTasks()
+						+ slow.poolSnapshot(RWScheduler.Pool.READ).completedTasks();
+				for (int targetLength : new int[]{RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES, RWScheduler.POOL_TELEMETRY_LENGTH}) {
+					for (int scratchLength : new int[]{RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES, RWScheduler.POOL_TELEMETRY_LENGTH}) {
+						var selected = new long[targetLength]; var scratch = new long[scratchLength];
+						root.copyCompactionReadTelemetry(selected, scratch);
+						assertEquals(4, selected[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS]);
+						assertEquals(1, selected[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()]);
+						assertEquals(completed, selected[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS]);
+						if (targetLength == RWScheduler.POOL_TELEMETRY_LENGTH) {
+							assertEquals(scratchLength == RWScheduler.POOL_TELEMETRY_LENGTH ? nonRun : -1,
+									selected[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES],
+									"selected legacy group telemetry must not retain the default pool's optional counter");
+						}
+					}
+				}
 				assertFalse(queued.isDone());
 				release.countDown();
 				assertNull(queued.get(5, SECONDS));
