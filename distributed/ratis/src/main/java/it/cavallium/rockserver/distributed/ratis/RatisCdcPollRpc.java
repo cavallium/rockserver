@@ -41,6 +41,7 @@ public final class RatisCdcPollRpc {
                         || request.from().covers(record.end()) || !next.covers(record.end())) throw new IllegalArgumentException("CDC reply record differs from lineage/cursor/cut");
                 previous=record.position().index(); bytes+=4L+record.encodedSize();
             }
+            if(outcome==Outcome.DATA && !next.equals(records.isEmpty() ? request.from() : records.getLast().end())) throw new IllegalArgumentException("CDC next cursor lacks a returned event boundary");
             if(bytes>request.maxBytes()) throw new IllegalArgumentException("CDC reply exceeds requested wire budget");
         }
     }

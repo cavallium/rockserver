@@ -85,7 +85,8 @@ class RatisCdcPollTest {
         var record=new DistributedCdcRecord(binding.lineage(),new ApplyPosition(1,1),command,null);
         var partial=new RatisCdcPollRpc.Request(binding,new DistributedCdcCheckpoint.Cursor(new ApplyPosition(1,1),0),2,4096);
         assertEquals(partial,RatisCdcPollRpc.decodeRequest(RatisCdcPollRpc.request(partial)));
-        var result=new RatisCdcPollRpc.Result(partial,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(2,3),DistributedCdcCheckpoint.Cursor.beginning(),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,3)),true,0,List.of(record));
+        var result=new RatisCdcPollRpc.Result(partial,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(2,3),DistributedCdcCheckpoint.Cursor.beginning(),record.end(),true,0,List.of(record));
+        assertThrows(IllegalArgumentException.class,()->new RatisCdcPollRpc.Result(partial,RatisCdcPollRpc.Outcome.DATA,result.cut(),result.floor(),DistributedCdcCheckpoint.Cursor.after(result.cut()),true,0,List.of(record)));
         byte[] encoded=RatisCdcPollRpc.reply(result); var decoded=RatisCdcPollRpc.decodeReply(encoded,partial);
         assertEquals(command.mutations(),decoded.records().getFirst().command().mutations()); assertEquals(partial.from(),decoded.request().from());
         var different=new RatisCdcPollRpc.Request(binding,DistributedCdcCheckpoint.Cursor.beginning(),2,4096);
@@ -115,7 +116,7 @@ class RatisCdcPollTest {
                 assertTrue(fresh); assertEquals(descriptor,range); requests.add(encoded.clone());
                 if(lost.getAndSet(false)) throw new IOException("Lost read reply");
                 var request=RatisCdcPollRpc.decodeRequest(encoded);
-                return RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(request,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(1,0),DistributedCdcCheckpoint.Cursor.beginning(),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,0)),true,0,List.of()));
+                return RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(request,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(1,0),DistributedCdcCheckpoint.Cursor.beginning(),request.from(),true,0,List.of()));
             }
         };
         try(var client=new RatisRoutedClient(directory,transport)) {

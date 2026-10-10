@@ -33,7 +33,7 @@ class NativeDistributedCdcTest {
             var page=poll(f,DistributedCdcCheckpoint.Cursor.beginning()); assertEquals(1,page.records().size());
             var record=page.records().getFirst(); assertEquals(original.mutations(),record.command().mutations()); assertNull(record.finalization());
             assertEquals(List.of(0,1,2),record.events().stream().map(e->e.cursor().mutationOrdinal()).toList());
-            assertEquals(DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2)),page.next());
+            assertEquals(record.end(),page.next());
             assertThrows(it.cavallium.rockserver.core.common.RocksDBException.class,()->f.store.pollCdc(lineage,DistributedCdcCheckpoint.Cursor.beginning(),1,1));
             try(var pin=f.store.capture()) { NativeRangeImage.write(image,pin,f.store.ownership().interval(),limits); }
         }
@@ -193,4 +193,20 @@ class NativeDistributedCdcTest {
             assertFalse(poll(f,new DistributedCdcCheckpoint.Cursor(new ApplyPosition(1,1),1)).fromVerified());
         }
     }
+    @Test void noEffectTailNeverBecomesAnUnretainedDeliveryEndpoint() throws Exception {
+        Path source=root.resolve("stable-delivery"); DistributedCdcCheckpoint.Cursor endpoint;
+        try(var f=outer.new Fixture(source,true)) {
+            f.store.enableCdc(outer.group); f.store.applyNoop(new ApplyPosition(1,0)); f.apply(1,helper.put(f,0,1,9)); f.store.applyNoop(new ApplyPosition(1,2));
+            var page=poll(f,DistributedCdcCheckpoint.Cursor.beginning()); endpoint=page.records().getLast().end();
+            assertEquals(new ApplyPosition(1,2),page.cut()); assertEquals(endpoint,page.next());
+            f.store.applyNoop(new ApplyPosition(2,3));
+            assertTrue(poll(f,endpoint).fromVerified());
+            var idle=poll(f,endpoint); assertTrue(idle.records().isEmpty()); assertEquals(endpoint,idle.next()); assertEquals(new ApplyPosition(2,3),idle.cut());
+        }
+        try(var f=outer.new Fixture(source,true)) {
+            f.store.enableCdc(outer.group); var idle=poll(f,endpoint);
+            assertTrue(idle.fromVerified()); assertEquals(endpoint,idle.next());
+        }
+    }
+
 }

@@ -70,16 +70,18 @@ public final class RatisCdcSubscriptionCatalogue {
     }
     public CommandResult execute(DistributedCommand command) throws IOException {
         validator.accept(command);
-        try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))))); }
+        try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))),8)); }
         catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC command reply",invalid); }
     }
     public void prepareDeliveryOwner(DistributedCommand command) throws IOException {
         validator.accept(command);
-        try { RatisCdcDeliveryRpc.requireEcho(content(client.io().sendReadOnly(message(RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.PREPARE,command)))),RatisCdcDeliveryRpc.PREPARE,command); }
+        byte[] request=RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.PREPARE,command);
+        try { RatisCdcDeliveryRpc.requireEcho(content(client.io().sendReadOnly(message(request)),request.length),RatisCdcDeliveryRpc.PREPARE,command); }
         catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC delivery preparation reply",invalid); }
     }
     public void cancelDelivery(DistributedCommand command) throws IOException {
-        try { RatisCdcDeliveryRpc.requireEcho(content(client.io().sendReadOnly(message(RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.CANCEL,command)))),RatisCdcDeliveryRpc.CANCEL,command); }
+        byte[] request=RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.CANCEL,command);
+        try { RatisCdcDeliveryRpc.requireEcho(content(client.io().sendReadOnly(message(request)),request.length),RatisCdcDeliveryRpc.CANCEL,command); }
         catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC delivery cancellation reply",invalid); }
     }
     public static boolean isCommand(DistributedCommand command) {
@@ -124,9 +126,14 @@ public final class RatisCdcSubscriptionCatalogue {
     public static byte[] capacityKey() { return new byte[]{CAPACITY}; }
     private static byte[] domainKey(UUID domain) { return ByteBuffer.allocate(16).putLong(domain.getMostSignificantBits()).putLong(domain.getLeastSignificantBits()).array(); }
     private byte[] point(byte[] key,int maximum) throws IOException {
-        try { return ScopedTransactionRpc.pointValue(content(client.io().sendReadOnly(message(ScopedTransactionRpc.pointRequest(column,key)))),maximum); }
+        try { return ScopedTransactionRpc.pointValue(content(client.io().sendReadOnly(message(ScopedTransactionRpc.pointRequest(column,key))),ScopedTransactionRpc.HEADER_BYTES+4+maximum),maximum); }
         catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC point reply",invalid); }
     }
     private static Message message(byte[] bytes) { return Message.valueOf(ByteString.copyFrom(bytes)); }
-    private static byte[] content(org.apache.ratis.protocol.RaftClientReply reply) throws IOException { if(reply==null || !reply.isSuccess() || reply.getMessage()==null) throw new IOException("CDC catalogue operation failed",reply==null ? null : reply.getException()); return reply.getMessage().getContent().toByteArray(); }
+    private static byte[] content(org.apache.ratis.protocol.RaftClientReply reply,int maximum) throws IOException {
+        if(reply==null || !reply.isSuccess() || reply.getMessage()==null) throw new IOException("CDC catalogue operation failed",reply==null ? null : reply.getException());
+        var bytes=reply.getMessage().getContent();
+        if(bytes.size()>maximum) throw new IOException("CDC catalogue reply exceeds operation budget");
+        return bytes.toByteArray();
+    }
 }

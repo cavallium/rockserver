@@ -151,7 +151,7 @@ final class NativeRangeCdc {
             if(record.encodedSize()!=metadata.bytes() || !record.end().equals(end)) throw new IllegalStateException("CDC record differs from retained metadata");
             records.add(record); bytes+=charge; next=record.end(); if(records.size()==maxRecords) break;
         }
-        if(records.size()<maxRecords && (sizes.isEmpty() || next.position().index()>=sizes.lastKey()) && cut!=null) next=DistributedCdcCheckpoint.Cursor.after(cut);
+        // Only retained event boundaries can be qualified again after the completed cut advances.
         return new ReplicatedRangeStore.CdcPage(lineage,cut,floor,next,verified,records);
     }
     DistributedCdcCheckpoint.Lineage lineage() { return lineage; }

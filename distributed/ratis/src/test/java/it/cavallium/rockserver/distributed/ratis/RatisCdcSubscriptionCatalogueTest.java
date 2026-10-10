@@ -2,7 +2,14 @@ package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
+import java.io.IOException;
+import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.client.api.BlockingApi;
+import org.apache.ratis.protocol.*;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import java.nio.file.Path;
 import java.util.*;
 import org.junit.jupiter.api.Test;
@@ -81,4 +88,30 @@ class RatisCdcSubscriptionCatalogueTest {
             assertFalse(RatisCdcSubscriptionCatalogue.isCommand(ordinary));
         }
     }
+    @Test void oversizedRepliesAreRejectedBeforeDecodingAtEachOperationBudget() throws Exception {
+        var owner=fixtureOwner(); try(var f=owner.new Fixture()) {
+            var length=new AtomicInteger();
+            var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args) ->
+                    new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("oversize-fixture"))
+                            .setGroupId(RaftGroupId.valueOf(f.outer.catalogue)).setCallId(1).setSuccess(true)
+                            .setMessage(Message.valueOf(ByteString.copyFrom(new byte[length.get()]))).build());
+            var client=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args) -> switch(method.getName()) {
+                case "getGroupId" -> RaftGroupId.valueOf(f.outer.catalogue); case "io" -> io; default -> throw new AssertionError(method);
+            });
+            var catalogue=new RatisCdcSubscriptionCatalogue(client,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
+            var source=directory(f); var definition=definition(source,1); var create=catalogue.prepareCreate(f.operation(1),definition,source,null);
+            length.set(ScopedTransactionRpc.HEADER_BYTES+4+12+1);
+            assertEquals("CDC catalogue reply exceeds operation budget",assertThrows(IOException.class,catalogue::readCapacity).getMessage());
+            length.set(ScopedTransactionRpc.HEADER_BYTES+4+DistributedCdcSubscription.MAX_BYTES+1);
+            assertEquals("CDC catalogue reply exceeds operation budget",assertThrows(IOException.class,()->catalogue.read(definition.subscriptionId())).getMessage());
+            length.set(9);
+            assertEquals("CDC catalogue reply exceeds operation budget",assertThrows(IOException.class,()->catalogue.execute(create)).getMessage());
+            var state=DistributedCdcSubscription.initial(definition); var lineage=state.delivered().cursors().keySet().iterator().next();
+            var delivery=catalogue.prepareDelivery(f.operation(2),state,state.delivered().advance(lineage,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,1))));
+            length.set(RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.PREPARE,delivery).length+1);
+            assertEquals("CDC catalogue reply exceeds operation budget",assertThrows(IOException.class,()->catalogue.prepareDeliveryOwner(delivery)).getMessage());
+            assertEquals("CDC catalogue reply exceeds operation budget",assertThrows(IOException.class,()->catalogue.cancelDelivery(delivery)).getMessage());
+        }
+    }
+
 }
