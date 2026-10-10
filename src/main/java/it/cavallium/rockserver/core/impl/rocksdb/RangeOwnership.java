@@ -59,6 +59,7 @@ public final class RangeOwnership {
 
     private final Map<UUID, Ownership> owners = new HashMap<>();
     private final Map<UUID, Lease> leases = new HashMap<>();
+    private final Map<UUID,TopologyTransfer> topologyTargets=new HashMap<>();
     private record SchemaChangeKey(UUID domain,UUID change) {}
     private final Map<SchemaChangeKey, SchemaTransition> schemaTransitions = new HashMap<>();
 
@@ -321,6 +322,53 @@ public final class RangeOwnership {
         }
     }
 
+    /** Reserve exact source geometry and fresh target identities without publishing retirement or birth. */
+    public synchronized TopologyTransfer prepareTopologyTransfer(Map<Owner,Interval> sources,Map<Owner,Interval> targets) {
+        sources=Map.copyOf(sources); targets=Map.copyOf(targets);
+        if(sources.isEmpty() || sources.size()>2 || targets.isEmpty() || targets.size()>2 || sources.size()+targets.size()!=3) throw new IllegalArgumentException("Topology transfer requires one split/merge union");
+        var sourceIds=new java.util.HashSet<UUID>();
+        for(var entry:sources.entrySet()) {
+            var actual=get(entry.getKey()); if(!actual.interval().equals(entry.getValue()) || actual.state()!=State.ACTIVE && actual.state()!=State.FENCED) throw new IllegalArgumentException("Topology source ownership changed");
+            requireUnleased(entry.getValue()); sourceIds.add(entry.getKey().groupId());
+        }
+        var sourceUnion=topologyUnion(sources.values()); var targetUnion=topologyUnion(targets.values());
+        if(!sourceUnion.equals(targetUnion)) throw new IllegalArgumentException("Topology transfer changes source physical union");
+        var targetIds=new java.util.HashSet<UUID>();
+        for(var entry:targets.entrySet()) { requireNew(entry.getKey()); if(!targetIds.add(entry.getKey().groupId())) throw new IllegalArgumentException("Duplicate topology target group"); requireCompatibleDomain(entry.getValue()); requireUnowned(entry.getValue(),sourceIds); }
+        var transfer=new TopologyTransfer(sources,targets);
+        for(var entry:sources.entrySet()) { var lease=new Lease(get(entry.getKey()),false); leases.put(entry.getKey().groupId(),lease); transfer.reservations.add(lease); }
+        targetIds.forEach(id -> topologyTargets.put(id,transfer)); return transfer;
+    }
+    private static Interval topologyUnion(java.util.Collection<Interval> intervals) {
+        var ordered=intervals.stream().sorted((a,b) -> a.lowerInclusive==null ? b.lowerInclusive==null ? 0 : -1 : b.lowerInclusive==null ? 1 : Arrays.compareUnsigned(a.lowerInclusive,b.lowerInclusive)).toList();
+        var first=ordered.getFirst(); var last=ordered.getLast();
+        for(int i=1;i<ordered.size();i++) { var prior=ordered.get(i-1); var next=ordered.get(i); if(!first.domainId.equals(next.domainId) || !first.columns.equals(next.columns) || prior.upperExclusive==null || !Arrays.equals(prior.upperExclusive,next.lowerInclusive)) throw new IllegalArgumentException("Topology intervals are not adjacent compatible geometry"); }
+        return new Interval(first.domainId,first.columns,first.lowerInclusive,last.upperExclusive);
+    }
+    public final class TopologyTransfer implements AutoCloseable {
+        private final Map<Owner,Interval> sources,targets;
+        private final java.util.ArrayList<Lease> reservations=new java.util.ArrayList<>();
+        private boolean published,closed;
+        private TopologyTransfer(Map<Owner,Interval> sources,Map<Owner,Interval> targets) { this.sources=sources; this.targets=targets; }
+        /** Invoke only after the one native seed/retirement batch has been forced. */
+        public void publish() {
+            synchronized(RangeOwnership.this) {
+                if(published) return; if(closed) throw new IllegalStateException("Topology transfer released");
+                for(var entry:sources.entrySet()) { var current=get(entry.getKey()); if(!current.interval.equals(entry.getValue()) || current.state!=State.ACTIVE && current.state!=State.FENCED || leases.get(entry.getKey().groupId())==null) throw new IllegalStateException("Topology source reservation changed"); }
+                sources.forEach((owner,interval) -> owners.put(owner.groupId(),new Ownership(owner,interval,State.RETIRED)));
+                targets.forEach((owner,interval) -> owners.put(owner.groupId(),new Ownership(owner,interval,State.FENCED)));
+                published=true; release();
+            }
+        }
+        private void release() { for(var lease:reservations) lease.close(); targets.keySet().forEach(owner -> topologyTargets.remove(owner.groupId(),this)); closed=true; }
+        @Override public void close() { synchronized(RangeOwnership.this) { if(!closed) release(); } }
+    }
+    /** Restore authoritative terminal sources and pending children before any ordinary registration. */
+    public synchronized void recoverTopology(Map<Owner,Interval> retired,Map<Owner,Interval> children) {
+        for(var entry:retired.entrySet()) register(entry.getKey(),entry.getValue(),State.RETIRED);
+        for(var entry:children.entrySet()) register(entry.getKey(),entry.getValue(),State.FENCED);
+    }
+
     /** Atomically transfers two adjacent compatible fenced intervals to one new fenced group. */
     public synchronized Ownership merge(Owner left, Owner right, Owner merged) {
         Ownership lower = get(left);
@@ -410,7 +458,7 @@ public final class RangeOwnership {
 
     private void requireNew(Owner owner) {
         Objects.requireNonNull(owner, "owner");
-        if (owners.containsKey(owner.groupId())) throw new IllegalStateException("Group identity already registered");
+        if (owners.containsKey(owner.groupId()) || topologyTargets.containsKey(owner.groupId())) throw new IllegalStateException("Group identity already registered/reserved");
     }
 
     private void requireCompatibleDomain(Interval interval) {

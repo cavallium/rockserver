@@ -5,6 +5,8 @@ import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologyBirth;
+import it.cavallium.rockserver.core.common.distributed.NativeTopologySeed;
 import it.cavallium.rockserver.core.common.distributed.TopologyChange;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallProof;
@@ -217,6 +219,8 @@ public final class ReplicatedRangeStore {
     private volatile DistributedSchema logicalSchema;
     private volatile NativeSchemaFence activeSchemaFence;
     private volatile NativeTopologyFreeze activeTopologyFreeze;
+    private volatile NativeTopologyBirth topologyBirth;
+    private volatile byte[] topologyRetirement;
     private volatile TopologyPreparation topologyPreparation;
     private volatile NativeSchemaInstallation activeSchemaInstallation;
     private volatile NativeSchemaActivationProof activeSchemaActivation;
@@ -518,6 +522,7 @@ public final class ReplicatedRangeStore {
         usageBucketsPrefix = ByteBuffer.allocate(17).put(markerKey).put((byte) 0x11).array();
         byte[] recovered = this.db.get(state, markerKey);
         applied = recovered == null ? null : decodePosition(recovered);
+        recoverTopologyOwnership();
         pendingInstallation = this.db.get(state, installingKey);
         if (pendingInstallation != null) {
             if (pendingInstallation.length != 52 || ByteBuffer.wrap(pendingInstallation).getInt() != STATE_VERSION) {
@@ -537,6 +542,7 @@ public final class ReplicatedRangeStore {
     void configureSnapshotAdmission(PoolSnapshotAdmission guard) { this.snapshotAdmission = guard; }
 
     /** Null means no log entry has yet completed. This is not a durable snapshot watermark. */
+    static byte[] topologyVirginUsage() { return ByteBuffer.allocate(36).putInt(STATE_VERSION).putLong(0).putLong(0).putLong(0).putLong(-1).array(); }
     public ApplyPosition applied() { return applied; }
     /** Process-only failure; native release outcome is unknown and requires pool replacement. */
     public Throwable snapshotReleaseFailure() { return snapshotReleaseFailure; }
@@ -593,7 +599,7 @@ public final class ReplicatedRangeStore {
         try {
             var current = ownership.get(owner);
             if (current.state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
-            else if (current.state() != RangeOwnership.State.FENCED) throw new IllegalStateException("Range cannot be fenced");
+            else if (current.state() != RangeOwnership.State.FENCED && current.state()!=RangeOwnership.State.RETIRED) throw new IllegalStateException("Range cannot be fenced");
             invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
         } finally { applyLane.unlock(); drainScopedReleases(); }
     }
@@ -608,6 +614,7 @@ public final class ReplicatedRangeStore {
     private void activateUnderAdmission() {
         applyLane.lock();
         try {
+            if(topologyRetired() || topologyBirthPending()) throw new IllegalStateException("Topology owner requires qualified future activation");
             if (pendingInstallation != null || importPending()) throw new IllegalStateException("Installation remains incomplete or unpublished");
             try { recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
             homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied); validateSnapshotHomeUsersUnchecked();
@@ -616,10 +623,30 @@ public final class ReplicatedRangeStore {
     }
 
     private void requireActive() {
-        if (pendingInstallation != null || importPending() || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
+        if (pendingInstallation != null || importPending() || topologyBirthPending() || topologyRetired() || ownership.get(owner).state() != RangeOwnership.State.ACTIVE) {
             throw new IllegalStateException("Range is fenced");
         }
     }
+
+    private byte[] topologyOwnershipKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
+    private void recoverTopologyOwnership() throws RocksDBException {
+        byte[] birth=db.get(state,topologyOwnershipKey(0x61)),retirement=db.get(state,topologyOwnershipKey(0x62));
+        if(birth!=null) { topologyBirth=NativeTopologyBirth.decode(birth); if(!topologyBirth.groupId().equals(groupId)) throw new IllegalArgumentException("Topology birth group differs from store"); }
+        if(retirement!=null && retirement.length!=32) throw new IllegalArgumentException("Invalid topology retirement pointer"); topologyRetirement=retirement;
+    }
+    public NativeTopologyBirth topologyBirth() { return topologyBirth; }
+    public boolean topologyBirthPending() { return topologyBirth!=null && topologyRetirement==null; }
+    public boolean topologyRetired() { return topologyRetirement!=null; }
+    void publishTopologyRetirement(NativeTopologySeed seed) { topologyRetirement=seed.digest(); }
+    /** Metadata-only parent/birth status at its own completed prefix; no USER snapshot is acquired. */
+    public RangeStateView retiredOutcomeState() throws RocksDBException {
+        return readSchemaMetadata(() -> {
+            if(!topologyRetired() && !topologyBirthPending()) throw new IllegalStateException("Range is not an inactive topology owner");
+            byte[] marker=db.get(state,markerKey); if(!Objects.equals(marker==null ? null : decodePosition(marker),applied)) throw new IllegalStateException("Inactive topology marker differs from completed prefix");
+            return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,columns.keySet(),interval.lowerInclusive(),interval.upperExclusive(),applied,minimumSessionEpoch(null),sessionAuthority(null));
+        });
+    }
+    public long retiredAcknowledgedThrough(OperationId operation) throws RocksDBException { return readSchemaMetadata(() -> { if(!topologyRetired()) throw new IllegalStateException("Parent is not retired"); return acknowledgedThrough(operation,null); }); }
 
     private byte[] topologyFreezeKey() { return ByteBuffer.allocate(17).put(markerKey).put((byte)0x60).array(); }
     private void requireTopologyWritable() { if(activeTopologyFreeze!=null || topologyPreparation!=null) throw new IllegalStateException("Topology freeze blocks new writable admission"); }
@@ -1040,7 +1067,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(schema); enterNative(); applyLane.lock();
         try {
             var current=ownership.get(owner).state();
-            if (current!=RangeOwnership.State.ACTIVE && current!=RangeOwnership.State.FENCED) throw new IllegalStateException("Range cannot install decoding schema");
+            if (current!=RangeOwnership.State.ACTIVE && current!=RangeOwnership.State.FENCED && !(current==RangeOwnership.State.RETIRED && topologyRetired())) throw new IllegalStateException("Range cannot install decoding schema");
             int prefix=schema.routingPrefixBytes();
             if (!Arrays.equals(schemaDigest,schema.digest()) || !interval.domainId().equals(schema.domainId()) || !interval.columns().equals(schema.columnIds())
                     || logicalSchema!=null && !Arrays.equals(logicalSchema.digest(),schema.digest())
@@ -1295,6 +1322,12 @@ public final class ReplicatedRangeStore {
     private HomeRecoveryCapacity homeRecoveryCapacityUnderLane() { return new HomeRecoveryCapacity(applied,homeRecoveries.size(),retainedHomeRecoveryBytes,reservedHomeRecoveryCount,reservedHomeRecoveryBytes); }
     public HomeRecoveryCapacity homeRecoveryCapacity() {
         enterNative(); applyLane.lock(); try { requireActive(); return homeRecoveryCapacityUnderLane(); } finally { applyLane.unlock(); leaveNative(); }
+    }
+    /** Metadata-only role validation after recovery; it grants no writable ownership. */
+    public HomeRecoveryCapacity recoveredHomeRecoveryCapacity() {
+        enterNative(); applyLane.lock();
+        try { if(pendingInstallation!=null)throw new IllegalStateException("Range metadata is being installed"); return homeRecoveryCapacityUnderLane(); }
+        finally { applyLane.unlock(); leaveNative(); }
     }
     public HomeRecoveryEstimate estimateHomeRecovery(HomeRecovery recovery) throws RocksDBException {
         Objects.requireNonNull(recovery); enterNative(); applyLane.lock();
@@ -3026,7 +3059,7 @@ public final class ReplicatedRangeStore {
         try {
             if(importIntent!=null && position.index()>=importIntent.position().index())throw new IllegalStateException("Pending native import owns its original committed apply position");
             var current = ownership.get(owner).state();
-            if (pendingInstallation != null || (current != RangeOwnership.State.ACTIVE && current != RangeOwnership.State.FENCED)) {
+            if (pendingInstallation != null || (current != RangeOwnership.State.ACTIVE && current != RangeOwnership.State.FENCED && !(current==RangeOwnership.State.RETIRED && topologyRetired()))) {
                 throw new IllegalStateException("Range cannot complete Raft accounting");
             }
             ensureReceiptUsage();
@@ -3082,6 +3115,7 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if(topologyRetired() || topologyBirthPending()) throw new IllegalStateException("Inactive topology owner cannot replace USER rows");
             if(topologyPreparation!=null) throw new IllegalStateException("Topology preparation owns native replacement admission");
             if(activeTopologyFreeze!=null) {
                 var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visit(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); });
@@ -3269,7 +3303,7 @@ public final class ReplicatedRangeStore {
     }
 
     /** Memory-only admission state; no native reads or snapshot acquisition. */
-    public boolean admissionOpen() { return !closing && pendingInstallation==null && !importPending() && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
+    public boolean admissionOpen() { return !closing && pendingInstallation==null && !importPending() && !topologyBirthPending() && !topologyRetired() && ownership.get(owner).state()==RangeOwnership.State.ACTIVE; }
     /** Memory-only scope validation before entering the short proposal coordination lane. */
     public void validateScope(TransactionScope scope) {
         Objects.requireNonNull(scope); requireSchemaAdmission(); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);

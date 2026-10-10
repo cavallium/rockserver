@@ -300,6 +300,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         rangeImportApply=adapter;rangeImportPublication=reader;
     }
     private void activateRecoveredOwner()throws IOException{
+        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending()){validateRoleNativeState();return;}
         if(store.importPending()){if(rangeImportApply==null)throw new IOException("Unpublished native import lacks configured adapter");rangeImportApply.requireGroup(store.ownership().owner().groupId());store.fence();return;}
         else store.activate();
         validateRoleNativeState();
@@ -993,7 +994,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void validateRoleNativeState() throws IOException {
         if(role!=RatisNodePlan.Role.DATA && store.topologyFreeze()!=null)throw new IOException("Non-DATA range contains topology FREEZE state");
         if (role!=RatisNodePlan.Role.DATA && (store.schemaFence()!=null || store.schemaInstallation()!=null)) throw new IOException("Non-DATA range contains schema transition state");
-        if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.homeRecoveryCapacity().effectiveCount()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
+        if (role!=RatisNodePlan.Role.TRANSACTION_HOME && store.recoveredHomeRecoveryCapacity().effectiveCount()!=0) throw new IOException("Range role contains protected transaction-HOME receipts");
         if (role!=RatisNodePlan.Role.DATA && (store.preparedCapacity().count()!=0 || store.gateCapacity().count()!=0)) throw new IOException("Non-DATA range contains participant/snapshot state");
     }
     void proofQueries(ProofQueryExecutor executor) {
@@ -1384,9 +1385,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             snapshots.init(storage);
             recover(false);
             activateRecoveredOwner();
-            if (role==RatisNodePlan.Role.DATA && !store.importPending()) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+            if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
             else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
-            if (enableSessionControls && !store.importPending()) store.enableSessionControls();
+            if (enableSessionControls && !store.importPending() && !store.topologyBirthPending() && !store.topologyRetired()) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
         } catch (Exception failure) { throw failRecovery(failure); }
     }
@@ -1493,6 +1494,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public long takeSnapshot() throws IOException {
+        // A retired parent's shared USER rows may already belong to its children.
+        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending())return -1;
         try (var pin = snapshotPin()) {
             if (pin.position() == null) return -1;
             var position = TermIndex.valueOf(pin.position().term(), pin.position().index());
@@ -1744,9 +1747,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear(); schemaConfigurationPending=!configurations.isEmpty();
                 activateRecoveredOwner();
-                if (role==RatisNodePlan.Role.DATA && !store.importPending()) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
                 else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
-                if (enableSessionControls && !store.importPending()) store.enableSessionControls();
+                if (enableSessionControls && !store.importPending() && !store.topologyBirthPending() && !store.topologyRetired()) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
                     for (var terminal:verifiedAdmissions.terminalScopes()) if (admissions.get(terminal.id)==terminal) retirePreparationScope(terminal);
@@ -4007,7 +4010,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var column=ScopedTransactionRpc.uuid(input); var key=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES-16,false); end(input);
                 reply=valueBlob(readablePoint(column,key));
             }
-            case ScopedTransactionRpc.STATE -> { end(input); try (var pin=snapshotPin()) { reply=pin.stateView().encode(); } }
+            case ScopedTransactionRpc.STATE -> {
+                end(input);
+                if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending())reply=store.retiredOutcomeState().encode();
+                else try(var pin=snapshotPin()){reply=pin.stateView().encode();}
+            }
             case ScopedTransactionRpc.OPEN -> {
                 if (!freshBarrier) throw new IOException("Transaction open requires a fresh linearizable read barrier");
                 var id=ScopedTransactionRpc.uuid(input); long ttl=input.getLong();

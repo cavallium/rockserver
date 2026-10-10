@@ -915,8 +915,23 @@ artifact and an uncovered suffix recreates preparation. Controlled adapter valid
 passes 68 tests in seven classes (`/tmp/rockserver-topology-ratis-freeze-final-gate.log`),
 with 12 unchanged native/schema tests reused from the first compile gate. The received
 snapshot regression failed before repair (`/tmp/rockserver-topology-freeze-snapshot-before-fix.log`).
-Metadata-only child birth, dynamic group startup, qualified publication/activation
-and lineage handoff remain required. No real server sockets or quorum were exercised.
+Local split/merge seeding now forces WAL and one bounded metadata batch before
+publishing RETIRED sources and FENCED children. USER rows remain in their existing
+CFs; no parent applied marker, configuration, receipts, floors or CDC rows are copied.
+Cold recovery restores topology ownership before ordinary range registration.
+Birth pointers retain the original seed artifact; children have absent Raft progress
+until their own bootstrap. Retired metadata/outcome lookup and already-open readonly
+pins survive the handoff. Controlled `withSessions` adapter startup verifies that a
+child's `(1,0)` Raft cut is separate from its `(0,0)` birth proof and the parent cut.
+Combined validation passes 71 tests across seven classes; passing unchanged model/
+ownership cases from `/tmp/rockserver-topology-local-seed-fixture-gate.log` are reused
+with `/tmp/rockserver-topology-local-seed-startup-gate.log` and the extended adapter
+case `/tmp/rockserver-topology-local-seed-session-startup-gate.log`.
+Qualified activation, dynamic group registration, publication and lineage handoff
+remain required. Retired reopen after later USER-CF deletion and activated-child/
+remote snapshot provenance remain unfinished. Pending children and retired sources
+cannot export/install USER images; their adapter snapshots are disabled until the
+appropriate recovery/retirement workflow exists. No server sockets or quorum were exercised.
 Relocation currently admits preparation/abort while its source stays writable.
 
 - Complete public RocksDB API and transport frontend transaction/range/cursor parity,
