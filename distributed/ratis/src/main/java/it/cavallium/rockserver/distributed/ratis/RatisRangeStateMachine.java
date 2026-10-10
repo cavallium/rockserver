@@ -127,6 +127,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final Consumer<DistributedCommand> commandValidator;
     @FunctionalInterface public interface ImportPublicationAdmission { void validate(DistributedCommand command) throws IOException; }
     private ImportPublicationAdmission importPublicationAdmission;
+    private ImportPublicationAdmission cdcDeliveryAdmission;
+    void cdcDeliveryAdmission(ImportPublicationAdmission admission) {
+        if(role!=RatisNodePlan.Role.CATALOGUE || getLifeCycleState()!=LifeCycle.State.NEW || cdcDeliveryAdmission!=null) throw new IllegalStateException("CDC delivery admission is fixed before initialization");
+        cdcDeliveryAdmission=java.util.Objects.requireNonNull(admission);
+    }
+    private boolean requiresCataloguePreparation(DistributedCommand command) {
+        return role==RatisNodePlan.Role.CATALOGUE && (RatisRangeImportCatalogue.requiresOwnerAdmission(command) || RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command));
+    }
     /** Trusted fresh owner checks for new publications only. Committed replay never invokes this callback. */
     public void importPublicationAdmission(ImportPublicationAdmission admission) {
         if(getLifeCycleState()!=LifeCycle.State.NEW || importPublicationAdmission!=null) throw new IllegalStateException("Import publication admission is fixed before initialization");
@@ -160,9 +168,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(hold.cut,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication lacks current prepared owner");
     }
     private void prepareImportPublication(DistributedCommand command)throws Exception{
-        if(role!=RatisNodePlan.Role.CATALOGUE || importPublicationAdmission==null || !RatisRangeImportCatalogue.requiresOwnerAdmission(command))throw new IOException("Fresh import publication admission is not configured");
+        var admission=RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command) ? cdcDeliveryAdmission : importPublicationAdmission;
+        if(role!=RatisNodePlan.Role.CATALOGUE || !requiresCataloguePreparation(command))throw new IOException("Expected catalogue delivery/publication preparation");
         checkCatalogueOwner();var owner=leadership();long generation=admissionGeneration.get();
         if(!store.estimateReceiptRetention(command).newReceipt())return;
+        if(admission==null) throw new IOException("Fresh catalogue delivery/publication admission is not configured");
         final ImportPublicationHold hold;
         synchronized(admissions){
             reconcileOlderProposalTerms(owner.term());
@@ -190,7 +200,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var points=new ArrayList<ReplicatedRangeStore.PhysicalPoint>();for(var predicate:command.predicates())points.add(new ReplicatedRangeStore.PhysicalPoint(predicate.columnId(),predicate.key()));
             ApplyPosition cut=null;int checked=0;
             for(int offset=0;offset<points.size();offset+=4){var witnesses=store.readCurrentPoints(points.subList(offset,Math.min(offset+4,points.size())));if(cut!=null && !cut.equals(witnesses.position()))throw new IOException("Import publication witness cut advanced");cut=witnesses.position();var values=witnesses.values();for(var value:values)if(!Arrays.equals(value,command.predicates().get(checked++).expectedValue()))throw new IOException("Import publication current native witness changed");}
-            hold.cut=cut;importPublicationAdmission.validate(command);
+            hold.cut=cut;admission.validate(command);
             var current=leadership();
             synchronized(admissions){hold.reading=false;requireImportPublicationForQualification(hold,current);hold.qualified=true;qualified=true;}
         }finally{synchronized(admissions){hold.reading=false;if(!qualified || hold.invalidated || hold.released)releaseImportPublication(hold);}}
@@ -1705,7 +1715,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var command = DistributedCommandCodec.decode(encoded);
             if (command.transactionRejection()) throw new IllegalArgumentException("Internal rejection records cannot be submitted by clients");
             // Fresh publication metadata/owner reads belong to the independently bounded preparation lane.
-            if(!RatisRangeImportCatalogue.requiresOwnerAdmission(command))commandValidator.accept(command);
+            if(!requiresCataloguePreparation(command))commandValidator.accept(command);
             store.validate(command);
             byte[] digest = command.payloadDigest();
             boolean fencing=role==RatisNodePlan.Role.CATALOGUE && RatisSchemaAdministration.isFencing(command);
@@ -1743,8 +1753,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     var known=admissions.get(command.operationId());
                     if (known!=null && !estimate.newReceipt()) settleAdmission(known);
                     var admission = admissions.get(command.operationId());
-                    var importOwner=estimate.newReceipt() && RatisRangeImportCatalogue.requiresOwnerAdmission(command) ? importPublicationHolds.get(command.operationId()) : null;
-                    if(estimate.newReceipt() && RatisRangeImportCatalogue.requiresOwnerAdmission(command))requireImportPublication(importOwner,command,leadership,generation);
+                    var importOwner=estimate.newReceipt() && requiresCataloguePreparation(command) ? importPublicationHolds.get(command.operationId()) : null;
+                    if(estimate.newReceipt() && requiresCataloguePreparation(command))requireImportPublication(importOwner,command,leadership,generation);
                     var fencingOwner=fencing && estimate.newReceipt() ? schemaHold : null;
                     if (fencing && estimate.newReceipt()) requireFencingOwner(fencingOwner,command,leadership,generation);
                     if (admission != null) {
@@ -3584,6 +3594,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if(kind==ScopedTransactionRpc.IMPORT_PUBLICATION_CANCEL){var command=RatisImportPublicationRpc.request(encoded);cancelImportPublication(command);return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(RatisImportPublicationRpc.preparedReply(kind,command))));}
                 var executor=importPublicationQueries;if(executor==null)throw new IOException("Bounded import publication dispatcher is not configured");long generation=admissionGeneration.get();
                 return executor.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.IMPORT_PUBLICATION_BYTES,false,owned->{if(generation!=admissionGeneration.get())throw new IOException("Import publication lost read-barrier owner");var command=RatisImportPublicationRpc.request(owned);prepareImportPublication(command);return Message.valueOf(ByteString.copyFrom(RatisImportPublicationRpc.preparedReply(kind,command)));});
+            }
+            if(RatisCdcDeliveryRpc.kind(kind)) {
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE) throw new IOException("CDC delivery requires a fresh catalogue barrier");
+                var command=RatisCdcDeliveryRpc.decode(encoded);
+                if(kind==RatisCdcDeliveryRpc.CANCEL) { cancelImportPublication(command); return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(encoded))); }
+                var executor=importPublicationQueries; if(executor==null) throw new IOException("Bounded catalogue preparation dispatcher is not configured");
+                long generation=admissionGeneration.get();
+                return executor.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.IMPORT_PUBLICATION_BYTES,false,owned->{
+                    if(generation!=admissionGeneration.get()) throw new IOException("CDC delivery lost read-barrier owner");
+                    prepareImportPublication(RatisCdcDeliveryRpc.decode(owned)); return Message.valueOf(ByteString.copyFrom(owned));
+                });
             }
             if (kind==ScopedTransactionRpc.SNAPSHOT_HELP) return snapshotHelpQuery(encoded,freshBarrier);
             if (kind==ScopedTransactionRpc.SCHEMA_FENCING_PREPARE || kind==ScopedTransactionRpc.SCHEMA_FENCE_PREPARE || kind==ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE || kind==ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE || kind==ScopedTransactionRpc.HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE || kind==ScopedTransactionRpc.FINALIZATION_PREPARE || kind==ScopedTransactionRpc.HOME_RECOVERY_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE) {

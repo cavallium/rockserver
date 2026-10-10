@@ -58,7 +58,7 @@ class RatisCdcSubscriptionCatalogueTest {
             assertEquals(CommandResult.Status.CONFLICT,catalogue.execute(b).status());
             var retry=catalogue.prepareCreate(f.operation(3),second,directory,catalogue.readCapacity()); assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(retry).status());
             var state=catalogue.read(first.subscriptionId()); var lineage=state.checkpoint().cursors().keySet().iterator().next();
-            var next=state.checkpoint().advance(lineage,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,10))); var ack=state.acknowledge(next,next);
+            var next=state.checkpoint().advance(lineage,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,10))); var ack=state.deliver(next).acknowledge(next);
             byte[] key=RatisCdcSubscriptionCatalogue.stateKey(first.subscriptionId());
             var forged=new DistributedCommand(f.outer.catalogue,1,new byte[32],f.operation(4),List.of(new Mutation(Mutation.Kind.PUT,f.outer.directoryColumn,key,ack.encode())),List.of(new KeyPredicate(f.outer.directoryColumn,key,state.encode())));
             assertThrows(IllegalArgumentException.class,()->catalogue.execute(forged)); assertEquals(state,catalogue.read(first.subscriptionId())); assertEquals(2,catalogue.readCapacity().count());

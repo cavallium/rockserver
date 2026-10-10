@@ -10,7 +10,7 @@ import org.apache.ratis.protocol.Message;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Protected catalogue rows. Creation reserves fixed state capacity; closure retains its identity.
- * Delivery-qualified ACK admission is intentionally separate from these pure lifecycle commands. */
+ * New delivery bounds require fresh configured admission; ACKs consume only persisted bounds. */
 public final class RatisCdcSubscriptionCatalogue {
     public static final int MAX_SUBSCRIPTIONS=1024;
     public static final long MAX_STATE_BYTES=64L*1024*1024;
@@ -57,13 +57,38 @@ public final class RatisCdcSubscriptionCatalogue {
         byte[] key=stateKey(expected.definition().subscriptionId()); var command=new DistributedCommand(group,epoch,schema,operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,expected.close().encode())),List.of(new KeyPredicate(column,key,expected.encode())));
         validator.accept(command); return command;
     }
+    public DistributedCommand prepareDelivery(OperationId operation,DistributedCdcSubscription expected,DistributedCdcCheckpoint delivered) {
+        return transition(operation,expected,expected.deliver(delivered));
+    }
+    public DistributedCommand prepareAcknowledgement(OperationId operation,DistributedCdcSubscription expected,DistributedCdcCheckpoint acknowledged) {
+        return transition(operation,expected,expected.acknowledge(acknowledged));
+    }
+    private DistributedCommand transition(OperationId operation,DistributedCdcSubscription expected,DistributedCdcSubscription next) {
+        byte[] key=stateKey(expected.definition().subscriptionId()); var command=new DistributedCommand(group,epoch,schema,operation,
+                List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,expected.encode())));
+        validator.accept(command); return command;
+    }
     public CommandResult execute(DistributedCommand command) throws IOException {
         validator.accept(command);
         try { return CommandResult.decode(content(client.io().send(message(DistributedCommandCodec.encode(command))))); }
         catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC command reply",invalid); }
     }
+    public void prepareDeliveryOwner(DistributedCommand command) throws IOException {
+        validator.accept(command);
+        try { RatisCdcDeliveryRpc.requireEcho(content(client.io().sendReadOnly(message(RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.PREPARE,command)))),RatisCdcDeliveryRpc.PREPARE,command); }
+        catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC delivery preparation reply",invalid); }
+    }
+    public void cancelDelivery(DistributedCommand command) throws IOException {
+        try { RatisCdcDeliveryRpc.requireEcho(content(client.io().sendReadOnly(message(RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.CANCEL,command)))),RatisCdcDeliveryRpc.CANCEL,command); }
+        catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC delivery cancellation reply",invalid); }
+    }
     public static boolean isCommand(DistributedCommand command) {
         return command.mutations().stream().anyMatch(m->{ var key=m.key(); return key.length==17 && key[0]==STATE || key.length==1 && key[0]==CAPACITY; });
+    }
+    public static boolean requiresOwnerAdmission(DistributedCommand command) {
+        if(!isCommand(command) || command.mutations().size()!=1 || command.predicates().size()!=1 || command.predicates().getFirst().expectedValue()==null) return false;
+        var next=DistributedCdcSubscription.decode(command.mutations().getFirst().value()); var previous=DistributedCdcSubscription.decode(command.predicates().getFirst().expectedValue());
+        return next.phase()==DistributedCdcSubscription.Phase.ACTIVE && next.checkpoint().equals(previous.checkpoint()) && !next.delivered().equals(previous.delivered());
     }
     public static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column) {
         Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(group); Objects.requireNonNull(column); byte[] digest=schema.clone();
@@ -88,8 +113,8 @@ public final class RatisCdcSubscriptionCatalogue {
             } else if(command.mutations().size()==1 && command.predicates().size()==1) {
                 var previous=command.predicates().getFirst(); predicate(previous,column,mutation.key()); if(previous.expectedValue()==null) throw new IllegalArgumentException("CDC closure lacks predecessor");
                 var old=DistributedCdcSubscription.decode(previous.expectedValue());
-                if(next.phase()!=DistributedCdcSubscription.Phase.CLOSED || mutation.value().length!=previous.expectedValue().length) throw new IllegalArgumentException("CDC ACK requires qualified delivery admission");
-                next.requireSuccessorOf(old,null);
+                if(mutation.value().length!=previous.expectedValue().length) throw new IllegalArgumentException("CDC transition changed reserved capacity");
+                next.requireSuccessorOf(old);
             } else throw new IllegalArgumentException("Invalid CDC lifecycle command shape");
         };
     }

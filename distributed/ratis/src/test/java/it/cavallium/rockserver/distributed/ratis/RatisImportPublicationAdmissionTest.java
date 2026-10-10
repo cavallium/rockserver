@@ -35,6 +35,9 @@ class RatisImportPublicationAdmissionTest {
         final AtomicLong term=new AtomicLong(1);
         final RatisProofQueryService authority=RatisProofQueryService.authorityLane();
         Fixture(RatisRangeStateMachine.ImportPublicationAdmission admission) throws Exception {
+            this(admission,machine->{});
+        }
+        Fixture(RatisRangeStateMachine.ImportPublicationAdmission admission,java.util.function.Consumer<RatisRangeStateMachine> configure) throws Exception {
             test.root=root; catalogue=test.new Fixture();
             group=RaftGroup.valueOf(RaftGroupId.valueOf(catalogue.outer.catalogue),peer);
             storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT)
@@ -42,6 +45,7 @@ class RatisImportPublicationAdmissionTest {
             machine=new RatisRangeStateMachine(catalogue.nativeCatalogue.store,group,new NativeRangeImage.Limits(4*1024*1024,32*1024*1024,2),
                     catalogue.pure,command -> {},() -> new RatisRangeStateMachine.Leadership(term.get(),true));
             machine.role(RatisNodePlan.Role.CATALOGUE);machine.schemaCatalogue(catalogue.outer.cluster,catalogue.outer.database,catalogue.outer.directoryColumn);machine.schemaAuthorityQueries(authority);machine.importPublicationQueries(queries); if(admission!=null) machine.importPublicationAdmission(admission);
+            configure.accept(machine);
             var identity=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> {
                 if(method.getName().equals("getId")) return peer.getId(); if(method.getName().equals("toString")) return "import-admission-fixture"; throw new AssertionError(method);
             });

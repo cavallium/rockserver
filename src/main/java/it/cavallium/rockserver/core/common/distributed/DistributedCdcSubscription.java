@@ -8,8 +8,8 @@ import java.util.*;
 /** Immutable subscription and monotone consumer progress. Delivered bounds are validated here;
  * their provenance and durable CAS/receipt ownership belong to the subscription service. */
 public final class DistributedCdcSubscription {
-    public static final int MAX_COLUMNS=256,HEADER_BYTES=17;
-    public static final int MAX_BYTES=HEADER_BYTES+Definition.MAX_BYTES+DistributedCdcCheckpoint.MAX_BYTES;
+    public static final int MAX_COLUMNS=256,HEADER_BYTES=21;
+    public static final int MAX_BYTES=HEADER_BYTES+Definition.MAX_BYTES+2*DistributedCdcCheckpoint.MAX_BYTES;
     public enum Phase { ACTIVE, CLOSED }
 
     public record Definition(UUID clusterId,UUID databaseId,UUID domainId,UUID subscriptionId,UUID incarnationId,
@@ -67,61 +67,77 @@ public final class DistributedCdcSubscription {
     private final Definition definition;
     private final Phase phase;
     private final long generation;
-    private final DistributedCdcCheckpoint checkpoint;
-    private DistributedCdcSubscription(Definition definition,Phase phase,long generation,DistributedCdcCheckpoint checkpoint) {
-        this.definition=Objects.requireNonNull(definition); this.phase=Objects.requireNonNull(phase); this.generation=generation; this.checkpoint=Objects.requireNonNull(checkpoint);
-        if(generation<0 || !checkpoint.cursors().keySet().equals(definition.start().cursors().keySet())) throw new IllegalArgumentException("CDC subscription generation/lineages changed");
-        for(var entry:checkpoint.cursors().entrySet()) if(!entry.getValue().covers(definition.start().cursors().get(entry.getKey()))) throw new IllegalArgumentException("CDC progress precedes initial checkpoint");
-        boolean initial=checkpoint.equals(definition.start());
-        if(initial ? generation!=(phase==Phase.ACTIVE ? 0 : 1) : generation<(phase==Phase.ACTIVE ? 1 : 2)) throw new IllegalArgumentException("CDC generation differs from progress/closure");
+    private final DistributedCdcCheckpoint checkpoint,delivered;
+    private DistributedCdcSubscription(Definition definition,Phase phase,long generation,DistributedCdcCheckpoint checkpoint,DistributedCdcCheckpoint delivered) {
+        this.definition=Objects.requireNonNull(definition); this.phase=Objects.requireNonNull(phase); this.generation=generation;
+        this.checkpoint=Objects.requireNonNull(checkpoint); this.delivered=Objects.requireNonNull(delivered);
+        if(generation<0 || !checkpoint.cursors().keySet().equals(definition.start().cursors().keySet()) || !delivered.cursors().keySet().equals(checkpoint.cursors().keySet())) throw new IllegalArgumentException("CDC subscription generation/lineages changed");
+        for(var entry:checkpoint.cursors().entrySet()) {
+            if(!entry.getValue().covers(definition.start().cursors().get(entry.getKey()))) throw new IllegalArgumentException("CDC ACK precedes initial checkpoint");
+            if(!delivered.cursors().get(entry.getKey()).covers(entry.getValue())) throw new IllegalArgumentException("CDC ACK exceeds persisted delivery");
+        }
+        boolean initial=delivered.equals(definition.start());
+        long minimum=(checkpoint.equals(definition.start()) ? 1 : 2)+(phase==Phase.CLOSED ? 1 : 0);
+        if(initial ? generation!=(phase==Phase.ACTIVE ? 0 : 1) : generation<minimum) throw new IllegalArgumentException("CDC generation differs from delivery/ACK/closure");
     }
-    public static DistributedCdcSubscription initial(Definition definition) { return new DistributedCdcSubscription(definition,Phase.ACTIVE,0,definition.start()); }
+    public static DistributedCdcSubscription initial(Definition definition) { return new DistributedCdcSubscription(definition,Phase.ACTIVE,0,definition.start(),definition.start()); }
     public Definition definition() { return definition; }
     public Phase phase() { return phase; }
     public long generation() { return generation; }
     public DistributedCdcCheckpoint checkpoint() { return checkpoint; }
+    public DistributedCdcCheckpoint delivered() { return delivered; }
 
-    /** Only changed lineages need supplied delivered bounds. Duplicate ACKs make no new progress claim. */
-    public DistributedCdcSubscription acknowledge(DistributedCdcCheckpoint next,DistributedCdcCheckpoint delivered) {
-        requireActive(); Objects.requireNonNull(next); Objects.requireNonNull(delivered);
-        if(!next.cursors().keySet().equals(checkpoint.cursors().keySet()) || !checkpoint.cursors().keySet().containsAll(delivered.cursors().keySet())) throw new IllegalArgumentException("CDC ACK changed lineage coverage");
+    /** Persist complete lineage coverage before a consumer can acknowledge new progress. */
+    public DistributedCdcSubscription deliver(DistributedCdcCheckpoint next) {
+        requireActive(); Objects.requireNonNull(next);
+        if(!next.cursors().keySet().equals(delivered.cursors().keySet())) throw new IllegalArgumentException("CDC delivery changed lineage coverage");
+        if(next.equals(delivered)) return this;
+        for(var entry:next.cursors().entrySet()) if(!entry.getValue().covers(delivered.cursors().get(entry.getKey()))) throw new IllegalArgumentException("CDC delivery regressed");
+        return new DistributedCdcSubscription(definition,phase,Math.incrementExact(generation),checkpoint,next);
+    }
+    public DistributedCdcSubscription acknowledge(DistributedCdcCheckpoint next) {
+        requireActive(); Objects.requireNonNull(next);
+        if(!next.cursors().keySet().equals(checkpoint.cursors().keySet())) throw new IllegalArgumentException("CDC ACK changed lineage coverage");
         if(next.equals(checkpoint)) return this;
         for(var entry:next.cursors().entrySet()) {
-            var previous=checkpoint.cursors().get(entry.getKey()); var cursor=entry.getValue();
-            if(!cursor.covers(previous)) throw new IllegalArgumentException("CDC ACK regressed");
-            if(!cursor.equals(previous)) {
-                var bound=delivered.cursors().get(entry.getKey());
-                if(bound==null || !bound.covers(cursor)) throw new IllegalArgumentException("CDC ACK exceeds delivered progress");
-            }
+            if(!entry.getValue().covers(checkpoint.cursors().get(entry.getKey()))) throw new IllegalArgumentException("CDC ACK regressed");
+            if(!delivered.cursors().get(entry.getKey()).covers(entry.getValue())) throw new IllegalArgumentException("CDC ACK exceeds persisted delivery");
         }
-        return new DistributedCdcSubscription(definition,phase,Math.incrementExact(generation),next);
+        return new DistributedCdcSubscription(definition,phase,Math.incrementExact(generation),next,delivered);
     }
-    public DistributedCdcSubscription close() { return phase==Phase.CLOSED ? this : new DistributedCdcSubscription(definition,Phase.CLOSED,Math.incrementExact(generation),checkpoint); }
-    public void requireSuccessorOf(DistributedCdcSubscription previous,DistributedCdcCheckpoint delivered) {
+    public DistributedCdcSubscription close() { return phase==Phase.CLOSED ? this : new DistributedCdcSubscription(definition,Phase.CLOSED,Math.incrementExact(generation),checkpoint,delivered); }
+    public void requireSuccessorOf(DistributedCdcSubscription previous) {
         Objects.requireNonNull(previous);
         if(!definition.equals(previous.definition) || previous.generation==Long.MAX_VALUE || generation!=previous.generation+1) throw new IllegalArgumentException("CDC successor changed definition/incarnation/generation");
-        previous.requireActive();
-        var expected=phase==Phase.CLOSED ? previous.close() : previous.acknowledge(checkpoint,delivered);
-        if(!equals(expected)) throw new IllegalArgumentException("CDC successor changed closure/progress");
+        previous.requireActive(); final DistributedCdcSubscription expected;
+        if(phase==Phase.CLOSED) expected=previous.close();
+        else {
+            boolean deliveryChanged=!delivered.equals(previous.delivered),ackChanged=!checkpoint.equals(previous.checkpoint);
+            if(deliveryChanged==ackChanged) throw new IllegalArgumentException("CDC successor requires exactly one delivery or ACK");
+            expected=deliveryChanged ? previous.deliver(delivered) : previous.acknowledge(checkpoint);
+        }
+        if(!equals(expected)) throw new IllegalArgumentException("CDC successor changed closure/delivery/ACK");
     }
     private void requireActive() { if(phase!=Phase.ACTIVE) throw new IllegalStateException("CDC subscription is closed"); }
     public byte[] encode() {
-        byte[] definition=this.definition.encode(),checkpoint=this.checkpoint.encode();
-        return ByteBuffer.allocate(HEADER_BYTES+definition.length+checkpoint.length).putLong(generation).put((byte)phase.ordinal()).putInt(definition.length).put(definition).putInt(checkpoint.length).put(checkpoint).array();
+        byte[] definition=this.definition.encode(),checkpoint=this.checkpoint.encode(),delivered=this.delivered.encode();
+        return ByteBuffer.allocate(HEADER_BYTES+definition.length+checkpoint.length+delivered.length).putLong(generation).put((byte)phase.ordinal()).putInt(definition.length).put(definition).putInt(checkpoint.length).put(checkpoint).putInt(delivered.length).put(delivered).array();
     }
     public static DistributedCdcSubscription decode(byte[] encoded) {
         Objects.requireNonNull(encoded);
-        if(encoded.length<HEADER_BYTES+Definition.HEADER_BYTES+16+8 || encoded.length>MAX_BYTES) throw new IllegalArgumentException("Invalid CDC subscription length");
+        if(encoded.length<HEADER_BYTES+Definition.HEADER_BYTES+16+12 || encoded.length>MAX_BYTES) throw new IllegalArgumentException("Invalid CDC subscription length");
         var bytes=ByteBuffer.wrap(encoded); long generation=bytes.getLong(); int phase=bytes.get()&255;
         if(phase>=Phase.values().length) throw new IllegalArgumentException("Invalid CDC subscription phase");
-        int size=bytes.getInt(); if(size<Definition.HEADER_BYTES+16+4 || size>Definition.MAX_BYTES || size>bytes.remaining()-4) throw new IllegalArgumentException("Invalid CDC subscription definition length");
+        int size=bytes.getInt(); if(size<Definition.HEADER_BYTES+16+4 || size>Definition.MAX_BYTES || size>bytes.remaining()-8) throw new IllegalArgumentException("Invalid CDC subscription definition length");
         byte[] definition=new byte[size]; bytes.get(definition); size=bytes.getInt();
-        if(size<4 || size>DistributedCdcCheckpoint.MAX_BYTES || size!=bytes.remaining()) throw new IllegalArgumentException("Invalid CDC ACK checkpoint length");
-        byte[] checkpoint=new byte[size]; bytes.get(checkpoint);
-        return new DistributedCdcSubscription(Definition.decode(definition),Phase.values()[phase],generation,DistributedCdcCheckpoint.decode(checkpoint));
+        if(size<4 || size>DistributedCdcCheckpoint.MAX_BYTES || size>bytes.remaining()-4) throw new IllegalArgumentException("Invalid CDC ACK checkpoint length");
+        byte[] checkpoint=new byte[size]; bytes.get(checkpoint); size=bytes.getInt();
+        if(size<4 || size>DistributedCdcCheckpoint.MAX_BYTES || size!=bytes.remaining()) throw new IllegalArgumentException("Invalid CDC delivered checkpoint length");
+        byte[] delivered=new byte[size]; bytes.get(delivered);
+        return new DistributedCdcSubscription(Definition.decode(definition),Phase.values()[phase],generation,DistributedCdcCheckpoint.decode(checkpoint),DistributedCdcCheckpoint.decode(delivered));
     }
-    @Override public boolean equals(Object other) { return other instanceof DistributedCdcSubscription subscription && definition.equals(subscription.definition) && phase==subscription.phase && generation==subscription.generation && checkpoint.equals(subscription.checkpoint); }
-    @Override public int hashCode() { return Objects.hash(definition,phase,generation,checkpoint); }
+    @Override public boolean equals(Object other) { return other instanceof DistributedCdcSubscription subscription && definition.equals(subscription.definition) && phase==subscription.phase && generation==subscription.generation && checkpoint.equals(subscription.checkpoint) && delivered.equals(subscription.delivered); }
+    @Override public int hashCode() { return Objects.hash(definition,phase,generation,checkpoint,delivered); }
     private static UUID uuid(ByteBuffer bytes) { return new UUID(bytes.getLong(),bytes.getLong()); }
     private static void uuid(ByteBuffer bytes,UUID id) { bytes.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()); }
 }
