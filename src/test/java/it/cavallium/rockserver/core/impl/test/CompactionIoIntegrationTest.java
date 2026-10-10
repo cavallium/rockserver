@@ -408,6 +408,12 @@ class CompactionIoIntegrationTest {
             }
             connection.getSyncApi(RequestContext.batch()).flush();
             for (int i = 0; i < 64; i++) assertTrue(api.existsMulti(0, column, keys).stream().allMatch(Boolean::booleanValue));
+            connection.getAsyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)))
+                    .getAsync(0, column, keys.getFirst(), RequestType.current()).get(5, TimeUnit.SECONDS);
+            var schedulerField = internal.getClass().getDeclaredField("scheduler"); schedulerField.setAccessible(true);
+            var scheduler = (it.cavallium.rockserver.core.impl.RWScheduler) schedulerField.get(internal);
+            long accepted = scheduler.poolSnapshot(it.cavallium.rockserver.core.impl.RWScheduler.Pool.READ).acceptedTasks();
+            assertTrue(accepted > 0, "the async point read must exercise the real READ arrival counter");
             var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
             var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
             var controller = controllerField.get(internal);
@@ -439,7 +445,7 @@ class CompactionIoIntegrationTest {
                     assertEquals(nativeKeys, sample.bulkKeys()); assertEquals(histogram.getCount(), sample.bulkCount());
                     assertEquals(nativeFound, sample.bulkFoundKeys()); assertEquals(nativeReturned, sample.bulkReturnedBytes());
                     assertEquals(nativeFound, statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND));
-                    assertTrue(sample.readFailures() >= 0);
+                    assertTrue(sample.readFailures() >= 0); assertEquals(accepted, sample.readAccepted());
                     assertTrue(sample.bulkMicros() > 0); assertTrue(sample.readWorkers() > 0);
                     assertEquals(0, sample.latencyReadQueued());
                     assertFalse(sample.bulkPending());
