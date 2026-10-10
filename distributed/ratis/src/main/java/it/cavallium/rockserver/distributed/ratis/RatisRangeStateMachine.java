@@ -156,7 +156,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized(admissions){
             reconcileOlderProposalTerms(owner.term());
             if(schemaConfigurationPending || generation!=admissionGeneration.get())throw new IOException("Import publication configuration/owner changed");
-            if(importPublicationHolds.containsKey(command.operationId()) || admissions.containsKey(command.operationId()))throw new IOException("Import operation already owns preparation/proposal");
+            var existing=importPublicationHolds.get(command.operationId());
+            if(existing!=null) {
+                if(!Arrays.equals(existing.digest,command.payloadDigest()))throw new IOException("Import operation identity reused with different command");
+                try { requireImportPublication(existing,command,owner,generation); return; }
+                catch(IOException stale) {
+                    if(existing.reading || existing.submitted || admissions.containsKey(command.operationId()))throw stale;
+                    existing.invalidated=true;releaseImportPublication(existing);
+                }
+            }
+            if(admissions.containsKey(command.operationId()))throw new IOException("Import operation already owns a proposal");
             if(importPublicationHolds.size()>=2 || RatisProofQueryService.IMPORT_PUBLICATION_BYTES>2*RatisProofQueryService.IMPORT_PUBLICATION_BYTES-importPublicationBytes)throw new IOException("Import publication metadata budget exhausted");
             var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(store.commandAccessScope(command)),owner.term(),generation);
             if(lease==null)throw new IOException("Import publication overlaps a reserved proposal");

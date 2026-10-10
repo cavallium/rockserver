@@ -66,6 +66,20 @@ class RatisImportPublicationAdmissionTest {
     @Test void newPublicationFailsClosedWithoutTrustedAdmission() throws Exception {
         try(var f=new Fixture(null)) { assertNotNull(f.propose().getException()); }
     }
+    @Test void lostSuccessfulPrepareReplyCanRetryAndStaleUnsubmittedCutIsRequalified() throws Exception {
+        var checks=new AtomicInteger();
+        try(var f=new Fixture(command->checks.incrementAndGet())) {
+            f.prepare().get(5,TimeUnit.SECONDS); // The transport loses this successful reply.
+            var retry=f.prepare().get(5,TimeUnit.SECONDS);
+            RatisImportPublicationRpc.decodePreparedReply(retry.getContent().toByteArray(),ScopedTransactionRpc.IMPORT_PUBLICATION_PREPARE,f.publication);
+            assertEquals(1,checks.get());assertEquals(1,f.machine.importPublicationStats().holds());assertEquals(1,f.machine.proposalGateStats().gates());
+            f.machine.notifyTermIndexUpdated(1,f.catalogue.nativeCatalogue.next.getAndIncrement());
+            f.prepare().get(5,TimeUnit.SECONDS);assertEquals(2,checks.get());assertEquals(1,f.machine.importPublicationStats().holds());assertEquals(1,f.machine.proposalGateStats().gates());
+            var proposal=f.propose();assertNull(proposal.getException());f.apply(proposal);
+            assertEquals(0,f.machine.importPublicationStats().holds());assertEquals(0,f.machine.proposalGateStats().gates());
+            f.prepare().get(5,TimeUnit.SECONDS);assertEquals(2,checks.get());
+        }
+    }
     @Test void freshChecksPrecedeAppendButSavedExactOutcomeReplaysWithoutThem() throws Exception {
         var checks=new AtomicInteger(); var unavailable=new java.util.concurrent.atomic.AtomicBoolean();
         try(var f=new Fixture(command -> { checks.incrementAndGet(); if(unavailable.get()) throw new IOException("Owner unavailable"); })) {

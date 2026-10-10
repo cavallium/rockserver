@@ -18,6 +18,7 @@ public final class RatisRangeImportController implements AutoCloseable {
     public static final long MAX_SOURCE_BYTES=64L*1024*1024*1024;
     public enum Phase { SOURCES, DEFINITION, BEGIN, FILES, INSTALL, ADMISSION, PUBLISH, ACTIVATE, ACTIVATION_ADMISSION, COMPLETE, DONE, CONFLICT }
     public record Progress(UUID importId,Phase phase,RatisRangeImportCatalogue.Head published,RatisRangeImportCatalogue.Head completed) {}
+    public record Source(UUID groupId,UUID fileId) { public Source { Objects.requireNonNull(groupId); Objects.requireNonNull(fileId); } }
     public interface DataPlane {
         RatisReferencedFile transfer(RangeImportDefinition definition,RatisReferencedFile.Request request,Path source) throws IOException;
         NativeSstImportManifest.Receipt install(RangeImportDefinition definition,RatisRangeImportRecord.Install record) throws IOException;
@@ -55,16 +56,16 @@ public final class RatisRangeImportController implements AutoCloseable {
         try { lock=lockChannel.tryLock(); if(lock==null) throw new IOException("Import journal root already owned"); }
         catch(IOException|RuntimeException failure) { lockChannel.close(); throw new IOException("Import journal lock unavailable",failure); }
     }
-    public Handle prepare(RangeImportDefinition definition,Map<UUID,Path> sources) throws IOException {
+    public Handle prepare(RangeImportDefinition definition,Map<Source,Path> sources) throws IOException {
         begin(); try { return prepareOwned(definition,sources); } finally { end(); }
     }
-    private Handle prepareOwned(RangeImportDefinition definition,Map<UUID,Path> sources) throws IOException {
+    private Handle prepareOwned(RangeImportDefinition definition,Map<Source,Path> sources) throws IOException {
         requireOpen(); requireNamespace(definition); UUID id=definition.importId();
         if(handles.containsKey(id) || Files.exists(path(id))) throw new IOException("Import already retained; reopen original import");
         long retained=0; int jobs=0;
         try(var files=Files.newDirectoryStream(root,"*.import")) { for(var file:files) { jobs++; var fields=RatisSchemaClientJournal.read(file); retained=Math.addExact(retained,sourceBytes(RangeImportDefinition.decode(fields.get("definition")))); } }
         long bytes=sourceBytes(definition); if(jobs>=MAX_JOBS || bytes>MAX_SOURCE_BYTES-retained) throw new IOException("Import job/source capacity exhausted");
-        var expected=new HashSet<UUID>(); definition.manifests().forEach(m -> m.columns().forEach(c -> c.files().forEach(f -> expected.add(f.fileId()))));
+        var expected=new HashSet<Source>(); definition.manifests().forEach(m -> m.columns().forEach(c -> c.files().forEach(f -> expected.add(new Source(m.groupId(),f.fileId())))));
         long fileCount=definition.manifests().stream().flatMap(m -> m.columns().stream()).mapToLong(c -> c.files().size()).sum();
         if(fileCount>MAX_SOURCE_FILES) throw new IOException("Import source metadata capacity exhausted");
         if(!sources.keySet().equals(expected)) throw new IllegalArgumentException("Original source coverage differs");
@@ -73,7 +74,7 @@ public final class RatisRangeImportController implements AutoCloseable {
         UUID issuer; do { issuer=UUID.randomUUID(); } while(issuer.equals(definition.operation().sessionId()));
         putText(h,"issuer",issuer.toString()); number(h,"sequence",0); number(h,"cursor",0); putText(h,"phase",Phase.SOURCES.name());
         var paths=new HashMap<String,byte[]>();
-        for(var entry:sources.entrySet()) paths.put(entry.getKey().toString(),entry.getValue().toAbsolutePath().normalize().toString().getBytes(StandardCharsets.UTF_8));
+        for(var entry:sources.entrySet()) paths.put(sourceKey(entry.getKey()),entry.getValue().toAbsolutePath().normalize().toString().getBytes(StandardCharsets.UTF_8));
         h.fields.put("sourcePaths",encodeEntries(paths));
         save(h); handles.put(id,h); retain(h); return h;
     }
@@ -137,7 +138,7 @@ public final class RatisRangeImportController implements AutoCloseable {
     private void retain(Handle h) throws IOException {
         var paths=decodeEntries(h.fields.get("sourcePaths")); Path originals=originals(h); Files.createDirectories(originals); SessionJournalFiles.force(root);
         for(var manifest:h.definition().manifests()) {
-            var sources=new HashMap<UUID,Path>(); for(var column:manifest.columns()) for(var file:column.files()) sources.put(file.fileId(),Path.of(new String(paths.get(file.fileId().toString()),StandardCharsets.UTF_8)));
+            var sources=new HashMap<UUID,Path>(); for(var column:manifest.columns()) for(var file:column.files()) sources.put(file.fileId(),Path.of(new String(paths.get(sourceKey(new Source(manifest.groupId(),file.fileId()))),StandardCharsets.UTF_8)));
             NativeRangeSstImport.retain(originals,manifest,sources);
             Path target=manifestPath(h,manifest); byte[] encoded=manifest.encode();
             if(Files.exists(target,LinkOption.NOFOLLOW_LINKS) && !Files.isRegularFile(target,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Invalid owned manifest path");
@@ -247,6 +248,7 @@ public final class RatisRangeImportController implements AutoCloseable {
     private static long sourceBytes(RangeImportDefinition d) { long total=0; for(var m:d.manifests()) { total=Math.addExact(total,m.encode().length); for(var c:m.columns()) for(var f:c.files()) total=Math.addExact(total,f.bytes()); } return total; }
     private void requireNamespace(RangeImportDefinition d) { if(!d.sourceDirectory().clusterId().equals(cluster) || !d.sourceDirectory().databaseId().equals(database)) throw new IllegalArgumentException("Foreign import namespace"); }
     private byte[] bindingBytes() { var b=ByteBuffer.allocate(88); ScopedTransactionRpc.uuid(b,binding.groupId()); b.putLong(binding.epoch()).put(binding.schemaDigest()); ScopedTransactionRpc.uuid(b,binding.directoryColumn()); ScopedTransactionRpc.uuid(b,binding.sessionsColumn()); return b.array(); }
+    private static String sourceKey(Source source) { return source.groupId()+"/"+source.fileId(); }
     private Path path(UUID id) { return root.resolve(id+".import"); }
     private Path originals(Handle h) { return root.resolve(h.id+".sources"); }
     private Path manifestPath(Handle h,NativeSstImportManifest m) { return originals(h).resolve(m.groupId()+".manifest"); }

@@ -131,7 +131,7 @@ class RatisRangeImportControllerTest {
             var file=new NativeSstImportManifest.File(fileId,bytes.length,RangeImportAdmission.sha256(bytes),1,new byte[]{1},new byte[]{1});
             var manifest=new NativeSstImportManifest(m.importId(),m.groupId(),m.rangeEpoch(),m.domainId(),m.schemaDigest(),m.lowerInclusive(),m.upperExclusive(),List.of(new NativeSstImportManifest.Column(RatisRangeImportCatalogueTest.id(21),"imported",false,List.of(file))));
             var d=new RangeImportDefinition(empty.importId(),empty.operation(),empty.sourceDirectory(),List.of(manifest)); f.seed(d.sourceDirectory()); Path source=root.resolve("original.sst"); Files.write(source,bytes); Path journal=Files.createDirectory(root.resolve("journal")); var data=new Data(f);
-            try(var c=controller(journal,f,data)) { c.prepare(d,Map.of(fileId,source)); } Files.delete(source);
+            try(var c=controller(journal,f,data)) { c.prepare(d,Map.of(new RatisRangeImportController.Source(manifest.groupId(),fileId),source)); } Files.delete(source);
             try(var c=controller(journal,f,data)) { var h=c.reopen(d.importId()); until(c,h,RatisRangeImportController.Phase.INSTALL); assertEquals(2,data.requests.size()); assertEquals(data.requests.getFirst().clientId(),data.requests.getLast().clientId()); assertEquals(data.requests.getFirst().callId()+1,data.requests.getLast().callId()); assertArrayEquals(bytes,Files.readAllBytes(NativeRangeSstImport.original(journal.resolve(d.importId()+".sources"),manifest,file))); }
         }
     }
@@ -167,6 +167,36 @@ class RatisRangeImportControllerTest {
             try(var c=controller(journal,f,data)) {
                 var h=c.reopen(d.importId()); assertSame(h.definition(),h.definition()); assertEquals(RatisRangeImportController.Phase.DEFINITION,c.advance(h,1).phase());
                 assertArrayEquals(manifest.encode(),Files.readAllBytes(target)); assertFalse(Files.exists(pending)); assertTrue(data.requests.isEmpty());
+            }
+        }
+    }
+
+    @Test void fileIdentityIsScopedToGroupForRetentionAndTransfers() throws Exception {
+        var catalogueTests=new RatisRangeImportCatalogueTest(); catalogueTests.root=root.resolve("catalogue"); Files.createDirectory(catalogueTests.root);
+        try(var f=catalogueTests.new Fixture()) {
+            var base=RatisRangeImportCatalogueTest.definition(f.outer.cluster,f.outer.database,f.operation(20)); var original=base.sourceDirectory(); var old=original.ranges().getFirst();
+            var first=new RangeDescriptor(old.rangeId(),old.groupId(),old.rangeEpoch(),old.configurationVersion(),null,new byte[]{(byte)128},RangeDescriptor.TopologyState.FENCED,old.replicas());
+            var second=new RangeDescriptor(RatisRangeImportCatalogueTest.id(31),RatisRangeImportCatalogueTest.id(32),3,4,new byte[]{(byte)128},null,RangeDescriptor.TopologyState.FENCED,old.replicas());
+            var directory=new RangeDirectory(original.clusterId(),original.databaseId(),original.domainId(),original.schemaEpoch(),original.schemaDigest(),original.generation(),original.columns(),original.routingPrefixBytes(),List.of(first,second));
+            UUID fileId=RatisRangeImportCatalogueTest.id(400); byte[] firstBytes={1,2,3},secondBytes={4,5,6,7};
+            var firstFile=new NativeSstImportManifest.File(fileId,firstBytes.length,RangeImportAdmission.sha256(firstBytes),1,new byte[]{1},new byte[]{1});
+            var secondFile=new NativeSstImportManifest.File(fileId,secondBytes.length,RangeImportAdmission.sha256(secondBytes),1,new byte[]{(byte)129},new byte[]{(byte)129});
+            UUID column=original.columns().iterator().next();
+            var firstManifest=new NativeSstImportManifest(base.importId(),first.groupId(),first.rangeEpoch(),directory.domainId(),directory.schemaDigest(),first.lowerInclusive(),first.upperExclusive(),List.of(new NativeSstImportManifest.Column(column,"imported",false,List.of(firstFile))));
+            var secondManifest=new NativeSstImportManifest(base.importId(),second.groupId(),second.rangeEpoch(),directory.domainId(),directory.schemaDigest(),second.lowerInclusive(),second.upperExclusive(),List.of(new NativeSstImportManifest.Column(column,"imported",false,List.of(secondFile))));
+            var definition=new RangeImportDefinition(base.importId(),base.operation(),directory,List.of(firstManifest,secondManifest)); f.seed(directory);
+            Path firstSource=root.resolve("first.sst"),secondSource=root.resolve("second.sst"); Files.write(firstSource,firstBytes); Files.write(secondSource,secondBytes);
+            Path journal=Files.createDirectory(root.resolve("journal")); var data=new Data(f);
+            try(var c=controller(journal,f,data)) { c.prepare(definition,Map.of(new RatisRangeImportController.Source(first.groupId(),fileId),firstSource,new RatisRangeImportController.Source(second.groupId(),fileId),secondSource)); }
+            Files.delete(firstSource); Files.delete(secondSource);
+            try(var c=controller(journal,f,data)) {
+                var h=c.reopen(definition.importId()); until(c,h,RatisRangeImportController.Phase.INSTALL); Path originals=journal.resolve(definition.importId()+".sources");
+                assertArrayEquals(firstBytes,Files.readAllBytes(NativeRangeSstImport.original(originals,firstManifest,firstFile)));
+                assertArrayEquals(secondBytes,Files.readAllBytes(NativeRangeSstImport.original(originals,secondManifest,secondFile)));
+                assertEquals(4,data.requests.size());
+                var firstRequest=data.requests.stream().filter(r -> r.groupId().equals(first.groupId()) && r.length()==firstBytes.length).findFirst().orElseThrow();
+                var secondRequest=data.requests.stream().filter(r -> r.groupId().equals(second.groupId()) && r.length()==secondBytes.length).findFirst().orElseThrow();
+                assertArrayEquals(firstFile.sha256(),firstRequest.sha256()); assertArrayEquals(secondFile.sha256(),secondRequest.sha256()); assertNotEquals(firstRequest.clientId(),secondRequest.clientId());
             }
         }
     }
