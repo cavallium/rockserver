@@ -261,6 +261,21 @@ class CompactionReadaheadTest {
             assertEquals(restored, t.policy.budget());
         }
     }
+    @Test void positiveReadaheadStillCutsAgainstHistoryWhenProbeReferenceWouldPermitMean() throws Exception {
+        var t = new Trace(16 * MIB); t.in.pointMean = 500; t.in.pointTail = 1500; t.until(MIB);
+        var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+        var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
+        var rate = CompactionIoBudget.class.getDeclaredField("budget"); rate.setAccessible(true);
+        var reference = CompactionIoBudget.class.getDeclaredField("probeLatency"); reference.setAccessible(true);
+        var protectedPoint = CompactionIoBudget.class.getDeclaredField("probePointProtected"); protectedPoint.setAccessible(true);
+        long restored = t.policy.budget(); prior.setLong(t.policy, restored);
+        rate.setLong(t.policy, restored * 3 / 4); reference.setDouble(t.policy, 1000);
+        protectedPoint.setBoolean(t.policy, true); state.set(t.policy, CompactionIoBudget.State.PROBE);
+        t.in.pointMean = 800; t.step();
+        assertEquals(0, t.in.applied, "historical latency pressure must still protect optional active-reader I/O");
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(restored, t.policy.budget(), "changing both actuators still invalidates the rate trial");
+    }
     @Test void sparseOnePollOwnedMeanNeedsCompletedFiveSecondQuorum() {
         var t = new Trace(16 * MIB); t.in.pointTail = 300; t.in.pointCalls = 10; t.until(MIB);
         t.in.pointMean = 130; t.step(); assertEquals(MIB, t.in.applied);

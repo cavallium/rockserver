@@ -401,8 +401,12 @@ public final class CompactionIoBudget {
         long pointTime = sample.nativePointReadNanos - old.nativePointReadNanos;
         if (pointCalls >= 32 && pointTime > 0 && baseline > 0
                 && pointTime / (pointCalls * 1000d) > baseline * 1.2) {
+            boolean alreadyOff = readaheadBytes == 0 && appliedReadahead == 0 && !readaheadUnknown;
             reduceReadahead(0);
-            if (state == State.PROBE) finishProbe(false, Double.NaN);
+            // Keep optional I/O safe against history; an already-OFF byte trial has its own comparable reference.
+            if (state == State.PROBE && (!alreadyOff || !probePointProtected
+                    || !Double.isFinite(probeLatency) || probeLatency <= 0
+                    || pointTime / (pointCalls * 1000d) > probeLatency * 1.2)) finishProbe(false, Double.NaN);
         }
         boolean pointSlow = sample.pointTailMicros > 0 && pointTailBaseline > 0
                 && sample.pointTailMicros > pointTailBaseline * 1.2;

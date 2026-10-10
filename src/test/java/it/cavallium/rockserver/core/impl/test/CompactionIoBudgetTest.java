@@ -10,6 +10,7 @@ class CompactionIoBudgetTest {
         final CompactionIoBudget policy = new CompactionIoBudget(SEED);
         long nanos, reads, micros, bytes, completions, nativePoints, nativeNanos;
         boolean point = true, timed = true;
+        long pointMax;
         Trace() { poll(0, 0, 0, false, false); }
         long poll(long count, long latency, long transferred, boolean pressure, boolean pending) {
             nanos += 1_000_000_000L; reads += count; micros += count * latency; bytes += transferred;
@@ -17,7 +18,7 @@ class CompactionIoBudgetTest {
             return policy.sample(new CompactionIoBudget.Sample(nanos, reads, micros, bytes,
                     transferred > 0, pressure, pressure, true, pending, completions, !pressure, pressure,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
-                    point ? latency : 0, 0, nativePoints, 0, 0, nativeNanos));
+                    point ? Math.max(latency, pointMax) : 0, 0, nativePoints, 0, 0, nativeNanos));
         }
         void window(long count, long latency, long transferred) {
             for (int i = 0; i < 5; i++) {
@@ -37,6 +38,48 @@ class CompactionIoBudgetTest {
         t.window(10, 80, 750_000);
         assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
         assertEquals(750_000, t.policy.budget());
+    }
+    @Test void offProbeUsesCurrentComparablePointReferenceInsteadOfStaleHistoricalMean() {
+        for (long currentMean : new long[]{800, 1000}) {
+            var t = new Trace(); t.pointMax = 1500;
+            t.window(40, 500, SEED);
+            t.window(40, 500, 750000); t.window(40, 500, 750000);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+            assertEquals(500, t.policy.baselineReadMicros());
+            for (int second = 0; second < 100 && t.policy.state() != CompactionIoBudget.State.PROBE; second++) {
+                t.completions += 40; t.poll(40, 1000, SEED, false, true);
+            }
+            assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+            assertEquals(0, t.policy.readaheadBytes());
+            assertEquals(500, t.policy.baselineReadMicros(), "historical mean stays distinct from the new workset's probe reference");
+            long candidate = t.policy.budget();
+            t.completions += 40; t.poll(40, currentMean, 750000, false, true);
+            assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(),
+                    "an improved or unchanged owned mean against the probe reference must not abort after one poll");
+            assertEquals(candidate, t.policy.budget());
+            for (int second = 0; second < 14; second++) {
+                t.completions += 40; t.poll(40, currentMean, 750000, false, true);
+            }
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+            assertEquals(currentMean == 800 ? candidate : SEED, t.policy.budget(),
+                    "two beneficial windows may accept; a stable unchanged workset must not fabricate benefit");
+            assertEquals(currentMean == 800 ? 800 : 750, t.policy.baselineReadMicros(), .001);
+        }
+    }
+    @Test void offProbeRejectsWorseningOrMissingPointReferenceImmediately() throws Exception {
+        for (int scenario = 0; scenario < 4; scenario++) {
+            var t = new Trace(); t.pointMax = 1500;
+            t.window(40, 500, SEED);
+            var reference = CompactionIoBudget.class.getDeclaredField("probeLatency"); reference.setAccessible(true);
+            reference.setDouble(t.policy, scenario == 2 ? Double.NaN : scenario == 3 ? 0 : 1000);
+            if (scenario == 1) {
+                var protectedPoint = CompactionIoBudget.class.getDeclaredField("probePointProtected");
+                protectedPoint.setAccessible(true); protectedPoint.setBoolean(t.policy, false);
+            }
+            t.completions += 40; t.poll(40, scenario == 0 ? 1300 : 800, 750000, false, true);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+            assertEquals(SEED, t.policy.budget());
+        }
     }
     @Test void transientProbeBenefitThenReboundRestoresPriorRateImmediately() {
         var t = new Trace();
