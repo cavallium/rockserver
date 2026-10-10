@@ -34,12 +34,12 @@ public final class NativeRangeSstImport {
         public void requireCut(ApplyPosition cut){if(cut==null || position.term()>cut.term() || position.index()>cut.index() || position.index()==cut.index() && position.term()!=cut.term())throw new IllegalArgumentException("File receipt exceeds completed native cut");}
     }
     private static Path directory(Path root,NativeSstImportManifest manifest) { return root.resolve(manifest.groupId()+"-"+manifest.importId()); }
-    static Path original(Path root,NativeSstImportManifest manifest,NativeSstImportManifest.File file) { return directory(root,manifest).resolve(file.fileId()+".sst"); }
-    static void retain(Path root,NativeSstImportManifest manifest,Map<UUID,Path> sources) throws IOException {
+    public static Path original(Path root,NativeSstImportManifest manifest,NativeSstImportManifest.File file) { return directory(root,manifest).resolve(file.fileId()+".sst"); }
+    public static void retain(Path root,NativeSstImportManifest manifest,Map<UUID,Path> sources) throws IOException {
         var needed=new HashSet<UUID>(); manifest.columns().forEach(c->c.files().forEach(f->needed.add(f.fileId())));
         if(!needed.containsAll(sources.keySet())) throw new IllegalArgumentException("Unknown import original");
         Files.createDirectories(root); Path directory=directory(root,manifest); Files.createDirectories(directory); forceDirectory(root); forceDirectory(root.getParent());
-        // Pool mutation is exclusive; these private unlinked copies cannot belong to an active importer.
+        // Caller exclusively owns this retention directory; private unlinked copies are recoverable.
         try(var leftovers=Files.newDirectoryStream(directory,"incoming-*.sst")) { for(var file:leftovers)Files.delete(file); }
         for(var column:manifest.columns()) for(var file:column.files()) {
             Path destination=original(root,manifest,file);

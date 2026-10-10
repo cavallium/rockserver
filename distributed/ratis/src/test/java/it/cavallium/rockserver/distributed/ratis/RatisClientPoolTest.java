@@ -18,6 +18,18 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Pure resource ownership checks; no Raft RPCs, sockets or server processes. */
 class RatisClientPoolTest {
+    @Test void stableClientIdentityIsPartOfBoundedRouteAndCannotAliasAnotherIssuer() throws Exception {
+        var closes=new AtomicInteger();var ids=new java.util.ArrayList<UUID>();UUID first=UUID.randomUUID(),second=UUID.randomUUID();
+        try(var pool=new RatisClientPool(1,range->{throw new AssertionError("Identity route required");},null,(range,id)->{ids.add(id);return client(closes);})) {
+            RaftClient original;
+            try(var one=pool.acquireClient(route(1,1,1,1),first);var same=pool.acquireClient(route(1,1,1,1),first)) {
+                original=one.client();assertSame(original,same.client());assertThrows(IOException.class,()->pool.acquireClient(route(1,1,1,1),second));
+            }
+            try(var replacement=pool.acquireClient(route(1,1,1,1),second)){assertNotSame(original,replacement.client());}
+            assertEquals(List.of(first,second),ids);assertEquals(1,closes.get());
+        }
+        assertEquals(2,closes.get());
+    }
     private static RangeDescriptor route(int group, long epoch, long config, int incarnation) {
         var peer = new ReplicaDescriptor(new UUID(1,1), new UUID(2,incarnation), new UUID(3,1),
                 "n1", "127.0.0.1:8001", ReplicaDescriptor.Role.VOTER);

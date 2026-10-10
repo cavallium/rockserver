@@ -18,9 +18,10 @@ import java.util.concurrent.locks.ReentrantLock;
 final class RatisClientPool implements AutoCloseable {
     @FunctionalInterface interface Factory { RaftClient open(RangeDescriptor descriptor) throws IOException; }
     @FunctionalInterface interface OwnerFactory { RaftClient open(RangeDescriptor descriptor,ReplicaDescriptor owner) throws IOException; }
-    private record Route(UUID group, long epoch, long configuration, List<ReplicaDescriptor> replicas,ReplicaDescriptor owner) {
-        Route(RangeDescriptor descriptor,ReplicaDescriptor owner) {
-            this(descriptor.groupId(), descriptor.rangeEpoch(), descriptor.configurationVersion(), descriptor.replicas(),owner);
+    @FunctionalInterface interface IdentityFactory { RaftClient open(RangeDescriptor descriptor,UUID clientId) throws IOException; }
+    private record Route(UUID group, long epoch, long configuration, List<ReplicaDescriptor> replicas,ReplicaDescriptor owner,UUID clientId) {
+        Route(RangeDescriptor descriptor,ReplicaDescriptor owner,UUID clientId) {
+            this(descriptor.groupId(), descriptor.rangeEpoch(), descriptor.configurationVersion(), descriptor.replicas(),owner,clientId);
         }
     }
     private static final class Entry {
@@ -44,6 +45,7 @@ final class RatisClientPool implements AutoCloseable {
     private final int capacity;
     private final Factory factory;
     private final OwnerFactory ownerFactory;
+    private final IdentityFactory identityFactory;
     private final LinkedHashMap<Route, Entry> clients = new LinkedHashMap<>(16, 0.75f, true);
     private final List<RaftClient> failedRetirements = new ArrayList<>();
     private final ReentrantLock shutdown = new ReentrantLock();
@@ -52,22 +54,30 @@ final class RatisClientPool implements AutoCloseable {
 
     RatisClientPool(int capacity, Factory factory) { this(capacity,factory,null); }
     RatisClientPool(int capacity, Factory factory,OwnerFactory ownerFactory) {
+        this(capacity,factory,ownerFactory,null);
+    }
+    RatisClientPool(int capacity, Factory factory,OwnerFactory ownerFactory,IdentityFactory identityFactory) {
         if (capacity < 1) throw new IllegalArgumentException("Invalid client capacity");
         this.capacity = capacity;
         this.factory = java.util.Objects.requireNonNull(factory);
         this.ownerFactory=ownerFactory;
+        this.identityFactory=identityFactory;
     }
 
-    Lease acquire(RangeDescriptor descriptor) throws IOException { return acquire(descriptor,null); }
+    Lease acquire(RangeDescriptor descriptor) throws IOException { return acquire(descriptor,null,null); }
+    Lease acquireClient(RangeDescriptor descriptor,UUID clientId) throws IOException {
+        if(identityFactory==null)throw new IOException("Stable-identity clients unsupported");
+        return acquire(descriptor,null,java.util.Objects.requireNonNull(clientId));
+    }
     /** The exact frozen member is targeted without ordinary leader discovery, using the same bounded cache. */
     Lease acquireOwner(RangeDescriptor descriptor,ReplicaDescriptor owner) throws IOException {
         java.util.Objects.requireNonNull(descriptor); java.util.Objects.requireNonNull(owner);
         if (!descriptor.replicas().contains(owner)) throw new IllegalArgumentException("Snapshot owner differs from frozen range membership");
         if (ownerFactory==null) throw new IOException("Owner-specific clients are unsupported by this pool");
-        return acquire(descriptor,owner);
+        return acquire(descriptor,owner,null);
     }
-    private Lease acquire(RangeDescriptor descriptor,ReplicaDescriptor owner) throws IOException {
-        Route route = new Route(descriptor,owner);
+    private Lease acquire(RangeDescriptor descriptor,ReplicaDescriptor owner,UUID clientId) throws IOException {
+        Route route = new Route(descriptor,owner,clientId);
         Entry entry;
         RaftClient retired = null;
         boolean create = false;
@@ -104,7 +114,7 @@ final class RatisClientPool implements AutoCloseable {
                         throw failure;
                     }
                 }
-                entry.ready.complete(java.util.Objects.requireNonNull(owner==null ? factory.open(descriptor) : ownerFactory.open(descriptor,owner)));
+                entry.ready.complete(java.util.Objects.requireNonNull(clientId!=null ? identityFactory.open(descriptor,clientId) : owner==null ? factory.open(descriptor) : ownerFactory.open(descriptor,owner)));
             } catch (IOException | RuntimeException | Error failure) {
                 synchronized (this) { clients.remove(route, entry); }
                 entry.ready.completeExceptionally(failure);
