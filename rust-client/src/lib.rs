@@ -42,21 +42,44 @@
 
 // Preserve the protobuf package hierarchy for cross-package RequestContext references.
 mod generated {
-    pub mod api {
-        pub mod proto {
-            #![allow(clippy::all, non_camel_case_types)]
-            tonic::include_proto!("it.cavallium.rockserver.core.common.api.proto");
-        }
-        pub mod export {
-            pub mod proto {
-                #![allow(clippy::all, non_camel_case_types)]
-                tonic::include_proto!("it.cavallium.rockserver.core.common.api.export.proto");
+    pub mod it {
+        pub mod cavallium {
+            pub mod rockserver {
+                pub mod core {
+                    pub mod common {
+                        pub mod api {
+                            pub mod proto {
+                                #![allow(clippy::all, non_camel_case_types)]
+                                tonic::include_proto!(
+                                    "it.cavallium.rockserver.core.common.api.proto"
+                                );
+                            }
+                            pub mod export {
+                                pub mod proto {
+                                    #![allow(clippy::all, non_camel_case_types)]
+                                    tonic::include_proto!(
+                                        "it.cavallium.rockserver.core.common.api.export.proto"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+    pub mod rockserver {
+        pub mod cdc {
+            #![allow(clippy::all, non_camel_case_types)]
+            tonic::include_proto!("rockserver.cdc");
+        }
+    }
 }
-pub use generated::api::export::proto as export_proto;
-pub use generated::api::proto;
+pub use generated::it::cavallium::rockserver::core::common::api::export::proto as export_proto;
+pub use generated::it::cavallium::rockserver::core::common::api::proto;
+pub use generated::rockserver::cdc as cdc_proto;
+pub mod cdc;
+pub use cdc::CdcClient;
 pub mod export;
 pub use export::ExportClient;
 

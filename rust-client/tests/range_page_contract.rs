@@ -9,6 +9,7 @@ fn capabilities_preserve_backend_modes_and_range_limits() {
     let capability = CapabilitiesResponse {
         backend_mode: rockserver_client::BackendMode::Distributed as i32,
         raw_scan_mode: rockserver_client::RawScanMode::ImmutableExportJobs as i32,
+        cdc_mode: rockserver_client::CdcMode::VectorSubscriptions as i32,
         maximum_range_page_keys: 4_096,
         maximum_range_page_bytes: 8 * 1024 * 1024,
     };
@@ -32,6 +33,7 @@ fn capabilities_reject_missing_unknown_modes_and_nonpositive_limits() {
     let valid = CapabilitiesResponse {
         backend_mode: rockserver_client::BackendMode::Standalone as i32,
         raw_scan_mode: rockserver_client::RawScanMode::PhysicalSst as i32,
+        cdc_mode: rockserver_client::CdcMode::Scalar as i32,
         maximum_range_page_keys: 4_096,
         maximum_range_page_bytes: 8 * 1024 * 1024,
     };
@@ -39,6 +41,13 @@ fn capabilities_reject_missing_unknown_modes_and_nonpositive_limits() {
         assert!(
             rockserver_client::Capabilities::try_from(CapabilitiesResponse {
                 backend_mode: value,
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            rockserver_client::Capabilities::try_from(CapabilitiesResponse {
+                cdc_mode: value,
                 ..valid.clone()
             })
             .is_err()
@@ -85,6 +94,7 @@ fn distributed_backend_rejects_physical_sst_capabilities() {
     let error = rockserver_client::Capabilities::try_from(CapabilitiesResponse {
         backend_mode: rockserver_client::BackendMode::Distributed as i32,
         raw_scan_mode: rockserver_client::RawScanMode::PhysicalSst as i32,
+        cdc_mode: rockserver_client::CdcMode::Scalar as i32,
         maximum_range_page_keys: 4_096,
         maximum_range_page_bytes: 8 * 1024 * 1024,
     })
@@ -143,4 +153,43 @@ fn page_response_preserves_cursor_and_has_more_without_partial_ambiguity() {
     assert_eq!(decoded.items.len(), 1);
     assert_eq!(decoded.resume_after.unwrap().keys, vec![vec![3]]);
     assert!(decoded.has_more);
+}
+
+#[test]
+fn cdc_mode_is_explicit_and_respects_backend_semantics() {
+    use rockserver_client::{BackendMode, Capabilities, CdcMode, RawScanMode};
+    let standalone = CapabilitiesResponse {
+        backend_mode: BackendMode::Standalone as i32,
+        raw_scan_mode: RawScanMode::PhysicalSst as i32,
+        cdc_mode: CdcMode::Scalar as i32,
+        maximum_range_page_keys: 4096,
+        maximum_range_page_bytes: 8 * 1024 * 1024,
+    };
+    let scalar = Capabilities::try_from(standalone.clone()).unwrap();
+    assert_eq!(scalar.maximum_vector_cdc_records(), 0);
+    assert!(Capabilities::try_from(CapabilitiesResponse {
+        cdc_mode: CdcMode::VectorSubscriptions as i32,
+        ..standalone.clone()
+    })
+    .is_err());
+    let distributed = CapabilitiesResponse {
+        backend_mode: BackendMode::Distributed as i32,
+        raw_scan_mode: RawScanMode::ImmutableExportJobs as i32,
+        cdc_mode: CdcMode::VectorSubscriptions as i32,
+        ..standalone
+    };
+    let vector = Capabilities::try_from(distributed.clone()).unwrap();
+    assert_eq!(vector.maximum_vector_cdc_records(), 256);
+    assert_eq!(vector.maximum_vector_cdc_source_bytes(), 8 * 1024 * 1024);
+    assert_eq!(vector.maximum_vector_cdc_batch_bytes(), 10_551_536);
+    assert!(Capabilities::try_from(CapabilitiesResponse {
+        cdc_mode: CdcMode::Scalar as i32,
+        ..distributed.clone()
+    })
+    .is_err());
+    assert!(Capabilities::try_from(CapabilitiesResponse {
+        cdc_mode: CdcMode::CdcUnsupported as i32,
+        ..distributed
+    })
+    .is_ok());
 }

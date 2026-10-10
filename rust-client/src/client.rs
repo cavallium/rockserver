@@ -166,6 +166,7 @@ impl RockserverClient {
             capabilities: Capabilities {
                 backend_mode: BackendMode::Standalone,
                 raw_scan_mode: RawScanMode::PhysicalSst,
+                cdc_mode: CdcMode::Scalar,
                 maximum_range_page_keys: 4_096,
                 maximum_range_page_bytes: 8 * 1024 * 1024,
             },
@@ -1547,6 +1548,15 @@ impl RockserverClient {
     // CDC
     // ============================================================================================
 
+    fn require_scalar_cdc(&self) -> Result<()> {
+        if self.capabilities.cdc_mode != CdcMode::Scalar {
+            return Err(Status::failed_precondition(
+                "backend does not support scalar CDC",
+            ));
+        }
+        Ok(())
+    }
+
     /// Creates a new CDC stream.
     pub async fn cdc_create(
         &self,
@@ -1555,6 +1565,7 @@ impl RockserverClient {
         column_ids: Vec<i64>,
         resolved_values: Option<bool>,
     ) -> Result<i64> {
+        self.require_scalar_cdc()?;
         let req = CdcCreateRequest {
             id,
             from_seq,
@@ -1577,6 +1588,7 @@ impl RockserverClient {
         resolved_values: Option<bool>,
         precondition: CdcCreatePrecondition,
     ) -> std::result::Result<i64, CdcError> {
+        self.require_scalar_cdc()?;
         let expected_last_committed = match precondition {
             CdcCreatePrecondition::Absent => {
                 Some(cdc_create_request::ExpectedLastCommitted::ExpectAbsent(()))
@@ -1603,6 +1615,7 @@ impl RockserverClient {
 
     /// Deletes a CDC stream.
     pub async fn cdc_delete(&self, id: String) -> Result<()> {
+        self.require_scalar_cdc()?;
         let req = CdcDeleteRequest { id };
         self.client.clone().cdc_delete(req).await?;
         Ok(())
@@ -1610,6 +1623,7 @@ impl RockserverClient {
 
     /// Returns the earliest CDC cursor still available in the database WAL.
     pub async fn cdc_get_earliest_available_sequence(&self) -> Result<i64> {
+        self.require_scalar_cdc()?;
         let resp = self
             .client
             .clone()
@@ -1622,6 +1636,7 @@ impl RockserverClient {
     ///
     /// `None` means that the subscription metadata does not exist.
     pub async fn cdc_get_last_committed_sequence(&self, id: String) -> Result<Option<i64>> {
+        self.require_scalar_cdc()?;
         let req = CdcGetLastCommittedSequenceRequest { id };
         let resp = self
             .client
@@ -1633,6 +1648,7 @@ impl RockserverClient {
 
     /// Commits a sequence number for a CDC stream.
     pub async fn cdc_commit(&self, id: String, seq: i64) -> Result<()> {
+        self.require_scalar_cdc()?;
         let req = CdcCommitRequest { id, seq };
         self.client.clone().cdc_commit(req).await?;
         Ok(())
@@ -1644,6 +1660,7 @@ impl RockserverClient {
         id: String,
         seq: i64,
     ) -> std::result::Result<(), CdcError> {
+        self.require_scalar_cdc()?;
         let req = CdcCommitRequest { id, seq };
         self.client
             .clone()
@@ -1660,6 +1677,7 @@ impl RockserverClient {
         from_seq: Option<i64>,
         max_events: i64,
     ) -> Result<impl Stream<Item = Result<CdcEvent>>> {
+        self.require_scalar_cdc()?;
         let req = CdcPollRequest {
             id,
             from_seq,
@@ -1678,6 +1696,7 @@ impl RockserverClient {
         max_events: i64,
     ) -> std::result::Result<impl Stream<Item = std::result::Result<CdcEvent, CdcError>>, CdcError>
     {
+        self.require_scalar_cdc()?;
         let req = CdcPollRequest {
             id,
             from_seq,
@@ -1701,6 +1720,7 @@ impl RockserverClient {
         from_seq: Option<i64>,
         max_events: i64,
     ) -> Result<CdcPollResponse> {
+        self.require_scalar_cdc()?;
         let req = CdcPollRequest {
             id,
             from_seq,
@@ -1718,6 +1738,7 @@ impl RockserverClient {
         from_seq: Option<i64>,
         max_events: i64,
     ) -> std::result::Result<CdcPollResponse, CdcError> {
+        self.require_scalar_cdc()?;
         let req = CdcPollRequest {
             id,
             from_seq,

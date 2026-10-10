@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Test;
 class RockserverCapabilitiesTest {
 	@Test void transportMaskPreservesActualBackendAndRangeLimits() {
 		var backend = new RockserverCapabilities(BackendMode.DISTRIBUTED,
-				RawScanMode.IMMUTABLE_EXPORT_JOBS, 123, 456);
+				RawScanMode.IMMUTABLE_EXPORT_JOBS, 123, 456,RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS);
 		var transport = backend.withoutRawScan();
 		assertEquals(BackendMode.DISTRIBUTED, transport.backendMode());
 		assertEquals(RawScanMode.UNSUPPORTED, transport.rawScanMode());
@@ -25,14 +25,14 @@ class RockserverCapabilitiesTest {
 		assertDoesNotThrow(RockserverCapabilities.STANDALONE::requirePhysicalSst);
 	}
 	@Test void pageBudgetUsesAdvertisedLimits() {
-		var caps = new RockserverCapabilities(BackendMode.STANDALONE, RawScanMode.UNSUPPORTED, 2, 3);
+		var caps = new RockserverCapabilities(BackendMode.STANDALONE, RawScanMode.UNSUPPORTED, 2, 3,RockserverCapabilities.CdcMode.SCALAR);
 		assertDoesNotThrow(() -> caps.requireRangeBudget(new RangeBudget(2, 3)));
 		assertThrows(RocksDBException.class, () -> caps.requireRangeBudget(new RangeBudget(3, 3)));
 		assertThrows(RocksDBException.class, () -> caps.requireRangeBudget(new RangeBudget(2, 4)));
 		assertThrows(IllegalArgumentException.class, () -> new RockserverCapabilities(
-				BackendMode.DISTRIBUTED, RawScanMode.PHYSICAL_SST, 1, 1));
+				BackendMode.DISTRIBUTED, RawScanMode.PHYSICAL_SST, 1, 1,RockserverCapabilities.CdcMode.UNSUPPORTED));
 		assertThrows(IllegalArgumentException.class, () -> new RockserverCapabilities(
-				BackendMode.STANDALONE, RawScanMode.UNSUPPORTED, 0, 1));
+				BackendMode.STANDALONE, RawScanMode.UNSUPPORTED, 0, 1,RockserverCapabilities.CdcMode.SCALAR));
 	}
 	@Test void transportLimitReservesCursorAndEnvelope() throws Exception {
 		long transportBytes = 4L*1024*1024;
@@ -65,11 +65,12 @@ class RockserverCapabilitiesTest {
 		var decoder = Class.forName("it.cavallium.rockserver.core.client.GrpcConnectionDelegate")
 				.getDeclaredMethod("decodeCapabilities", CapabilitiesResponse.class);
 		decoder.setAccessible(true);
-		var valid = CapabilitiesResponse.newBuilder().setBackendModeValue(1).setRawScanModeValue(2)
+		var valid = CapabilitiesResponse.newBuilder().setBackendModeValue(1).setRawScanModeValue(2).setCdcModeValue(2)
 				.setMaximumRangePageKeys(4096).setMaximumRangePageBytes(8L*1024*1024).build();
 		assertEquals(RockserverCapabilities.STANDALONE, decoder.invoke(null, valid));
 		for (var invalid : java.util.List.of(CapabilitiesResponse.getDefaultInstance(),
 				valid.toBuilder().setBackendModeValue(999).build(),
+                valid.toBuilder().setCdcModeValue(0).build(), valid.toBuilder().setCdcModeValue(999).build(), valid.toBuilder().setCdcModeValue(3).build(),
 				valid.toBuilder().setRawScanModeValue(0).build(),
 				valid.toBuilder().setRawScanModeValue(999).build(),
 				valid.toBuilder().setMaximumRangePageBytes(-1).build(),
@@ -79,4 +80,16 @@ class RockserverCapabilitiesTest {
 			assertEquals(RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED, failure.getErrorUniqueId());
 		}
 	}
+    @Test void cdcModePreservesStandaloneAndMasksTransportTooSmallForVectorFrames() {
+        assertEquals(RockserverCapabilities.CdcMode.SCALAR,RockserverCapabilities.STANDALONE.cdcMode());
+        assertDoesNotThrow(RockserverCapabilities.STANDALONE::requireScalarCdc);
+        assertThrows(RocksDBException.class,RockserverCapabilities.STANDALONE::requireVectorCdc);
+        var vector=new RockserverCapabilities(BackendMode.DISTRIBUTED,RawScanMode.UNSUPPORTED,123,456,RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS);
+        assertEquals(vector,vector.withTransportLimit(RockserverCapabilities.VECTOR_CDC_TRANSPORT_BYTES));
+        assertEquals(RockserverCapabilities.CdcMode.UNSUPPORTED,vector.withTransportLimit(RockserverCapabilities.VECTOR_CDC_TRANSPORT_BYTES-1).cdcMode());
+        assertEquals(RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS,vector.withoutRawScan().cdcMode());
+        assertDoesNotThrow(vector::requireVectorCdc); assertThrows(RocksDBException.class,vector::requireScalarCdc);
+        assertThrows(IllegalArgumentException.class,()->new RockserverCapabilities(BackendMode.DISTRIBUTED,RawScanMode.UNSUPPORTED,1,1,RockserverCapabilities.CdcMode.SCALAR));
+    }
+
 }

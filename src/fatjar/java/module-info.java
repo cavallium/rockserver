@@ -48,6 +48,8 @@ module rockserver.core {
 	exports it.cavallium.rockserver.core.common;
 	exports it.cavallium.rockserver.core.common.distributed;
 	exports it.cavallium.rockserver.core.common.cdc;
+	exports it.cavallium.rockserver.core.common.api.cdc.proto;
+	exports it.cavallium.rockserver.core.common.api.cdc;
 	exports it.cavallium.rockserver.core.config;
 	opens it.cavallium.rockserver.core.resources;
 	opens it.cavallium.rockserver.core.config to org.github.gestalt.core, org.github.gestalt.hocon;

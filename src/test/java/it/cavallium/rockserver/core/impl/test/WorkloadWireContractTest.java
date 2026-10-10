@@ -74,7 +74,7 @@ class WorkloadWireContractTest {
 
 	@Test
 	void capabilitiesDescribeActualModesAndRangeLimits() throws Exception {
-		var capabilities = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.newBuilder()
+		var capabilities = it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse.newBuilder().setCdcModeValue(2)
 				.setBackendMode(it.cavallium.rockserver.core.common.api.proto.BackendMode.DISTRIBUTED)
                 .setRawScanMode(it.cavallium.rockserver.core.common.api.proto.RawScanMode.IMMUTABLE_EXPORT_JOBS)
                 .setMaximumRangePageKeys(4096).setMaximumRangePageBytes(8L*1024*1024)

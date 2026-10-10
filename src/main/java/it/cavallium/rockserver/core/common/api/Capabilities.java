@@ -14,6 +14,7 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   private static final org.apache.thrift.protocol.TField RAW_SCAN_MODE_FIELD_DESC = new org.apache.thrift.protocol.TField("rawScanMode", org.apache.thrift.protocol.TType.I32, (short)2);
   private static final org.apache.thrift.protocol.TField MAXIMUM_RANGE_PAGE_KEYS_FIELD_DESC = new org.apache.thrift.protocol.TField("maximumRangePageKeys", org.apache.thrift.protocol.TType.I32, (short)3);
   private static final org.apache.thrift.protocol.TField MAXIMUM_RANGE_PAGE_BYTES_FIELD_DESC = new org.apache.thrift.protocol.TField("maximumRangePageBytes", org.apache.thrift.protocol.TType.I64, (short)4);
+  private static final org.apache.thrift.protocol.TField CDC_MODE_FIELD_DESC = new org.apache.thrift.protocol.TField("cdcMode", org.apache.thrift.protocol.TType.I32, (short)5);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new CapabilitiesStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new CapabilitiesTupleSchemeFactory();
@@ -30,6 +31,11 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
   public @org.apache.thrift.annotation.Nullable RawScanMode rawScanMode; // required
   public int maximumRangePageKeys; // required
   public long maximumRangePageBytes; // required
+  /**
+   *
+   * @see CdcMode
+   */
+  public @org.apache.thrift.annotation.Nullable CdcMode cdcMode; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -44,7 +50,12 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
      */
     RAW_SCAN_MODE((short)2, "rawScanMode"),
     MAXIMUM_RANGE_PAGE_KEYS((short)3, "maximumRangePageKeys"),
-    MAXIMUM_RANGE_PAGE_BYTES((short)4, "maximumRangePageBytes");
+    MAXIMUM_RANGE_PAGE_BYTES((short)4, "maximumRangePageBytes"),
+    /**
+     *
+     * @see CdcMode
+     */
+    CDC_MODE((short)5, "cdcMode");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -68,6 +79,8 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
           return MAXIMUM_RANGE_PAGE_KEYS;
         case 4: // MAXIMUM_RANGE_PAGE_BYTES
           return MAXIMUM_RANGE_PAGE_BYTES;
+        case 5: // CDC_MODE
+          return CDC_MODE;
         default:
           return null;
       }
@@ -125,6 +138,8 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
     tmpMap.put(_Fields.MAXIMUM_RANGE_PAGE_BYTES, new org.apache.thrift.meta_data.FieldMetaData("maximumRangePageBytes", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+    tmpMap.put(_Fields.CDC_MODE, new org.apache.thrift.meta_data.FieldMetaData("cdcMode", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.EnumMetaData(org.apache.thrift.protocol.TType.ENUM, CdcMode.class)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(Capabilities.class, metaDataMap);
   }
@@ -136,7 +151,8 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     BackendMode backendMode,
     RawScanMode rawScanMode,
     int maximumRangePageKeys,
-    long maximumRangePageBytes)
+    long maximumRangePageBytes,
+    CdcMode cdcMode)
   {
     this();
     this.backendMode = backendMode;
@@ -145,6 +161,7 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     setMaximumRangePageKeysIsSet(true);
     this.maximumRangePageBytes = maximumRangePageBytes;
     setMaximumRangePageBytesIsSet(true);
+    this.cdcMode = cdcMode;
   }
 
   /**
@@ -160,6 +177,9 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     }
     this.maximumRangePageKeys = other.maximumRangePageKeys;
     this.maximumRangePageBytes = other.maximumRangePageBytes;
+    if (other.isSetCdcMode()) {
+      this.cdcMode = other.cdcMode;
+    }
   }
 
   @Override
@@ -175,6 +195,7 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     this.maximumRangePageKeys = 0;
     setMaximumRangePageBytesIsSet(false);
     this.maximumRangePageBytes = 0;
+    this.cdcMode = null;
   }
 
   /**
@@ -289,6 +310,39 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __MAXIMUMRANGEPAGEBYTES_ISSET_ID, value);
   }
 
+  /**
+   *
+   * @see CdcMode
+   */
+  @org.apache.thrift.annotation.Nullable
+  public CdcMode getCdcMode() {
+    return this.cdcMode;
+  }
+
+  /**
+   *
+   * @see CdcMode
+   */
+  public Capabilities setCdcMode(@org.apache.thrift.annotation.Nullable CdcMode cdcMode) {
+    this.cdcMode = cdcMode;
+    return this;
+  }
+
+  public void unsetCdcMode() {
+    this.cdcMode = null;
+  }
+
+  /** Returns true if field cdcMode is set (has been assigned a value) and false otherwise */
+  public boolean isSetCdcMode() {
+    return this.cdcMode != null;
+  }
+
+  public void setCdcModeIsSet(boolean value) {
+    if (!value) {
+      this.cdcMode = null;
+    }
+  }
+
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -324,6 +378,14 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       }
       break;
 
+    case CDC_MODE:
+      if (value == null) {
+        unsetCdcMode();
+      } else {
+        setCdcMode((CdcMode)value);
+      }
+      break;
+
     }
   }
 
@@ -342,6 +404,9 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
 
     case MAXIMUM_RANGE_PAGE_BYTES:
       return getMaximumRangePageBytes();
+
+    case CDC_MODE:
+      return getCdcMode();
 
     }
     throw new java.lang.IllegalStateException();
@@ -363,6 +428,8 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       return isSetMaximumRangePageKeys();
     case MAXIMUM_RANGE_PAGE_BYTES:
       return isSetMaximumRangePageBytes();
+    case CDC_MODE:
+      return isSetCdcMode();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -416,6 +483,15 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
         return false;
     }
 
+    boolean this_present_cdcMode = true && this.isSetCdcMode();
+    boolean that_present_cdcMode = true && that.isSetCdcMode();
+    if (this_present_cdcMode || that_present_cdcMode) {
+      if (!(this_present_cdcMode && that_present_cdcMode))
+        return false;
+      if (!this.cdcMode.equals(that.cdcMode))
+        return false;
+    }
+
     return true;
   }
 
@@ -434,6 +510,10 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     hashCode = hashCode * 8191 + maximumRangePageKeys;
 
     hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(maximumRangePageBytes);
+
+    hashCode = hashCode * 8191 + ((isSetCdcMode()) ? 131071 : 524287);
+    if (isSetCdcMode())
+      hashCode = hashCode * 8191 + cdcMode.getValue();
 
     return hashCode;
   }
@@ -486,6 +566,16 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
         return lastComparison;
       }
     }
+    lastComparison = java.lang.Boolean.compare(isSetCdcMode(), other.isSetCdcMode());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetCdcMode()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.cdcMode, other.cdcMode);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
     return 0;
   }
 
@@ -533,6 +623,14 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     sb.append("maximumRangePageBytes:");
     sb.append(this.maximumRangePageBytes);
     first = false;
+    if (!first) sb.append(", ");
+    sb.append("cdcMode:");
+    if (this.cdcMode == null) {
+      sb.append("null");
+    } else {
+      sb.append(this.cdcMode);
+    }
+    first = false;
     sb.append(")");
     return sb.toString();
   }
@@ -547,6 +645,9 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
     }
     // alas, we cannot check 'maximumRangePageKeys' because it's a primitive and you chose the non-beans generator.
     // alas, we cannot check 'maximumRangePageBytes' because it's a primitive and you chose the non-beans generator.
+    if (cdcMode == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'cdcMode' was not present! Struct: " + toString());
+    }
     // check for sub-struct validity
   }
 
@@ -620,6 +721,14 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
+          case 5: // CDC_MODE
+            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+              struct.cdcMode = it.cavallium.rockserver.core.common.api.CdcMode.findByValue(iprot.readI32());
+              struct.setCdcModeIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
           default:
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
         }
@@ -658,6 +767,11 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       oprot.writeFieldBegin(MAXIMUM_RANGE_PAGE_BYTES_FIELD_DESC);
       oprot.writeI64(struct.maximumRangePageBytes);
       oprot.writeFieldEnd();
+      if (struct.cdcMode != null) {
+        oprot.writeFieldBegin(CDC_MODE_FIELD_DESC);
+        oprot.writeI32(struct.cdcMode.getValue());
+        oprot.writeFieldEnd();
+      }
       oprot.writeFieldStop();
       oprot.writeStructEnd();
     }
@@ -680,6 +794,7 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       oprot.writeI32(struct.rawScanMode.getValue());
       oprot.writeI32(struct.maximumRangePageKeys);
       oprot.writeI64(struct.maximumRangePageBytes);
+      oprot.writeI32(struct.cdcMode.getValue());
     }
 
     @Override
@@ -693,6 +808,8 @@ public class Capabilities implements org.apache.thrift.TBase<Capabilities, Capab
       struct.setMaximumRangePageKeysIsSet(true);
       struct.maximumRangePageBytes = iprot.readI64();
       struct.setMaximumRangePageBytesIsSet(true);
+      struct.cdcMode = it.cavallium.rockserver.core.common.api.CdcMode.findByValue(iprot.readI32());
+      struct.setCdcModeIsSet(true);
     }
   }
 

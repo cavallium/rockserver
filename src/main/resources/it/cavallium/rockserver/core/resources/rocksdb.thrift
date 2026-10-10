@@ -59,11 +59,14 @@ enum RawScanMode {
   IMMUTABLE_EXPORT_JOBS = 3
 }
 
+enum CdcMode { CDC_UNSUPPORTED = 1, SCALAR = 2, VECTOR_SUBSCRIPTIONS = 3 }
+
 struct Capabilities {
   1: required BackendMode backendMode,
   2: required RawScanMode rawScanMode,
   3: required i32 maximumRangePageKeys,
-  4: required i64 maximumRangePageBytes
+  4: required i64 maximumRangePageBytes,
+  5: required CdcMode cdcMode
 }
 
 enum PutBatchMode {

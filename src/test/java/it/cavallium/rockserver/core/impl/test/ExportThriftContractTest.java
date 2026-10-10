@@ -74,7 +74,7 @@ class ExportThriftContractTest {
     @Test void standaloneUnprefixedClientAndDisabledExportRouteShareProcessor() throws Exception {
         var calls=new AtomicInteger();
         var standalone=new it.cavallium.rockserver.core.common.api.Capabilities(
-                BackendMode.STANDALONE,RawScanMode.UNSUPPORTED,128,65536);
+                BackendMode.STANDALONE,RawScanMode.UNSUPPORTED,128,65536,it.cavallium.rockserver.core.common.api.CdcMode.SCALAR);
         var database=(RocksDB.Iface)Proxy.newProxyInstance(RocksDB.Iface.class.getClassLoader(),
                 new Class<?>[]{RocksDB.Iface.class},(proxy,method,args)->{
                     assertEquals("getCapabilities",method.getName());

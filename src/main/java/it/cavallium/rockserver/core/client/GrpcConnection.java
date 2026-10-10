@@ -148,6 +148,7 @@ public final class GrpcConnection extends BaseConnection {
 	public RockserverCapabilities getCapabilities() {
 		return delegate.getCapabilities();
 	}
+    @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { return delegate.getDistributedCdcApi(); }
 
 	@Override
 	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
@@ -340,13 +341,18 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	public RockserverCapabilities getCapabilities() {
 		return capabilities;
 	}
+    @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() {
+        capabilities.requireVectorCdc(); return new GrpcDistributedCdcClient(channel);
+    }
+
 
 	private static RockserverCapabilities decodeCapabilities(CapabilitiesResponse response) {
 		try {
 			return new RockserverCapabilities(
 					RockserverCapabilities.BackendMode.valueOf(response.getBackendMode().name()),
 					RockserverCapabilities.RawScanMode.valueOf(response.getRawScanMode().name()),
-					response.getMaximumRangePageKeys(), response.getMaximumRangePageBytes());
+					response.getMaximumRangePageKeys(), response.getMaximumRangePageBytes(),
+                    response.getCdcMode()==it.cavallium.rockserver.core.common.api.proto.CdcMode.CDC_UNSUPPORTED ? RockserverCapabilities.CdcMode.UNSUPPORTED : RockserverCapabilities.CdcMode.valueOf(response.getCdcMode().name()));
 		} catch (IllegalArgumentException invalid) {
 			throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,
 					"The connected backend advertised invalid capability modes or limits", invalid);
@@ -1254,6 +1260,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			@Nullable List<Long> columnIds,
 			@Nullable Boolean resolvedValues,
 			@NotNull OptionalLong expectedLastCommitted) throws RocksDBException {
+        capabilities.requireScalarCdc();
 		var builder = CdcCreateRequest.newBuilder()
 				.setId(id);
         if (fromSeq != null) builder.setFromSeq(fromSeq);
@@ -1269,6 +1276,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
     @Override
     public CompletableFuture<Void> cdcDeleteAsync(@NotNull String id) throws RocksDBException {
+        capabilities.requireScalarCdc();
 		return toResponse(futureStub.cdcDelete(CdcDeleteRequest.newBuilder()
 				.setId(id)
 				.build()), _ -> null);
@@ -1276,6 +1284,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 	@Override
 	public CompletableFuture<Long> cdcGetEarliestAvailableSequenceAsync() throws RocksDBException {
+        capabilities.requireScalarCdc();
 		return toResponse(futureStub.cdcGetEarliestAvailableSequence(
 				CdcGetEarliestAvailableSequenceRequest.newBuilder()
 						.build()),
@@ -1284,6 +1293,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
     @Override
     public CompletableFuture<OptionalLong> cdcGetLastCommittedSequenceAsync(@NotNull String id) throws RocksDBException {
+        capabilities.requireScalarCdc();
 		var request = CdcGetLastCommittedSequenceRequest.newBuilder()
 				.setId(id)
 				.build();
@@ -1295,6 +1305,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
     @Override
     public CompletableFuture<Void> cdcCommitAsync(@NotNull String id, long seq) throws RocksDBException {
+        capabilities.requireScalarCdc();
 		return toResponse(futureStub.cdcCommit(CdcCommitRequest.newBuilder()
 				.setId(id).setSeq(seq)
 				.build()), _ -> null);
@@ -1302,6 +1313,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
     @Override
     public Publisher<CDCEvent> cdcPollAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) throws RocksDBException {
+        capabilities.requireScalarCdc();
 		var builder = CdcPollRequest.newBuilder()
 				.setId(id)
 				.setMaxEvents(maxEvents)
@@ -1316,11 +1328,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 			@NotNull String id,
 			@Nullable Long fromSeq,
 			long maxEvents) {
+        capabilities.requireScalarCdc();
 		return withRequestContext(context, () -> cdcPollBatchAsync(id, fromSeq, maxEvents));
 	}
 
     @Override
     public Mono<CdcBatch> cdcPollBatchAsync(@NotNull String id, @Nullable Long fromSeq, long maxEvents) {
+        capabilities.requireScalarCdc();
 		var builder = CdcPollRequest.newBuilder()
 				.setId(id)
 				.setMaxEvents(maxEvents)

@@ -97,11 +97,18 @@ enum RawScanMode {
   PHYSICAL_SST = 2;
   IMMUTABLE_EXPORT_JOBS = 3;
 }
+enum CdcMode {
+  CDC_MODE_UNSPECIFIED = 0;
+  CDC_UNSUPPORTED = 1;
+  SCALAR = 2;
+  VECTOR_SUBSCRIPTIONS = 3;
+}
 message CapabilitiesResponse {
   BackendMode backendMode = 1;
   RawScanMode rawScanMode = 2;
   int32 maximumRangePageKeys = 3;
   int64 maximumRangePageBytes = 4;
+  CdcMode cdcMode = 5;
 }
 
 enum PutBatchMode {

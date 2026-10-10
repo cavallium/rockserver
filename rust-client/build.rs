@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    for name in ["rocksdb.proto", "exports.proto"] {
+    for name in ["rocksdb.proto", "exports.proto", "cdc.proto"] {
         let bundled = format!("proto/{name}");
         let canonical = format!("../src/main/proto/{name}");
         println!("cargo:rerun-if-changed={bundled}");
@@ -31,7 +31,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("Could not find google/protobuf/empty.proto in ../target/protoc-dependencies. Ensure the Java project is built to generate dependencies.")?;
 
     tonic_build::configure().compile_protos(
-        &[bundled_proto, Path::new("proto/exports.proto")],
+        &[
+            bundled_proto,
+            Path::new("proto/exports.proto"),
+            Path::new("proto/cdc.proto"),
+        ],
         &["proto", &include_path],
     )?;
 

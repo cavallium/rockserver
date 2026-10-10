@@ -3,7 +3,7 @@ use std::time::Duration;
 
 // Re-export proto types that are part of the public API
 pub use crate::proto::{
-    BackendMode, CdcEvent, Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch,
+    BackendMode, CdcEvent, CdcMode, Changed, ColumnHashType, Delta, FirstAndLast, Kv, KvBatch,
     MergeBatchMode, Merged, Operation, Previous, PreviousPresence, PutBatchMode, RawScanMode,
     RequestContext, UpdateBegin, WorkloadProfile,
 };
@@ -13,6 +13,7 @@ pub use crate::proto::{
 pub struct Capabilities {
     pub backend_mode: BackendMode,
     pub raw_scan_mode: RawScanMode,
+    pub cdc_mode: CdcMode,
     pub maximum_range_page_keys: i32,
     pub maximum_range_page_bytes: i64,
 }
@@ -46,6 +47,18 @@ impl TryFrom<proto::CapabilitiesResponse> for Capabilities {
                 "distributed backends cannot expose physical SST raw scans",
             ));
         }
+        let cdc_mode = CdcMode::try_from(response.cdc_mode)
+            .map_err(|_| tonic::Status::failed_precondition("unknown CDC mode"))?;
+        if !matches!(
+            cdc_mode,
+            CdcMode::CdcUnsupported | CdcMode::Scalar | CdcMode::VectorSubscriptions
+        ) || backend_mode == BackendMode::Distributed && cdc_mode == CdcMode::Scalar
+            || backend_mode == BackendMode::Standalone && cdc_mode == CdcMode::VectorSubscriptions
+        {
+            return Err(tonic::Status::failed_precondition(
+                "invalid backend CDC mode",
+            ));
+        }
         if response.maximum_range_page_keys <= 0 || response.maximum_range_page_bytes <= 0 {
             return Err(tonic::Status::failed_precondition(
                 "bounded range page limits must be positive",
@@ -54,6 +67,7 @@ impl TryFrom<proto::CapabilitiesResponse> for Capabilities {
         Ok(Self {
             backend_mode,
             raw_scan_mode,
+            cdc_mode,
             maximum_range_page_keys: response.maximum_range_page_keys,
             maximum_range_page_bytes: response.maximum_range_page_bytes,
         })
@@ -61,6 +75,27 @@ impl TryFrom<proto::CapabilitiesResponse> for Capabilities {
 }
 
 impl Capabilities {
+    pub fn maximum_vector_cdc_records(&self) -> i32 {
+        if self.cdc_mode == CdcMode::VectorSubscriptions {
+            crate::cdc::MAX_RECORDS
+        } else {
+            0
+        }
+    }
+    pub fn maximum_vector_cdc_source_bytes(&self) -> i32 {
+        if self.cdc_mode == CdcMode::VectorSubscriptions {
+            crate::cdc::MAX_POLL_BYTES
+        } else {
+            0
+        }
+    }
+    pub fn maximum_vector_cdc_batch_bytes(&self) -> usize {
+        if self.cdc_mode == CdcMode::VectorSubscriptions {
+            crate::cdc::MAX_BATCH_BYTES
+        } else {
+            0
+        }
+    }
     pub(crate) fn with_transport_limit(
         mut self,
         maximum_message_bytes: usize,
@@ -105,6 +140,7 @@ mod capability_tests {
         let capabilities = Capabilities {
             backend_mode: BackendMode::Standalone,
             raw_scan_mode: RawScanMode::PhysicalSst,
+            cdc_mode: CdcMode::Scalar,
             maximum_range_page_keys: 4_096,
             maximum_range_page_bytes: 8 * 1024 * 1024,
         };
@@ -147,6 +183,7 @@ mod capability_tests {
         let capabilities = Capabilities {
             backend_mode: BackendMode::Standalone,
             raw_scan_mode: RawScanMode::PhysicalSst,
+            cdc_mode: CdcMode::Scalar,
             maximum_range_page_keys: 4_096,
             maximum_range_page_bytes: 8 * 1024 * 1024,
         };

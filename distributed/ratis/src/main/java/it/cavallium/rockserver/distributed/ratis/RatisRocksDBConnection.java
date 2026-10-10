@@ -101,7 +101,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     }
     @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { requireOpen(); return cdc; }
     @Override public URI getUrl() { return uri; }
-    @Override public RockserverCapabilities getCapabilities() { return new RockserverCapabilities(RockserverCapabilities.BackendMode.DISTRIBUTED,RockserverCapabilities.RawScanMode.UNSUPPORTED,RangeBudget.DEFAULT_MAX_ITEMS,RangeBudget.DEFAULT_MAX_BYTES); }
+    @Override public RockserverCapabilities getCapabilities() { return new RockserverCapabilities(RockserverCapabilities.BackendMode.DISTRIBUTED,RockserverCapabilities.RawScanMode.UNSUPPORTED,RangeBudget.DEFAULT_MAX_ITEMS,RangeBudget.DEFAULT_MAX_BYTES,RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS); }
     public List<RatisSchemaRequests.Status> pendingSchemaRequests() { return schemas.pending(); }
     public RatisSchemaRequests.Status schemaRequestStatus(UUID id) { return schemas.status(id); }
     public CompletableFuture<RatisSchemaRequests.Result> resumeSchemaRequest(UUID id,RequestContext context) { requireOpen(); return schemas.resume(id,context,false); }

@@ -97,6 +97,8 @@ public class ThriftServer extends Server {
         processor.registerProcessor(ExportThriftService.SERVICE_NAME,
                 new it.cavallium.rockserver.core.common.api.RocksDBExports.Processor<>(
                         new ExportThriftService(exportBackend, validatedMaxFrameSize)));
+        processor.registerProcessor(DistributedCdcThriftService.SERVICE_NAME,
+                new DistributedCdcThriftService(client.getCapabilities().withTransportLimit(validatedMaxFrameSize).cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null,validatedMaxFrameSize).boundedProcessor());
         try {
             var serverTransport = new ConfiguredNonblockingServerSocket(
 					new InetSocketAddress(http2Host, http2Port),
@@ -576,7 +578,8 @@ public class ThriftServer extends Server {
 					it.cavallium.rockserver.core.common.api.BackendMode.valueOf(capabilities.backendMode().name()),
 					it.cavallium.rockserver.core.common.api.RawScanMode.valueOf(capabilities.rawScanMode().name()),
 					capabilities.maximumRangePageKeys(),
-					capabilities.maximumRangePageBytes());
+					capabilities.maximumRangePageBytes(),
+                    it.cavallium.rockserver.core.common.api.CdcMode.valueOf(capabilities.cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.UNSUPPORTED ? "CDC_UNSUPPORTED" : capabilities.cdcMode().name()));
 		}
 
 		@Override

@@ -301,7 +301,7 @@ class RangePageContractTest {
 				.addService(new ReactorRocksDBServiceGrpc.RocksDBServiceImplBase() {
 					@Override
 					public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
-						return Mono.just(CapabilitiesResponse.newBuilder()
+						return Mono.just(CapabilitiesResponse.newBuilder().setCdcModeValue(2)
 								.build());
 					}
 				})

@@ -124,6 +124,7 @@ public final class ThriftConnection extends BaseConnection {
 	public RockserverCapabilities getCapabilities() {
 		return delegate.getCapabilities();
 	}
+    @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { return delegate.getDistributedCdcApi(); }
 
 	@Override
 	public void close() throws IOException {
@@ -167,6 +168,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private final Scheduler executorScheduler;
 	private final RockserverCapabilities capabilities;
 	private final AtomicBoolean closed = new AtomicBoolean();
+    private ThriftDistributedCdcClient distributedCdc;
 
 	private static it.cavallium.rockserver.core.common.api.RequestContext[] createNoTimeoutWireContexts() {
 		var contexts = new it.cavallium.rockserver.core.common.api.RequestContext[WorkloadProfile.values().length];
@@ -220,7 +222,8 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 					RockserverCapabilities.RawScanMode.valueOf(
 							Objects.requireNonNull(capabilities.getRawScanMode(), "rawScanMode").name()),
 					capabilities.getMaximumRangePageKeys(),
-					capabilities.getMaximumRangePageBytes()).withTransportLimit(maxFrameSize);
+					capabilities.getMaximumRangePageBytes(),
+                    capabilities.getCdcMode()==it.cavallium.rockserver.core.common.api.CdcMode.CDC_UNSUPPORTED ? RockserverCapabilities.CdcMode.UNSUPPORTED : RockserverCapabilities.CdcMode.valueOf(Objects.requireNonNull(capabilities.getCdcMode(),"cdcMode").name())).withTransportLimit(maxFrameSize);
 		} catch (TException | RuntimeException | Error failure) {
 			for (var slot : allClientSlots) {
 				slot.close();
@@ -240,6 +243,13 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	public RockserverCapabilities getCapabilities() {
 		return capabilities;
 	}
+    @Override public synchronized it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() {
+        capabilities.requireVectorCdc();
+        if(closed.get()) throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,"Connection closed");
+        if(distributedCdc==null) distributedCdc=new ThriftDistributedCdcClient(host,port,executor,maxFrameSize);
+        return distributedCdc;
+    }
+
 
 	@Override
 	public URI getUrl() {
@@ -251,6 +261,9 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 		if (!closed.compareAndSet(false, true)) {
 			return;
 		}
+        final ThriftDistributedCdcClient cdc;
+        synchronized(this) { cdc=distributedCdc; }
+        if(cdc!=null) cdc.close();
 		for (var slot : allClientSlots) {
 			slot.close();
 		}
@@ -861,6 +874,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			List<Long> columnIds,
 			Boolean emitLatestValues,
 			OptionalLong expectedLastCommitted) {
+        capabilities.requireScalarCdc();
 		try {
 			var request = new it.cavallium.rockserver.core.common.api.CdcCreateRequest().setId(id);
 			if (fromSeq != null) {
@@ -885,6 +899,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public void cdcDelete(String id) {
+        capabilities.requireScalarCdc();
 		try {
 			client.cdcDelete(id);
 		} catch (TException e) {
@@ -894,6 +909,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public long cdcGetEarliestAvailableSequence() {
+        capabilities.requireScalarCdc();
 		try {
 			return client.cdcGetEarliestAvailableSequence();
 		} catch (TException e) {
@@ -903,6 +919,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public OptionalLong cdcGetLastCommittedSequence(String id) {
+        capabilities.requireScalarCdc();
 		try {
 			OptionalLongValue response = client.cdcGetLastCommittedSequence(id);
 			return response.isSetValue()
@@ -920,6 +937,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public void cdcCommit(String id, long seq) {
+        capabilities.requireScalarCdc();
 		try {
 			client.cdcCommit(id, seq);
 		} catch (TException e) {
@@ -1199,6 +1217,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	}
 
 	private CdcBatch cdcPollBatch(String id, Long fromSeq, long maxEvents) {
+        capabilities.requireScalarCdc();
 		try {
 			var request = new it.cavallium.rockserver.core.common.api.CdcPollRequest()
 					.setId(id)

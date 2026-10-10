@@ -366,6 +366,7 @@ public class GrpcServer extends Server {
 				.maxInboundMessageSize(512 * 1024 * 1024)
 				.addService(service)
 				.addService(new ExportGrpcService(exports).bindBoundedService())
+                .addService(new DistributedCdcGrpcService(client.getCapabilities().cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null).bindBoundedService())
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new AdaptiveCompressionInterceptor())
@@ -1151,6 +1152,7 @@ public class GrpcServer extends Server {
                     .setRawScanMode(it.cavallium.rockserver.core.common.api.proto.RawScanMode.valueOf(capabilities.rawScanMode().name()))
                     .setMaximumRangePageKeys(capabilities.maximumRangePageKeys())
                     .setMaximumRangePageBytes(capabilities.maximumRangePageBytes())
+                    .setCdcMode(it.cavallium.rockserver.core.common.api.proto.CdcMode.valueOf(capabilities.cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.UNSUPPORTED ? "CDC_UNSUPPORTED" : capabilities.cdcMode().name()))
 					.build());
 		}
 

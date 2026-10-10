@@ -68,7 +68,7 @@ class ThriftAsyncDispatchRegressionTest {
 	@Test
 	void thriftCapabilitiesPreserveBackendLimitsAndDisableRawScans() throws Exception {
 		var backend = new RockserverCapabilities(RockserverCapabilities.BackendMode.DISTRIBUTED,
-				RockserverCapabilities.RawScanMode.IMMUTABLE_EXPORT_JOBS, 123, 456L);
+				RockserverCapabilities.RawScanMode.IMMUTABLE_EXPORT_JOBS, 123, 456L,RockserverCapabilities.CdcMode.UNSUPPORTED);
 		var connection = (RocksDBConnection) java.lang.reflect.Proxy.newProxyInstance(
 				RocksDBConnection.class.getClassLoader(), new Class<?>[] { RocksDBConnection.class },
 				(proxy, method, args) -> {
