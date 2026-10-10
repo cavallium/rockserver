@@ -270,7 +270,7 @@ public final class CompactionIoBudget {
         } else stableLoadedWindows = 0;
         lastPointMean = pointReliable ? latency : 0;
         lastBulkMean = bulkComparable ? bulkLatency : 0;
-        updateForegroundTails(stationary && !unhealthyMean, pointTailActive, bulkTailActive);
+        updateForegroundTails(stationary && !unhealthyMean, pointReliable, pointTailActive, bulkTailActive);
         boolean tailsCalibrated = !tailCalibrationNeeded
                 && (!pointTailActive || pointTailBaseline > 0 && nativePoints >= 32)
                 && (!bulkTailActive || bulkComparable && bulkTailBaseline > 0 && nativeBulks >= 32);
@@ -445,7 +445,7 @@ public final class CompactionIoBudget {
         tailBlockReads = tailBlockMicros = tailBlockKeys = tailBlockBulkMicros = 0;
         tailBlockShape = firstTailShape = firstPointMean = firstBulkMean = 0;
     }
-    private void updateForegroundTails(boolean healthy, boolean pointActive, boolean bulkActive) {
+    private void updateForegroundTails(boolean healthy, boolean pointReliable, boolean pointActive, boolean bulkActive) {
         // Maxima are noisy observations, not quantiles. Learn an envelope only with optional I/O OFF.
         if (readaheadBytes != 0 || appliedReadahead != 0 || readaheadUnknown || readaheadSettling
                 || state == State.PROBE || previous.nanos < safetyGrowthUntil || !healthy) {
@@ -464,7 +464,7 @@ public final class CompactionIoBudget {
         }
         tailBlockPointMax = Math.max(tailBlockPointMax, pointTailWindow);
         tailBlockBulkMax = Math.max(tailBlockBulkMax, bulkTailWindow);
-        tailBlockReads += reads; tailBlockMicros += micros;
+        if (pointReliable) { tailBlockReads += reads; tailBlockMicros += micros; }
         tailBlockKeys += bulkKeys; tailBlockBulkMicros += bulkTime;
         if (++tailBlockWindows < 6) return;
         double pointMean = tailBlockReads > 0 ? (double) tailBlockMicros / tailBlockReads : 0;
@@ -474,7 +474,7 @@ public final class CompactionIoBudget {
             firstPointMean = pointMean; firstBulkMean = bulkMean; firstTailShape = shape;
             tailBlocks = 1;
         } else if ((firstPointMax > 0) == pointActive && (firstBulkMax > 0) == bulkActive
-                && (!pointActive || pointMean <= firstPointMean * 1.1)
+                && (!pointActive || pointMean == 0 || firstPointMean == 0 || pointMean <= firstPointMean * 1.1)
                 && (!bulkActive || compatibleShape(shape, firstTailShape) && bulkMean <= firstBulkMean * 1.1)) {
             pointTailBaseline = Math.max(firstPointMax, tailBlockPointMax);
             bulkTailBaseline = Math.max(firstBulkMax, tailBlockBulkMax);

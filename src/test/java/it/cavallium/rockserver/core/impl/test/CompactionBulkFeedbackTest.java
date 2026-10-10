@@ -13,12 +13,15 @@ class CompactionBulkFeedbackTest {
         long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail, pointTail,
                 compTransferred = 64L << 20, compReadMicros = 250000;
         int bytePeriod = 1, bytePhase, sampleIndex, compReadCalls = 1000;
+        int metadataReads;
+        long metadataMicros = 1000;
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
         boolean point = true, pointNative = true, bulkStats = true, pressure, stopped, bulkPending;
         Trace() { step(); }
         void step() {
             nanos += 1_000_000_000L;
             if (point) { pointReads += 100; pointTime += 100 * pointLatency; }
+            pointReads += metadataReads; pointTime += metadataReads * metadataMicros;
             nativePoints += (point && pointNative ? 100 : 0) + extraPointCalls;
             done += writes;
             bytes += transferred;
@@ -443,6 +446,17 @@ class CompactionBulkFeedbackTest {
                 assertTrue(t.applied >= 65536, "a calibrated new lane must permit bounded regrowth");
             }
         }
+    }
+    @Test void denseCachedPointLaneIgnoresRareVariableMetadataMissesDuringOffCalibration() throws Exception {
+        var t = new Trace(); t.point = false; t.extraPointCalls = 100; t.metadataReads = 1;
+        t.active = t.latencyActive = t.workers; t.queued = 16;
+        t.seconds(85); // First complete OFF block: only five SDK metadata misses per window.
+        t.metadataMicros = 10000;
+        t.seconds(30); // Second block's sparse SDK misses are not a reliable point-mean comparator.
+        var reference = CompactionIoBudget.class.getDeclaredField("pointTailBaseline"); reference.setAccessible(true);
+        assertEquals(t.pointLatency, reference.getDouble(t.p), .001,
+                "dense native cache hits must qualify despite below-quorum metadata latency variation");
+        t.seconds(180); assertTrue(t.applied >= 65536);
     }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;
