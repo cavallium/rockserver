@@ -3180,6 +3180,34 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
+	private record CompactionReadCompletion(long bytes, long micros, long count) {
+		private static final CompactionReadCompletion UNAVAILABLE = new CompactionReadCompletion(-1, -1, -1);
+	}
+
+	private static CompactionReadCompletion sampleCompactionReadCompletion(org.rocksdb.Statistics statistics) {
+		try {
+			for (int attempt = 0; attempt < 3; attempt++) {
+				var before = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES);
+				var time = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
+				var after = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES);
+				var timeAfter = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
+				if (before == null || time == null || after == null || timeAfter == null) return CompactionReadCompletion.UNAVAILABLE;
+				long count = after.getCount(), bytes = after.getSum(), micros = timeAfter.getSum();
+				if (count < 0 || bytes < 0 || micros < 0 || before.getCount() < 0
+						|| before.getSum() < 0 || time.getCount() < 0 || time.getSum() < 0 || timeAfter.getCount() < 0) return CompactionReadCompletion.UNAVAILABLE;
+				// Built-in native statistics serialize each completed-histogram update with snapshots.
+				// Separate publications still need matching counts and stable sums across snapshots.
+				if (before.getCount() == count && time.getCount() == count && timeAfter.getCount() == count
+						&& before.getSum() == bytes && time.getSum() == micros
+						&& (count != 0 || bytes == 0 && micros == 0))
+					return new CompactionReadCompletion(bytes, micros, count);
+			}
+		} catch (RuntimeException unavailable) {
+			// Optional read-service telemetry must not fail pressure/foreground sampling.
+		}
+		return CompactionReadCompletion.UNAVAILABLE;
+	}
+
 	private CompactionIoBudget.Sample sampleCompactionIo(org.rocksdb.RateLimiter limiter) {
 		return sampleCompactionIo(limiter, new long[RWScheduler.POOL_TELEMETRY_LENGTH],
 				new long[RWScheduler.POOL_TELEMETRY_LENGTH]);
@@ -3230,7 +3258,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			try (var statistics = dbOptions.statistics()) {
 				var histogram = statistics.getHistogramData(org.rocksdb.HistogramType.READ_BLOCK_GET_MICROS);
-				var compactionReads = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_MICROS);
+				var compactionReads = sampleCompactionReadCompletion(statistics);
 				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
 				var bulk = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
 				scheduler.copyCompactionReadTelemetry(readPoolTelemetry, groupReadPoolTelemetry);
@@ -3247,8 +3275,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						foregroundPending,
 						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_READ)
 								+ statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_KEYS_WRITTEN), recoveryClear, urgentPressure,
-						statistics.getTickerCount(org.rocksdb.TickerType.COMPACT_READ_BYTES),
-						compactionReads.getSum(), compactionReads.getCount(), prefetch.getCount(), prefetch.getSum(),
+						compactionReads.bytes(), compactionReads.micros(), compactionReads.count(), prefetch.getCount(), prefetch.getSum(),
 						bulk.getCount(), bulk.getSum(), statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ),
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT],
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS],

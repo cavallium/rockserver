@@ -817,6 +817,7 @@ public final class CompactionIoBudget {
                 || sample.compactionReadCount < old.compactionReadCount || sample.prefetchCount < old.prefetchCount
                 || sample.prefetchBytes < old.prefetchBytes || sample.compactionReadBytes < 0
                 || sample.compactionReadMicros < 0 || sample.compactionReadCount < 0
+                || old.compactionReadBytes < 0 || old.compactionReadMicros < 0 || old.compactionReadCount < 0
                 || sample.prefetchCount < 0 || sample.prefetchBytes < 0) {
             clearReadWindow(); serviceRate = 0;
             recentReadBytes = recentReadMicros = recentReadCount = 0;
