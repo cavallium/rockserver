@@ -352,6 +352,41 @@ class CompactionBulkFeedbackTest {
         assertTrue(t.applied >= 65536);
         assertEquals(256000, tail.getDouble(t.p), .001, "only a complete healthy OFF epoch replaces the old envelope");
     }
+    @Test void unavailableCompletionSnapshotRequiresFreshDeltaBaseline() throws Exception {
+        var t = new Trace(); t.compTransferred = 4L << 20; t.compReadCalls = 64;
+        t.active = t.latencyActive = t.workers; t.queued = 16; t.pressure = true;
+        t.seconds(600);
+        long bytes = t.compBytes, micros = t.compTime, count = t.compCalls;
+        t.compBytes = -1 - t.compTransferred;
+        t.compTime = -1 - t.compReadMicros; t.compCalls = -1 - t.compReadCalls;
+        t.step(); assertEquals(0, t.applied);
+        t.compBytes = bytes; t.compTime = micros; t.compCalls = count;
+        t.step();
+        for (String name : new String[]{"compactionBytes", "compactionMicros", "compactionReads"}) {
+            var field = CompactionIoBudget.class.getDeclaredField(name); field.setAccessible(true);
+            assertEquals(0, field.getLong(t.p), "recovery must baseline instead of ingesting lifetime counters: " + name);
+        }
+        t.step();
+        var field = CompactionIoBudget.class.getDeclaredField("compactionBytes"); field.setAccessible(true);
+        assertEquals(4L << 20, field.getLong(t.p), "only actual post-baseline completion deltas qualify");
+    }
+    @Test void completionPublicationAllowsSeedDespiteSparseJobProgress() {
+        var sparse = new Trace(65536);
+        var coherent = new Trace(65536);
+        for (var t : new Trace[]{sparse, coherent}) {
+            t.active = t.latencyActive = t.workers; t.queued = 16;
+            t.bulkCallMicros = 128000; t.compReadCalls = 64;
+            t.compReadMicros = 250000; t.pressure = true;
+        }
+        sparse.bytePeriod = 120; sparse.compTransferred = 480L << 20;
+        coherent.compTransferred = 4L << 20;
+        sparse.seconds(1200); coherent.seconds(1200);
+        assertEquals(CompactionIoBudget.State.RECOVERY, sparse.p.state());
+        assertEquals(CompactionIoBudget.State.RECOVERY, coherent.p.state());
+        assertEquals(65536, coherent.applied);
+        assertEquals(0, sparse.applied,
+                "the old progress population demonstrates the false hold without relaxing controller guards");
+    }
     @Test void laggedCompactionBytesDoNotSuppressHealthyLoadedPrefetchAcrossPulsePhases() {
         for (int phase = 0; phase < 5; phase++) {
             var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;

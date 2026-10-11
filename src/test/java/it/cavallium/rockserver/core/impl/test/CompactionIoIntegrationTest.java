@@ -48,6 +48,30 @@ class CompactionIoIntegrationTest {
             var sampled = new CountDownLatch(1);
             connection.getInternalDB().setCompactionIoSampleObserverForTesting(sampled::countDown);
             assertTrue(sampled.await(5, TimeUnit.SECONDS));
+            var internal = connection.getInternalDB();
+            var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
+            var controller = (AutoCloseable) controllerField.get(internal); controller.close();
+            var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
+            var optionsField = internal.getClass().getDeclaredField("dbOptions"); optionsField.setAccessible(true);
+            var sampler = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            sampler.setAccessible(true);
+            try (var statistics = ((org.rocksdb.DBOptions) optionsField.get(internal)).statistics()) {
+                var bytes = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES);
+                var time = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
+                assertTrue(bytes.getCount() > 0, "manual compaction must exercise actual synchronous filesystem reads");
+                assertEquals(bytes.getCount(), time.getCount());
+                for (int i = 0; i < 2; i++) {
+                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                            sampler.invoke(internal, limiterField.get(controller));
+                    assertTrue(sample.valid());
+                    assertEquals(bytes.getSum(), sample.compactionReadBytes());
+                    assertEquals(time.getSum(), sample.compactionReadMicros());
+                    assertEquals(time.getCount(), sample.compactionReadCount());
+                }
+                assertEquals(bytes.getSum(), statistics.getHistogramData(
+                        org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES).getSum(),
+                        "sampling must retain cumulative completion statistics");
+            }
         }
         try (var connection = new EmbeddedConnection(dbPath, "adaptive-reopen", cfg)) {
             var api = connection.getSyncApi(RequestContext.latency(java.time.Duration.ofSeconds(10)));
