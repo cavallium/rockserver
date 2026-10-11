@@ -154,6 +154,11 @@ public final class CompactionIoBudget {
     private double pointReferenceMax, pointReferenceShape;
     private long pointReferenceCap;
     private boolean pointReferenceBulkActive;
+    private int bulkReferenceWindows, bulkReferenceIndex;
+    private final double[] bulkReferenceMeans = new double[12];
+    private double bulkReferenceShape, bulkReferenceNativeShape;
+    private long bulkReferenceCap;
+    private boolean bulkReferencePointActive;
     private long queuedIntegral, safetyGrowthUntil;
     private double queueReferenceDepth, queueReferenceMix, queueReferenceShape;
     private int queueReferenceWindows;
@@ -204,6 +209,7 @@ public final class CompactionIoBudget {
         if (bytes < 0 || bytes > readaheadCeiling) throw new IllegalArgumentException("Invalid applied readahead");
         if (bytes != appliedReadahead || readaheadUnknown) {
             pointReferenceWindows = 0; pointReferenceMax = 0;
+            bulkReferenceWindows = 0;
             queueReferenceWindows = 0; probeQueueProtected = false;
             priorReadahead = appliedReadahead;
             priorPrefetchMean = prefetchMean;
@@ -224,6 +230,7 @@ public final class CompactionIoBudget {
         }
         readaheadUnknown = readaheadSettling = true;
         pointReferenceWindows = 0; pointReferenceMax = 0;
+        bulkReferenceWindows = 0;
         queueReferenceWindows = 0; probeQueueProtected = false;
         clearReadWindow();
     }
@@ -379,6 +386,29 @@ public final class CompactionIoBudget {
                 baseline = Math.min(baseline, pointReferenceMax);
             }
         } else { pointReferenceWindows = 0; pointReferenceMax = 0; }
+        if (state != State.PROBE && stationary && bulkComparable && bulkContentValid && ownBulkReliable && tailsCalibrated && !latencyUnsafe
+                && sample.nanos >= safetyGrowthUntil && !readaheadUnknown && !readaheadSettling && readaheadBytes == appliedReadahead) {
+            if (bulkReferenceWindows > 0 && (bulkReferenceCap != appliedReadahead
+                    || bulkReferencePointActive != pointTailActive
+                    || !compatibleShape(bulkShape, bulkReferenceShape)
+                    || !compatibleShape(nativeBulkShapeInWindow, bulkReferenceNativeShape))) bulkReferenceWindows = 0;
+            if (bulkReferenceWindows == 0) {
+                bulkReferenceIndex = 0;
+                bulkReferenceCap = appliedReadahead;
+                bulkReferenceShape = bulkShape;
+                bulkReferenceNativeShape = nativeBulkShapeInWindow;
+                bulkReferencePointActive = pointTailActive;
+            }
+            bulkReferenceMeans[bulkReferenceIndex] = bulkLatency;
+            bulkReferenceIndex = (bulkReferenceIndex + 1) % bulkReferenceMeans.length;
+            bulkReferenceWindows = Math.min(bulkReferenceMeans.length, bulkReferenceWindows + 1);
+            if (bulkReferenceWindows == bulkReferenceMeans.length) {
+                double maximum = 0;
+                for (double mean : bulkReferenceMeans) maximum = Math.max(maximum, mean);
+                bulkBaseline = Math.min(bulkBaseline, maximum);
+            }
+        } else bulkReferenceWindows = 0;
+        bulkHealthy = bulkComparable && bulkLatency <= bulkBaseline * 1.2;
         pointHealthy = !pointReliable || baseline > 0 && latency <= baseline * 1.2;
         boolean readaheadGrowthAllowed = stableLoadedWindows >= 2 && tailsCalibrated && !latencyUnsafe
                 && sample.nanos >= safetyGrowthUntil;
@@ -653,6 +683,7 @@ public final class CompactionIoBudget {
     }
     private void invalidateBulk() {
         pointReferenceWindows = 0; pointReferenceMax = 0;
+        bulkReferenceWindows = 0;
         reduceReadahead(0);
         queueReferenceWindows = 0; probeQueueProtected = false;
         bulkBaseline = 0; bulkCalibrationWindows = bulkIdleWindows = readClearWindows = 0;
@@ -895,6 +926,7 @@ public final class CompactionIoBudget {
     }
     private void beginProbe(double latency, double foregroundRate, double pointCallRate) {
         pointReferenceWindows = 0; pointReferenceMax = 0;
+        bulkReferenceWindows = 0;
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
         long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));

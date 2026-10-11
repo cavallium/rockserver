@@ -77,6 +77,35 @@ class CompactionBulkFeedbackTest {
         t.seconds(5); assertTrue(t.veto(), "one clear window is insufficient");
         t.seconds(5); assertFalse(t.veto());
     }
+    @Test void sustainedWarmBulkRefreshesColdReferenceDespiteSaturatedQueueAndNoProbeBenefit() {
+        var t = new Trace(65536); t.bulkTail = 120000; t.prime();
+        double coldReference = t.p.bulkBaselineMicrosPerKey();
+        t.saturated(); t.bulkCallMicros = 20000;
+        int bindingPolls = 0, restoredTrials = 0;
+        for (int i = 0; i < 600; i++) {
+            boolean probing = t.p.state() == CompactionIoBudget.State.PROBE;
+            t.transferred = probing ? RATE * 3 / 4 : RATE;
+            if (probing) bindingPolls++;
+            t.step();
+            if (probing && t.p.state() == CompactionIoBudget.State.TRACKING) {
+                restoredTrials++;
+                assertEquals(RATE, t.p.budget(), "unchanged bulk service cannot justify a lower budget");
+            }
+        }
+        assertTrue(t.veto(), "flat saturated workers keep the established READ growth veto");
+        assertTrue(bindingPolls >= 10 && restoredTrials >= 2,
+                "the trace must include actual25% ALL_IO cuts and repeated ineffective trials");
+        double warmReference = t.p.bulkBaselineMicrosPerKey();
+        assertTrue(t.applied > 0, "otherwise the subsequent mean-safety check is vacuous");
+        t.bulkCallMicros = 30000; t.transferred = RATE; t.seconds(5);
+        assertTrue(30000d / t.shape < coldReference * 1.2,
+                "the warm regression remains hidden below the cold historical threshold");
+        assertAll(
+                () -> assertTrue(warmReference <= 20000d / t.shape * 1.01,
+                        "a complete qualified warm epoch must refresh the compatible cold bulk reference"),
+                () -> assertEquals(0, t.applied,
+                        "a50% regression of qualified warm bulk service must cut active prefetch despite unchanged raw tails"));
+    }
     @Test void pointBenefitCannotAcceptBulkRegressionDuringSaturatedProbe() {
         var t = new Trace(); t.prime(); t.bulkCallMicros = 70000; t.saturated(); t.probe();
         long prior = t.p.budget() / 3 * 4;
@@ -790,6 +819,105 @@ class CompactionBulkFeedbackTest {
         while (t.nanos < deadline) t.step();
         t.seconds(50); assertEquals(68514, t.p.baselineReadMicros(), .001, "old history must not supply the new quorum");
         t.seconds(10); assertEquals(1466, t.p.baselineReadMicros(), .001);
+    }
+    @Test void warmBulkReferenceNeedsTwelveCompleteWindowsEvenWithoutPointLane() {
+        for (boolean point : new boolean[]{true, false}) {
+            var t = new Trace(65536); t.point = point; t.bulkTail = 120000;
+            t.saturated(); t.seconds(20); t.pressure = true; t.seconds(600);
+            assertTrue(t.applied > 0); assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());
+            long budget = t.p.budget();
+            t.bulkCallMicros = 20000; t.seconds(55);
+            assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001, "eleven windows retain a cold sample");
+            t.seconds(5); assertEquals(20000d / 72, t.p.bulkBaselineMicrosPerKey(), .001);
+            assertEquals(budget, t.p.budget(), "bulk reference learning must not change Recovery priority");
+            t.bulkCallMicros = 30000; t.seconds(5); assertEquals(0, t.applied);
+        }
+    }
+    @Test void rollingBulkMaximumPreservesRecurringHealthySlowWindows() {
+        var t = new Trace(65536); t.bulkTail = 120000; t.saturated(); t.seconds(20);
+        t.pressure = true; t.seconds(600);
+        for (int cycle = 0; cycle < 18; cycle++) {
+            t.bulkCallMicros = 20000; t.seconds(5); t.bulkCallMicros = 60000; t.seconds(5);
+        }
+        assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001,
+                "a rolling maximum cannot teach away the recurring60ms bulk population");
+        assertTrue(t.applied > 0);
+        t.bulkCallMicros = 75000; t.seconds(5); assertEquals(0, t.applied);
+    }
+    @Test void sparseBulkWindowRequiresAnotherCompleteWarmMinute() {
+        var t = new Trace(65536); t.bulkTail = 120000; t.saturated(); t.seconds(20);
+        t.pressure = true; t.seconds(600); t.bulkCallMicros = 20000; t.seconds(50);
+        t.calls = 1; t.seconds(5); t.calls = 120;
+        t.seconds(55); assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001);
+        t.seconds(5); assertEquals(20000d / 72, t.p.bulkBaselineMicrosPerKey(), .001);
+    }
+    @Test void failedOrUnknownUsefulWorkCannotJoinWarmBulkReferenceMinute() {
+        for (String interrupt : new String[]{"failure", "missing", "foundReset", "bytesReset", "outcomes"}) {
+            var t = new Trace(65536); t.bulkTail = 120000; t.saturated(); t.seconds(20);
+            t.pressure = true; t.seconds(600); t.bulkCallMicros = 20000; t.seconds(50);
+            switch (interrupt) {
+                case "failure" -> t.readFailures++;
+                case "missing" -> t.contentAvailable = false;
+                case "foundReset" -> t.foundKeys = 0;
+                case "bytesReset" -> t.returnedBytes = 0;
+                case "outcomes" -> t.outcomesAvailable = false;
+                default -> throw new AssertionError(interrupt);
+            }
+            t.seconds(5); t.contentAvailable = t.outcomesAvailable = true;
+            t.seconds(5); assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001,
+                    "a failed or unavailable work window cannot complete ten old windows: " + interrupt);
+            t.seconds(50); assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001, interrupt);
+            t.seconds(15); assertEquals(20000d / 72, t.p.bulkBaselineMicrosPerKey(), .001, interrupt);
+        }
+    }
+    @Test void bulkReferenceCannotJoinSafetyCutHistoryThroughRecoveryClearWindow() throws Exception {
+        var t = new Trace(65536); t.bulkTail = 120000; t.saturated(); t.seconds(20);
+        t.pressure = true; t.bulkCallMicros = 20000;
+        var count = CompactionIoBudget.class.getDeclaredField("bulkReferenceWindows"); count.setAccessible(true);
+        for (int i = 0; i < 300 && count.getInt(t.p) != 11; i++) t.step();
+        assertEquals(11, count.getInt(t.p)); assertEquals(0, t.applied);
+        var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+        state.set(t.p, CompactionIoBudget.State.TRACKING);
+        t.pressure = false; t.compReadCalls = 1; t.compReadMicros = 100000; t.step();
+        var hold = CompactionIoBudget.class.getDeclaredField("safetyGrowthUntil"); hold.setAccessible(true);
+        long deadline = hold.getLong(t.p);
+        t.pressure = true; t.compReadCalls = 1000; t.compReadMicros = 250000; t.step();
+        t.seconds(10); assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001);
+        while (t.nanos < deadline) t.step();
+        t.seconds(50); assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001);
+        t.seconds(10); assertEquals(20000d / 72, t.p.bulkBaselineMicrosPerKey(), .001);
+    }
+    @Test void bulkCandidateResetsOnPopulationEpochSafetyAndActuatorInterruptions() throws Exception {
+        for (String interrupt : new String[]{"queue", "workers", "sdkShape", "pointLane", "invalid", "sdkReset", "nativeReset", "actuator", "ack", "probe"}) {
+            var t = new Trace(65536); t.bulkTail = 120000; t.saturated(); t.seconds(20);
+            t.pressure = true; t.seconds(600); t.bulkCallMicros = 20000; t.seconds(50);
+            switch (interrupt) {
+                case "queue" -> t.queued = 400;
+                case "workers" -> t.workers = t.active = t.latencyActive = 9;
+                case "sdkShape" -> t.shape = 108;
+                case "pointLane" -> t.point = false;
+                case "invalid" -> t.sampleValid = false;
+                case "sdkReset" -> t.bulkCount = t.bulkTime = t.bulkKeys = 0;
+                case "nativeReset" -> t.nativeBulks = t.nativeBulkKeys = 0;
+                case "actuator" -> {
+                    var failed = CompactionIoBudget.class.getDeclaredMethod("readaheadApplyFailed"); failed.setAccessible(true); failed.invoke(t.p);
+                }
+                case "ack" -> {
+                    var ack = CompactionIoBudget.class.getDeclaredMethod("readaheadApplied", long.class); ack.setAccessible(true); ack.invoke(t.p, 0L); t.applied = 0;
+                }
+                case "probe" -> {
+                    var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class);
+                    probe.setAccessible(true); probe.invoke(t.p, 22000d, 10000d, 100d);
+                }
+                default -> throw new AssertionError(interrupt);
+            }
+            t.seconds(5);
+            var count = CompactionIoBudget.class.getDeclaredField("bulkReferenceWindows"); count.setAccessible(true);
+            assertTrue(count.getInt(t.p) <= 1, "old candidate must not survive " + interrupt);
+            if (interrupt.equals("invalid") || interrupt.equals("sdkReset") || interrupt.equals("sdkShape"))
+                assertEquals(0, t.p.bulkBaselineMicrosPerKey(), .001, "existing unavailable/reset shape semantics: " + interrupt);
+            else assertEquals(60000d / 72, t.p.bulkBaselineMicrosPerKey(), .001, interrupt);
+        }
     }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;
