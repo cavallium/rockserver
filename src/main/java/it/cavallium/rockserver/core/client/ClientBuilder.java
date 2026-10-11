@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.client;
 
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.io.IOException;
+import java.net.URI;
 import java.net.UnixDomainSocketAddress;
 import java.nio.file.Path;
 
@@ -15,6 +16,12 @@ public class ClientBuilder {
 	private Path embeddedConfig;
 	private boolean embeddedInMemory;
 	private boolean useThrift;
+	private boolean deferred;
+
+	/** Defer remote connection construction and capability validation until first use. */
+	public void setDeferred(boolean deferred) {
+		this.deferred = deferred;
+	}
 
 	public void setEmbeddedPath(Path path) {
 		this.embeddedPath = path;
@@ -54,12 +61,22 @@ public class ClientBuilder {
 		} else if (embeddedPath != null) {
 			return new EmbeddedConnection(embeddedPath, name, embeddedConfig);
 		} else if (unixAddress != null) {
-			return GrpcConnection.forPath(name, unixAddress.getPath());
+			var path = unixAddress.getPath();
+			var connectionName = name;
+			return deferred
+					? new DeferredRockserverConnection(URI.create("unix://" + path),
+							() -> GrpcConnection.forPath(connectionName, path))
+					: GrpcConnection.forPath(connectionName, path);
 		} else if (httpAddress != null) {
 			if (useThrift) {
 				throw new UnsupportedOperationException("Not implemented: thrift http2 address");
 			} else {
-				return GrpcConnection.forHostAndPort(name, httpAddress);
+				var address = httpAddress;
+				var connectionName = name;
+				return deferred
+						? new DeferredRockserverConnection(URI.create("http://" + address.host() + ":" + address.port()),
+								() -> GrpcConnection.forHostAndPort(connectionName, address))
+						: GrpcConnection.forHostAndPort(connectionName, address);
 			}
 		} else if (iNetAddress != null) {
 			throw new UnsupportedOperationException("Not implemented: inet address");
