@@ -7,7 +7,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class CompactionBulkFeedbackTest {
     private static final long RATE = 256L << 20;
     private static final class Trace {
-        final CompactionIoBudget p = new CompactionIoBudget(RATE, 16L << 20);
+        final CompactionIoBudget p;
         long nanos, pointReads, pointTime, done, bytes, bulkCount, bulkTime, bulkKeys, readDone,
                 compBytes, compTime, compCalls, prefCount, prefBytes, applied, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, foundKeys, returnedBytes, readFailures, readArrivals, terminalOutcomes, nonRunOutcomes;
         long pointLatency = 22000, bulkCallMicros = 60000, transferred = RATE, writes = 10000, bulkTail, pointTail,
@@ -18,8 +18,9 @@ class CompactionBulkFeedbackTest {
         int foundPerCall = 72, returnedPerCall = 4096, readTasks = -1, acceptedTasks = -1, pointCallsPerSecond = 100, removalsPerSecond;
         boolean contentAvailable = true, arrivalsAvailable = true, outcomesAvailable = true;
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
-        boolean point = true, pointNative = true, bulkStats = true, pressure, stopped, bulkPending;
-        Trace() { step(); }
+        boolean point = true, pointNative = true, bulkStats = true, sampleValid = true, pressure, stopped, bulkPending;
+        Trace() { this(16L << 20); }
+        Trace(long ceiling) { p = new CompactionIoBudget(RATE, ceiling); step(); }
         void step() {
             nanos += 1_000_000_000L;
             if (point) { pointReads += 100; pointTime += 100 * pointLatency; }
@@ -40,7 +41,7 @@ class CompactionBulkFeedbackTest {
             compTime += compReadMicros; compCalls += compReadCalls;
             if (applied > 0) { prefCount += 32; prefBytes += 32 * applied; }
             p.sample(new CompactionIoBudget.Sample(nanos, pointReads, pointTime, bytes, true,
-                    pressure, stopped, true, true, done, !pressure, pressure,
+                    pressure, stopped, sampleValid, true, done, !pressure, pressure,
                     compBytes, compTime, compCalls, prefCount, prefBytes,
                     bulkCount, bulkTime, bulkKeys, workers, active, latencyActive, queued, readDone, bulkPending, point && pointNative || extraPointCalls > 0 ? (pointTail > 0 ? pointTail : pointLatency) : 0,
                     bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, contentAvailable ? foundKeys : -1, contentAvailable ? returnedBytes : -1,
@@ -686,6 +687,109 @@ class CompactionBulkFeedbackTest {
             else t.nonRunOutcomes = 0;
             t.seconds(15); assertEquals(prior, t.p.budget(), 4, epoch);
         }
+    }
+    @Test void sustainedWarmRecoveryTightensColdPointReferenceOnlyAfterWholeMinute() {
+        var t = new Trace(65536); t.nativePointMean = 68514; t.pointTail = 100000; t.bulkCallMicros = 115000;
+        t.active = t.latencyActive = t.workers; t.queued = 16; t.seconds(20);
+        assertEquals(68514, t.p.baselineReadMicros(), .001);
+        t.pressure = true; t.seconds(600);
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state()); assertTrue(t.applied > 0);
+        long recoveryBudget = t.p.budget();
+        t.nativePointMean = 1466; t.seconds(55);
+        assertEquals(68514, t.p.baselineReadMicros(), .001, "eleven windows cannot replace the cold reference");
+        t.seconds(5); assertEquals(1466, t.p.baselineReadMicros(), .001,
+                "a complete qualified warm minute must tighten even before the Recovery return");
+        assertEquals(recoveryBudget, t.p.budget(), "reference calibration must preserve Recovery byte-budget priority");
+        t.nativePointMean = 1800; t.step();
+        assertEquals(0, t.applied, "the tightened mean must protect the next dense poll with unchanged raw max");
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());
+    }
+    @Test void recoveryPointReferenceUsesWindowMeanMaximumAndPreservesPeriodicHealthyPeaks() {
+        var t = new Trace(65536); t.nativePointMean = 800; t.pointTail = 2000; t.bulkCallMicros = 115000;
+        t.active = t.latencyActive = t.workers; t.queued = 16; t.seconds(20);
+        t.pressure = true; t.seconds(600); assertTrue(t.applied > 0);
+        for (int cycle = 0; cycle < 18; cycle++) {
+            t.nativePointMean = 200; t.seconds(5); t.nativePointMean = 800; t.seconds(5);
+        }
+        assertEquals(800, t.p.baselineReadMicros(), .001, "rolling60s MAX cannot learn away recurring800us windows");
+        t.nativePointMean = 1000; t.step(); assertEquals(0, t.applied);
+    }
+    @Test void warmPointEnvelopeUsesMaximumRatherThanAverage() {
+        var t = new Trace(65536); t.nativePointMean = 68514; t.pointTail = 100000; t.bulkCallMicros = 115000;
+        t.active = t.latencyActive = t.workers; t.queued = 16; t.seconds(20);
+        t.pressure = true; t.seconds(600);
+        for (int cycle = 0; cycle < 6; cycle++) {
+            t.nativePointMean = 500; t.seconds(5); t.nativePointMean = 1466; t.seconds(5);
+        }
+        assertEquals(1466, t.p.baselineReadMicros(), .001);
+        t.nativePointMean = 1600; t.step(); assertTrue(t.applied > 0, "a weighted or EMA reference would falsely cut");
+    }
+    @Test void sparsePointWindowRequiresAnotherCompleteQualifiedMinute() {
+        var t = new Trace(65536); t.nativePointMean = 68514; t.pointTail = 100000; t.bulkCallMicros = 115000;
+        t.active = t.latencyActive = t.workers; t.queued = 16; t.seconds(20);
+        t.pressure = true; t.seconds(600); t.nativePointMean = 1466; t.seconds(50);
+        t.pointCallsPerSecond = 1; t.seconds(5); t.pointCallsPerSecond = 100;
+        t.seconds(55); assertEquals(68514, t.p.baselineReadMicros(), .001);
+        t.seconds(5); assertEquals(1466, t.p.baselineReadMicros(), .001);
+    }
+    @Test void pointReferenceCandidateResetsOnSafetyGeometryActuatorAndProbeInterruptions() throws Exception {
+        for (String interrupt : new String[]{"queue", "workers", "bulkShape", "invalid", "actuator", "ack", "probe"}) {
+            var t = new Trace(65536); t.nativePointMean = 68514; t.pointTail = 100000; t.bulkCallMicros = 115000;
+            t.active = t.latencyActive = t.workers; t.queued = 16; t.seconds(20);
+            t.pressure = true; t.seconds(600); t.nativePointMean = 1466; t.seconds(50);
+            switch (interrupt) {
+                case "queue" -> t.queued = 40;
+                case "workers" -> t.workers = t.active = t.latencyActive = 9;
+                case "bulkShape" -> t.shape = 108;
+                case "invalid" -> t.sampleValid = false;
+                case "actuator" -> {
+                    var failed = CompactionIoBudget.class.getDeclaredMethod("readaheadApplyFailed"); failed.setAccessible(true);
+                    failed.invoke(t.p);
+                }
+                case "ack" -> {
+                    var ack = CompactionIoBudget.class.getDeclaredMethod("readaheadApplied", long.class); ack.setAccessible(true);
+                    ack.invoke(t.p, 0L); t.applied = 0;
+                }
+                case "probe" -> {
+                    var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class);
+                    probe.setAccessible(true); probe.invoke(t.p, 1466d, 10000d, 100d);
+                }
+                default -> throw new AssertionError(interrupt);
+            }
+            var count = CompactionIoBudget.class.getDeclaredField("pointReferenceWindows"); count.setAccessible(true);
+            if (interrupt.equals("actuator") || interrupt.equals("ack") || interrupt.equals("probe")) assertEquals(0, count.getInt(t.p), interrupt);
+            else { t.seconds(5); assertEquals(0, count.getInt(t.p), interrupt); }
+            assertEquals(68514, t.p.baselineReadMicros(), .001, interrupt);
+        }
+    }
+    @Test void ownedPointEpochResetCannotCarryWarmReferenceCandidate() throws Exception {
+        var t = new Trace(65536); t.nativePointMean = 68514; t.pointTail = 100000; t.bulkCallMicros = 115000;
+        t.active = t.latencyActive = t.workers; t.queued = 16; t.seconds(20);
+        t.pressure = true; t.seconds(600); t.nativePointMean = 1466; t.seconds(50);
+        t.nativePoints = t.nativePointNanos = 0; t.step();
+        var count = CompactionIoBudget.class.getDeclaredField("pointReferenceWindows"); count.setAccessible(true);
+        assertEquals(0, count.getInt(t.p)); assertEquals(0, t.p.baselineReadMicros()); assertEquals(0, t.applied);
+    }
+    @Test void offCapSafetyCutAndRecoveryEntryCannotJoinOldPointReferenceHistory() throws Exception {
+        var t = new Trace(65536); t.nativePointMean = 68514; t.pointTail = 100000; t.bulkCallMicros = 115000;
+        t.active = t.latencyActive = t.workers; t.queued = 16; t.seconds(20);
+        t.pressure = true; t.nativePointMean = 1466;
+        var count = CompactionIoBudget.class.getDeclaredField("pointReferenceWindows"); count.setAccessible(true);
+        for (int i = 0; i < 300 && count.getInt(t.p) != 11; i++) t.step();
+        assertEquals(11, count.getInt(t.p)); assertEquals(0, t.applied);
+        assertEquals(68514, t.p.baselineReadMicros(), .001);
+        var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
+        state.set(t.p, CompactionIoBudget.State.TRACKING);
+        t.pressure = false; t.compReadCalls = 1; t.compReadMicros = 100000; t.step();
+        var hold = CompactionIoBudget.class.getDeclaredField("safetyGrowthUntil"); hold.setAccessible(true);
+        long deadline = hold.getLong(t.p);
+        t.pressure = true; t.compReadCalls = 1000; t.compReadMicros = 250000; t.step();
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.p.state());
+        t.seconds(10); assertEquals(68514, t.p.baselineReadMicros(), .001,
+                "Recovery clearWindow cannot let eleven pre-cut windows bypass the safety cooldown");
+        while (t.nanos < deadline) t.step();
+        t.seconds(50); assertEquals(68514, t.p.baselineReadMicros(), .001, "old history must not supply the new quorum");
+        t.seconds(10); assertEquals(1466, t.p.baselineReadMicros(), .001);
     }
     @Test void nativeUrgencyRetainsAuthorityDespiteBulkSaturation() {
         var t = new Trace(); t.prime(); t.saturated(); t.bulkCallMicros = 200000; t.pressure = true;

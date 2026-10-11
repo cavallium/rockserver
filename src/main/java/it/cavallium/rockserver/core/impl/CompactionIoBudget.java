@@ -149,6 +149,11 @@ public final class CompactionIoBudget {
     private boolean tailBlockPointActive, tailBlockBulkActive;
     private double queueAnchor = -1;
     private volatile double lastPointMean;
+    private int pointReferenceWindows, pointReferenceIndex;
+    private final double[] pointReferenceMeans = new double[12];
+    private double pointReferenceMax, pointReferenceShape;
+    private long pointReferenceCap;
+    private boolean pointReferenceBulkActive;
     private long queuedIntegral, safetyGrowthUntil;
     private double queueReferenceDepth, queueReferenceMix, queueReferenceShape;
     private int queueReferenceWindows;
@@ -198,6 +203,7 @@ public final class CompactionIoBudget {
     void readaheadApplied(long bytes) {
         if (bytes < 0 || bytes > readaheadCeiling) throw new IllegalArgumentException("Invalid applied readahead");
         if (bytes != appliedReadahead || readaheadUnknown) {
+            pointReferenceWindows = 0; pointReferenceMax = 0;
             queueReferenceWindows = 0; probeQueueProtected = false;
             priorReadahead = appliedReadahead;
             priorPrefetchMean = prefetchMean;
@@ -217,6 +223,7 @@ public final class CompactionIoBudget {
             probeHoldUntil = previous.nanos + 180_000_000_000L;
         }
         readaheadUnknown = readaheadSettling = true;
+        pointReferenceWindows = 0; pointReferenceMax = 0;
         queueReferenceWindows = 0; probeQueueProtected = false;
         clearReadWindow();
     }
@@ -349,6 +356,29 @@ public final class CompactionIoBudget {
         boolean tailsCalibrated = !tailCalibrationNeeded
                 && (!pointTailActive || pointTailBaseline > 0 && nativePoints >= 32)
                 && (!bulkTailActive || bulkComparable && bulkTailBaseline > 0 && nativeBulks >= 32);
+        // A cold reference may tighten only to the envelope of a full comparable minute, even in Recovery.
+        if (state != State.PROBE && stationary && pointReliable && tailsCalibrated && !latencyUnsafe
+                && sample.nanos >= safetyGrowthUntil && !readaheadUnknown && !readaheadSettling && readaheadBytes == appliedReadahead) {
+            if (pointReferenceWindows > 0 && (pointReferenceCap != appliedReadahead
+                    || pointReferenceBulkActive != bulkTailActive
+                    || bulkTailActive && !compatibleShape(nativeBulkShapeInWindow, pointReferenceShape))) {
+                pointReferenceWindows = 0; pointReferenceMax = 0;
+            }
+            if (pointReferenceWindows == 0) {
+                pointReferenceIndex = 0;
+                pointReferenceCap = appliedReadahead;
+                pointReferenceShape = nativeBulkShapeInWindow;
+                pointReferenceBulkActive = bulkTailActive;
+            }
+            pointReferenceMeans[pointReferenceIndex] = latency;
+            pointReferenceIndex = (pointReferenceIndex + 1) % pointReferenceMeans.length;
+            pointReferenceWindows = Math.min(pointReferenceMeans.length, pointReferenceWindows + 1);
+            if (pointReferenceWindows == pointReferenceMeans.length) {
+                pointReferenceMax = 0;
+                for (double mean : pointReferenceMeans) pointReferenceMax = Math.max(pointReferenceMax, mean);
+                baseline = Math.min(baseline, pointReferenceMax);
+            }
+        } else { pointReferenceWindows = 0; pointReferenceMax = 0; }
         pointHealthy = !pointReliable || baseline > 0 && latency <= baseline * 1.2;
         boolean readaheadGrowthAllowed = stableLoadedWindows >= 2 && tailsCalibrated && !latencyUnsafe
                 && sample.nanos >= safetyGrowthUntil;
@@ -622,6 +652,7 @@ public final class CompactionIoBudget {
         return reference > 0 && Math.abs(shape / reference - 1) <= .25;
     }
     private void invalidateBulk() {
+        pointReferenceWindows = 0; pointReferenceMax = 0;
         reduceReadahead(0);
         queueReferenceWindows = 0; probeQueueProtected = false;
         bulkBaseline = 0; bulkCalibrationWindows = bulkIdleWindows = readClearWindows = 0;
@@ -863,6 +894,7 @@ public final class CompactionIoBudget {
         clearReadWindow();
     }
     private void beginProbe(double latency, double foregroundRate, double pointCallRate) {
+        pointReferenceWindows = 0; pointReferenceMax = 0;
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
         long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
