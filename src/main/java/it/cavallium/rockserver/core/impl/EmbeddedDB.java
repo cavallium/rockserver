@@ -329,7 +329,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private record StoragePressureColumn(long id,
 			ColumnFamilyHandle handle,
 			@Nullable ColumnInstance registeredColumn,
-			long effectiveSoftPendingCompactionBytesLimit, int effectiveLevel0SlowdownWritesTrigger) {
+			long effectiveSoftPendingCompactionBytesLimit, int effectiveLevel0SlowdownWritesTrigger,
+			int effectiveMaxWriteBufferNumber, int effectiveMinWriteBufferNumberToMerge) {
 	}
 
 	private static long storagePressurePendingCompactionBytesOverride() {
@@ -1113,7 +1114,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return new StoragePressureColumn(handle.getID(),
 				handle,
 				null,
-				options.softPendingCompactionBytesLimit(), options.level0SlowdownWritesTrigger());
+				options.softPendingCompactionBytesLimit(), options.level0SlowdownWritesTrigger(),
+				options.maxWriteBufferNumber(), options.minWriteBufferNumberToMerge());
 	}
 
 	private void upsertStoragePressureColumn(StoragePressureColumn replacement) {
@@ -1175,7 +1177,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				pressureColumn.id(),
 				pressureColumn.handle(),
 				column,
-				pressureColumn.effectiveSoftPendingCompactionBytesLimit(), pressureColumn.effectiveLevel0SlowdownWritesTrigger()));
+				pressureColumn.effectiveSoftPendingCompactionBytesLimit(), pressureColumn.effectiveLevel0SlowdownWritesTrigger(),
+				pressureColumn.effectiveMaxWriteBufferNumber(), pressureColumn.effectiveMinWriteBufferNumberToMerge()));
 
 		logger.info("Registered column: " + column);
 		return id;
@@ -3209,6 +3212,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					long levelZeroFiles = Long.parseUnsignedLong(nativeDb.getProperty(column.handle(), "rocksdb.num-files-at-level0"));
 					int slowdownTrigger = column.effectiveLevel0SlowdownWritesTrigger();
 					urgentPressure |= slowdownTrigger >= 0 && Long.compareUnsigned(levelZeroFiles, slowdownTrigger) >= 0;
+					int maxWriteBuffers = column.effectiveMaxWriteBufferNumber();
+					// Native delay cannot precede stop for small maxima or large merge batches.
+					// NumNotFlushed includes in-flight flushes even when flush-pending is false.
+					if (maxWriteBuffers <= 3 || column.effectiveMinWriteBufferNumberToMerge() > maxWriteBuffers - 2) {
+						long immutableTables = nativeDb.getLongProperty(column.handle(),
+								RocksDBLongProperty.NUM_IMMUTABLE_MEM_TABLE.getName());
+						boolean flushHeadroomPressure = Long.compareUnsigned(immutableTables,
+								Math.max(1L, (long) maxWriteBuffers - 1)) >= 0;
+						urgentPressure |= flushHeadroomPressure;
+						recoveryClear &= !flushHeadroomPressure;
+					}
 					pressure |= urgentPressure;
 					recoveryClear &= slowdownTrigger < 0
 							|| Long.compareUnsigned(levelZeroFiles, slowdownTrigger - slowdownTrigger / 5) < 0;

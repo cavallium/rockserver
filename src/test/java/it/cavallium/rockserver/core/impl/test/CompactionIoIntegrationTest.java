@@ -276,7 +276,8 @@ class CompactionIoIntegrationTest {
                     var constructor = configured.getClass().getDeclaredConstructors()[0];
                     constructor.setAccessible(true);
                     configured = constructor.newInstance((long) handle.getID(), handle, registeredColumn,
-                            columnOptions.softPendingCompactionBytesLimit(), cachedTrigger.invoke(configured));
+                            columnOptions.softPendingCompactionBytesLimit(), cachedTrigger.invoke(configured),
+                            columnOptions.maxWriteBufferNumber(), columnOptions.minWriteBufferNumberToMerge());
                     var snapshot = originalPressureColumns.clone();
                     var cachedHandle = configured.getClass().getDeclaredMethod("handle");
                     cachedHandle.setAccessible(true);
@@ -645,6 +646,105 @@ class CompactionIoIntegrationTest {
                 controller.close(); // Repeat close must not touch the now-disposed limiter.
             }
         } finally { release.countDown(); registry.close(); }
+    }
+    @Test void flushHeadroomIsUrgentBeforeTheNativeDelayGapReachesStop(@TempDir Path root) throws Exception {
+        var cfg = config(root, "database.global.spinning=true\n");
+        try (var connection = new EmbeddedConnection(root.resolve("flush-headroom"), "flush-headroom", cfg)) {
+            var internal = connection.getInternalDB();
+            var columnId = connection.getSyncApi(RequestContext.batch()).createColumn("flush-data",
+                    ColumnSchema.of(IntList.of(1), ObjectList.of(), true));
+            var controllerField = internal.getClass().getDeclaredField("compactionIoController");
+            controllerField.setAccessible(true);
+            var controller = (AutoCloseable) controllerField.get(internal);
+            controller.close(); // Keep the native property observations deterministic.
+            var limiterField = controller.getClass().getDeclaredField("limiter");
+            limiterField.setAccessible(true);
+            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
+            var sampleMethod = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            sampleMethod.setAccessible(true);
+            var dbField = internal.getClass().getDeclaredField("db");
+            dbField.setAccessible(true);
+            var nativeDb = ((it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB) dbField.get(internal)).get();
+            var columnsField = internal.getClass().getDeclaredField("columns");
+            columnsField.setAccessible(true);
+            var column = (it.cavallium.rockserver.core.impl.ColumnInstance)
+                    ((java.util.Map<?, ?>) columnsField.get(internal)).get(columnId);
+            var handle = column.cfh();
+            var snapshotField = internal.getClass().getDeclaredField("storagePressureColumns");
+            snapshotField.setAccessible(true);
+            var original = (Object[]) snapshotField.get(internal);
+            var type = original[0].getClass();
+            var maxBuffers = type.getDeclaredMethod("effectiveMaxWriteBufferNumber");
+            var mergeBuffers = type.getDeclaredMethod("effectiveMinWriteBufferNumberToMerge");
+            var cachedHandle = type.getDeclaredMethod("handle");
+            maxBuffers.setAccessible(true); mergeBuffers.setAccessible(true); cachedHandle.setAccessible(true);
+            var optionsField = internal.getClass().getDeclaredField("columnsConifg"); optionsField.setAccessible(true);
+            var effectiveOptions = (java.util.Map<String, org.rocksdb.ColumnFamilyOptions>) optionsField.get(internal);
+            for (var cached : original) {
+                var cf = (org.rocksdb.ColumnFamilyHandle) cachedHandle.invoke(cached);
+                var options = effectiveOptions.get(new String(cf.getName(), java.nio.charset.StandardCharsets.UTF_8));
+                assertEquals(options.maxWriteBufferNumber(), maxBuffers.invoke(cached),
+                        "system and dynamic columns must retain their own effective limits");
+                assertEquals(options.minWriteBufferNumberToMerge(), mergeBuffers.invoke(cached));
+            }
+            var constructor = type.getDeclaredConstructors()[0]; constructor.setAccessible(true);
+            nativeDb.pauseBackgroundWork();
+            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(false)) {
+                for (int immutable = 1; immutable <= 3; immutable++) {
+                    nativeDb.put(handle, new byte[]{(byte) immutable}, new byte[]{1});
+                    nativeDb.flush(flush, handle);
+                    assertEquals(immutable, nativeDb.getLongProperty(handle, "rocksdb.num-immutable-mem-table"));
+                    assertEquals(0, nativeDb.getLongProperty("rocksdb.is-write-stopped"));
+                    assertEquals(0, nativeDb.getLongProperty("rocksdb.actual-delayed-write-rate"));
+                    var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                            sampleMethod.invoke(internal, limiter);
+                    assertTrue(sample.valid());
+                    assertEquals(immutable == 3, sample.urgentPressure());
+                    assertEquals(immutable == 3, sample.pressure());
+                    assertEquals(immutable < 3, sample.recoveryClear());
+                    // Isolate the effective-option boundary against this same real native count.
+                    for (int[] limits : new int[][]{{4, 2, 0}, {2, 1, 1}, {3, 1, 2}}) {
+                        var snapshot = original.clone();
+                        for (int index = 0; index < snapshot.length; index++) {
+                            if (((org.rocksdb.ColumnFamilyHandle) cachedHandle.invoke(snapshot[index])).getID() == handle.getID()) {
+                                snapshot[index] = constructor.newInstance((long) handle.getID(), handle, column,
+                                        Long.MAX_VALUE, -1, limits[0], limits[1]);
+                            }
+                        }
+                        try {
+                            snapshotField.set(internal, snapshot);
+                            var boundary = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                                    sampleMethod.invoke(internal, limiter);
+                            boolean urgent = limits[2] > 0 && immutable >= limits[2];
+                            assertEquals(urgent, boundary.urgentPressure());
+                            assertEquals(!urgent, boundary.recoveryClear());
+                        } finally { snapshotField.set(internal, original); }
+                    }
+                }
+                internal.refreshStoragePressureForTesting();
+                assertFalse(connection.getScheduler().isStoragePressure(),
+                        "flush headroom must restore background service without delaying foreground admission");
+            } finally {
+                snapshotField.set(internal, original);
+                nativeDb.continueBackgroundWork();
+            }
+            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(true)) { nativeDb.flush(flush, handle); }
+            assertEquals(0, nativeDb.getLongProperty(handle, "rocksdb.num-immutable-mem-table"));
+            var drained = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+            assertFalse(drained.urgentPressure()); assertTrue(drained.recoveryClear());
+            var system = nativeDb.getDefaultColumnFamily();
+            int systemThreshold = Math.max(1, effectiveOptions.get("default").maxWriteBufferNumber() - 1);
+            nativeDb.pauseBackgroundWork();
+            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(false)) {
+                for (int i = 0; i < systemThreshold; i++) { nativeDb.put(system, new byte[]{(byte) i}, new byte[]{1}); nativeDb.flush(flush, system); }
+                assertEquals(systemThreshold, nativeDb.getLongProperty(system, "rocksdb.num-immutable-mem-table"));
+                var systemSample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+                assertTrue(systemSample.urgentPressure()); assertFalse(systemSample.recoveryClear());
+            } finally { nativeDb.continueBackgroundWork(); }
+            try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(true)) { nativeDb.flush(flush, system); }
+            var systemDrained = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+            assertFalse(systemDrained.urgentPressure()); assertTrue(systemDrained.recoveryClear());
+        }
     }
     @Test void zeroConfiguredWriteBufferStillBootstrapsAboveAlignmentFloor(@TempDir Path root) throws Exception {
         var cfg = config(root, "database.global.write-buffer-manager=0\ndatabase.global.block-cache=8MiB\n");
