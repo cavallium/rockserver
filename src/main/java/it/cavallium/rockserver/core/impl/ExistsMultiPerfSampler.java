@@ -10,7 +10,8 @@ import org.rocksdb.PerfLevel;
 import org.rocksdb.RocksDB;
 
 /** Internal, bounded LATENCY status-only diagnostics. Caller-thread counters may omit work performed off thread;
- * block-read timing is partial and bytes are not physical disk bytes. Time-cadence sampling is not a census. */
+ * block-read timing is partial and bytes are not physical disk bytes. Index/filter timing includes cache or SST
+ * retrieval and overlaps block-read timing; it is not exclusive physical I/O time. Time-cadence sampling is not a census. */
 public final class ExistsMultiPerfSampler {
 	static final String PROPERTY = "rockserver.exists-perf.";
 	private static final ThreadLocal<Boolean> ACTIVE = new ThreadLocal<>();
@@ -29,10 +30,13 @@ public final class ExistsMultiPerfSampler {
 		Counters counters();
 	}
 
-	public record Counters(long reads, long bytes, long readNanos, long hits, long checksumNanos, long decompressNanos) {
+	public record Counters(long reads, long bytes, long readNanos, long hits, long checksumNanos, long decompressNanos,
+			long indexReads, long indexReadNanos, long filterReads, long filterReadNanos) {
 		Counters minus(Counters before) {
 			return new Counters(reads - before.reads, bytes - before.bytes, readNanos - before.readNanos,
-					hits - before.hits, checksumNanos - before.checksumNanos, decompressNanos - before.decompressNanos);
+					hits - before.hits, checksumNanos - before.checksumNanos, decompressNanos - before.decompressNanos,
+					indexReads - before.indexReads, indexReadNanos - before.indexReadNanos,
+					filterReads - before.filterReads, filterReadNanos - before.filterReadNanos);
 		}
 	}
 	public record Observation(Counters counters, long nativeNanos) {}
@@ -71,7 +75,9 @@ public final class ExistsMultiPerfSampler {
 				startNanos = Math.addExact(startNanos, Math.multiplyExact(offsetMillis, 1_000_000L));
 			}
 			String[] names = {"samples", "block.read.count", "block.read.bytes", "block.read.nanoseconds",
-					"block.cache.hits", "block.checksum.nanoseconds", "block.decompress.nanoseconds", "native.nanoseconds"};
+					"block.cache.hits", "block.checksum.nanoseconds", "block.decompress.nanoseconds", "native.nanoseconds",
+					"index.block.read.count", "index.block.read.nanoseconds",
+					"filter.block.read.count", "filter.block.read.nanoseconds"};
 			Counter[] counters = new Counter[names.length];
 			for (int i = 0; i < names.length; i++) {
 				counters[i] = registry.counter("rockserver.exists.perf.caller." + names[i], "db", db, "path", "status_only");
@@ -85,6 +91,8 @@ public final class ExistsMultiPerfSampler {
 						counters[3].increment(c.readNanos()); counters[4].increment(c.hits());
 						counters[5].increment(c.checksumNanos()); counters[6].increment(c.decompressNanos());
 						counters[7].increment(value.nativeNanos());
+						counters[8].increment(c.indexReads()); counters[9].increment(c.indexReadNanos());
+						counters[10].increment(c.filterReads()); counters[11].increment(c.filterReadNanos());
 					}, failures::increment);
 		} catch (Throwable ignored) {
 			return disabled();
@@ -105,7 +113,9 @@ public final class ExistsMultiPerfSampler {
 				public Counters counters() {
 					if (context == null) context = db.getPerfContext(); // Borrowed TLS; never reset or transfer.
 					return new Counters(context.getBlockReadCount(), context.getBlockReadByte(), context.getBlockReadTime(),
-							context.getBlockCacheHitCount(), context.getBlockChecksumTime(), context.getBlockDecompressTime());
+							context.getBlockCacheHitCount(), context.getBlockChecksumTime(), context.getBlockDecompressTime(),
+							context.getIndexBlockReadCount(), context.getReadIndexBlockNanos(),
+							context.getFilterBlockReadCount(), context.getReadFilterBlockNanos());
 				}
 			});
 		} catch (Throwable ignored) { failed(); return null; }
@@ -154,7 +164,9 @@ public final class ExistsMultiPerfSampler {
 			long elapsed = clock.getAsLong() - sample.nativeStarted();
 			var delta = sample.access().counters().minus(sample.before());
 			if (elapsed < 0 || delta.reads() < 0 || delta.bytes() < 0 || delta.readNanos() < 0
-					|| delta.hits() < 0 || delta.checksumNanos() < 0 || delta.decompressNanos() < 0) {
+					|| delta.hits() < 0 || delta.checksumNanos() < 0 || delta.decompressNanos() < 0
+					|| delta.indexReads() < 0 || delta.indexReadNanos() < 0
+					|| delta.filterReads() < 0 || delta.filterReadNanos() < 0) {
 				diagnosticFailed = true; // Another TLS user reset counters; this sample is invalid.
 			} else {
 				observation = new Observation(delta, elapsed);

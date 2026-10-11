@@ -18,7 +18,36 @@ class ExistsMultiPerfSamplerTest {
 		public ExistsMultiPerfSampler.Counters counters() {
 			reads++;
 			if (fail) throw new IllegalStateException("diagnostic JNI failure");
-			return new ExistsMultiPerfSampler.Counters(reads, reads, reads, reads, reads, reads);
+			return new ExistsMultiPerfSampler.Counters(reads, reads, reads, reads, reads, reads, reads, reads, reads, reads);
+		}
+	}
+
+	@Test void metadataCountersUsePerCallDeltasAndRejectResets() {
+		for (int reset = -1; reset < 4; reset++) {
+			var values = new long[]{100, 200, 300, 400};
+			var access = new ExistsMultiPerfSampler.Access() {
+				public PerfLevel level() { return PerfLevel.ENABLE_TIME; }
+				public void level(PerfLevel ignored) { fail(); }
+				public ExistsMultiPerfSampler.Counters counters() {
+					return new ExistsMultiPerfSampler.Counters(0, 0, 0, 0, 0, 0,
+							values[0], values[1], values[2], values[3]);
+				}
+			};
+			var observed = new java.util.concurrent.atomic.AtomicReference<ExistsMultiPerfSampler.Observation>();
+			var failures = new AtomicInteger();
+			var sampler = new ExistsMultiPerfSampler(1, 10, 1, () -> 0, observed::set, failures::incrementAndGet);
+			var sample = sampler.begin(access); assertNotNull(sample);
+			for (int i = 0; i < values.length; i++) values[i] += i + 1;
+			if (reset >= 0) values[reset] = 0;
+			sampler.finish(sample);
+			if (reset >= 0) {
+				assertNull(observed.get()); assertEquals(1, failures.get());
+			} else {
+				var c = observed.get().counters();
+				assertEquals(1, c.indexReads()); assertEquals(2, c.indexReadNanos());
+				assertEquals(3, c.filterReads()); assertEquals(4, c.filterReadNanos());
+				assertEquals(0, failures.get());
+			}
 		}
 	}
 

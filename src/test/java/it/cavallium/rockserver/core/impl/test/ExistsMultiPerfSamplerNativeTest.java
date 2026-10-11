@@ -40,6 +40,12 @@ class ExistsMultiPerfSamplerNativeTest {
 				assertTrue(observed.get().counters().reads() > 0);
 				assertTrue(observed.get().counters().bytes() > 0);
 				assertTrue(observed.get().nativeNanos() > 0);
+				var context = db.getPerfContext();
+				var counters = observed.get().counters();
+				assertEquals(context.getIndexBlockReadCount() - sample.before().indexReads(), counters.indexReads());
+				assertEquals(context.getReadIndexBlockNanos() - sample.before().indexReadNanos(), counters.indexReadNanos());
+				assertEquals(context.getFilterBlockReadCount() - sample.before().filterReads(), counters.filterReads());
+				assertEquals(context.getReadFilterBlockNanos() - sample.before().filterReadNanos(), counters.filterReadNanos());
 			}
 		}
 	}
@@ -60,6 +66,11 @@ class ExistsMultiPerfSamplerNativeTest {
 				var counter = connection.getInternalDB().getMetricsRegistry().get("rockserver.exists.perf.caller.samples").counter();
 				assertEquals(List.of(false), api.existsMulti(0, column, keys));
 				assertEquals(0, counter.count());
+				for (var suffix : List.of("index.block.read.count", "index.block.read.nanoseconds",
+						"filter.block.read.count", "filter.block.read.nanoseconds")) {
+					assertEquals(0, connection.getInternalDB().getMetricsRegistry()
+							.get("rockserver.exists.perf.caller." + suffix).counter().count());
+				}
 				assertEquals(List.of(false), latency.existsMulti(0, column, keys));
 				assertEquals(1, counter.count());
 				assertEquals(List.of(false), connection.getAsyncApi(it.cavallium.rockserver.core.common.RequestContext.latency(java.time.Duration.ofSeconds(5))).existsMultiAsync(0, column, keys).join());
