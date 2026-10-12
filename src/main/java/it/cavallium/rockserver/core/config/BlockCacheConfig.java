@@ -12,4 +12,6 @@ public interface BlockCacheConfig {
 
 	DataSize size() throws GestaltException;
 	@Nullable DataSize metadataSize() throws GestaltException;
+	/** Named-cache override; omitted fields inherit the global snapshot policy. */
+	@Nullable HotCacheSnapshotConfig snapshot() throws GestaltException;
 }
