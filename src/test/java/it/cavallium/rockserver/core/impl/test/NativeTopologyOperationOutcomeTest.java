@@ -43,6 +43,20 @@ class NativeTopologyOperationOutcomeTest {
             f.parent.apply(new ApplyPosition(1,4),DistributedCommand.advanceSessionEpochFloor(command.groupId(),1,f.parent.schemaDigest(),new OperationId(new UUID(0,1002),2,0),2));var absentOldEpoch=new OperationId(new UUID(0,1003),1,100);assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(read(f.parent,f.definition,absentOldEpoch,new byte[32]).result()).status());assertNull(read(f.parent,f.definition,unknown,new byte[32]).result());assertEquals(0,f.parent.activeSnapshotPins());
         }
     }
+    @Test void retiredParentAcknowledgesOriginalReceiptsWithoutChildEffectsAndReplaysExactly()throws Exception {
+        Path path=root.resolve("ack-retired");TopologyChange.Definition definition;DistributedCommand command,ack;byte[] result;
+        try(var f=nativeTest.new Fixture(path)) {
+            command=batch(f.parent);f.parent.apply(new ApplyPosition(1,1),command);f.freeze();f.seed();definition=f.definition;
+            assertEquals(RangeOwnership.State.RETIRED,f.parent.ownership().state());
+            ack=new DistributedCommand(command.groupId(),1,f.parent.schemaDigest(),new OperationId(command.operationId().sessionId(),1,1),List.of(),List.of(),0);
+            assertTrue(f.parent.metadataTopologyControl(ack));f.parent.validate(ack);assertTrue(f.parent.estimateReceiptRetention(ack).newReceipt());
+            result=f.parent.apply(new ApplyPosition(1,3),ack);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(result).status());
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(read(f.parent,definition,command.operationId(),command.receiptDigest()).result()).status());
+            assertArrayEquals(result,f.parent.apply(new ApplyPosition(2,4),ack));assertArrayEquals(result,read(f.parent,definition,ack.operationId(),ack.receiptDigest()).result());
+            assertArrayEquals(helper.helper.key(9),f.child.readCurrentPoint(helper.outer.fixed,helper.helper.key(1)));assertEquals(0,f.parent.activeSnapshotPins());
+        }
+        try(var pool=helper.pool(path)){var parent=helper.open(pool,definition.parents().getFirst());assertArrayEquals(result,read(parent,definition,ack.operationId(),ack.receiptDigest()).result());assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(read(parent,definition,command.operationId(),command.receiptDigest()).result()).status());}
+    }
     @Test void rejectedAcceptedTransactionRetainsOriginalBusinessReceiptDigest()throws Exception {
         try(var f=nativeTest.new Fixture(root)) {
             var scope=new TransactionScope(List.of(TransactionScope.Span.range(helper.outer.fixed,null,null)));var accepted=DistributedCommand.acceptedTransaction(batch(f.parent),new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1004),scope,new CommandResult(CommandResult.Status.SUCCESS,List.of(helper.helper.key(9),helper.helper.key(8))).encode()));var rejected=DistributedCommand.rejectAcceptedTransaction(accepted);byte[] original=f.parent.apply(new ApplyPosition(1,1),rejected);f.freeze();f.seed();assertEquals(CommandResult.Status.CONFLICT,CommandResult.decode(read(f.parent,f.definition,accepted.operationId(),accepted.receiptDigest()).result()).status());assertArrayEquals(original,read(f.parent,f.definition,accepted.operationId(),accepted.receiptDigest()).result());assertThrows(IllegalArgumentException.class,()->read(f.parent,f.definition,accepted.operationId(),rejected.payloadDigest()));

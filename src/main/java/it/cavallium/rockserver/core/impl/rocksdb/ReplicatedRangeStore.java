@@ -186,9 +186,10 @@ public final class ReplicatedRangeStore {
     /** Cached shape classification for the adapter; validate/estimate/apply separately verify native evidence. */
     public boolean metadataTopologyControl(DistributedCommand command) {
         var freeze=activeTopologyFreeze;var control=command.sessionControl();
-        return freeze!=null && control!=null && !control.binding() && groupId.equals(command.groupId()) && rangeEpoch==command.rangeEpoch()
-                && Arrays.equals(schemaDigest,command.schemaDigest()) && command.mutations().isEmpty() && command.predicates().isEmpty() && command.acceptance()==null && !command.transactionRejection()
-                && freeze.header().clusterId().equals(control.authority().clusterId()) && freeze.header().databaseId().equals(control.authority().databaseId());
+        if(freeze==null || !groupId.equals(command.groupId()) || rangeEpoch!=command.rangeEpoch()
+                || !Arrays.equals(schemaDigest,command.schemaDigest()) || !command.mutations().isEmpty() || !command.predicates().isEmpty() || command.acceptance()!=null || command.transactionRejection())return false;
+        return command.kind()==DistributedCommand.Kind.DATA && command.acknowledgedThrough()>=0
+                || control!=null && !control.binding() && freeze.header().clusterId().equals(control.authority().clusterId()) && freeze.header().databaseId().equals(control.authority().databaseId());
     }
     private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;

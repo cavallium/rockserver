@@ -51,6 +51,17 @@ class RatisTopologyOperationOutcomeTest {
             var reply=query(f,request(f,original));assertEquals(RatisTopologyOperationOutcomeRpc.Outcome.EXPIRED,reply.outcome());assertNull(reply.result());assertEquals(0,f.store.activeSnapshotPins());
         }
     }
+    @Test void retiredMetadataAdmissionAppliesExactOriginalAckAndDrainsItsReceipts()throws Exception {
+        try(var f=new RatisTopologyCdcPollTest.Fixture(root)) {
+            var original=spanning(f);f.apply(original);f.seal(true);var childPosition=f.child.applied();
+            var ack=new DistributedCommand(f.groupId,1,f.schema.digest(),new OperationId(f.session,1,2),List.of(),List.of(),1);
+            assertTrue(f.store.metadataTopologyControl(ack));byte[] result=f.apply(ack);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(result).status());
+            assertEquals(RatisTopologyOperationOutcomeRpc.Outcome.EXPIRED,query(f,request(f,original)).outcome());
+            assertEquals(RatisTopologyOperationOutcomeRpc.Outcome.FOUND,query(f,request(f,ack)).outcome());assertArrayEquals(result,f.apply(ack));
+            assertEquals(childPosition,f.child.applied());assertEquals(0,f.store.activeSnapshotPins());assertEquals(0,f.child.activeSnapshotPins());
+            var effects=new DistributedCommand(f.groupId,1,f.schema.digest(),new OperationId(f.session,1,3),original.mutations(),List.of(),2);assertFalse(f.store.metadataTopologyControl(effects));
+        }
+    }
     @Test void foreignNamespaceLineageConfigurationTermAndLifecycleStayUnavailable()throws Exception {
         try(var f=new RatisTopologyCdcPollTest.Fixture(root)) {
             var original=spanning(f);f.apply(original);f.seal(true);var request=request(f,original);

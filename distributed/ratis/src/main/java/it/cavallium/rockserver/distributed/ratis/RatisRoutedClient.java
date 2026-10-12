@@ -1230,7 +1230,13 @@ public final class RatisRoutedClient implements AutoCloseable {
         return switch(reply.outcome()) {
             case FOUND -> CommandResult.decode(reply.result());
             case EXPIRED -> new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of());
-            case ABSENT -> throw new OriginalOperationAbsent(prepared,reply);
+            case ABSENT -> {
+                if(!RatisOperationRerouteAdmissionRpc.acknowledgementOnly(prepared.command))throw new OriginalOperationAbsent(prepared,reply);
+                // Receipt cleanup belongs to this sealed lineage, using its exact original identity.
+                var result=transport.command(prepared.descriptor,prepared.command);
+                if(result==null || result.valueCount()!=0)throw new IOException("Invalid original-parent acknowledgement result");
+                yield result;
+            }
         };
     }
     public CommandResult execute(PreparedCommand prepared) throws IOException {

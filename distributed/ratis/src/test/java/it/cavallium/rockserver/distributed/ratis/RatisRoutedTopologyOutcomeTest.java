@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.*;
+import it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
@@ -80,6 +81,22 @@ class RatisRoutedTopologyOutcomeTest {
             var clock=DistributedCommand.sessionControl(original.descriptor().groupId(),original.descriptor().rangeEpoch(),parent.schemaDigest(),new OperationId(new UUID(178,2),1,0),RangeSessionControl.advance(ledger),-1);
             parent.apply(new ApplyPosition(1,parent.applied().index()+1),clock);f.topology.server.machines.get(RaftGroupId.valueOf(original.descriptor().groupId())).notifyTermIndexUpdated(1,parent.applied().index());
             assertEquals(RatisTopologyOperationOutcomeRpc.Outcome.EXPIRED,f.routed.operationOutcome(original).outcome());assertEquals(CommandResult.Status.SESSION_EXPIRED,f.routed.execute(original).status());assertEquals(1,f.writes);assertEquals(0,parent.activeSnapshotPins());
+        }
+    }
+    @Test void lostAcknowledgementAfterSplitDrainsOnlyOriginalParentAndReusesItsReceipt()throws Exception {
+        try(var f=new Fixture()) {
+            var original=f.prepare(7);f.routed.execute(original);
+            var ack=f.routed.prepareAcknowledgement(new OperationId(original.command().operationId().sessionId(),0,1),RatisTopologyControllerTest.COLUMN,new byte[]{1},0);
+            f.activate();f.routed.refresh(f.topology.definition.targetDirectory());f.lose=true;
+            assertThrows(IOException.class,()->f.routed.execute(ack));assertEquals(2,f.writes);
+            var parent=f.topology.store(original.descriptor().groupId());assertEquals(RangeOwnership.State.RETIRED,parent.ownership().state());
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,f.routed.execute(original).status());
+            assertEquals(CommandResult.Status.SUCCESS,f.routed.execute(ack).status());assertEquals(2,f.writes);
+            for(var child:f.topology.definition.targets()) {
+                var store=f.topology.store(child.groupId());assertNull(store.operationResult(ack.command().operationId(),ack.command().receiptDigest()));
+                assertArrayEquals(new byte[]{7},store.readCurrentPoint(RatisTopologyControllerTest.COLUMN,child.lowerInclusive()==null?new byte[]{1}:new byte[]{(byte)200}));
+            }
+            assertEquals(0,parent.activeSnapshotPins());
         }
     }
     @Test void authoritativeAbsenceKeepsWholeOriginalRequestAndUnavailableOrCrossedRepliesNeverAuthorizeWrites() throws Exception {
