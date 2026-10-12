@@ -57,6 +57,19 @@ class NativeHomeReservationTest {
             var another=origin(1,2,businessGrant.epoch());var replacement=TransactionStatus.reserve(new OperationRerouteOrigin(another.clusterId(),another.databaseId(),another.domainId(),another.source(),another.operation(),another.originalReceiptDigest(),another.absenceCommitment(),another.absenceCut(),another.targetDirectoryDigest(),another.planDigest(),2,new OperationId(helper.user,controlGrant.epoch(),2)),1,new byte[32]);assertEquals(CommandResult.Status.SESSION_EXPIRED,helper.apply(f,6,cas(null,replacement,0)).status());assertEquals(3,f.store.homeRecoveryCapacity().reservedCount());assertTrue(f.store.estimateHomeRecovery(abort(reserved,0)).creditCovered());
         }
     }
+    @Test void missingBusinessBindingRejectsWithoutConsumingReservationControl()throws Exception {
+        try(var f=helper.new Fixture(root)) {
+            configure(f);f.store.enableSessionControls();var business=helper.initial(0);
+            var ledger=SessionEpochLedger.initial(business.clusterId(),business.databaseId(),0).issue(business.operation().sessionId(),1000).issue(helper.user,1000);
+            var businessGrant=ledger.grants().getFirst();var controlGrant=ledger.grants().getLast();
+            helper.apply(f,1,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,controlGrant.epoch(),0),RangeSessionControl.bind(ledger,controlGrant,4),-1));
+            var source=origin(0,2,businessGrant.epoch());var bound=new OperationRerouteOrigin(source.clusterId(),source.databaseId(),source.domainId(),source.source(),source.operation(),source.originalReceiptDigest(),source.absenceCommitment(),source.absenceCut(),source.targetDirectoryDigest(),source.planDigest(),2,new OperationId(helper.user,controlGrant.epoch(),0));
+            var reserved=TransactionStatus.reserve(bound,1,new byte[32]);var command=cas(null,reserved,0);var capacity=f.store.homeRecoveryCapacity();var usage=f.store.receiptUsage();
+            assertThrows(IllegalStateException.class,()->helper.apply(f,2,command));assertEquals(new ApplyPosition(1,1),f.store.applied());assertEquals(capacity,f.store.homeRecoveryCapacity());assertEquals(usage,f.store.receiptUsage());assertNull(f.store.readCurrentPoint(helper.column,helper.key(reserved)));
+            helper.apply(f,2,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,controlGrant.epoch(),1),RangeSessionControl.bind(ledger,businessGrant,4),0));
+            assertEquals(CommandResult.Status.SUCCESS,helper.apply(f,3,command).status());assertEquals(reserved,row(f,reserved));assertEquals(3,f.store.homeRecoveryCapacity().reservedCount());
+        }
+    }
     @Test void capacityAndOriginIdentityRejectBeforeAnyReservationOrParticipantChange()throws Exception {
         try(var f=helper.new Fixture(root)) {
             configure(f);int index=0,registered=0;for(int n=0;n<64;n++){var reserved=reserve(n,64);var command=cas(null,reserved,0);try{f.store.estimateHomeRegistration(command);}catch(IllegalStateException full){break;}assertEquals(CommandResult.Status.SUCCESS,helper.apply(f,++index,command).status());registered++;}assertTrue(registered>0);assertTrue(registered<64);var capacity=f.store.homeRecoveryCapacity();assertTrue(capacity.effectiveCount()<=ReplicatedRangeStore.MAX_HOME_RECOVERIES);assertTrue(capacity.effectiveBytes()<=ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES);
