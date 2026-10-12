@@ -2,19 +2,11 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import org.junit.jupiter.api.Test;
-import org.rocksdb.HistogramData;
-import org.rocksdb.HistogramType;
 import org.rocksdb.Statistics;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class CompactionReadCompletionTest {
-    private static final HistogramType BYTES = HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES;
-    private static final HistogramType MICROS = HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS;
-
-    private HistogramData histogram(long count, long sum) {
-        return new HistogramData(0, 0, 0, 0, 0, 0, count, sum, 0);
-    }
     private long[] sample(Statistics statistics) throws Exception {
         var method = EmbeddedDB.class.getDeclaredMethod("sampleCompactionReadCompletion", Statistics.class);
         method.setAccessible(true);
@@ -27,63 +19,52 @@ class CompactionReadCompletionTest {
         }
         return values;
     }
-    @Test void completedPopulationExcludesJobProgressAndSubmissionTiming() throws Exception {
+    @Test void atomicPopulationExcludesJobProgressAndSubmissionTiming() throws Exception {
         var statistics = mock(Statistics.class);
-        when(statistics.getHistogramData(BYTES)).thenReturn(histogram(64, 4L << 20));
-        when(statistics.getHistogramData(MICROS)).thenReturn(histogram(64, 250000));
+        when(statistics.getCompactionReadCompletion()).thenReturn(new long[]{64, 4L << 20, 250000});
         assertArrayEquals(new long[]{4L << 20, 250000, 64}, sample(statistics));
-        verify(statistics, never()).getTickerCount(any());
-        verify(statistics, never()).getHistogramData(HistogramType.FILE_READ_COMPACTION_MICROS);
+        verify(statistics).getCompactionReadCompletion();
+        verifyNoMoreInteractions(statistics);
     }
-    @Test void publicationBetweenSnapshotsRetriesTheWholePopulation() throws Exception {
+    @Test void changingLegacyHistogramsCannotInvalidateAnAtomicCompletion() throws Exception {
         var statistics = mock(Statistics.class);
-        when(statistics.getHistogramData(BYTES)).thenReturn(histogram(63, 63L << 16), histogram(64, 4L << 20), histogram(64, 4L << 20));
-        when(statistics.getHistogramData(MICROS)).thenReturn(histogram(63, 246000), histogram(64, 250000), histogram(64, 250000));
+        when(statistics.getHistogramData(any())).thenThrow(new AssertionError("separate histogram sampling"));
+        when(statistics.getCompactionReadCompletion()).thenReturn(new long[]{64, 4L << 20, 250000});
         assertArrayEquals(new long[]{4L << 20, 250000, 64}, sample(statistics));
-        verify(statistics, times(4)).getHistogramData(BYTES);
-        verify(statistics, times(4)).getHistogramData(MICROS);
+        verify(statistics, never()).getHistogramData(any());
     }
-    @Test void countBeforeSumPublicationCannotMixChangingTimeSums() throws Exception {
-        var statistics = mock(Statistics.class);
-        when(statistics.getHistogramData(BYTES)).thenReturn(histogram(64, 4L << 20));
-        when(statistics.getHistogramData(MICROS)).thenReturn(histogram(64, 246000), histogram(64, 250000), histogram(64, 250000));
-        assertArrayEquals(new long[]{4L << 20, 250000, 64}, sample(statistics));
-        verify(statistics, times(4)).getHistogramData(MICROS);
-    }
-    @Test void resetBetweenSnapshotsDiscardsOldEpoch() throws Exception {
-        var statistics = mock(Statistics.class);
-        when(statistics.getHistogramData(BYTES)).thenReturn(histogram(64, 4L << 20), histogram(0, 0), histogram(0, 0));
-        when(statistics.getHistogramData(MICROS)).thenReturn(histogram(0, 0));
-        assertArrayEquals(new long[]{0, 0, 0}, sample(statistics));
-        verify(statistics, times(4)).getHistogramData(BYTES);
-    }
-    @Test void persistentMismatchIsBoundedAndUnavailable() throws Exception {
-        var statistics = mock(Statistics.class);
-        when(statistics.getHistogramData(BYTES)).thenReturn(histogram(64, 4L << 20));
-        when(statistics.getHistogramData(MICROS)).thenReturn(histogram(63, 246000));
-        assertArrayEquals(new long[]{-1, -1, -1}, sample(statistics));
-        verify(statistics, times(6)).getHistogramData(BYTES);
-        verify(statistics, times(6)).getHistogramData(MICROS);
-    }
-    @Test void missingErrorsAndInvalidCountersAreUnavailable() throws Exception {
-        for (var invalid : new HistogramData[]{null, histogram(-1, 0), histogram(1, -1), histogram(0, 1)}) {
+    @Test void unavailableAndMalformedTuplesFailClosedWithoutRetry() throws Exception {
+        for (var invalid : new long[][]{null, {}, {0, 0}, {0, 0, 0, 0},
+                {-1, 0, 0}, {1, -1, 0}, {1, 0, -1}, {0, 1, 0}, {0, 0, 1}}) {
             var statistics = mock(Statistics.class);
-            when(statistics.getHistogramData(BYTES)).thenReturn(invalid);
-            when(statistics.getHistogramData(MICROS)).thenReturn(histogram(0, 0));
+            when(statistics.getCompactionReadCompletion()).thenReturn(invalid);
             assertArrayEquals(new long[]{-1, -1, -1}, sample(statistics));
+            verify(statistics).getCompactionReadCompletion();
+            verifyNoMoreInteractions(statistics);
         }
+    }
+    @Test void telemetryErrorsRemainUnavailable() throws Exception {
         var statistics = mock(Statistics.class);
-        when(statistics.getHistogramData(BYTES)).thenThrow(new IllegalStateException("unavailable"));
+        when(statistics.getCompactionReadCompletion()).thenThrow(new IllegalStateException("unavailable"));
         assertArrayEquals(new long[]{-1, -1, -1}, sample(statistics));
+    }
+    @Test void unavailableThenValidUsesTheNextAtomicPopulation() throws Exception {
+        var statistics = mock(Statistics.class);
+        when(statistics.getCompactionReadCompletion()).thenReturn(null, new long[]{64, 4L << 20, 250000});
+        assertArrayEquals(new long[]{-1, -1, -1}, sample(statistics));
+        assertArrayEquals(new long[]{4L << 20, 250000, 64}, sample(statistics));
     }
     @Test void quietAndResetPopulationsRemainCumulativeInputs() throws Exception {
         var statistics = mock(Statistics.class);
-        when(statistics.getHistogramData(BYTES)).thenReturn(histogram(64, 4L << 20));
-        when(statistics.getHistogramData(MICROS)).thenReturn(histogram(64, 250000));
+        when(statistics.getCompactionReadCompletion()).thenReturn(new long[]{64, 4L << 20, 250000});
         assertArrayEquals(sample(statistics), sample(statistics));
-        when(statistics.getHistogramData(BYTES)).thenReturn(histogram(0, 0));
-        when(statistics.getHistogramData(MICROS)).thenReturn(histogram(0, 0));
+        when(statistics.getCompactionReadCompletion()).thenReturn(new long[]{0, 0, 0});
         assertArrayEquals(new long[]{0, 0, 0}, sample(statistics));
         verify(statistics, never()).reset();
+    }
+    @Test void zeroByteAndSubMicrosecondCompletionsRemainValid() throws Exception {
+        var statistics = mock(Statistics.class);
+        when(statistics.getCompactionReadCompletion()).thenReturn(new long[]{1, 0, 0});
+        assertArrayEquals(new long[]{0, 0, 1}, sample(statistics));
     }
 }
