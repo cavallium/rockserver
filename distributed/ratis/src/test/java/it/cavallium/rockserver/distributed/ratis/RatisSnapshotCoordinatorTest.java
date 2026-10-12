@@ -191,6 +191,26 @@ class RatisSnapshotCoordinatorTest {
             }
         }
     }
+    @Test void heldBarriersSurviveReopenAndCannotCompleteOrReleaseBeforeExplicitAdvance()throws Exception {
+        try(var f=new Fixture("held-barriers")) {
+            Path path=root.resolve("held-barriers.journal");var initial=SnapshotFenceStatus.begin(f.fence);
+            try(var journal=RatisDurableSnapshot.create(path,f.home.homes,f.data,initial,f.home.homes.prepare(control(20),null,initial),f.directory.ranges());var driver=f.driver(journal)) {
+                boolean ready=false;for(int n=0;n<32 && !ready;n++)ready=driver.step(RatisSnapshotCoordinator.StopAt.GATES_READY).action()==RatisSnapshotCoordinator.Action.GATES_READY;
+                assertTrue(ready);assertEquals(0,f.captures.get());assertFalse(journal.snapshot().observedHome().terminal());long writes=f.writes();driver.step(RatisSnapshotCoordinator.StopAt.GATES_READY);assertEquals(writes,f.writes());
+                assertNull(f.left.f.store.snapshotGate(f.fence.fenceId()).released());assertNull(f.right.f.store.snapshotGate(f.fence.fenceId()).released());
+                var mutation=f.put(f.left,1,9,100);assertThrows(IOException.class,()->f.data.execute(f.data.prepare(mutation.operationId(),mutation.mutations())));
+            }
+            try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.data);var driver=f.driver(journal)) {
+                boolean captured=false;for(int n=0;n<32 && !captured;n++){var step=driver.step(RatisSnapshotCoordinator.StopAt.CAPTURES_REPORTED);captured=step.action()==RatisSnapshotCoordinator.Action.CAPTURE_REPORTED && step.participant()==null;assertFalse(step.complete());}
+                assertTrue(captured);assertEquals(1,f.left.f.store.activeSnapshotPins());assertEquals(1,f.right.f.store.activeSnapshotPins());assertEquals(2,journal.snapshot().participants().stream().map(p->p.captureToken().snapshotId()).distinct().count());assertFalse(journal.snapshot().observedHome().terminal());for(var group:List.of(f.left,f.right))assertNull(group.f.store.snapshotGate(f.fence.fenceId()).released());
+            }
+            try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.data);var driver=f.driver(journal)) {
+                long writes=f.writes();var held=driver.step(RatisSnapshotCoordinator.StopAt.CAPTURES_REPORTED);assertEquals(RatisSnapshotCoordinator.Action.CAPTURE_REPORTED,held.action());assertEquals(writes,f.writes());assertFalse(journal.snapshot().observedHome().terminal());
+                boolean complete=false;for(int n=0;n<32 && !complete;n++)complete=driver.step().complete();assertTrue(complete);assertThrows(IOException.class,()->driver.step(RatisSnapshotCoordinator.StopAt.CAPTURES_REPORTED));
+                var mutation=f.put(f.left,1,9,101);assertEquals(CommandResult.Status.SUCCESS,f.data.execute(f.data.prepare(mutation.operationId(),mutation.mutations())).status());
+            }
+        }
+    }
     @Test void twoGroupsHelpCommittedPreparationBeforeCaptureAndRecoverLostCaptureReply() throws Exception {
         try (var f=new Fixture("two-groups")) {
             f.committedTransactionWithRightStillPrepared(); assertNull(f.right.f.store.committedParticipant(tx));

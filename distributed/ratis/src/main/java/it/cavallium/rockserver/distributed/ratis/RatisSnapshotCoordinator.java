@@ -8,7 +8,8 @@ import java.util.function.*;
 
 /** Bounded forward policy over forced snapshot control. COMPLETE never promises a volatile lease remains live. */
 public final class RatisSnapshotCoordinator implements AutoCloseable {
-    public enum Action { RETRIED_HOME, REGISTERED, WAITING, INSTALLED, HELPED, READY, CAPTURED, CAPTURE_REPORTED, COMPLETED, ABORTED, RELEASED, RETIRED, HOME_RETIRED, COMPLETE }
+    public enum StopAt { GATES_READY, CAPTURES_REPORTED, RELEASED }
+    public enum Action { GATES_READY, RETRIED_HOME, REGISTERED, WAITING, INSTALLED, HELPED, READY, CAPTURED, CAPTURE_REPORTED, COMPLETED, ABORTED, RELEASED, RETIRED, HOME_RETIRED, COMPLETE }
     public record Step(Action action,UUID participant,boolean complete) {}
     private final RatisDurableSnapshot journal;
     private final RatisSnapshotFences homes;
@@ -29,17 +30,21 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
         journal.requireClients(homes,data); groups=journal.snapshot().participants().stream().map(p -> p.route().groupId()).toList();
     }
     /** One active step and at most one state-changing RPC. Rotation happens before participant work. */
-    public Step step() throws IOException {
+    public Step step() throws IOException { return step(StopAt.RELEASED); }
+    /** Backup barriers stop before capture or HOME completion; COMPLETE would authorize independent gate release. */
+    public Step step(StopAt stop) throws IOException {
+        Objects.requireNonNull(stop);
         synchronized (this) { if (closed || active) throw new IOException("Snapshot coordinator closed or step active"); active=true; }
-        try { if (journal.snapshot().homeRetirementProof()!=null) return new Step(Action.HOME_RETIRED,null,true); return advance(); }
-        catch (RatisSnapshotHomeRetiredException retired) { return new Step(Action.HOME_RETIRED,null,true); } finally { synchronized (this) { active=false; } }
+        try { if (journal.snapshot().homeRetirementProof()!=null) { if(stop!=StopAt.RELEASED)throw new IOException("Retired snapshot cannot retain backup gates");return new Step(Action.HOME_RETIRED,null,true); } return advance(stop); }
+        catch (RatisSnapshotHomeRetiredException retired) { if(stop!=StopAt.RELEASED)throw new IOException("Retired snapshot cannot retain backup gates",retired);return new Step(Action.HOME_RETIRED,null,true); } finally { synchronized (this) { active=false; } }
     }
-    private Step advance() throws IOException {
+    private Step advance(StopAt stop) throws IOException {
         journal.refreshHome(); journal.resolveHomeFromObserved(); var snapshot=journal.snapshot();
         if (snapshot.homeResult()==null && !snapshot.homeSuperseded()) { journal.executeHome(); return result(Action.RETRIED_HOME,null); }
         var home=snapshot.observedHome();
         if (home==null) return transition(snapshot,snapshot.initial(),Action.REGISTERED,null);
         if (home.terminal()) {
+            if(stop!=StopAt.RELEASED && home.phase()==SnapshotFenceStatus.Phase.COMPLETE)throw new IOException("Snapshot completed before held backup barrier");
             UUID group=select(snapshot,p -> p.retirementProof()==null && (p.releaseReceipt()==null || p.nativeGate()==null || p.nativeGate().released()==null));
             if (group==null) return result(Action.COMPLETE,null);
             if (home.consumed()) { var resolved=journal.resolveRelease(group); if (resolved!=null && resolved.retired()) return result(Action.RETIRED,group); }
@@ -72,8 +77,9 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
             }
             return transition(journal.snapshot(),home.ready(group,ready),Action.READY,group);
         }
+        if(stop==StopAt.GATES_READY)return result(Action.GATES_READY,null);
         group=select(snapshot,p -> p.captureToken()==null || home.progress(p.route().groupId()).capture()==null);
-        if (group==null) return transition(snapshot,home.complete(),Action.COMPLETED,null);
+        if (group==null) return stop==StopAt.CAPTURES_REPORTED ? result(Action.CAPTURE_REPORTED,null) : transition(snapshot,home.complete(),Action.COMPLETED,null);
         var progress=snapshot.participant(group);
         if (progress.capture()==null) {
             var target=data.snapshotTarget(home.fence(),group); var id=Objects.requireNonNull(captureIds.get());
