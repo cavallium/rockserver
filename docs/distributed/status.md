@@ -908,8 +908,12 @@ relocation controller now drives image transfer, native tail readiness, conditio
 membership CAS and catalogue publication. Actor-journal durability/sidecar recovery
 and CAS call ownership passed the 59-case repair gate plus seven host cases in
 `/tmp/rockserver-relocation-actor-durability-repair-gate.log` and
-`/tmp/rockserver-relocation-actor-sidecar-guard-gate.log`. Joint-configuration crash
-recovery, removal/replacement and newer-schema adapter recovery remain incomplete.
+`/tmp/rockserver-relocation-actor-sidecar-guard-gate.log`. Qualified SOURCE/TARGET
+joint memberships now recover without weakening peer
+identity checks. Historical COMPLETE retries preserve newer routing. Current
+completion also refreshes the local schema/topology replica role while in-flight
+schema jobs retain their captured context. Removal/replacement and newer-schema
+adapter recovery remain incomplete.
 
 Native learners retain their original image evidence and can install an explicitly
 authorized later image without rolling back a completed tail. Receiver preparation
@@ -928,7 +932,13 @@ ownership. Native pool cohorts now share one physical snapshot and admission cha
 `/tmp/rockserver-cohort-relocation-backup-combined-gate.log`. Copied archive assets
 and fresh-cluster restore planning passed their ten cases in
 `/tmp/rockserver-relocation-image-backup-repair-gate.log`; full restore execution
-and finite retention across materialization remain incomplete.
+remains incomplete. READ_ONLY capture requests now permit a finite maximum of
+24 hours, further restricted by the configured native pin age; defaults remain
+60 seconds. WRITE_CERTIFIED stays capped at 60 seconds. Retries retain their
+original deadline. The 119-case controlled adapter selection passed in
+`/tmp/rockserver-retention-backup-export-api-repair-gate.log`, covering retention
+validation, cold journal reopen, and role rebind. The unfinished global driver
+still needs validation of its persisted deadline and complete materialization acceptance.
 
 SST imports now freeze declared count, byte, metadata and JNI batch limits in the
 current manifest. The 34-case native selection passed in
