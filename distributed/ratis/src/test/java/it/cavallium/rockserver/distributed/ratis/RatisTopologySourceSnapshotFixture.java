@@ -36,11 +36,12 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
     final ReplicatedRangeStore store;
     final RaftServer.Division division=mock(RaftServer.Division.class);
     final DivisionInfo info=mock(DivisionInfo.class);
-    final AtomicInteger captures=new AtomicInteger(),pinCloses=new AtomicInteger(),calls=new AtomicInteger(),proofs=new AtomicInteger();
+    final AtomicInteger captures=new AtomicInteger(),pinCloses=new AtomicInteger(),calls=new AtomicInteger(),proofs=new AtomicInteger(),durableReleases=new AtomicInteger(),releaseLookups=new AtomicInteger();
     final ByteArrayOutputStream received=new ByteArrayOutputStream();
     volatile CountDownLatch entered,unblock;
-    volatile boolean failFirst,unknownReply,alreadyInstalled,installed=true,owner=true;
-    RatisTopologySourceSnapshotFixture(Path root)throws Exception {
+    volatile boolean failFirst,unknownReply,alreadyInstalled,installed=true,owner=true,failRelease;
+    RatisTopologySourceSnapshotFixture(Path root)throws Exception {this(root,false);}
+    RatisTopologySourceSnapshotFixture(Path root,boolean bootstrap)throws Exception {
         this.root=root;Files.createDirectories(root.resolve("snapshots"));image=root.resolve("snapshots/native.image");
         var parent=new RangeDescriptor(id(6),group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(donor));
         var target=new RangeDescriptor(parent.rangeId(),group,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(donor,receiver));
@@ -50,7 +51,7 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
         pool=DistributedStoragePool.open(root.resolve("pool"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
         store=pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(id(3),Set.of(column),null,null),schema.digest(),Map.of(column,"data"),Set.of());store.enableLogicalSchema(schema);
         var peer=RaftPeer.newBuilder().setId(donor.peerId()).setAddress(donor.address()).build();
-        var configuration=RaftConfigurationProto.newBuilder().addPeers(peer.getRaftPeerProto()).build();store.applyNoop(new ApplyPosition(1,0),configuration.toByteArray());
+        var configuration=RaftConfigurationProto.newBuilder().addPeers(peer.getRaftPeerProto()).build();if(bootstrap){store.initializeConfiguration(configuration.toByteArray());store.applyNoop(new ApplyPosition(1,0));}else store.applyNoop(new ApplyPosition(1,0),configuration.toByteArray());
         byte[] value=new byte[2*1024*1024-512];for(int n=0;n<value.length;n++)value[n]=(byte)n;
         store.apply(new ApplyPosition(1,1),new DistributedCommand(group,1,schema.digest(),new OperationId(id(31),1,0),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{1},value))));
         when(division.getMemberId()).thenReturn(RaftGroupMemberId.valueOf(RaftPeerId.valueOf(donor.peerId()),RaftGroupId.valueOf(group)));when(division.getId()).thenReturn(RaftPeerId.valueOf(donor.peerId()));when(division.getInfo()).thenReturn(info);when(info.getCurrentTerm()).thenReturn(1L);
@@ -69,6 +70,8 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
     }
     @Override public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception {if(!owner)throw new IOException("controlled owner loss");assertEquals(store.applied(),lease.prepared().image().position());assertEquals(store.configuration().term(),lease.prepared().sourceCfg().term());assertEquals(store.configuration().index(),lease.prepared().sourceCfg().index());assertArrayEquals(store.configuration().data(),lease.prepared().sourceCfg().data());}
     @Override public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception {proofs.incrementAndGet();if(!installed || !Arrays.equals(MessageDigest.getInstance("SHA-256").digest(received.toByteArray()),lease.prepared().image().sha256()))throw new IOException("Receiver has not qualified the exact installed image");}
+    @Override public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request){releaseLookups.incrementAndGet();return false;}
+    @Override public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{durableReleases.incrementAndGet();if(failRelease)throw new IOException("controlled durable release failure");}
     @Override public InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException {
         int call=calls.incrementAndGet();if(entered!=null){entered.countDown();try{if(!unblock.await(5,TimeUnit.SECONDS))throw new IOException("controlled chunk wait expired");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}}
         if(failFirst && call==1)throw new IOException("controlled RPC failure");

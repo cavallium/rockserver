@@ -34,7 +34,8 @@ public final class RatisTopologySourceSnapshotRpc {
                     || !schema.clusterId().equals(header.clusterId()) || !schema.databaseId().equals(header.databaseId()) || !schema.domainId().equals(header.domainId())
                     || !Arrays.equals(image.schemaDigest(),header.schemaDigest()) || !Arrays.equals(schema.digest(),header.schemaDigest())
                     || !parent.owner(sourceOwner.replicaId()).equals(TopologyChange.Owner.of(sourceOwner)) || sourceOwner.role()!=ReplicaDescriptor.Role.VOTER
-                    || sourceCfg.index()<0 || sourceCfg.term()<1 || sourceCfg.index()>image.position().index() || sourceCfg.term()>image.position().term())throw new IllegalArgumentException("Prepared image differs from source/schema/configuration");
+                    || !(sourceCfg.term()==0 && sourceCfg.index()==-1) && (sourceCfg.term()<1 || sourceCfg.index()<0 || sourceCfg.index()>image.position().index() || sourceCfg.term()>image.position().term()
+                            || sourceCfg.index()==image.position().index() && sourceCfg.term()!=image.position().term()))throw new IllegalArgumentException("Prepared image differs from source/schema/configuration");
             var merges=new HashSet<UUID>();for(var column:schema.columns())if(column.operator()!=null)merges.add(column.columnId());
             if(!image.deterministicMergeColumns().equals(merges))throw new IllegalArgumentException("Image merge admission differs from qualified schema");
             bound(image.interval().lowerInclusive());bound(image.interval().upperExclusive());owner(sourceOwner);

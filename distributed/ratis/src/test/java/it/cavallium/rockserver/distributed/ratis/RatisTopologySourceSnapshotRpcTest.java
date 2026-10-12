@@ -28,4 +28,16 @@ class RatisTopologySourceSnapshotRpcTest {
             assertThrows(IllegalArgumentException.class,()->request(108,fixture.request(50)));assertEquals(0,fixture.captures.get());
         }
     }
+    @Test void actualBootstrapSourceConfigurationRoundtripsWithoutInventingACommittedIndex()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root,true);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+            var request=fixture.request(50);var prepared=service.prepare(request);assertEquals(0,fixture.store.configuration().term());assertEquals(-1,fixture.store.configuration().index());
+            var decoded=reply(reply(PREPARE,prepared),PREPARE,request);assertEquals(0,decoded.sourceCfg().term());assertEquals(-1,decoded.sourceCfg().index());assertTrue(decoded.image().position().term()>0);
+            assertSame(prepared,service.transfer(request));service.release(request);
+            byte[] data=prepared.sourceCfg().data();
+            for(var config:List.of(new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(0,0,data),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(2,0,data),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(1,2,data)))
+                assertThrows(IllegalArgumentException.class,()->new Prepared(request,prepared.image(),prepared.schema(),prepared.sourceOwner(),config,prepared.schemaRows()));
+            assertThrows(IllegalArgumentException.class,()->new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(1,-1,data));
+        }
+    }
+
 }

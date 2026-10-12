@@ -44,7 +44,7 @@ class RatisTopologySourceSnapshotServiceTest {
             var request=fixture.request(50);service.prepare(request);fixture.entered=new CountDownLatch(1);fixture.unblock=new CountDownLatch(1);
             var actual=new CompletableFuture<Prepared>();executor.execute(()->{try{actual.complete(service.transfer(request));}catch(Throwable error){actual.completeExceptionally(error);}});
             assertTrue(fixture.entered.await(5,TimeUnit.SECONDS));var observer=actual.copy();assertTrue(observer.cancel(true));assertFalse(actual.isCancelled());
-            assertThrows(IOException.class,()->service.release(request));assertThrows(IOException.class,service::close);assertEquals(0,fixture.pinCloses.get());assertEquals(1,service.stats().active());
+            assertThrows(IOException.class,()->service.release(request));assertEquals(0,fixture.durableReleases.get());assertEquals(0,fixture.releaseLookups.get());assertThrows(IOException.class,service::close);assertEquals(0,fixture.durableReleases.get());assertEquals(0,fixture.pinCloses.get());assertEquals(1,service.stats().active());
             fixture.unblock.countDown();assertThrows(ExecutionException.class,()->actual.get(5,TimeUnit.SECONDS));assertEquals(1,fixture.pinCloses.get());assertEquals(0,fixture.imageDescriptors());assertEquals(0,service.stats().leases());service.close();
         }
     }
@@ -55,6 +55,8 @@ class RatisTopologySourceSnapshotServiceTest {
                 public RatisTopologySourceSnapshotService.Lease capture(Request request)throws Exception{entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return fixture.capture(request);}
                 public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
                 public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
+                public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);}
+                public boolean isReleased(Request request)throws Exception{return fixture.isReleased(request);}
                 public InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException{return fixture.send(request);}
             };
             var limits=new RatisTopologySourceSnapshotService.Limits(4,8*1024*1024,32*1024*1024,3L*MAX_REPLY_BYTES);
@@ -76,4 +78,23 @@ class RatisTopologySourceSnapshotServiceTest {
             assertThrows(IOException.class,()->service.prepare(fixture.request(52)));assertEquals(1,fixture.pinCloses.get());assertEquals(0,service.stats().active());service.close();assertEquals(0,service.stats().reservedImageBytes());
         }
     }
+    @Test void failedDurableReleaseKeepsExactPinAndChargesUntilRetrySucceeds()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,limits())){
+            var request=fixture.request(50);service.prepare(request);service.transfer(request);var held=service.stats();fixture.failRelease=true;
+            assertThrows(IOException.class,()->service.release(request));assertEquals(1,fixture.durableReleases.get());assertEquals(0,fixture.pinCloses.get());assertEquals(held.metadataBytes(),service.stats().metadataBytes());assertEquals(held.reservedImageBytes(),service.stats().reservedImageBytes());
+            fixture.failRelease=false;service.release(request);service.release(request);assertEquals(2,fixture.durableReleases.get());assertEquals(1,fixture.pinCloses.get());assertEquals(0,service.stats().leases());
+        }
+    }
+
+    @Test void coldReleaseMetadataQuotaRejectsBeforeHostLookup()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,new RatisTopologySourceSnapshotService.Limits(4,8*1024*1024,32*1024*1024,3L*MAX_REPLY_BYTES))){
+            assertThrows(IOException.class,()->service.release(fixture.request(50)));assertEquals(0,fixture.releaseLookups.get());assertEquals(0,fixture.captures.get());assertEquals(0,service.stats().active());assertEquals(0,service.stats().metadataBytes());
+        }
+    }
+    @Test void stoppedOwnerRejectsNewColdReleaseLookupWithoutHostWork()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,limits())){
+            service.close();assertThrows(IOException.class,()->service.release(fixture.request(50)));assertEquals(0,fixture.releaseLookups.get());assertEquals(0,fixture.captures.get());assertEquals(0,service.stats().active());assertEquals(0,service.stats().metadataBytes());
+        }
+    }
+
 }

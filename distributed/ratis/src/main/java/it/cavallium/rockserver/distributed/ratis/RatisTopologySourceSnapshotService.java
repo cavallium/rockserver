@@ -14,6 +14,8 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public static final int CHUNK_BYTES=1024*1024,MAX_LEASES=4,MAX_RELEASED=1024;
     public static final long MAX_METADATA_BYTES=128L*1024*1024;
+    // CRC reader copies, expected sidecar bytes and bounded sidecar comparison during cleanup.
+    private static final long RELEASE_LOOKUP_BYTES=4L*MAX_REPLY_BYTES;
     public record Limits(int maximumLeases,long maximumImageBytes,long maximumReservedImageBytes,long maximumMetadataBytes) {
         public Limits {if(maximumLeases<1 || maximumLeases>MAX_LEASES || maximumImageBytes<1 || maximumReservedImageBytes<maximumImageBytes || maximumMetadataBytes<3L*MAX_REPLY_BYTES || maximumMetadataBytes>MAX_METADATA_BYTES)throw new IllegalArgumentException("Invalid source snapshot limits");}
         public static Limits defaults(long maximumImageBytes){return new Limits(MAX_LEASES,maximumImageBytes,Math.multiplyExact(MAX_LEASES,maximumImageBytes),MAX_METADATA_BYTES);}
@@ -31,6 +33,8 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         Lease capture(Request request)throws Exception;
         void requireOwner(Lease lease)throws Exception;
         void requireReceiverInstalled(Lease lease)throws Exception;
+        void released(Lease lease)throws Exception;
+        boolean isReleased(Request request)throws Exception;
         InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException;
     }
     public record Stats(int leases,int active,long reservedImageBytes,long metadataBytes,int released) {}
@@ -39,14 +43,14 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         Entry(Request request,long imageCharge,long metadataCharge){this.request=request;this.imageCharge=imageCharge;this.metadataCharge=metadataCharge;}
     }
     private final Host host;private final Limits limits;
-    private final Map<UUID,Entry> entries=new LinkedHashMap<>();private final Map<UUID,byte[]> released=new HashMap<>();
+    private final Map<UUID,Entry> entries=new LinkedHashMap<>();private final Map<UUID,byte[]> released=new HashMap<>();private final Set<UUID> releaseLookups=new HashSet<>();
     private long imageBytes,metadataBytes;private int active;private boolean stopping;
     public RatisTopologySourceSnapshotService(Host host,Limits limits){this.host=Objects.requireNonNull(host);this.limits=Objects.requireNonNull(limits);}
     public synchronized Stats stats(){return new Stats(entries.size(),active,imageBytes,metadataBytes,released.size());}
     public Prepared prepare(Request request)throws IOException {
         Objects.requireNonNull(request);Entry entry;boolean capture;
         synchronized(this){
-            requireOpen();requireNotReleased(request);entry=entries.get(request.transferId());
+            requireOpen();requireNotReleased(request);if(releaseLookups.contains(request.transferId()))throw new IOException("Durable release lookup still owns this transfer");entry=entries.get(request.transferId());
             if(entry!=null){requireSame(entry,request);if(entry.unusable)throw new IOException("Failed source preparation requires cleanup drainage");if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;active++;capture=entry.lease==null;}
             else {
                 long charge=3L*MAX_REPLY_BYTES;
@@ -94,10 +98,17 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         Entry entry;
         synchronized(this){
             byte[] prior=released.get(request.transferId());if(prior!=null){requireReleased(request,prior);return;}
-            entry=entries.get(request.transferId());if(entry==null)throw new IOException("Unknown source snapshot lease");requireSame(entry,request);
-            if(entry.busy || !entry.installed)throw new IOException("Source snapshot has no settled receiver installation");entry.busy=true;active++;
+            entry=entries.get(request.transferId());
+            if(entry!=null){requireSame(entry,request);if(entry.busy || !entry.installed)throw new IOException("Source snapshot has no settled receiver installation");entry.busy=true;active++;}
+            else {requireOpen();if(active>=MAX_LEASES || released.size()>=MAX_RELEASED || RELEASE_LOOKUP_BYTES>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Durable release lookup capacity/ownership unavailable");active++;metadataBytes+=RELEASE_LOOKUP_BYTES;}
         }
-        retire(entry,true);
+        if(entry!=null){retire(entry,true);return;}
+        try {
+            // This hook only reads a forced receipt; absent input cannot gain release authority.
+            if(!host.isReleased(request))throw new IOException("Unknown source snapshot lease/release receipt");
+            synchronized(this){released.put(request.transferId(),digest(request));}
+        }catch(Exception failure){throw io("Durable source release retry failed",failure);}
+        finally{synchronized(this){releaseLookups.remove(request.transferId());active--;metadataBytes-=RELEASE_LOOKUP_BYTES;notifyAll();}}
     }
     private Entry begin(Request request)throws IOException {
         synchronized(this){requireOpen();requireNotReleased(request);var entry=entries.get(request.transferId());if(entry==null || entry.lease==null || entry.unusable)throw new IOException("Prepare the exact source image first");requireSame(entry,request);if(entry.unusable)throw new IOException("Failed source preparation requires cleanup drainage");if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;active++;return entry;}
@@ -109,7 +120,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     }
     private void retire(Entry entry,boolean remember)throws IOException {
         boolean success=false;
-        try{if(entry.lease!=null)entry.lease.close();success=true;}
+        try{if(entry.lease!=null){if(remember)host.released(entry.lease);entry.lease.close();}success=true;}
         catch(Exception problem){throw io("Source snapshot cleanup failed; lease retained",problem);}
         finally{synchronized(this){active--;entry.busy=false;if(success){entries.remove(entry.request.transferId(),entry);imageBytes-=entry.imageCharge;metadataBytes-=entry.metadataCharge;if(remember)released.put(entry.request.transferId(),digest(entry.request));}notifyAll();}}
     }
