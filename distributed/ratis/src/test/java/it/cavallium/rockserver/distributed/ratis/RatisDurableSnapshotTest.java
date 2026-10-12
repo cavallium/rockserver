@@ -30,6 +30,22 @@ class RatisDurableSnapshotTest {
         return new RatisSnapshotCoordinator(journal,f.home.homes,f.client,
                 last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10));
     }
+    @Test void externalCapturedCutIsForcedAndColdReopenAcceptsExactResultWithoutCaptureRpc()throws Exception {
+        Path path=root.resolve("external.journal");try(var f=fixture("external")) {
+            var group=f.data.f.groupId;RatisRoutedClient.PreparedSnapshotCapture prepared;SnapshotFenceStatus.Capture token;
+            try(var journal=create(path,f)) {installed(journal,f);transition(journal,f,f.initial.ready(group,journal.snapshot().participant(group).readyProof()),1);prepared=f.operation();journal.freezeCapture(prepared);
+                try(var pin=f.data.f.machine.captureSnapshotGate(f.home.homes,f.fence)) {token=new SnapshotFenceStatus.Capture(prepared.request().owner(),prepared.request().snapshotId(),pin.position());int owners=f.owners.get(),homes=f.homes.get();assertEquals(token,journal.acceptExternalCapture(group,prepared,new RatisSnapshotCaptureRequest.Result(token,null)));assertEquals(owners,f.owners.get());assertEquals(homes,f.homes.get());assertArrayEquals(new byte[]{7},pin.get(f.data.f.column,new byte[]{2}));}
+            }
+            int owners=f.owners.get(),homes=f.homes.get();try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)){var saved=journal.snapshot().participant(group);assertArrayEquals(prepared.bytes(),saved.capture().bytes());assertEquals(token,saved.captureToken());assertEquals(token,journal.acceptExternalCapture(group,prepared,new RatisSnapshotCaptureRequest.Result(token,null)));assertEquals(owners,f.owners.get());assertEquals(homes,f.homes.get());var changed=f.client.prepareSnapshotCapture(prepared.target(),UUID.randomUUID(),Duration.ofSeconds(10));assertThrows(IllegalArgumentException.class,()->journal.acceptExternalCapture(group,changed,new RatisSnapshotCaptureRequest.Result(token,null)));}
+        }
+    }
+    @Test void externalJournalForceUnknownFencesOriginalOwnerThenReopensExactForcedToken()throws Exception {
+        Path path=root.resolve("external-force.journal");try(var f=fixture("external-force")) {
+            var group=f.data.f.groupId;RatisRoutedClient.PreparedSnapshotCapture prepared;SnapshotFenceStatus.Capture token;
+            try(var journal=create(path,f)){installed(journal,f);transition(journal,f,f.initial.ready(group,journal.snapshot().participant(group).readyProof()),1);prepared=f.operation();journal.freezeCapture(prepared);try(var pin=f.data.f.machine.captureSnapshotGate(f.home.homes,f.fence)){token=new SnapshotFenceStatus.Capture(prepared.request().owner(),prepared.request().snapshotId(),pin.position());journal.persistence=(file,body,maximum)->{SessionJournalFiles.write(file,body,maximum);throw new IOException("Unknown after external capture force");};var result=new RatisSnapshotCaptureRequest.Result(token,null);assertThrows(IOException.class,()->journal.acceptExternalCapture(group,prepared,result));assertThrows(IOException.class,()->journal.acceptExternalCapture(group,prepared,result));}}
+            int owners=f.owners.get(),homes=f.homes.get();try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)){assertArrayEquals(prepared.bytes(),journal.snapshot().participant(group).capture().bytes());assertEquals(token,journal.snapshot().participant(group).captureToken());assertEquals(token,journal.acceptExternalCapture(group,prepared,new RatisSnapshotCaptureRequest.Result(token,null)));assertEquals(owners,f.owners.get());assertEquals(homes,f.homes.get());}
+        }
+    }
     @Test void coordinatorCompletesForcedWorkflowWithOneRaftWritePerStep() throws Exception {
         try (var f=fixture("driver"); var journal=create(root.resolve("driver.journal"),f);
                 var driver=coordinator(journal,f)) {

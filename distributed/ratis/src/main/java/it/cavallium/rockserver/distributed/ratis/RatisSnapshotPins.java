@@ -52,7 +52,7 @@ final class RatisSnapshotPins implements AutoCloseable {
         ScopedTransactionRpc.Handle handle;
         SnapshotFenceStatus.Capture token;
         long bytes;
-        boolean busy=true,closed,permanent,cleaning,compacted;
+        boolean busy=true,closed,permanent,cleaning,compacted,external,physicalStarted;
         Entry(SnapshotFence fence,UUID snapshotId,byte[] digest,long opened,long ttl,long bytes,RatisSnapshotCaptureRequest.Mode mode) {
             this.fence=fence; fenceId=fence.fenceId(); this.snapshotId=snapshotId; this.digest=digest; this.opened=opened; this.ttl=ttl; this.bytes=bytes; anchorEpoch=fence.operation().epoch();
             this.mode=mode;
@@ -87,6 +87,40 @@ final class RatisSnapshotPins implements AutoCloseable {
         this.certifiedCapture=certifiedCapture; this.certifiedCloser=certifiedCloser; this.certifiedLive=certifiedLive;
         if ((certifiedCapture==null)!=(certifiedCloser==null) || (certifiedCapture==null)!=(certifiedLive==null)) throw new IllegalArgumentException("Incomplete certified capture ownership");
     }
+    final class ExternalReservation {
+        private final Entry entry;
+        private ExternalReservation(Entry entry){this.entry=entry;}
+    }
+    /** Reserve every cohort participant before starting the one physical capture. No factory or HOME lookup. */
+    ExternalReservation reserveExternal(RatisSnapshotCaptureRequest request,LongSupplier floor)throws Exception {
+        Objects.requireNonNull(request);Objects.requireNonNull(floor);requireOwner(request.owner());
+        if(request.mode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY)throw new IllegalArgumentException("External cohort capture must be read-only");
+        if(request.ttl().compareTo(limits.maximumTtl())>0)throw new IllegalArgumentException("Snapshot pin TTL exceeds advertised limit");
+        var fence=request.fence();var participant=fence.participant(group);byte[] definition=fence.encode(),digest=hash(definition);long bytes=TOMBSTONE_BYTES+(long)definition.length+RangeMutationHistory.accountedScopeBytes(participant.scope());
+        expire();retireBefore(floor.getAsLong());synchronized(this){
+            if(closed)throw lost("Registry is closed");var existing=entries.get(fence.fenceId());
+            if(existing!=null){if(!existing.snapshotId.equals(request.snapshotId()) || existing.ttl!=request.ttl().toNanos() || existing.mode!=request.mode() || !Arrays.equals(existing.digest,digest))throw new IllegalArgumentException("External reservation changed original request");if(existing.busy)throw new IOException("Snapshot capture/operation is still running");throw lost("Original external capture identity is already owned or retired");}
+            if(fence.operation().epoch()<minimumEpoch)throw lost("Snapshot business epoch was retired");if(snapshots.containsKey(request.snapshotId()))throw new IllegalArgumentException("Snapshot ID belongs to another fence");
+            if(entries.size()>=limits.captures() || bytes>limits.bytes()-chargedBytes)throw new IOException("Snapshot pin entry/metadata admission exhausted");var entry=new Entry(fence,request.snapshotId(),digest,nanos.getAsLong(),request.ttl().toNanos(),bytes,request.mode());entry.external=true;entries.put(entry.fenceId,entry);snapshots.put(entry.snapshotId,entry);chargedBytes+=bytes;return new ExternalReservation(entry);
+        }
+    }
+    private Entry external(ExternalReservation reservation)throws IOException {
+        if(reservation==null || !reservation.entry.external || entries.get(reservation.entry.fenceId)!=reservation.entry || snapshots.get(reservation.entry.snapshotId)!=reservation.entry)throw new IOException("External reservation is not owned by this registry");return reservation.entry;
+    }
+    /** Irreversible identity marker, set before entering code that may physically capture. */
+    synchronized void markPhysicalStarted(ExternalReservation reservation)throws Exception {var entry=external(reservation);ensureLive(entry);if(!entry.busy || entry.physicalStarted)throw new IOException("External capture already started or settled");entry.physicalStarted=true;entry.permanent=true;}
+    /** Transfers this exact owned pin, including failed publication cleanup, to the registry. */
+    Captured publishExternal(ExternalReservation reservation,ReplicatedRangeStore.ScopedSnapshot pin)throws Exception {
+        Objects.requireNonNull(pin);final Entry entry;synchronized(this){entry=external(reservation);if(!entry.busy || !entry.physicalStarted || entry.pin!=null)throw new IOException("External capture is not awaiting its original physical result");entry.pin=pin;pins++;}
+        boolean success=false;Throwable failure=null;try {
+            pin.requireLive();var participant=entry.fence.participant(group);if(!pin.groupId().equals(group) || pin.rangeEpoch()!=participant.rangeEpoch() || !Arrays.equals(pin.schemaDigest(),participant.schemaDigest()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(pin.scope()),ScopedTransactionRpc.scopeBytes(participant.scope())))throw lost("External capture returned another scope/range");
+            var token=new SnapshotFenceStatus.Capture(owner,entry.snapshotId,pin.position());synchronized(this){ensureLive(entry);entry.token=token;}success=true;return new Captured(token,null);
+        }catch(IllegalStateException problem){var lost=new RatisSnapshotLostException("External native pin is no longer open",problem);failure=lost;throw lost;}catch(Exception|Error problem){failure=problem;throw problem;}finally{finish(entry,!success,failure);}
+    }
+    /** Cancellation does not settle an already-started physical action; its actual exit must fail or publish. */
+    void cancelExternal(ExternalReservation reservation)throws Exception {synchronized(this){var entry=external(reservation);entry.closed=true;if(!entry.physicalStarted)entry.busy=false;}cleanup();}
+    /** Called only after the physical attempt has actually exited and unadopted pins have closed. */
+    void failExternal(ExternalReservation reservation)throws Exception {final Entry entry;synchronized(this){entry=external(reservation);if(entry.pin!=null || !entry.busy)throw new IOException("External capture has already transferred or settled");}finish(entry,true,null);}
     SnapshotFenceStatus.Capture capture(RatisSnapshotFences homes,SnapshotFence fence,UUID expectedOwner,UUID snapshotId,Duration ttl,LongSupplier floor) throws Exception {
         return capture(homes,fence,expectedOwner,snapshotId,ttl,floor,RatisSnapshotCaptureRequest.Mode.READ_ONLY).token();
     }
@@ -154,11 +188,11 @@ final class RatisSnapshotPins implements AutoCloseable {
             if (existing.busy) throw new IOException("Snapshot capture/operation is still running");
             ensureLive(existing);
             if (existing.token==null) throw lost("Capture has no historical pin");
-            if (mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY) return new Captured(existing.token,null);
             existing.busy=true;
         }
         boolean retire=false; Throwable failure=null;
         try {
+            if(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY){try{existing.pin.requireLive();}catch(IllegalStateException closed){retire=true;throw new RatisSnapshotLostException("Original read-only capture owner is no longer open",closed);}synchronized(this){ensureLive(existing);return new Captured(existing.token,null);}}
             if (!certifiedLive.live(existing.handle)) { retire=true; throw lost("Original writable capture owner is no longer valid"); }
             synchronized (this) { ensureLive(existing); return new Captured(existing.token,existing.handle); }
         } catch (Exception | Error problem) { failure=problem; throw problem; }
@@ -286,7 +320,7 @@ final class RatisSnapshotPins implements AutoCloseable {
         Throwable failure=null;
         for (var entry:release) {
             boolean success=false;
-            try { if (entry.pin!=null) closer.close(entry.pin); success=entry.handle==null || certifiedCloser.close(entry.handle); }
+            try { if (entry.pin!=null) closer.close(entry.pin); success=(entry.pin==null || entry.pin.releaseSettled()) && (entry.handle==null || certifiedCloser.close(entry.handle)); }
             catch (Throwable problem) { if (failure==null) failure=problem; else if (failure!=problem) failure.addSuppressed(problem); }
             finally {
                 synchronized (this) {

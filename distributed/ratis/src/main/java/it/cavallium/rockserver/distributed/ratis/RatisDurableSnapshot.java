@@ -33,6 +33,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         Entry(RangeDescriptor route) { this.route=route; }
         ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,certifiedHandle,captureLost,captureReleased,captureReleaseLost,releaseFrozen,releaseReceipt,retirementProof); }
     }
+    @FunctionalInterface interface Persistence {void write(Path path,byte[] body,int maximum)throws IOException;}
+    Persistence persistence=SessionJournalFiles::write;
     private final Path path;
     private final RatisSnapshotFences homes;
     private final RatisRoutedClient data;
@@ -242,15 +244,24 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 if (failure instanceof RatisSnapshotLostException || failure.getCause() instanceof IllegalArgumentException) { synchronized (this) { entry.captureLost=true; persist(); } throw new RatisSnapshotLostException("Frozen owner capture lost or changed",failure); }
                 throw failure;
             }
-            synchronized (this) {
-                var token=captured.token(); var request=entry.capture.request(); var homeToken=observed==null ? null : observed.progress(group).capture();
-                if (!token.ownerIncarnation().equals(request.owner()) || !token.snapshotId().equals(request.snapshotId()) || entry.ready==null || !atLeast(token.position(),entry.ready)
-                        || entry.token!=null && !entry.token.equals(token) || entry.certifiedHandle!=null && !entry.certifiedHandle.equals(captured.handle()) || homeToken!=null && !homeToken.equals(token)) {
-                    entry.captureLost=true; persist(); throw new RatisSnapshotLostException("Capture token changed its frozen identity/cut");
-                }
-                if (entry.token==null) { entry.token=token; entry.certifiedHandle=captured.handle(); persist(); } return token;
-            }
+            synchronized(this){return acceptCaptured(entry,group,captured);}
+
         } finally { end(); }
+    }
+    /** Accepts the original cohort-owned result without any capture or HOME RPC. Request must already be forced. */
+    public synchronized SnapshotFenceStatus.Capture acceptExternalCapture(UUID group,RatisRoutedClient.PreparedSnapshotCapture exactPrepared,RatisSnapshotCaptureRequest.Result result)throws IOException {
+        idle();var entry=entry(group);Objects.requireNonNull(exactPrepared);Objects.requireNonNull(result);
+        if(captureMode!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || exactPrepared.request().mode()!=captureMode || result.handle()!=null)throw new IllegalArgumentException("External cohort capture must retain read-only mode");
+        if(entry.capture==null || !sameCapture(entry.capture,exactPrepared))throw new IllegalArgumentException("External capture changed its frozen request/owner/route");
+        if(entry.captureLost || entry.captureReleaseFrozen)throw new RatisSnapshotLostException("Capture was lost or explicitly released");return acceptCaptured(entry,group,result);
+    }
+    private SnapshotFenceStatus.Capture acceptCaptured(Entry entry,UUID group,RatisSnapshotCaptureRequest.Result captured)throws IOException {
+        var token=captured.token();var request=entry.capture.request();var homeToken=observed==null ? null : observed.progress(group).capture();
+        if((captureMode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED)!=(captured.handle()!=null) || !token.ownerIncarnation().equals(request.owner()) || !token.snapshotId().equals(request.snapshotId()) || entry.ready==null || !atLeast(token.position(),entry.ready)
+                || entry.token!=null && !entry.token.equals(token) || entry.certifiedHandle!=null && !entry.certifiedHandle.equals(captured.handle()) || homeToken!=null && !homeToken.equals(token)) {
+            entry.captureLost=true;persist();throw new RatisSnapshotLostException("Capture token changed its frozen identity/cut/mode");
+        }
+        if(entry.token==null){entry.token=token;entry.certifiedHandle=captured.handle();persist();}return token;
     }
     private RatisSnapshotCaptureRequest.Result readCapture(Entry entry) throws IOException {
         return captureMode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED ? data.executeWritableSnapshotCapture(entry.capture)
@@ -453,7 +464,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private void idle() throws IOException { requireOpen(); if (homeRetirementProof!=null) throw new RatisSnapshotHomeRetiredException(homeRetirementProof); if (active) throw new IOException("Snapshot journal RPC already active"); }
     private synchronized void end() { active=false; }
     private void persist() throws IOException {
-        try { SessionJournalFiles.write(path,encode(),MAX_BYTES); }
+        try { persistence.write(path,encode(),MAX_BYTES); }
         catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Snapshot journal persistence failed; reopen it",failure); }
     }
     @Override public synchronized void close() throws IOException {
