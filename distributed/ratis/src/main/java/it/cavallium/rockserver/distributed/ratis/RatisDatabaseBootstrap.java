@@ -10,7 +10,7 @@ import org.apache.ratis.client.RaftClient;
 
 /** Frozen database bootstrap. Every DATA domain shares one ledger and must pass fresh readiness. */
 public final class RatisDatabaseBootstrap implements AutoCloseable {
-    public static final int MAX_DOMAINS=64,MAX_SCOPE_BYTES=16*1024*1024;
+    public static final int MAX_DOMAINS=DatabaseDomainRoster.MAX_DOMAINS,MAX_SCOPE_BYTES=16*1024*1024;
     public enum Phase { PREFLIGHT, SCHEMA, GENESIS, CLOCK, PROPAGATE, VERIFY, READY, CONFLICT, EXPIRED }
     public record Domain(RatisNodePlan plan,RatisRoutedClient routed,DistributedSchema schema,byte[] allocationWitness) {
         public Domain {
@@ -35,11 +35,12 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
     private record RangeWork(DomainWork domain,RangeDescriptor range) {}
     private record State(Phase phase,SessionAuthority target,BitSet checked,int cursor,int domain) {}
     private final List<DomainWork> domains;private final List<RangeWork> ranges;private final LongSupplier time;private final byte[] scope;
+    private final DatabaseDomainRoster beforeRoster,afterRoster;private final RatisDatabaseDomainRoster rosters;
     private final FileChannel lockChannel;private final FileLock lock;private RatisCatalogueClock clock;
     private State state=new State(Phase.PREFLIGHT,null,new BitSet(),0,0);private boolean busy,closing,closed;
 
     /** Existing ledger is an immutable publication witness. Null creates it once at initialTime. All clients remain borrowed. */
-    public RatisDatabaseBootstrap(Path root,List<Domain> inputs,RaftClient client,SessionEpochLedger existingLedger,
+    public RatisDatabaseBootstrap(Path root,List<Domain> inputs,RaftClient client,SessionEpochLedger existingLedger,DatabaseDomainRoster expectedRoster,
                                   long initialTime,LongSupplier time,int maxRanges)throws IOException {
         Objects.requireNonNull(client);this.time=Objects.requireNonNull(time);inputs=List.copyOf(inputs);
         if(inputs.isEmpty() || inputs.size()>MAX_DOMAINS || initialTime<0 || maxRanges<1 || maxRanges>RangeDirectoryCodec.MAX_RANGES)throw new IllegalArgumentException("Invalid database bootstrap scope/budget");
@@ -65,7 +66,9 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             for(var range:d.ranges()){if(!rangeIds.add(range.rangeId()) || !groups.add(range.groupId()) || metadataGroups.contains(range.groupId()))throw new IllegalArgumentException("Duplicate DATA group identity");allRanges.add(new RangeWork(domain,range));}
         }
         if(allRanges.size()>maxRanges)throw new IllegalArgumentException("Aggregate range budget exceeded");
-        domains=List.copyOf(work);ranges=List.copyOf(allRanges);requireCachedScope();scope=binding(inputs,existingLedger,initialTime);
+        beforeRoster=expectedRoster; afterRoster=expectedRoster==null ? DatabaseDomainRoster.initial(directory.clusterId(),directory.databaseId(),domainIds) : expectedRoster.add(domainIds);
+        RatisDatabaseDomainRoster.requireNamespace(afterRoster,directory.clusterId(),directory.databaseId()); rosters=new RatisDatabaseDomainRoster(client,directory.clusterId(),directory.databaseId(),c);
+        domains=List.copyOf(work);ranges=List.copyOf(allRanges);requireCachedScope();scope=binding(inputs,existingLedger,initialTime,beforeRoster,afterRoster);
         Path path=root.toAbsolutePath();if(!Files.isDirectory(path))throw new IOException("Bootstrap root is absent");
         var epochs=new RatisSessionEpochs(client,directory.clusterId(),directory.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
         lockChannel=FileChannel.open(path.resolve("bootstrap.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);FileLock acquired=null;
@@ -76,7 +79,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             var ledger=existingLedger==null ? SessionEpochLedger.initial(directory.clusterId(),directory.databaseId(),initialTime) : existingLedger;
             for(int i=0;i<domains.size();i++){var domain=domains.get(i);var input=domain.input;var journals=Files.createDirectories(parent.resolve(input.plan().directory().domainId().toString()));SessionJournalFiles.force(journals);SessionJournalFiles.force(parent);
                 if(input.schema()!=null)domain.publication=new RatisSchemaPublication(journals.resolve("schema.bin"),client,input.plan(),input.schema(),input.allocationWitness(),Map.of(),Map.of(),Map.of());
-                domain.genesis=new RatisCatalogueGenesis(journals.resolve("genesis.bin"),client,input.plan(),initialTime,i==0 && existingLedger==null ? null : ledger);
+                domain.genesis=new RatisCatalogueGenesis(journals.resolve("genesis.bin"),client,input.plan(),initialTime,i==0 && existingLedger==null ? null : ledger,i==0 ? beforeRoster : afterRoster,afterRoster);
                 var clocks=Files.createDirectories(journals.resolve("ranges"));SessionJournalFiles.force(clocks);SessionJournalFiles.force(journals);domain.propagation=new RatisSessionPropagation(clocks,epochs,input.routed(),maxRanges);
             }
             clock=new RatisCatalogueClock(path.resolve("clock.bin"),epochs);
@@ -86,10 +89,10 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
         if(first.homes().size()!=next.homes().size())return false;
         for(var home:first.homes()){var other=next.home(home.role());if(other==null || !home.column().equals(other.column()) || !home.physicalName().equals(other.physicalName()) || !Arrays.equals(home.directory().payloadDigest(),other.directory().payloadDigest()))return false;}return true;
     }
-    private static byte[] binding(List<Domain> domains,SessionEpochLedger ledger,long initialTime)throws IOException {
+    private static byte[] binding(List<Domain> domains,SessionEpochLedger ledger,long initialTime,DatabaseDomainRoster beforeRoster,DatabaseDomainRoster afterRoster)throws IOException {
         var bytes=new ByteArrayOutputStream();var out=new DataOutputStream(bytes);out.writeLong(ledger==null ? initialTime : 0);out.writeInt(domains.size());
         for(var domain:domains){out.write(domain.plan().identityDigest());out.write(domain.plan().directory().payloadDigest());out.write(domain.schema()==null ? new byte[32] : domain.schema().digest());var witness=domain.allocationWitness();out.writeInt(witness==null ? -1 : witness.length);if(witness!=null)out.write(witness);}
-        if(ledger!=null)out.write(ledger.encode());return OperatorUpload.sha256(bytes.toByteArray());
+        if(ledger!=null)out.write(ledger.encode());out.writeInt(beforeRoster==null ? -1 : beforeRoster.encode().length);if(beforeRoster!=null)out.write(beforeRoster.encode());out.write(afterRoster.encode());return OperatorUpload.sha256(bytes.toByteArray());
     }
     public synchronized Progress progress(){return progress(state,Map.of());}
     /** Bounded participant work or one immutable publication; catalogue observations are additional work. */
@@ -112,7 +115,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
         }finally{synchronized(this){busy=false;}}
     }
     private void requireCachedScope()throws IOException {for(var domain:domains)if(!Arrays.equals(domain.scope,domain.input.routed().directory().payloadDigest()))throw new IOException("Bootstrap routed directory changed; frozen intent cannot be rebased");}
-    private void requirePublishedScope()throws IOException {for(var domain:domains){var current=RatisRoutedClient.rpc(()->domain.catalogue.read(domain.input.plan().directory().domainId()));if(current==null || !Arrays.equals(domain.scope,current.payloadDigest()))throw new IOException("Published directory differs from frozen bootstrap scope");requirePublishedSchema(domain);}}
+    private void requirePublishedScope()throws IOException {var view=rosters.readComplete();if(!view.roster().equals(afterRoster))throw new IOException("Published database roster differs from frozen bootstrap scope");for(var domain:domains){var current=RatisRoutedClient.rpc(()->domain.catalogue.read(domain.input.plan().directory().domainId()));if(current==null || !Arrays.equals(domain.scope,current.payloadDigest()))throw new IOException("Published directory differs from frozen bootstrap scope");requirePublishedSchema(domain);}}
     private void requirePublishedSchema(DomainWork domain)throws IOException {if(domain.schemas==null)return;var schema=domain.input.schema();var current=RatisRoutedClient.rpc(()->domain.schemas.read(schema.digest()));if(current==null || !Arrays.equals(DistributedSchemaCodec.encode(schema),DistributedSchemaCodec.encode(current)))throw new IOException("Published schema differs from frozen bootstrap content");}
     private Progress progress(State state,Map<UUID,String> failures){return new Progress(state.phase(),HexFormat.of().formatHex(scope),state.target(),state.checked().cardinality(),ranges.size(),failures);}
     @Override public synchronized void close()throws IOException {if(closed)return;if(busy)throw new IOException("Bootstrap work is active");closing=true;for(var domain:domains)domain.close();if(clock!=null)clock.close();try{if(lock.isValid())lock.release();}finally{lockChannel.close();}closed=true;}

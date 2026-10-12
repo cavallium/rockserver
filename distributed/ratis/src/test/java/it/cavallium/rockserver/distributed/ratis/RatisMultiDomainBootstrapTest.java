@@ -73,7 +73,7 @@ class RatisMultiDomainBootstrapTest {
             public void close()throws Exception{routed.close();machine.close();machine.awaitNativeReaders(java.time.Duration.ofSeconds(5));storage.close();}
         }
         List<RatisDatabaseBootstrap.Domain> domains(){return List.of(new RatisDatabaseBootstrap.Domain(data.get(0).plan,data.get(0).routed,data.get(0).schema,null),new RatisDatabaseBootstrap.Domain(data.get(1).plan,data.get(1).routed,data.get(1).schema,RatisColumnAllocation.counterValue(71)));}
-        RatisDatabaseBootstrap bootstrap(Path path,SessionEpochLedger existing,int maximum)throws IOException{return new RatisDatabaseBootstrap(path,domains(),client,existing,10,()->20L,maximum);}
+        RatisDatabaseBootstrap bootstrap(Path path,SessionEpochLedger existing,int maximum)throws IOException{return new RatisDatabaseBootstrap(path,domains(),client,existing,null,10,()->20L,maximum);}
         RatisCatalogue directories(){return catalogue.epochs.catalogue(outer.directoryColumn);}
         void ready(RatisDatabaseBootstrap bootstrap)throws IOException {for(int n=0;n<40;n++)if(bootstrap.step(1).phase()==RatisDatabaseBootstrap.Phase.READY)return;fail("Aggregate bootstrap did not reach READY");}
         void writesWithOneIssuedGrant()throws Exception {
@@ -118,13 +118,13 @@ class RatisMultiDomainBootstrapTest {
             byte[] identity=Files.readAllBytes(path.resolve("bootstrap.identity"));var later=f.data.get(1);var journals=path.resolve("domains").resolve(later.domain.toString());assertTrue(Files.isDirectory(journals));try(var files=Files.walk(journals)){for(var file:files.sorted(Comparator.reverseOrder()).toList())Files.delete(file);}assertFalse(Files.exists(journals));
             var descriptor=new RangeDescriptor(later.descriptor.rangeId(),later.group,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,later.descriptor.replicas());var directory=new RangeDirectory(f.outer.cluster,f.outer.database,later.domain,1,later.schema.digest(),0,Set.of(later.column),0,List.of(descriptor));var plan=new RatisNodePlan(f.node,f.incarnation,directory,later.plan.catalogue(),later.plan.columns(),Set.of(),2);assertArrayEquals(later.plan.identityDigest(),plan.identityDigest());assertFalse(Arrays.equals(later.directory.payloadDigest(),directory.payloadDigest()));
             try(var routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{return later.routed.read(column,key);}public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{return later.append(command);}public RangeStateView stateView(RangeDescriptor route)throws IOException{return later.routed.stateView(later.group);}})) {
-                var changed=List.of(f.domains().getFirst(),new RatisDatabaseBootstrap.Domain(plan,routed,later.schema,RatisColumnAllocation.counterValue(71)));assertThrows(IOException.class,()->new RatisDatabaseBootstrap(path,changed,f.client,null,10,()->20L,2));assertFalse(Files.exists(journals));assertArrayEquals(identity,Files.readAllBytes(path.resolve("bootstrap.identity")));assertEquals(0,f.catalogue.next.get());
+                var changed=List.of(f.domains().getFirst(),new RatisDatabaseBootstrap.Domain(plan,routed,later.schema,RatisColumnAllocation.counterValue(71)));assertThrows(IOException.class,()->new RatisDatabaseBootstrap(path,changed,f.client,null,null,10,()->20L,2));assertFalse(Files.exists(journals));assertArrayEquals(identity,Files.readAllBytes(path.resolve("bootstrap.identity")));assertEquals(0,f.catalogue.next.get());
             }
         }
     }
     @Test void duplicateDomainsAndAggregateRangeBudgetFailBeforeWritingAnyIntent()throws Exception {
         try(var f=new Fixture()) {
-            Path duplicates=Files.createDirectory(root.resolve("duplicate"));var first=f.domains().getFirst();assertThrows(IllegalArgumentException.class,()->new RatisDatabaseBootstrap(duplicates,List.of(first,first),f.client,null,10,()->20L,2));try(var files=Files.list(duplicates)){assertEquals(0,files.count());}
+            Path duplicates=Files.createDirectory(root.resolve("duplicate"));var first=f.domains().getFirst();assertThrows(IllegalArgumentException.class,()->new RatisDatabaseBootstrap(duplicates,List.of(first,first),f.client,null,null,10,()->20L,2));try(var files=Files.list(duplicates)){assertEquals(0,files.count());}
             Path limited=Files.createDirectory(root.resolve("limited"));assertThrows(IllegalArgumentException.class,()->f.bootstrap(limited,null,1));try(var files=Files.list(limited)){assertEquals(0,files.count());}assertEquals(0,f.catalogue.next.get());for(var d:f.data)assertEquals(0,d.commands);
         }
     }

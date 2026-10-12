@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.distributed.*;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -18,7 +19,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
  * Publishing a directory does not fence or activate data groups; a topology controller must establish those facts. */
 public final class RatisCatalogue {
     // Both old and new images must fit one conditional command, including its envelopes.
-    public static final int MAX_DIRECTORY_BYTES = (DistributedCommandCodec.MAX_ENCODED_BYTES-RatisSchemaAdministration.MAX_HEAD_BYTES-RatisRangeImportCatalogue.MAX_HEAD_BYTES-TopologyChange.MAX_STATUS_BYTES-512)/2;
+    public static final int MAX_DIRECTORY_BYTES = (DistributedCommandCodec.MAX_ENCODED_BYTES-RatisSchemaAdministration.MAX_HEAD_BYTES-RatisRangeImportCatalogue.MAX_HEAD_BYTES-TopologyChange.MAX_STATUS_BYTES-2*DatabaseDomainRoster.MAX_BYTES-512)/2;
     private final RaftClient client;
     private final UUID clusterId, databaseId, groupId, columnId;
     private final long rangeEpoch;
@@ -57,14 +58,18 @@ public final class RatisCatalogue {
 
     /** Prepare once; retry this exact command/operation identity after an uncertain reply. */
     public DistributedCommand prepare(OperationId operationId, RangeDirectory expected, RangeDirectory next) {
-        return prepareGuarded(operationId,expected,next,null,null,null);
+        return prepare(operationId,expected,next,null);
     }
 
+    /** Null roster is an exact absent-row witness, never a lookup or implicit retry rebase. */
+    public DistributedCommand prepare(OperationId operationId,RangeDirectory expected,RangeDirectory next,DatabaseDomainRoster previousRoster) {
+        return prepareGuarded(operationId,expected,next,null,null,null,previousRoster);
+    }
     /** Resume ordinary topology changes after the domain's schema operation has fully retired or aborted. */
     public DistributedCommand prepareAfterAdministration(OperationId operationId, RangeDirectory expected, RangeDirectory next,
                                                         RatisSchemaAdministration.Head administrativeHead) {
         Objects.requireNonNull(administrativeHead);
-        return prepareGuarded(operationId,expected,next,administrativeHead.encode(),null,null);
+        return prepareGuarded(operationId,expected,next,administrativeHead.encode(),null,null,null);
     }
 
     /** Explicitly qualify both terminal administrative owners; null means an exact absent-head guard. */
@@ -73,15 +78,19 @@ public final class RatisCatalogue {
     }
     /** Every administrative owner is guarded by its exact absent or terminal domain head. */
     public DistributedCommand prepareAfterAdministration(OperationId operationId,RangeDirectory expected,RangeDirectory next,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead,TopologyChange.State topologyHead) {
-        return prepareGuarded(operationId,expected,next,schemaHead==null ? null : schemaHead.encode(),importHead==null ? null : importHead.encode(),topologyHead==null ? null : topologyHead.encode());
+        return prepareGuarded(operationId,expected,next,schemaHead==null ? null : schemaHead.encode(),importHead==null ? null : importHead.encode(),topologyHead==null ? null : topologyHead.encode(),null);
     }
-    private DistributedCommand prepareGuarded(OperationId operationId,RangeDirectory expected,RangeDirectory next,byte[] administrativeHead,byte[] importHead,byte[] topologyHead) {
+    private DistributedCommand prepareGuarded(OperationId operationId,RangeDirectory expected,RangeDirectory next,byte[] administrativeHead,byte[] importHead,byte[] topologyHead,DatabaseDomainRoster previousRoster) {
         byte[] value = RangeDirectoryCodec.encode(Objects.requireNonNull(next));
         byte[] previous = expected == null ? null : RangeDirectoryCodec.encode(expected);
         byte[] key = key(next.domainId());
-        var command = new DistributedCommand(groupId, rangeEpoch, schemaDigest, operationId,
-                List.of(new Mutation(Mutation.Kind.PUT, columnId, key, value)),
-                List.of(new KeyPredicate(columnId, key, previous),new KeyPredicate(columnId,RatisSchemaAdministration.headKey(next.domainId()),administrativeHead),new KeyPredicate(columnId,RatisRangeImportCatalogue.headKey(next.domainId()),importHead),new KeyPredicate(columnId,RatisTopologyCatalogue.headKey(next.domainId()),topologyHead)));
+        var mutations=new ArrayList<Mutation>(); mutations.add(new Mutation(Mutation.Kind.PUT,columnId,key,value));
+        var predicates=new ArrayList<KeyPredicate>(List.of(new KeyPredicate(columnId,key,previous),new KeyPredicate(columnId,RatisSchemaAdministration.headKey(next.domainId()),administrativeHead),new KeyPredicate(columnId,RatisRangeImportCatalogue.headKey(next.domainId()),importHead),new KeyPredicate(columnId,RatisTopologyCatalogue.headKey(next.domainId()),topologyHead)));
+        if(expected==null) {
+            var roster=previousRoster==null ? DatabaseDomainRoster.initial(clusterId,databaseId,List.of(next.domainId())) : previousRoster.add(List.of(next.domainId()));
+            mutations.add(new Mutation(Mutation.Kind.PUT,columnId,RatisDatabaseDomainRoster.key(databaseId),roster.encode())); predicates.add(new KeyPredicate(columnId,RatisDatabaseDomainRoster.key(databaseId),previousRoster==null ? null : previousRoster.encode()));
+        } else if(previousRoster!=null) throw new IllegalArgumentException("Directory replacement cannot change the domain roster");
+        var command=new DistributedCommand(groupId,rangeEpoch,schemaDigest,operationId,mutations,predicates);
         validator.accept(command);
         return command;
     }
@@ -110,7 +119,8 @@ public final class RatisCatalogue {
                 throw new IllegalArgumentException("Wrong catalogue identity/schema");
             }
             if ((command.acknowledgedThrough() >= 0 || command.minimumSessionEpoch() >= 0) && command.mutations().isEmpty() && command.predicates().isEmpty()) return;
-            if (command.mutations().size() != 1 || command.predicates().size() != 4) {
+            if(command.kind()!=DistributedCommand.Kind.DATA) throw new IllegalArgumentException("Directory publication requires DATA CAS");
+            if ((command.mutations().size()!=1 && command.mutations().size()!=2) || (command.predicates().size()!=4 && command.predicates().size()!=5)) {
                 throw new IllegalArgumentException("Catalogue requires one conditional directory replacement");
             }
             var mutation = command.mutations().getFirst();
@@ -126,11 +136,13 @@ public final class RatisCatalogue {
             var guard=command.predicates().get(1);
             if (!guard.columnId().equals(columnId) || !command.predicates().get(2).columnId().equals(columnId) || !command.predicates().get(3).columnId().equals(columnId)) throw new IllegalArgumentException("Wrong schema administration guard column");
             if (previous == null) {
-                if (next.generation() != 0) throw new IllegalArgumentException("Initial directory generation must be zero");
+                if (next.generation() != 0 || command.predicates().size()!=5) throw new IllegalArgumentException("Initial directory requires generation zero and a database roster witness");
+                var rosterGuard=command.predicates().get(4); if(!rosterGuard.columnId().equals(columnId)) throw new IllegalArgumentException("Wrong database roster column"); RatisDatabaseDomainRoster.requirePublication(rosterGuard,command.mutations().size()==2 ? command.mutations().get(1) : null,next);
                 RatisSchemaAdministration.requireTopologyGuard(guard,next);
                 RatisRangeImportCatalogue.requireTopologyGuard(command.predicates().get(2),next);
                 RatisTopologyCatalogue.requireAdministrationGuard(command.predicates().get(3),next);
             } else {
+                if(command.mutations().size()!=1 || command.predicates().size()!=4) throw new IllegalArgumentException("Directory replacement cannot mutate its database roster");
                 var expected = decode(previous);
                 requireIdentity(expected, clusterId, databaseId, mutation.key());
                 RatisSchemaAdministration.requireTopologyGuard(guard,expected);
@@ -180,26 +192,20 @@ public final class RatisCatalogue {
             else if (RatisColumnAllocation.isAllocationCommand(command)) allocation.accept(command);
             else if (RatisSchemaAdministration.isCommand(command)) administration.accept(command);
             else if (RatisSchemaCatalogue.isSchemaCommand(command) && command.mutations().getFirst().columnId().equals(directoryColumn)) schemas.accept(command);
-            else if (command.mutations().size()==2) {
-                if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
-                        || command.predicates().size()!=5 || !command.mutations().get(0).columnId().equals(directoryColumn)
-                        || !command.mutations().get(1).columnId().equals(sessionColumn)
-                        || command.predicates().stream().anyMatch(predicate -> predicate.expectedValue()!=null)) {
-                    throw new IllegalArgumentException("Genesis requires ordered absent directory/session/schema/import/topology keys");
+            else if (!command.mutations().isEmpty() && command.mutations().getFirst().columnId().equals(directoryColumn) && !command.predicates().isEmpty()
+                    && command.predicates().size()>1 && command.predicates().get(1).columnId().equals(sessionColumn)) {
+                if(command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1 || command.predicates().size()!=6 || command.predicates().getFirst().expectedValue()!=null) throw new IllegalArgumentException("Initial domain requires frozen directory/ledger/administration/roster witnesses");
+                var ledgerGuard=command.predicates().get(1); if(ledgerGuard.bucket() || !Arrays.equals(ledgerGuard.key(),key(databaseId))) throw new IllegalArgumentException("Initial domain ledger key changed");
+                int rosterIndex=1;
+                if(ledgerGuard.expectedValue()==null) {
+                    if(command.mutations().size()<2 || !command.mutations().get(1).columnId().equals(sessionColumn)) throw new IllegalArgumentException("Absent database ledger must be initialized atomically");
+                    sessions.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),List.of(command.mutations().get(1)),List.of(ledgerGuard))); rosterIndex=2;
+                } else {
+                    var ledger=SessionEpochLedger.decode(ledgerGuard.expectedValue()); if(!ledger.clusterId().equals(clusterId) || !ledger.databaseId().equals(databaseId)) throw new IllegalArgumentException("Initial domain changed database ledger identity");
                 }
-                directory.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
-                        List.of(command.mutations().get(0)),List.of(command.predicates().get(0),command.predicates().get(2),command.predicates().get(3),command.predicates().get(4))));
-                sessions.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
-                        List.of(command.mutations().get(1)),List.of(command.predicates().get(1))));
-            } else if(command.mutations().size()==1 && command.predicates().size()==5 && command.mutations().getFirst().columnId().equals(directoryColumn)) {
-                var ledgerGuard=command.predicates().get(1);
-                if(command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
-                        || command.predicates().getFirst().expectedValue()!=null || !ledgerGuard.columnId().equals(sessionColumn)
-                        || !Arrays.equals(ledgerGuard.key(),key(databaseId)) || ledgerGuard.expectedValue()==null)throw new IllegalArgumentException("Initial domain requires exact existing database ledger guard");
-                var ledger=SessionEpochLedger.decode(ledgerGuard.expectedValue());
-                if(!ledger.clusterId().equals(clusterId) || !ledger.databaseId().equals(databaseId))throw new IllegalArgumentException("Initial domain changed ledger identity");
-                directory.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
-                        command.mutations(),List.of(command.predicates().get(0),command.predicates().get(2),command.predicates().get(3),command.predicates().get(4))));
+                if(command.mutations().size()<rosterIndex || command.mutations().size()>rosterIndex+1) throw new IllegalArgumentException("Initial domain has unrelated mutations");
+                var mutations=new ArrayList<Mutation>(); mutations.add(command.mutations().getFirst()); if(command.mutations().size()>rosterIndex) mutations.add(command.mutations().get(rosterIndex));
+                directory.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),mutations,List.of(command.predicates().get(0),command.predicates().get(2),command.predicates().get(3),command.predicates().get(4),command.predicates().get(5))));
             } else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(sessionColumn)) sessions.accept(command);
             else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(directoryColumn)
                     && command.mutations().getFirst().key().length==33) schemas.accept(command);

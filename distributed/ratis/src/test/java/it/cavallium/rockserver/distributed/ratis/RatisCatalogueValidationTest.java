@@ -19,9 +19,10 @@ class RatisCatalogueValidationTest {
                 List.of(new RangeDescriptor(UUID.randomUUID(), UUID.randomUUID(), 1, 0, null, null, RangeDescriptor.TopologyState.ACTIVE, List.of(replica))));
     }
     DistributedCommand command(byte[] expected, byte[] value) {
-        return new DistributedCommand(group, 1, new byte[32], new OperationId(UUID.randomUUID(), 1, 1),
-                List.of(new Mutation(Mutation.Kind.PUT, column, key, value)), List.of(new KeyPredicate(column, key, expected),
-                new KeyPredicate(column,RatisSchemaAdministration.headKey(domain),null),new KeyPredicate(column,RatisRangeImportCatalogue.headKey(domain),null),new KeyPredicate(column,RatisTopologyCatalogue.headKey(domain),null)));
+        var mutations=new java.util.ArrayList<Mutation>(); mutations.add(new Mutation(Mutation.Kind.PUT,column,key,value));
+        var predicates=new java.util.ArrayList<KeyPredicate>(List.of(new KeyPredicate(column,key,expected),new KeyPredicate(column,RatisSchemaAdministration.headKey(domain),null),new KeyPredicate(column,RatisRangeImportCatalogue.headKey(domain),null),new KeyPredicate(column,RatisTopologyCatalogue.headKey(domain),null)));
+        if(expected==null) { mutations.add(new Mutation(Mutation.Kind.PUT,column,RatisDatabaseDomainRoster.key(database),DatabaseDomainRoster.initial(cluster,database,List.of(domain)).encode())); predicates.add(new KeyPredicate(column,RatisDatabaseDomainRoster.key(database),null)); }
+        return new DistributedCommand(group,1,new byte[32],new OperationId(UUID.randomUUID(),1,1),mutations,predicates);
     }
     @Test void acknowledgementOnlyDoesNotRequireOrWeakenDirectoryReplacement() {
         var operation = new OperationId(UUID.randomUUID(),1,2);
@@ -45,7 +46,7 @@ class RatisCatalogueValidationTest {
     @Test void acceptedUserPlansCannotBypassCataloguePredicates() {
         var base=command(null,RangeDirectoryCodec.encode(directory(cluster,0)));
         var audit=new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,1),
-                new TransactionScope(List.of(TransactionScope.Span.point(column,key),TransactionScope.Span.point(column,RatisSchemaAdministration.headKey(domain)),TransactionScope.Span.point(column,RatisRangeImportCatalogue.headKey(domain)),TransactionScope.Span.point(column,RatisTopologyCatalogue.headKey(domain)))),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
+                new TransactionScope(List.of(TransactionScope.Span.point(column,key),TransactionScope.Span.point(column,RatisSchemaAdministration.headKey(domain)),TransactionScope.Span.point(column,RatisRangeImportCatalogue.headKey(domain)),TransactionScope.Span.point(column,RatisTopologyCatalogue.headKey(domain)),TransactionScope.Span.point(column,RatisDatabaseDomainRoster.key(database)))),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
         var accepted=DistributedCommand.acceptedTransaction(base,audit);
         assertThrows(IllegalArgumentException.class,() -> validate.accept(accepted));
         var epochs=RatisSessionEpochs.validator(cluster,database,group,1,new byte[32],column);

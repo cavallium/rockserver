@@ -15,19 +15,23 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
  * Schema-bearing bootstrap publishes schema content and column issuance before this intent.
  * All replicas require the combined validator. */
 public final class RatisCatalogueGenesis implements AutoCloseable {
-    private static final int MAGIC=0x5243474a, MAX_BYTES=RatisCatalogue.MAX_DIRECTORY_BYTES+SessionEpochLedger.MAX_BYTES+4096;
+    private static final int MAGIC=0x5243474a, MAX_BYTES=RatisCatalogue.MAX_DIRECTORY_BYTES+SessionEpochLedger.MAX_BYTES+2*DatabaseDomainRoster.MAX_BYTES+4096;
     private final Path journal; private final RaftClient client; private final RatisNodePlan plan; private final long initialTime;
     private final SessionEpochLedger existingLedger;
+    private final DatabaseDomainRoster beforeRoster,afterRoster;
     private final byte[] intent; private final Consumer<DistributedCommand> validator;
     private final FileChannel lockChannel; private final FileLock lock;
     private DistributedCommand command; private CommandResult result;
     private boolean busy,closed,fenced;
     /** Authorized initial placement publication. Null ledger creates it at initialTime; otherwise its exact state is guarded unchanged. */
-    public RatisCatalogueGenesis(Path journal,RaftClient client,RatisNodePlan plan,long initialTime,SessionEpochLedger existingLedger) throws IOException {
-        this.journal=journal.toAbsolutePath(); this.client=Objects.requireNonNull(client); this.plan=Objects.requireNonNull(plan); this.initialTime=initialTime; this.existingLedger=existingLedger;
+    public RatisCatalogueGenesis(Path journal,RaftClient client,RatisNodePlan plan,long initialTime,SessionEpochLedger existingLedger,DatabaseDomainRoster beforeRoster,DatabaseDomainRoster afterRoster) throws IOException {
+        this.journal=journal.toAbsolutePath(); this.client=Objects.requireNonNull(client); this.plan=Objects.requireNonNull(plan); this.initialTime=initialTime; this.existingLedger=existingLedger; this.beforeRoster=beforeRoster; this.afterRoster=Objects.requireNonNull(afterRoster);
         var c=plan.catalogue();
         if (initialTime<0 || plan.directory().generation()!=0 || !client.getGroupId().getUuid().equals(c.groupId())) throw new IllegalArgumentException("Invalid catalogue genesis binding");
         if(existingLedger!=null && (!existingLedger.clusterId().equals(plan.directory().clusterId()) || !existingLedger.databaseId().equals(plan.directory().databaseId())))throw new IllegalArgumentException("Domain publication changed database ledger identity");
+        RatisDatabaseDomainRoster.requireNamespace(afterRoster,plan.directory().clusterId(),plan.directory().databaseId());
+        if(beforeRoster==null) { if(afterRoster.generation()!=0) throw new IllegalArgumentException("Initial roster generation differs"); } else { RatisDatabaseDomainRoster.requireNamespace(beforeRoster,plan.directory().clusterId(),plan.directory().databaseId()); if(!beforeRoster.equals(afterRoster)) afterRoster.requireSuccessorOf(beforeRoster); }
+        if(!afterRoster.domainIds().contains(plan.directory().domainId())) throw new IllegalArgumentException("Genesis domain is not advertised");
         validator=RatisCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn());
         intent=prepare(new UUID(0,0)).payloadDigest();
         if (!Files.isDirectory(this.journal.getParent())) throw new IOException("Genesis journal parent is absent");
@@ -74,8 +78,9 @@ public final class RatisCatalogueGenesis implements AutoCloseable {
         var d=plan.directory(); var c=plan.catalogue(); byte[] directory=RangeDirectoryCodec.encode(d);
         var mutations=new ArrayList<Mutation>();mutations.add(new Mutation(Mutation.Kind.PUT,c.directoryColumn(),uuid(d.domainId()),directory));
         if(existingLedger==null)mutations.add(new Mutation(Mutation.Kind.PUT,c.sessionsColumn(),uuid(d.databaseId()),SessionEpochLedger.initial(d.clusterId(),d.databaseId(),initialTime).encode()));
+        if(!Objects.equals(beforeRoster,afterRoster)) mutations.add(new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisDatabaseDomainRoster.key(d.databaseId()),afterRoster.encode()));
         var prepared=new DistributedCommand(c.groupId(),c.epoch(),c.schemaDigest(),new OperationId(session,0,0),mutations,
-                List.of(new KeyPredicate(c.directoryColumn(),uuid(d.domainId()),null),new KeyPredicate(c.sessionsColumn(),uuid(d.databaseId()),existingLedger==null ? null : existingLedger.encode()),new KeyPredicate(c.directoryColumn(),RatisSchemaAdministration.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisRangeImportCatalogue.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisTopologyCatalogue.headKey(d.domainId()),null)));
+                List.of(new KeyPredicate(c.directoryColumn(),uuid(d.domainId()),null),new KeyPredicate(c.sessionsColumn(),uuid(d.databaseId()),existingLedger==null ? null : existingLedger.encode()),new KeyPredicate(c.directoryColumn(),RatisSchemaAdministration.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisRangeImportCatalogue.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisTopologyCatalogue.headKey(d.domainId()),null),new KeyPredicate(c.directoryColumn(),RatisDatabaseDomainRoster.key(d.databaseId()),beforeRoster==null ? null : beforeRoster.encode())));
         validator.accept(prepared); return prepared;
     }
     private void persist(CommandResult outcome) throws IOException {
