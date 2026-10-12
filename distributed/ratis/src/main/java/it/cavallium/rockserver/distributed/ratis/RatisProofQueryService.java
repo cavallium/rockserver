@@ -19,6 +19,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     public static RatisProofQueryService authorityLane() { return new RatisProofQueryService(1,"ratis-schema-authority-"); }
     public static final long IMPORT_PUBLICATION_BYTES=64L*1024*1024;
     public static RatisProofQueryService importPublicationLane(){return new RatisProofQueryService(1,"ratis-import-publication-",2,2*IMPORT_PUBLICATION_BYTES);}
+    public static RatisProofQueryService sourceOutcomeLane(){return new RatisProofQueryService(1,"ratis-source-outcome-",2,2*IMPORT_PUBLICATION_BYTES);}
     public static RatisProofQueryService operationRerouteLane(){return new RatisProofQueryService(1,"ratis-home-reroute-",2,2*IMPORT_PUBLICATION_BYTES);}
     private RatisProofQueryService(int threads,String name) {this(threads,name,MAX_JOBS,MAX_BYTES);}
     private RatisProofQueryService(int threads,String name,int maximumJobs,long maximumBytes) {

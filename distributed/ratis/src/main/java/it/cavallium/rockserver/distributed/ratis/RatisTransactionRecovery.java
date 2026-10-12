@@ -66,7 +66,7 @@ public final class RatisTransactionRecovery implements AutoCloseable {
         }
         if(home.reserved()) {
             if(!journal.noEffectReservationState(home))throw new IOException("HOME reservation has participant effects");
-            journal.queueRecovery(home.decide(TransactionStatus.Phase.ABORT));journal.executeHome();return result(Action.ABORT_ATTEMPTED,null);
+            journal.queueRecovery(home.abortReservation(TransactionStatus.NoEffectOutcome.SESSION_EXPIRED));journal.executeHome();return result(Action.ABORT_ATTEMPTED,null);
         }
         if (home.phase()==TransactionStatus.Phase.PREPARING) {
             journal.queueRecovery(home.decide(TransactionStatus.Phase.ABORT));

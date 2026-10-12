@@ -37,7 +37,9 @@ class RatisAcceptedSessionClientTest {
             calls.incrementAndGet(); byte[] wire=DistributedCommandCodec.encode(command);
             if (command.acceptance()!=null) {
                 byte[] body=SessionJournalFiles.read(journal,SessionWindowJournal.MAX_BYTES); var input=ByteBuffer.wrap(body);
-                assertEquals(1,input.getInt(4)); int size=input.getInt(121); assertArrayEquals(wire,Arrays.copyOfRange(body,125,125+size),"Accepted bytes must be checkpointed before transport execution");
+                assertEquals(1,input.getInt(4));input.position(121);int directories=input.getInt();assertEquals(1,directories);
+                for(int i=0;i<directories;i++){int length=input.getInt();byte[] bytes=new byte[length];input.get(bytes);var source=RangeDirectoryCodec.decode(bytes);assertEquals(route,source.ranges().getFirst());}
+                int size=input.getInt();byte[] saved=new byte[size];input.get(saved);assertArrayEquals(wire,saved,"Accepted bytes must be checkpointed before transport execution");
             }
             byte[] first=received.putIfAbsent(command.operationId(),wire); if (first!=null) assertArrayEquals(first,wire);
             if (lose && command.acceptance()!=null) { lose=false; throw new IOException("Lost applied reply"); }

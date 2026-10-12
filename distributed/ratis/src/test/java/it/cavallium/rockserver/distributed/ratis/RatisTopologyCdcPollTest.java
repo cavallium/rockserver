@@ -45,10 +45,15 @@ class RatisTopologyCdcPollTest {
         final AtomicReference<SessionEpochLedger> ledger;
         final DistributedStoragePool pool; final ReplicatedRangeStore store; final RaftStorage storage; final RatisRangeStateMachine machine;
         final RatisProofQueryService queries=new RatisProofQueryService();
+        final RatisProofQueryService sourceQueries=RatisProofQueryService.sourceOutcomeLane();
         NativeTopologyFreeze freeze; NativeTopologySeed seed; ReplicatedRangeStore child;
         long index;
         Fixture(Path path) throws Exception { this(path,id(1),id(2),id(3)); }
+        Fixture(Path path,RatisRangeStateMachine.RetentionLimits retention) throws Exception { this(path,id(1),id(2),id(3),retention); }
         Fixture(Path path,UUID cluster,UUID database,UUID domain) throws Exception {
+            this(path,cluster,database,domain,RatisRangeStateMachine.RetentionLimits.defaults());
+        }
+        Fixture(Path path,UUID cluster,UUID database,UUID domain,RatisRangeStateMachine.RetentionLimits retention) throws Exception {
             this.cluster=cluster;this.database=database;this.domain=domain;
             schema=new DistributedSchema(cluster,database,domain,1,0,List.of(new DistributedSchema.Column(1,column,"data",ColumnSchema.of(IntArrayList.of(1),ObjectArrayList.of(),true),null)));
             directory=new RangeDirectory(cluster,database,domain,1,schema.digest(),1,Set.of(column),0,List.of(parent));
@@ -65,8 +70,8 @@ class RatisTopologyCdcPollTest {
             });
             var client=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)-> { if(method.getName().equals("getGroupId"))return RaftGroupId.valueOf(catalogue);if(method.getName().equals("io"))return io;throw new AssertionError(method); });
             var epochs=new RatisSessionEpochs(client,cluster,database,catalogue,1,new byte[32],id(21));
-            machine=RatisRangeStateMachine.withSessions(store,group,new NativeRangeImage.Limits(4*1024*1024,32*1024*1024,2),command->{},epochs,directory,RatisRangeStateMachine.RetentionLimits.defaults(),leader::get);
-            machine.cdcBinding(cluster,database,rangeId); machine.proofQueries(queries);
+            machine=RatisRangeStateMachine.withSessions(store,group,new NativeRangeImage.Limits(4*1024*1024,32*1024*1024,2),command->{},epochs,directory,retention,leader::get);
+            machine.cdcBinding(cluster,database,rangeId); machine.proofQueries(queries);machine.sourceOutcomeQueries(sourceQueries);
             storage=RaftStorage.newBuilder().setDirectory(path.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).build(); storage.initialize();
             var identity=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args)-> { if(method.getName().equals("getId"))return peer.getId();if(method.getName().equals("toString"))return "topology-cdc-fixture";throw new AssertionError(method); });
             machine.initialize(identity,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
@@ -83,7 +88,7 @@ class RatisTopologyCdcPollTest {
         DistributedCommand clock(long sequence,long time) { ledger.set(ledger.get().advanceTime(time)); return DistributedCommand.sessionControl(groupId,1,schema.digest(),new OperationId(admin,Math.max(1,ledger.get().minimumEpoch()),sequence),RangeSessionControl.advance(ledger.get()),-1); }
         RatisCdcPollRpc.Request request(DistributedCdcCheckpoint.Cursor from,int bytes) { return new RatisCdcPollRpc.Request(new RatisCdcPollRpc.Binding(cluster,database,domain,new DistributedCdcCheckpoint.Lineage(rangeId,groupId,1)),from,16,bytes); }
         RatisCdcPollRpc.Result poll(RatisCdcPollRpc.Request request) throws Exception { return RatisCdcPollRpc.decodeReply(machine.queryLinearizable(message(RatisCdcPollRpc.request(request))).get(5,TimeUnit.SECONDS).getContent().toByteArray(),request); }
-        @Override public void close() throws Exception { queries.stop().get(5,TimeUnit.SECONDS);machine.close();machine.awaitNativeReaders(java.time.Duration.ofSeconds(5));storage.close();pool.close(); }
+        @Override public void close() throws Exception { sourceQueries.stop().get(5,TimeUnit.SECONDS);queries.stop().get(5,TimeUnit.SECONDS);machine.close();machine.awaitNativeReaders(java.time.Duration.ofSeconds(5));storage.close();pool.close(); }
     }
     @Test void frozenAndRetiredParentPollReturnsRealBarrierAndClockAgesOnlyMetadata() throws Exception {
         for(boolean retired:new boolean[]{false,true})try(var f=new Fixture(root.resolve("parent-"+retired))) {

@@ -22,7 +22,7 @@ final class RatisOperationRerouteAdmission {
             if(RatisOperationRerouteAdmissionRpc.acknowledgementOnly(evidence.original()))throw new IOException("Original-parent ACK proof is required before reroute bookkeeping");
             var next=TransactionStatus.decode(command.mutations().getFirst().value());var origin=Objects.requireNonNull(next.origin());var original=evidence.original();var target=evidence.targetDirectory();var saved=evidence.absence();var header=saved.freeze().header();
             if(original.kind()!=DistributedCommand.Kind.DATA && original.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || original.kind()==DistributedCommand.Kind.DATA && original.mutations().isEmpty() && original.predicates().isEmpty() && !RatisOperationRerouteAdmissionRpc.acknowledgementOnly(original)
-                    || original.acknowledgedThrough()!=-1 && !RatisOperationRerouteAdmissionRpc.acknowledgementOnly(original) || !original.operationId().equals(origin.operation()) || !original.groupId().equals(origin.source().groupId()) || original.rangeEpoch()!=origin.source().rangeEpoch()
+                    || !original.operationId().equals(origin.operation()) || !original.groupId().equals(origin.source().groupId()) || original.rangeEpoch()!=origin.source().rangeEpoch()
                     || !Arrays.equals(original.receiptDigest(),origin.originalReceiptDigest()) || !Arrays.equals(original.schemaDigest(),next.schemaDigest()) || target.schemaEpoch()!=next.schemaEpoch() || !Arrays.equals(target.schemaDigest(),next.schemaDigest())
                     || !target.clusterId().equals(origin.clusterId()) || !target.databaseId().equals(origin.databaseId()) || !target.domainId().equals(origin.domainId()) || !Arrays.equals(target.payloadDigest(),origin.targetDirectoryDigest())
                     || !header.clusterId().equals(origin.clusterId()) || !header.databaseId().equals(origin.databaseId()) || !header.domainId().equals(origin.domainId()))throw new IOException("Reroute original input/namespace/schema changed");
@@ -43,8 +43,12 @@ final class RatisOperationRerouteAdmission {
             if(!Arrays.equals(RatisOperationRerouteAdmissionRpc.normalizedDigest(original,target),origin.planDigest()) || RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,target)!=origin.targetParticipantCount())throw new IOException("Reroute normalized plan/count changed");
             if(RatisTransactionStatuses.isReservation(command)){if(!evidence.intents().isEmpty())throw new IOException("Reservation cannot carry accepted target captures");return;}
             if(original.kind()!=DistributedCommand.Kind.DATA || RatisOperationRerouteAdmissionRpc.acknowledgementOnly(original))throw new IOException("Accepted original certification cannot be recaptured after topology change");
-            var plan=RatisTransactionPlan.create(target,original.operationId(),original.mutations(),original.predicates());
+            var plan=RatisTransactionPlan.fromOriginal(target,original);
             byte[] expected=command.predicates().getFirst().expectedValue();var reserved=TransactionStatus.decode(expected);
+            var credit=fresh.credit();
+            var home=new HomeIdentity(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.mutations().getFirst().columnId(),reserved);
+            var promised=new NativeSourceOutcomeCredit.Request(original,origin,target,fresh.freeze(),home);
+            if(credit==null || !credit.request().equals(promised))throw new IOException("Promotion lacks its exact durable source receipt capacity");
             var accepted=new HashMap<UUID,DistributedCommand>();var captures=new HashMap<UUID,UUID>();var prepares=new HashMap<UUID,OperationId>();var finalizes=new HashMap<UUID,OperationId>();
             for(var intent:evidence.intents()) {
                 UUID group=intent.route().groupId();if(accepted.putIfAbsent(group,intent.acceptedBusiness())!=null || intent.captureId()==null)throw new IOException("Duplicate/missing original accepted capture");captures.put(group,intent.captureId());
@@ -54,6 +58,7 @@ final class RatisOperationRerouteAdmission {
                 prepares.put(group,RatisOperationRerouteAdmissionRpc.control(origin,n));finalizes.put(group,RatisOperationRerouteAdmissionRpc.control(origin,64+n++));
             }
             var reconstructed=plan.accept(origin.transactionId(),accepted,prepares,finalizes,captures);
+            RatisDurableTransaction.validateResultPlan(reconstructed.intents());
             if(!Arrays.equals(reserved.promote(reconstructed.initial()).encode(),next.encode()) || !promotionControl(origin,command.operationId()))throw new IOException("Promotion changed exact accepted definition/control");
             // Native PREPARE subsequently checks original live captures/results before any participant effects.
         }catch(IllegalArgumentException|NullPointerException invalid){throw new IOException("Invalid reroute admission evidence",invalid);}

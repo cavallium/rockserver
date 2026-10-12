@@ -103,6 +103,12 @@ class RatisHomeReservationTest {
         }
     }
     record ReservedEvidence(TransactionStatus status,RatisOperationRerouteAdmissionRpc.Evidence evidence) {}
+    NativeSourceOutcomeCredit reserveSource(Fixture f,ReservedEvidence base)throws Exception {
+        var e=base.evidence();var home=new HomeIdentity(f.groupId,1,new byte[32],f.column,base.status());
+        var request=new NativeSourceOutcomeCredit.Request(e.original(),base.status().origin(),e.targetDirectory(),e.absence().freeze(),home);
+        var credit=f.source.store.applySourceOutcomeCredit(new ApplyPosition(1,++f.source.index),request);f.source.machine.notifyTermIndexUpdated(1,f.source.index);
+        var fresh=f.sourceOutcome(e.original());assertEquals(credit,fresh.credit());assertArrayEquals(fresh.credit().encode(),RatisTopologyOperationOutcomeRpc.decodeReply(RatisTopologyOperationOutcomeRpc.reply(fresh),fresh.request()).credit().encode());return credit;
+    }
     ReservedEvidence reserveOriginal(Fixture f,DistributedCommand original)throws Exception {
         var origin=new OperationRerouteOrigin(f.source.cluster,f.source.database,f.source.domain,new DistributedCdcCheckpoint.Lineage(f.source.rangeId,f.source.groupId,1),original.operationId(),original.receiptDigest(),OperatorUpload.sha256(f.source.freeze.encode()),f.source.store.applied(),f.source.target.payloadDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(original,f.source.target),RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,f.source.target),f.origin.firstControl());
         var reserved=TransactionStatus.reserve(origin,f.source.schema.schemaEpoch(),f.source.schema.digest());var command=f.command(origin.firstControl(),null,reserved);
@@ -133,6 +139,17 @@ class RatisHomeReservationTest {
         try(var f=new Fixture(root.resolve("qualified-promotion"),true,true)){
             var original=new DistributedCommand(f.source.groupId,1,f.source.schema.digest(),f.original.operationId(),List.of(new Mutation(Mutation.Kind.PUT,f.source.column,new byte[]{(byte)200},new byte[]{20},Mutation.ReturnMode.CURRENT),new Mutation(Mutation.Kind.PUT,f.source.column,new byte[]{10},new byte[]{10},Mutation.ReturnMode.CURRENT),new Mutation(Mutation.Kind.PUT,f.source.column,new byte[]{(byte)201},new byte[]{21},Mutation.ReturnMode.CURRENT),new Mutation(Mutation.Kind.PUT,f.source.column,new byte[]{11},new byte[]{11},Mutation.ReturnMode.CURRENT)));
             var base=reserveOriginal(f,original);var accepted=controlledAccepted(f,base);var intents=accepted.intents();assertEquals(List.of(1,3),intents.getFirst().resultPositions());assertEquals(List.of(0,2),intents.getLast().resultPositions());
+            var unfunded=f.command(RatisOperationRerouteAdmissionRpc.control(base.status().origin(),128),base.status(),base.status().promote(accepted.initial()));
+            assertThrows(ExecutionException.class,()->f.machine.queryLinearizable(message(RatisOperationRerouteAdmissionRpc.prepareRequest(unfunded,promotionEvidence(base,intents)))).get(5,TimeUnit.SECONDS));assertEquals(base.status(),f.read());
+            reserveSource(f,base);
+            var oversized=new ArrayList<RatisDurableTransaction.Intent>();
+            for(var intent:intents) {
+                var business=intent.acceptedBusiness();var cut=business.acceptance();
+                var result=new CommandResult(CommandResult.Status.SUCCESS,List.of(new byte[1_100_000],new byte[1])).encode();
+                var large=DistributedCommand.acceptedTransaction(new DistributedCommand(business.groupId(),business.rangeEpoch(),business.schemaDigest(),business.operationId(),business.mutations(),business.predicates(),business.acknowledgedThrough()),new TransactionAcceptance(cut.snapshot(),cut.leaderGeneration(),cut.ownerIncarnation(),cut.scope(),result));
+                oversized.add(new RatisDurableTransaction.Intent(intent.route(),large,intent.prepareControl(),intent.finalizeControl(),intent.resultPositions(),intent.captureId()));
+            }
+            rejectPromotion(f,base,oversized);
             var first=intents.getFirst();var audit=first.acceptedBusiness().acceptance();
             var wide=new TransactionScope(List.of(TransactionScope.Span.range(f.source.column,null,new byte[]{(byte)128})));
             var changedScope=DistributedCommand.acceptedTransaction(new DistributedCommand(first.route().groupId(),first.route().rangeEpoch(),f.source.schema.digest(),original.operationId(),first.acceptedBusiness().mutations(),first.acceptedBusiness().predicates()),new TransactionAcceptance(audit.snapshot(),audit.leaderGeneration(),audit.ownerIncarnation(),wide,audit.result()));

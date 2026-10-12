@@ -91,12 +91,12 @@ class RatisTopologyOperationOutcomeTest {
             assertThrows(ExecutionException.class,()->catalogue.machine.queryLinearizable(message(RatisTopologyOperationOutcomeRpc.request(request))).get(5,TimeUnit.SECONDS));
         }
         try(var f=new RatisTopologyCdcPollTest.Fixture(root.resolve("queued"))) {
-            var original=spanning(f);f.apply(original);f.seal(true);var entered=new CountDownLatch(4);var release=new CountDownLatch(1);var blockers=new ArrayList<CompletableFuture<Message>>();
+            var original=spanning(f);f.apply(original);f.seal(true);var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var blockers=new ArrayList<CompletableFuture<Message>>();
             try {
-                for(int i=0;i<4;i++)blockers.add(f.queries.submit(f.groupId,new byte[]{(byte)i},1,false,owned->{entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new java.io.IOException("Fixture timeout");return Message.EMPTY;}));
-                assertTrue(entered.await(5,TimeUnit.SECONDS));var future=f.machine.queryLinearizable(message(RatisTopologyOperationOutcomeRpc.request(request(f,original))));assertEquals(5,f.queries.stats().jobs());
-                assertTrue(future.cancel(false));assertEquals(5,f.queries.stats().jobs());f.machine.notifyNotLeader(List.of());f.leader.set(new RatisRangeStateMachine.Leadership(2,false));release.countDown();
-                for(var blocker:blockers)blocker.get(5,TimeUnit.SECONDS);f.queries.stop().get(5,TimeUnit.SECONDS);assertEquals(0,f.queries.stats().jobs());assertEquals(0,f.queries.stats().bytes());assertEquals(0,f.store.activeSnapshotPins());
+                for(int i=0;i<1;i++)blockers.add(f.sourceQueries.submit(f.groupId,new byte[]{(byte)i},1,false,owned->{entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new java.io.IOException("Fixture timeout");return Message.EMPTY;}));
+                assertTrue(entered.await(5,TimeUnit.SECONDS));var future=f.machine.queryLinearizable(message(RatisTopologyOperationOutcomeRpc.request(request(f,original))));assertEquals(2,f.sourceQueries.stats().jobs());
+                assertTrue(future.cancel(false));assertEquals(2,f.sourceQueries.stats().jobs());f.machine.notifyNotLeader(List.of());f.leader.set(new RatisRangeStateMachine.Leadership(2,false));release.countDown();
+                for(var blocker:blockers)blocker.get(5,TimeUnit.SECONDS);f.sourceQueries.stop().get(5,TimeUnit.SECONDS);assertEquals(0,f.sourceQueries.stats().jobs());assertEquals(0,f.sourceQueries.stats().bytes());assertEquals(0,f.store.activeSnapshotPins());
             } finally {release.countDown();}
         }
     }
@@ -111,11 +111,11 @@ class RatisTopologyOperationOutcomeTest {
             byte[] malformed=RatisTopologyOperationOutcomeRpc.request(request);ByteBuffer.wrap(malformed).putLong(ScopedTransactionRpc.HEADER_BYTES+104,-1);assertThrows(IllegalArgumentException.class,()->RatisTopologyOperationOutcomeRpc.decodeRequest(malformed));
             var reply=query(f,request);
             byte[] maximumResult=new CommandResult(CommandResult.Status.SUCCESS,List.of(new byte[CommandResult.MAX_BYTES-12])).encode();
-            var maximum=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.FOUND,reply.cut(),reply.freeze(),reply.configurationTerm(),reply.configurationIndex(),reply.configuration(),maximumResult);
+            var maximum=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.FOUND,reply.cut(),reply.freeze(),reply.configurationTerm(),reply.configurationIndex(),reply.configuration(),reply.credit(),maximumResult);
             byte[] maximumWire=RatisTopologyOperationOutcomeRpc.reply(maximum);assertTrue(maximumWire.length<=RatisTopologyOperationOutcomeRpc.MAX_REPLY_BYTES);assertArrayEquals(maximumResult,RatisTopologyOperationOutcomeRpc.decodeReply(maximumWire,request).result());
             assertThrows(IllegalArgumentException.class,()->RatisTopologyOperationOutcomeRpc.decodeReply(new byte[RatisTopologyOperationOutcomeRpc.MAX_REPLY_BYTES+1],request));
-            assertThrows(IllegalArgumentException.class,()->new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,reply.cut(),reply.freeze(),reply.configurationTerm(),reply.configurationIndex(),reply.configuration(),result));
-            assertThrows(IllegalArgumentException.class,()->new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.FOUND,reply.cut(),reply.freeze(),reply.configurationTerm(),reply.configurationIndex(),reply.configuration(),new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of()).encode()));
+            assertThrows(IllegalArgumentException.class,()->new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,reply.cut(),reply.freeze(),reply.configurationTerm(),reply.configurationIndex(),reply.configuration(),reply.credit(),result));
+            assertThrows(IllegalArgumentException.class,()->new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.FOUND,reply.cut(),reply.freeze(),reply.configurationTerm(),reply.configurationIndex(),reply.configuration(),reply.credit(),new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of()).encode()));
         }
     }
 }

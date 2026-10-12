@@ -239,7 +239,7 @@ class RatisAtomicClientTest {
         var physical=RatisLogicalClient.plan(f.schema,changes(),absentIdentity(),RatisTransactionPlan.MAX_BYTES);
         var original=new DistributedCommand(parent.groupId(),1,f.schema.digest(),allocated.business(),physical.mutations(),physical.predicates(),acknowledgedThrough);
         var freeze=new NativeTopologyFreeze(definition.header(),parent.groupId(),new ApplyPosition(1,1),NativeTopologyFreeze.boundsDigest(null,null),new byte[32]);var lineage=new DistributedCdcCheckpoint.Lineage(parent.rangeId(),parent.groupId(),1);
-        var request=new RatisTopologyOperationOutcomeRpc.Request(source.clusterId(),source.databaseId(),source.domainId(),lineage,allocated.business(),original.receiptDigest());var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,freeze.position(),freeze,1,0,new byte[]{1},null);
+        var request=new RatisTopologyOperationOutcomeRpc.Request(source.clusterId(),source.databaseId(),source.domainId(),lineage,allocated.business(),original.receiptDigest());var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,freeze.position(),freeze,1,0,new byte[]{1},null,null);
         var evidence=new RatisOperationRerouteAdmissionRpc.Evidence(original,source,f.directory,absence,List.of());
         var origin=new OperationRerouteOrigin(source.clusterId(),source.databaseId(),source.domainId(),lineage,allocated.business(),original.receiptDigest(),OperatorUpload.sha256(freeze.encode()),absence.cut(),f.directory.payloadDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(original,f.directory),RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,f.directory),allocated.firstControl());
         var reserved=TransactionStatus.reserve(origin,f.schema.schemaEpoch(),f.schema.digest());return new ReservedInput(reserved,new RatisAtomicClient.Identity(reserved.transactionId(),allocated.business(),allocated.firstControl()),evidence);
@@ -345,7 +345,7 @@ class RatisAtomicClientTest {
             Path path=root.resolve("expired-reserved-promotion.bin");
             try(var client=f.client();var operation=client.executeReservedPlan(path,identity,reserved,plan,evidence,TTL,RequestContext.batch())) {
                 assertEquals(CommandResult.Status.SESSION_EXPIRED,operation.completion().get(10,TimeUnit.SECONDS).status());
-                assertEquals(reserved.decide(TransactionStatus.Phase.ABORT),f.homes.read(identity.transaction()));assertEquals(1,f.promotionSubmissions.get());
+                assertEquals(reserved.abortReservation(TransactionStatus.NoEffectOutcome.SESSION_EXPIRED),f.homes.read(identity.transaction()));assertEquals(1,f.promotionSubmissions.get());
                 for(var group:f.groups)assertNull(f.stores.get(group).preparedParticipant(identity.transaction()));
                 assertNull(f.get(71,key(2)));assertNull(f.get(72,key(200)));assertNull(f.get(73,key(2)));assertNull(f.get(74,member(200,"second")));
             }

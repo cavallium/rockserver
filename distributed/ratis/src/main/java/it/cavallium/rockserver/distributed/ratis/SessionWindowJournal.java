@@ -12,7 +12,7 @@ import java.util.*;
 final class SessionWindowJournal implements AutoCloseable {
     static final int MAX_BYTES=64*1024*1024;
     static final long MAX_WINDOW_BYTES=16L*1024*1024;
-    private static final int MAGIC=0x53574a4c, VERSION=1, HEADER_BYTES=121;
+    private static final int MAGIC=0x53574a4c, VERSION=1, HEADER_BYTES=125;
     record Saved(SessionEpochLedger.Grant grant,RatisSessionClient.Limits limits,RatisSessionClient.WindowState state) {}
     private final Path path;
     private final RatisRoutedClient routed;
@@ -84,12 +84,19 @@ final class SessionWindowJournal implements AutoCloseable {
             var limits=new RatisSessionClient.Limits(input.getInt(),input.getLong(),input.getLong()); validateLimits(limits);
             long sequence=input.getLong(), acknowledged=input.getLong(); boolean exhausted=flag(input); int count=input.getInt();
             if (count<0 || count>limits.outstanding() || (long)count*70>input.remaining()) throw new IOException("Invalid session window entry count");
+            int directoryCount=input.getInt();if(directoryCount<0 || directoryCount>count)throw new IOException("Invalid source directory count");
+            var directories=new java.util.HashMap<String,RangeDirectory>();long directoryCharge=0;
+            for(int n=0;n<directoryCount;n++) {
+                var directory=RangeDirectoryCodec.decode(blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES,false));directoryCharge+=RatisSessionClient.directoryCharge(directory);
+                if(directoryCharge>RatisSessionClient.MAX_SOURCE_DIRECTORY_BYTES || directories.put(java.util.HexFormat.of().formatHex(directory.payloadDigest()),directory)!=null)throw new IOException("Session source directory ownership exceeded/duplicated");
+            }
             var entries=new ArrayList<RatisSessionClient.WindowEntry>(count);
             for (int i=0;i<count;i++) {
                 byte[] encoded=blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false);
                 var command=DistributedCommandCodec.decode(encoded);
                 if (!Arrays.equals(encoded,DistributedCommandCodec.encode(command))) throw new IOException("Noncanonical session window command");
-                var descriptor=route(input); var prepared=routed.restoreSessionCommand(command,descriptor);
+                byte[] sourceDigest=new byte[32];input.get(sourceDigest);var directory=directories.get(java.util.HexFormat.of().formatHex(sourceDigest));var group=uuid(input);
+                if(directory==null)throw new IOException("Missing original source directory");var descriptor=directory.ranges().stream().filter(r->r.groupId().equals(group)).findFirst().orElseThrow();var prepared=routed.restoreSessionCommand(directory,command,descriptor);
                 byte[] resultBytes=blob(input,CommandResult.MAX_BYTES,true);
                 var result=resultBytes==null ? null : CommandResult.decode(resultBytes);
                 if (result!=null && !Arrays.equals(resultBytes,result.encode())) throw new IOException("Noncanonical session window result");
@@ -108,12 +115,14 @@ final class SessionWindowJournal implements AutoCloseable {
     private static int encodedSize(Saved saved) throws IOException {
         validateLimits(saved.limits()); var entries=saved.state().entries();
         if (entries.size()>saved.limits().outstanding()) throw new IOException("Session window entry count exceeds bound");
-        long size=HEADER_BYTES;
+        long size=HEADER_BYTES;long directoryCharge=0;
+        for(var directory:directories(saved).values()){size+=4L+RangeDirectoryCodec.encode(directory).length;directoryCharge+=RatisSessionClient.directoryCharge(directory);}
+        if(directoryCharge>RatisSessionClient.MAX_SOURCE_DIRECTORY_BYTES)throw new IOException("Session source directory byte budget exhausted");
         for (var entry:entries) {
             int command=DistributedCommandCodec.encodedSize(entry.prepared().command());
             if (command<1 || command>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Session command blob exceeds bound");
             long result=entry.result()==null ? 0 : resultSize(entry.result());
-            size+=4L+command+routeSize(entry.prepared().descriptor())+4+result+2;
+            size+=4L+command+48+4+result+2;
             if (size>MAX_BYTES-32) throw new IOException("Session window journal exceeds aggregate byte bound");
         }
         return (int)size;
@@ -134,13 +143,17 @@ final class SessionWindowJournal implements AutoCloseable {
         for (var replica:route.replicas()) size+=57L+ascii(replica.peerId(),128).length+ascii(replica.address(),256).length;
         return size;
     }
+    private static java.util.SortedMap<String,RangeDirectory> directories(Saved saved) {
+        var result=new java.util.TreeMap<String,RangeDirectory>();for(var entry:saved.state().entries()){var source=entry.prepared().sourceDirectory();result.put(java.util.HexFormat.of().formatHex(source.payloadDigest()),source);}return result;
+    }
     private byte[] encode(Saved saved,int size) {
         var output=ByteBuffer.allocate(size).putInt(MAGIC).putInt(VERSION).put(identity); var grant=saved.grant(); var limits=saved.limits(); var state=saved.state();
         output.putLong(grant.epoch()); uuid(output,grant.sessionId()); output.putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis());
         output.putInt(limits.outstanding()).putLong(limits.commandBytes()).putLong(limits.resultBytes());
         output.putLong(state.nextSequence()).putLong(state.acknowledgedThrough()).put((byte)(state.exhausted() ? 1 : 0)).putInt(state.entries().size());
+        var directories=directories(saved);output.putInt(directories.size());for(var directory:directories.values())blob(output,RangeDirectoryCodec.encode(directory));
         for (var entry:state.entries()) {
-            blob(output,DistributedCommandCodec.encode(entry.prepared().command())); route(output,entry.prepared().descriptor());
+            blob(output,DistributedCommandCodec.encode(entry.prepared().command()));output.put(entry.prepared().sourceDirectory().payloadDigest());uuid(output,entry.prepared().descriptor().groupId());
             blob(output,entry.result()==null ? null : entry.result().encode()); output.put((byte)(entry.consumed() ? 1 : 0));
             output.put((byte)(entry.intent() ? 1 : entry.abandoned() ? 2 : 0));
         }

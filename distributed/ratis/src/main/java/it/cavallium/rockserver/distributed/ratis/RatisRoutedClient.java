@@ -211,6 +211,7 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
         public RangeDescriptor descriptor() { return descriptor; }
         public DistributedCommand command() { return command; }
+        RangeDirectory sourceDirectory(){return source;}
     }
 
     /** Frozen original replica and process incarnation; reads never reselect the current leader. */
@@ -640,6 +641,10 @@ public final class RatisRoutedClient implements AutoCloseable {
     /** Fresh terminal result lookup does not depend on either business or recovery grant eligibility. */
     public ParticipantOutcome finalizedParticipant(UUID group,UUID transactionId) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
+        return finalizedParticipant(observed,descriptor,transactionId);
+    }
+    ParticipantOutcome finalizedParticipant(RangeDirectory observed,RangeDescriptor descriptor,UUID transactionId)throws IOException {
+        requireNamespace(observed);if(observed.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Frozen participant descriptor absent");UUID group=descriptor.groupId();
         var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,transactionId);
         try {
             var input=ByteBuffer.wrap(transaction(descriptor,ScopedTransactionRpc.PARTICIPANT_OUTCOME,body.array(),true));
@@ -760,6 +765,10 @@ public final class RatisRoutedClient implements AutoCloseable {
     public ParticipantFenceProof participantFence(ParticipantIdentity identity) throws IOException {
         Objects.requireNonNull(identity); var observed=current(); var participant=identity.participant();
         var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(identity.participantGroup())).findFirst().orElseThrow(() -> new IllegalArgumentException("Participant route absent"));
+        return participantFence(observed,descriptor,identity);
+    }
+    ParticipantFenceProof participantFence(RangeDirectory observed,RangeDescriptor descriptor,ParticipantIdentity identity)throws IOException {
+        requireNamespace(observed);if(observed.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Frozen participant fence descriptor absent");var participant=identity.participant();
         if (!observed.clusterId().equals(identity.definition().clusterId()) || !observed.databaseId().equals(identity.definition().databaseId()) || !observed.domainId().equals(identity.definition().domainId())
                 || !descriptor.rangeId().equals(participant.rangeId()) || descriptor.rangeEpoch()!=participant.rangeEpoch() || !Arrays.equals(observed.schemaDigest(),participant.schemaDigest())) throw new IllegalArgumentException("Participant fence route differs");
         try {
@@ -1051,6 +1060,23 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
 
     /** The routing key selects one range; acknowledgement does not mutate that user key. */
+    @FunctionalInterface public interface SourceAckDirectoryReader { RangeDirectory read(TopologyChange.Header header)throws IOException; }
+    public record QualifiedAcknowledgementSource(RangeDirectory directory,RangeDescriptor parent,RatisTopologyOperationOutcomeRpc.Reply evidence){public QualifiedAcknowledgementSource{Objects.requireNonNull(directory);Objects.requireNonNull(parent);Objects.requireNonNull(evidence);}}
+    /** Qualify the metadata header before a durable window allocates a fresh ACK identity. */
+    public QualifiedAcknowledgementSource qualifyAcknowledgementSource(PreparedCommand original,SourceAckDirectoryReader reader)throws IOException {
+        Objects.requireNonNull(original);Objects.requireNonNull(reader);var evidence=operationOutcome(original);var header=evidence.freeze().header();var directory=reader.read(header);
+        if(directory==null || !Arrays.equals(directory.payloadDigest(),header.sourceDirectoryDigest()) || directory.schemaEpoch()!=header.schemaEpoch() || !Arrays.equals(directory.schemaDigest(),header.schemaDigest()) || directory.generation()!=header.sourceGeneration())throw new IOException("ACK source directory differs from actual native sealed header");
+        try{requireNamespace(directory);var lineage=evidence.request().lineage();var parent=directory.ranges().stream().filter(r->r.rangeId().equals(lineage.rangeId()) && r.groupId().equals(lineage.groupId()) && r.rangeEpoch()==lineage.rangeEpoch()).findFirst().orElseThrow(()->new IllegalArgumentException("ACK source lineage absent from immutable directory"));
+            if(!Arrays.equals(parent.lowerInclusive(),original.descriptor.lowerInclusive()) || !Arrays.equals(parent.upperExclusive(),original.descriptor.upperExclusive()))throw new IllegalArgumentException("ACK source ownership changed original lineage bounds");
+            synchronized(this){requireOpen();if(acceptedSchemas.stream().noneMatch(known->sameSchema(known,directory))){if(acceptedSchemas.size()>=65)throw new IllegalArgumentException("ACK source schema history capacity exhausted");var schemas=new java.util.ArrayList<>(acceptedSchemas);schemas.add(directory);acceptedSchemas=List.copyOf(schemas);}}
+            return new QualifiedAcknowledgementSource(directory,parent,evidence);
+        }catch(IllegalArgumentException invalid){throw new IOException("ACK source namespace/projection changed",invalid);}
+    }
+    /** Original-parent receipt GC uses the caller's fresh durable DATA identity and frozen source placement. */
+    public PreparedCommand prepareAcknowledgementAt(OperationId fresh,RangeDirectory frozenSource,RangeDescriptor originalParent,long acknowledgedThrough){
+        Objects.requireNonNull(fresh);Objects.requireNonNull(frozenSource);Objects.requireNonNull(originalParent);
+        return restoreSessionCommand(frozenSource,new DistributedCommand(originalParent.groupId(),originalParent.rangeEpoch(),frozenSource.schemaDigest(),fresh,List.of(),List.of(),acknowledgedThrough),originalParent);
+    }
     public PreparedCommand prepareAcknowledgement(OperationId operation, UUID columnId, byte[] physicalKey,
                                                   long acknowledgedThrough) {
         Objects.requireNonNull(physicalKey);
@@ -1197,6 +1223,16 @@ public final class RatisRoutedClient implements AutoCloseable {
         try { return readOriginalOutcome(prepared); }
         finally { endCall(); }
     }
+    public RatisSourceOutcomeRpc.Prepared prepareSourceOutcome(RangeDirectory source,RatisSourceOutcomeRpc.Proposal proposal)throws IOException {
+        var route=sourceOutcomeRoute(source,proposal.request());beginCall();try{return RatisSourceOutcomeRpc.prepared(transport.transaction(route,RatisSourceOutcomeRpc.prepare(proposal),true),proposal);}catch(IllegalArgumentException invalid){throw new IOException("Invalid source preparation reply",invalid);}finally{endCall();}
+    }
+    public RatisSourceOutcomeRpc.Applied appendSourceOutcome(RangeDirectory source,RatisSourceOutcomeRecord record,List<RatisDurableTransaction.Intent> intents)throws IOException {
+        var route=sourceOutcomeRoute(source,record.request());var proposal=new RatisSourceOutcomeRpc.Proposal(record.kind(),record.request(),intents,record);var prepared=prepareSourceOutcome(source,proposal);if(prepared.fenced())return new RatisSourceOutcomeRpc.Applied(record.digest(),NativeSourceOutcomePublication.Outcome.FENCED,null);if(!record.equals(prepared.record()))throw new IOException("Source append changed frozen record");beginCall();try{return RatisSourceOutcomeRpc.applied(transport.participant(route,record.encode()),record);}catch(IllegalArgumentException invalid){throw new IOException("Invalid source applied proof",invalid);}finally{endCall();}
+    }
+    public void cancelSourceOutcome(RangeDirectory source,RatisSourceOutcomeRecord.Kind kind,NativeSourceOutcomeCredit.Request request)throws IOException {
+        var route=sourceOutcomeRoute(source,request);beginCall();try{RatisSourceOutcomeRpc.requireCancelled(transport.transaction(route,RatisSourceOutcomeRpc.cancel(kind,request),true),kind,request);}catch(IllegalArgumentException invalid){throw new IOException("Invalid source cancellation reply",invalid);}finally{endCall();}
+    }
+    private RangeDescriptor sourceOutcomeRoute(RangeDirectory source,NativeSourceOutcomeCredit.Request request){requireNamespace(source);var parent=request.freeze().header().participant(TopologyChange.Stage.FREEZE,request.original().groupId());var route=source.ranges().stream().filter(r->r.groupId().equals(parent.groupId()) && r.rangeId().equals(parent.rangeId()) && r.rangeEpoch()==parent.rangeEpoch()).findFirst().orElseThrow(()->new IllegalArgumentException("Original source route absent"));if(!source.domainId().equals(request.origin().domainId()) || !Arrays.equals(source.schemaDigest(),request.original().schemaDigest()))throw new IllegalArgumentException("Source request changed original ownership/schema");return route;}
     public void authorizeOperationReroute(PreparedCommand prepared) throws IOException {
         Objects.requireNonNull(prepared);requireIdentity(prepared.source);beginCall();
         try { RatisOperationRerouteAdmissionRpc.requireEcho(transport.transaction(prepared.descriptor,
@@ -1364,7 +1400,7 @@ public final class RatisRoutedClient implements AutoCloseable {
             return rpc(() -> { try (var lease=clients.acquireOwner(descriptor,owner)) { return snapshotOnOwner(lease.client(),descriptor,owner,request); } });
         }
         @Override public byte[] participant(RangeDescriptor descriptor,byte[] record) throws IOException {
-            return rpc(() -> { try (var lease=clients.acquire(descriptor)) { return content(lease.client().io().send(Message.valueOf(ByteString.copyFrom(record)))); } });
+            return rpc(() -> { try (var lease=clients.acquire(descriptor)) { return content(lease.client().io().send(Message.valueOf(ByteString.copyFrom(record))),RatisSourceOutcomeRecord.isRecord(record)?37+NativeSourceOutcomeCredit.MAX_BYTES:CommandResult.MAX_BYTES); } });
         }
 
         private static RaftClient connected(RangeDescriptor descriptor) throws IOException {

@@ -45,7 +45,23 @@ public final class RatisSessionClient {
     private final SessionEpochLedger.Grant grant;
     private final Limits limits;
     private final TreeMap<Long,Pending> pending = new TreeMap<>();
+    static final long MAX_SOURCE_DIRECTORY_BYTES=16L*1024*1024;
     private long nextSequence, acknowledgedThrough=-1, commandBytes, resultBytes;
+    private final java.util.Map<String,RangeDirectory> sourceDirectories=new java.util.HashMap<>();
+    private long sourceDirectoryBytes;
+    static long directoryCharge(RangeDirectory directory) {
+        long replicas=directory.ranges().stream().mapToLong(r->r.replicas().size()).sum();
+        return 4L*RangeDirectoryCodec.encode(directory).length+128L*directory.ranges().size()+160L*replicas+96L*directory.columns().size()+1024;
+    }
+    private void retainDirectory(RangeDirectory directory) {
+        var key=java.util.HexFormat.of().formatHex(directory.payloadDigest());if(sourceDirectories.containsKey(key))return;
+        long bytes=directoryCharge(directory);if(bytes>MAX_SOURCE_DIRECTORY_BYTES-sourceDirectoryBytes)throw new IllegalStateException("Session original directory byte budget exhausted");
+        sourceDirectories.put(key,directory);sourceDirectoryBytes+=bytes;
+    }
+    private void trimDirectories() {
+        var keep=pending.values().stream().map(p->java.util.HexFormat.of().formatHex(p.prepared.sourceDirectory().payloadDigest())).collect(java.util.stream.Collectors.toSet());
+        for(var entry:java.util.List.copyOf(sourceDirectories.entrySet()))if(!keep.contains(entry.getKey())){sourceDirectoryBytes-=directoryCharge(entry.getValue());sourceDirectories.remove(entry.getKey());}
+    }
     private boolean exhausted;
 
     /**
@@ -83,7 +99,7 @@ public final class RatisSessionClient {
         if (count!=state.entries().size()) throw new IllegalArgumentException("Recovered sequence window is not contiguous");
         long sequence=ack==Long.MAX_VALUE ? Long.MAX_VALUE : ack+1;
         for (var saved:state.entries()) {
-            var prepared=routed.restoreSessionCommand(saved.prepared().command(),saved.prepared().descriptor()); var command=prepared.command(); var id=command.operationId();
+            var prepared=routed.restoreSessionCommand(saved.prepared().sourceDirectory(),saved.prepared().command(),saved.prepared().descriptor()); var command=prepared.command(); var id=command.operationId();
             if (!id.sessionId().equals(grant.sessionId()) || id.epoch()!=grant.epoch() || id.sequence()!=sequence
                     || command.acknowledgedThrough()>ack || saved.consumed() && saved.result()==null
                     || client.pending.isEmpty() && saved.consumed()
@@ -93,6 +109,7 @@ public final class RatisSessionClient {
             int bytes=DistributedCommandCodec.encodedSize(command), result=maximumResult(command);
             if (bytes>limits.commandBytes()-client.commandBytes || result>limits.resultBytes()-client.resultBytes) throw new IllegalArgumentException("Recovered byte window exceeds limits");
             if (saved.result()!=null) validateResult(command,saved.result());
+            client.retainDirectory(prepared.sourceDirectory());
             var entry=new Pending(client,prepared,bytes,result); entry.result=saved.result(); entry.consumed=saved.consumed(); entry.awaitingAcceptance=saved.intent(); entry.abandoned=saved.abandoned();
             client.pending.put(sequence,entry); client.commandBytes+=bytes; client.resultBytes+=result;
             if (sequence!=Long.MAX_VALUE) sequence++;
@@ -146,7 +163,7 @@ public final class RatisSessionClient {
         if (accepted.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || accepted.acceptance()==null) throw new IllegalArgumentException("Transaction acceptance requires an accepted commit");
         var exact=DistributedCommand.acceptedTransaction(entry.command(),accepted.acceptance());
         if (!Arrays.equals(DistributedCommandCodec.encode(exact),DistributedCommandCodec.encode(accepted))) throw new IllegalArgumentException("Accepted transaction changed original identity or ordered plan");
-        var prepared=routed.restoreSessionCommand(accepted,entry.descriptor());
+        var prepared=routed.restoreSessionCommand(entry.prepared.sourceDirectory(),accepted,entry.descriptor());
         int bytes=DistributedCommandCodec.encodedSize(accepted), result=maximumResult(accepted);
         if (bytes>limits.commandBytes()-(commandBytes-entry.commandBytes) || result>limits.resultBytes()-(resultBytes-entry.resultBytes)) {
             throw new IllegalStateException("Accepted transaction exceeds session byte window");
@@ -170,6 +187,10 @@ public final class RatisSessionClient {
         if (acknowledgedThrough < 0) throw new IllegalStateException("No consumed contiguous results to acknowledge");
         return retain(routed.prepareAcknowledgement(new OperationId(grant.sessionId(),grant.epoch(),nextSequence),column,routingKey,acknowledgedThrough));
     }
+    synchronized Pending prepareAcknowledgementAt(RangeDirectory source,RangeDescriptor parent) {
+        requireCapacity();if(acknowledgedThrough<0)throw new IllegalStateException("No consumed original results to acknowledge");
+        return retain(routed.prepareAcknowledgementAt(new OperationId(grant.sessionId(),grant.epoch(),nextSequence),source,parent,acknowledgedThrough));
+    }
     private void requireCapacity() {
         if (exhausted) throw new IllegalStateException("Session sequence space exhausted");
         if (pending.size() >= limits.outstanding()) throw new IllegalStateException("Session outstanding window exhausted");
@@ -181,6 +202,7 @@ public final class RatisSessionClient {
         if (encoded > limits.commandBytes()-commandBytes || maximumResult > limits.resultBytes()-resultBytes) {
             throw new IllegalStateException("Session command/result byte window exhausted");
         }
+        retainDirectory(prepared.sourceDirectory()); // Charge encoded/expanded graph before nextSequence advances.
         var entry=new Pending(this,prepared,encoded,maximumResult); entry.awaitingAcceptance=intent;
         pending.put(nextSequence,entry); commandBytes+=encoded; resultBytes+=maximumResult;
         if (nextSequence==Long.MAX_VALUE) exhausted=true; else nextSequence++;
@@ -231,6 +253,7 @@ public final class RatisSessionClient {
             acknowledgedThrough=first.getKey();
             commandBytes-=first.getValue().commandBytes; resultBytes-=first.getValue().resultBytes;
         }
+        trimDirectories();
     }
     private void requireOwner(Pending entry) {
         if (entry==null || entry.owner!=this) throw new IllegalArgumentException("Operation belongs to another session client");

@@ -159,7 +159,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     /** Returns the globally ordered business outcome only after every native finalization and home ACK is durable. */
     public synchronized CommandResult result() throws IOException {
         requireOpen();
-        if(noEffectReservationState(observed) && observed.terminal())return new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of());
+        if(noEffectReservationState(observed) && observed.terminal())return observed.terminalBusinessResult();
         if (homeRetirementProof!=null && (observed==null || !observed.fullyFinalized()
                 || entries.values().stream().anyMatch(entry -> entry.outcome==null && (observed.phase()!=TransactionStatus.Phase.ABORT || entry.retirementProof==null)))) throw new RatisTransactionOutcomeExpiredException(initial.transactionId());
         if (observed==null || !observed.fullyFinalized() || entries.values().stream().anyMatch(entry -> entry.outcome==null && entry.retirementProof==null)) throw new IllegalStateException("Transaction result requires all participant proofs and home ACKs");

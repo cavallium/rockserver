@@ -103,6 +103,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisNativeParticipantDiscovery nativeParticipantDiscovery;
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
+    private RatisProofQueryService sourceOutcomeQueries;
     private RatisProofQueryService authorityQueries;
     private RatisProofQueryService importPublicationQueries;
     private RatisProofQueryService operationRerouteQueries;
@@ -236,7 +237,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (snapshotPlan!=null) {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
-        proofQueries=new RatisProofQueryService();
+        proofQueries=new RatisProofQueryService();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();
         if(groups.raftGroups().stream().anyMatch(group->groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.TRANSACTION_HOME))
             operationRerouteQueries=RatisProofQueryService.operationRerouteLane();
         if (groups.raftGroups().stream().anyMatch(group -> groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.CATALOGUE)) {
@@ -315,7 +316,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     var recipe=registration.retired() ? groups.retirement(id) : registration.seed();
                     var bindings=recipe!=null ? recipe.physicalNames() : home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
                     var importDefinition=registration.seed()==null ? plan.importDefinition(id) : null;
-                    var store=registration.seed()!=null ? pool.reopenTopologyRange(registration.seed().birth(id),seedSchema(registration.seed())) : importDefinition==null ? pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
+                    var store=registration.retired() ? pool.openRetiredTopologyRange(id) : registration.seed()!=null ? pool.reopenTopologyRange(registration.seed().birth(id),seedSchema(registration.seed())) : importDefinition==null ? pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
                             directory.schemaDigest(),bindings,recipe!=null ? recipe.mergeColumns() : home==null ? plan.merges() : Set.of())
                             : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchema)
                             : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchema);
@@ -323,7 +324,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
-                    if (role==RatisNodePlan.Role.DATA && (logicalSchema!=null || registration.seed()!=null)) {
+                    if (role==RatisNodePlan.Role.DATA && !registration.retired() && (logicalSchema!=null || registration.seed()!=null)) {
                         var effectiveSchema=store.installedSchema();
                         store.enableLogicalSchema(effectiveSchema==null ? logicalSchema : effectiveSchema);
                     }
@@ -435,8 +436,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
         throw new IOException("Forced topology seed has no qualified local native source schema");
     }
     private void configureDataMachine(RatisRangeStateMachine machine,RangeDirectory directory,it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor){
-        machine.role(RatisNodePlan.Role.DATA);machine.cdcBinding(directory.clusterId(),directory.databaseId(),descriptor.rangeId());machine.schemaStorage(pool);machine.schemaActivated(this::observeSchemaActivation);
+        machine.role(RatisNodePlan.Role.DATA);machine.sourceOutcomeQueries(sourceOutcomeQueries);machine.cdcBinding(directory.clusterId(),directory.databaseId(),descriptor.rangeId());machine.schemaStorage(pool);machine.schemaActivated(this::observeSchemaActivation);
         var authority=epochs.schemaAuthority();machine.schemaAuthority((header,digest)->readSchemaAuthority(authority,header,digest),directory);machine.schemaReplicas(schemaReplicas,ownReplica(descriptor));machine.topologyAuthority(epochs.topologyAuthority()::read,directory,ownReplica(descriptor),pool);machine.topologySeedInstaller(this::seedTopology);machine.topologyActivated(this::observeTopologyActivation);
+        if(transactionHomes!=null)machine.sourceOutcomeAdmission(new RatisSourceOutcomeAdmission(new RatisSourceOutcomeAdmission.Authority(){
+            public it.cavallium.rockserver.core.common.distributed.TransactionStatus home(it.cavallium.rockserver.core.common.distributed.HomeIdentity original)throws IOException{var configured=plan.home(RatisNodePlan.Role.TRANSACTION_HOME);if(configured==null || !configured.column().equals(original.columnId()))throw new IOException("Source proof HOME column is not configured");var read=transactionHomes.readRegistration(original.transactionId());if(!read.descriptor().groupId().equals(original.groupId()) || read.descriptor().rangeEpoch()!=original.rangeEpoch() || !Arrays.equals(configured.directory().schemaDigest(),original.schemaDigest()))throw new IOException("Source proof changed exact HOME placement");return read.status();}
+            public it.cavallium.rockserver.core.common.distributed.ParticipantOutcome outcome(RangeDirectory frozen,RangeDescriptor route,UUID transaction)throws IOException{return routed.finalizedParticipant(frozen,route,transaction);}
+            public it.cavallium.rockserver.core.common.distributed.ParticipantFenceProof fence(RangeDirectory frozen,RangeDescriptor route,it.cavallium.rockserver.core.common.distributed.ParticipantIdentity identity)throws IOException{return routed.participantFence(frozen,route,identity);}
+        })::qualify);
         if(captureHomes!=null)machine.snapshotHomes(captureHomes);if(transactionHomes!=null){machine.transactionHomes(transactionHomes);machine.snapshotRecovery(this::recoverParticipant,snapshotHelp);}
     }
     private boolean nativeAdmissionOpen(UUID group){var store=stores.get(group);return store!=null && store.admissionOpen();}
@@ -650,6 +656,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 try { operationRerouteQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch(InterruptedException interrupted) { Thread.currentThread().interrupt();throw new IOException("Reroute preparation drain interrupted",interrupted); }
                 catch(ExecutionException | TimeoutException failure) { throw new IOException("Reroute preparation did not drain",failure); }
+            }
+            if(sourceOutcomeQueries!=null){
+                try{sourceOutcomeQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Source outcome proof drain interrupted",interrupted);}
+                catch(ExecutionException|TimeoutException failure){throw new IOException("Source outcome proof did not drain",failure);}
             }
             if (proofQueries!=null) {
                 try { proofQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }

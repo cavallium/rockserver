@@ -24,19 +24,43 @@ class RatisOperationRerouteJournalTest {
         if(accepted)command=DistributedCommand.acceptedTransaction(command,new TransactionAcceptance(new ApplyPosition(1,1),0,new UUID(4,2),new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{1}))),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()));
         var freeze=new NativeTopologyFreeze(definition.header(),group,new ApplyPosition(1,2),NativeTopologyFreeze.boundsDigest(null,null),new byte[32]);
         var lineage=new DistributedCdcCheckpoint.Lineage(group,group,1);var request=new RatisTopologyOperationOutcomeRpc.Request(cluster,database,domain,lineage,operation,command.receiptDigest());
-        var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,new ApplyPosition(1,2),freeze,1,0,new byte[]{1},null);
+        var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,new ApplyPosition(1,2),freeze,1,0,new byte[]{1},null,null);
         var origin=new OperationRerouteOrigin(cluster,database,domain,lineage,operation,command.receiptDigest(),OperatorUpload.sha256(freeze.encode()),absence.cut(),target.payloadDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(command,target),RatisOperationRerouteAdmissionRpc.targetParticipantCount(command,target),new OperationId(new UUID(4,3),2,0));return new Input(source,command,target,origin,absence);
     }
     @Test void emptyAcceptedReadCertificationPreservesItsOriginalAudit()throws Exception {
         var base=input(true);var command=DistributedCommand.readCertification(base.command().groupId(),base.command().rangeEpoch(),base.command().schemaDigest(),base.command().operationId(),base.command().acceptance());
         var old=base.origin();var request=new RatisTopologyOperationOutcomeRpc.Request(old.clusterId(),old.databaseId(),old.domainId(),old.source(),old.operation(),command.receiptDigest());var saved=base.absence();
-        var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,saved.outcome(),saved.cut(),saved.freeze(),saved.configurationTerm(),saved.configurationIndex(),saved.configuration(),null);
+        var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,saved.outcome(),saved.cut(),saved.freeze(),saved.configurationTerm(),saved.configurationIndex(),saved.configuration(),saved.credit(),null);
         var origin=new OperationRerouteOrigin(old.clusterId(),old.databaseId(),old.domainId(),old.source(),old.operation(),command.receiptDigest(),old.absenceCommitment(),old.absenceCut(),old.targetDirectoryDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(command,base.target()),RatisOperationRerouteAdmissionRpc.targetParticipantCount(command,base.target()),old.firstControl());
         Path path=root.resolve("read-certification.bin");try(var ignored=create(path,new Input(base.source(),command,base.target(),origin,absence))){}
         try(var journal=RatisOperationRerouteJournal.reopen(path,binding)){assertTrue(journal.originalCommand().readCertification());assertTrue(journal.originalCommand().mutations().isEmpty());assertArrayEquals(DistributedCommandCodec.encode(command),DistributedCommandCodec.encode(journal.originalCommand()));assertArrayEquals(ScopedTransactionRpc.scopeBytes(command.acceptance().scope()),ScopedTransactionRpc.scopeBytes(journal.originalCommand().acceptance().scope()));}
     }
     static RangeDirectory preparedSource(RatisRoutedClient.PreparedCommand prepared)throws Exception {var field=RatisRoutedClient.PreparedCommand.class.getDeclaredField("source");field.setAccessible(true);return (RangeDirectory)field.get(prepared);}
     RatisOperationRerouteJournal create(Path path,Input input)throws IOException{return RatisOperationRerouteJournal.create(path,binding,input.source(),input.command(),input.target(),input.origin(),input.absence(),ttl);}
+    @Test void selectedInputForcesBeforeIssuanceAndBindsOriginalAllocationExactlyOnce()throws Exception {
+        var input=input(false);Path path=root.resolve("selected.bin");
+        try(var selected=RatisOperationRerouteJournal.select(path,binding,input.source(),input.command(),input.target(),input.absence(),ttl)){assertNull(selected.origin());assertTrue(Files.isRegularFile(path));assertFalse(Files.exists(root.resolve("issuer.bin")));}
+        try(var selected=RatisOperationRerouteJournal.reopen(path,binding)){assertNull(selected.origin());assertArrayEquals(DistributedCommandCodec.encode(input.command()),DistributedCommandCodec.encode(selected.originalCommand()));selected.bindOrigin(input.origin());selected.bindOrigin(input.origin());assertEquals(input.origin(),selected.origin());}
+        try(var selected=RatisOperationRerouteJournal.reopen(path,binding)){assertEquals(input.origin(),selected.origin());var old=input.origin();var other=new OperationRerouteOrigin(old.clusterId(),old.databaseId(),old.domainId(),old.source(),old.operation(),old.originalReceiptDigest(),old.absenceCommitment(),old.absenceCut(),old.targetDirectoryDigest(),old.planDigest(),old.targetParticipantCount(),new OperationId(new UUID(9,1),old.firstControl().epoch(),0));assertThrows(IOException.class,()->selected.bindOrigin(other));}
+    }
+    @Test void uncertainOriginBindingFencesOwnerAndReopensExactlyPublishedPhase()throws Exception {
+        var input=input(false);Path path=root.resolve("bind-unknown.bin");
+        try(var selected=RatisOperationRerouteJournal.select(path,binding,input.source(),input.command(),input.target(),input.absence(),ttl)) {
+            assertThrows(IOException.class,()->selected.bindOrigin(input.origin(),(file,body,maximum)->{SessionJournalFiles.write(file,body,maximum);throw new IOException("Lost bound-origin force confirmation");}));assertThrows(IOException.class,()->selected.bindOrigin(input.origin()));
+        }
+        try(var reopened=RatisOperationRerouteJournal.reopen(path,binding)){assertEquals(input.origin(),reopened.origin());reopened.requireInput(input.source(),input.command(),input.target(),input.origin(),input.absence(),ttl);}
+    }
+    @Test void preRenameBoundSidecarKeepsSelectedAuthorityAndSameIssuedAllocation()throws Exception {
+        var input=input(false);Path path=root.resolve("bind-before-rename.bin");
+        try(var selected=RatisOperationRerouteJournal.select(path,binding,input.source(),input.command(),input.target(),input.absence(),ttl)) {
+            assertThrows(IOException.class,()->selected.bindOrigin(input.origin(),(file,body,maximum)->{SessionJournalFiles.write(file.resolveSibling(file.getFileName()+".pending"),body,maximum);throw new IOException("Lost before rename");}));
+        }
+        try(var recovered=RatisOperationRerouteJournal.reopen(path,binding)) {
+            assertNull(recovered.origin(),"The durable SELECTED phase grants no HOME/capture authority");var old=input.origin();var replacement=new OperationRerouteOrigin(old.clusterId(),old.databaseId(),old.domainId(),old.source(),old.operation(),old.originalReceiptDigest(),old.absenceCommitment(),old.absenceCut(),old.targetDirectoryDigest(),old.planDigest(),old.targetParticipantCount(),new OperationId(new UUID(9,2),old.firstControl().epoch(),0));
+            assertThrows(IOException.class,()->recovered.bindOrigin(replacement));recovered.bindOrigin(input.origin());assertEquals(input.origin(),recovered.origin());assertFalse(Files.exists(path.resolveSibling(path.getFileName()+".pending")));
+        }
+        try(var recovered=RatisOperationRerouteJournal.reopen(path,binding)){assertEquals(input.origin(),recovered.origin());}
+    }
     @Test void forcedAcceptedInputReopensExactlyAndHasExclusiveStableOwnership()throws Exception {
         var input=input(true);Path path=root.resolve("input.bin");byte[] bytes;
         try(var journal=create(path,input)) {
