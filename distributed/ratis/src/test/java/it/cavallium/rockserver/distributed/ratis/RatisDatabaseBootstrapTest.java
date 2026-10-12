@@ -22,7 +22,7 @@ class RatisDatabaseBootstrapTest {
                 new RatisNodePlan.Catalogue(f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.outer.sessions,List.of(catalogue)),Map.of(f.outer.data,"data"),Set.of(),2);
     }
     RatisDatabaseBootstrap bootstrap(Path path,RatisSessionPropagationTest.Fixture f,RatisNodePlan plan) throws IOException {
-        return new RatisDatabaseBootstrap(path,plan,f.catalogue.client,f.routed,10,() -> 20L,2);
+        return new RatisDatabaseBootstrap(path,List.of(new RatisDatabaseBootstrap.Domain(plan,f.routed,null,null)),f.catalogue.client,null,10,() -> 20L,2);
     }
     void ready(RatisDatabaseBootstrap bootstrap) throws Exception {
         for (int i=0;i<20;i++) if (bootstrap.step(1).phase()==RatisDatabaseBootstrap.Phase.READY) return;
@@ -124,7 +124,7 @@ class RatisDatabaseBootstrapTest {
                 new DistributedSchema.Column(71,outer.data,"data",ColumnSchema.of(IntArrayList.of(1),new ObjectArrayList<>(),true),null)));
     }
     RatisDatabaseBootstrap bootstrap(Path path,RatisSessionPropagationTest.Fixture f,DistributedSchema schema) throws IOException {
-        return new RatisDatabaseBootstrap(path,plan(f),f.catalogue.client,f.routed,schema,10,() -> 20L,2);
+        return new RatisDatabaseBootstrap(path,List.of(new RatisDatabaseBootstrap.Domain(plan(f),f.routed,schema,null)),f.catalogue.client,null,10,() -> 20L,2);
     }
     RatisSchemaCatalogue schemas(RatisSessionPropagationTest.Fixture f) {
         return new RatisSchemaCatalogue(f.catalogue.client,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
@@ -163,17 +163,17 @@ class RatisDatabaseBootstrapTest {
             var allocation=new RatisColumnAllocation(f.catalogue.client,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn);
             byte[] witness=allocation.readCounter(); assertEquals(70,RatisColumnAllocation.counter(witness));
             Path journals=Files.createDirectory(root.resolve("later-domain")); byte[] frozen;
-            try (var boot=new RatisDatabaseBootstrap(journals,plan(f),f.catalogue.client,f.routed,schema,witness,10,() -> 20L,2)) {
+            try (var boot=new RatisDatabaseBootstrap(journals,List.of(new RatisDatabaseBootstrap.Domain(plan(f),f.routed,schema,witness)),f.catalogue.client,null,10,() -> 20L,2)) {
                 assertEquals(RatisDatabaseBootstrap.Phase.SCHEMA,boot.step(2).phase());
                 f.catalogue.writeOverride=new byte[4]; assertThrows(IOException.class,() -> boot.step(1));
-                assertEquals(RatisDatabaseBootstrap.Phase.SCHEMA,boot.progress().phase()); frozen=Files.readAllBytes(journals.resolve("schema.bin"));
+                assertEquals(RatisDatabaseBootstrap.Phase.SCHEMA,boot.progress().phase()); frozen=Files.readAllBytes(journals.resolve("domains").resolve(schema.domainId().toString()).resolve("schema.bin"));
                 assertEquals(71,RatisColumnAllocation.counter(allocation.readCounter())); assertNotNull(schemas(f).read(schema.digest()));
             } finally { f.catalogue.writeOverride=null; }
             assertEquals(CommandResult.Status.SUCCESS,allocation.execute(allocation.prepare(f.outer.operation(100),new UUID(91,3),other.domainId(),new UUID(91,4),allocation.readCounter())).status());
             assertEquals(72,RatisColumnAllocation.counter(allocation.readCounter()));
-            assertThrows(IllegalArgumentException.class,() -> new RatisDatabaseBootstrap(journals,plan(f),f.catalogue.client,f.routed,schema,allocation.readCounter(),10,() -> 20L,2),"Current counter cannot replace the journal's original witness");
-            try (var boot=new RatisDatabaseBootstrap(journals,plan(f),f.catalogue.client,f.routed,schema,witness,10,() -> 20L,2)) {
-                assertArrayEquals(frozen,Files.readAllBytes(journals.resolve("schema.bin")),"Reopen preserves the original unknown command");
+            assertThrows(IllegalArgumentException.class,() -> new RatisDatabaseBootstrap(journals,List.of(new RatisDatabaseBootstrap.Domain(plan(f),f.routed,schema,allocation.readCounter())),f.catalogue.client,null,10,() -> 20L,2),"Current counter cannot replace the journal's original witness");
+            try (var boot=new RatisDatabaseBootstrap(journals,List.of(new RatisDatabaseBootstrap.Domain(plan(f),f.routed,schema,witness)),f.catalogue.client,null,10,() -> 20L,2)) {
+                assertArrayEquals(frozen,Files.readAllBytes(journals.resolve("domains").resolve(schema.domainId().toString()).resolve("schema.bin")),"Reopen preserves the original unknown command");
                 ready(boot); assertEquals(72,RatisColumnAllocation.counter(allocation.readCounter()));
                 assertArrayEquals(DistributedSchemaCodec.encode(other),DistributedSchemaCodec.encode(schemas(f).read(other.digest())));
             }
