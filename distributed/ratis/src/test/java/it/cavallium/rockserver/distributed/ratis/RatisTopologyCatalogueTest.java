@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed.ratis;
 import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
 import java.nio.file.Path;
+import java.nio.ByteBuffer;
 import java.util.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -104,6 +105,15 @@ class RatisTopologyCatalogueTest {
                 assertThrows(IllegalArgumentException.class,()->f.pure.accept(malformed));
             }
             assertEquals(expected,catalogue.readHead(source.domainId()));
+        }
+    }
+
+    @Test void writableRelocationHasIrreversibleJoiningAndAtomicQualifiedPublication()throws Exception{
+        var owner=owner();try(var f=owner.new Fixture()){
+            var source=source(f);f.seed(source);var parent=source.ranges().getFirst();var peers=new ArrayList<>(parent.replicas());peers.add(new ReplicaDescriptor(new UUID(90,1),new UUID(90,2),new UUID(90,3),"new-listener","127.0.0.1:9456",ReplicaDescriptor.Role.LISTENER));var targetRange=new RangeDescriptor(parent.rangeId(),parent.groupId(),parent.rangeEpoch(),parent.configurationVersion()+1,parent.lowerInclusive(),parent.upperExclusive(),parent.topologyState(),peers);var target=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.schemaDigest(),source.generation()+1,source.columns(),source.routingPrefixBytes(),List.of(targetRange));var definition=new TopologyChange.Definition(new UUID(90,4),source,target);var catalogue=catalogue(f);
+            catalogue.execute(catalogue.prepareDefinition(f.operation(1),definition,null));catalogue.execute(catalogue.prepareBegin(f.operation(2),definition,null,null,null));var prepared=catalogue.readIntent(definition.intentId());var join=catalogue.prepareJoining(f.operation(3),definition,prepared,null,null);assertFalse(RatisTopologyCatalogue.requiresOwnerAdmission(join));assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(join).status());var joining=catalogue.readIntent(definition.intentId());assertThrows(IllegalStateException.class,joining::abort);assertArrayEquals(RangeDirectoryCodec.encode(source),f.immutable.read(ByteBuffer.allocate(16).putLong(source.domainId().getMostSignificantBits()).putLong(source.domainId().getLeastSignificantBits()).array()));
+            // This fixture exercises catalogue structure/CAS; controlled callback does not claim a native configuration effect.
+            var voter=targetRange.replicas().stream().filter(r->r.role()==ReplicaDescriptor.Role.VOTER).findFirst().orElseThrow();var proof=new TopologyChange.RelocationProof(parent.groupId(),TopologyChange.Owner.of(voter),new ApplyPosition(1,4),new ApplyPosition(1,8),new ApplyPosition(1,8),new byte[32]);var progress=catalogue.prepareReconfigured(f.operation(4),definition,joining,proof,null,null);assertTrue(RatisTopologyCatalogue.requiresOwnerAdmission(progress));assertThrows(java.io.IOException.class,()->RatisTopologyCatalogue.admitRelocation(progress,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.immutable::read,null));RatisTopologyCatalogue.RelocationOwnerReader qualified=(d,p)->new RatisTopologyCatalogue.QualifiedRelocation(p,new ApplyPosition(1,9));RatisTopologyCatalogue.admitRelocation(progress,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.immutable::read,qualified);assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(progress).status());var publication=catalogue.prepareRelocationPublication(f.operation(5),definition,catalogue.readIntent(definition.intentId()),null,null);assertEquals(3,publication.mutations().size());RatisTopologyCatalogue.admitRelocation(publication,f.outer.cluster,f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.immutable::read,qualified);assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(publication).status());assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(publication).status());assertTrue(catalogue.readHead(source.domainId()).terminal());assertArrayEquals(RangeDirectoryCodec.encode(target),f.immutable.read(ByteBuffer.allocate(16).putLong(source.domainId().getMostSignificantBits()).putLong(source.domainId().getLeastSignificantBits()).array()));
         }
     }
 

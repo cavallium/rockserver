@@ -17,6 +17,8 @@ public final class RatisTopologyCatalogue {
     @FunctionalInterface public interface ImmutableReader { byte[] read(byte[] key); }
     /** Trusted transport validates the actual addressed owner, stable configuration and current Raft term. */
     @FunctionalInterface public interface OwnerProofReader { QualifiedOwner read(TopologyChange.Definition definition,TopologyChange.Proof expected) throws IOException; }
+    @FunctionalInterface public interface RelocationOwnerReader { QualifiedRelocation read(TopologyChange.Definition definition,TopologyChange.RelocationProof expected)throws IOException; }
+    public record QualifiedRelocation(TopologyChange.RelocationProof proof,ApplyPosition completedCut){public QualifiedRelocation{Objects.requireNonNull(proof);Objects.requireNonNull(completedCut);}}
     public record QualifiedOwner(TopologyChange.Proof proof,ApplyPosition completedCut) {
         public QualifiedOwner { Objects.requireNonNull(proof); Objects.requireNonNull(completedCut); }
     }
@@ -74,6 +76,14 @@ public final class RatisTopologyCatalogue {
                         predicate(domainKey(header.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),predicate(identityKey(header.intentId()),definition.digest()),
                         predicate(RatisSchemaAdministration.headKey(header.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(RatisRangeImportCatalogue.headKey(header.domainId()),importHead==null ? null : importHead.encode())));
     }
+    public DistributedCommand prepareJoining(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead){expected.requireDefinition(definition);return prepareProgress(operation,definition,expected,expected.beginJoining(),schemaHead,importHead,false);}
+    public DistributedCommand prepareReconfigured(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.RelocationProof proof,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead){expected.requireDefinition(definition);return prepareProgress(operation,definition,expected,expected.reconfigured(proof),schemaHead,importHead,false);}
+    public DistributedCommand prepareRelocationPublication(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead){expected.requireDefinition(definition);return prepareProgress(operation,definition,expected,expected.publishRelocation(),schemaHead,importHead,true);}
+    public static boolean relocationExecution(DistributedCommand command){return isCommand(command) && command.mutations().size()>=2 && TopologyChange.State.decode(command.mutations().getFirst().value()).header().kind()==TopologyChange.Kind.RELOCATE;}
+    public static void admitRelocation(DistributedCommand command,UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,ImmutableReader reader,RelocationOwnerReader owners)throws IOException{
+        validator(cluster,database,group,epoch,schema,column,reader).accept(command);if(!requiresOwnerAdmission(command) || !relocationExecution(command) || owners==null)throw new IOException("Fresh relocation owner admission is not configured");requireCurrentWitnesses(command,reader);var next=TopologyChange.State.decode(command.mutations().getFirst().value());var definition=TopologyChange.Definition.decode(reader.read(definitionKey(next.header().definitionDigest())));var expected=next.relocation();var actual=owners.read(definition,expected);if(actual==null || !expected.equals(actual.proof()) || !covers(actual.completedCut(),expected.completedPosition()))throw new IOException("Relocation lost exact committed configuration/native readiness");requireCurrentWitnesses(command,reader);
+    }
+    private static boolean covers(ApplyPosition cut,ApplyPosition expected){return cut.term()>=expected.term() && cut.index()>=expected.index() && (cut.index()!=expected.index() || cut.term()==expected.term());}
     public DistributedCommand prepareProof(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.Proof proof) {
         UUID domain=definition.header().domainId();
         byte[] schemaHead=uncheckedRead(RatisSchemaAdministration.headKey(domain)),importHead=uncheckedRead(RatisRangeImportCatalogue.headKey(domain));
@@ -102,7 +112,7 @@ public final class RatisTopologyCatalogue {
         if(!isCommand(command) || command.mutations().size()<2 || command.predicates().size()!=6 || command.predicates().getFirst().expectedValue()==null) return false;
         var previous=TopologyChange.State.decode(command.predicates().getFirst().expectedValue());
         var next=TopologyChange.State.decode(command.mutations().getFirst().value());
-        return previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.FENCING;
+        return previous.phase()!=TopologyChange.Phase.PREPARED || next.phase()!=TopologyChange.Phase.FENCING && next.phase()!=TopologyChange.Phase.JOINING;
     }
     /** Fresh preparation only. Deterministic validation and committed replay never call remote owners. */
     public static void admitExecution(DistributedCommand command,UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column,ImmutableReader reader,OwnerProofReader owners) throws IOException {
@@ -195,7 +205,11 @@ public final class RatisTopologyCatalogue {
                 var previous=TopologyChange.State.decode(oldState); next.requireSuccessorOf(previous);
                 if(!Arrays.equals(oldState,oldHead)) throw new IllegalArgumentException("Topology progress requires exact predecessor head/state");
                 if(previous.phase()==TopologyChange.Phase.PREPARED) {
-                    if(command.mutations().size()!=2 || next.phase()!=TopologyChange.Phase.FENCING) throw new IllegalArgumentException("Topology fencing requires exact prepared head/state");
+                    if(command.mutations().size()!=2 || next.phase()!=(header.kind()==TopologyChange.Kind.RELOCATE?TopologyChange.Phase.JOINING:TopologyChange.Phase.FENCING)) throw new IllegalArgumentException("Topology execution requires exact prepared head/state");
+                } else if(header.kind()==TopologyChange.Kind.RELOCATE){
+                    if(previous.phase()==TopologyChange.Phase.JOINING && next.phase()==TopologyChange.Phase.RECONFIGURED){if(command.mutations().size()!=2)throw new IllegalArgumentException("Relocation progress writes only intent/head");}
+                    else if(previous.phase()==TopologyChange.Phase.RECONFIGURED && next.phase()==TopologyChange.Phase.ACTIVE){if(command.mutations().size()!=3)throw new IllegalArgumentException("Relocation publication must atomically replace directory");}
+                    else throw new IllegalArgumentException("Invalid relocation execution step");
                 } else if(previous.phase()==TopologyChange.Phase.SEEDED && next.phase()==TopologyChange.Phase.PUBLISHED) {
                     if(command.mutations().size()!=3) throw new IllegalArgumentException("Topology publication must atomically replace its directory");
                 } else {

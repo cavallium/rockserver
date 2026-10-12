@@ -10,7 +10,7 @@ public final class TopologyChange {
     public static final int MAX_DEFINITION_BYTES=DistributedCommandCodec.MAX_ENCODED_BYTES-8192,MAX_HEADER_BYTES=8192,MAX_STATUS_BYTES=16384;
     private static final int DEFINITION_MAGIC=0x54434446,HEADER_MAGIC=0x54434844,STATE_MAGIC=0x54435354,PROOF_MAGIC=0x54435046;
     public enum Kind { SPLIT, MERGE, RELOCATE }
-    public enum Phase { PREPARED, FENCING, FENCED, SEEDED, PUBLISHED, ACTIVE, RETIRED, ABORTED }
+    public enum Phase { PREPARED, FENCING, FENCED, SEEDED, PUBLISHED, ACTIVE, RETIRED, ABORTED, JOINING, RECONFIGURED }
     public enum Stage { FREEZE, SEED, ACTIVATE }
     private TopologyChange() {}
     public record Owner(UUID replicaId,ReplicaDescriptor.Role role,byte[] identityDigest) {
@@ -157,34 +157,60 @@ public final class TopologyChange {
         @Override public boolean equals(Object other) { return other instanceof Proof proof && Arrays.equals(encode(),proof.encode()); }
         @Override public int hashCode() { return Arrays.hashCode(encode()); }
     }
+    /** Genuine target configuration commitment and native catch-up cuts, qualified freshly by the adapter. */
+    public record RelocationProof(UUID groupId,Owner owner,ApplyPosition configurationPosition,ApplyPosition completedPosition,ApplyPosition requiredCatchupCut,byte[] configurationDigest) {
+        public static final int BYTES=149;
+        public RelocationProof { Objects.requireNonNull(groupId);Objects.requireNonNull(owner);Objects.requireNonNull(configurationPosition);Objects.requireNonNull(completedPosition);Objects.requireNonNull(requiredCatchupCut);exact(configurationDigest);configurationDigest=configurationDigest.clone();if(owner.role()!=ReplicaDescriptor.Role.VOTER || configurationPosition.term()<1 || configurationPosition.index()<1 || requiredCatchupCut.term()<1 || !covers(completedPosition,configurationPosition) || !covers(completedPosition,requiredCatchupCut))throw new IllegalArgumentException("Relocation proof lacks committed configuration/native catch-up"); }
+        private static boolean covers(ApplyPosition cut,ApplyPosition expected){return cut.term()>=expected.term() && cut.index()>=expected.index() && (cut.index()!=expected.index() || cut.term()==expected.term());}
+        @Override public byte[] configurationDigest(){return configurationDigest.clone();}
+        public byte[] encode(){var out=ByteBuffer.allocate(BYTES).putInt(0x54524350);uuid(out,groupId);writeOwner(out,owner);for(var cut:List.of(configurationPosition,completedPosition,requiredCatchupCut))out.putLong(cut.term()).putLong(cut.index());return out.put(configurationDigest).array();}
+        public static RelocationProof decode(byte[] bytes){var in=input(bytes,BYTES,BYTES,0x54524350);var group=uuid(in);var owner=readOwner(in);var config=new ApplyPosition(in.getLong(),in.getLong());var completed=new ApplyPosition(in.getLong(),in.getLong());var required=new ApplyPosition(in.getLong(),in.getLong());var result=new RelocationProof(group,owner,config,completed,required,readDigest(in));end(in);canonical(bytes,result.encode());return result;}
+        @Override public boolean equals(Object other){return other instanceof RelocationProof proof && Arrays.equals(encode(),proof.encode());}
+        @Override public int hashCode(){return Arrays.hashCode(encode());}
+    }
     public record Key(UUID groupId,UUID replicaId) { public Key { Objects.requireNonNull(groupId); Objects.requireNonNull(replicaId); } }
     public static final class State {
         private final Header header;
         private final long generation;
         private final Phase phase;
         private final Map<Key,Proof> frozen,seeded,activated;
+        private final RelocationProof relocation;
         private State(Header header,long generation,Phase phase,Map<Key,Proof> frozen,Map<Key,Proof> seeded,Map<Key,Proof> activated) {
+            this(header,generation,phase,frozen,seeded,activated,null);
+        }
+        private State(Header header,long generation,Phase phase,Map<Key,Proof> frozen,Map<Key,Proof> seeded,Map<Key,Proof> activated,RelocationProof relocation) {
+            this.relocation=relocation;
             this.header=Objects.requireNonNull(header); this.generation=generation; this.phase=Objects.requireNonNull(phase); this.frozen=Map.copyOf(frozen); this.seeded=Map.copyOf(seeded); this.activated=Map.copyOf(activated);
             for(var stage:Stage.values()) for(var entry:proofs(stage).entrySet()) { var proof=entry.getValue(); bind(proof,stage); if(!entry.getKey().equals(key(proof))) throw new IllegalArgumentException("Topology proof key differs"); }
             for(var stage:Stage.values()) for(var p:stage==Stage.FREEZE ? header.parents : header.targets) {
                 ApplyPosition cut=null; for(var proof:proofs(stage).values()) if(proof.groupId().equals(p.groupId())) { if(cut!=null && !cut.equals(proof.position())) throw new IllegalArgumentException("Owners disagree on original group stage cut"); cut=proof.position(); }
             }
             boolean f=quorum(Stage.FREEZE),s=quorum(Stage.SEED),a=quorum(Stage.ACTIVATE);
-            if(header.kind==Kind.RELOCATE && phase!=Phase.PREPARED && phase!=Phase.ABORTED) throw new IllegalArgumentException("Relocation execution is unsupported; source remains writable");
+            if(header.kind==Kind.RELOCATE){
+                if(!this.frozen.isEmpty() || !this.seeded.isEmpty() || !this.activated.isEmpty())throw new IllegalArgumentException("Writable relocation cannot carry split execution proofs");
+                long expected=switch(phase){case PREPARED->0;case ABORTED,JOINING->1;case RECONFIGURED->2;case ACTIVE->3;default->throw new IllegalArgumentException("Invalid writable relocation phase");};
+                if(generation!=expected || (phase==Phase.RECONFIGURED || phase==Phase.ACTIVE)!=(relocation!=null))throw new IllegalArgumentException("Relocation generation/configuration proof differs");
+                if(relocation!=null){var target=header.targets.getFirst();if(!target.groupId().equals(relocation.groupId()) || !target.owner(relocation.owner().replicaId()).equals(relocation.owner()))throw new IllegalArgumentException("Relocation proof changed target owner");}return;
+            }
+            if(relocation!=null || phase==Phase.JOINING || phase==Phase.RECONFIGURED)throw new IllegalArgumentException("Split/merge carries relocation authority");
             if(phase==Phase.PREPARED || phase==Phase.ABORTED) { if(!this.frozen.isEmpty() || !this.seeded.isEmpty() || !this.activated.isEmpty()) throw new IllegalArgumentException("Prepared/aborted topology has execution proofs"); }
             else if(phase==Phase.FENCING ? f || !this.seeded.isEmpty() || !this.activated.isEmpty() : !f) throw new IllegalArgumentException("Topology lacks parent freeze quorum");
             if((phase==Phase.FENCED && s) || (phase==Phase.SEEDED || phase==Phase.PUBLISHED || phase==Phase.ACTIVE || phase==Phase.RETIRED) && !s || (phase!=Phase.PUBLISHED && phase!=Phase.ACTIVE && phase!=Phase.RETIRED) && !this.activated.isEmpty() || phase==Phase.PUBLISHED && a || (phase==Phase.ACTIVE || phase==Phase.RETIRED) && !a) throw new IllegalArgumentException("Topology readiness differs from seed/activation quorums");
             for(var proof:this.frozen.values()) if(!Arrays.equals(proof.predecessorDigest(),header.sourceDigest)) throw new IllegalArgumentException("Freeze proof changed source commitment");
             for(var proof:this.seeded.values()) if(!Arrays.equals(proof.predecessorDigest(),freezeDigest())) throw new IllegalArgumentException("Seed proof changed parent cut commitment");
             for(var proof:this.activated.values()) { var seed=this.seeded.get(key(proof)); if(seed==null || !Arrays.equals(proof.predecessorDigest(),seed.digest()) || proof.position().index()<=seed.position().index() || proof.position().term()<seed.position().term()) throw new IllegalArgumentException("Owner activation lacks its exact local seed/birth"); }
-            long base=switch(phase) { case PREPARED -> 0; case FENCING,FENCED,SEEDED -> 1; case PUBLISHED,ACTIVE -> 2; case RETIRED -> 3; case ABORTED -> 1; };
+            long base=switch(phase) { case PREPARED -> 0; case FENCING,FENCED,SEEDED -> 1; case PUBLISHED,ACTIVE -> 2; case RETIRED -> 3; case ABORTED -> 1; case JOINING,RECONFIGURED -> throw new IllegalArgumentException("Not a split phase"); };
             if(generation!=base+this.frozen.size()+this.seeded.size()+this.activated.size()) throw new IllegalArgumentException("Topology generation differs from single-step history");
         }
         public static State begin(Header header) { return new State(header,0,Phase.PREPARED,Map.of(),Map.of(),Map.of()); }
         public Header header() { return header; }
         public Phase phase() { return phase; }
         public long generation() { return generation; }
-        public boolean terminal() { return phase==Phase.RETIRED || phase==Phase.ABORTED; }
+        public boolean terminal() { return phase==Phase.RETIRED || phase==Phase.ABORTED || header.kind==Kind.RELOCATE && phase==Phase.ACTIVE; }
+        public RelocationProof relocation(){return relocation;}
+        public State beginJoining(){if(header.kind!=Kind.RELOCATE || phase!=Phase.PREPARED && phase!=Phase.JOINING)throw new IllegalStateException("Joining requires prepared relocation");return phase==Phase.JOINING?this:new State(header,1,Phase.JOINING,frozen,seeded,activated,null);}
+        public State reconfigured(RelocationProof proof){Objects.requireNonNull(proof);if(header.kind!=Kind.RELOCATE || phase!=Phase.JOINING && phase!=Phase.RECONFIGURED)throw new IllegalStateException("Configuration proof requires irreversible JOINING");if(phase==Phase.RECONFIGURED){if(!relocation.equals(proof))throw new IllegalArgumentException("Original relocation proof changed");return this;}return new State(header,2,Phase.RECONFIGURED,frozen,seeded,activated,proof);}
+        public State publishRelocation(){if(header.kind!=Kind.RELOCATE || phase!=Phase.RECONFIGURED && phase!=Phase.ACTIVE)throw new IllegalStateException("Publication requires committed relocation readiness");return phase==Phase.ACTIVE?this:new State(header,3,Phase.ACTIVE,frozen,seeded,activated,relocation);}
         public Map<Key,Proof> frozen() { return frozen; }
         public Map<Key,Proof> seeded() { return seeded; }
         public Map<Key,Proof> activated() { return activated; }
@@ -219,18 +245,19 @@ public final class TopologyChange {
             if(Arrays.equals(encode(),previous.encode())) return;
             if(!Arrays.equals(header.encode(),previous.header.encode()) || generation!=previous.generation+1) throw new IllegalArgumentException("Topology successor changed intent/generation"); State expected=null; int additions=0;
             try {
+                if(header.kind==Kind.RELOCATE){expected=switch(phase){case JOINING->previous.beginJoining();case RECONFIGURED->previous.reconfigured(relocation);case ACTIVE->previous.publishRelocation();case ABORTED->previous.abort();default->null;};if(expected==null || !equals(expected))throw new IllegalArgumentException("Relocation successor is not one exact phase step");return;}
                 for(var stage:Stage.values()) for(var entry:proofs(stage).entrySet()) if(!previous.proofs(stage).containsKey(entry.getKey())) { expected=previous.add(stage,entry.getValue()); additions++; }
                 if(additions==0) expected=switch(phase) { case FENCING -> previous.beginFencing(); case PUBLISHED -> previous.publish(); case RETIRED -> previous.retire(); case ABORTED -> previous.abort(); default -> null; };
             } catch(IllegalStateException|UnsupportedOperationException invalid) { throw new IllegalArgumentException("Illegal topology successor phase",invalid); }
             if(additions>1 || expected==null || !Arrays.equals(encode(),expected.encode())) throw new IllegalArgumentException("Topology successor is not one proof/phase step");
         }
         public byte[] encode() {
-            byte[] h=header.encode(); int size=29+h.length+82*(frozen.size()+seeded.size()+activated.size()); if(size>MAX_STATUS_BYTES) throw new IllegalArgumentException("Topology state exceeds bound");
-            var out=ByteBuffer.allocate(size).putInt(STATE_MAGIC); blob(out,h); out.putLong(generation).put((byte)phase.ordinal()); for(var stage:Stage.values()) compact(out,header,stage,proofs(stage)); return out.array();
+            byte[] h=header.encode(); int size=33+h.length+82*(frozen.size()+seeded.size()+activated.size())+(relocation==null?0:RelocationProof.BYTES); if(size>MAX_STATUS_BYTES) throw new IllegalArgumentException("Topology state exceeds bound");
+            var out=ByteBuffer.allocate(size).putInt(STATE_MAGIC); blob(out,h); out.putLong(generation).put((byte)phase.ordinal()); for(var stage:Stage.values()) compact(out,header,stage,proofs(stage));out.putInt(relocation==null?0:RelocationProof.BYTES);if(relocation!=null)out.put(relocation.encode()); return out.array();
         }
         @Override public boolean equals(Object other) { return other instanceof State state && Arrays.equals(encode(),state.encode()); }
         @Override public int hashCode() { return Arrays.hashCode(encode()); }
-        public static State decode(byte[] bytes) { var in=input(bytes,MAX_STATUS_BYTES,29,STATE_MAGIC); var header=Header.decode(blob(in,MAX_HEADER_BYTES)); if(in.remaining()<21) throw new IllegalArgumentException("Truncated topology state"); long generation=in.getLong(); var phase=tag(Phase.values(),in.get()); var state=new State(header,generation,phase,compact(in,header,Stage.FREEZE),compact(in,header,Stage.SEED),compact(in,header,Stage.ACTIVATE)); end(in); canonical(bytes,state.encode()); return state; }
+        public static State decode(byte[] bytes) { var in=input(bytes,MAX_STATUS_BYTES,29,STATE_MAGIC); var header=Header.decode(blob(in,MAX_HEADER_BYTES)); if(in.remaining()<21) throw new IllegalArgumentException("Truncated topology state"); long generation=in.getLong(); var phase=tag(Phase.values(),in.get()); var frozen=compact(in,header,Stage.FREEZE);var seeded=compact(in,header,Stage.SEED);var activated=compact(in,header,Stage.ACTIVATE);if(in.remaining()<4)throw new IllegalArgumentException("Missing relocation proof framing");int length=in.getInt();if(length!=0 && length!=RelocationProof.BYTES || length>in.remaining())throw new IllegalArgumentException("Invalid relocation proof length");RelocationProof relocation=null;if(length!=0){byte[] proof=new byte[length];in.get(proof);relocation=RelocationProof.decode(proof);}var state=new State(header,generation,phase,frozen,seeded,activated,relocation); end(in); canonical(bytes,state.encode()); return state; }
     }
     private static Key key(Proof proof) { return new Key(proof.groupId(),proof.owner().replicaId()); }
     private static void compact(ByteBuffer out,Header header,Stage stage,Map<Key,Proof> map) {
