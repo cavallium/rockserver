@@ -903,24 +903,40 @@ Relocation source transfer now retains the exact prepared native image across
 restart and forces request-bound release receipts before artifact cleanup. The
 source-service/artifact/RPC/client/host selection passed 23 controlled cases in
 `/tmp/rockserver-source-cold-release-host-repair-gate.log`. The host fixture includes
-failed lease construction and verifies that its native pin drains. The complete
-relocation controller, receiver join, membership CAS and actor recovery are still
-being implemented; that source-transfer gate does not establish their acceptance.
+failed lease construction and verifies that its native pin drains. The
+relocation controller now drives image transfer, native tail readiness, conditional
+membership CAS and catalogue publication. Actor-journal durability/sidecar recovery
+and CAS call ownership passed the 59-case repair gate plus seven host cases in
+`/tmp/rockserver-relocation-actor-durability-repair-gate.log` and
+`/tmp/rockserver-relocation-actor-sidecar-guard-gate.log`. Joint-configuration crash
+recovery, removal/replacement and newer-schema adapter recovery remain incomplete.
 
 Native learners retain their original image evidence and can install an explicitly
-authorized later image without rolling back a completed tail. The existing
-12-case learner gate passed in
-`/tmp/rockserver-later-image-staged-export-repair-gate.log`; receiver preparation
-when the newer image also advances schema remains under implementation.
+authorized later image without rolling back a completed tail. Receiver preparation
+can create its own operator/CF generation for a newer-schema
+image without claiming historical participation. The 49-case native gate passed
+in `/tmp/rockserver-behind-schema-native-gate.log`, including 13 learner cases.
+Its complete remote adapter path remains under implementation.
 
 Snapshot coordination can stop with all gates READY, or all captures reported
 while HOME remains INSTALLING. The six coordinator cases passed after repair in
 `/tmp/rockserver-held-barrier-host-fixture-repair-gate.log` (the separate host case
 in that run failed and passed in the later source-transfer gate above). Complete
-database backup still requires global barrier orchestration, one physical snapshot
-and admission charge per qualified pool cohort, durable copied archives, and
-restoration into fresh cluster/group/session authority. Current per-range captures
-charge the whole shared pool separately and do not meet that resource requirement.
+database backup still requires global barrier orchestration and remote cohort
+ownership. Native pool cohorts now share one physical snapshot and admission charge;
+45 native cases passed, including 65 groups, in
+`/tmp/rockserver-cohort-relocation-backup-combined-gate.log`. Copied archive assets
+and fresh-cluster restore planning passed their ten cases in
+`/tmp/rockserver-relocation-image-backup-repair-gate.log`; full restore execution
+and finite retention across materialization remain incomplete.
+
+SST imports now freeze declared count, byte, metadata and JNI batch limits in the
+current manifest. The 34-case native selection passed in
+`/tmp/rockserver-large-import-policy-jni-diagnostic-gate.log`; the actual 65-SST
+single-prefix fixture covers interrupted batching, cold replay, preserved neighbours
+and saved-receipt retry. Distributed quota/planning alignment and preflight I/O
+isolation are being validated. These fixtures do not establish large-data throughput
+or a globally admitted node/pool/tenant envelope.
 
 Topology has bounded definitions, staged quorum proofs and catalogue CAS for
 reservation, PREPARED, FENCING and explicit pre-fencing abort. Directory publication
