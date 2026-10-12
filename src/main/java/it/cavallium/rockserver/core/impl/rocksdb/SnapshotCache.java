@@ -6,6 +6,7 @@ import org.rocksdb.Cache;
 public final class SnapshotCache extends Cache {
     private boolean stopped;
     private boolean destroyed;
+    private int activeCaptures;
 
     public SnapshotCache(NativeStartupBridge.CacheConfig config) {
         super(NativeStartupBridge.createCache(config));
@@ -14,14 +15,24 @@ public final class SnapshotCache extends Cache {
     /** Must run before closing the DB; cancels and joins native snapshot jobs. */
     public synchronized void stop() {
         if (!stopped && !destroyed) {
-            NativeStartupBridge.stopCache(nativeHandle_);
             stopped = true;
+            NativeStartupBridge.stopCache(nativeHandle_);
         }
     }
 
-    public synchronized NativeStartupBridge.SnapshotResult snapshot() {
-        requireRunning();
-        return NativeStartupBridge.capture(nativeHandle_);
+    public NativeStartupBridge.SnapshotResult snapshot() {
+        synchronized (this) {
+            requireRunning();
+            activeCaptures++;
+        }
+        try {
+            return NativeStartupBridge.capture(nativeHandle_);
+        } finally {
+            synchronized (this) {
+                activeCaptures--;
+                notifyAll();
+            }
+        }
     }
 
     public synchronized void feedback(int mask) {
@@ -59,8 +70,18 @@ public final class SnapshotCache extends Cache {
     @Override protected synchronized void disposeInternal(long handle) {
         if (!destroyed) {
             stop();
-            NativeStartupBridge.destroyCache(handle);
-            destroyed = true;
+            // Native stop joins the job; retain the holder until the FFM calls return too.
+            boolean interrupted = false;
+            while (activeCaptures != 0) {
+                try { wait(); }
+                catch (InterruptedException e) { interrupted = true; }
+            }
+            try {
+                NativeStartupBridge.destroyCache(handle);
+                destroyed = true;
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
+            }
         }
     }
 }

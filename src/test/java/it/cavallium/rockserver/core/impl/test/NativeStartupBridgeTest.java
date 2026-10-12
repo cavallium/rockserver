@@ -6,6 +6,8 @@ import java.lang.reflect.InvocationTargetException;
 
 import java.lang.foreign.Arena;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 import static java.lang.foreign.ValueLayout.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -20,6 +22,15 @@ class NativeStartupBridgeTest {
             throw e;
         }
     }
+    @Test void artifactFingerprintFitsNativeCompatibilityBound(@TempDir Path directory) throws Exception {
+        Path artifact = Files.writeString(directory.resolve("native.so"), "abc");
+        var method = NativeStartupBridge.class.getDeclaredMethod("artifactFingerprint", Path.class);
+        method.setAccessible(true);
+        String fingerprint = (String) method.invoke(null, artifact);
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", fingerprint);
+        assertTrue(fingerprint.matches("[0-9a-f]{64}"));
+    }
+
     @Test void encodesExactNativeLayoutAndScopedStringsWithoutBindingNativeSymbols() throws Exception {
         var config = new NativeStartupBridge.CacheConfig(1, -1, 101, 102, 103, 104, 105,
                 106, 107, 108, 109, 110, 111, 112, 113, 8, 4, .5,

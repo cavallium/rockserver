@@ -88,15 +88,23 @@ public final class NativeStartupBridge {
             try (var arena = Arena.ofConfined()) {
                 var buffer = arena.allocate(65536);
                 check((int) call(PATH, buffer, buffer.byteSize()), "Resolve loaded RocksDB library path");
-                var digest = MessageDigest.getInstance("SHA-256");
-                try (var input = Files.newInputStream(Path.of(buffer.getString(0)))) {
-                    byte[] bytes = new byte[65536];
-                    for (int n; (n = input.read(bytes)) >= 0;) digest.update(bytes, 0, n);
-                }
-                return "rshc-v1-sha256-" + HexFormat.of().formatHex(digest.digest());
-            } catch (IOException | NoSuchAlgorithmException e) {
+                return artifactFingerprint(Path.of(buffer.getString(0)));
+            } catch (IOException e) {
                 throw new IllegalStateException("Cannot fingerprint loaded RocksDB library", e);
             }
+        }
+    }
+
+    static String artifactFingerprint(Path path) throws IOException {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            try (var input = Files.newInputStream(path)) {
+                byte[] bytes = new byte[65536];
+                for (int n; (n = input.read(bytes)) >= 0;) digest.update(bytes, 0, n);
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new AssertionError("SHA-256 is required by the Java platform", e);
         }
     }
 
