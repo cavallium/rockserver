@@ -6295,9 +6295,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			var nativeKeys = new MemorySegment[calculatedKeys.size()];
 			var emptyValues = new MemorySegment[calculatedKeys.size()];
+			// The MemorySegment overload creates a distinct ByteBuffer per entry; zero capacity prevents writes.
+			var emptyValue = arena.allocate(0);
 			for (int i = 0; i < calculatedKeys.size(); i++) {
 				nativeKeys[i] = copyToNativeSegment(arena, calculatedKeys.get(i));
-				emptyValues[i] = arena.allocate(0);
+				emptyValues[i] = emptyValue;
 			}
 
 			var nativeDb = db.get();
