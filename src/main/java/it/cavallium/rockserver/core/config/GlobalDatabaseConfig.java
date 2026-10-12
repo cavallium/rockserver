@@ -28,6 +28,12 @@ public interface GlobalDatabaseConfig {
 
 	boolean openFilesAsync() throws GestaltException;
 
+	/** Optional startup storage admission; absent preserves existing opening behavior. */
+	@Nullable StartupIoConfig startupIo() throws GestaltException;
+
+	/** Optional restart cache snapshots; absent performs no snapshot I/O. */
+	@Nullable HotCacheSnapshotConfig hotCacheSnapshot() throws GestaltException;
+
 	@Nullable Integer maxFileOpeningThreads() throws GestaltException;
 
 	boolean optimistic() throws GestaltException;
