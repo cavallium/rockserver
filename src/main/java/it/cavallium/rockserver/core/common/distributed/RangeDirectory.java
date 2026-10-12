@@ -9,7 +9,7 @@ import java.util.*;
 public final class RangeDirectory {
     private final UUID clusterId, databaseId, domainId;
     private final long schemaEpoch, generation;
-    private final byte[] schemaDigest;
+    private final byte[] schemaDigest, payloadDigest;
     private final Set<UUID> columns;
     private final int routingPrefixBytes;
     private final List<RangeDescriptor> ranges;
@@ -56,6 +56,7 @@ public final class RangeDirectory {
         if (RangeDirectoryCodec.encodedSize(this) > RangeDirectoryCodec.MAX_ENCODED_BYTES) {
             throw new IllegalArgumentException("Directory exceeds byte limit");
         }
+        payloadDigest = RangeDirectoryCodec.digest(this);
     }
 
     public UUID clusterId() { return clusterId; }
@@ -67,7 +68,7 @@ public final class RangeDirectory {
     public Set<UUID> columns() { return columns; }
     public int routingPrefixBytes() { return routingPrefixBytes; }
     public List<RangeDescriptor> ranges() { return ranges; }
-    public byte[] payloadDigest() { return RangeDirectoryCodec.digest(this); }
+    public byte[] payloadDigest() { return payloadDigest.clone(); }
 
     public RangeDescriptor route(UUID columnId, byte[] physicalKey) {
         requireColumn(columnId);

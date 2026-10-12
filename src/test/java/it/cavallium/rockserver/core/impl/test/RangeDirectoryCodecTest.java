@@ -44,11 +44,13 @@ class RangeDirectoryCodecTest {
         source.clear();
         columns.clear();
         directory.schemaDigest()[0] = 99;
+        directory.payloadDigest()[0] ^= 1;
         directory.ranges().getFirst().upperExclusive()[0] = 99;
         assertThrows(UnsupportedOperationException.class, () -> directory.ranges().clear());
         assertThrows(UnsupportedOperationException.class, () -> directory.columns().clear());
         assertThrows(UnsupportedOperationException.class, () -> directory.ranges().getFirst().replicas().clear());
         assertArrayEquals(encoded, RangeDirectoryCodec.encode(directory));
+        assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(encoded), directory.payloadDigest());
         var decoded = RangeDirectoryCodec.decode(encoded);
         assertEquals(CLUSTER, decoded.clusterId());
         assertEquals(DATABASE, decoded.databaseId());
