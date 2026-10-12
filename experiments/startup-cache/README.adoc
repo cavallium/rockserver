@@ -55,3 +55,91 @@ snapshot stress remain unqualified. It does not measure production HDD speedup.
 The fixture marker and canonical destination checks protect against accidentally
 opening a different DB or overwriting a live fixture SST. Callers must serialize
 operations sharing paths. CRC detects corruption; it is not authentication.
+
+== Asynchronous opening admission
+
+Native patch `native/opening-admission.patch` is based on the same `cc8367a`
+tree. Its commit is `9764ed956770c483f9f7ad7a8da58cc8705a1440`; the qualified
+library SHA256 is
+`417930b19495264d57769ac3aadf8d654c502c36173560eb3bc13c6ecc35f816`.
+Use a clean checkout with the qualified build recipe; an arbitrary RocksDB
+library lacks this experiment's versioned C ABI.
+
+The opt-in process-wide gate admits whole asynchronous `FindTable` calls before
+DB/cache loading locks. Synchronous opens and foreground reads bypass it.
+Pressure halves the concurrency limit and spaces admissions; healthy feedback
+increases the limit. Registered waiters use an allocation-free FIFO. Feedback
+cannot postpone a progress deadline, which advances only on admission. Running
+opens finish; queued workers observe shutdown and helper errors. This controls
+concurrency, not bytes/IOPS. It assumes a shared storage budget and cannot promote
+an already-running background owner. FIFO covers registered waiters, not CF
+priority or a hard wall-clock bound on filesystem work.
+
+[source,shell]
+----
+python3 experiments/startup-cache/run_opening_admission.py /path/to/librocksdb.so.11.8.1 /new/local/opening-run
+----
+
+The runner seeds twelve SSTs with disjoint, fixed-width key ranges and distinct
+values. Baseline and adaptive processes receive separate copies of the completed
+fixture. They skip synchronous opening-statistics initialization. Foreground
+Gets use only six ranges, leaving six SSTs for background filesystem reads.
+The baseline full-run p95 histogram upper bound calibrates the adaptive
+threshold at twice that value. This calibration is not a throughput comparison;
+copying controls data mutations but does not remove OS-cache/JIT/order bias.
+
+The adaptive process explicitly starts under commanded pressure, with maximum
+four permits and a 25 ms progress interval. It supplies approximately 50 ms
+measurement windows. Every Get contributes to the bounded histogram; p95 is
+reported as a bucket upper bound with eight buckets per power of two. Sample
+counts and actual elapsed windows are retained. Typed FFM calls avoid varargs
+boxing in the measured Get/free path. Native resources close in reverse order,
+including partial initialization and errors, before the library Arena closes.
+
+Acceptance requires all twelve admitted calls and returned permits, positive
+opener-thread logical read bytes, pressured admissions and feedback while work
+is active or queued, correct values, and zero surviving work at close. Counter
+names distinguish permit returns from actual table-load calls. Logical bytes
+and elapsed `FindTable` service include filesystem/cache behavior and loading
+mutex waits; they do not measure physical HDD reads. The fixture marker is
+checked before opening an existing DB; seeding cannot replace an existing path.
+
+Native tests cover same-SST foreground bypass, errors, shutdown, FIFO ordering,
+independent-owner cancellation, alternating feedback, cold versus pinned-reader
+logical-byte attribution and invalid C ABI arguments. Existing asynchronous
+opening lifecycle tests exercise enabled and disabled admission. Full native
+suite, representative HDD/DDR4/NUMA workloads, io_uring acceptance, and feedback
+integration with the actual Rockserver scheduler remain unqualified.
+
+The revised native qualification passed nine focused tests repeated 100 times,
+56 default-off lifecycle tests and 65 enabled/focused tests. A matching-header,
+matching-library probe reproduces the old deadline defect and checks the fix;
+it does not mix the old and new C++ class layouts. Native source/style checks
+passed. The runtime is a Linux debug build, with io_uring initialization denied
+in the test container and the supported fallback exercised.
+
+== Evidence and execution bounds
+
+Both runners require a new output directory. They retain commands, compiler
+output, Java version, library/source hashes, process exit codes, stdout/stderr,
+reports and fixture storage. A 60-second process timeout retains partial output.
+Each JVM has a 256 MiB heap maximum; native allocations follow the fixture bounds
+above and are not part of that heap limit. Expected operational failures require
+exit code 1 and their specified error; native crashes cannot count as success.
+
+These standalone sources are compiled with `javac --release 25` and lint warnings
+as errors, except the intentional restricted-FFM category. They are outside
+Maven's service sources. The cache probe has ASan/UBSan coverage; its matching
+RocksDB runtime was not instrumented. Naming-only changes reuse the earlier
+sanitizer evidence explicitly. Admission does not claim sanitizer or full-suite
+coverage. Do not rebuild a shared library in place while a fixture is using it.
+
+To rebuild admission in the qualified local image, use
+`native/build-opening.sh` inside a proper Git clone of the native patched source,
+with the compiler/dependency paths supplied by that image. The retained image ID
+is `sha256:52535a7fcb149c0e761f44d5517b80448c3838ea973812b64b6d2fcb72481721`.
+Give each build separate outputs and no more than three CPUs/eight GiB. Apply
+patches to the exact base, record the actual source commit/tree and flags, and
+retain the resulting library hash. An image's embedded Git metadata is not the
+source identity of a copied source archive. The recorded SHA identifies the tested
+binary; a rebuild with different timestamps/metadata need not be bit-identical.

@@ -1,0 +1,904 @@
+From 9764ed956770c483f9f7ad7a8da58cc8705a1440 Mon Sep 17 00:00:00 2001
+From: Andrea Cavalli <andrea@cavallium.it>
+Date: Mon, 12 Oct 2026 17:28:06 +0200
+Subject: [PATCH] Prototype fair adaptive SST opening admission with load
+ attribution
+
+---
+ db/async_file_open_admission.h                |  75 ++++
+ db/db_impl/db_impl.cc                         |   5 +
+ db/db_impl/db_impl_open.cc                    |   5 +-
+ db/db_test.cc                                 | 365 ++++++++++++++++++
+ db/version_util.cc                            | 214 +++++++++-
+ db/version_util.h                             |   4 +-
+ .../async_file_open_admission_experiment.h    |  45 +++
+ 7 files changed, 707 insertions(+), 6 deletions(-)
+ create mode 100644 db/async_file_open_admission.h
+ create mode 100644 include/rocksdb/utilities/async_file_open_admission_experiment.h
+
+diff --git a/db/async_file_open_admission.h b/db/async_file_open_admission.h
+new file mode 100644
+index 0000000..80f4986
+--- /dev/null
++++ b/db/async_file_open_admission.h
+@@ -0,0 +1,75 @@
++//  Copyright (c) Meta Platforms, Inc. and affiliates.
++//  This source code is licensed under both the GPLv2 (found in the
++//  COPYING file in the root directory) and Apache 2.0 License
++//  (found in the LICENSE.Apache file in the root directory).
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++
++#include "rocksdb/rocksdb_namespace.h"
++
++namespace ROCKSDB_NAMESPACE {
++// Experimental process-wide admission for asynchronous startup SST opens only.
++// Acquire is called before FindTable, without DB or table-loading locks. The
++// caller must release every admitted operation, including failures. Pressure
++// halves concurrency and spaces admission, but cannot indefinitely pause work.
++class AsyncFileOpenAdmission {
++ public:
++  AsyncFileOpenAdmission(uint32_t maximum, uint32_t progress_interval_ms)
++      : maximum_(maximum),
++        limit_(maximum),
++        interval_(progress_interval_ms),
++        next_progress_(Clock::now() + interval_) {}
++  bool Acquire(const std::atomic<bool>* stop,
++               const std::atomic<bool>* peer_error = nullptr);
++  void Release(bool table_load_attempted = false,
++               uint64_t table_load_micros = 0, uint64_t logical_bytes_read = 0,
++               bool table_load_failed = false);
++  void Feedback(bool pressure);
++  void NotifyWaiters();
++  // 0 active, 1 waiters, 2 admitted, 3 cancelled, 4 wait microseconds,
++  // 5 current limit, 6 pressure, 7 released permits, 8 peak active,
++  // 9 FindTable calls, 10 failed calls, 11 FindTable microseconds,
++  // 12 logical read bytes, 13 admissions under pressure.
++  uint64_t Counter(uint32_t selector);
++
++ private:
++  using Clock = std::chrono::steady_clock;
++  // Waiters live on their Acquire stack. Queue links are protected by mutex_.
++  // FIFO admission prevents one DB's next open from overtaking older waiters
++  // from another DB. Cancellation unlinks any waiter without allocating.
++  struct Waiter {
++    explicit Waiter(AsyncFileOpenAdmission* admission_owner)
++        : owner(admission_owner) {}
++    Waiter(const Waiter&) = delete;
++    Waiter& operator=(const Waiter&) = delete;
++    ~Waiter() {
++      if (queued) owner->RemoveWaiter(this);
++    }
++    AsyncFileOpenAdmission* const owner;
++    bool queued = true;
++    Waiter* previous = nullptr;
++    Waiter* next = nullptr;
++  };
++  void RemoveWaiter(Waiter* waiter);
++  const uint32_t maximum_;
++  uint32_t limit_;
++  const std::chrono::milliseconds interval_;
++  Clock::time_point next_progress_;
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  bool pressure_ = false;
++  uint64_t active_ = 0, waiters_ = 0, admitted_ = 0, cancelled_ = 0;
++  uint64_t wait_micros_ = 0, released_ = 0, peak_active_ = 0;
++  uint64_t table_loads_ = 0, failed_loads_ = 0, table_load_micros_ = 0;
++  uint64_t logical_bytes_read_ = 0, pressured_admissions_ = 0;
++  Waiter* first_waiter_ = nullptr;
++  Waiter* last_waiter_ = nullptr;
++};
++std::shared_ptr<AsyncFileOpenAdmission> ExperimentalAsyncFileOpenAdmission();
++}  // namespace ROCKSDB_NAMESPACE
+diff --git a/db/db_impl/db_impl.cc b/db/db_impl/db_impl.cc
+index 225896f..7f245a9 100644
+--- a/db/db_impl/db_impl.cc
++++ b/db/db_impl/db_impl.cc
+@@ -11,6 +11,8 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++
++#include "db/async_file_open_admission.h"
+ #ifdef OS_SOLARIS
+ #include <alloca.h>
+ #endif
+@@ -590,6 +592,9 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
+     NotifyOnDBShutdownBegin();
+   }
+   shutting_down_.store(true, std::memory_order_release);
++  if (auto admission = ExperimentalAsyncFileOpenAdmission()) {
++    admission->NotifyWaiters();
++  }
+   bg_cv_.SignalAll();
+   if (!wait) {
+     return;
+diff --git a/db/db_impl/db_impl_open.cc b/db/db_impl/db_impl_open.cc
+index d6fd735..c16de61 100644
+--- a/db/db_impl/db_impl_open.cc
++++ b/db/db_impl/db_impl_open.cc
+@@ -8,6 +8,7 @@
+ // found in the LICENSE file. See the AUTHORS file for names of contributors.
+ #include <cinttypes>
+ 
++#include "db/async_file_open_admission.h"
+ #include "db/blob/blob_file_partition_manager.h"
+ #include "db/builder.h"
+ #include "db/db_impl/db_impl.h"
+@@ -3086,6 +3087,7 @@ void DBImpl::BGWorkAsyncFileOpen(void* arg) {
+   std::unique_ptr<AsyncFileOpenContext, decltype(deleter)> ctx(raw_ctx,
+                                                                deleter);
+ 
++  auto admission = ExperimentalAsyncFileOpenAdmission();
+   ReadOptions ro;
+   Status async_open_status;
+   for (size_t i = 0; i < ctx->versions.size(); i++) {
+@@ -3119,7 +3121,8 @@ void DBImpl::BGWorkAsyncFileOpen(void* arg) {
+         *vstorage->InternalComparator(), cfd->internal_stats(),
+         db->immutable_db_options_.max_file_opening_threads,
+         false /* prefetch_index_and_filter_in_cache */, mutable_cf_options,
+-        max_file_size_for_l0_meta_pin, ro, &db->shutting_down_);
++        max_file_size_for_l0_meta_pin, ro, &db->shutting_down_,
++        admission.get());
+     if (!s.ok()) {
+       ROCKS_LOG_ERROR(
+           db->immutable_db_options_.info_log,
+diff --git a/db/db_test.cc b/db/db_test.cc
+index 6e3c0d7..6d1edfa 100644
+--- a/db/db_test.cc
++++ b/db/db_test.cc
+@@ -13,6 +13,8 @@
+ #include <fcntl.h>
+ 
+ #include <algorithm>
++#include <chrono>
++#include <future>
+ #include <set>
+ #include <thread>
+ #include <unordered_set>
+@@ -26,6 +28,7 @@
+ #endif
+ 
+ #include "cache/lru_cache.h"
++#include "db/async_file_open_admission.h"
+ #include "db/attribute_group_iterator_impl.h"
+ #include "db/blob/blob_index.h"
+ #include "db/blob/blob_log_format.h"
+@@ -34,6 +37,7 @@
+ #include "db/dbformat.h"
+ #include "db/job_context.h"
+ #include "db/version_set.h"
++#include "db/version_util.h"
+ #include "db/write_batch_internal.h"
+ #include "env/mock_env.h"
+ #include "file/filename.h"
+@@ -57,6 +61,7 @@
+ #include "rocksdb/table_properties.h"
+ #include "rocksdb/thread_status.h"
+ #include "rocksdb/types.h"
++#include "rocksdb/utilities/async_file_open_admission_experiment.h"
+ #include "rocksdb/utilities/checkpoint.h"
+ #include "rocksdb/utilities/optimistic_transaction_db.h"
+ #include "rocksdb/utilities/write_batch_with_index.h"
+@@ -7926,6 +7931,366 @@ TEST_F(DBTest, FileCollapsibleEntryReadSampledStats) {
+   SyncPoint::GetInstance()->ClearAllCallBacks();
+ }
+ 
++// Admission is outside table loading locks: a foreground Get on the same SST
++// succeeds while every background opener is waiting for its first permit.
++TEST_F(DBTest, AsyncOpenAdmissionForegroundAndShutdown) {
++  Options options = CurrentOptions();
++  options.disable_auto_compactions = true;
++  options.max_open_files = -1;
++  options.max_file_opening_threads = 3;
++  DestroyAndReopen(options);
++  ASSERT_OK(Put("key", "value"));
++  ASSERT_OK(Flush());
++  Close();
++  ASSERT_EQ(rocksdb_async_open_admission_abi_version(), 1);
++  ASSERT_EQ(rocksdb_async_open_admission_enable(0, 1), -1);
++  const bool already_enabled = ExperimentalAsyncFileOpenAdmission() != nullptr;
++  ASSERT_EQ(rocksdb_async_open_admission_enable(3, 60000),
++            already_enabled ? -2 : 0);
++  const uint64_t admitted_before = rocksdb_async_open_admission_counter(2);
++  const uint64_t cancelled_before = rocksdb_async_open_admission_counter(3);
++  ASSERT_EQ(rocksdb_async_open_admission_enable(3, 60000), -2);
++  options.open_files_async = true;
++  options.skip_stats_update_on_db_open = true;
++  for (bool shutdown : {false, true}) {
++    rocksdb_async_open_admission_feedback(0);
++    rocksdb_async_open_admission_feedback(1);
++    std::promise<void> waiting;
++    std::atomic<bool> signalled{false};
++    auto* sync = SyncPoint::GetInstance();
++    sync->SetCallBack("AsyncFileOpenAdmission::Waiting", [&](void*) {
++      if (!signalled.exchange(true)) waiting.set_value();
++    });
++    sync->LoadDependency(
++        {{"DBImpl::BGWorkAsyncFileOpen:Done", "AsyncOpenAdmission::Done"}});
++    sync->EnableProcessing();
++    Reopen(options);
++    ASSERT_EQ(waiting.get_future().wait_for(std::chrono::seconds(5)),
++              std::future_status::ready);
++    ASSERT_EQ(Get("key"), "value");
++    ASSERT_EQ(rocksdb_async_open_admission_counter(0), 0);
++    if (!shutdown) {
++      rocksdb_async_open_admission_feedback(0);
++      TEST_SYNC_POINT("AsyncOpenAdmission::Done");
++      ASSERT_EQ(rocksdb_async_open_admission_counter(2), admitted_before + 1);
++      ASSERT_EQ(rocksdb_async_open_admission_counter(7), admitted_before + 1);
++    }
++    Close();
++    sync->DisableProcessing();
++    sync->ClearAllCallBacks();
++    sync->ClearTrace();
++    ASSERT_EQ(rocksdb_async_open_admission_counter(0), 0);
++    ASSERT_EQ(rocksdb_async_open_admission_counter(1), 0);
++  }
++  ASSERT_EQ(rocksdb_async_open_admission_counter(3), cancelled_before + 1);
++  rocksdb_async_open_admission_feedback(0);
++}
++
++TEST_F(DBTest, AsyncOpenAdmissionPeerErrorCancelsWaiter) {
++  Options options = CurrentOptions();
++  options.disable_auto_compactions = true;
++  DestroyAndReopen(options);
++  ASSERT_OK(Put("key", "value"));
++  ASSERT_OK(Flush());
++  auto* cfd =
++      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
++          ->cfd();
++  FileMetaData missing;
++  missing.fd = FileDescriptor(999999, 0, 123);
++  // Both workers target an absent file. Only its first owner may FindTable;
++  // its sibling must leave admission on peer failure, without another open.
++  std::vector<std::pair<FileMetaData*, int>> files = {{&missing, 0},
++                                                      {&missing, 0}};
++  AsyncFileOpenAdmission gate(1, 60000);
++  std::atomic<bool> stop{false};
++  std::promise<void> waiting;
++  std::atomic<bool> signalled{false};
++  std::atomic<uint32_t> finds{0};
++  auto* sync = SyncPoint::GetInstance();
++  sync->SetCallBack("AsyncFileOpenAdmission::Waiting", [&](void*) {
++    if (!signalled.exchange(true)) waiting.set_value();
++  });
++  sync->SetCallBack("VersionBuilder::Rep::LoadTableHandlers::BeforeFindTable",
++                    [&](void*) {
++                      if (finds.fetch_add(1) == 0) waiting.get_future().wait();
++                    });
++  sync->EnableProcessing();
++  Status result = LoadTableHandlersHelper(
++      files, cfd->table_cache(), FileOptions(options),
++      cfd->internal_comparator(), cfd->internal_stats(), 2, false,
++      cfd->GetLatestMutableCFOptions(), 0, ReadOptions(), &stop, &gate);
++  sync->DisableProcessing();
++  sync->ClearAllCallBacks();
++  ASSERT_FALSE(result.ok());
++  ASSERT_EQ(finds.load(), 1);
++  ASSERT_EQ(gate.Counter(0), 0);
++  ASSERT_EQ(gate.Counter(1), 0);
++  ASSERT_EQ(gate.Counter(2), 1);
++  ASSERT_EQ(gate.Counter(3), 1);
++  ASSERT_EQ(gate.Counter(7), 1);
++  ASSERT_EQ(gate.Counter(9), 1);
++  ASSERT_EQ(gate.Counter(10), 1);
++}
++
++TEST_F(DBTest, AsyncOpenAdmissionAttributesColdLoadAndPinnedHit) {
++  Options options = CurrentOptions();
++  options.disable_auto_compactions = true;
++  options.max_open_files = 10;
++  DestroyAndReopen(options);
++  ASSERT_OK(Put("key", "value"));
++  ASSERT_OK(Flush());
++  Close();
++  options.skip_stats_update_on_db_open = true;
++  // Suppress the normal small initial reader set, keeping the Version's
++  // copied reader descriptors cold too. Do not unpin live Version readers.
++  auto* sync = SyncPoint::GetInstance();
++  sync->SetCallBack("VersionEditHandler::LoadTables:skip_load_table_files",
++                    [&](void* flag) { *static_cast<bool*>(flag) = true; });
++  sync->EnableProcessing();
++  Reopen(options);
++  sync->DisableProcessing();
++  sync->ClearAllCallBacks();
++  auto* cfd =
++      static_cast_with_check<ColumnFamilyHandleImpl>(db_->DefaultColumnFamily())
++          ->cfd();
++  std::vector<std::pair<FileMetaData*, int>> files;
++  for (auto* file : GetLevelFileMetadatas(0)) files.emplace_back(file, 0);
++  ASSERT_EQ(files.size(), 1);
++  ASSERT_EQ(files[0].first->fd.pinned_reader.Get(), nullptr);
++  AsyncFileOpenAdmission gate(1, 1);
++  std::atomic<bool> stop{false};
++  auto load = [&] {
++    return LoadTableHandlersHelper(
++        files, cfd->table_cache(), FileOptions(options),
++        cfd->internal_comparator(), cfd->internal_stats(), 1, false,
++        cfd->GetLatestMutableCFOptions(), 0, ReadOptions(), &stop, &gate);
++  };
++  ASSERT_OK(load());
++  ASSERT_EQ(gate.Counter(9), 1);
++  ASSERT_EQ(gate.Counter(10), 0);
++  const uint64_t cold_bytes = gate.Counter(12);
++#ifndef NIOSTATS_CONTEXT
++  ASSERT_GT(cold_bytes, 0);
++#endif
++  // The second call uses the pinned reader: another permit/call does not
++  // imply another table open or another byte read from the file system.
++  ASSERT_OK(load());
++  ASSERT_EQ(gate.Counter(9), 2);
++  ASSERT_EQ(gate.Counter(12), cold_bytes);
++  ASSERT_EQ(gate.Counter(0), 0);
++  ASSERT_EQ(gate.Counter(7), 2);
++  ASSERT_EQ(Get("key"), "value");
++}
++
++TEST(AsyncOpenAdmissionTest, CAbiRejectsInvalidLimits) {
++  for (const auto& limits : std::vector<std::pair<uint32_t, uint32_t>>{
++           {0, 1}, {1025, 1}, {1, 0}, {1, 60001}}) {
++    ASSERT_EQ(rocksdb_async_open_admission_enable(limits.first, limits.second),
++              -1);
++  }
++  ASSERT_EQ(rocksdb_async_open_admission_abi_version(), 1);
++  ASSERT_EQ(rocksdb_async_open_admission_counter(UINT32_MAX), 0);
++}
++
++TEST(AsyncOpenAdmissionTest, RegisteredWaitersKeepFifoAcrossOwners) {
++  AsyncFileOpenAdmission gate(1, 1);
++  std::atomic<bool> stop{false};
++  ASSERT_TRUE(gate.Acquire(&stop));
++  std::promise<void> first_registered, second_registered;
++  std::atomic<int> registered{0}, order{0};
++  auto* sync = SyncPoint::GetInstance();
++  sync->SetCallBack("AsyncFileOpenAdmission::Enqueued", [&](void*) {
++    if (registered.fetch_add(1) == 0)
++      first_registered.set_value();
++    else
++      second_registered.set_value();
++  });
++  sync->EnableProcessing();
++  auto open = [&] {
++    if (!gate.Acquire(&stop)) return -1;
++    const int position = order.fetch_add(1);
++    gate.Release();
++    return position;
++  };
++  auto first = std::async(std::launch::async, open);
++  first_registered.get_future().wait();
++  auto second = std::async(std::launch::async, open);
++  second_registered.get_future().wait();
++  sync->DisableProcessing();
++  sync->ClearAllCallBacks();
++  gate.Release();
++  // This previous owner must register behind both older owners, even if it
++  // races their wakeup and would otherwise reacquire the available permit.
++  const int previous_owner_position = open();
++  ASSERT_EQ(first.get(), 0);
++  ASSERT_EQ(second.get(), 1);
++  ASSERT_EQ(previous_owner_position, 2);
++  ASSERT_EQ(gate.Counter(0), 0);
++  ASSERT_EQ(gate.Counter(1), 0);
++  ASSERT_EQ(gate.Counter(8), 1);
++}
++
++TEST(AsyncOpenAdmissionTest, CancellingOneOwnerLeavesOtherOwnerLive) {
++  AsyncFileOpenAdmission gate(1, 1);
++  for (bool cancel_first : {true, false}) {
++    SCOPED_TRACE(cancel_first);
++    std::atomic<bool> owner_stop{false}, cancelled_stop{false}, live_stop{false};
++    const uint64_t cancelled_before = gate.Counter(3);
++    const uint64_t released_before = gate.Counter(7);
++    ASSERT_TRUE(gate.Acquire(&owner_stop));
++    std::promise<void> first_registered, second_registered;
++    std::atomic<int> registered{0};
++    auto* sync = SyncPoint::GetInstance();
++    sync->SetCallBack("AsyncFileOpenAdmission::Enqueued", [&](void*) {
++      if (registered.fetch_add(1) == 0) first_registered.set_value();
++      else second_registered.set_value();
++    });
++    sync->EnableProcessing();
++    auto cancelled_open = [&] { return gate.Acquire(&cancelled_stop); };
++    auto live_open = [&] {
++      bool admitted = gate.Acquire(&live_stop);
++      if (admitted) gate.Release();
++      return admitted;
++    };
++    auto first = cancel_first
++        ? std::async(std::launch::async, cancelled_open)
++        : std::async(std::launch::async, live_open);
++    first_registered.get_future().wait();
++    auto second = cancel_first
++        ? std::async(std::launch::async, live_open)
++        : std::async(std::launch::async, cancelled_open);
++    second_registered.get_future().wait();
++    auto& cancelled = cancel_first ? first : second;
++    auto& live = cancel_first ? second : first;
++    cancelled_stop.store(true, std::memory_order_release);
++    gate.NotifyWaiters();
++    const auto cancelled_ready = cancelled.wait_for(std::chrono::seconds(2));
++    // Cleanup precedes assertions, including a failed cancellation invariant.
++    gate.Release();
++    const bool cancelled_result = cancelled.get();
++    if (cancelled_result) gate.Release();
++    const bool live_result = live.get();
++    sync->DisableProcessing();
++    sync->ClearAllCallBacks();
++    ASSERT_EQ(cancelled_ready, std::future_status::ready);
++    ASSERT_FALSE(cancelled_result);
++    ASSERT_TRUE(live_result);
++    ASSERT_EQ(gate.Counter(0), 0);
++    ASSERT_EQ(gate.Counter(1), 0);
++    ASSERT_EQ(gate.Counter(3), cancelled_before + 1);
++    ASSERT_EQ(gate.Counter(7), released_before + 2);
++  }
++}
++
++TEST(AsyncOpenAdmissionTest, AlternatingFeedbackCannotPostponeProgress) {
++  AsyncFileOpenAdmission gate(1, 100);
++  std::atomic<bool> stop{false};
++  ASSERT_TRUE(gate.Acquire(&stop));
++  std::promise<void> registered;
++  auto* sync = SyncPoint::GetInstance();
++  sync->SetCallBack("AsyncFileOpenAdmission::Enqueued",
++                    [&](void*) { registered.set_value(); });
++  sync->EnableProcessing();
++  auto admitted = std::async(std::launch::async, [&] {
++    bool result = gate.Acquire(&stop);
++    if (result) gate.Release();
++    return result;
++  });
++  registered.get_future().wait();
++  // The held permit prevents admission during every healthy slice. The
++  // registered waiter should retain a deadline tied to this actual admission.
++  const auto until = std::chrono::steady_clock::now() +
++                     std::chrono::milliseconds(200);
++  do {
++    gate.Feedback(false);
++    gate.Feedback(true);
++  } while (std::chrono::steady_clock::now() < until);
++  gate.Release();
++  // Resetting the deadline on each pressure transition would force a further
++  // 100ms wait even though the previous owner completed after 200ms.
++  const auto ready = admitted.wait_for(std::chrono::milliseconds(50));
++  if (ready != std::future_status::ready) {
++    stop.store(true, std::memory_order_release);
++    gate.NotifyWaiters();
++  }
++  const bool result = admitted.get();
++  sync->DisableProcessing();
++  sync->ClearAllCallBacks();
++  ASSERT_EQ(ready, std::future_status::ready);
++  ASSERT_TRUE(result);
++  ASSERT_EQ(gate.Counter(13), 1);
++  ASSERT_EQ(gate.Counter(0), 0);
++}
++
++TEST(AsyncOpenAdmissionTest, PressureMakesProgressWithRepeatedFeedback) {
++  AsyncFileOpenAdmission gate(8, 1);
++  std::atomic<bool> stop{false};
++  gate.Feedback(true);
++  ASSERT_EQ(gate.Counter(5), 4);
++  gate.Feedback(true);
++  ASSERT_EQ(gate.Counter(5), 2);
++  gate.Feedback(true);
++  ASSERT_EQ(gate.Counter(5), 1);
++  std::atomic<bool> done{false};
++  std::promise<void> feedback_started;
++  std::thread feedback([&] {
++    gate.Feedback(true);
++    feedback_started.set_value();
++    while (!done.load(std::memory_order_acquire)) gate.Feedback(true);
++  });
++  feedback_started.get_future().wait();
++  auto admitted = std::async(std::launch::async, [&] {
++    bool result = gate.Acquire(&stop);
++    if (result) gate.Release();
++    return result;
++  });
++  const auto ready = admitted.wait_for(std::chrono::seconds(2));
++  // Always stop both workers before asserting, including a failed progress
++  // invariant, so the test can report the failure rather than deadlock.
++  done.store(true, std::memory_order_release);
++  feedback.join();
++  if (ready != std::future_status::ready) {
++    stop.store(true, std::memory_order_release);
++    gate.NotifyWaiters();
++  }
++  ASSERT_EQ(ready, std::future_status::ready);
++  ASSERT_TRUE(admitted.get());
++  ASSERT_EQ(gate.Counter(2), 1);
++  ASSERT_EQ(gate.Counter(7), 1);
++  ASSERT_EQ(gate.Counter(0), 0);
++  gate.Feedback(false);
++  ASSERT_EQ(gate.Counter(5), 2);
++}
++
++TEST(AsyncOpenAdmissionTest, PermitLimitAndCancellation) {
++  AsyncFileOpenAdmission gate(1, 1);
++  std::atomic<bool> stop{false};
++  ASSERT_TRUE(gate.Acquire(&stop));
++  std::promise<void> waiting;
++  std::atomic<bool> signalled{false};
++  auto* sync = SyncPoint::GetInstance();
++  sync->SetCallBack("AsyncFileOpenAdmission::Waiting", [&](void*) {
++    if (!signalled.exchange(true)) waiting.set_value();
++  });
++  sync->EnableProcessing();
++  auto blocked =
++      std::async(std::launch::async, [&] { return gate.Acquire(&stop); });
++  const auto ready = waiting.get_future().wait_for(std::chrono::seconds(5));
++  stop.store(true, std::memory_order_release);
++  gate.NotifyWaiters();
++  const bool result = blocked.get();
++  if (result) gate.Release();
++  gate.Release();
++  sync->DisableProcessing();
++  sync->ClearAllCallBacks();
++  ASSERT_EQ(ready, std::future_status::ready);
++  ASSERT_FALSE(result);
++  ASSERT_EQ(gate.Counter(0), 0);
++  ASSERT_EQ(gate.Counter(1), 0);
++  ASSERT_EQ(gate.Counter(3), 1);
++  ASSERT_EQ(gate.Counter(8), 1);
++}
++
+ enum class ReadType : uint8_t { kGet, kMultiGet, kIterator, kNumReadTypes };
+ 
+ class OpenFilesAsyncTest
+diff --git a/db/version_util.cc b/db/version_util.cc
+index 8966f95..b7337b4 100644
+--- a/db/version_util.cc
++++ b/db/version_util.cc
+@@ -5,18 +5,152 @@
+ 
+ #include "db/version_util.h"
+ 
++#include <algorithm>
+ #include <atomic>
++#include <cassert>
+ #include <functional>
+ #include <thread>
+ #include <utility>
+ #include <vector>
+ 
++#include "db/async_file_open_admission.h"
+ #include "db/internal_stats.h"
+ #include "db/table_cache.h"
+ #include "port/port.h"
++#include "rocksdb/iostats_context.h"
++#include "rocksdb/utilities/async_file_open_admission_experiment.h"
+ #include "test_util/sync_point.h"
+ 
+ namespace ROCKSDB_NAMESPACE {
++namespace {
++std::shared_ptr<AsyncFileOpenAdmission> experimental_admission;
++}
++std::shared_ptr<AsyncFileOpenAdmission> ExperimentalAsyncFileOpenAdmission() {
++  return std::atomic_load(&experimental_admission);
++}
++
++bool AsyncFileOpenAdmission::Acquire(const std::atomic<bool>* stop,
++                                     const std::atomic<bool>* peer_error) {
++  const auto start = Clock::now();
++  std::unique_lock<std::mutex> lock(mutex_);
++  // The waiter destructs before lock, unlinking safely on any exception.
++  Waiter waiter(this);
++  waiter.previous = last_waiter_;
++  if (last_waiter_ != nullptr)
++    last_waiter_->next = &waiter;
++  else
++    first_waiter_ = &waiter;
++  last_waiter_ = &waiter;
++  ++waiters_;
++  TEST_SYNC_POINT("AsyncFileOpenAdmission::Enqueued");
++  for (;;) {
++    if ((stop != nullptr && stop->load(std::memory_order_acquire)) ||
++        (peer_error != nullptr &&
++         peer_error->load(std::memory_order_acquire))) {
++      RemoveWaiter(&waiter);
++      ++cancelled_;
++      wait_micros_ += std::chrono::duration_cast<std::chrono::microseconds>(
++                          Clock::now() - start)
++                          .count();
++      return false;
++    }
++    const auto now = Clock::now();
++    if (first_waiter_ == &waiter && active_ < limit_ &&
++        (!pressure_ || now >= next_progress_)) {
++      RemoveWaiter(&waiter);
++      ++active_;
++      ++admitted_;
++      if (pressure_) ++pressured_admissions_;
++      peak_active_ = std::max(peak_active_, active_);
++      wait_micros_ +=
++          std::chrono::duration_cast<std::chrono::microseconds>(now - start)
++              .count();
++      next_progress_ = now + interval_;
++      return true;
++    }
++    TEST_SYNC_POINT("AsyncFileOpenAdmission::Waiting");
++    // Notification wakes waiters. Bounded polling covers a notification race
++    // or a stop published by an alternate close path without notification.
++    cv_.wait_until(lock, std::min(now + std::chrono::milliseconds(10),
++                                  pressure_ && next_progress_ > now
++                                      ? next_progress_
++                                      : now + std::chrono::milliseconds(10)));
++  }
++}
++void AsyncFileOpenAdmission::RemoveWaiter(Waiter* waiter) {
++  if (waiter->previous != nullptr)
++    waiter->previous->next = waiter->next;
++  else
++    first_waiter_ = waiter->next;
++  if (waiter->next != nullptr)
++    waiter->next->previous = waiter->previous;
++  else
++    last_waiter_ = waiter->previous;
++  waiter->queued = false;
++  --waiters_;
++  cv_.notify_all();
++}
++void AsyncFileOpenAdmission::Release(bool table_load_attempted,
++                                     uint64_t table_load_micros,
++                                     uint64_t logical_bytes_read,
++                                     bool table_load_failed) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  assert(active_ > 0);
++  --active_;
++  ++released_;
++  if (table_load_attempted) {
++    ++table_loads_;
++    if (table_load_failed) ++failed_loads_;
++    table_load_micros_ += table_load_micros;
++    logical_bytes_read_ += logical_bytes_read;
++  }
++  cv_.notify_all();
++}
++void AsyncFileOpenAdmission::Feedback(bool pressure) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  // Feedback changes urgency, never the progress deadline. Even alternating
++  // pressure/healthy samples cannot postpone a queued open indefinitely.
++  pressure_ = pressure;
++  limit_ = pressure ? std::max(uint32_t{1}, limit_ / 2)
++                    : std::min(maximum_, limit_ + 1);
++  cv_.notify_all();
++}
++void AsyncFileOpenAdmission::NotifyWaiters() { cv_.notify_all(); }
++uint64_t AsyncFileOpenAdmission::Counter(uint32_t selector) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  switch (selector) {
++    case 0:
++      return active_;
++    case 1:
++      return waiters_;
++    case 2:
++      return admitted_;
++    case 3:
++      return cancelled_;
++    case 4:
++      return wait_micros_;
++    case 5:
++      return limit_;
++    case 6:
++      return pressure_;
++    case 7:
++      return released_;
++    case 8:
++      return peak_active_;
++    case 9:
++      return table_loads_;
++    case 10:
++      return failed_loads_;
++    case 11:
++      return table_load_micros_;
++    case 12:
++      return logical_bytes_read_;
++    case 13:
++      return pressured_admissions_;
++    default:
++      return 0;
++  }
++}
+ 
+ Status LoadTableHandlersHelper(
+     const std::vector<std::pair<FileMetaData*, int>>& files_meta,
+@@ -26,7 +160,7 @@ Status LoadTableHandlersHelper(
+     bool prefetch_index_and_filter_in_cache,
+     const MutableCFOptions& mutable_cf_options,
+     size_t max_file_size_for_l0_meta_pin, const ReadOptions& read_options,
+-    std::atomic<bool>* stop) {
++    std::atomic<bool>* stop, AsyncFileOpenAdmission* admission) {
+   assert(table_cache != nullptr);
+ 
+   std::atomic<size_t> next_file_meta_idx(0);
+@@ -57,6 +191,15 @@ Status LoadTableHandlersHelper(
+       auto* file_meta = files_meta[file_idx].first;
+       int level = files_meta[file_idx].second;
+ 
++      if (admission != nullptr && !admission->Acquire(stop, &has_error)) {
++        break;
++      }
++      if (admission != nullptr &&
++          (has_error.load(std::memory_order_acquire) ||
++           (stop != nullptr && stop->load(std::memory_order_acquire)))) {
++        admission->Release();
++        break;
++      }
+       TEST_SYNC_POINT_CALLBACK(
+           "VersionBuilder::Rep::LoadTableHandlers::BeforeFindTable", file_meta);
+ 
+@@ -65,6 +208,13 @@ Status LoadTableHandlersHelper(
+       const bool prefetch_index_and_filter_for_file =
+           prefetch_index_and_filter_in_cache &&
+           !file_meta->skip_index_and_filter_blocks_prefetch;
++      // Attribution is enabled only with the experiment. These are this
++      // opener thread's logical bytes, not physical device IO or cache heat.
++      const auto load_start = admission != nullptr
++                                  ? std::chrono::steady_clock::now()
++                                  : std::chrono::steady_clock::time_point{};
++      const uint64_t bytes_before =
++          admission != nullptr ? get_iostats_context()->bytes_read : 0;
+       auto status = table_cache->FindTable(
+           read_options, file_options, internal_comparator, *file_meta, &handle,
+           mutable_cf_options, &table_reader, false /* no_io */,
+@@ -73,15 +223,30 @@ Status LoadTableHandlersHelper(
+           max_file_size_for_l0_meta_pin, file_meta->temperature,
+           true /* pin_table_handle */);
+ 
+-      TEST_SYNC_POINT_CALLBACK(
+-          "VersionBuilder::Rep::LoadTableHandlers::AfterFindTable", &status);
+-
++      const uint64_t load_micros =
++          admission != nullptr
++              ? std::chrono::duration_cast<std::chrono::microseconds>(
++                    std::chrono::steady_clock::now() - load_start)
++                    .count()
++              : 0;
++      const uint64_t bytes_after =
++          admission != nullptr ? get_iostats_context()->bytes_read : 0;
++      const uint64_t logical_bytes =
++          bytes_after >= bytes_before ? bytes_after - bytes_before : 0;
++      // Publish failure before freeing this slot, so already waiting siblings
++      // cannot take its permit and issue another FindTable after the failure.
+       if (!status.ok()) {
+         bool expected = false;
+         if (has_error.compare_exchange_strong(expected, true)) {
+           ret = status;
++          if (admission != nullptr) admission->NotifyWaiters();
+         }
+       }
++      if (admission != nullptr) {
++        admission->Release(true, load_micros, logical_bytes, !status.ok());
++      }
++      TEST_SYNC_POINT_CALLBACK(
++          "VersionBuilder::Rep::LoadTableHandlers::AfterFindTable", &status);
+     }
+   });
+ 
+@@ -97,3 +262,44 @@ Status LoadTableHandlersHelper(
+ }
+ 
+ }  // namespace ROCKSDB_NAMESPACE
++
++extern "C" uint32_t rocksdb_async_open_admission_abi_version() { return 1; }
++
++extern "C" int rocksdb_async_open_admission_enable(uint32_t maximum,
++                                                   uint32_t interval_ms) {
++  if (maximum == 0 || maximum > 1024 || interval_ms == 0 ||
++      interval_ms > 60000) {
++    return -1;
++  }
++  try {
++    if (ROCKSDB_NAMESPACE::ExperimentalAsyncFileOpenAdmission()) return -2;
++    std::shared_ptr<ROCKSDB_NAMESPACE::AsyncFileOpenAdmission> expected;
++    auto gate = std::make_shared<ROCKSDB_NAMESPACE::AsyncFileOpenAdmission>(
++        maximum, interval_ms);
++    return std::atomic_compare_exchange_strong(
++               &ROCKSDB_NAMESPACE::experimental_admission, &expected, gate)
++               ? 0
++               : -2;
++  } catch (...) {
++    // No C++ exception may escape the C/FFM boundary, including allocation or
++    // synchronization-resource failure during controller construction.
++    return -3;
++  }
++}
++extern "C" int rocksdb_async_open_admission_feedback(int pressure) {
++  try {
++    auto gate = ROCKSDB_NAMESPACE::ExperimentalAsyncFileOpenAdmission();
++    if (gate) gate->Feedback(pressure != 0);
++    return 0;
++  } catch (...) {
++    return -3;
++  }
++}
++extern "C" uint64_t rocksdb_async_open_admission_counter(uint32_t selector) {
++  try {
++    auto gate = ROCKSDB_NAMESPACE::ExperimentalAsyncFileOpenAdmission();
++    return gate ? gate->Counter(selector) : 0;
++  } catch (...) {
++    return UINT64_MAX;
++  }
++}
+diff --git a/db/version_util.h b/db/version_util.h
+index a426f94..030b8f1 100644
+--- a/db/version_util.h
++++ b/db/version_util.h
+@@ -16,6 +16,7 @@
+ 
+ namespace ROCKSDB_NAMESPACE {
+ 
++class AsyncFileOpenAdmission;
+ class TableCache;
+ struct FileMetaData;
+ class InternalKeyComparator;
+@@ -31,7 +32,8 @@ Status LoadTableHandlersHelper(
+     bool prefetch_index_and_filter_in_cache,
+     const MutableCFOptions& mutable_cf_options,
+     size_t max_file_size_for_l0_meta_pin, const ReadOptions& read_options,
+-    std::atomic<bool>* stop = nullptr);
++    std::atomic<bool>* stop = nullptr,
++    AsyncFileOpenAdmission* admission = nullptr);
+ 
+ // Instead of opening a `DB` to perform certain manifest updates, this
+ // uses the underlying `VersionSet` API to read and modify the MANIFEST. This
+diff --git a/include/rocksdb/utilities/async_file_open_admission_experiment.h b/include/rocksdb/utilities/async_file_open_admission_experiment.h
+new file mode 100644
+index 0000000..fced0ef
+--- /dev/null
++++ b/include/rocksdb/utilities/async_file_open_admission_experiment.h
+@@ -0,0 +1,45 @@
++//  Copyright (c) Meta Platforms, Inc. and affiliates.
++//  This source code is licensed under both the GPLv2 (found in the
++//  COPYING file in the root directory) and Apache 2.0 License
++//  (found in the LICENSE.Apache file in the root directory).
++#pragma once
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Versioned research-only C ABI. Version 1 uses int feedback status and the
++// counter selectors below. This function never allocates or throws.
++uint32_t rocksdb_async_open_admission_abi_version(void);
++// Research-only C ABI; disabled until enabled. Enable once before DB::Open,
++// never replace an active controller. Returns 0 on success, -1 for invalid
++// limits, -2 if already enabled, -3 on resource failure. Limits: 1..1024
++// opens, 1..60000 milliseconds. All async openers in this process share the
++// gate (and assumed storage budget). Foreground opens and synchronous DB::Open
++// bypass it. It gates whole table opens, not bytes/IOPS, and cannot promote an
++// already running background owner.
++int rocksdb_async_open_admission_enable(uint32_t maximum,
++                                        uint32_t progress_interval_ms);
++// Thread-safe sampled external feedback, e.g. foreground tail latency/storage
++// pressure. Pressure halves the limit (floor 1) and spaces opens by the
++// progress interval; a healthy sample adds one permit up to maximum. Existing
++// opens run to completion. One sample is one control step; callers choose
++// cadence. Returns 0 on success (including disabled), -3 on resource failure.
++// Feedback never postpones the next progress deadline; FIFO registered waiters
++// from different DBs share the same admission order. No C++ exceptions escape.
++int rocksdb_async_open_admission_feedback(int pressure);
++// Thread-safe counters: 0 active, 1 waiters, 2 admitted, 3 cancelled,
++// 4 cumulative wait microseconds, 5 limit, 6 pressure, 7 released permits,
++// 8 peak active permits, 9 FindTable calls, 10 failed FindTable calls,
++// 11 cumulative FindTable microseconds (including loading-mutex waits),
++// 12 opener-thread logical bytes read during FindTable, 13 pressured
++// admissions. Calls include cache hits; released permits include
++// aborted-before-load work. Logical bytes require enabled IOStatsContext and do
++// not measure physical IO. Unknown selector / disabled gate returns 0; resource
++// failure returns UINT64_MAX. Individual counters are synchronized, but
++// separate calls are not a snapshot. Gate is retained until exit; no C++
++// exceptions escape these functions.
++uint64_t rocksdb_async_open_admission_counter(uint32_t selector);
++#ifdef __cplusplus
++}
++#endif
