@@ -212,7 +212,7 @@ public final class ReplicatedRangeStore {
     private boolean sourceOperationFenced(OperationId operation) throws RocksDBException { return operation.epoch()<minimumSessionEpoch(null) || operation.sequence()<=acknowledgedThrough(operation,null); }
     private void requireSourceOutcomeRequest(NativeSourceOutcomeCredit.Request request) throws RocksDBException {
         requireTopologyMetadataOwner();if(!activeTopologyFreeze.equals(request.freeze()) || !request.original().groupId().equals(groupId) || request.original().rangeEpoch()!=rangeEpoch)throw new IllegalArgumentException("Source outcome differs from sealed native owner");
-        if(!request.targetDirectory().columns().equals(columns.keySet()) || logicalSchema!=null && request.targetDirectory().routingPrefixBytes()!=logicalSchema.routingPrefixBytes())throw new IllegalArgumentException("Source recovery target projection changed");
+        if(!request.targetDirectory().columns().equals(logicalColumns()) || (logicalSchema!=null || retiredRoutingPrefix>=0) && request.targetDirectory().routingPrefixBytes()!=(logicalSchema!=null ? logicalSchema.routingPrefixBytes() : retiredRoutingPrefix))throw new IllegalArgumentException("Source recovery target projection changed");
         request.freeze().requireCut(request.origin().absenceCut());if(request.origin().absenceCut().index()>applied.index() || request.origin().absenceCut().term()>applied.term())throw new IllegalArgumentException("Source credit absence cut exceeds native prefix");
     }
     public NativeSourceOutcomeCredit sourceOutcomeCredit(OperationId operation,byte[] originalReceiptDigest) throws RocksDBException {
@@ -435,7 +435,7 @@ public final class ReplicatedRangeStore {
             merges.put(schemaIdentity(source.digest()),record.sourceMerges()); merges.put(schemaIdentity(target.digest()),record.targetMerges());
             superseded.put(schemaIdentity(source.digest()),record.position()); proofs.put(record.definition().changeId(),record.proof());
         }
-        if(current!=null && (!Arrays.equals(current.definition().targetSchema().digest(),schemaDigest) || !current.definition().targetSchema().columnIds().equals(columns.keySet()) || !current.targetMerges().equals(deterministicMergeColumns))) throw new IllegalStateException("Current generation differs from opened handles");
+        if(current!=null && (!Arrays.equals(current.definition().targetSchema().digest(),schemaDigest) || !current.definition().targetSchema().columnIds().equals(logicalColumns()) || !current.targetMerges().equals(deterministicMergeColumns))) throw new IllegalStateException("Current generation differs from opened handles");
         schemaHistory=Map.copyOf(schemas); schemaMergeHistory=Map.copyOf(merges); schemaSuperseded=Map.copyOf(superseded); schemaInstallProofs=Map.copyOf(proofs); schemaActivationProofs=Map.copyOf(activations);
         activeSchemaInstallation=current; activeSchemaActivation=activation;
         if(current!=null) { logicalSchema=current.definition().targetSchema(); installedGeneration=new SchemaGeneration(logicalSchema,interval,columns,deterministicMergeColumns); }
@@ -506,6 +506,13 @@ public final class ReplicatedRangeStore {
     private final long rangeEpoch;
     private volatile byte[] schemaDigest;
     private volatile Map<UUID, ColumnFamilyHandle> columns;
+    private volatile boolean retiredMetadataOnly;
+    private volatile int retiredRoutingPrefix=-1;
+    void configureRetiredTopologyDirectory(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) {
+        if(!retiredMetadataOnly || !directory.domainId().equals(interval.domainId()) || !Arrays.equals(directory.schemaDigest(),schemaDigest) || !directory.columns().equals(interval.columns()))throw new IllegalArgumentException("Retired directory differs from original projection");retiredRoutingPrefix=directory.routingPrefixBytes();
+    }
+    private Set<UUID> logicalColumns() { return retiredMetadataOnly ? interval.columns() : columns.keySet(); }
+    public boolean userHandlesDetached() { return retiredMetadataOnly; }
     private volatile Set<UUID> deterministicMergeColumns;
     private final ColumnFamilyHandle state;
     private final ColumnFamilyHandle receipts;
@@ -555,7 +562,7 @@ public final class ReplicatedRangeStore {
         importBirth=manifest;
         if(receipt!=null) { importReceipt=NativeSstImportManifest.Receipt.decode(receipt); importReceipt.requireManifest(manifest); if(intent!=null)throw new IllegalStateException("Installed import retains intent"); importReceipt.requireCut(applied); }
         if(activation!=null) { importActivation=NativeRangeSstImport.Activation.decode(activation); if(importReceipt==null || !Arrays.equals(importActivation.receipt().encode(),importReceipt.encode()))throw new IllegalStateException("Import activation differs from receipt"); importActivation.requireCut(applied); }
-        boolean current=Arrays.equals(manifest.schemaDigest(),schemaDigest) && manifest.physicalNames().keySet().equals(columns.keySet()) && manifest.mergeColumns().equals(deterministicMergeColumns);
+        boolean current=Arrays.equals(manifest.schemaDigest(),schemaDigest) && manifest.physicalNames().keySet().equals(logicalColumns()) && manifest.mergeColumns().equals(deterministicMergeColumns);
         if(!current) {
             if(importActivation==null)throw new IllegalStateException("Unpublished import schema changed");
             boolean qualified=false;
@@ -645,6 +652,13 @@ public final class ReplicatedRangeStore {
             byte[] schemaDigest, Map<UUID, ColumnFamilyHandle> columns,
             ColumnFamilyHandle state, ColumnFamilyHandle receipts,
             Set<UUID> deterministicMergeColumns) throws RocksDBException {
+        this(db,ownership,owner,schemaDigest,columns,state,receipts,deterministicMergeColumns,false);
+    }
+    ReplicatedRangeStore(RocksDB db,RangeOwnership ownership,RangeOwnership.Owner owner,
+            byte[] schemaDigest,Map<UUID,ColumnFamilyHandle> columns,ColumnFamilyHandle state,
+            ColumnFamilyHandle receipts,Set<UUID> deterministicMergeColumns,boolean retiredMetadataOnly) throws RocksDBException {
+        this.retiredMetadataOnly=retiredMetadataOnly;
+        if(retiredMetadataOnly && (ownership.get(owner).state()!=RangeOwnership.State.RETIRED || !columns.isEmpty()))throw new IllegalArgumentException("Metadata-only range requires retired ownership without USER handles");
         this.databaseOwner = Objects.requireNonNull(db);
         if (db instanceof TransactionDB) {
             throw new IllegalArgumentException("Distributed pools require regular or optimistic-base RocksDB for atomic range deletion");
@@ -655,13 +669,13 @@ public final class ReplicatedRangeStore {
         this.interval = ownership.get(owner).interval();
         this.groupId = owner.groupId();
         this.rangeEpoch = owner.epoch();
-        if (schemaDigest.length != 32 || !interval.columns().equals(columns.keySet())) {
+        if (schemaDigest.length != 32 || !retiredMetadataOnly && !interval.columns().equals(columns.keySet())) {
             throw new IllegalArgumentException("Invalid range schema or physical column coverage");
         }
         this.schemaDigest = schemaDigest.clone();
         this.columns = Map.copyOf(columns);
         this.deterministicMergeColumns = Set.copyOf(deterministicMergeColumns);
-        if (!columns.keySet().containsAll(this.deterministicMergeColumns)) {
+        if (!logicalColumns().containsAll(this.deterministicMergeColumns)) {
             throw new IllegalArgumentException("Merge admission refers to an unknown column");
         }
         this.state = Objects.requireNonNull(state);
@@ -688,6 +702,7 @@ public final class ReplicatedRangeStore {
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
         }
         recoverTopologyOwnership();
+        if(retiredMetadataOnly && (!topologyRetired() || pendingInstallation!=null))throw new IllegalArgumentException("Metadata-only owner lacks completed retirement");
         if(pendingInstallation==null) {
             recoverSchemaMetadata();
             recoverImportMetadata();
@@ -830,7 +845,7 @@ public final class ReplicatedRangeStore {
         return readSchemaMetadata(() -> {
             if(!topologyRetired() && !topologyBirthPending()) throw new IllegalStateException("Range is not an inactive topology owner");
             byte[] marker=db.get(state,markerKey); if(!Objects.equals(marker==null ? null : decodePosition(marker),applied)) throw new IllegalStateException("Inactive topology marker differs from completed prefix");
-            return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,columns.keySet(),interval.lowerInclusive(),interval.upperExclusive(),applied,minimumSessionEpoch(null),sessionAuthority(null));
+            return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,logicalColumns(),interval.lowerInclusive(),interval.upperExclusive(),applied,minimumSessionEpoch(null),sessionAuthority(null));
         });
     }
     public long retiredAcknowledgedThrough(OperationId operation) throws RocksDBException { return readSchemaMetadata(() -> { if(!topologyRetired()) throw new IllegalStateException("Parent is not retired"); return acknowledgedThrough(operation,null); }); }
@@ -1385,7 +1400,7 @@ public final class ReplicatedRangeStore {
         if(active) { requireActive(); if(!metadataSchemaControl(command)) requireSchemaAdmission(); }
         var commandSchemaDigest=command.schemaDigest(); boolean currentSchema=Arrays.equals(schemaDigest,commandSchemaDigest);
         var historical=(!active || pendingSchemaControl(command)) && !currentSchema ? schemaHistory.get(schemaIdentity(commandSchemaDigest)) : null;
-        var commandColumns=historical==null ? columns.keySet() : historical.columnIds();
+        var commandColumns=historical==null ? logicalColumns() : historical.columnIds();
         if (!groupId.equals(command.groupId()) || rangeEpoch != command.rangeEpoch()
                 || !currentSchema && historical==null) {
             throw new IllegalArgumentException("Wrong group, epoch or schema");
@@ -3659,7 +3674,7 @@ public final class ReplicatedRangeStore {
     public void validateScope(TransactionScope scope) {
         Objects.requireNonNull(scope); requireSchemaAdmission(); if (!admissionOpen()) throw new IllegalStateException("Range admission is closed"); validateSnapshotScope(scope);
     }
-    private void validateSnapshotScope(TransactionScope scope) { validateSnapshotScope(scope,columns.keySet()); }
+    private void validateSnapshotScope(TransactionScope scope) { validateSnapshotScope(scope,logicalColumns()); }
     private void validateSnapshotScope(TransactionScope scope,Set<UUID> scopeColumns) {
         for (var span : scope.spans()) {
             if (!scopeColumns.contains(span.columnId())) throw new IllegalArgumentException("Scope column is outside this range");
@@ -4049,6 +4064,20 @@ public final class ReplicatedRangeStore {
     }
 
     private void leaveNative() { nativeLifecycle.readLock().unlock(); signalSchemaCaptureDrain(); signalTopologyDrain(); }
+
+    /** Called under pool mutation ownership; never closes shared CFs or busy snapshots. */
+    boolean detachRetiredUserHandles() throws RocksDBException {
+        requireSnapshotReleaseHealthy();if(!nativeLifecycle.writeLock().tryLock())return false;
+        try { applyLane.lock();try {
+            if(closing)throw new IllegalStateException("Retired range is closing");requireTopologyMetadataOwner();
+            if(!topologyRetired() || ownership.get(owner).state()!=RangeOwnership.State.RETIRED)throw new IllegalStateException("Only durable retired topology owners can detach USER handles");
+            if(snapshotPins.get()!=0)return false;
+            if(retiredMetadataOnly)return true;
+            columns=Map.of();retiredMetadataOnly=true;
+            if(installedGeneration!=null)installedGeneration=new SchemaGeneration(installedGeneration.schema(),interval,columns,deterministicMergeColumns);
+            return true;
+        } finally { applyLane.unlock(); } } finally { nativeLifecycle.writeLock().unlock(); }
+    }
 
     /**
      * Permanently closes borrowed native admission. Pool ownership stays intact

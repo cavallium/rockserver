@@ -195,6 +195,26 @@ public final class DistributedStoragePool implements AutoCloseable {
             topologyBirths=Map.copyOf(births); topologyRetirements=Map.copyOf(retirements); pendingTopologySeed=null; return seed;
         } catch(IOException failure) { throw new IllegalStateException("Cannot encode topology metadata",failure); }
     }
+    /** Opens only retained parent metadata, independent of historic USER CF availability. */
+    public ReplicatedRangeStore openRetiredTopologyRange(UUID group) throws RocksDBException {
+        Objects.requireNonNull(group);nativeMutation.acquireUninterruptibly();
+        try {
+            synchronized(admission) { if(closing)throw new IllegalStateException("Pool is closing"); }
+            if(pendingTopologySeed!=null)throw new IllegalStateException("Unknown topology seed completion requires exact retry");
+            var seed=topologyRetirements.get(group);if(seed==null)throw new IllegalArgumentException("Group has no durable topology retirement");requireTopologySeedRows(seed);
+            var descriptor=seed.definition().parents().stream().filter(range->range.groupId().equals(group)).findFirst().orElseThrow();var owner=new RangeOwnership.Owner(group,descriptor.rangeEpoch());
+            for(var existing:ranges)if(existing.ownership().owner().equals(owner)) { if(existing.detachRetiredUserHandles()) { existing.configureRetiredTopologyDirectory(seed.definition().sourceDirectory());drainDeferredDrops(); }return existing; }
+            var registered=ownership.get(owner);if(registered.state()!=RangeOwnership.State.RETIRED || !registered.interval().equals(topologyInterval(seed,descriptor)))throw new IllegalArgumentException("Retired ownership history changed");
+            var store=new ReplicatedRangeStore(loaded.db().get(),ownership,owner,seed.header().schemaDigest(),Map.of(),handles.get(STATE_COLUMN),handles.get(RECEIPTS_COLUMN),seed.mergeColumns(),true);
+            store.configureSnapshotAdmission(snapshotAdmission);store.configureSchemaPreparationPool(this);store.validateTopologyActivationRecovery();store.configureRetiredTopologyDirectory(seed.definition().sourceDirectory());ranges.add(store);drainDeferredDrops();return store;
+        } finally { nativeMutation.release(); }
+    }
+    /** Releases only this parent's borrowed USER references after actual native users/pins drain. */
+    public boolean detachRetiredUserHandles(ReplicatedRangeStore store) throws RocksDBException {
+        Objects.requireNonNull(store);nativeMutation.acquireUninterruptibly();
+        try { synchronized(admission) { if(closing)throw new IllegalStateException("Pool is closing"); }if(!ranges.contains(store))throw new IllegalArgumentException("Range is not owned by this pool");var seed=topologyRetirements.get(store.ownership().owner().groupId());if(seed==null)throw new IllegalArgumentException("Range has no topology retirement");requireTopologySeedRows(seed);boolean detached=store.detachRetiredUserHandles();if(detached) { store.configureRetiredTopologyDirectory(seed.definition().sourceDirectory());drainDeferredDrops(); }return detached; }
+        finally { nativeMutation.release(); }
+    }
     public ReplicatedRangeStore reopenTopologyRange(NativeTopologyBirth birth,DistributedSchema schema) throws RocksDBException {
         Objects.requireNonNull(birth); Objects.requireNonNull(schema); var seed=topologySeeds.get(birth.intentId()); if(seed==null) throw new IllegalArgumentException("Topology birth artifact missing"); birth.requireSeed(seed); schema.requireMatches(seed.definition().targetDirectory()); var range=birth.resolveDescriptor(seed);
         var store=openRange(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),topologyInterval(seed,range),schema.digest(),seed.physicalNames(),seed.mergeColumns());
@@ -1359,7 +1379,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         var iterator=deferredDrops.iterator();
         while(iterator.hasNext()) {
             var id=iterator.next();
-            if(ranges.stream().anyMatch(range -> range.ownership().interval().columns().contains(id))) continue;
+            if(ranges.stream().anyMatch(range -> !range.userHandlesDetached() && range.ownership().interval().columns().contains(id))) continue;
             var origin=Objects.requireNonNull(deletionOrigins.get(id)); boolean needed=false;
             for(var participant:origin.sourceDirectory().ranges()) {
                 var group=participant.groupId(); var marker=ByteBuffer.allocate(16).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).array();
