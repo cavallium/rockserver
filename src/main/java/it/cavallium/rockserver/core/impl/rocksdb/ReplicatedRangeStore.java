@@ -914,9 +914,14 @@ public final class ReplicatedRangeStore {
     public RangeStateView retiredOutcomeState() throws RocksDBException {
         return readSchemaMetadata(() -> {
             if(!topologyRetired() && !topologyBirthPending()) throw new IllegalStateException("Range is not an inactive topology owner");
-            byte[] marker=db.get(state,markerKey); if(!Objects.equals(marker==null ? null : decodePosition(marker),applied)) throw new IllegalStateException("Inactive topology marker differs from completed prefix");
-            return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,logicalColumns(),interval.lowerInclusive(),interval.upperExclusive(),applied,minimumSessionEpoch(null),sessionAuthority(null));
+            return metadataOutcomeStateUnderLane();
         });
+    }
+    /** Trusted outcome/status metadata only; does not grant USER access or acquire a native snapshot. */
+    public RangeStateView metadataOutcomeState() throws RocksDBException { return readSchemaMetadata(this::metadataOutcomeStateUnderLane); }
+    private RangeStateView metadataOutcomeStateUnderLane() throws RocksDBException {
+        byte[] marker=db.get(state,markerKey);if(!Objects.equals(marker==null ? null : decodePosition(marker),applied))throw new IllegalStateException("Metadata marker differs from completed prefix");
+        return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,logicalColumns(),interval.lowerInclusive(),interval.upperExclusive(),applied,minimumSessionEpoch(null),sessionAuthority(null));
     }
     public long retiredAcknowledgedThrough(OperationId operation) throws RocksDBException { return readSchemaMetadata(() -> { if(!topologyRetired()) throw new IllegalStateException("Parent is not retired"); return acknowledgedThrough(operation,null); }); }
 
