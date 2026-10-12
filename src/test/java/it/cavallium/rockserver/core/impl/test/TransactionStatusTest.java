@@ -59,7 +59,8 @@ class TransactionStatusTest {
         var max=TransactionStatus.begin(cluster,database,domain,transaction,initial.operation(),1,new byte[32],new byte[32],participants);
         assertTrue(max.encode().length<=TransactionStatus.MAX_BYTES); assertEquals(max,TransactionStatus.decode(max.encode())); participants.add(participant(new UUID(0,200)));
         assertThrows(IllegalArgumentException.class,() -> TransactionStatus.begin(cluster,database,domain,transaction,initial.operation(),1,new byte[32],new byte[32],participants));
-    }    TransactionStatus reservation(int count) { return TransactionStatus.reserve(OperationRerouteOriginTest.origin(count),1,new byte[32]); }
+    }
+    TransactionStatus reservation(int count) { return TransactionStatus.reserve(OperationRerouteOriginTest.origin(count),1,new byte[32]); }
     TransactionStatus accepted(TransactionStatus reserved,List<TransactionStatus.Participant> participants) { return TransactionStatus.begin(reserved.clusterId(),reserved.databaseId(),reserved.domainId(),reserved.transactionId(),reserved.operation(),reserved.schemaEpoch(),reserved.schemaDigest(),OperationRerouteOriginTest.digest(9),participants); }
     @Test void reservationHasNoEffectsAndPromotionInstallsAcceptedHashOnceBeforeOrdinaryVotes() {
         var reserved=reservation(2); reserved.requireInitial(); assertTrue(reserved.reserved()); assertFalse(reserved.terminal()); assertFalse(reserved.fullyFinalized()); assertFalse(reserved.gcEligible()); assertTrue(reserved.participants().isEmpty()); assertEquals(reserved,reserved.asInitial()); assertEquals(reserved,TransactionStatus.decode(reserved.encode()));
@@ -77,10 +78,24 @@ class TransactionStatusTest {
     }
     @Test void maximumPromotedReservationAndMalformedGenerationOriginAndPhaseAreBounded() {
         var reserved=reservation(TransactionStatus.MAX_PARTICIPANTS); var participants=new ArrayList<TransactionStatus.Participant>(); for(int i=0;i<TransactionStatus.MAX_PARTICIPANTS;i++) participants.add(participant(new UUID(0,100+i))); var promoted=reserved.promote(accepted(reserved,participants)); assertEquals(TransactionStatus.MAX_BYTES,promoted.encode().length); assertEquals(promoted,TransactionStatus.decode(promoted.encode()));
-        var originLength=reserved.encode(); ByteBuffer.wrap(originLength).putInt(182,Integer.MAX_VALUE); assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(originLength));
+        var originLength=reserved.encode(); ByteBuffer.wrap(originLength).putInt(183,Integer.MAX_VALUE); assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(originLength));
         var generation=reserved.encode(); ByteBuffer.wrap(generation).putLong(168,1); assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(generation)); var preparing=promoted.encode(); ByteBuffer.wrap(preparing).putLong(168,0); assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(preparing));
         var missingOrigin=initial().encode(); missingOrigin[176]=(byte)TransactionStatus.Phase.RESERVED.ordinal(); assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(missingOrigin)); var unconsumed=reserved.encode(); unconsumed[177]=1; assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(unconsumed));
         var noOp=promoted.encode(); ByteBuffer.wrap(noOp).putLong(168,2); var decoded=TransactionStatus.decode(noOp); assertThrows(IllegalArgumentException.class,()->decoded.requireSuccessorOf(promoted));
+    }
+    @Test void noEffectAbortChoosesOneCanonicalBusinessOutcomeAcrossReplayAndConsumption() {
+        var reserved=reservation(2); assertEquals(TransactionStatus.NoEffectOutcome.NONE,reserved.noEffectOutcome());
+        var conflict=reserved.decide(TransactionStatus.Phase.ABORT); var expired=reserved.abortReservation(TransactionStatus.NoEffectOutcome.SESSION_EXPIRED);
+        for(var terminal:List.of(conflict,expired)) {
+            terminal.requireSuccessorOf(reserved); assertTrue(terminal.sameDefinition(reserved)); assertTrue(terminal.participants().isEmpty()); assertEquals(terminal,TransactionStatus.decode(terminal.encode())); assertEquals(terminal.noEffectOutcome(),terminal.terminalDecision().noEffectOutcome()); assertEquals(TransactionStatus.NoEffectOutcome.NONE,terminal.asInitial().noEffectOutcome()); assertEquals(reserved,terminal.asInitial());
+            var consumed=terminal.consume(); consumed.requireSuccessorOf(terminal); assertEquals(terminal.noEffectOutcome(),consumed.noEffectOutcome()); assertEquals(terminal.terminalDecision(),consumed.terminalDecision()); assertArrayEquals(terminal.terminalBusinessResult().encode(),consumed.terminalBusinessResult().encode()); assertSame(consumed,consumed.decide(TransactionStatus.Phase.ABORT));
+        }
+        assertEquals(CommandResult.Status.CONFLICT,conflict.terminalBusinessResult().status()); assertEquals(CommandResult.Status.SESSION_EXPIRED,expired.terminalBusinessResult().status()); assertEquals(0,expired.terminalBusinessResult().valueCount());
+        assertThrows(IllegalArgumentException.class,()->reserved.abortReservation(TransactionStatus.NoEffectOutcome.NONE)); assertThrows(IllegalArgumentException.class,reserved::terminalBusinessResult); assertThrows(IllegalArgumentException.class,()->expired.abortReservation(TransactionStatus.NoEffectOutcome.CONFLICT));
+        var flip=conflict.consume().encode(); flip[182]=(byte)TransactionStatus.NoEffectOutcome.SESSION_EXPIRED.ordinal(); var changed=TransactionStatus.decode(flip); assertTrue(changed.sameDefinition(conflict)); assertThrows(IllegalArgumentException.class,()->changed.requireSuccessorOf(conflict));
+        var unset=expired.encode(); unset[182]=0; assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(unset)); var invalid=reserved.encode(); invalid[182]=127; assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(invalid));
+        var ordinaryAbort=initial().decide(TransactionStatus.Phase.ABORT); assertEquals(TransactionStatus.NoEffectOutcome.NONE,ordinaryAbort.noEffectOutcome()); assertEquals(CommandResult.Status.CONFLICT,ordinaryAbort.terminalBusinessResult().status()); var forbidden=ordinaryAbort.encode(); forbidden[182]=1; assertThrows(IllegalArgumentException.class,()->TransactionStatus.decode(forbidden)); assertThrows(IllegalArgumentException.class,()->ordinaryAbort.abortReservation(TransactionStatus.NoEffectOutcome.SESSION_EXPIRED));
+        assertThrows(IllegalArgumentException.class,()->prepared().decide(TransactionStatus.Phase.COMMIT).terminalBusinessResult());
     }
 
 }

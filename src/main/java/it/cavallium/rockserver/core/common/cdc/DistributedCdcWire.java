@@ -100,7 +100,7 @@ public final class DistributedCdcWire {
     }
     public static CdcFinalization finalization(ParticipantFinalization value) {
         var decision=value.decision();
-        if(decision.phase()!=TransactionStatus.Phase.COMMIT && decision.phase()!=TransactionStatus.Phase.ABORT) throw new IllegalArgumentException("CDC finalization requires a terminal decision");
+        if(!decision.terminal() || decision.noEffectOutcome()!=TransactionStatus.NoEffectOutcome.NONE) throw new IllegalArgumentException("CDC finalization requires a participant terminal decision without a no-effect HOME outcome");
         var builder=CdcDecision.newBuilder().setClusterId(uuid(decision.clusterId())).setDatabaseId(uuid(decision.databaseId())).setDomainId(uuid(decision.domainId())).setTransactionId(uuid(decision.transactionId())).setOperation(operation(decision.operation())).setSchemaEpoch(decision.schemaEpoch()).setSchemaDigest(ByteString.copyFrom(decision.schemaDigest())).setPlanDigest(ByteString.copyFrom(decision.planDigest())).setPhase(decision.phase()==TransactionStatus.Phase.COMMIT ? CdcDecisionPhase.DECISION_COMMIT : CdcDecisionPhase.DECISION_ABORT);
         if(decision.origin()!=null) builder.setOrigin(ByteString.copyFrom(decision.origin().encode()));
         for(var participant:decision.participants()) { var p=CdcParticipant.newBuilder().setLineage(lineage(new DistributedCdcCheckpoint.Lineage(participant.rangeId(),participant.groupId(),participant.rangeEpoch()))).setSchemaDigest(ByteString.copyFrom(participant.schemaDigest())).setPlanDigest(ByteString.copyFrom(participant.planDigest())); if(participant.prepared()!=null) p.setPrepared(position(participant.prepared())); builder.addParticipants(p); }
@@ -119,6 +119,7 @@ public final class DistributedCdcWire {
         }
         for(var p:d.getParticipantsList()) if(p.hasPrepared()) decision=decision.prepared(uuid(p.getLineage().getGroupId()),p.getPlanDigest().toByteArray(),position(p.getPrepared()));
         decision=decision.decide(d.getPhase()==CdcDecisionPhase.DECISION_COMMIT ? TransactionStatus.Phase.COMMIT : TransactionStatus.Phase.ABORT);
+        if(decision.noEffectOutcome()!=TransactionStatus.NoEffectOutcome.NONE) throw new IllegalArgumentException("CDC participant finalization cannot encode an empty HOME outcome");
         return new ParticipantFinalization(uuid(value.getHomeGroup()),value.getHomeEpoch(),uuid(value.getParticipantGroup()),operation(value.getRecoveryOperation()),decision);
     }
     public static CdcEnvelope envelope(DistributedCdcSubscriptions.Envelope value) {

@@ -27,7 +27,7 @@ const ENVELOPE_HEADER_BYTES: usize = 92;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 pub const REROUTE_ORIGIN_BYTES: usize = 300;
-pub const MAX_FINALIZATION_BYTES: usize = 76 + 186 + REROUTE_ORIGIN_BYTES + 64 * 121;
+pub const MAX_FINALIZATION_BYTES: usize = 76 + 187 + REROUTE_ORIGIN_BYTES + 64 * 121;
 const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 4 + 60 * MAX_LINEAGES;
 const MAX_DEFINITION_BYTES: usize = 120 + 16 * MAX_COLUMNS + MAX_CHECKPOINT_BYTES;
@@ -679,6 +679,7 @@ impl RerouteOrigin {
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Participant finalizations always carry the canonical NoEffectOutcome::NONE byte; empty HOME aborts have no participant.
 pub struct Decision {
     pub cluster_id: Id,
     pub database_id: Id,
@@ -702,7 +703,7 @@ pub struct Finalization {
 }
 impl Finalization {
     fn budget_bytes(&self) -> usize {
-        76 + 186
+        76 + 187
             + self
                 .decision
                 .origin
@@ -2625,7 +2626,7 @@ mod tests {
             assert_ne!(decoded.decision.plan_digest, origin.plan_digest);
             assert_eq!(
                 decoded.budget_bytes(),
-                76 + 186 + REROUTE_ORIGIN_BYTES + 121
+                76 + 187 + REROUTE_ORIGIN_BYTES + 121
             );
         }
         let mut wire = batch();
@@ -2633,7 +2634,7 @@ mod tests {
         assert!(Batch::try_from(wire).is_ok());
         let ordinary = Finalization::try_from(finalization()).unwrap();
         assert!(ordinary.decision.origin.is_none());
-        assert_eq!(ordinary.budget_bytes(), 76 + 186 + 121);
+        assert_eq!(ordinary.budget_bytes(), 76 + 187 + 121);
     }
     #[test]
     fn reroute_origin_rejects_malformed_fixed_body_cut_and_control_allocation() {
@@ -2692,7 +2693,7 @@ mod tests {
             v.decision.as_mut().unwrap().phase = phase;
             assert!(Finalization::try_from(v).is_err());
         }
-        assert_eq!(MAX_FINALIZATION_BYTES, 8306);
+        assert_eq!(MAX_FINALIZATION_BYTES, 8307);
     }
     #[test]
     fn transaction_metadata_binds_commit_operation_preparation_and_namespace() {

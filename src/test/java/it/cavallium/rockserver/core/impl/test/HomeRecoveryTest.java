@@ -70,5 +70,11 @@ class HomeRecoveryTest {
         var accepted=TransactionStatus.begin(cluster,database,domain,reserved.transactionId(),reserved.operation(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(data,data,1,new byte[32],new byte[32],null,false))); var promoted=reserved.promote(accepted);
         assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.ABORT,command(reserved,promoted,control(1)),null));
     }
+    @Test void protectedReservationAbortRetainsQualifiedExpiredChoiceInsteadOfReconstructingConflict() {
+        var origin=new OperationRerouteOrigin(cluster,database,domain,new DistributedCdcCheckpoint.Lineage(data,data,1),initial().operation(),new byte[32],new byte[32],new ApplyPosition(2,3),new byte[32],new byte[32],1,new OperationId(new UUID(0,9),1,10)); var before=TransactionStatus.reserve(origin,1,new byte[32]); var next=before.abortReservation(TransactionStatus.NoEffectOutcome.SESSION_EXPIRED);
+        var recovery=new HomeRecovery(HomeRecovery.Action.ABORT,command(before,next,control(0)),null); var decoded=HomeRecovery.decode(recovery.encode()); assertEquals(recovery,decoded); assertEquals(TransactionStatus.NoEffectOutcome.SESSION_EXPIRED,decoded.next().noEffectOutcome()); assertEquals(CommandResult.Status.SESSION_EXPIRED,decoded.next().terminalBusinessResult().status());
+        var receipt=new HomeRecoveryReceipt(recovery,new ApplyPosition(3,4),new CommandResult(CommandResult.Status.SUCCESS,List.of())); assertEquals(next,HomeRecoveryReceipt.decode(receipt.encode()).recovery().next());
+        assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.ACK,command(before,next,control(1)),new HomeRecovery.Proof(data,new ApplyPosition(3,4),new byte[32])));
+    }
 
 }

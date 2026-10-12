@@ -1495,8 +1495,8 @@ public final class ReplicatedRangeStore {
         if (homeRecoveryContext!=null) return homeRecoveryContext;
         var credit=homeRecoveryCredits.values().stream().findFirst().orElse(null); return credit==null ? null : new HomeRecoveryContext(credit.cluster(),credit.database(),credit.column());
     }
-    private HomeCreditChange homeCreditChange(DistributedCommand command,ApplyPosition position,boolean successful) { return homeCreditChange(command,position,successful,false); }
-    private HomeCreditChange homeCreditChange(DistributedCommand command,ApplyPosition position,boolean successful,boolean protectedRecovery) {
+    private HomeCreditChange homeCreditChange(DistributedCommand command,ApplyPosition position,boolean successful) throws RocksDBException { return homeCreditChange(command,position,successful,false); }
+    private HomeCreditChange homeCreditChange(DistributedCommand command,ApplyPosition position,boolean successful,boolean protectedRecovery) throws RocksDBException {
         if (!successful || command.mutations().isEmpty()) return null;
         if (!protectedRecovery && homeRecoveryContext==null && !homeRecoveryCredits.isEmpty()) throw new IllegalStateException("HOME reservations must be configured before ordinary changes");
         var context=creditContext(); if (context==null) return null;
@@ -1508,7 +1508,7 @@ public final class ReplicatedRangeStore {
         var old=homeRecoveryCredits.get(next.transactionId()); TransactionStatus initial;
         if (predicate.expectedValue()==null) { next.requireInitial(); if(next.origin()!=null && !next.reserved())throw new IllegalArgumentException("Reroute HOME must reserve before installing accepted participants"); if (old!=null) throw new IllegalStateException("HOME registration replaced a promise"); initial=next; }
         else {
-            var before=TransactionStatus.decode(predicate.expectedValue()); next.requireSuccessorOf(before);
+            var before=TransactionStatus.decode(predicate.expectedValue()); next.requireSuccessorOf(before);requireHomeNoEffectOutcome(before,next);
             if (old==null && HomeRecoveryCredit.remaining(before)!=0) throw new IllegalStateException("Existing HOME has no future recovery promise");
             if (old!=null && !old.current().equals(before)) throw new IllegalStateException("HOME row and promise differ"); initial=before.reserved() && next.phase()==TransactionStatus.Phase.PREPARING ? next.asInitial() : old==null ? before : old.initial();
         }
@@ -1569,7 +1569,8 @@ public final class ReplicatedRangeStore {
             if (retired!=null) return new HomeRecoveryEstimate(homeRecoveryCapacityUnderLane(),false,null,false,0,0,retired);
             requireHomeRecoveryIdentity(recovery); var command=recovery.command(); requireUnlocked(command); requireUngated(commandScope(command));
             var capacity=homeRecoveryCapacityUnderLane();
-            var credit=homeRecoveryCredits.get(recovery.before().transactionId()); boolean covered=credit!=null && credit.current().equals(recovery.before()) && evaluate(command).result().status()==CommandResult.Status.SUCCESS;
+            boolean successful=evaluate(command).result().status()==CommandResult.Status.SUCCESS;if(successful)requireHomeNoEffectOutcome(recovery.before(),recovery.next());
+            var credit=homeRecoveryCredits.get(recovery.before().transactionId()); boolean covered=credit!=null && credit.current().equals(recovery.before()) && successful;
             int count=covered ? 0 : 1; long bytes=covered ? 0 : homeRecoveryBytes(recovery); checkHomeCapacity(count,bytes);
             return new HomeRecoveryEstimate(capacity,true,null,covered,count,bytes,null);
         } finally { applyLane.unlock(); leaveNative(); }
@@ -1617,7 +1618,7 @@ public final class ReplicatedRangeStore {
         if (receipt.result().status()!=CommandResult.Status.SUCCESS) return;
         if (current==null) throw new IllegalStateException("Successful HOME recovery has no USER row");
         var next=receipt.recovery().next();
-        if (!next.sameDefinition(current) || next.phase()!=current.phase() || current.generation()<next.generation() || next.consumed() && !current.consumed()) throw new IllegalArgumentException("Successful HOME recovery USER definition/decision regressed");
+        if (!next.sameDefinition(current) || next.noEffectOutcome()!=current.noEffectOutcome() || next.phase()!=current.phase() || current.generation()<next.generation() || next.consumed() && !current.consumed()) throw new IllegalArgumentException("Successful HOME recovery USER definition/decision regressed");
         long steps=next.consumed()==current.consumed() ? 0 : 1;
         for (int i=0;i<next.participants().size();i++) {
             var before=next.participants().get(i); var after=current.participants().get(i);
@@ -1631,6 +1632,18 @@ public final class ReplicatedRangeStore {
         var mutation=receipt.recovery().command().mutations().getFirst(); var column=columns.get(mutation.columnId());
         byte[] bytes=options==null ? db.get(column,mutation.key()) : db.get(column,options,mutation.key());
         requireHomeRecoverySuccessor(receipt,bytes==null ? null : TransactionStatus.decode(bytes));
+    }
+    private void requireHomeNoEffectOutcome(TransactionStatus before,TransactionStatus next) throws RocksDBException {
+        if(!before.reserved() || next.noEffectOutcome()!=TransactionStatus.NoEffectOutcome.SESSION_EXPIRED)return;
+        var origin=before.origin();var first=origin.firstControl();var promotion=new OperationId(first.sessionId(),first.epoch(),first.sequence()+128);
+        if(!homeIdentityExpired(before.operation(),false) && !homeIdentityExpired(promotion,true))throw new IllegalArgumentException("HOME expired no-effect outcome lacks native business/control expiry evidence");
+    }
+    private boolean homeIdentityExpired(OperationId operation,boolean acknowledgement) throws RocksDBException {
+        if(operation.epoch()<minimumSessionEpoch(null) || acknowledgement && operation.sequence()<=acknowledgedThrough(operation,null))return true;
+        var authority=sessionAuthority();if(authority==null)return false;
+        if(operation.epoch()<authority.minimumEpoch())return true;
+        var binding=sessionBinding(operation.epoch());
+        return binding!=null && binding.grant().sessionId().equals(operation.sessionId()) && binding.grant().expiresAtMillis()<=authority.logicalTimeMillis();
     }
     private boolean expiredHomeRegistration(DistributedCommand command) throws RocksDBException {
         var context=homeRecoveryContext!=null ? homeRecoveryContext : snapshotHomeContext;
