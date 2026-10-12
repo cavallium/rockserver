@@ -13,6 +13,30 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Durable user-window/native composition; no server process, network or power-loss acceptance. */
 class RatisDurableSessionClientTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    @Test void sessionOwnedResolutionKeepsOriginalActiveAndForcesResultBeforeExposure()throws Exception {
+        try(var f=new RatisSessionPropagationTest.Fixture(root)) {
+            Path path=root.resolve("resolved-window.bin");byte[] original,result;
+            try(var client=RatisDurableSessionClient.create(path,f.routed,f.ledger,f.ledger.grants().getFirst(),RatisSessionClient.Limits.defaults())) {
+                var pending=client.prepare(List.of(new Mutation(Mutation.Kind.PUT,f.outer.data,new byte[]{7},new byte[]{9},Mutation.ReturnMode.PREVIOUS)));original=DistributedCommandCodec.encode(pending.command());
+                f.routed.execute(client.prepareBinding(f.catalogue.epochs,new OperationId(f.outer.maintenance,1,100),pending,-1));
+                assertThrows(IOException.class,()->client.execute(pending,prepared->null));assertNull(pending.savedResult());
+                var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+                var execution=CompletableFuture.supplyAsync(()->{try{return client.execute(pending,prepared->{
+                    assertArrayEquals(original,DistributedCommandCodec.encode(prepared.command()));entered.countDown();
+                    try{if(!release.await(5,TimeUnit.SECONDS))throw new IOException("Resolver release timed out");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}
+                    assertNull(pending.savedResult());return f.routed.execute(prepared);
+                });}catch(IOException failure){throw new CompletionException(failure);}});
+                try {
+                    assertTrue(entered.await(5,TimeUnit.SECONDS));assertThrows(IOException.class,()->client.execute(pending));assertThrows(IOException.class,client::close);assertThrows(IllegalStateException.class,()->client.acknowledge(pending));
+                }finally{release.countDown();}
+                result=execution.get(5,TimeUnit.SECONDS).encode();assertArrayEquals(result,pending.savedResult().encode());assertArrayEquals(original,DistributedCommandCodec.encode(pending.command()));
+            }
+            try(var recovered=RatisDurableSessionClient.reopen(path,f.routed)) {
+                var pending=recovered.pending().getFirst();assertArrayEquals(original,DistributedCommandCodec.encode(pending.command()));assertArrayEquals(result,pending.savedResult().encode());
+                assertArrayEquals(result,recovered.execute(pending,prepared->{throw new AssertionError("Saved result must not rerun the resolver");}).encode());recovered.acknowledge(pending);assertTrue(recovered.pending().isEmpty());assertEquals(0,recovered.acknowledgedThrough());
+            }
+        }
+    }
     @Test void originalQualifiedSchemaPreparationIsForcedAndReopensWithoutResequencing() throws Exception {
         var helper=new RatisSchemaLifecycleClientTest(); var wire=helper.new Transport(); var source=wire.definition.sourceDirectory();
         var ledger=SessionEpochLedger.initial(source.clusterId(),source.databaseId(),10).issue(new UUID(93,1),1000);

@@ -34,7 +34,13 @@ public final class RatisTransactionPlan {
         return create(directory,operation,plan.mutations(),plan.predicates());
     }
     public static RatisTransactionPlan create(RangeDirectory directory,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates) {
-        return create(directory,operation,mutations,predicates,Map.of());
+        return create(directory,operation,mutations,predicates,Map.of(),-1);
+    }
+    /** Normalize the complete original effectful DATA input without losing its piggyback ACK. */
+    public static RatisTransactionPlan fromOriginal(RangeDirectory target,DistributedCommand original) {
+        Objects.requireNonNull(original);
+        if(original.kind()!=DistributedCommand.Kind.DATA || original.mutations().isEmpty() && original.predicates().isEmpty() || !Arrays.equals(original.schemaDigest(),target.schemaDigest()))throw new IllegalArgumentException("Reroute requires original effectful DATA with the target schema");
+        return create(target,original.operationId(),original.mutations(),original.predicates(),Map.of(),original.acknowledgedThrough());
     }
     /** Every participant in the consistent original read projection must certify, including groups with no writes. */
     public static RatisTransactionPlan captured(RangeDirectory directory,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,RatisDurableSnapshot.Snapshot snapshot) {
@@ -63,9 +69,9 @@ public final class RatisTransactionPlan {
                     || participant.scope().participants(directory,SnapshotFence.MAX_PARTICIPANTS).size()!=1) throw new IllegalArgumentException("Original read projection changed route");
             if (captures.putIfAbsent(route.groupId(),new CapturedCut(target,participant.scope(),handle))!=null) throw new IllegalArgumentException("Duplicate captured participant");
         }
-        return create(directory,operation,mutations,predicates,captures);
+        return create(directory,operation,mutations,predicates,captures,-1);
     }
-    private static RatisTransactionPlan create(RangeDirectory directory,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,Map<UUID,CapturedCut> captures) {
+    private static RatisTransactionPlan create(RangeDirectory directory,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,Map<UUID,CapturedCut> captures,long acknowledgedThrough) {
         Objects.requireNonNull(directory); Objects.requireNonNull(operation); mutations=List.copyOf(mutations); predicates=List.copyOf(predicates);
         if (captures.isEmpty() && mutations.isEmpty() && predicates.isEmpty() || (long)mutations.size()+predicates.size()>DistributedCommandCodec.MAX_ITEMS) throw new IllegalArgumentException("Invalid global transaction input count");
         var groups=new TreeMap<UUID,Builder>(); int returned=0; long[] bodyBytes={0};
@@ -93,7 +99,7 @@ public final class RatisTransactionPlan {
             var command=cut!=null && group.mutations.isEmpty() && group.predicates.isEmpty()
                     ? DistributedCommand.readCertification(group.route.groupId(),group.route.rangeEpoch(),directory.schemaDigest(),operation,
                             new TransactionAcceptance(cut.handle().position(),cut.handle().generation(),cut.handle().owner(),cut.scope(),new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode()))
-                    : new DistributedCommand(group.route.groupId(),group.route.rangeEpoch(),directory.schemaDigest(),operation,group.mutations,group.predicates);
+                    : new DistributedCommand(group.route.groupId(),group.route.rangeEpoch(),directory.schemaDigest(),operation,group.mutations,group.predicates,acknowledgedThrough);
             bytes+=DistributedCommandCodec.encodedSize(command); if (bytes>MAX_BYTES) throw new IllegalArgumentException("Global transaction exceeds byte budget");
             var spans=new ArrayList<TransactionScope.Span>();
             for (var mutation:group.mutations) spans.add(mutation.kind()==Mutation.Kind.DELETE_RANGE ? TransactionScope.Span.range(mutation.columnId(),mutation.key(),mutation.value()) : TransactionScope.Span.point(mutation.columnId(),mutation.key()));

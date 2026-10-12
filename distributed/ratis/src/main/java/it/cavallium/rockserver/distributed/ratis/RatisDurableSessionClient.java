@@ -90,6 +90,10 @@ public final class RatisDurableSessionClient implements AutoCloseable {
         var pending=new Pending(this,entry,null,false); retained.put(entry.command().operationId().sequence(),pending); return pending;
     }
     public CommandResult execute(Pending pending) throws IOException {
+        return execute(pending,null);
+    }
+    /** Keeps the original pending identity active until the resolved outcome has been forced. */
+    CommandResult execute(Pending pending,RatisSessionClient.Execution resolution) throws IOException {
         lane.lock();
         try {
             requireOpen(); owned(pending);
@@ -98,7 +102,7 @@ public final class RatisDurableSessionClient implements AutoCloseable {
             if (pending.executing) throw new IOException("This durable operation is already executing"); pending.executing=true; active++;
         } finally { lane.unlock(); }
         try {
-            var result=client.execute(pending.pending); lane.lock();
+            var result=resolution==null ? client.execute(pending.pending) : client.execute(pending.pending,resolution); lane.lock();
             try { requireOpen(); checkpoint(); pending.result=result; return result; } finally { lane.unlock(); }
         } finally { lane.lock(); try { pending.executing=false; active--; } finally { lane.unlock(); } }
     }

@@ -197,6 +197,12 @@ public final class RatisSessionClient {
 
     /** Failure leaves the immutable command in the window for explicit same-identity retry. */
     public CommandResult execute(Pending entry) throws IOException {
+        return execute(entry,routed::execute);
+    }
+    @FunctionalInterface interface Execution { CommandResult execute(RatisRoutedClient.PreparedCommand original)throws IOException; }
+    /** A session-owned resolver executes the same immutable command under its existing ownership. */
+    CommandResult execute(Pending entry,Execution execution) throws IOException {
+        Objects.requireNonNull(execution);
         synchronized (this) {
             requireOwner(entry);
             if (entry.awaitingAcceptance) throw new IllegalStateException("Transaction intent has not been accepted");
@@ -205,7 +211,8 @@ public final class RatisSessionClient {
             entry.executing=true;
         }
         try {
-            CommandResult result=routed.execute(entry.prepared);
+            CommandResult result=execution.execute(entry.prepared);
+            if(result==null)throw new IOException("Missing session outcome");
             try { validateResult(entry.command(),result); } catch (IllegalArgumentException malformed) { throw new IOException("Invalid session outcome",malformed); }
             synchronized (this) { entry.result=result; }
             return result;

@@ -228,7 +228,8 @@ class RatisAtomicClientTest {
     }
     static RatisOperationRerouteAdmissionRpc.Evidence operationEvidence(RatisAtomicClient.Operation operation)throws Exception {var field=operation.getClass().getDeclaredField("journal");field.setAccessible(true);return ((RatisDurableTransaction)field.get(operation)).promotionEvidence();}
     record ReservedInput(TransactionStatus reserved,RatisAtomicClient.Identity identity,RatisOperationRerouteAdmissionRpc.Evidence evidence) {}
-    ReservedInput reservedInput(Fixture f,RatisAtomicClient.Identity allocated)throws Exception {
+    ReservedInput reservedInput(Fixture f,RatisAtomicClient.Identity allocated)throws Exception {return reservedInput(f,allocated,-1);}
+    ReservedInput reservedInput(Fixture f,RatisAtomicClient.Identity allocated,long acknowledgedThrough)throws Exception {
         // Controlled source authority is supplied by the fixture callback; these canonical wire
         // fields exercise persisted proof plumbing, while native target captures and HOME are real.
         var owner=f.directory.ranges().getFirst().replicas().getFirst();var parent=new RangeDescriptor(new UUID(120,1),new UUID(120,2),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(owner));
@@ -236,12 +237,75 @@ class RatisAtomicClientTest {
         var left=new RangeDescriptor(new UUID(120,3),new UUID(120,4),1,0,null,new byte[]{(byte)128},RangeDescriptor.TopologyState.ACTIVE,List.of(owner));var right=new RangeDescriptor(new UUID(120,5),new UUID(120,6),1,0,new byte[]{(byte)128},null,RangeDescriptor.TopologyState.ACTIVE,List.of(owner));
         var frozenTarget=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.schemaDigest(),1,source.columns(),source.routingPrefixBytes(),List.of(left,right));var definition=new TopologyChange.Definition(new UUID(120,7),source,frozenTarget);
         var physical=RatisLogicalClient.plan(f.schema,changes(),absentIdentity(),RatisTransactionPlan.MAX_BYTES);
-        var original=new DistributedCommand(parent.groupId(),1,f.schema.digest(),allocated.business(),physical.mutations(),physical.predicates());
+        var original=new DistributedCommand(parent.groupId(),1,f.schema.digest(),allocated.business(),physical.mutations(),physical.predicates(),acknowledgedThrough);
         var freeze=new NativeTopologyFreeze(definition.header(),parent.groupId(),new ApplyPosition(1,1),NativeTopologyFreeze.boundsDigest(null,null),new byte[32]);var lineage=new DistributedCdcCheckpoint.Lineage(parent.rangeId(),parent.groupId(),1);
         var request=new RatisTopologyOperationOutcomeRpc.Request(source.clusterId(),source.databaseId(),source.domainId(),lineage,allocated.business(),original.receiptDigest());var absence=new RatisTopologyOperationOutcomeRpc.Reply(request,RatisTopologyOperationOutcomeRpc.Outcome.ABSENT,freeze.position(),freeze,1,0,new byte[]{1},null);
         var evidence=new RatisOperationRerouteAdmissionRpc.Evidence(original,source,f.directory,absence,List.of());
         var origin=new OperationRerouteOrigin(source.clusterId(),source.databaseId(),source.domainId(),lineage,allocated.business(),original.receiptDigest(),OperatorUpload.sha256(freeze.encode()),absence.cut(),f.directory.payloadDigest(),RatisOperationRerouteAdmissionRpc.normalizedDigest(original,f.directory),RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,f.directory),allocated.firstControl());
         var reserved=TransactionStatus.reserve(origin,f.schema.schemaEpoch(),f.schema.digest());return new ReservedInput(reserved,new RatisAtomicClient.Identity(reserved.transactionId(),allocated.business(),allocated.firstControl()),evidence);
+    }
+    @Test void inlineDriverOnSingleMutationWorkerReopensSameNativeCapturesWithoutNestedScheduling()throws Exception {
+        try(var f=new Fixture(root);var client=f.client()) {
+            var allocated=f.separateIdentity(10);var input=reservedInput(f,allocated);f.allowedReservation=input.reserved();var plan=RatisTransactionPlan.fromOriginal(f.directory,input.evidence().original());
+            assertEquals(CommandResult.Status.SUCCESS,f.homes.execute(f.homes.prepare(input.identity().firstControl(),null,input.reserved()),input.evidence()).status());
+            Path path=root.resolve("inline-lost.bin");var checks=new AtomicInteger();var first=new CompletableFuture<Void>();f.losePromotion=true;
+            f.scheduler.executor(WorkloadProfile.BATCH,OperationFamily.MUTATION,Long.MAX_VALUE).execute(()-> {
+                var worker=Thread.currentThread();
+                try(var operation=client.executeReservedPlanInline(path,input.identity(),input.reserved(),plan,input.evidence(),TTL,RequestContext.batch(),()->{assertSame(worker,Thread.currentThread());checks.incrementAndGet();})) {
+                    assertTrue(operation.completion().isDone());assertTrue(operation.completion().isCompletedExceptionally());assertEquals(1,client.stats().operations());assertTrue(client.stats().bytes()>0);assertThrows(IOException.class,()->client.reopen(path,RequestContext.batch()));
+                }catch(Throwable failure){first.completeExceptionally(failure);return;}first.complete(null);
+            },1<<20);
+            first.get(10,TimeUnit.SECONDS);assertEquals(0,f.captureCloses.get());
+            var second=new CompletableFuture<Void>();
+            f.scheduler.executor(WorkloadProfile.BATCH,OperationFamily.MUTATION,Long.MAX_VALUE).execute(()-> {
+                try(var operation=client.reopenInline(path,RequestContext.batch(),()->checks.incrementAndGet())) {
+                    assertTrue(operation.completion().isDone());var result=operation.resumeInline(RequestContext.batch(),()->checks.incrementAndGet());assertEquals(CommandResult.Status.SUCCESS,result.status());assertEquals(5,result.valueCount());assertArrayEquals(new byte[]{9},result.value(0));assertNull(result.value(1));assertNull(result.value(2));assertArrayEquals(new byte[]{7},result.value(3));assertArrayEquals(new byte[]{8},result.value(4));assertEquals(input.reserved().origin(),operation.snapshot().initial().origin());
+                }catch(Throwable failure){second.completeExceptionally(failure);return;}second.complete(null);
+            },1<<20);
+            second.get(10,TimeUnit.SECONDS);assertEquals(2,f.opens.get());assertEquals(2,f.captureCloses.get());assertTrue(checks.get()>0);assertEquals(0,client.stats().operations());
+        }
+    }
+    @Test void inlineCancellationKeepsExclusiveChargeUntilActualTaskFinishesAndOwnerCloses()throws Exception {
+        try(var f=new Fixture(root);var client=f.client()) {
+            var allocated=f.separateIdentity(10);var input=reservedInput(f,allocated);f.allowedReservation=input.reserved();var plan=RatisTransactionPlan.fromOriginal(f.directory,input.evidence().original());
+            assertEquals(CommandResult.Status.SUCCESS,f.homes.execute(f.homes.prepare(input.identity().firstControl(),null,input.reserved()),input.evidence()).status());
+            var finished=new CompletableFuture<Void>();Path path=root.resolve("inline-cancel.bin");
+            f.scheduler.executor(WorkloadProfile.BATCH,OperationFamily.MUTATION,Long.MAX_VALUE).execute(()-> {
+                try(var operation=client.executeReservedPlanInline(path,input.identity(),input.reserved(),plan,input.evidence(),TTL,RequestContext.batch(),()->{assertEquals(1,client.stats().operations());throw new IOException("Outer admitted task cancelled");})) {
+                    assertTrue(operation.completion().isDone());assertTrue(operation.completion().isCompletedExceptionally());assertEquals(1,client.stats().operations());assertEquals(0,f.opens.get());assertFalse(Files.exists(path));assertThrows(IOException.class,()->client.reopen(path,RequestContext.batch()));
+                }catch(Throwable failure){finished.completeExceptionally(failure);return;}finished.complete(null);
+            },1<<20);
+            finished.get(10,TimeUnit.SECONDS);assertEquals(0,client.stats().operations());assertEquals(0,client.stats().bytes());assertEquals(0,f.captureCloses.get());assertEquals(input.reserved(),f.homes.read(input.identity().transaction()));
+        }
+    }
+    @Test void participantAuthorizationKeepsSameAckAndRejectsChangedAckWithoutLosingOriginalHandle()throws Exception {
+        try(var f=new Fixture(root)) {
+            var allocation=f.separateIdentity(10);var identity=new RatisAtomicClient.Identity(new UUID(121,1),new OperationId(f.session,1,2),allocation.firstControl());var input=reservedInput(f,identity,0);var plan=RatisTransactionPlan.fromOriginal(f.directory,input.evidence().original());
+            var captures=new ArrayList<RatisRoutedClient.ScopedTransaction>();var accepted=new HashMap<UUID,DistributedCommand>();var prepare=new HashMap<UUID,OperationId>();var finalize=new HashMap<UUID,OperationId>();var ids=new HashMap<UUID,UUID>();int n=0;
+            try {
+                for(var part:plan.partitions()) {var capture=f.data.openTransaction(part.scope(),TTL);captures.add(capture);var staged=capture.stage(part.command().mutations(),part.command().predicates());accepted.put(part.route().groupId(),capture.participantIntent(part.command(),staged));ids.put(part.route().groupId(),capture.captureId());prepare.put(part.route().groupId(),new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),n));finalize.put(part.route().groupId(),new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),64+n++));}
+                var frozen=plan.accept(identity.transaction(),accepted,prepare,finalize,ids);assertEquals(CommandResult.Status.SUCCESS,f.homes.execute(f.homes.prepare(new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),128),null,frozen.initial())).status());
+                var capture=captures.getFirst();var original=accepted.get(capture.descriptor().groupId());var control=prepare.get(capture.descriptor().groupId());
+                var raw=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),original.operationId(),original.mutations(),original.predicates(),1);var changed=DistributedCommand.acceptedTransaction(raw,original.acceptance());assertThrows(IOException.class,()->capture.authorizeParticipant(changed,control,identity.transaction()),"HOME bound the original ACK before authorization");
+                var first=capture.authorizeParticipant(original,control,identity.transaction());assertEquals(0,first.preparation().business().acknowledgedThrough());assertArrayEquals(first.bytes(),capture.authorizeParticipant(original,control,identity.transaction()).bytes());
+                assertThrows(IOException.class,()->capture.authorizeParticipant(changed,control,identity.transaction()));assertArrayEquals(first.bytes(),capture.authorizeParticipant(original,control,identity.transaction()).bytes());
+                for(var group:f.groups)assertNull(f.stores.get(group).preparedParticipant(identity.transaction()),"Authorizing the retained image does not append PREPARE or USER effects");assertNull(f.get(71,key(2)));
+            }finally{for(var capture:captures)capture.close();}
+        }
+    }
+    @Test void originalPiggybackAckMakesBeyondWindowBusinessEligibleOnBothNativeChildren()throws Exception {
+        try(var f=new Fixture(root);var client=f.client()) {
+            var controls=f.separateIdentity(10);var allocated=new RatisAtomicClient.Identity(controls.transaction(),new OperationId(f.session,1,1040),controls.firstControl());var input=reservedInput(f,allocated,16);f.allowedReservation=input.reserved();var plan=RatisTransactionPlan.fromOriginal(f.directory,input.evidence().original());
+            for(var part:plan.partitions()){assertEquals(16,part.command().acknowledgedThrough());assertEquals(allocated.business(),part.command().operationId());}
+            assertEquals(CommandResult.Status.SUCCESS,f.homes.execute(f.homes.prepare(input.identity().firstControl(),null,input.reserved()),input.evidence()).status());
+            try(var operation=client.executeReservedPlan(root.resolve("acked-children.bin"),input.identity(),input.reserved(),plan,input.evidence(),TTL,RequestContext.batch())) {
+                f.complete(operation,CommandResult.Status.SUCCESS);assertEquals(5,operation.completion().get(5,TimeUnit.SECONDS).valueCount());for(var participant:operation.snapshot().participants()){assertTrue(participant.vote().prepared());assertEquals(16,participant.intent().acceptedBusiness().acknowledgedThrough());assertEquals(allocated.business(),participant.intent().acceptedBusiness().operationId());}assertArrayEquals(new byte[]{1},f.get(71,key(2)));assertArrayEquals(new byte[]{8},f.get(74,member(200,"second")));
+                var column=f.schema.column(71).columnId();var physical=f.schema.encodeLogicalKey(column,key(3)).physicalKey();var follow=new OperationId(f.session,1,1041);
+                // Child 2PC uses the ACK for eligibility; original-parent publication owns receipt GC.
+                var rejected=assertThrows(IOException.class,()->f.data.execute(f.data.prepare(follow,List.of(new Mutation(Mutation.Kind.PUT,column,physical,new byte[]{99})))));
+                assertEquals("Session admission rejected: CONFLICT",rejected.getCause().getMessage());assertNull(f.get(71,key(3)));
+            }
+        }
     }
     @Test void reservedPlanVerifiesBeforeCapturePromotesAndReopensLostOriginalPromotion() throws Exception {
         try(var f=new Fixture(root)) {

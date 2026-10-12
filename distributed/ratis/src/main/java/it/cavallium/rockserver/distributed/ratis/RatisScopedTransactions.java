@@ -213,10 +213,12 @@ final class RatisScopedTransactions implements AutoCloseable {
         try {
             if (entry.plan!=null) throw new IllegalArgumentException("Ordinary plan already owns this handle");
             var audit=accepted.acceptance();
-            if (audit==null || accepted.acknowledgedThrough()!=-1 || !audit.snapshot().equals(handle.position()) || audit.leaderGeneration()!=handle.generation() || !audit.ownerIncarnation().equals(handle.owner()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(audit.scope()),ScopedTransactionRpc.scopeBytes(entry.scope))) throw new IllegalArgumentException("Participant accepted cut differs from original handle");
+            // In 2PC the original ACK is an eligibility header, not a child receipt-deletion
+            // request. Native PREPARE accounts the frozen family; COMMIT leaves child floors alone.
+            if (audit==null || !audit.snapshot().equals(handle.position()) || audit.leaderGeneration()!=handle.generation() || !audit.ownerIncarnation().equals(handle.owner()) || !Arrays.equals(ScopedTransactionRpc.scopeBytes(audit.scope()),ScopedTransactionRpc.scopeBytes(entry.scope))) throw new IllegalArgumentException("Participant accepted cut differs from original handle");
             if (entry.participant!=null) {
                 var original=entry.participant.preparation();
-                if (!original.transactionId().equals(transaction) || !original.operation().equals(control) || !Arrays.equals(original.business().payloadDigest(),accepted.payloadDigest())) throw new IllegalArgumentException("Participant authorization retry changed original image");
+                if (!original.transactionId().equals(transaction) || !original.operation().equals(control) || !Arrays.equals(DistributedCommandCodec.encode(original.business()),DistributedCommandCodec.encode(accepted))) throw new IllegalArgumentException("Participant authorization retry changed original image");
                 try (var current=machine.reattachParticipant(transaction,control,accepted)) { checked(entry); return current.bytes(); }
             }
             if (accepted.readCertification()) {

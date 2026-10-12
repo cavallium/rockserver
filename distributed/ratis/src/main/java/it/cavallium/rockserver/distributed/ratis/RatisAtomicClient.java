@@ -79,8 +79,16 @@ public final class RatisAtomicClient implements AutoCloseable {
             out.flush();return java.security.MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
         }catch(java.io.IOException|java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
     }
+    @FunctionalInterface interface InlineCheck { void check()throws IOException; }
     /** Verify an exact existing HOME reservation before opening any frozen target captures. */
     public Operation executeReservedPlan(Path journal,Identity identity,TransactionStatus reservation,RatisTransactionPlan plan,RatisOperationRerouteAdmissionRpc.Evidence evidence,Duration ttl,RequestContext context)throws IOException {
+        long deadline=scheduler.resolveMonotonicDeadline(context);var operation=reservedOperation(journal,identity,reservation,plan,evidence,ttl,context);operation.beginExecution(context,deadline);return operation;
+    }
+    /** Caller already owns admitted MUTATION work; this performs the same driver without another queue. */
+    Operation executeReservedPlanInline(Path journal,Identity identity,TransactionStatus reservation,RatisTransactionPlan plan,RatisOperationRerouteAdmissionRpc.Evidence evidence,Duration ttl,RequestContext context,InlineCheck check)throws IOException {
+        Objects.requireNonNull(check);var operation=reservedOperation(journal,identity,reservation,plan,evidence,ttl,context);operation.beginInline(context,check);return operation;
+    }
+    private Operation reservedOperation(Path journal,Identity identity,TransactionStatus reservation,RatisTransactionPlan plan,RatisOperationRerouteAdmissionRpc.Evidence evidence,Duration ttl,RequestContext context)throws IOException {
         Objects.requireNonNull(reservation);Objects.requireNonNull(identity);Objects.requireNonNull(plan);Objects.requireNonNull(context);
         if(context.profile()==WorkloadProfile.CONTROL)throw new IOException("Reserved input preparation requires a data workload profile");
         byte[] retained=RatisDurableTransaction.validateReservationEvidence(reservation,evidence);
@@ -89,10 +97,9 @@ public final class RatisAtomicClient implements AutoCloseable {
                 || !reservation.clusterId().equals(schema.clusterId()) || !reservation.databaseId().equals(schema.databaseId()) || !reservation.domainId().equals(schema.domainId())
                 || reservation.schemaEpoch()!=schema.schemaEpoch() || !Arrays.equals(reservation.schemaDigest(),schema.digest()) || !Arrays.equals(origin.targetDirectoryDigest(),directory.payloadDigest())
                 || !Arrays.equals(origin.planDigest(),rawPlanDigest(plan)) || origin.targetParticipantCount()!=plan.partitions().size())throw new IllegalArgumentException("Reserved atomic origin differs from frozen target plan/identities");
-        long deadline=scheduler.resolveMonotonicDeadline(context);
         if(!identity.business().equals(plan.operation()) || !Arrays.equals(directory.payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis())))throw new IllegalArgumentException("Reserved atomic plan/TTL changed");
         long bytes=estimate(plan)+3L*retained.length;if(bytes>RatisDurableTransaction.MAX_BYTES)throw new IOException("Reserved evidence future persistence exceeds journal budget");
-        var operation=admit(journal,identity,plan,ttl,bytes);operation.reservation=reservation;operation.reservationEvidence=RatisOperationRerouteAdmissionRpc.Evidence.decode(retained);operation.beginExecution(context,deadline);return operation;
+        var operation=admit(journal,identity,plan,ttl,bytes);operation.reservation=reservation;operation.reservationEvidence=RatisOperationRerouteAdmissionRpc.Evidence.decode(retained);return operation;
     }
     /** Submit a fully frozen captured projection without staging again or opening replacement cuts. */
     public Operation executeAccepted(Path path,Identity identity,RatisTransactionPlan.Accepted accepted,RequestContext context) throws IOException {
@@ -128,6 +135,11 @@ public final class RatisAtomicClient implements AutoCloseable {
     public Operation reopen(Path journal,RequestContext context) throws IOException {
         long deadline=scheduler.resolveMonotonicDeadline(context);
         var operation=admit(journal,null,null,null,RatisDurableTransaction.MAX_BYTES); operation.beginExecution(context,deadline); return operation;
+    }
+    /** Reopen on the caller's already admitted MUTATION worker, preserving the original journal. */
+    Operation reopenInline(Path journal,RequestContext context,InlineCheck check)throws IOException {
+        Objects.requireNonNull(check);if(context.profile()==WorkloadProfile.CONTROL)throw new IOException("Atomic recovery requires a data workload profile");
+        var operation=admit(journal,null,null,null,RatisDurableTransaction.MAX_BYTES);operation.beginInline(context,check);return operation;
     }
     public synchronized Operation operation(Path journal) { return operations.get(journal.toAbsolutePath().normalize()); }
     public synchronized Stats stats() { return new Stats(operations.size(),chargedBytes); }
@@ -188,6 +200,20 @@ public final class RatisAtomicClient implements AutoCloseable {
         public boolean rejectedBeforeRegistration() { return rejected!=null; }
         public synchronized CompletableFuture<CommandResult> completion() { return execution==null ? CompletableFuture.failedFuture(new IOException("Atomic execution not admitted")) : execution.view(); }
         public CompletableFuture<CommandResult> resume(RequestContext context) { return execute(context,scheduler.resolveMonotonicDeadline(context)); }
+        CommandResult resumeInline(RequestContext context,InlineCheck check)throws IOException {
+            var task=beginInline(context,check);
+            try{return task.result.getNow(null);}catch(CompletionException failure){if(failure.getCause() instanceof IOException io)throw io;throw new IOException("Inline atomic execution failed",failure.getCause());}
+        }
+        private Task<CommandResult> beginInline(RequestContext context,InlineCheck check)throws IOException {
+            Objects.requireNonNull(check);if(context.profile()==WorkloadProfile.CONTROL)throw new IOException("Inline atomic work requires a data workload profile");
+            final Task<CommandResult> task;
+            synchronized(this) {
+                requireOpen();if(closed || closeRequested || closingOperation)throw new IOException("Atomic operation closing/closed");
+                if(active!=null)throw new IOException("Atomic operation already active");
+                task=new Task<>(this,Kind.EXECUTE,scheduler.resolveMonotonicDeadline(context),this::drive);task.inlineCheck=check;execution=task;active=task;
+            }
+            task.run();return task;
+        }
         private synchronized void beginExecution(RequestContext context,long deadline) {
             if (active!=null) return;
             var task=new Task<CommandResult>(this,Kind.EXECUTE,deadline,this::drive); execution=task; submit(task,context);
@@ -343,13 +369,14 @@ public final class RatisAtomicClient implements AutoCloseable {
     private final class Task<T> implements Runnable,RWScheduler.RejectionAwareTask {
         final Operation operation; final Kind kind; final long deadline; final Work<T> work;
         final CompletableFuture<T> result=new CompletableFuture<>(); final AtomicInteger phase=new AtomicInteger();
-        int views; volatile Throwable rejection;
+        int views; volatile Throwable rejection; InlineCheck inlineCheck;
         Task(Operation operation,Kind kind,long deadline,Work<T> work) { this.operation=operation; this.kind=kind; this.deadline=deadline; this.work=work; }
         synchronized CompletableFuture<T> view() {
             if (!result.isDone() && views>=MAX_WAITERS) return CompletableFuture.failedFuture(new RejectedExecutionException("Atomic waiter capacity exhausted"));
             if (!result.isDone()) views++; return result.copy();
         }
         void check() throws IOException {
+            if(inlineCheck!=null)inlineCheck.check();
             if (rejection!=null) throw new IOException("Atomic task rejected; journal retained",rejection);
             if (deadline!=Long.MAX_VALUE && scheduler.isMonotonicDeadlineExpired(deadline)) throw new IOException("Atomic deadline expired; journal retained",new TimeoutException());
         }
