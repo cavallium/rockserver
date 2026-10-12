@@ -59,7 +59,7 @@ def main():
     manifest = {"scope": "Local production JNI/Java bridge component qualification; no service, DDR4, dual-NUMA, or live acceptance",
                 "source_sha256": sha256(source), "runner_sha256": sha256(Path(__file__)), "support_sha256": sha256(Path(__file__).parent / "experiment_support.py"),
                 "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-                "cache_geometry": "HyperClockCache DATA28MiB METADATA4MiB, baseline/candidate matched",
+                "cache_geometry": "AutoHyperClockCache DATA28MiB METADATA4MiB, estimatedEntryCharge0/shards-1 baseline/candidate matched",
                 "feedback": "Real StartupIoPolicy and StartupReadCompletions, 1second coherent native-call cohorts, 3tracked foreground tasks including writes; 100ms sampled admission-overlap classification",
                 "service_acceptance": "Requires separate paired EmbeddedDB service gate",
                 "sampling_scope": "Production DATA 64/METADATA 16 defaults; explicit sample-every 1 is capture stress only",
@@ -72,6 +72,9 @@ def main():
                 "acceptance_predefined": {"zero_mismatches_crashes_timeouts": True, "all_writes_survive_fresh_jvm": True,
                                           "admission_peak_active_max": 4, "material_gain_ratio": 1.10,
                                           "protected_p99_max_ratio": 1.20, "minimum_pairs": 3,
+                                          "cache_mechanism_gate": "Every candidate pair requires real secondary hits, periodic publication in both roles during foreground, and durable final capture; final manual override cannot qualify periodic behavior",
+                                          "admission_mechanism_gate": "Every candidate pair requires foreground overlap and completed FindTable calls",
+                                          "resident_hotset_gate": "Hot point-read p99 protected at same1.20ratio; every returned value verified despite concurrent read-driven cache turnover",
                                           "note": "Thresholds classify this component workload only; spread crossing thresholds is inconclusive. Histograms report eight buckets per power of two, upper bounds."},
                 "retained_fixture_roots": []}
     write_json(out / "manifest.json", manifest)
@@ -138,7 +141,7 @@ def main():
         for mode in MODES[1:]:
             baseline, candidate = by_mode["none"], by_mode[mode]
             gains = [a["foreground_elapsed_ns"] / b["foreground_elapsed_ns"] for a, b in zip(baseline, candidate)]
-            tails = [max(b[k]["p99_upper_ns"] / max(1, a[k]["p99_upper_ns"]) for k in ("point", "multi_get", "writes")) for a, b in zip(baseline, candidate)]
+            tails = [max(b[k]["p99_upper_ns"] / max(1, a[k]["p99_upper_ns"]) for k in ("point", "hot_point", "multi_get", "writes")) for a, b in zip(baseline, candidate)]
             performance = "PASS" if args.pairs >= 3 and min(gains) >= 1.10 and max(tails) <= 1.20 else "INCONCLUSIVE_OR_REGRESSION"
             mechanisms = []
             for report in candidate:
@@ -150,7 +153,18 @@ def main():
                                    "opening_overlap_operations": report["opening_overlap"]["operations"],
                                    "completed_find_table_calls_including_hits": opening.get("completed_find_table"),
                                    "actual_physical_opened_ssts": "not exposed by API"})
-            comparisons.append({"disk": disk_index, "mode": mode, "mechanism_evidence": mechanisms, "paired_throughput_ratios": gains,
+            mechanism_exercised = all(
+                (mode not in ("cache", "both") or
+                 (report.get("actual_secondary_hits", 0) > 0 and report.get("durable_final_capture")
+                  and all(report.get("periodic_published_snapshots_during_foreground", {}).get(role, 0) > 0
+                          for role in ("data", "metadata"))))
+                and (mode not in ("admission", "both") or
+                     (report["opening_overlap"]["operations"] > 0 and
+                      report.get("admission_before_close", {}).get("completed_find_table", 0) > 0))
+                for report in candidate)
+            if not mechanism_exercised:
+                performance = "INCONCLUSIVE_MECHANISM_NOT_EXERCISED"
+            comparisons.append({"disk": disk_index, "mechanism_exercised": mechanism_exercised, "mode": mode, "mechanism_evidence": mechanisms, "paired_throughput_ratios": gains,
                                 "median_throughput_ratio": statistics.median(gains), "protected_p99_ratios": tails,
                                 "performance_acceptance": performance})
     write_json(out / "result.json", {"correctness_status": "PASS", "performance_comparisons": comparisons,

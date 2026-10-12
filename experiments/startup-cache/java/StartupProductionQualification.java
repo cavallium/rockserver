@@ -97,7 +97,7 @@ public final class StartupProductionQualification {
     }
     static SnapshotCache snapshotCache(Path path, boolean seed, boolean metadata, int sampling) {
         return new SnapshotCache(new NativeStartupBridge.CacheConfig(1, -1, (metadata ? 4 : 28) * MIB,
-                metadata ? 1024 : 4096, (metadata ? 12 : 36) * MIB, (metadata ? 4 : 12) * MIB,
+                0, (metadata ? 12 : 36) * MIB, (metadata ? 4 : 12) * MIB,
                 metadata ? 2048 : 8192, (metadata ? 2 : 4) * MIB, 256 * 1024,
                 64 * MIB, 2 * MIB, 5000, seed ? 0 : 500, 8 * MIB, 8 * MIB,
                 sampling, 2, .5, path, metadata ? "metadata" : "data"));
@@ -128,18 +128,19 @@ public final class StartupProductionQualification {
         var output = new LinkedHashMap<String, Object>();
         output.put("mode", mode); output.put("direct_reads", direct); output.put("fixture_keys", keys);
         output.put("primary_cache_capacity_bytes", CAPACITY);
-        output.put("cache_geometry", "HyperClockCache data28MiB/metadata4MiB; matched baseline/candidate");
+        output.put("cache_geometry", "AutoHyperClockCache data28MiB/metadata4MiB, estimatedEntryCharge0/shards-1; matched baseline/candidate");
         output.put("data_sample_every", dataSampling); output.put("metadata_sample_every", metadataSampling);
         output.put("feedback_policy_window_ns", 1_000_000_000L);
         output.put("snapshot_budget_bytes", 16 * MIB); output.put("disk_budget_bytes", 48 * MIB);
+        var hotPoint = new Histogram(); var coldPoint = new Histogram();
         var point = new Histogram(); var multi = new Histogram(); var writes = new Histogram();
         var overlap = new Histogram(); var steady = new Histogram();
         var samples = Collections.synchronizedList(new ArrayList<Map<String, Object>>());
         var running = new AtomicBoolean(true);
         SnapshotCache snapshot = cacheEnabled ? snapshotCache(cachePath, seed, false, dataSampling) : null;
         SnapshotCache metadataSnapshot = cacheEnabled ? snapshotCache(cachePath, seed, true, metadataSampling) : null;
-        try (Cache cache = snapshot != null ? snapshot : new HyperClockCache(28 * MIB, 4096, -1, false);
-             Cache metadataCache = metadataSnapshot != null ? metadataSnapshot : new HyperClockCache(4 * MIB, 1024, -1, false);
+        try (Cache cache = snapshot != null ? snapshot : new HyperClockCache(28 * MIB, 0, -1, false);
+             Cache metadataCache = metadataSnapshot != null ? metadataSnapshot : new HyperClockCache(4 * MIB, 0, -1, false);
              Options options = new Options().setCreateIfMissing(seed).setErrorIfExists(seed)
                      .setCompressionType(CompressionType.NO_COMPRESSION).setDisableAutoCompactions(true)
                      .setWriteBufferSize(8 * MIB).setMaxOpenFiles(-1).setMaxFileOpeningThreads(4)
@@ -250,7 +251,7 @@ public final class StartupProductionQualification {
                                                 long before = System.nanoTime(), ns; boolean failed = true;
                                                 try { actual = db.get(read, nativeKey); failed = false; }
                                                 finally { ns = System.nanoTime() - before; completions.recordPoint(ns, failed); }
-                                                point.record(ns); (opening ? overlap : steady).record(ns);
+                                                point.record(ns); (op % 2 == 0 ? hotPoint : coldPoint).record(ns); (opening ? overlap : steady).record(ns);
                                                 verify(actual, id);
                                             }
                                         }
@@ -284,7 +285,7 @@ public final class StartupProductionQualification {
                                 monitor.get();
                             }
                             output.put("foreground_elapsed_ns", foregroundEnded - started);
-                            output.put("point", point.report()); output.put("multi_get", multi.report()); output.put("writes", writes.report());
+                            output.put("point", point.report()); output.put("hot_point", hotPoint.report()); output.put("cold_point", coldPoint.report()); output.put("multi_get", multi.report()); output.put("writes", writes.report());
                             output.put("opening_overlap", overlap.report()); output.put("steady_or_unclassified", steady.report());
                             output.put("overlap_classification", budget == null ? "unclassified: admission disabled" : "approximate: latest100ms admission sample");
                             var finalForeground = foreground.sample(1 + (System.nanoTime() - started) / 1_000_000_000L,
