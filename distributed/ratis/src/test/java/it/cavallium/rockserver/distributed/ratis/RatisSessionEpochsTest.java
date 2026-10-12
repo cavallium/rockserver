@@ -128,9 +128,8 @@ class RatisSessionEpochsTest {
             var foreign=SessionEpochLedger.initial(UUID.randomUUID(),database,10);
             assertThrows(IllegalArgumentException.class,() -> f.epochs.prepare(operation(0),null,foreign));
             assertThrows(IllegalArgumentException.class,() -> f.epochs.prepare(operation(0),null,initial.issue(a,100)));
-            var dir=directory(cluster); var key=bytes(dir.domainId());
-            var dirCommand=new DistributedCommand(catalogue,1,new byte[32],operation(1),
-                    List.of(new Mutation(Mutation.Kind.PUT,directoryColumn,key,RangeDirectoryCodec.encode(dir))),List.of(new KeyPredicate(directoryColumn,key,null),new KeyPredicate(directoryColumn,RatisSchemaAdministration.headKey(dir.domainId()),null)));
+            var dir=directory(cluster);
+            var dirCommand=f.epochs.catalogue(directoryColumn).prepare(operation(1),null,dir);
             assertDoesNotThrow(() -> f.validate.accept(dirCommand));
         }
     }
@@ -222,9 +221,9 @@ class RatisSessionEpochsTest {
                     UUID column=ScopedTransactionRpc.uuid(input); byte[] key=ScopedTransactionRpc.blob(input,2*1024*1024,false); assertFalse(input.hasRemaining());
                     assertTrue(column.equals(sessions) || column.equals(directoryColumn));
                     if (column.equals(sessions)) assertArrayEquals(bytes(database),key);
-                    if (key.length==33) { assertEquals(directoryColumn,column); assertEquals(0x53,key[0]); if (schemaUnavailable) throw new IOException("schema unavailable"); }
+                    if (key.length==33) { assertEquals(directoryColumn,column); if (key[0]==0x53 && schemaUnavailable) throw new IOException("schema unavailable"); }
                     try (var pin=store.capture()) {
-                        byte[] value=key.length==33 && missingSchema ? null : pin.get(column,key);
+                        byte[] value=key.length==33 && key[0]==0x53 && missingSchema ? null : pin.get(column,key);
                         reply=value==null ? ByteBuffer.allocate(4).putInt(-1).array() : ByteBuffer.allocate(4+value.length).putInt(value.length).put(value).array();
                     }
                     if (readOverride!=null) reply=readOverride;
