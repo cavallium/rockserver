@@ -622,6 +622,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     // Queue-time schema authority invalidation; ordinary DATA generation changes only on native apply.
     private long schemaConfigurationStamp; // guarded by admissions
     private volatile boolean schemaConfigurationPending;
+    private volatile boolean currentDataVoter=true;
+    private void updateDataVoter(byte[] configuration)throws IOException{if(role!=RatisNodePlan.Role.DATA || topologyLocalReplica==null)return;var cfg=RaftConfigurationProto.parseFrom(configuration);String peer=topologyLocalReplica.peerId();currentDataVoter=java.util.stream.Stream.concat(cfg.getPeersList().stream(),cfg.getOldPeersList().stream()).anyMatch(p->p.getId().toStringUtf8().equals(peer));}
+    private void requireUserReplica()throws IOException{if(role==RatisNodePlan.Role.DATA && !currentDataVoter)throw new IOException("Local replica is no longer a current voting USER owner");}
     private static final class SchemaHold {
         final Object record;
         ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
@@ -695,6 +698,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     static void requireActualMembership(org.apache.ratis.server.RaftConfiguration actual,RangeDescriptor expected)throws IOException{
         for(var role:List.of(RaftPeerRole.FOLLOWER,RaftPeerRole.LISTENER)){if(!actual.getPreviousPeers(role).isEmpty())throw new IOException("Relocation requires stable actual configuration");var peers=new java.util.TreeMap<String,String>();for(var peer:actual.getCurrentPeers(role))peers.put(peer.getId().toString(),peer.getAddress());var wanted=new java.util.TreeMap<String,String>();for(var replica:expected.replicas())if((replica.role()==ReplicaDescriptor.Role.LISTENER)==(role==RaftPeerRole.LISTENER))wanted.put(replica.peerId(),replica.address());if(!peers.equals(wanted))throw new IOException("Relocation actual membership differs");}
     }
+    static void requireActualRelocationMembership(org.apache.ratis.server.RaftConfiguration actual,RatisTopologyRelocationRecord record,boolean joint)throws IOException{
+        var cfg=RaftConfigurationProto.newBuilder();actual.getCurrentPeers(RaftPeerRole.FOLLOWER).forEach(p->cfg.addPeers(p.getRaftPeerProto()));actual.getCurrentPeers(RaftPeerRole.LISTENER).forEach(p->cfg.addListeners(p.getRaftPeerProto()));actual.getPreviousPeers(RaftPeerRole.FOLLOWER).forEach(p->cfg.addOldPeers(p.getRaftPeerProto()));actual.getPreviousPeers(RaftPeerRole.LISTENER).forEach(p->cfg.addOldListeners(p.getRaftPeerProto()));if(record.requireNativeConfiguration(cfg.build().toByteArray())!=joint)throw new IOException("Actual relocation joint phase differs from native commitment");
+    }
     interface RelocationObserver {void persist(RatisTopologyRelocationRecord record,ApplyPosition position)throws IOException;boolean saved(RatisTopologyRelocationRecord record)throws IOException;}
     private RelocationObserver relocationObserver;
     void relocationObserver(RelocationObserver observer){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || relocationObserver!=null)throw new IllegalStateException("Relocation journal owner fixed before initialization");relocationObserver=java.util.Objects.requireNonNull(observer);}
@@ -714,7 +720,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private byte[] applyRelocation(ApplyPosition position,RatisTopologyRelocationRecord record)throws Exception{
         if(relocationObserver==null)throw new IOException("Committed relocation lacks durable node owner");relocationObserver.persist(record,position);byte[] result;
         if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && store.topologyLearnerRegistration()!=null)result=store.applyTopologyRelocationCompletion(position,record.definition(),record.targetConfiguration(),record.catalogue(),record.catalogueCut()).encode();else{store.applyNoop(position,null);result=new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode();}
-        if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE){var directory=record.definition().targetDirectory();var descriptor=record.definition().targets().getFirst();schemaDescriptor=descriptor;topologyDescriptor=descriptor;refreshSessionAdmission(directory);if(store.admissionOpen()){if(enableSessionControls)store.enableSessionControls();store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());}}
+        if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE){var directory=record.definition().targetDirectory();var descriptor=record.definition().targets().getFirst();if((effectiveSessionDirectory==null || directory.generation()>=effectiveSessionDirectory.generation()) && (topologyDescriptor==null || descriptor.configurationVersion()>=topologyDescriptor.configurationVersion())){schemaDescriptor=descriptor;topologyDescriptor=descriptor;refreshSessionAdmission(directory);if(store.admissionOpen()){if(enableSessionControls)store.enableSessionControls();store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());}}}
         synchronized(admissions){if(relocationHold!=null && relocationHold.record.equals(record))releaseRelocation(relocationHold);}return result;
     }
     Path sourceSnapshotDirectory(){return snapshots.getSnapshotFile(0,0).toPath().getParent();}
@@ -748,7 +754,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         schemaActivationObserver=java.util.Objects.requireNonNull(observer);
     }
     Throwable schemaActivationObserverFailure() { return schemaActivationObserverFailure; }
+    private volatile RangeDirectory effectiveSessionDirectory;
     private void refreshSessionAdmission(RangeDirectory directory) {
+        if(effectiveSessionDirectory!=null && directory.generation()<effectiveSessionDirectory.generation())return;effectiveSessionDirectory=directory;
         if (sessionEpochs==null) return;
         UUID group=store.ownership().owner().groupId();
         var floor=sessionEpochs.floorAdmission(directory,group); var control=sessionEpochs.sessionControlAdmission(directory,group);
@@ -1275,7 +1283,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     long transactionTerm() { var a=store.applied(); return a==null ? -1 : a.term(); }
     UUID transactionOwnerIncarnation() { return transactionIncarnation; }
     void checkTransactionOwner() throws IOException {
-        requireDataRole(); requireHealthy(); var current=leadership(); var a=store.applied();
+        requireDataRole(); requireHealthy(); requireUserReplica();var current=leadership(); var a=store.applied();
         if (!current.ready() || a==null || a.term()!=current.term() || !store.admissionOpen()) throw new IOException("Transaction leader changed or is not ready");
     }
     private ProofQueryExecutor sourceOutcomeQueries;
@@ -1766,7 +1774,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var cfg = store.configuration();
         var a = store.applied();
         if (a != null && (cfg.index() > a.index() || cfg.term() > a.term())) throw new IOException("Native configuration exceeds completed marker");
-        validateConfiguration(cfg.data());
+        validateConfiguration(cfg.data());updateDataVoter(cfg.data());
         if (schemaHold!=null) schemaRecovered(schemaHold.record);
         if(topologyHold!=null)topologyRecovered(topologyHold.record);
         if(topologyActivationHold!=null)topologyActivationRecovered(topologyActivationHold.record);
@@ -1813,7 +1821,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (cfg == null || cfg.index() > manifest.position().index() || cfg.term() > manifest.position().term()) {
             throw new IOException("Snapshot lacks configuration at its cut");
         }
-        validateConfiguration(cfg.data());
+        validateConfiguration(cfg.data());updateDataVoter(cfg.data());
         boolean currentSchema=manifest.interval().equals(store.ownership().interval())
                 && Arrays.equals(manifest.schemaDigest(),store.schemaDigest())
                 && manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns());
@@ -1866,7 +1874,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     private byte[] readablePoint(UUID column,byte[] key) throws Exception {
-        synchronized (gate) { requireHealthy(); return store.readCurrentPoint(column,key); }
+        synchronized (gate) { requireHealthy();requireUserReplica(); return store.readCurrentPoint(column,key); }
     }
 
     @Override public void pause() {
@@ -2217,6 +2225,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 synchronized (admissions) {
                     var estimate=originalEstimate;
                     requireHealthy();
+                    if(role==RatisNodePlan.Role.DATA && estimate.newReceipt() && (!command.mutations().isEmpty() || !command.predicates().isEmpty() || command.acceptance()!=null || command.sessionControl()!=null && command.sessionControl().binding()))requireUserReplica();
                     if (generation != admissionGeneration.get()) throw new IllegalStateException("Admission leadership generation changed");
                     if (!store.admissionOpen() && metadataOwner==null) throw new IllegalStateException("Native range admission is closed");
                     if(metadataOwner!=null && (getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || metadataOwner.stamp()!=schemaConfigurationStamp || metadataOwner.generation()!=generation || metadataOwner.term()!=leadership.term())) throw new IOException("Topology metadata control lost configuration/owner");
@@ -3976,6 +3985,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (previous==null) {
                     schemaConfigurationStamp++; schemaConfigurationPending=true;
+                    try{updateDataVoter(bytes);}catch(IOException invalid){throw new IllegalStateException("Invalid local voting configuration",invalid);}
                     if(relocationHold!=null){relocationHold.invalidated=true;if(!relocationHold.submitted)releaseRelocation(relocationHold);}
                     for(var hold:List.copyOf(sourceHolds.values())){hold.invalidated=true;if(!hold.submitted)releaseSourceHold(hold);}
         if(topologyActivationHold!=null){topologyActivationHold.invalidated=true;if(!topologyActivationHold.submitted)releaseTopologyActivation(topologyActivationHold);}
@@ -4478,6 +4488,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             case ScopedTransactionRpc.STATE -> {
                 end(input);
                 if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending())reply=store.retiredOutcomeState().encode();
+                else if(role==RatisNodePlan.Role.DATA && !currentDataVoter)reply=store.metadataOutcomeState().encode();
                 else try(var pin=snapshotPin()){reply=pin.stateView().encode();}
             }
             case ScopedTransactionRpc.OPEN -> {

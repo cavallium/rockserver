@@ -745,10 +745,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public Throwable transactionExpiryFailure() { return transactionExpiry==null ? null : transactionExpiry.lastFailure(); }
     private void verify(RaftGroup group) throws IOException {
         var division=server.getDivision(group.getGroupId()); var configuration=division.getRaftConf();var registration=groups.require(group.getGroupId().getUuid());
-        if(registration.relocation()!=null){var record=registration.relocation();try{RatisRangeStateMachine.requireActualMembership(configuration,record.definition().targets().getFirst());group=groups.group(record.definition().targets().getFirst());}catch(IOException notTarget){RatisRangeStateMachine.requireActualMembership(configuration,record.definition().parents().getFirst());group=groups.group(record.definition().parents().getFirst());}}
-
-        for (var role:List.of(RaftPeerRole.FOLLOWER,RaftPeerRole.LISTENER)) {
-            if (!configuration.getPreviousPeers(role).isEmpty()) throw new IOException("Joint membership requires topology reconciliation");
+        boolean joint=false;
+        if(registration.relocation()!=null){ReplicatedRangeStore.Configuration cfg;try{cfg=stores.get(group.getGroupId().getUuid()).configuration();}catch(org.rocksdb.RocksDBException failure){throw new IOException("Relocation native configuration unavailable",failure);}if(cfg==null)throw new IOException("Relocation has no native configuration");joint=registration.relocation().requireNativeConfiguration(cfg.data());RatisRangeStateMachine.requireActualRelocationMembership(configuration,registration.relocation(),joint);if(!joint)group=groups.group(RatisTopologyRelocationRecord.sameConfiguration(cfg.data(),registration.relocation().targetConfiguration())?registration.relocation().definition().targets().getFirst():registration.relocation().definition().parents().getFirst());}
+        if(!joint)for (var role:List.of(RaftPeerRole.FOLLOWER,RaftPeerRole.LISTENER)) {
+            if (!configuration.getPreviousPeers(role).isEmpty()) throw new IOException("Joint membership lacks a forced relocation intent");
             var expected=new TreeMap<String,String>(); var actual=new TreeMap<String,String>();
             for (var peer:group.getPeers()) if (peer.getStartupRole()==role) expected.put(peer.getId().toString(),peer.getAddress()+"|"+Objects.toString(peer.getDataStreamAddress(),""));
             for (var peer:configuration.getCurrentPeers(role)) actual.put(peer.getId().toString(),peer.getAddress()+"|"+Objects.toString(peer.getDataStreamAddress(),""));
