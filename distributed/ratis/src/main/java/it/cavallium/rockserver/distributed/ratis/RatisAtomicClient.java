@@ -18,12 +18,13 @@ public final class RatisAtomicClient implements AutoCloseable {
         public Limits { if (operations<1 || operations>MAX_OPERATIONS || bytes<1 || bytes>MAX_BYTES) throw new IllegalArgumentException("Invalid atomic client limits"); }
         public static Limits defaults() { return new Limits(MAX_OPERATIONS,128L*1024*1024); }
     }
-    /** The caller exclusively reserves this control block in the same issued/bound grant as business. */
+    /** The caller exclusively reserves 256 controls in an issued/bound grant; business may use a separate grant. */
     public record Identity(UUID transaction,OperationId business,OperationId firstControl) {
         public Identity {
             Objects.requireNonNull(transaction); Objects.requireNonNull(business); Objects.requireNonNull(firstControl);
-            if (business.epoch()<1 || !business.sessionId().equals(firstControl.sessionId()) || business.epoch()!=firstControl.epoch()
-                    || firstControl.sequence()<=business.sequence() || firstControl.sequence()>Long.MAX_VALUE-CONTROL_SLOTS) throw new IllegalArgumentException("Invalid reserved atomic identities");
+            boolean sameGrant=business.sessionId().equals(firstControl.sessionId()) && business.epoch()==firstControl.epoch();
+            if (business.epoch()<1 || firstControl.epoch()<1 || sameGrant && firstControl.sequence()<=business.sequence()
+                    || firstControl.sequence()>Long.MAX_VALUE-CONTROL_SLOTS) throw new IllegalArgumentException("Invalid reserved atomic identities");
         }
         public OperationId lastControl() { return control(CONTROL_SLOTS-1); }
         private OperationId control(long offset) { return new OperationId(firstControl.sessionId(),firstControl.epoch(),Math.addExact(firstControl.sequence(),offset)); }

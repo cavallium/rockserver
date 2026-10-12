@@ -126,6 +126,21 @@ class RatisAtomicClientTest {
             return new RangeDescriptor(group,group,1,0,lower,upper,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
         }
         RatisAtomicClient.Identity identity(int block) { return new RatisAtomicClient.Identity(new UUID(115,block+1),new OperationId(session,1,block*(RatisAtomicClient.CONTROL_SLOTS+1L)),new OperationId(session,1,block*(RatisAtomicClient.CONTROL_SLOTS+1L)+1)); }
+        RatisAtomicClient.Identity separateIdentity(long time) throws Exception {
+            var before=catalogue.epochs.read();
+            if(time>before.logicalTimeMillis()) {
+                var advanced=before.advanceTime(time);
+                assertEquals(CommandResult.Status.SUCCESS,catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(2),before,advanced)).status());before=advanced;
+            }
+            UUID controls=new UUID(116,1);var issued=before.issue(controls,time+2000);
+            assertEquals(CommandResult.Status.SUCCESS,catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(3),before,issued)).status());
+            var controlGrant=issued.grants().getLast();int n=0;
+            for(var source:List.of(directory,homeDirectory))for(var descriptor:source.ranges()) {
+                var binding=catalogue.epochs.prepareSessionBinding(source,descriptor.groupId(),new OperationId(admin,issued.minimumEpoch(),4+n++),controlGrant,1024,-1);
+                assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(append(descriptor,DistributedCommandCodec.encode(binding))).status());
+            }
+            return new RatisAtomicClient.Identity(new UUID(116,2),new OperationId(session,grant.epoch(),0),new OperationId(controls,controlGrant.epoch(),0));
+        }
         RatisAtomicClient client() { return new RatisAtomicClient(schema,homes,data,scheduler,RatisAtomicClient.Limits.defaults()); }
         int writes() { return submissions.get(); }
         RatisRoutedClient.Transport transport() {
@@ -191,6 +206,56 @@ class RatisAtomicClientTest {
             proofs.stop().get(5,TimeUnit.SECONDS);
             for (var machine:machines.values()) { machine.close(); machine.awaitNativeReaders(Duration.ofSeconds(5)); }
             for (var storage:storages) storage.close(); if (data!=null) data.close(); if (homeClient!=null) homeClient.close(); if (snapshotClient!=null) snapshotClient.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close();
+        }
+    }
+    @Test void separateIdentityKeepsBoundsAndRejectionJournalPreservesBothExactIds() throws Exception {
+        var business=new OperationId(new UUID(117,1),1,100);var control=new OperationId(new UUID(117,2),2,0);
+        var identity=new RatisAtomicClient.Identity(new UUID(117,3),business,control);
+        assertEquals(new OperationId(control.sessionId(),2,255),identity.lastControl());
+        assertThrows(IllegalArgumentException.class,()->new RatisAtomicClient.Identity(identity.transaction(),business,new OperationId(business.sessionId(),1,100)));
+        assertThrows(IllegalArgumentException.class,()->new RatisAtomicClient.Identity(identity.transaction(),business,new OperationId(control.sessionId(),0,0)));
+        assertThrows(IllegalArgumentException.class,()->new RatisAtomicClient.Identity(identity.transaction(),new OperationId(business.sessionId(),0,0),control));
+        assertThrows(IllegalArgumentException.class,()->new RatisAtomicClient.Identity(identity.transaction(),business,new OperationId(control.sessionId(),2,Long.MAX_VALUE-RatisAtomicClient.CONTROL_SLOTS+1)));
+        var sameSessionNewGrant=new RatisAtomicClient.Identity(identity.transaction(),business,new OperationId(business.sessionId(),2,0));assertEquals(0,sameSessionNewGrant.firstControl().sequence());
+        Path path=root.resolve("separate-rejection.bin");byte[] binding=new byte[32],digest=new byte[32];digest[0]=1;
+        try(var rejection=RatisAtomicRejection.create(path,binding,identity,digest)){assertEquals(identity,rejection.identity());}
+        try(var restored=RatisAtomicRejection.reopen(path,binding)){assertEquals(identity,restored.identity());assertArrayEquals(digest,restored.requestDigest());restored.consume();}
+        try(var restored=RatisAtomicRejection.reopen(path,binding)){assertEquals(identity,restored.identity());assertTrue(restored.consumed());}
+    }
+    @Test void separateBoundControlGrantCommitsOrderedBusinessAfterLostPrepareAndExactReopen() throws Exception {
+        try(var f=new Fixture(root)) {
+            var identity=f.separateIdentity(10);Path path=root.resolve("separate-lost.bin");List<RatisDurableTransaction.ParticipantProgress> original;
+            f.losePrepareGroup=f.groups.getLast();
+            try(var client=f.client();var operation=client.executeAtomic(path,identity,changes(),absentIdentity(),TTL,RequestContext.batch())) {
+                assertInstanceOf(IOException.class,assertThrows(ExecutionException.class,()->operation.completion().get(10,TimeUnit.SECONDS)).getCause());
+                var saved=operation.snapshot();assertEquals(identity.business(),saved.initial().operation());original=saved.participants();
+                for(int n=0;n<original.size();n++) {
+                    var intent=original.get(n).intent();assertEquals(identity.business(),intent.acceptedBusiness().operationId());
+                    assertEquals(new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),n),intent.prepareControl());
+                    assertEquals(new OperationId(identity.firstControl().sessionId(),identity.firstControl().epoch(),64+n),intent.finalizeControl());
+                }
+            }
+            try(var client=f.client();var resumed=client.reopen(path,RequestContext.batch())) {
+                f.complete(resumed,CommandResult.Status.SUCCESS);var saved=resumed.snapshot();assertEquals(identity.business(),saved.initial().operation());
+                for(int n=0;n<original.size();n++){assertEquals(original.get(n).intent().prepareControl(),saved.participants().get(n).intent().prepareControl());assertEquals(original.get(n).intent().finalizeControl(),saved.participants().get(n).intent().finalizeControl());assertEquals(original.get(n).intent().captureId(),saved.participants().get(n).intent().captureId());}
+                assertEquals(identity.firstControl().sessionId(),saved.lastHome().sessionId());assertEquals(identity.firstControl().epoch(),saved.lastHome().epoch());
+                assertTrue(saved.lastHome().sequence()>=128 && saved.lastHome().sequence()<=255);
+                var result=resumed.completion().get(5,TimeUnit.SECONDS);assertEquals(5,result.valueCount());assertArrayEquals(new byte[]{9},result.value(0));assertNull(result.value(1));assertNull(result.value(2));assertArrayEquals(new byte[]{7},result.value(3));assertArrayEquals(new byte[]{8},result.value(4));
+                resumed.consume(RequestContext.batch()).get(5,TimeUnit.SECONDS);assertTrue(f.homes.read(identity.transaction()).consumed());assertEquals(identity.business(),f.homes.read(identity.transaction()).operation());
+                assertArrayEquals(new byte[]{1},f.get(71,key(2)));assertArrayEquals(new byte[]{8},f.get(74,member(200,"second")));
+            }
+        }
+    }
+    @Test void freshSeparateControlsCannotResurrectExpiredOriginalBusinessGrant() throws Exception {
+        try(var f=new Fixture(root);var client=f.client()) {
+            var identity=f.separateIdentity(1000);
+            assertFalse(f.catalogue.epochs.read().isLive(identity.business()));assertTrue(f.catalogue.epochs.read().isLive(identity.firstControl()));
+            try(var operation=client.executeAtomic(root.resolve("expired-business.bin"),identity,changes(),absentIdentity(),TTL,RequestContext.batch())) {
+                var expired=assertThrows(ExecutionException.class,()->operation.completion().get(10,TimeUnit.SECONDS));
+                assertInstanceOf(RatisTransactionOutcomeExpiredException.class,expired.getCause());
+                assertEquals(identity.business(),operation.snapshot().initial().operation());assertNotNull(operation.snapshot().homeRetirementProof());
+                assertNull(f.get(71,key(2)));assertNull(f.get(72,key(200)));assertNull(f.get(73,key(2)));assertNull(f.get(74,member(200,"second")));
+            }
         }
     }
     @Test void fourLogicalColumnsCommitTogetherWithOrderedResultsAndCompleteCollisionBuckets() throws Exception {
