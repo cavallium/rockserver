@@ -78,4 +78,32 @@ class StartupIoPolicyTest {
         counters.recordBulk(100, 5, true);
         assertEquals(StartupIoPolicy.FOREGROUND, sample(0, 0, false).pressureMask());
     }
+
+    @Test void optionalSharedFailureBecomesNeutralAfterFreshIdleWindowsWithoutQualifyingGrowth() {
+        counters.recordBulk(100, 2, true);
+        var failed = input(0, 0, false);
+        assertTrue(policy.sample(failed, failed.sampledNanos(), true).capturePressure());
+        for (int i = 0; i < StartupIoPolicy.RECOVERY_WINDOWS; i++) {
+            var idle = input(0, 0, false);
+            var decision = policy.sample(idle, idle.sampledNanos(), true);
+            assertEquals(i < StartupIoPolicy.RECOVERY_WINDOWS - 1, decision.capturePressure());
+            assertFalse(decision.qualifiedHealthy());
+            assertSame(decision, policy.sample(idle, idle.sampledNanos(), true));
+        }
+        var idle = input(0, 0, false);
+        assertEquals(StartupIoPolicy.UNKNOWN, policy.sample(idle, idle.sampledNanos(), true).pressureMask());
+    }
+
+    @Test void aRepeatedHealthyWindowCannotUndoMissingOrContradictoryFeedback() {
+        calibrate();
+        counters.recordPoint(100, false);
+        var healthy = input(0, 0, false);
+        assertTrue(policy.sample(healthy, healthy.sampledNanos()).qualifiedHealthy());
+        assertTrue(policy.sample(null, healthy.sampledNanos()).capturePressure());
+        assertFalse(policy.sample(healthy, healthy.sampledNanos()).qualifiedHealthy());
+        var urgent = new StartupIoPolicy.InputSample(healthy.epoch(), healthy.sampledNanos(), true, true,
+                2, 0, 0, 100, 100, true, healthy.reads());
+        assertTrue(policy.sample(urgent, urgent.sampledNanos()).capturePressure());
+        assertNotEquals(0, policy.sample(healthy, healthy.sampledNanos()).pressureMask() & StartupIoPolicy.URGENT);
+    }
 }

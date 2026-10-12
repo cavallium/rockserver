@@ -131,7 +131,7 @@ class StartupSettingsTest {
                 "lookup-concurrency: 0", "lookup-concurrency: 65", "read-ceiling: -1B", "write-ceiling: 1B"
         }) assertThrows(IllegalArgumentException.class, () -> resolve(ENABLED_SNAPSHOT
                 + "database.global.hot-cache-snapshot.data { " + invalid + " }"), invalid);
-        assertThrows(IllegalArgumentException.class, () -> resolve(ENABLED_SNAPSHOT + """
+        assertDoesNotThrow(() -> resolve(ENABLED_SNAPSHOT + """
                 database.parallelism.workload-groups: [{name: __shared}]
                 """));
     }
