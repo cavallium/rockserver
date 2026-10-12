@@ -60,6 +60,9 @@ class CompactionIoIntegrationTest {
                 var time = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
                 assertTrue(bytes.getCount() > 0, "manual compaction must exercise actual synchronous filesystem reads");
                 assertEquals(bytes.getCount(), time.getCount());
+                var completion = statistics.getCompactionReadCompletion();
+                assertArrayEquals(new long[]{bytes.getCount(), bytes.getSum(), time.getSum()}, completion,
+                        "atomic JNI population must retain the exported histogram cohort");
                 for (int i = 0; i < 2; i++) {
                     var sample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
                             sampler.invoke(internal, limiterField.get(controller));
@@ -71,6 +74,14 @@ class CompactionIoIntegrationTest {
                 assertEquals(bytes.getSum(), statistics.getHistogramData(
                         org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES).getSum(),
                         "sampling must retain cumulative completion statistics");
+                statistics.reset();
+                assertArrayEquals(new long[]{0, 0, 0}, statistics.getCompactionReadCompletion(),
+                        "native reset must clear the atomic completion population");
+                var resetSample = (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample)
+                        sampler.invoke(internal, limiterField.get(controller));
+                assertEquals(0, resetSample.compactionReadCount());
+                assertEquals(0, resetSample.compactionReadBytes());
+                assertEquals(0, resetSample.compactionReadMicros());
             }
         }
         try (var connection = new EmbeddedConnection(dbPath, "adaptive-reopen", cfg)) {

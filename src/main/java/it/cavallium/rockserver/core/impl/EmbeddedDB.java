@@ -3186,22 +3186,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private static CompactionReadCompletion sampleCompactionReadCompletion(org.rocksdb.Statistics statistics) {
 		try {
-			for (int attempt = 0; attempt < 3; attempt++) {
-				var before = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES);
-				var time = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
-				var after = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_BYTES);
-				var timeAfter = statistics.getHistogramData(org.rocksdb.HistogramType.FILE_READ_COMPACTION_COMPLETED_MICROS);
-				if (before == null || time == null || after == null || timeAfter == null) return CompactionReadCompletion.UNAVAILABLE;
-				long count = after.getCount(), bytes = after.getSum(), micros = timeAfter.getSum();
-				if (count < 0 || bytes < 0 || micros < 0 || before.getCount() < 0
-						|| before.getSum() < 0 || time.getCount() < 0 || time.getSum() < 0 || timeAfter.getCount() < 0) return CompactionReadCompletion.UNAVAILABLE;
-				// Built-in native statistics serialize each completed-histogram update with snapshots.
-				// Separate publications still need matching counts and stable sums across snapshots.
-				if (before.getCount() == count && time.getCount() == count && timeAfter.getCount() == count
-						&& before.getSum() == bytes && time.getSum() == micros
-						&& (count != 0 || bytes == 0 && micros == 0))
-					return new CompactionReadCompletion(bytes, micros, count);
-			}
+			var completion = statistics.getCompactionReadCompletion();
+			if (completion == null || completion.length != 3) return CompactionReadCompletion.UNAVAILABLE;
+			long count = completion[0], bytes = completion[1], micros = completion[2];
+			if (count < 0 || bytes < 0 || micros < 0 || count == 0 && (bytes != 0 || micros != 0))
+				return CompactionReadCompletion.UNAVAILABLE;
+			return new CompactionReadCompletion(bytes, micros, count);
 		} catch (RuntimeException unavailable) {
 			// Optional read-service telemetry must not fail pressure/foreground sampling.
 		}
