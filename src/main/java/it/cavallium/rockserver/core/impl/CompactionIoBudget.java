@@ -13,7 +13,23 @@ public final class CompactionIoBudget {
                          long compactionReadCount, long prefetchCount, long prefetchBytes,
                          long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
                          int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
+                         long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted, long readTerminalOutcomes, long readNonRunOutcomes, int readTopologyWorkers) {
+        public Sample(long nanos, long readCount, long readMicros, long bytes,
+                         boolean background, boolean pressure, boolean stopped, boolean valid,
+                         boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
+                         boolean urgentPressure, long compactionReadBytes, long compactionReadMicros,
+                         long compactionReadCount, long prefetchCount, long prefetchBytes,
+                         long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
+                         int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
                          long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted, long readTerminalOutcomes, long readNonRunOutcomes) {
+            this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure,
+                    compactionReadBytes, compactionReadMicros, compactionReadCount, prefetchCount, prefetchBytes,
+                    bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
+                    readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
+                    nativeBulkCompletions, nativeBulkKeys, nativePointReadNanos, bulkFoundKeys, bulkReturnedBytes,
+                    readFailures, readAccepted, readTerminalOutcomes, readNonRunOutcomes, readWorkers);
+        }
         public Sample(long nanos, long readCount, long readMicros, long bytes,
                          boolean background, boolean pressure, boolean stopped, boolean valid,
                          boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
@@ -275,7 +291,7 @@ public final class CompactionIoBudget {
             clearWindow();
         }
         if (!sample.valid || old == null || !old.valid || sample.nanos <= old.nanos
-                || pointEpochFailure || sample.bytes < 0 || sample.foregroundCompletions < 0
+                || pointEpochFailure || sample.readTopologyWorkers < 0 || sample.bytes < 0 || sample.foregroundCompletions < 0
                 || sample.nanos - old.nanos > 3_000_000_000L || sample.bytes < old.bytes
                 || sample.foregroundCompletions < old.foregroundCompletions) {
             if (state == State.PROBE) finishProbe(false, 0);
@@ -581,9 +597,9 @@ public final class CompactionIoBudget {
             tailCalibrationNeeded = true;
             if (readaheadBytes > 0 || appliedReadahead > 0) reduceReadahead(0);
         }
-        if (queueWorkers < 0) queueWorkers = sample.readWorkers;
-        else if (queueWorkers != sample.readWorkers) {
-            queueWorkers = sample.readWorkers;
+        if (queueWorkers < 0) queueWorkers = sample.readTopologyWorkers;
+        else if (queueWorkers != sample.readTopologyWorkers) {
+            queueWorkers = sample.readTopologyWorkers;
             queueAnchor = -1;
             queueReferenceWindows = 0; probeQueueProtected = false;
             lastPointMean = 0;
@@ -694,7 +710,7 @@ public final class CompactionIoBudget {
     private void accumulateBulk(Sample sample, Sample old, long elapsed) {
         if (sample.bulkCount < old.bulkCount || sample.bulkMicros < old.bulkMicros || sample.bulkKeys < old.bulkKeys
                 || sample.readCompletions < old.readCompletions || sample.bulkCount < 0 || sample.bulkMicros < 0
-                || sample.bulkKeys < 0 || sample.readWorkers < 0 || sample.readActive < 0
+                || sample.bulkKeys < 0 || sample.readWorkers < 0 || sample.readTopologyWorkers < 0 || sample.readActive < 0
                 || sample.latencyReadActive < 0 || sample.latencyReadQueued < 0) {
             invalidateBulk(); bulkEpochValid = false; return;
         }

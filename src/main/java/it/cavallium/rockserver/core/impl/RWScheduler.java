@@ -548,10 +548,20 @@ public final class RWScheduler {
 	 * counters include every group, preserving a monotonic database-wide progress signal.
 	 */
 	public void copyCompactionReadTelemetry(long[] target, long[] scratch) {
+		copyCompactionReadTelemetryAndTopology(target, scratch);
+	}
+
+	/** Stable configured capacity, separate from the selected pool pressure tuple. */
+	int copyCompactionReadTelemetryAndTopology(long[] target, long[] scratch) {
 		copyPoolTelemetry(Pool.READ, target);
+		int topologyWorkers = Math.toIntExact(target[POOL_TELEMETRY_WORKER_COUNT]);
+		if (topologyWorkers < 0) throw new IllegalStateException("Negative READ worker count");
 		long completions = target[POOL_TELEMETRY_COMPLETED_TASKS];
 		for (var group : ownedGroups) {
 			group.copyPoolTelemetry(Pool.READ, scratch);
+			int groupWorkers = Math.toIntExact(scratch[POOL_TELEMETRY_WORKER_COUNT]);
+			if (groupWorkers < 0) throw new IllegalStateException("Negative group READ worker count");
+			topologyWorkers = Math.addExact(topologyWorkers, groupWorkers);
 			completions = Math.addExact(completions, scratch[POOL_TELEMETRY_COMPLETED_TASKS]);
 			if (moreReadContention(scratch, target)) {
 				System.arraycopy(scratch, 0, target, 0,
@@ -561,6 +571,7 @@ public final class RWScheduler {
 			}
 		}
 		target[POOL_TELEMETRY_COMPLETED_TASKS] = completions;
+		return topologyWorkers;
 	}
 
 	private static boolean moreReadContention(long[] candidate, long[] selected) {

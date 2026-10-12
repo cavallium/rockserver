@@ -3286,7 +3286,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var compactionReads = sampleCompactionReadCompletion(statistics);
 				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
 				var bulk = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
-				scheduler.copyCompactionReadTelemetry(readPoolTelemetry, groupReadPoolTelemetry);
+				int readTopologyWorkers = scheduler.copyCompactionReadTelemetryAndTopology(readPoolTelemetry, groupReadPoolTelemetry);
 				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
 						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
 				boolean foregroundPending = ops.getPendingOpsCount() > 1;
@@ -3315,7 +3315,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						workloadGroups.isEmpty() ? readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] : -1,
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES]);
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES], readTopologyWorkers);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {
