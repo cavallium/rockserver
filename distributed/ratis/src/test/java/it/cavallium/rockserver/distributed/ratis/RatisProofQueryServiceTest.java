@@ -113,4 +113,9 @@ class RatisProofQueryServiceTest {
         } finally { release.countDown(); service.stop().get(5,TimeUnit.SECONDS); }
     }
 
+    @Test void topologyImageLaneRetainsFullChargeUntilActualWorkExitsAndOrdinaryControlRemainsIndependent()throws Exception{
+        var image=RatisProofQueryService.topologyImageLane();var ordinary=new RatisProofQueryService();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var group=UUID.randomUUID();
+        try{assertThrows(ExecutionException.class,()->image.submit(group,new byte[]{1},RatisProofQueryService.TOPOLOGY_IMAGE_BYTES+1,false,owned->{throw new AssertionError();}).get(5,TimeUnit.SECONDS));var running=image.submit(group,new byte[]{2},RatisProofQueryService.TOPOLOGY_IMAGE_BYTES,false,owned->{entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new IOException("Image fixture timeout");return Message.EMPTY;});assertTrue(entered.await(5,TimeUnit.SECONDS));assertEquals(Message.EMPTY,ordinary.submit(group,new byte[]{3},1,false,owned->Message.EMPTY).get(5,TimeUnit.SECONDS));assertThrows(ExecutionException.class,()->image.submit(group,new byte[]{4},1,false,owned->Message.EMPTY).get(5,TimeUnit.SECONDS));running.cancel(false);var stop=image.stop();assertFalse(stop.isDone());assertEquals(RatisProofQueryService.TOPOLOGY_IMAGE_BYTES,image.stats().bytes());release.countDown();stop.get(5,TimeUnit.SECONDS);assertEquals(0,image.stats().bytes());assertEquals(0,image.stats().jobs());}finally{release.countDown();image.stop().get(5,TimeUnit.SECONDS);ordinary.stop().get(5,TimeUnit.SECONDS);}
+    }
+
 }
