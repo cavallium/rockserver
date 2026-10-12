@@ -9,12 +9,19 @@ final class RatisSchemaClientJournal {
     static final int MAX_BYTES=32*1024*1024, MAX_FIELDS=4096;
     private static final int MAGIC=0x5253434a;
     static void write(Path file,Map<String,byte[]> fields) throws IOException {
-        var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(MAGIC); out.writeInt(fields.size());
-        if (fields.size()>MAX_FIELDS) throw new IOException("Schema request journal fields exhausted");
+        if (fields.isEmpty() || fields.size()>MAX_FIELDS) throw new IOException("Schema request journal fields exhausted");
+        long size=8;
+        for (var entry:fields.entrySet()) {
+            String key=entry.getKey(); byte[] value=entry.getValue();
+            if (key==null || key.length()>128 || value==null) throw new IOException("Invalid schema journal field");
+            int utfBytes=0;
+            for (int i=0;i<key.length();i++) { char c=key.charAt(i); utfBytes+=c>=1 && c<=127 ? 1 : c<=2047 ? 2 : 3; }
+            size+=6L+utfBytes+value.length;
+            if (size>MAX_BYTES-32) throw new IOException("Schema request journal exceeds bound");
+        }
+        var bytes=new ByteArrayOutputStream((int)size); var out=new DataOutputStream(bytes); out.writeInt(MAGIC); out.writeInt(fields.size());
         for (var key:fields.keySet().stream().sorted().toList()) {
-            if (key.length()>128 || fields.get(key)==null) throw new IOException("Invalid schema journal field");
             out.writeUTF(key); byte[] value=fields.get(key); out.writeInt(value.length); out.write(value);
-            if (bytes.size()>MAX_BYTES-32) throw new IOException("Schema request journal exceeds bound");
         }
         out.flush(); SessionJournalFiles.write(file,bytes.toByteArray(),MAX_BYTES);
     }
