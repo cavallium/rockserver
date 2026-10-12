@@ -34,6 +34,11 @@ public final class NativeTopologyImageOrigin {
         var birth=localSeed.birth(activation.birth().groupId());
         return new NativeTopologyActivation(localSeed,birth,activation.position(),activation.catalogueGroup(),activation.catalogueCut(),activation.publicationCommitment());
     }
+    /** Qualified learner import preserves the original source owner/recipe; it never rebinds activation. */
+    public void requireLearner(NativeTopologyLearnerRegistration registration) {
+        Objects.requireNonNull(registration);if(!equals(registration.origin()))throw new IllegalArgumentException("Learner image changed original source provenance");
+        var range=registration.definition().parents().getFirst();requireImage(range.groupId(),range.rangeEpoch(),registration.schema().domainId(),range.lowerInclusive(),range.upperExclusive(),registration.imageCut());
+    }
     private static void requireCatalogueAdmission(NativeTopologySeed seed,UUID catalogue) {
         byte[] initial=TopologyChange.State.begin(seed.header()).beginFencing().encode();
         byte[] expected=OperatorUpload.sha256(ByteBuffer.allocate(16+initial.length).putLong(catalogue.getMostSignificantBits()).putLong(catalogue.getLeastSignificantBits()).put(initial).array());

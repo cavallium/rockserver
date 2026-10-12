@@ -36,6 +36,7 @@ public final class RatisSessionEpochs {
     RatisSchemaAuthority schemaAuthority() { return new RatisSchemaAuthority(client,cluster,database,group); }
     RatisRangeImportAuthority.Client importAuthority() { return new RatisRangeImportAuthority.Client(client,cluster,database,group); }
     RatisTopologyAuthority.Client topologyAuthority() { return new RatisTopologyAuthority.Client(client,cluster,database,group); }
+    RatisTopologyJoinAuthority.Client topologyJoinAuthority() { return new RatisTopologyJoinAuthority.Client(client,cluster,database,group); }
     RatisTopologyCatalogue topologyCatalogue(UUID directoryColumn) { return new RatisTopologyCatalogue(client,cluster,database,group,rangeEpoch,schema,Objects.requireNonNull(directoryColumn)); }
     RatisCatalogue catalogue(UUID directoryColumn) { return new RatisCatalogue(client,cluster,database,group,rangeEpoch,schema,Objects.requireNonNull(directoryColumn)); }
     void requireDatabaseBinding(UUID expectedCluster,UUID expectedDatabase) {

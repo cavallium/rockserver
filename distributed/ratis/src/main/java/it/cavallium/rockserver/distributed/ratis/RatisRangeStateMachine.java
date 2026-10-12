@@ -657,6 +657,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         synchronized (admissions) { if (schemaConfigurationPending || stamp!=schemaConfigurationStamp) throw new IOException("Schema replica configuration changed during validation"); }
         return stamp;
     }
+    /** Actual listener division and completed native tail evidence; this confers no USER authority. */
+    public ReplicatedRangeStore.TopologyLearnerReadiness topologyLearnerReadiness(ApplyPosition requiredCut)throws IOException {
+        requireDataRole();requireHealthy();var registration=store.topologyLearnerRegistration();if(registration==null)throw new IOException("No receiver-local learner registration");
+        long generation=admissionGeneration.get();final long stamp;synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Learner configuration apply pending");stamp=schemaConfigurationStamp;}
+        var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(registration.receiver().peerId()))throw new IOException("Learner server identity differs");var division=server.getDivision(initialGroup.getGroupId());var info=division.getInfo();var term=info.getCurrentTerm();var configuration=division.getRaftConf();
+        if(getLifeCycleState()!=LifeCycle.State.RUNNING || division.getStateMachine()!=this || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING || term<1)throw new IOException("Learner division is not actual running owner");
+        for(var role:List.of(org.apache.ratis.proto.RaftProtos.RaftPeerRole.FOLLOWER,org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER)){
+            if(!configuration.getPreviousPeers(role).isEmpty())throw new IOException("Learner readiness requires stable configuration");var actual=new java.util.TreeMap<String,String>();for(var peer:configuration.getCurrentPeers(role))actual.put(peer.getId().toString(),peer.getAddress());var expected=new java.util.TreeMap<String,String>();for(var replica:registration.definition().targets().getFirst().replicas())if((replica.role()==it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor.Role.LISTENER)==(role==org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER))expected.put(replica.peerId(),replica.address());if(!actual.equals(expected))throw new IOException("Learner actual configuration differs from proposed membership");
+        }
+        final ReplicatedRangeStore.TopologyLearnerReadiness result;try{result=store.topologyLearnerReadiness(requiredCut);}catch(org.rocksdb.RocksDBException|IllegalStateException invalid){throw new IOException("Learner native readiness unavailable",invalid);}
+        if(result.ready() && (result.completedCut().term()!=term || result.configuration().index()!=configuration.getLogEntryIndex()))throw new IOException("Learner tail/configuration does not cover actual division");
+        synchronized(admissions){if(generation!=admissionGeneration.get() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || getLifeCycleState()!=LifeCycle.State.RUNNING || division.getInfo().getCurrentTerm()!=term || !java.util.Objects.equals(result.completedCut(),store.applied()))throw new IOException("Learner readiness owner changed");}return result;
+    }
     static void requireSchemaMembership(it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor,byte[] configuration) throws IOException {
         var nativeConfiguration=RaftConfigurationProto.parseFrom(configuration);
         var actual=new java.util.HashMap<String,String>();
@@ -2593,7 +2606,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             return new AppliedRecord(preparation.operation(),RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded); commandValidator.accept(command);
-        return new AppliedRecord(command.operationId(),store.apply(positionArg,command));
+        return new AppliedRecord(command.operationId(),store.topologyLearnerRegistration()==null ? store.apply(positionArg,command) : store.applyTopologyLearnerTail(positionArg,command));
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         if(RatisSourceOutcomeRecord.isRecord(encoded))return new AppliedRecord(null,recoveredSourceRecord(RatisSourceOutcomeRecord.decode(encoded)));
@@ -4077,6 +4090,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         : 4L*it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES;
                 return proofQueries.submit(store.ownership().owner().groupId(),encoded,weight,false,owned->{
                     prepareImportApply(RatisRangeImportRpc.proposal(owned),generation);return Message.valueOf(ByteString.copyFrom(owned));
+                });
+            }
+            if(kind==RatisTopologyJoinAuthority.KIND){
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Topology join authority requires configured fresh catalogue dispatcher");
+                checkCatalogueOwner();long generation=admissionGeneration.get();var owner=leadership();final long configurationStamp;
+                synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Topology join authority waits for configuration apply");configurationStamp=schemaConfigurationStamp;}
+                return schemaAuthorityQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{
+                    checkCatalogueOwner();if(generation!=admissionGeneration.get() || leadership().term()!=owner.term())throw new IOException("Topology join authority lost read-barrier owner");
+                    var view=RatisTopologyJoinAuthority.readNative(store,schemaColumn,schemaCluster,schemaDatabase,RatisTopologyJoinAuthority.decodeRequest(owned));
+                    checkCatalogueOwner();var current=leadership();
+                    synchronized(admissions){if(generation!=admissionGeneration.get() || current.term()!=owner.term() || view.cut().term()!=current.term()
+                            || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || configurationStamp!=schemaConfigurationStamp || !java.util.Objects.equals(view.cut(),store.applied()))throw new IOException("Topology join authority cut/configuration changed");}
+                    return Message.valueOf(ByteString.copyFrom(RatisTopologyJoinAuthority.reply(view)));
                 });
             }
             if(kind==RatisTopologyAuthority.KIND){
