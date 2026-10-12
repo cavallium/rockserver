@@ -75,15 +75,15 @@ public final class TopologyChange {
         private static void relocation(RangeDescriptor source,RangeDescriptor target) {
             if(!source.rangeId().equals(target.rangeId()) || !source.groupId().equals(target.groupId()) || source.rangeEpoch()!=target.rangeEpoch() || !sameBound(source.lowerInclusive(),target.lowerInclusive()) || !sameBound(source.upperExclusive(),target.upperExclusive())
                     || source.configurationVersion()==Long.MAX_VALUE || target.configurationVersion()!=source.configurationVersion()+1) throw new IllegalArgumentException("Relocation changed lineage/interval/configuration step");
-            var old=new HashMap<UUID,ReplicaDescriptor>(); source.replicas().forEach(r->old.put(r.replicaId(),r)); var next=new HashMap<UUID,ReplicaDescriptor>(); target.replicas().forEach(r->next.put(r.replicaId(),r)); int changes=0;
+            var old=new HashMap<UUID,ReplicaDescriptor>(); source.replicas().forEach(r->old.put(r.replicaId(),r)); var next=new HashMap<UUID,ReplicaDescriptor>(); target.replicas().forEach(r->next.put(r.replicaId(),r)); int changes=0,removedVoters=0,promotedListeners=0;
             for(var replica:source.replicas()) {
-                var replacement=next.get(replica.replicaId()); if(replacement==null) changes++;
+                var replacement=next.get(replica.replicaId()); if(replacement==null) { changes++;if(replica.role()==ReplicaDescriptor.Role.VOTER)removedVoters++; }
                 else if(!replica.equals(replacement)) {
-                    if(replica.role()==replacement.role() || !replica.nodeId().equals(replacement.nodeId()) || !replica.nodeIncarnation().equals(replacement.nodeIncarnation()) || !replica.peerId().equals(replacement.peerId()) || !replica.address().equals(replacement.address())) throw new IllegalArgumentException("Relocation replaced an existing peer identity/endpoint"); changes++;
+                    if(replica.role()==replacement.role() || !replica.nodeId().equals(replacement.nodeId()) || !replica.nodeIncarnation().equals(replacement.nodeIncarnation()) || !replica.peerId().equals(replacement.peerId()) || !replica.address().equals(replacement.address())) throw new IllegalArgumentException("Relocation replaced an existing peer identity/endpoint"); changes++;if(replica.role()==ReplicaDescriptor.Role.LISTENER && replacement.role()==ReplicaDescriptor.Role.VOTER)promotedListeners++;
                 }
             }
             for(var replica:target.replicas()) if(!old.containsKey(replica.replicaId())) { if(replica.role()!=ReplicaDescriptor.Role.LISTENER) throw new IllegalArgumentException("New relocation peer must be staged as LISTENER"); changes++; }
-            if(changes!=1) throw new IllegalArgumentException("Relocation requires one bounded membership staging step");
+            if(changes!=1 && !(changes==2 && removedVoters==1 && promotedListeners==1)) throw new IllegalArgumentException("Relocation requires one membership step or one staged voter replacement");
         }
         public UUID intentId() { return intentId; }
         public Kind kind() { return kind; }

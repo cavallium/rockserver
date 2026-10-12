@@ -97,4 +97,19 @@ class TopologyChangeTest {
         replicas.set(4,owner(5,ReplicaDescriptor.Role.VOTER)); var voter=new RangeDescriptor(original.rangeId(),original.groupId(),original.rangeEpoch(),4,original.lowerInclusive(),original.upperExclusive(),RangeDescriptor.TopologyState.ACTIVE,replicas);
         assertThrows(IllegalArgumentException.class,()->new TopologyChange.Definition(id(72),base,directory(9,List.of(base.ranges().getFirst(),voter,base.ranges().getLast()))));
     }
+    @Test void stagedListenerCanReplaceOneOfFiveVotersInOneBoundedConfigurationStep() {
+        var peers=new ArrayList<ReplicaDescriptor>();for(int n=1;n<=5;n++)peers.add(owner(n,ReplicaDescriptor.Role.VOTER));peers.add(owner(6,ReplicaDescriptor.Role.LISTENER));
+        var original=range(80,81,1,null,null,peers);var source=directory(8,List.of(original));
+        var replacements=new ArrayList<ReplicaDescriptor>();for(int n=2;n<=6;n++)replacements.add(owner(n,ReplicaDescriptor.Role.VOTER));
+        var targetRange=new RangeDescriptor(original.rangeId(),original.groupId(),original.rangeEpoch(),4,null,null,RangeDescriptor.TopologyState.ACTIVE,replacements);
+        var definition=new TopologyChange.Definition(id(82),TopologyChange.Kind.RELOCATE,source,directory(9,List.of(targetRange)));
+        assertEquals(5,definition.targetDirectory().ranges().getFirst().replicas().stream().filter(r->r.role()==ReplicaDescriptor.Role.VOTER).count());
+        assertArrayEquals(definition.encode(),TopologyChange.Definition.decode(definition.encode()).encode());
+        var unprepared=new ArrayList<>(replacements);unprepared.set(4,owner(7,ReplicaDescriptor.Role.VOTER));
+        var unpreparedRange=new RangeDescriptor(original.rangeId(),original.groupId(),original.rangeEpoch(),4,null,null,RangeDescriptor.TopologyState.ACTIVE,unprepared);
+        assertThrows(IllegalArgumentException.class,()->new TopologyChange.Definition(id(83),source,directory(9,List.of(unpreparedRange))));
+        var multipleRemovals=new ArrayList<>(replacements);multipleRemovals.removeFirst();
+        var smaller=new RangeDescriptor(original.rangeId(),original.groupId(),original.rangeEpoch(),4,null,null,RangeDescriptor.TopologyState.ACTIVE,multipleRemovals);
+        assertThrows(IllegalArgumentException.class,()->new TopologyChange.Definition(id(84),source,directory(9,List.of(smaller))));
+    }
 }
