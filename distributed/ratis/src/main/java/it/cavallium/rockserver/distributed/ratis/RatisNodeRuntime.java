@@ -121,7 +121,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
     private RatisProofQueryService sourceOutcomeQueries;
-    private RatisProofQueryService topologyImageQueries,relocationOwnerQueries;private RatisTopologySourceSnapshotArtifacts sourceArtifacts;private RatisTopologySourceSnapshotService sourceSnapshots;private RatisRelocationDataClient relocationClients;
+    private RatisProofQueryService topologyImageQueries,relocationOwnerQueries,importPreflightQueries;private RatisTopologySourceSnapshotArtifacts sourceArtifacts;private RatisTopologySourceSnapshotService sourceSnapshots;private RatisRelocationDataClient relocationClients;
     private RatisProofQueryService authorityQueries;
     private RatisProofQueryService importPublicationQueries;
     private RatisProofQueryService operationRerouteQueries;
@@ -255,7 +255,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (snapshotPlan!=null) {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
-        proofQueries=new RatisProofQueryService();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();topologyImageQueries=RatisProofQueryService.topologyImageLane();relocationOwnerQueries=RatisProofQueryService.relocationOwnerLane();relocationClients=new RatisRelocationDataClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
+        proofQueries=new RatisProofQueryService();importPreflightQueries=RatisProofQueryService.importPreflightLane();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();topologyImageQueries=RatisProofQueryService.topologyImageLane();relocationOwnerQueries=RatisProofQueryService.relocationOwnerLane();relocationClients=new RatisRelocationDataClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
         if(groups.raftGroups().stream().anyMatch(group->groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.TRANSACTION_HOME))
             operationRerouteQueries=RatisProofQueryService.operationRerouteLane();
         if (groups.raftGroups().stream().anyMatch(group -> groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.CATALOGUE)) {
@@ -339,6 +339,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     var recipe=registration.retired() ? groups.retirement(id) : registration.seed();
                     var bindings=registration.learner()!=null ? registration.learner().physicalNames() : recipe!=null ? recipe.physicalNames() : home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
                     var importDefinition=registration.seed()==null && registration.learner()==null ? plan.importDefinition(id) : null;
+                    if(importDefinition!=null){var manifest=importDefinition.manifest(id);RatisRangeImportRecord.requirePolicy(manifest);if(manifest.columns().size()>settings.images().maxColumns() || (long)manifest.encode().length+17>settings.images().maxRowBytes() || (long)manifest.encode().length+17>settings.images().maxImageBytes())throw new IOException("Imported manifest exceeds configured native image row budget");}
                     var store=registration.learner()!=null ? pool.openTopologyLearner(registration.learner()) : registration.retired() ? pool.openRetiredTopologyRange(id) : registration.seed()!=null ? pool.reopenTopologyRange(registration.seed().birth(id),seedSchema(registration.seed())) : importDefinition==null ? pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
                             directory.schemaDigest(),bindings,recipe!=null ? recipe.mergeColumns() : home==null ? plan.merges() : Set.of())
                             : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchema)
@@ -376,14 +377,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     }
                     else { configureDataMachine(machine,effectiveDirectory,descriptor); }
                     if (importDefinition!=null) {
-                        var limits=new RatisReferencedFiles.Limits(4096,8,32,
+                        var limits=new RatisReferencedFiles.Limits(4096,4096,8,32,
                                 it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES,
-                                it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_TOTAL_BYTES
-                                        +it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES);
+                                RatisRangeImportRecord.DISTRIBUTED_LIMITS.maximumTotalBytes()+RatisRangeImportRecord.DISTRIBUTED_LIMITS.maximumEncodedBytes());
                         var files=new RatisReferencedFiles(root.resolve("referenced-files").resolve(id.toString()),id,limits,importFileIo,
                                 request->RatisRangeImportRpc.requireFile(importDefinition.manifest(id),request));
                         importFiles.put(id,files); machine.referencedFiles(files);
-                        machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority(),ownReplica(descriptor));
+                        machine.importPreflightQueries(importPreflightQueries);machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority(),ownReplica(descriptor));
                     }
                 }
                 machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.proofQueries(proofQueries);
@@ -766,6 +766,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         try {
             if(topologyImageQueries!=null){try{topologyImageQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Topology image drain interrupted",interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException("Topology image owners did not drain",failure);}}
             if(sourceSnapshots!=null)sourceSnapshots.close();if(sourceArtifacts!=null)sourceArtifacts.close();
+            if(importPreflightQueries!=null){try{importPreflightQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Import preflight drain interrupted",interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException("Import preflight owners did not drain",failure);}}
             // Ordinary proofs can await both catalogue authority and local replica preparation.
             if(operationRerouteQueries!=null) {
                 try { operationRerouteQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }

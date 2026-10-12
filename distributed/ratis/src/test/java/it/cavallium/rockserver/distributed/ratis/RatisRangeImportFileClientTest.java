@@ -21,7 +21,7 @@ class RatisRangeImportFileClientTest {
         byte[] bytes=new byte[3*RatisRangeImportFileClient.BUFFER_BYTES+17]; new Random(1).nextBytes(bytes); Path source=root.resolve("immutable"); Files.write(source,bytes);
         UUID group=UUID.randomUUID(),column=UUID.randomUUID(),domain=UUID.randomUUID(),job=UUID.randomUUID(); var clientId=ClientId.randomId();
         var request=new RatisReferencedFile.Request(group,clientId.getUuid(),71,bytes.length,MessageDigest.getInstance("SHA-256").digest(bytes));
-        var manifest=new NativeSstImportManifest(job,group,1,domain,new byte[32],null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of(new NativeSstImportManifest.File(UUID.randomUUID(),bytes.length,request.sha256(),1,new byte[]{1},new byte[]{1})))));
+        var manifest=new NativeSstImportManifest(job,group,1,domain,new byte[32],null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of(new NativeSstImportManifest.File(UUID.randomUUID(),bytes.length,request.sha256(),1,new byte[]{1},new byte[]{1})))),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
         var owner=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"leader","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
         var directory=new RangeDirectory(UUID.randomUUID(),UUID.randomUUID(),domain,0,new byte[32],0,Set.of(column),0,List.of(new RangeDescriptor(UUID.randomUUID(),group,1,0,null,null,RangeDescriptor.TopologyState.FENCED,List.of(owner))));
         var definition=new RangeImportDefinition(job,new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));

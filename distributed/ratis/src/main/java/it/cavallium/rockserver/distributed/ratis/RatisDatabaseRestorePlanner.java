@@ -50,21 +50,30 @@ public final class RatisDatabaseRestorePlanner {
             }
             var initial=new RangeDirectory(cluster,old.databaseId(),schema.domainId(),0,schema.digest(),0,schema.columnIds(),schema.routingPrefixBytes(),ranges);
             var current=initial; var imports=new ArrayList<RangeImportDefinition>();
-            for(int start=0; start<ranges.size(); start+=RangeImportDefinition.MAX_GROUPS) {
-                UUID importId=UUID.randomUUID(); var manifests=new ArrayList<NativeSstImportManifest>();
-                for(var range:ranges.subList(start,Math.min(ranges.size(),start+RangeImportDefinition.MAX_GROUPS))) {
-                    var columns=new ArrayList<NativeSstImportManifest.Column>();
+            int start=0;
+            while(start<ranges.size()) {
+                UUID importId=UUID.randomUUID();var manifests=new ArrayList<NativeSstImportManifest>();
+                long encodedBytes=60L+RangeDirectoryCodec.encode(current).length, sourceBytes=0;int fileCount=0;
+                while(start<ranges.size() && manifests.size()<RangeImportDefinition.MAX_GROUPS) {
+                    var range=ranges.get(start);var columns=new ArrayList<NativeSstImportManifest.Column>();
                     for(var column:schema.columns()) {
                         var files=complete.chunks().stream().filter(c->c.groupId().equals(sourceGroups.get(range.groupId())) && c.columnId().equals(column.columnId()) && c.entries()>0)
                                 .map(c->new NativeSstImportManifest.File(c.objectId(),c.bytes(),c.sha256(),c.entries(),c.firstKey(),c.lastKey())).toList();
                         columns.add(new NativeSstImportManifest.Column(column.columnId(),"restored-"+column.columnId(),column.operator()!=null,files));
                     }
-                    // Materialized PUT tables do not bind source group/schema IDs. Native destination preflight must requalify every row.
-                    try { manifests.add(new NativeSstImportManifest(importId,range.groupId(),0,schema.domainId(),schema.digest(),range.lowerInclusive(),range.upperExclusive(),columns)); }
-                    catch(IllegalArgumentException oversized) { throw new IllegalArgumentException("Restore range requires staged native import beyond current per-group file/byte limits",oversized); }
+                    // Materialized PUT tables carry the physical codec, not old consensus/receipt identities.
+                    var manifest=new NativeSstImportManifest(importId,range.groupId(),0,schema.domainId(),schema.digest(),range.lowerInclusive(),range.upperExclusive(),columns,RatisRangeImportRecord.DISTRIBUTED_LIMITS);
+                    int count=columns.stream().mapToInt(c->c.files().size()).sum();long bytes=manifest.encode().length;
+                    for(var c:columns)for(var file:c.files())bytes=Math.addExact(bytes,file.bytes());
+                    long nextEncoded=encodedBytes+4L+manifest.encode().length;
+                    if(nextEncoded>RangeImportDefinition.MAX_BYTES || bytes>RatisRangeImportController.MAX_SOURCE_BYTES-sourceBytes || count>RatisRangeImportController.MAX_SOURCE_FILES-fileCount) {
+                        if(manifests.isEmpty())throw new IllegalArgumentException("Restore interval exceeds declared distributed job envelope");
+                        break;
+                    }
+                    manifests.add(manifest);encodedBytes=nextEncoded;sourceBytes+=bytes;fileCount+=count;start++;
                 }
                 var batch=new RangeImportDefinition(importId,new OperationId(session,1,sequence++),current,manifests);
-                imports.add(batch); current=batch.targetDirectory();
+                imports.add(batch);current=batch.targetDirectory();
             }
             domains.add(new Domain(schema,initial,imports));
         }

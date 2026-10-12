@@ -19,7 +19,7 @@ class RatisRangeImportOwnerClientTest {
         var listener=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"listener","127.0.0.1:9998",ReplicaDescriptor.Role.LISTENER);
         var range=new RangeDescriptor(UUID.randomUUID(),group,1,7,null,null,RangeDescriptor.TopologyState.FENCED,List.of(voter,listener));
         var directory=new RangeDirectory(cluster,database,domain,0,new byte[32],0,Set.of(column),0,List.of(range));
-        var manifest=new NativeSstImportManifest(job,group,1,domain,new byte[32],null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of())));
+        var manifest=new NativeSstImportManifest(job,group,1,domain,new byte[32],null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
         var definition=new RangeImportDefinition(job,new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));
         var receipt=new NativeSstImportManifest.Receipt(job,group,1,manifest.digest(),new ApplyPosition(1,3));var published=RatisRangeImportCatalogue.Head.prepared(definition).publish(new byte[32]);
         var installed=new RatisRangeImportApply.Status(group,1,definition.digest(),manifest.digest(),new ApplyPosition(1,3),RatisRangeImportApply.Phase.INSTALLED,receipt,null);

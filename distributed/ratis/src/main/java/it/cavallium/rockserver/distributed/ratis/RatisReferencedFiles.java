@@ -14,9 +14,9 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Group-owned forced immutable payloads. Borrowed executor; observers never own actual publication. */
 public final class RatisReferencedFiles implements StateMachine.DataApi,AutoCloseable {
-    public record Limits(int maxReferences,int maxStreams,int maxPendingOperations,long maxFileBytes,long maxContentBytes) {
-        public Limits { if(maxReferences<1 || maxReferences>4096 || maxStreams<1 || maxPendingOperations<1 || maxFileBytes<1 || maxFileBytes>Integer.MAX_VALUE || maxContentBytes<maxFileBytes) throw new IllegalArgumentException("Invalid referenced file limits"); }
-        public static Limits defaults() { return new Limits(4096,8,32,32L*1024*1024,256L*1024*1024); }
+    public record Limits(int maxReferences,int maxReaders,int maxStreams,int maxPendingOperations,long maxFileBytes,long maxContentBytes) {
+        public Limits { if(maxReferences<1 || maxReferences>4096 || maxReaders<1 || maxReaders>4096 || maxStreams<1 || maxPendingOperations<1 || maxFileBytes<1 || maxFileBytes>Integer.MAX_VALUE || maxContentBytes<maxFileBytes) throw new IllegalArgumentException("Invalid referenced file limits"); }
+        public static Limits defaults() { return new Limits(4096,4096,8,32,32L*1024*1024,256L*1024*1024); }
     }
     enum PublishStage { FILE_FORCED,CONTENT_PUBLISHED,DIRECTORY_FORCED,REFERENCE_FORCED }
     @FunctionalInterface interface PublicationObserver { void at(PublishStage stage) throws IOException; }
@@ -185,7 +185,16 @@ public final class RatisReferencedFiles implements StateMachine.DataApi,AutoClos
         public synchronized ByteString read() throws IOException { if(released) throw new IOException("Referenced reader closed"); byte[] bytes=new byte[Math.toIntExact(reference.length())]; try(var channel=FileChannel.open(file(reference.sha256()),StandardOpenOption.READ)) { if(channel.size()!=reference.length()) throw new IOException("Referenced bytes changed"); var buffer=ByteBuffer.wrap(bytes); while(buffer.hasRemaining()) if(channel.read(buffer)<0) throw new EOFException("Referenced bytes shortened"); if(channel.size()!=reference.length()) throw new IOException("Referenced bytes changed"); } if(!MessageDigest.isEqual(hash(bytes),reference.sha256())) throw new IOException("Referenced bytes changed"); return ByteString.copyFrom(bytes); }
         public void close() throws IOException { synchronized(this) { if(released) return; released=true; } synchronized(RatisReferencedFiles.this) { String sha=HexFormat.of().formatHex(reference.sha256()); readers.compute(sha,(key,count) -> count==1 ? null : count-1); if(!readers.containsKey(sha)) readerBytes.remove(sha); } reclaim(); }
     }
-    public synchronized Reader pin(RatisReferencedFile reference) throws IOException { requireOpen(); requireGroup(reference.groupId()); if(!reference.equals(references.get(reference.index()))) throw new IOException("Reference is not owned/live"); if(readers.values().stream().mapToInt(Integer::intValue).sum()>=limits.maxPendingOperations()) throw new IOException("Referenced reader capacity exhausted"); String sha=HexFormat.of().formatHex(reference.sha256()); readers.merge(sha,1,Integer::sum); readerBytes.put(sha,reference.length()); return new Reader(reference); }
+    public synchronized Reader pin(RatisReferencedFile reference) throws IOException { requireOpen(); requireGroup(reference.groupId()); if(!reference.equals(references.get(reference.index()))) throw new IOException("Reference is not owned/live"); if(readers.values().stream().mapToInt(Integer::intValue).sum()>=limits.maxReaders()) throw new IOException("Referenced reader capacity exhausted"); String sha=HexFormat.of().formatHex(reference.sha256()); readers.merge(sha,1,Integer::sum); readerBytes.put(sha,reference.length()); return new Reader(reference); }
+    /** Atomically reserves metadata ownership; actual file I/O still uses its separate bounded executor admission. */
+    public synchronized List<Reader> pinAll(Collection<RatisReferencedFile> requested) throws IOException {
+        requireOpen();Objects.requireNonNull(requested);
+        int retained=readers.values().stream().mapToInt(Integer::intValue).sum();
+        if(requested.size()>limits.maxReaders()-retained)throw new IOException("Referenced bulk reader capacity exhausted");
+        var refs=List.copyOf(requested);var indices=new HashSet<Long>();
+        for(var reference:refs) { requireGroup(reference.groupId());if(!indices.add(reference.index()) || !reference.equals(references.get(reference.index())))throw new IOException("Bulk reference is duplicate or not owned/live"); }
+        var pinned=new ArrayList<Reader>(refs.size());for(var reference:refs)pinned.add(pin(reference));return List.copyOf(pinned);
+    }
     @Override public CompletableFuture<ByteString> read(LogEntryProto entry) {
         try { var request=request(entry); if(request==null) return CompletableFuture.completedFuture(ByteString.EMPTY); var reference=reference(entry,request); var reader=pin(reference); var future=new CompletableFuture<ByteString>(); future.whenComplete((value,error) -> { try { reader.close(); } catch(IOException cleanup) { synchronized(RatisReferencedFiles.this) { fenced=true; } } }); return submit(future,() -> { try(reader) { return reader.read(); } }); }
         catch(Exception failure) { return CompletableFuture.failedFuture(failure); }

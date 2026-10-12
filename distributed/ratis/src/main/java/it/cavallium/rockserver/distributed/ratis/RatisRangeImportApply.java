@@ -108,9 +108,11 @@ public final class RatisRangeImportApply {
     private Pins pin(RatisRangeImportRecord.Install record) throws IOException {
         var pinned=new Pins();
         try {
-            var metadata=files.pin(record.manifestReference()); pinned.readers.add(metadata);
+            var entries=record.fileReferences().entrySet().stream().sorted(Map.Entry.comparingByKey(Comparator.comparing(UUID::toString))).toList();
+            var refs=new ArrayList<RatisReferencedFile>();refs.add(record.manifestReference());entries.forEach(entry->refs.add(entry.getValue()));
+            pinned.readers.addAll(files.pinAll(refs));var metadata=pinned.readers.getFirst();
             var restored=NativeSstImportManifest.decode(metadata.read().toByteArray()); if(!Arrays.equals(restored.encode(),manifest.encode()))throw new IllegalArgumentException("Referenced manifest differs from frozen original import");
-            for(var entry:record.fileReferences().entrySet()) { var reader=files.pin(entry.getValue()); pinned.readers.add(reader); pinned.paths.put(entry.getKey(),reader.immutablePath()); }
+            for(int i=0;i<entries.size();i++)pinned.paths.put(entries.get(i).getKey(),pinned.readers.get(i+1).immutablePath());
             return pinned;
         } catch(IOException|RuntimeException failure) { try { pinned.close(); } catch(IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }

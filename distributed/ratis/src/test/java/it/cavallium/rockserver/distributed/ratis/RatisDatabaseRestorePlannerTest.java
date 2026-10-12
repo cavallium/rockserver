@@ -39,13 +39,16 @@ class RatisDatabaseRestorePlannerTest {
         byte[] malformed=f.definition.encode();java.nio.ByteBuffer.wrap(malformed).putInt(0,0);assertThrows(IllegalArgumentException.class,()->DatabaseBackupDefinition.decode(malformed));
         var limits=new DatabaseBackupDefinition.Limits(1,1,1,1,1);assertThrows(IllegalArgumentException.class,()->new DatabaseBackupDefinition(UUID.randomUUID(),f.definition.roster(),f.definition.domains(),limits));
     }
-    @Test void legalLargeArchiveRequiresStagedImportRatherThanTruncation() {
+    @Test void legalLargeArchivePlansSameUnsplittableIntervalWithoutTruncation() {
         var f=new RatisDatabaseBackupFixture(1,1024);var range=f.directory.ranges().getFirst();var pieces=new ArrayList<DatabaseBackupManifest.Chunk>();
-        for(int i=0;i<65;i++)pieces.add(new DatabaseBackupManifest.Chunk(f.domain,range.groupId(),f.column,i,f.cut,i==0?null:new byte[]{(byte)i},i==64?null:new byte[]{(byte)(i+1)},UUID.randomUUID(),1,new byte[32],1,new byte[]{(byte)i},new byte[]{(byte)i}));
-        var definition=new DatabaseBackupDefinition(f.definition.backupId(),f.definition.roster(),f.definition.domains(),new DatabaseBackupDefinition.Limits(1,1,65,1024,4*1024*1024));
+        for(int i=0;i<65;i++)pieces.add(new DatabaseBackupManifest.Chunk(f.domain,range.groupId(),f.column,i,f.cut,i==0?null:new byte[]{(byte)i},i==64?null:new byte[]{(byte)(i+1)},UUID.randomUUID(),9L*1024*1024,new byte[32],1,new byte[]{(byte)i},new byte[]{(byte)i}));
+        var definition=new DatabaseBackupDefinition(f.definition.backupId(),f.definition.roster(),f.definition.domains(),new DatabaseBackupDefinition.Limits(1,1,65,1024L*1024*1024,4*1024*1024));
         var complete=new DatabaseBackupManifest(definition,f.destination,f.held,List.of(f.cohort),pieces,List.of());assertEquals(65,complete.chunks().size());
-        var failure=assertThrows(IllegalArgumentException.class,()->RatisDatabaseRestorePlanner.plan(complete,UUID.randomUUID(),List.of(f.fresh()),UUID.randomUUID(),0));
-        assertTrue(failure.getMessage().contains("staged native import"));assertEquals(65,complete.chunks().size(),"Planning denial never truncates archived coverage");
+        var plan=RatisDatabaseRestorePlanner.plan(complete,UUID.randomUUID(),List.of(f.fresh()),UUID.randomUUID(),0);
+        var restored=plan.domains().getFirst();assertEquals(1,restored.initialDirectory().ranges().size());
+        var manifest=restored.imports().getFirst().manifests().getFirst();assertEquals(65,manifest.columns().getFirst().files().size());
+        assertEquals(RatisRangeImportRecord.DISTRIBUTED_LIMITS,manifest.limits());assertEquals(65,complete.chunks().size());assertTrue(manifest.columns().getFirst().files().stream().mapToLong(NativeSstImportManifest.File::bytes).sum()>512L*1024*1024);
+
     }
     @Test void executablePlanRequiresCommittedFreshIssuedGrant() {
         var f=new RatisDatabaseBackupFixture(1,1024);var cluster=UUID.randomUUID();var session=UUID.randomUUID();var plan=RatisDatabaseRestorePlanner.plan(f.manifest(f.emptyChunks()),cluster,List.of(f.fresh()),session,10);

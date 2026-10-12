@@ -29,7 +29,7 @@ class RatisRangeImportApplyTest {
         try(var env=new EnvOptions();var options=new Options();var writer=new SstFileWriter(env,options)) { writer.open(sst.toString()); if(deletion)writer.delete(new byte[]{2}); else writer.put(new byte[]{2},new byte[]{7}); writer.finish(); }
         byte[] bytes=Files.readAllBytes(sst); var schema=schema(); UUID id=UUID.randomUUID();
         var file=new NativeSstImportManifest.File(UUID.randomUUID(),bytes.length,MessageDigest.getInstance("SHA-256").digest(bytes),1,new byte[]{2},new byte[]{2});
-        var manifest=new NativeSstImportManifest(id,group,1,domain,schema.digest(),null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of(file))));
+        var manifest=new NativeSstImportManifest(id,group,1,domain,schema.digest(),null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of(file))),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
         var replica=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"local","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
         var range=new RangeDescriptor(UUID.randomUUID(),group,1,1,null,null,RangeDescriptor.TopologyState.FENCED,List.of(replica));
         var directory=new RangeDirectory(cluster,database,domain,0,schema.digest(),0,schema.columnIds(),0,List.of(range));
@@ -76,7 +76,7 @@ class RatisRangeImportApplyTest {
             machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,input.definition()),definition->{
                 reads.incrementAndGet(); if(block.get()){entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Catalogue fixture timeout");}catch(InterruptedException e){throw new IOException(e);}}
                 return new RatisRangeImportApply.PublicationView(published,definition.targetDirectory());
-            },input.definition().sourceDirectory().ranges().getFirst().replicas().getFirst()); machine.referencedFiles(files); machine.proofQueries(queries);
+            },input.definition().sourceDirectory().ranges().getFirst().replicas().getFirst()); machine.referencedFiles(files); machine.proofQueries(queries); machine.importPreflightQueries(queries);
             var server=(org.apache.ratis.server.RaftServer)java.lang.reflect.Proxy.newProxyInstance(org.apache.ratis.server.RaftServer.class.getClassLoader(),new Class<?>[]{org.apache.ratis.server.RaftServer.class},(proxy,method,args)->{
                 if(method.getName().equals("getId"))return peer.getId(); if(method.getName().equals("toString"))return "import-proposal-fixture"; throw new AssertionError(method);
             });
@@ -189,7 +189,7 @@ class RatisRangeImportApplyTest {
             var raft=org.apache.ratis.protocol.RaftGroup.valueOf(org.apache.ratis.protocol.RaftGroupId.valueOf(group),peer);
             var machine=new RatisRangeStateMachine(store,raft,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),command->{},command->{},()->new RatisRangeStateMachine.Leadership(1,true));
             var adapter=new RatisRangeImportApply(pool,store,files,input.definition(),stage->{if(stage==NativeRangeSstImport.Stage.COLUMN_INGESTED){entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Import fixture timeout");}catch(InterruptedException e){throw new IOException(e);}}});
-            machine.rangeImportApply(adapter,definition->{throw new AssertionError("Committed replay must not query catalogue");}); machine.referencedFiles(files); machine.proofQueries(queries);
+            machine.rangeImportApply(adapter,definition->{throw new AssertionError("Committed replay must not query catalogue");}); machine.referencedFiles(files); machine.proofQueries(queries); machine.importPreflightQueries(queries);
             var server=(org.apache.ratis.server.RaftServer)java.lang.reflect.Proxy.newProxyInstance(org.apache.ratis.server.RaftServer.class.getClassLoader(),new Class<?>[]{org.apache.ratis.server.RaftServer.class},(proxy,method,args)->{
                 if(method.getName().equals("getId"))return peer.getId(); if(method.getName().equals("toString"))return "import-apply-fixture"; throw new AssertionError(method);
             });
@@ -269,9 +269,45 @@ class RatisRangeImportApplyTest {
             var store=pool.openNewFencedRange(input.manifest(),input.schema()); assertTrue(store.importPending()); assertEquals(RangeOwnership.State.FENCED,store.ownership().state());
         }
         try(var pool=pool(path)) {
-            var changed=new NativeSstImportManifest(UUID.randomUUID(),group,1,domain,input.schema().digest(),null,null,input.manifest().columns());
+            var changed=new NativeSstImportManifest(UUID.randomUUID(),group,1,domain,input.schema().digest(),null,null,input.manifest().columns(),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
             assertThrows(IllegalStateException.class,()->pool.reopenImportRange(changed,input.schema()));
             var recovered=pool.reopenImportRange(input.manifest(),input.schema()); assertTrue(recovered.importPending()); assertEquals(RangeOwnership.State.FENCED,recovered.ownership().state()); assertThrows(IllegalStateException.class,recovered::activate);
         }
     }
+    @Test void sixtyFiveRealSstFilesInstallAndActivateThroughOneFencedRange()throws Exception{
+        RocksDB.loadLibrary();var schema=schema();UUID id=UUID.randomUUID(),client=UUID.randomUUID();var sources=new ArrayList<NativeSstImportManifest.File>();var payloads=new ArrayList<byte[]>();
+        for(int i=0;i<65;i++){
+            Path path=root.resolve("many-"+i+".sst");try(var env=new EnvOptions();var options=new Options();var writer=new SstFileWriter(env,options)){writer.open(path.toString());writer.put(new byte[]{(byte)i},new byte[]{(byte)(i+1)});writer.finish();}
+            byte[] bytes=Files.readAllBytes(path);payloads.add(bytes);sources.add(new NativeSstImportManifest.File(UUID.randomUUID(),bytes.length,MessageDigest.getInstance("SHA-256").digest(bytes),1,new byte[]{(byte)i},new byte[]{(byte)i}));
+        }
+        var manifest=new NativeSstImportManifest(id,group,1,domain,schema.digest(),null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,sources)),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
+        var replica=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"local","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
+        var range=new RangeDescriptor(UUID.randomUUID(),group,1,1,null,null,RangeDescriptor.TopologyState.FENCED,List.of(replica));
+        var directory=new RangeDirectory(cluster,database,domain,0,schema.digest(),0,schema.columnIds(),0,List.of(range));
+        var definition=new RangeImportDefinition(id,new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));
+        try(var executor=Executors.newSingleThreadExecutor();var files=new RatisReferencedFiles(root.resolve("many-refs"),group,RatisReferencedFiles.Limits.defaults(),executor);var pool=pool(root.resolve("many-pool"))){
+            var refs=new HashMap<UUID,RatisReferencedFile>();
+            for(int i=0;i<65;i++){files.write(RatisReferencedFilesTest.entry(group,client,i, i,payloads.get(i),true)).get(10,TimeUnit.SECONDS);refs.put(sources.get(i).fileId(),files.reference(1,i));}
+            files.write(RatisReferencedFilesTest.entry(group,client,65,65,manifest.encode(),true)).get(10,TimeUnit.SECONDS);
+            var install=new RatisRangeImportRecord.Install(id,group,1,definition.digest(),files.reference(1,65),refs);assertArrayEquals(install.encode(),RatisRangeImportRecord.decode(install.encode()).encode());
+            var store=pool.openNewFencedRange(manifest,schema);for(int i=0;i<=65;i++)store.applyNoop(new ApplyPosition(1,i));
+            var apply=new RatisRangeImportApply(pool,store,files,definition);apply.validateInstallProposal(install);var receipt=apply.applyInstall(new ApplyPosition(1,66),install);
+            assertEquals(RatisRangeImportApply.Phase.INSTALLED,apply.status().phase());assertTrue(store.importPending());
+            var published=new RatisRangeImportRecord.Publication(UUID.randomUUID(),new ApplyPosition(2,100),RatisRangeImportCatalogue.Head.prepared(definition).publish(new byte[32]));
+            var activation=new RatisRangeImportRecord.Activate(receipt,published);apply.validateActivationProposal(activation,d->new RatisRangeImportApply.PublicationView(published,definition.targetDirectory()));apply.applyActivate(new ApplyPosition(1,67),activation);
+            assertEquals(RatisRangeImportApply.Phase.PUBLISHED,apply.status().phase());assertFalse(store.importPending());
+            try(var snapshot=store.capture(new TransactionScope(List.of(TransactionScope.Span.range(column,null,null))))){for(int i=0;i<65;i++)assertArrayEquals(new byte[]{(byte)(i+1)},snapshot.get(column,new byte[]{(byte)i}));}
+        }
+    }
+
+    @Test void installInventoryWireBoundAndDeclaredPolicyAreCheckedBeforeNativeBirth() {
+        UUID client=UUID.randomUUID();var refs=new HashMap<UUID,RatisReferencedFile>();
+        for(int i=0;i<RatisRangeImportRecord.MAX_USER_FILES;i++)refs.put(UUID.randomUUID(),new RatisReferencedFile(group,1,i,client,i,1,new byte[32]));
+        var metadata=new RatisReferencedFile(group,1,RatisRangeImportRecord.MAX_USER_FILES,client,RatisRangeImportRecord.MAX_USER_FILES,1,new byte[32]);
+        var install=new RatisRangeImportRecord.Install(UUID.randomUUID(),group,1,new byte[32],metadata,refs);assertEquals(RatisRangeImportRecord.MAX_BYTES,install.encode().length);assertArrayEquals(install.encode(),RatisRangeImportRecord.decode(install.encode()).encode());
+        refs.put(UUID.randomUUID(),new RatisReferencedFile(group,1,4096,client,4096,1,new byte[32]));assertThrows(IllegalArgumentException.class,()->new RatisRangeImportRecord.Install(UUID.randomUUID(),group,1,new byte[32],metadata,refs));
+        var wide=new NativeSstImportManifest(UUID.randomUUID(),group,1,domain,schema().digest(),null,null,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of())),NativeSstImportManifest.Limits.defaults());
+        assertThrows(IllegalArgumentException.class,()->RatisRangeImportRecord.requirePolicy(wide));
+    }
+
 }

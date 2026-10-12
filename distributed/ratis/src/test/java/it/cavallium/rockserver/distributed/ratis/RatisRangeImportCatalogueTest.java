@@ -23,7 +23,7 @@ class RatisRangeImportCatalogueTest {
     static RangeImportDefinition definition(UUID cluster,UUID database,OperationId publication) {
         var owners=List.of(owner(1,ReplicaDescriptor.Role.VOTER),owner(2,ReplicaDescriptor.Role.LISTENER)); var range=new RangeDescriptor(id(10),id(11),2,3,null,null,RangeDescriptor.TopologyState.FENCED,owners);
         var directory=new RangeDirectory(cluster,database,id(20),1,new byte[32],7,Set.of(id(21)),0,List.of(range));
-        var manifest=new NativeSstImportManifest(id(22),range.groupId(),range.rangeEpoch(),directory.domainId(),directory.schemaDigest(),null,null,List.of(new NativeSstImportManifest.Column(id(21),"imported",false,List.of())));
+        var manifest=new NativeSstImportManifest(id(22),range.groupId(),range.rangeEpoch(),directory.domainId(),directory.schemaDigest(),null,null,List.of(new NativeSstImportManifest.Column(id(21),"imported",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
         return new RangeImportDefinition(id(22),publication,directory,List.of(manifest));
     }
     static RangeImportAdmission admission(RangeImportDefinition definition,long completed) {

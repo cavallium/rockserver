@@ -19,6 +19,8 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     public static RatisProofQueryService authorityLane() { return new RatisProofQueryService(1,"ratis-schema-authority-"); }
     public static final long IMPORT_PUBLICATION_BYTES=64L*1024*1024;
     public static RatisProofQueryService importPublicationLane(){return new RatisProofQueryService(1,"ratis-import-publication-",2,2*IMPORT_PUBLICATION_BYTES);}
+    public static final long IMPORT_PREFLIGHT_BYTES=4L*RatisRangeImportRecord.MAX_MANIFEST_BYTES;
+    public static RatisProofQueryService importPreflightLane(){return new RatisProofQueryService(1,"ratis-import-preflight-",2,2*IMPORT_PREFLIGHT_BYTES);}
     public static final long TOPOLOGY_IMAGE_BYTES=4*IMPORT_PUBLICATION_BYTES;
     public static RatisProofQueryService topologyImageLane(){return new RatisProofQueryService(1,"ratis-topology-image-",2,TOPOLOGY_IMAGE_BYTES);}
     // Eight copies cover request decoding/canonical validation plus bounded configuration/native reply transients.

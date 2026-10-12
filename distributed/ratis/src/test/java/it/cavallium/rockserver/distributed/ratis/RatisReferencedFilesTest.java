@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed.ratis;
 
+import java.io.IOException;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.*;
@@ -51,7 +52,7 @@ class RatisReferencedFilesTest {
     }
     @Test void rejectedTruncateDoesNotKeepItsFlagAndRetryAfterHeldReadSucceeds() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] payload={1,2,3}; var entry=entry(group,client,1,1,payload,true); var executor=new ControlledExecutor();
-        try(var owner=new RatisReferencedFiles(root.resolve("truncate-reject"),group,new RatisReferencedFiles.Limits(8,2,1,16,64),executor)) {
+        try(var owner=new RatisReferencedFiles(root.resolve("truncate-reject"),group,new RatisReferencedFiles.Limits(8,8,2,1,16,64),executor)) {
             var written=owner.write(entry); executor.run(); written.get(); var read=owner.read(entry); assertEquals(1,executor.jobs.size());
             assertThrows(ExecutionException.class,() -> owner.truncate(1).get()); assertThrows(java.io.IOException.class,owner::close);
             executor.run(); assertArrayEquals(payload,read.get().toByteArray());
@@ -61,7 +62,7 @@ class RatisReferencedFilesTest {
     }
     @Test void truncatePinsSharedContentUntilLastReaderAndChargesItAcrossNewAdmission() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] shared={1,2,3},replacement={4,5,6}; var path=root.resolve("shared");
-        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,2,4,3,3),executor)) {
+        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,8,2,4,3,3),executor)) {
             owner.write(entry(group,client,1,1,shared,true)).get(); owner.write(entry(group,client,2,2,shared,true)).get();
             var reference=owner.reference(1,2); try(var reader=owner.pin(reference)) {
                 owner.truncate(2).get(); try(var files=Files.list(path.resolve("content"))) { assertEquals(1,files.count()); } assertArrayEquals(shared,reader.read().toByteArray());
@@ -70,12 +71,12 @@ class RatisReferencedFilesTest {
             }
             owner.truncate(3).get(); owner.write(entry(group,client,3,3,replacement,true)).get(); owner.drain().get();
         }
-        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,2,4,3,3),executor)) {
+        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,8,2,4,3,3),executor)) {
             assertThrows(java.io.IOException.class,() -> owner.reference(1,1)); assertThrows(java.io.IOException.class,() -> owner.reference(1,2)); assertArrayEquals(replacement,owner.read(entry(group,client,3,3,replacement,false)).get().toByteArray()); owner.drain().get();
         }
     }
     @Test void corruptOversizedReadAndCorruptReopenFailClosedWithinSmallBounds() throws Exception {
-        UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] payload={1,2,3}; var path=root.resolve("corrupt"); var limits=new RatisReferencedFiles.Limits(8,2,4,8,32); Path content;
+        UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] payload={1,2,3}; var path=root.resolve("corrupt"); var limits=new RatisReferencedFiles.Limits(8,8,2,4,8,32); Path content;
         try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,limits,executor)) {
             var entry=entry(group,client,1,1,payload,true); owner.write(entry).get(); var reference=owner.reference(1,1); content=path.resolve("content").resolve(HexFormat.of().formatHex(reference.sha256())+".data");
             Files.write(content,new byte[16]); assertThrows(ExecutionException.class,() -> owner.read(entry).get()); owner.drain().get();
@@ -87,7 +88,7 @@ class RatisReferencedFilesTest {
     @Test void storedVerificationRetainsActualOwnershipAndRejectsChangedBytesAcrossBufferBoundaries() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID();byte[] payload=new byte[65537];Arrays.fill(payload,(byte)7);
         var executor=new ControlledExecutor();var path=root.resolve("stored-verification");
-        var limits=new RatisReferencedFiles.Limits(8,2,4,payload.length,2L*payload.length);var entry=entry(group,client,1,1,payload,true);
+        var limits=new RatisReferencedFiles.Limits(8,8,2,4,payload.length,2L*payload.length);var entry=entry(group,client,1,1,payload,true);
         try(var owner=new RatisReferencedFiles(path,group,limits,executor)) {
             var first=owner.write(entry);executor.runAll();first.get();owner.drain().get();
         }
@@ -104,7 +105,7 @@ class RatisReferencedFilesTest {
     }
     @Test void canceledCreationAndExecutorRejectionReleaseUnexposedStreamOwnership() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] payload={1,2,3}; var executor=new ControlledExecutor(); var path=root.resolve("unexposed");
-        try(var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,1,2,8,32),executor)) {
+        try(var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,8,1,2,8,32),executor)) {
             var observer=owner.stream(request(group,client,1,payload)); observer.cancel(false); executor.reject=true; executor.run(); assertThrows(java.io.IOException.class,owner::close);
             executor.reject=false; var drained=owner.drain(); executor.runAll(); drained.get();
             executor.reject=true; assertThrows(ExecutionException.class,() -> owner.stream(request(group,client,2,payload)).get()); executor.reject=false;
@@ -113,7 +114,7 @@ class RatisReferencedFilesTest {
     }
     @Test void duplicateStreamsReleaseTheirIncomingOwnershipAfterCanonicalPublication() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] payload={1,2,3}; var path=root.resolve("duplicates");
-        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,2,4,8,32),executor)) {
+        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,8,2,4,8,32),executor)) {
             var one=owner.stream(request(group,client,1,payload)).get(); var two=owner.stream(request(group,client,1,payload)).get();
             for(var stream:List.of(one,two)) { var bytes=java.nio.ByteBuffer.wrap(payload); while(bytes.hasRemaining()) stream.getDataChannel().write(bytes); stream.getDataChannel().close(); }
             var entry=entry(group,client,1,1,payload,false); owner.link(one,entry).get(); owner.link(two,entry).get(); owner.flush(1).get(); owner.drain().get();
@@ -123,7 +124,7 @@ class RatisReferencedFilesTest {
     }
     @Test void replacementIsRegisteredWithoutBlockingBehindExactTruncateCompletion() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] old={1,2,3},replacement={4,5,6}; var executor=new ControlledExecutor();
-        try(var owner=new RatisReferencedFiles(root.resolve("replacement"),group,new RatisReferencedFiles.Limits(8,2,4,8,32),executor)) {
+        try(var owner=new RatisReferencedFiles(root.resolve("replacement"),group,new RatisReferencedFiles.Limits(8,8,2,4,8,32),executor)) {
             var first=owner.write(entry(group,client,1,1,old,true)); executor.run(); first.get();
             var truncated=owner.truncate(1); var secondEntry=entry(group,client,2,1,replacement,true).toBuilder().setTerm(2).build(); var second=owner.write(secondEntry); var flush=owner.flush(1);
             assertFalse(truncated.isDone()); assertFalse(second.isDone()); assertFalse(flush.isDone()); assertThrows(java.io.IOException.class,owner::close);
@@ -134,16 +135,39 @@ class RatisReferencedFilesTest {
 
     @Test void publicationFenceStillAllowsExistingStreamCleanupAndActualDrain() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] payload={1,2,3}; var path=root.resolve("fenced-cleanup");
-        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,2,4,8,32),executor)) {
+        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,8,2,4,8,32),executor)) {
             var unlinked=owner.stream(request(group,client,1,payload)).get();
             owner.publicationObserver(stage -> { if(stage==RatisReferencedFiles.PublishStage.CONTENT_PUBLISHED) throw new java.io.IOException("Controlled uncertain publication"); });
             assertThrows(ExecutionException.class,() -> owner.write(entry(group,client,2,1,payload,true)).get());
             assertThrows(ExecutionException.class,() -> owner.flush(1).get()); assertThrows(java.io.IOException.class,owner::close);
             unlinked.cleanUp().get(); owner.drain().get();
         }
-        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,2,4,8,32),executor)) {
+        try(var executor=Executors.newSingleThreadExecutor(); var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,8,2,4,8,32),executor)) {
             assertThrows(java.io.IOException.class,() -> owner.reference(1,1)); try(var files=Files.list(path.resolve("content"))) { assertEquals(0,files.count()); }
         }
+    }
+
+    @Test void bulkFileOwnershipHasSeparateFiniteBudgetFromActualIoAdmission()throws Exception{
+        UUID group=UUID.randomUUID(),client=UUID.randomUUID();var limits=new RatisReferencedFiles.Limits(8,4,1,1,8,64);
+        try(var owner=new RatisReferencedFiles(root.resolve("bulk-pins"),group,limits,Runnable::run)){
+            for(int i=0;i<4;i++)owner.write(entry(group,client,i,i,new byte[]{(byte)i},true)).get(5,TimeUnit.SECONDS);
+            var refs=new ArrayList<RatisReferencedFile>();for(int i=0;i<4;i++)refs.add(owner.reference(1,i));
+            var pinned=owner.pinAll(refs);assertEquals(4,pinned.size());assertThrows(IOException.class,()->owner.pin(refs.getFirst()));
+            owner.truncate(0).get(5,TimeUnit.SECONDS);assertThrows(IOException.class,owner::close);
+            for(var reader:pinned){reader.verify();assertTrue(Files.exists(reader.immutablePath()));}
+            for(var reader:pinned)reader.close();owner.drain().get(5,TimeUnit.SECONDS);
+        }
+    }
+    @Test void bulkReservationRejectsBeforeOwningAnyReaderAndColdLowerQuotaRejectsInventory()throws Exception{
+        UUID group=UUID.randomUUID(),client=UUID.randomUUID();Path path=root.resolve("bulk-reject");var limits=new RatisReferencedFiles.Limits(8,2,1,1,8,64);
+        try(var owner=new RatisReferencedFiles(path,group,limits,Runnable::run)){
+            for(int i=0;i<3;i++)owner.write(entry(group,client,i,i,new byte[]{(byte)i},true)).get(5,TimeUnit.SECONDS);
+            assertThrows(IOException.class,()->owner.pinAll(List.of(owner.reference(1,0),owner.reference(1,1),owner.reference(1,2))));
+            assertThrows(IOException.class,()->owner.pinAll(List.of(owner.reference(1,0),owner.reference(1,0))));
+            try(var reader=owner.pin(owner.reference(1,0))){reader.verify();}
+        }
+        assertThrows(IOException.class,()->new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(2,2,1,1,8,64),Runnable::run));
+        try(var owner=new RatisReferencedFiles(path,group,limits,Runnable::run)){assertNotNull(owner.reference(1,2));}
     }
 
 }

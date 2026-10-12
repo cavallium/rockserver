@@ -66,7 +66,7 @@ class RatisNodeManifestTest {
         var fenced=new RangeDirectory(active.clusterId(),active.databaseId(),active.domainId(),active.schemaEpoch(),active.schemaDigest(),active.generation(),active.columns(),active.routingPrefixBytes(),List.of(
                 new RangeDescriptor(range.rangeId(),range.groupId(),range.rangeEpoch(),range.configurationVersion(),null,null,RangeDescriptor.TopologyState.FENCED,range.replicas())));
         UUID job=UUID.randomUUID(); var columns=original.plan().columns().entrySet().stream().map(entry -> new NativeSstImportManifest.Column(entry.getKey(),entry.getValue(),false,List.of())).toList();
-        var nativeManifest=new NativeSstImportManifest(job,range.groupId(),range.rangeEpoch(),fenced.domainId(),fenced.schemaDigest(),null,null,columns);
+        var nativeManifest=new NativeSstImportManifest(job,range.groupId(),range.rangeEpoch(),fenced.domainId(),fenced.schemaDigest(),null,null,columns,RatisRangeImportRecord.DISTRIBUTED_LIMITS);
         var definition=new RangeImportDefinition(job,new OperationId(UUID.randomUUID(),1,0),fenced,List.of(nativeManifest));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,fenced,original.plan().catalogue(),original.plan().columns(),Set.of(),20));
         var configured=new RatisNodePlan(NODE,INCARNATION,fenced,original.plan().catalogue(),original.plan().columns(),Set.of(),List.of(),List.of(definition),20);

@@ -14,7 +14,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Caller-driven durable SST import. Transports are borrowed; owned originals survive close/reopen. */
 public final class RatisRangeImportController implements AutoCloseable {
-    public static final int MAX_JOBS=8, MAX_SOURCE_FILES=RangeImportDefinition.MAX_GROUPS*NativeSstImportManifest.MAX_FILES, MAX_METADATA_BYTES=RatisSchemaClientJournal.MAX_BYTES;
+    public static final int MAX_JOBS=8, MAX_SOURCE_FILES=32768, MAX_METADATA_BYTES=RatisSchemaClientJournal.MAX_BYTES;
     public static final long MAX_SOURCE_BYTES=64L*1024*1024*1024;
     public enum Phase { SOURCES, DEFINITION, BEGIN, FILES, INSTALL, ADMISSION, PUBLISH, ACTIVATE, ACTIVATION_ADMISSION, COMPLETE, DONE, CONFLICT }
     public record Progress(UUID importId,Phase phase,RatisRangeImportCatalogue.Head published,RatisRangeImportCatalogue.Head completed) {}
@@ -62,10 +62,10 @@ public final class RatisRangeImportController implements AutoCloseable {
         begin(); try { return prepareOwned(definition,sources); } finally { end(); }
     }
     private Handle prepareOwned(RangeImportDefinition definition,Map<Source,Path> sources) throws IOException {
-        requireOpen(); requireNamespace(definition); UUID id=definition.importId();
+        requireOpen(); requireNamespace(definition); requirePolicy(definition); UUID id=definition.importId();
         if(handles.containsKey(id) || Files.exists(path(id))) throw new IOException("Import already retained; reopen original import");
         long retained=0; int jobs=0;
-        try(var files=Files.newDirectoryStream(root,"*.import")) { for(var file:files) { jobs++; var fields=RatisSchemaClientJournal.read(file); retained=Math.addExact(retained,sourceBytes(RangeImportDefinition.decode(fields.get("definition")))); } }
+        try(var files=Files.newDirectoryStream(root,"*.import")) { for(var file:files) { jobs++; var fields=RatisSchemaClientJournal.read(file); var saved=RangeImportDefinition.decode(fields.get("definition"));requirePolicy(saved);retained=Math.addExact(retained,sourceBytes(saved)); } }
         long bytes=sourceBytes(definition); if(jobs>=MAX_JOBS || bytes>MAX_SOURCE_BYTES-retained) throw new IOException("Import job/source capacity exhausted");
         var expected=new HashSet<Source>(); definition.manifests().forEach(m -> m.columns().forEach(c -> c.files().forEach(f -> expected.add(new Source(m.groupId(),f.fileId())))));
         long fileCount=definition.manifests().stream().flatMap(m -> m.columns().stream()).mapToLong(c -> c.files().size()).sum();
@@ -89,7 +89,7 @@ public final class RatisRangeImportController implements AutoCloseable {
         final Handle h;
         try { h=new Handle(importId,RatisSchemaClientJournal.read(path(importId))); } catch(IllegalArgumentException malformed) { throw new IOException("Invalid retained import definition",malformed); }
         try {
-            var d=h.definition(); requireNamespace(d); h.phase();
+            var d=h.definition(); requireNamespace(d); requirePolicy(d); h.phase();
             if(!d.importId().equals(importId) || !Arrays.equals(bindingBytes(),h.fields.get("binding")) || UUID.fromString(text(h,"issuer")).equals(d.operation().sessionId()) || number(h,"sequence")<0 || number(h,"cursor")<0) throw new IllegalArgumentException("Import journal identity differs");
             if(h.fields.containsKey("pendingCommand")) validateCommand(h,DistributedCommandCodec.decode(h.fields.get("pendingCommand")));
             if(h.fields.containsKey("pendingAck")) validateCommand(h,DistributedCommandCodec.decode(h.fields.get("pendingAck")));
@@ -248,6 +248,11 @@ public final class RatisRangeImportController implements AutoCloseable {
     private RatisSchemaAdministration.Head schemaHead(Handle h) { return h.fields.containsKey("schemaHead") ? RatisSchemaAdministration.Head.decode(h.fields.get("schemaHead")) : null; }
     private static List<RangeDescriptor> importedRanges(RangeImportDefinition d) { var groups=new HashSet<UUID>(); d.manifests().forEach(m -> groups.add(m.groupId())); return d.sourceDirectory().ranges().stream().filter(r -> groups.contains(r.groupId())).toList(); }
     private static long sourceBytes(RangeImportDefinition d) { long total=0; for(var m:d.manifests()) { total=Math.addExact(total,m.encode().length); for(var c:m.columns()) for(var f:c.files()) total=Math.addExact(total,f.bytes()); } return total; }
+    private static void requirePolicy(RangeImportDefinition d) throws IOException {
+        for(var manifest:d.manifests())RatisRangeImportRecord.requirePolicy(manifest);
+        long count=d.manifests().stream().flatMap(m->m.columns().stream()).mapToLong(c->c.files().size()).sum();
+        if(count>MAX_SOURCE_FILES || sourceBytes(d)>MAX_SOURCE_BYTES || d.encode().length>RangeImportDefinition.MAX_BYTES)throw new IOException("Import source/definition envelope exceeds finite policy");
+    }
     private void requireNamespace(RangeImportDefinition d) { if(!d.sourceDirectory().clusterId().equals(cluster) || !d.sourceDirectory().databaseId().equals(database)) throw new IllegalArgumentException("Foreign import namespace"); }
     private byte[] bindingBytes() { var b=ByteBuffer.allocate(88); ScopedTransactionRpc.uuid(b,binding.groupId()); b.putLong(binding.epoch()).put(binding.schemaDigest()); ScopedTransactionRpc.uuid(b,binding.directoryColumn()); ScopedTransactionRpc.uuid(b,binding.sessionsColumn()); return b.array(); }
     private static String sourceKey(Source source) { return source.groupId()+"/"+source.fileId(); }
@@ -260,13 +265,19 @@ public final class RatisRangeImportController implements AutoCloseable {
     private static void number(Handle h,String key,long value) { h.fields.put(key,ByteBuffer.allocate(8).putLong(value).array()); }
     private void save(Handle h) throws IOException { try { RatisSchemaClientJournal.write(path(h.id),h.fields); } catch(IOException failure) { fenced=true; throw failure; } }
     private static byte[] encodeEntries(Map<String,byte[]> entries) throws IOException {
-        var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(entries.size());
+        long length=4;
+        for(var entry:entries.entrySet()) {
+            String key=entry.getKey();if(key.length()>128 || entry.getValue()==null)throw new IOException("Invalid import metadata entry");
+            int utf=0;for(int i=0;i<key.length();i++){char c=key.charAt(i);utf+=c>=1 && c<=127?1:c<=2047?2:3;}
+            length+=6L+utf+entry.getValue().length;if(length>MAX_METADATA_BYTES-32)throw new IOException("Import metadata entries exceed bound before allocation");
+        }
+        var bytes=new ByteArrayOutputStream((int)length); var out=new DataOutputStream(bytes); out.writeInt(entries.size());
         for(var key:entries.keySet().stream().sorted().toList()) { out.writeUTF(key); byte[] value=entries.get(key); out.writeInt(value.length); out.write(value); if(bytes.size()>MAX_METADATA_BYTES-32) throw new IOException("Import metadata entries exceed bound"); }
         out.flush(); return bytes.toByteArray();
     }
     private static Map<String,byte[]> decodeEntries(byte[] bytes) throws IOException {
         if(bytes==null) return new HashMap<>(); var in=new DataInputStream(new ByteArrayInputStream(bytes)); int count=in.readInt();
-        if(count<0 || count>MAX_SOURCE_FILES+RangeImportDefinition.MAX_GROUPS) throw new IOException("Invalid import metadata count"); var entries=new HashMap<String,byte[]>();
+        if(count<0 || count>MAX_SOURCE_FILES+RangeImportDefinition.MAX_GROUPS || 6L*count>in.available()) throw new IOException("Invalid import metadata count"); var entries=new HashMap<String,byte[]>();
         for(int i=0;i<count;i++) { String key=in.readUTF(); int n=in.readInt(); if(key.length()>128 || n<0 || n>in.available() || entries.containsKey(key)) throw new IOException("Invalid import metadata entry"); entries.put(key,in.readNBytes(n)); }
         if(in.available()!=0) throw new IOException("Trailing import metadata entries"); return entries;
     }

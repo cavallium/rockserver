@@ -708,6 +708,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         boolean qualified=false;try{if(relocationObserver.saved(record)){synchronized(admissions){hold.reading=false;hold.qualified=true;requireRelocationHold(hold,leadership());qualified=true;}return;}var purpose=record.action()==RatisTopologyRelocationRecord.Action.AUTHORIZE?RatisTopologyJoinAuthority.Purpose.SOURCE_CONFIGURATION:RatisTopologyJoinAuthority.Purpose.PUBLICATION;var request=RatisTopologyJoinAuthority.Request.of(record.definition().header(),topologyLocalReplica.replicaId(),purpose);var view=relocationAuthority.read(request);view.require(request);if(!view.catalogue().equals(record.catalogue()) || !java.util.Arrays.equals(view.definition().encode(),record.definition().encode()) || !RatisRelocationOwnerRpc.covers(view.cut(),record.catalogueCut()))throw new IOException("Relocation catalogue witness differs");var cfg=store.configuration();var cut=store.applied();byte[] expected=record.action()==RatisTopologyRelocationRecord.Action.AUTHORIZE?record.sourceConfiguration():record.targetConfiguration();if(cfg==null || cut==null || cut.term()!=leader.term() || !java.util.Arrays.equals(cfg.data(),expected))throw new IOException("Relocation native configuration changed");requireActualMembership(getServer().getNow(null).getDivision(getGroupId()).getRaftConf(),record.action()==RatisTopologyRelocationRecord.Action.AUTHORIZE?record.definition().parents().getFirst():record.definition().targets().getFirst());if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && !java.util.Arrays.equals(view.state().relocation().configurationDigest(),OperatorUpload.sha256(expected)))throw new IOException("Publication committed another configuration");synchronized(admissions){hold.reading=false;hold.qualified=true;requireRelocationHold(hold,leadership());qualified=true;}}finally{synchronized(admissions){hold.reading=false;if(!qualified)releaseRelocation(hold);}}
     }
     private TransactionContext startRelocation(TransactionContext transaction,RatisTopologyRelocationRecord record)throws IOException{synchronized(admissions){var hold=relocationHold;requireRelocationHold(hold,leadership());if(!hold.record.equals(record))throw new IOException("Relocation frozen record changed");hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}}
+    private ProofQueryExecutor importPreflightQueries;
+    void importPreflightQueries(ProofQueryExecutor executor){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || importPreflightQueries!=null)throw new IllegalStateException("Import preflight lane fixed before initialization");importPreflightQueries=java.util.Objects.requireNonNull(executor);}
+    private int qualifiedImportManifestBytes(Object record){var definition=rangeImportApply.definition();if(record instanceof RatisRangeImportRecord proposal)proposal.requireDefinition(definition);else if(!(record instanceof RatisReferencedFile.Request))throw new IllegalArgumentException("Unknown import preparation subject");var manifest=definition.manifest(store.ownership().owner().groupId());RatisRangeImportRecord.requirePolicy(manifest);return manifest.limits().maximumEncodedBytes();}
     private byte[] applyRelocation(ApplyPosition position,RatisTopologyRelocationRecord record)throws Exception{
         if(relocationObserver==null)throw new IOException("Committed relocation lacks durable node owner");relocationObserver.persist(record,position);byte[] result;
         if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && store.topologyLearnerRegistration()!=null)result=store.applyTopologyRelocationCompletion(position,record.definition(),record.targetConfiguration(),record.catalogue(),record.catalogueCut()).encode();else{store.applyNoop(position,null);result=new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode();}
@@ -4143,7 +4146,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 });
             }
             if(ScopedTransactionRpc.importApply(kind)) {
-                if(!freshBarrier || role!=RatisNodePlan.Role.DATA || rangeImportApply==null || proofQueries==null)throw new IOException("Native import preparation requires configured fresh DATA barrier");
+                if(!freshBarrier || role!=RatisNodePlan.Role.DATA || rangeImportApply==null || importPreflightQueries==null)throw new IOException("Native import preparation requires configured fresh DATA barrier");
                 var record=RatisRangeImportRpc.proposal(encoded); requireImportProposal(record);
                 if(kind==ScopedTransactionRpc.IMPORT_APPLY_CANCEL){
                     synchronized(admissions){var hold=importApplyHold;if(hold!=null && Arrays.equals(hold.bytes,importProposalBytes(record)) && !hold.submitted){hold.invalidated=true;releaseImportApply(hold);}}
@@ -4151,8 +4154,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 long generation=admissionGeneration.get();
                 long weight=record instanceof RatisRangeImportRecord.Activate ? 4L*RatisRangeImportAuthority.MAX_REPLY_BYTES
-                        : 4L*it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES;
-                return proofQueries.submit(store.ownership().owner().groupId(),encoded,weight,false,owned->{
+                        : 4L*qualifiedImportManifestBytes(record);
+                return importPreflightQueries.submit(store.ownership().owner().groupId(),encoded,weight,false,owned->{
                     prepareImportApply(RatisRangeImportRpc.proposal(owned),generation);return Message.valueOf(ByteString.copyFrom(owned));
                 });
             }
