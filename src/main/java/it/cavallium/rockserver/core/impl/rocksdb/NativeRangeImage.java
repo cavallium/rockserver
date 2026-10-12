@@ -235,6 +235,7 @@ public final class NativeRangeImage {
                 byte[] key = new byte[keyLength];
                 input.readFully(key);
                 if(section==Section.STATE && key.length>16 && key[16]==0x64 && valueLength>NativeTopologyImageOrigin.MAX_BYTES) throw new IOException("Topology image origin exceeds canonical bound");
+                if(section==Section.STATE && key.length>16 && key[16]==0x69 && (key.length!=17 || valueLength!=48))throw new IOException("Invalid learner image receipt length");
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
@@ -419,6 +420,7 @@ public final class NativeRangeImage {
         private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest importBirth;
         private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.Receipt importReceipt;
         private it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration learnerAdoption;
+        private byte[] learnerImageReceipt;
         private NativeRangeSstImport.Activation importActivation;
         private int importFileReceipts;
         private long importFileReceiptCount;
@@ -535,6 +537,7 @@ public final class NativeRangeImage {
                         }
                     } catch(IllegalArgumentException invalid) { throw new IOException("Invalid topology image provenance",invalid); }
                 }
+                if(section==Section.STATE && key.length==17 && key[16]==0x69){if(value.length!=48)throw new IOException("Invalid learner image receipt");learnerImageReceipt=value.clone();}
                 if(section==Section.STATE && key.length==17 && key[16]==0x67){try{learnerAdoption=it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.decode(value);}catch(IllegalArgumentException invalid){throw new IOException("Invalid learner adoption evidence",invalid);}}
                 if(section==Section.STATE && key.length>16 && (key[16]==0x65 || key[16]==0x66)) {
                     try {
@@ -828,11 +831,21 @@ public final class NativeRangeImage {
                     if(old==null || prepared.preparation().scope().spans().stream().anyMatch(span -> !old.columnIds().contains(span.columnId()))) throw new IOException("Historical preparation columns differ");
                 }
             }
+            if(learnerAdoption!=null) {
+                var descriptor=learnerAdoption.definition().targets().getFirst();
+                byte[] expected=ByteBuffer.allocate(48).putLong(learnerAdoption.imageCut().term()).putLong(learnerAdoption.imageCut().index()).put(learnerAdoption.imageHash()).array();
+                var cut=learnerAdoption.imageCut();
+                if(!descriptor.groupId().equals(header.owner().groupId()) || descriptor.rangeEpoch()!=header.owner().epoch() || !learnerAdoption.schema().domainId().equals(header.interval().domainId()) || !Arrays.equals(descriptor.lowerInclusive(),header.interval().lowerInclusive()) || !Arrays.equals(descriptor.upperExclusive(),header.interval().upperExclusive()) || !Arrays.equals(expected,learnerImageReceipt) || cut.index()>header.position().index() || cut.term()>header.position().term() || cut.index()==header.position().index() && cut.term()!=header.position().term())throw new IOException("Learner image lacks original qualified import evidence");
+                boolean currentLearnerSchema=Arrays.equals(header.schema(),learnerAdoption.schema().digest()) && header.interval().columns().equals(learnerAdoption.schema().columnIds());
+                if(!currentLearnerSchema && (schemaInstallation==null || currentSchemaActivation==null || schemaInstallations.stream().noneMatch(record->Arrays.equals(record.definition().sourceSchema().digest(),learnerAdoption.schema().digest()) && record.sourceNames().equals(learnerAdoption.physicalNames()) && record.sourceMerges().equals(learnerAdoption.mergeColumns()))))throw new IOException("Learner image lacks verified current schema evolution");
+                for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] expectedRow=learnerAdoption.localSchemaRows().get(HexFormat.of().formatHex(key));if(expectedRow!=null && !Arrays.equals(expectedRow,record.encode()))throw new IOException("Learner image changed adopted schema aliases");}
+                if(learnerAdoption.origin()==null && (topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null))throw new IOException("Ordinary learner image acquired birth provenance");
+            } else if(learnerImageReceipt!=null)throw new IOException("Learner image receipt lacks registration");
             if(topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null) {
                 if(topologyOrigin==null || topologyBirth==null || topologyActivation==null || topologyFreeze!=null || importBirth!=null
                         || !topologyBirth.equals(topologyOrigin.activation().birth()) || !Arrays.equals(topologyActivation.encode(),topologyOrigin.activation().encode())) throw new IOException("Topology image lacks exact complete birth/activation/origin provenance");
                 var seed=topologyOrigin.seed(); var source=seed.definition().sourceDirectory();
-                Map<String,byte[]> adoptedMutable=Map.of();if(topologyOrigin.learnerAdoptionDigest()!=null){if(learnerAdoption==null || !Arrays.equals(topologyOrigin.learnerAdoptionDigest(),learnerAdoption.digest()) || !Arrays.equals(seed.encode(),learnerAdoption.origin().seed().encode()) || !Arrays.equals(topologyActivation.encode(),learnerAdoption.origin().activation().encode()))throw new IOException("Topology alias bridge lacks exact original learner adoption");adoptedMutable=learnerAdoption.localSchemaRows();for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] expected=adoptedMutable.get(HexFormat.of().formatHex(key));if(expected!=null && !Arrays.equals(expected,record.encode()))throw new IOException("Learner image changed normalized historical alias evidence");}}
+                Map<String,byte[]> adoptedMutable=Map.of();if(topologyOrigin.learnerAdoptionDigest()!=null){if(learnerAdoption==null || learnerAdoption.origin()==null || !Arrays.equals(topologyOrigin.learnerAdoptionDigest(),learnerAdoption.digest()) || !Arrays.equals(seed.encode(),learnerAdoption.origin().seed().encode()) || !Arrays.equals(topologyActivation.encode(),learnerAdoption.origin().activation().encode()))throw new IOException("Topology alias bridge lacks exact original learner adoption");adoptedMutable=learnerAdoption.localSchemaRows();for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] expected=adoptedMutable.get(HexFormat.of().formatHex(key));if(expected!=null && !Arrays.equals(expected,record.encode()))throw new IOException("Learner image changed normalized historical alias evidence");}}
 
                 final Map<String,byte[]> adopted=adoptedMutable;
                 boolean original=Arrays.equals(source.schemaDigest(),header.schema()) && source.columns().equals(header.interval().columns()) && seed.mergeColumns().equals(header.mergeColumns());
