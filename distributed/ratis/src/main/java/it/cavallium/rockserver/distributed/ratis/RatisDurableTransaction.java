@@ -93,7 +93,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
             TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents) throws IOException {
         var journal=new RatisDurableTransaction(path,homes,data,true);
         try {
-            journal.initial=Objects.requireNonNull(initial); initial.requireInitial();
+            journal.initial=Objects.requireNonNull(initial); initial.requireInitial(); if(initial.reserved())throw new IllegalArgumentException("Participant journal requires promoted HOME initial status");
             journal.validateRegistration(registration);
             if (intents.size()!=initial.participants().size()) throw new IllegalArgumentException("Missing participant intents");
             for (var intent:intents) {
@@ -141,7 +141,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private boolean homeSupersedesPending() {
         if (pending==null || observed==null) return false;
         var before=expected(pending);
-        return before==null ? initial.sameDefinition(observed) : before.sameDefinition(observed) && observed.generation()>before.generation();
+        return before==null || before.reserved() ? initial.sameDefinition(observed) : before.sameDefinition(observed) && observed.generation()>before.generation();
     }
     public synchronized Snapshot snapshot() throws IOException {
         requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,pendingRecovery,recoveryReceipt,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof);
@@ -149,6 +149,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     /** Returns the globally ordered business outcome only after every native finalization and home ACK is durable. */
     public synchronized CommandResult result() throws IOException {
         requireOpen();
+        if(noEffectReservationState(observed) && observed.terminal())return new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of());
         if (homeRetirementProof!=null && (observed==null || !observed.fullyFinalized()
                 || entries.values().stream().anyMatch(entry -> entry.outcome==null && (observed.phase()!=TransactionStatus.Phase.ABORT || entry.retirementProof==null)))) throw new RatisTransactionOutcomeExpiredException(initial.transactionId());
         if (observed==null || !observed.fullyFinalized() || entries.values().stream().anyMatch(entry -> entry.outcome==null && entry.retirementProof==null)) throw new IllegalStateException("Transaction result requires all participant proofs and home ACKs");
@@ -221,6 +222,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
                     if (observed!=null && observed.generation()>successful.generation()) requireMonotone(successful,observed);
                     else observe(successful);
                 }
+                if(result.status()==CommandResult.Status.SESSION_EXPIRED && pendingRecovery==null && expected(request)!=null && expected(request).reserved()) {
+                    if(!noEffectReservationState(expected(request)))throw new IOException("Expired promotion has participant effects");
+                    observed=expected(request);
+                }
                 homeResult=result; recoveryReceipt=retained; persist(); return result;
             }
         } catch (RatisHomeRetiredException retired) {
@@ -235,7 +240,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         }
         var next=next(request); var expected=expected(request);
         if (observed==null) {
-            if (expected!=null || !next.equals(initial) || homeResult==null || homeResult.status()==CommandResult.Status.SUCCESS) throw new IllegalArgumentException("Registration retry requires a definite no-effects home result");
+            if (!Objects.equals(expected,registrationExpected()) || !next.equals(initial) || homeResult==null || homeResult.status()==CommandResult.Status.SUCCESS) throw new IllegalArgumentException("Registration retry requires a definite no-effects home result");
         } else {
             if (expected==null || !expected.equals(observed)) throw new IllegalArgumentException("Home CAS does not use current observed image");
             next.requireSuccessorOf(observed); validateEvidence(next);
@@ -265,7 +270,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         pendingRecovery=request; pending=request.command(); recoverySequence++; recoveryReceipt=null; homeResult=null; homeSuperseded=false; persist();
     }
     private static boolean protectedTransition(TransactionStatus before,TransactionStatus next) {
-        if (before.phase()==TransactionStatus.Phase.PREPARING) return next.phase()==TransactionStatus.Phase.ABORT;
+        if (before.phase()==TransactionStatus.Phase.PREPARING || before.reserved()) return next.phase()==TransactionStatus.Phase.ABORT;
         return next.participants().stream().anyMatch(p -> p.finalized() && !before.participants().stream().filter(old -> old.groupId().equals(p.groupId())).findFirst().orElseThrow().finalized());
     }
     public TransactionStatus refreshHome() throws IOException {
@@ -274,7 +279,12 @@ public final class RatisDurableTransaction implements AutoCloseable {
             var read=homes.readRegistration(initial.transactionId());
             try { requireHomeRoute(read.descriptor()); } catch (IllegalArgumentException invalid) { throw new IOException("Home read changed frozen range incarnation",invalid); }
             var status=read.status();
-            if (status==null || !initial.sameDefinition(status)) {
+            if(status!=null && status.reserved()) {
+                if(!status.equals(registrationExpected()))throw new IOException("HOME reservation differs from promoted journal origin");
+                synchronized(this){if(observed!=null && !observed.reserved())throw new IOException("Promoted HOME regressed to reservation");}
+                return status;
+            }
+            if (status==null || !initial.sameDefinition(status) && !noEffectReservationState(status)) {
                 var retirement=homes.fence(homes.identity(initial,homeRoute));
                 if (retirement!=null) { synchronized (this) { mergeHomeRetirement(retirement); persist(); } throw new RatisHomeRetiredException(retirement); }
             }
@@ -334,6 +344,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid native participant proof",invalid); }
     }
     private void validateEvidence(TransactionStatus next) {
+        if(noEffectReservationState(next))return;
         if (!initial.sameDefinition(next)) throw new IllegalArgumentException("Home definition changed");
         boolean choosingCommit=observed.phase()==TransactionStatus.Phase.PREPARING && next.phase()==TransactionStatus.Phase.COMMIT;
         for (var participant:next.participants()) {
@@ -345,9 +356,18 @@ public final class RatisDurableTransaction implements AutoCloseable {
         }
         if (next.consumed() && entries.values().stream().anyMatch(e -> e.outcome==null && (next.phase()!=TransactionStatus.Phase.ABORT || e.retirementProof==null))) throw new IllegalArgumentException("Consumption lacks every terminal outcome or ABORT fence");
     }
+    /** An expired promotion may retire its original reservation without any participant effects. */
+    synchronized boolean noEffectReservationState(TransactionStatus status) {
+        var reserved=registrationExpected();
+        return reserved!=null && status!=null && reserved.sameDefinition(status) && (status.reserved() || status.phase()==TransactionStatus.Phase.ABORT && status.participants().isEmpty())
+                && entries.values().stream().allMatch(e->e.registration==null && e.preparation==null && e.vote==null && e.finalization==null && e.receipt==null && e.outcome==null && e.retirementProof==null);
+    }
     private void observe(TransactionStatus status) throws IOException {
-        requireMonotone(initial,status);
-        if (observed!=null) requireMonotone(observed,status);
+        if(!noEffectReservationState(status))requireMonotone(initial,status);
+        if (observed!=null) {
+            if(observed.reserved()) {try{status.requireSuccessorOf(observed);}catch(IllegalArgumentException invalid){throw new IOException("Reserved HOME recovery changed original origin",invalid);}}
+            else requireMonotone(observed,status);
+        }
         observed=status;
     }
     private static void requireMonotone(TransactionStatus before,TransactionStatus after) throws IOException {
@@ -379,8 +399,11 @@ public final class RatisDurableTransaction implements AutoCloseable {
     }
     private void validateRegistration(RatisRoutedClient.PreparedCommand registration) {
         homes.restore(registration.command(),registration.descriptor());
-        if (expected(registration)!=null || !initial.equals(next(registration))) throw new IllegalArgumentException("Invalid frozen home registration");
+        if (!Objects.equals(expected(registration),registrationExpected()) || !initial.equals(next(registration))) throw new IllegalArgumentException("Invalid frozen home registration");
         homeRoute=registration.descriptor();
+    }
+    synchronized TransactionStatus registrationExpected() {
+        return initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.schemaEpoch(),initial.schemaDigest());
     }
     private RangeDescriptor homeRoute;
     private RangeDescriptor homeRoute() { return homeRoute; }
@@ -502,9 +525,9 @@ public final class RatisDurableTransaction implements AutoCloseable {
             if (input.getInt()!=MAGIC) throw new IOException("Invalid transaction journal format");
             byte[] bound=new byte[32],homeBound=new byte[32]; input.get(bound).get(homeBound);
             if (!Arrays.equals(bound,identity) || !Arrays.equals(homeBound,homeIdentity)) throw new IOException("Wrong transaction journal client identity");
-            initial=TransactionStatus.decode(blob(input,TransactionStatus.MAX_BYTES,false)); initial.requireInitial(); homeRoute=SessionWindowJournal.route(input); lastHome=operation(input); recoveryNamespace=new UUID(input.getLong(),input.getLong()); recoverySequence=input.getLong();
+            initial=TransactionStatus.decode(blob(input,TransactionStatus.MAX_BYTES,false)); initial.requireInitial(); if(initial.reserved())throw new IllegalArgumentException("Participant journal requires promoted HOME initial status"); homeRoute=SessionWindowJournal.route(input); lastHome=operation(input); recoveryNamespace=new UUID(input.getLong(),input.getLong()); recoverySequence=input.getLong();
             byte[] status=blob(input,TransactionStatus.MAX_BYTES,true); observed=status==null ? null : TransactionStatus.decode(status);
-            if (observed!=null) requireMonotone(initial,observed);
+            if (observed!=null && !noEffectReservationState(observed)) requireMonotone(initial,observed);
             int homeKind=input.get() & 255; if (homeKind>2) throw new IOException("Invalid pending home request kind");
             if (homeKind!=0) {
                 byte[] command=blob(input,homeKind==2 ? HomeRecovery.MAX_BYTES : DistributedCommandCodec.MAX_ENCODED_BYTES,false); var route=SessionWindowJournal.route(input);
@@ -551,8 +574,9 @@ public final class RatisDurableTransaction implements AutoCloseable {
                     if (!value.operation().equals(intent.finalizeControl()) || observed==null || observed.phase()==TransactionStatus.Phase.PREPARING || !value.decision().equals(observed.terminalDecision())) throw new IOException("Frozen finalization differs from home/intent");
                 }
             }
+            if (observed!=null && !initial.sameDefinition(observed) && !noEffectReservationState(observed))throw new IOException("Reserved recovery journal has participant effects");
             if (input.hasRemaining()) throw new IOException("Trailing transaction journal bytes");
-            if (pending==null || pendingRecovery==null && !pending.command().operationId().equals(lastHome) || !initial.sameDefinition(next(pending))) throw new IOException("Invalid journal home request");
+            if (pending==null || pendingRecovery==null && !pending.command().operationId().equals(lastHome) || !initial.sameDefinition(next(pending)) && !noEffectReservationState(next(pending))) throw new IOException("Invalid journal home request");
             if (expected(pending)==null) { if (!next(pending).equals(initial)) throw new IOException("Invalid journal registration"); }
             else next(pending).requireSuccessorOf(expected(pending));
             if (pendingRecovery!=null) {

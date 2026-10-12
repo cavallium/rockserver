@@ -302,7 +302,7 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
         var path=file.path.resolveSibling(file.path.getFileName()+".pending"); return Files.exists(path,LinkOption.NOFOLLOW_LINKS) ? temporarySize(path) : 0;
     }
     private static boolean complete(RatisDurableParticipantRecovery.Snapshot snapshot) {
-        return snapshot.outcome()!=null && snapshot.observedHome().phase()!=TransactionStatus.Phase.PREPARING
+        return snapshot.outcome()!=null && snapshot.observedHome().terminal()
                 && snapshot.observedHome().participants().stream().filter(p -> p.groupId().equals(snapshot.participantRoute().groupId())).findFirst().orElseThrow().finalized();
     }
     private synchronized void begin() throws IOException { if (stopping || active || closing) throw new IOException("Participant recovery registry closed or operation active"); active=true; }

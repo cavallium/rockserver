@@ -40,9 +40,9 @@ public final class HomeRecovery {
         var key=ByteBuffer.allocate(16).putLong(before.transactionId().getMostSignificantBits()).putLong(before.transactionId().getLeastSignificantBits()).array();
         if (!Arrays.equals(key,mutation.key()) || command.operationId().equals(before.operation())) throw new IllegalArgumentException("HOME recovery key/business identity changed");
         if (action==Action.ABORT) {
-            if (proof!=null || before.phase()!=TransactionStatus.Phase.PREPARING || !before.decide(TransactionStatus.Phase.ABORT).equals(next)) throw new IllegalArgumentException("HOME recovery ABORT changed its transition");
+            if (proof!=null || (before.phase()!=TransactionStatus.Phase.PREPARING && !before.reserved()) || !before.decide(TransactionStatus.Phase.ABORT).equals(next)) throw new IllegalArgumentException("HOME recovery ABORT changed its transition");
         } else {
-            if (proof==null || before.phase()==TransactionStatus.Phase.PREPARING || proof.fenced() && before.phase()!=TransactionStatus.Phase.ABORT || !before.finalized(proof.participant()).equals(next)) throw new IllegalArgumentException("HOME recovery ACK changed its participant/transition");
+            if (proof==null || !before.terminal() || proof.fenced() && before.phase()!=TransactionStatus.Phase.ABORT || !before.finalized(proof.participant()).equals(next)) throw new IllegalArgumentException("HOME recovery ACK changed its participant/transition");
         }
         if (proof!=null && proof.fenced()) requireFence(new ParticipantFenceProof(new ParticipantIdentity(command.groupId(),command.rangeEpoch(),proof.participant(),before),proof.minimumEpoch(),proof.position()));
         if ((long)9+DistributedCommandCodec.encodedSize(command)+(proof==null ? 0 : 73)>MAX_BYTES) throw new IllegalArgumentException("HOME recovery exceeds byte bound");

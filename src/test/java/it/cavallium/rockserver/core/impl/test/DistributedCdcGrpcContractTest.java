@@ -177,4 +177,46 @@ class DistributedCdcGrpcContractTest {
         assertEquals(status,it.cavallium.rockserver.core.common.cdc.ThriftDistributedCdcWire.status(thrift,subscription));
     }
 
+    static ParticipantFinalization reroutedFinalization(TransactionStatus.Phase phase) {
+        var business=new OperationId(id(50),1,2); var participant=new TransactionStatus.Participant(id(4),id(5),1,new byte[32],new byte[32],null,false);
+        byte[] normalized=new byte[32],accepted=new byte[32]; normalized[0]=7; accepted[0]=9;
+        var origin=new OperationRerouteOrigin(id(1),id(2),id(3),new DistributedCdcCheckpoint.Lineage(id(80),id(81),3),business,new byte[32],new byte[32],new ApplyPosition(2,4),new byte[32],normalized,1,new OperationId(id(62),1,100));
+        var initial=TransactionStatus.begin(id(1),id(2),id(3),origin.transactionId(),business,1,new byte[32],accepted,List.of(participant));
+        var status=TransactionStatus.reserve(origin,1,new byte[32]).promote(initial).prepared(id(5),new byte[32],new ApplyPosition(1,1)).decide(phase);
+        return new ParticipantFinalization(id(61),1,id(5),new OperationId(id(63),1,101),status);
+    }
+    @Test void typedFinalizationPreservesRerouteOriginAndRejectsReservedOrMalformedOrigin() throws Exception {
+        for(var phase:List.of(TransactionStatus.Phase.COMMIT,TransactionStatus.Phase.ABORT)) {
+            var finalization=reroutedFinalization(phase); var wire=DistributedCdcWire.finalization(finalization);
+            assertTrue(wire.getDecision().hasOrigin()); assertEquals(OperationRerouteOrigin.MAX_BYTES,wire.getDecision().getOrigin().size());
+            var decoded=DistributedCdcWire.finalization(CdcFinalization.parseFrom(wire.toByteArray()));
+            assertEquals(finalization,decoded); assertEquals(finalization.decision().origin(),decoded.decision().origin());
+            assertEquals(7,decoded.decision().origin().planDigest()[0]); assertEquals(9,decoded.decision().planDigest()[0]); assertEquals(0,decoded.decision().generation());
+            assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.finalization(wire.toBuilder().setDecision(wire.getDecision().toBuilder().setOrigin(ByteString.EMPTY)).build()));
+            assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.finalization(wire.toBuilder().setDecision(wire.getDecision().toBuilder().setOrigin(ByteString.copyFrom(new byte[OperationRerouteOrigin.MAX_BYTES+1]))).build()));
+            var foreign=wire.getDecision().getOrigin().toByteArray(); foreign[0]=1;
+            assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.finalization(wire.toBuilder().setDecision(wire.getDecision().toBuilder().setOrigin(ByteString.copyFrom(foreign))).build()));
+            assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.finalization(wire.toBuilder().setDecision(wire.getDecision().toBuilder().setPhaseValue(3)).build()));
+            var reserved=TransactionStatus.reserve(finalization.decision().origin(),1,new byte[32]);
+            assertThrows(IllegalArgumentException.class,()->new ParticipantFinalization(id(61),1,id(5),new OperationId(id(63),1,101),reserved));
+        }
+        var ordinary=DistributedCdcWire.finalization(new ParticipantFinalization(id(61),1,lineage.groupId(),new OperationId(id(62),0,0),TransactionStatus.begin(id(1),id(2),id(3),id(60),operation,1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(lineage.rangeId(),lineage.groupId(),1,new byte[32],new byte[32],null,false))).prepared(lineage.groupId(),new byte[32],new ApplyPosition(1,1)).decide(TransactionStatus.Phase.COMMIT)));
+        assertFalse(ordinary.getDecision().hasOrigin()); assertNull(DistributedCdcWire.finalization(ordinary).decision().origin());
+    }
+
+    @Test void rerouteOriginMatchesRustFixedCanonicalFixtureAndDerivedIdentity() throws Exception {
+        byte[] encoded=HexFormat.of().parseHex("0303030303030303030303030303030304040404040404040404040404040404050505050505050505050505050505051f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f2020202020202020202020202020202000000000000000040a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a000000000000000100000000000000022222222222222222222222222222222222222222222222222222222222222222232323232323232323232323232323232323232323232323232323232323232300000000000000020000000000000000242424242424242424242424242424242424242424242424242424242424242425252525252525252525252525252525252525252525252525252525252525250000000121212121212121212121212121212121000000000000000200000000000003e8");
+        var origin=OperationRerouteOrigin.decode(encoded); assertArrayEquals(encoded,origin.encode());
+        assertEquals(UUID.fromString("6871e5cc-95b3-44ff-62d3-317485c2db06"),origin.transactionId()); assertEquals(new ApplyPosition(2,0),origin.absenceCut());
+        byte[] acceptedPlan=new byte[32]; Arrays.fill(acceptedPlan,(byte)15);
+        var participant=new TransactionStatus.Participant(id(90),id(91),1,new byte[32],new byte[32],null,false);
+        var accepted=TransactionStatus.begin(origin.clusterId(),origin.databaseId(),origin.domainId(),origin.transactionId(),origin.operation(),1,new byte[32],acceptedPlan,List.of(participant));
+        for(var phase:List.of(TransactionStatus.Phase.COMMIT,TransactionStatus.Phase.ABORT)) {
+            var terminal=TransactionStatus.reserve(origin,1,new byte[32]).promote(accepted).prepared(id(91),new byte[32],new ApplyPosition(2,1)).decide(phase);
+            var finalization=new ParticipantFinalization(id(92),1,id(91),new OperationId(id(93),1,1),terminal);
+            var decoded=DistributedCdcWire.finalization(CdcFinalization.parseFrom(DistributedCdcWire.finalization(finalization).toByteArray()));
+            assertEquals(finalization,decoded); assertArrayEquals(encoded,decoded.decision().origin().encode()); assertArrayEquals(acceptedPlan,decoded.decision().planDigest());
+        }
+    }
+
 }

@@ -50,6 +50,7 @@ class RatisAtomicClientTest {
         final RatisSnapshotFences snapshots;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"public-atomic-test");
         final RatisProofQueryService proofs=new RatisProofQueryService();
+        final RatisProofQueryService rerouteProofs=RatisProofQueryService.operationRerouteLane();
         final RatisSnapshotHelpService snapshotHelp;
         RatisParticipantRecoveryRegistry snapshotRecoveries;
         final AtomicInteger helped=new AtomicInteger();
@@ -57,9 +58,12 @@ class RatisAtomicClientTest {
         final Map<UUID,RatisRangeStateMachine> machines=new LinkedHashMap<>();
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>();
         final List<RaftStorage> storages=new ArrayList<>();
-        final AtomicInteger opens=new AtomicInteger(),submissions=new AtomicInteger(),rpcs=new AtomicInteger(),captureRequests=new AtomicInteger();
-        volatile Runnable beforeAuthorize,beforeHomeRead,beforeSnapshotCapture,beforeSnapshotRead,beforeSnapshotRelease;
+        final AtomicInteger opens=new AtomicInteger(),captureCloses=new AtomicInteger(),submissions=new AtomicInteger(),rpcs=new AtomicInteger(),captureRequests=new AtomicInteger();
+        volatile Runnable beforeAuthorize,beforeHomeRead,beforeSnapshotCapture,beforeSnapshotRead,beforeSnapshotRelease,beforePromotion;
         volatile UUID losePrepareGroup,loseCaptureGroup;
+        volatile TransactionStatus allowedReservation;
+        volatile boolean losePromotion;
+        final AtomicInteger promotionChecks=new AtomicInteger(),promotionSubmissions=new AtomicInteger();
         final SessionEpochLedger ledger;
         final SessionEpochLedger.Grant grant;
         Fixture(Path root) throws Exception { this(root,false); }
@@ -103,7 +107,15 @@ class RatisAtomicClientTest {
                         boolean progress=snapshotRecoveries.step(groupId,prepared); if (progress) helped.incrementAndGet(); return progress;
                     },snapshotHelp);
                 } }
-                else if (source==homeDirectory) { machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(outer.cluster,outer.database,key,value)); machine.homeRecoveryReservations(outer.cluster,outer.database,homeColumn); machine.homeRecoveryData(data); }
+                else if (source==homeDirectory) { machine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value) -> RatisTransactionStatuses.validateRecord(outer.cluster,outer.database,key,value)); machine.homeRecoveryReservations(outer.cluster,outer.database,homeColumn); machine.homeRecoveryData(data); machine.operationRerouteQueries(rerouteProofs); machine.operationRerouteAdmission(command -> {
+                    var next=TransactionStatus.decode(command.mutations().getFirst().value());
+                    if(allowedReservation==null || !allowedReservation.equals(next))throw new IOException("Unqualified fixture reservation");
+                },command -> {
+                    if(beforePromotion!=null)beforePromotion.run();
+                    var expected=TransactionStatus.decode(command.predicates().getFirst().expectedValue());var next=TransactionStatus.decode(command.mutations().getFirst().value());
+                    if(allowedReservation==null || !allowedReservation.equals(expected) || !allowedReservation.origin().equals(next.origin()) || next.reserved() || next.generation()!=1 || opens.get()!=2)throw new IOException("Fixture promotion did not preserve reserved captured plan");
+                    promotionChecks.incrementAndGet();
+                }); }
                 else { machine.role(RatisNodePlan.Role.SNAPSHOT_HOME,(key,value) -> RatisSnapshotFences.validateRecord(outer.cluster,outer.database,snapshotGroup,1,key,value)); machine.snapshotHomeStorage(outer.cluster,outer.database,snapshotColumn); machine.snapshotHomeData(data); }
                 var storage=RaftStorage.newBuilder().setDirectory(root.resolve(descriptor.groupId().toString()).toFile()).setOption(RaftStorage.StartupOption.FORMAT)
                         .setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build();
@@ -152,6 +164,7 @@ class RatisAtomicClientTest {
                 public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException {
                     rpcs.incrementAndGet(); int kind=ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                     if (kind==ScopedTransactionRpc.OPEN) opens.incrementAndGet();
+                    if (kind==ScopedTransactionRpc.CLOSE)captureCloses.incrementAndGet();
                     if (kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE && beforeAuthorize!=null) beforeAuthorize.run();
                     try { var message=Message.valueOf(ByteString.copyFrom(request)); var machine=machines.get(route.groupId());
                         return (fresh ? machine.queryLinearizable(message) : machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray();
@@ -170,7 +183,12 @@ class RatisAtomicClientTest {
                     } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Controlled owner query failed",failure); }
                 }
                 public RangeStateView stateView(RangeDescriptor route) throws IOException { return RangeStateView.decode(ScopedTransactionRpc.parse(transaction(route,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true),ScopedTransactionRpc.MAX_REPLY_BYTES).body()); }
-                public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return CommandResult.decode(append(route,DistributedCommandCodec.encode(command))); }
+                public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException {
+                    if(route.groupId().equals(homeGroup) && command.mutations().size()==1) {var next=TransactionStatus.decode(command.mutations().getFirst().value());if(next.origin()!=null && next.phase()==TransactionStatus.Phase.PREPARING && next.generation()==1)promotionSubmissions.incrementAndGet();}
+                    var result=CommandResult.decode(append(route,DistributedCommandCodec.encode(command)));
+                    if(losePromotion && route.groupId().equals(homeGroup) && TransactionStatus.decode(command.mutations().getFirst().value()).origin()!=null && TransactionStatus.decode(command.mutations().getFirst().value()).generation()==1) {losePromotion=false;throw new IOException("Lost applied promotion reply");}
+                    return result;
+                }
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException {
                     byte[] reply=append(route,bytes);
                     if (route.groupId().equals(losePrepareGroup) && RatisParticipantRecord.isParticipant(bytes) && !RatisParticipantRecord.isFinalization(bytes)) {
@@ -203,9 +221,78 @@ class RatisAtomicClientTest {
         public void close() throws Exception {
             if (snapshotHelp!=null) snapshotHelp.stop().get(5,TimeUnit.SECONDS);
             if (snapshotRecoveries!=null) snapshotRecoveries.close();
-            proofs.stop().get(5,TimeUnit.SECONDS);
+            rerouteProofs.stop().get(5,TimeUnit.SECONDS);proofs.stop().get(5,TimeUnit.SECONDS);
             for (var machine:machines.values()) { machine.close(); machine.awaitNativeReaders(Duration.ofSeconds(5)); }
             for (var storage:storages) storage.close(); if (data!=null) data.close(); if (homeClient!=null) homeClient.close(); if (snapshotClient!=null) snapshotClient.close(); scheduler.disposeGracefully().block(Duration.ofSeconds(5)); catalogue.close();
+        }
+    }
+    @Test void reservedPlanVerifiesBeforeCapturePromotesAndReopensLostOriginalPromotion() throws Exception {
+        try(var f=new Fixture(root)) {
+            var allocated=f.separateIdentity(10);var plan=RatisTransactionPlan.logical(f.schema,f.directory,allocated.business(),changes(),absentIdentity());
+            var source=f.directory.ranges().getFirst();var origin=new OperationRerouteOrigin(f.schema.clusterId(),f.schema.databaseId(),f.schema.domainId(),new DistributedCdcCheckpoint.Lineage(source.rangeId(),source.groupId(),source.rangeEpoch()),allocated.business(),new byte[32],new byte[32],new ApplyPosition(1,0),f.directory.payloadDigest(),RatisAtomicClient.rawPlanDigest(plan),plan.partitions().size(),allocated.firstControl());
+            var reserved=TransactionStatus.reserve(origin,f.schema.schemaEpoch(),f.schema.digest());var identity=new RatisAtomicClient.Identity(reserved.transactionId(),allocated.business(),allocated.firstControl());f.allowedReservation=reserved;
+            try(var client=f.client();var missing=client.executeReservedPlan(root.resolve("missing-reservation.bin"),identity,reserved,plan,TTL,RequestContext.batch())) {assertInstanceOf(IOException.class,assertThrows(ExecutionException.class,()->missing.completion().get(5,TimeUnit.SECONDS)).getCause());assertEquals(0,f.opens.get());}
+            assertEquals(CommandResult.Status.SUCCESS,f.homes.execute(f.homes.prepare(identity.firstControl(),null,reserved)).status());assertEquals(reserved,f.homes.read(identity.transaction()));
+            var changed=RatisTransactionPlan.logical(f.schema,f.directory,allocated.business(),List.of(RatisLogicalClient.Change.put(71,key(3),value(5),Mutation.ReturnMode.NONE)),List.of());
+            try(var client=f.client()){assertThrows(IllegalArgumentException.class,()->client.executeReservedPlan(root.resolve("changed-plan.bin"),identity,reserved,changed,TTL,RequestContext.batch()));assertEquals(0,f.opens.get());}
+            Path path=root.resolve("reserved-lost.bin");f.losePromotion=true;List<UUID> originalCaptures;
+            try(var client=f.client();var operation=client.executeReservedPlan(path,identity,reserved,plan,TTL,RequestContext.batch())) {
+                assertInstanceOf(IOException.class,assertThrows(ExecutionException.class,()->operation.completion().get(10,TimeUnit.SECONDS)).getCause());
+                originalCaptures=operation.snapshot().participants().stream().map(p->p.intent().captureId()).toList();
+                var initial=operation.snapshot().initial();assertEquals(1,initial.generation());assertEquals(origin,initial.origin());assertFalse(initial.reserved());
+            }
+            assertEquals(0,f.captureCloses.get(),"Closing an unresolved forced journal preserves its TTL-owned original captures");
+            try(var client=f.client();var resumed=client.reopen(path,RequestContext.batch())) {
+                f.complete(resumed,CommandResult.Status.SUCCESS);assertEquals(originalCaptures,resumed.snapshot().participants().stream().map(p->p.intent().captureId()).toList());assertEquals(2,f.captureCloses.get());assertEquals(origin,resumed.snapshot().initial().origin());assertEquals(identity.business(),resumed.snapshot().initial().operation());assertEquals(2,f.opens.get());assertTrue(f.promotionChecks.get()>0);resumed.consume(RequestContext.batch()).get(5,TimeUnit.SECONDS);
+            }
+        }
+    }
+    @Test void expiredBusinessAfterCapturesAbortsExactReservationWithoutReplacementPromotion() throws Exception {
+        try(var f=new Fixture(root)) {
+            var allocated=f.separateIdentity(10);var plan=RatisTransactionPlan.logical(f.schema,f.directory,allocated.business(),changes(),absentIdentity());var source=f.directory.ranges().getFirst();
+            var origin=new OperationRerouteOrigin(f.schema.clusterId(),f.schema.databaseId(),f.schema.domainId(),new DistributedCdcCheckpoint.Lineage(source.rangeId(),source.groupId(),source.rangeEpoch()),allocated.business(),new byte[32],new byte[32],new ApplyPosition(1,0),f.directory.payloadDigest(),RatisAtomicClient.rawPlanDigest(plan),plan.partitions().size(),allocated.firstControl());
+            var reserved=TransactionStatus.reserve(origin,f.schema.schemaEpoch(),f.schema.digest());var identity=new RatisAtomicClient.Identity(reserved.transactionId(),allocated.business(),allocated.firstControl());f.allowedReservation=reserved;
+            assertEquals(CommandResult.Status.SUCCESS,f.homes.execute(f.homes.prepare(identity.firstControl(),null,reserved)).status());
+            var once=new java.util.concurrent.atomic.AtomicBoolean();
+            f.beforePromotion=()-> {
+                if(!once.compareAndSet(false,true))return;assertEquals(2,f.opens.get());
+                try {
+                    var before=f.catalogue.epochs.read();var expired=before.advanceTime(1000);
+                    assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(f.outer.operation(4),before,expired)).status());
+                    var binding=f.catalogue.epochs.prepareSessionBinding(f.homeDirectory,f.homeGroup,new OperationId(f.admin,expired.minimumEpoch(),8),expired.grants().getLast(),1024,-1);
+                    assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.append(f.homeDirectory.ranges().getFirst(),DistributedCommandCodec.encode(binding))).status());
+                }catch(Exception failure){throw new RuntimeException(failure);}
+            };
+            Path path=root.resolve("expired-reserved-promotion.bin");
+            try(var client=f.client();var operation=client.executeReservedPlan(path,identity,reserved,plan,TTL,RequestContext.batch())) {
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,operation.completion().get(10,TimeUnit.SECONDS).status());
+                assertEquals(reserved.decide(TransactionStatus.Phase.ABORT),f.homes.read(identity.transaction()));assertEquals(1,f.promotionSubmissions.get());
+                for(var group:f.groups)assertNull(f.stores.get(group).preparedParticipant(identity.transaction()));
+                assertNull(f.get(71,key(2)));assertNull(f.get(72,key(200)));assertNull(f.get(73,key(2)));assertNull(f.get(74,member(200,"second")));
+            }
+            int calls=f.promotionSubmissions.get();
+            try(var client=f.client();var reopened=client.reopen(path,RequestContext.batch())) {
+                assertEquals(CommandResult.Status.SESSION_EXPIRED,reopened.completion().get(5,TimeUnit.SECONDS).status());assertEquals(calls,f.promotionSubmissions.get());assertEquals(origin,reopened.snapshot().initial().origin());
+                reopened.consume(RequestContext.batch()).get(5,TimeUnit.SECONDS);assertTrue(f.homes.read(identity.transaction()).consumed());
+            }
+        }
+    }
+    @Test void possiblyPublishedJournalRetainsOriginalCapturesBeforeClientAssignment() throws Exception {
+        try(var f=new Fixture(root)) {
+            Path path=root.resolve("unknown-publication.bin");var identity=f.identity(0);var observed=new java.util.concurrent.atomic.AtomicBoolean();
+            try(var client=new RatisAtomicClient(f.schema,f.homes,f.data,f.scheduler,RatisAtomicClient.Limits.defaults(),published -> {
+                assertEquals(path,published);assertTrue(Files.isRegularFile(published));observed.set(true);throw new IOException("Lost journal publication confirmation");
+            });var operation=client.executeAtomic(path,identity,changes(),absentIdentity(),TTL,RequestContext.batch())) {
+                assertInstanceOf(IOException.class,assertThrows(ExecutionException.class,()->operation.completion().get(10,TimeUnit.SECONDS)).getCause());assertTrue(observed.get());assertEquals(2,f.opens.get());assertNull(f.homes.read(identity.transaction()));
+            }
+            assertEquals(0,f.captureCloses.get(),"Possibly published journal retains its original remote handles");
+            List<UUID> captures;
+            try(var saved=RatisDurableTransaction.reopen(path,f.homes,f.data)) {
+                assertEquals(identity.business(),saved.snapshot().initial().operation());captures=saved.snapshot().participants().stream().map(part->part.intent().captureId()).toList();
+            }
+            try(var client=f.client();var resumed=client.reopen(path,RequestContext.batch())) {
+                f.complete(resumed,CommandResult.Status.SUCCESS);assertEquals(captures,resumed.snapshot().participants().stream().map(part->part.intent().captureId()).toList());assertEquals(2,f.opens.get());assertEquals(2,f.captureCloses.get());assertArrayEquals(new byte[]{1},f.get(71,key(2)));assertArrayEquals(new byte[]{8},f.get(74,member(200,"second")));
+            }
         }
     }
     @Test void separateIdentityKeepsBoundsAndRejectionJournalPreservesBothExactIds() throws Exception {

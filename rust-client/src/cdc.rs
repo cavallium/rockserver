@@ -26,6 +26,8 @@ pub const MAX_BARRIER_BYTES: usize = 104 + MAX_TOPOLOGY_HEADER_BYTES;
 const ENVELOPE_HEADER_BYTES: usize = 92;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
+pub const REROUTE_ORIGIN_BYTES: usize = 300;
+pub const MAX_FINALIZATION_BYTES: usize = 76 + 186 + REROUTE_ORIGIN_BYTES + 64 * 121;
 const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 4 + 60 * MAX_LINEAGES;
 const MAX_DEFINITION_BYTES: usize = 120 + 16 * MAX_COLUMNS + MAX_CHECKPOINT_BYTES;
@@ -588,6 +590,94 @@ pub struct Participant {
     pub plan_digest: [u8; 32],
     pub prepared: Option<Position>,
 }
+/// Frozen source-evidenced reroute identity. Decoding validates binding, not admission provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RerouteOrigin {
+    canonical: Vec<u8>,
+    pub cluster_id: Id,
+    pub database_id: Id,
+    pub domain_id: Id,
+    pub source: Lineage,
+    pub operation: OperationId,
+    pub original_receipt_digest: [u8; 32],
+    pub absence_commitment: [u8; 32],
+    pub absence_cut: Position,
+    pub target_directory_digest: [u8; 32],
+    pub plan_digest: [u8; 32],
+    pub target_participant_count: i32,
+    pub first_control: OperationId,
+}
+impl RerouteOrigin {
+    pub fn decode(encoded: Vec<u8>) -> Result<Self> {
+        if encoded.len() != REROUTE_ORIGIN_BYTES {
+            return Err(invalid("reroute origin must contain exactly 300 bytes"));
+        }
+        let mut r = Reader(&encoded);
+        let cluster_id = r.id()?;
+        let database_id = r.id()?;
+        let domain_id = r.id()?;
+        let source = Lineage {
+            range_id: r.id()?,
+            group_id: r.id()?,
+            range_epoch: r.i64()?,
+        };
+        source.validate()?;
+        let operation = Self::operation(&mut r)?;
+        let original_receipt_digest = r.take(32)?.try_into().unwrap();
+        let absence_commitment = r.take(32)?.try_into().unwrap();
+        let absence_cut = Position {
+            term: r.i64()?,
+            index: r.i64()?,
+        };
+        absence_cut.validate(true)?;
+        let target_directory_digest = r.take(32)?.try_into().unwrap();
+        let plan_digest = r.take(32)?.try_into().unwrap();
+        let target_participant_count = r.i32()?;
+        let first_control = Self::operation(&mut r)?;
+        if !(1..=64).contains(&target_participant_count)
+            || first_control.epoch < 1
+            || first_control.sequence > i64::MAX - 255
+            || first_control == operation
+            || !r.0.is_empty()
+        {
+            return Err(invalid("invalid reroute origin participant/control bounds"));
+        }
+        Ok(Self {
+            canonical: encoded,
+            cluster_id,
+            database_id,
+            domain_id,
+            source,
+            operation,
+            original_receipt_digest,
+            absence_commitment,
+            absence_cut,
+            target_directory_digest,
+            plan_digest,
+            target_participant_count,
+            first_control,
+        })
+    }
+    fn operation(r: &mut Reader<'_>) -> Result<OperationId> {
+        OperationId::try_from(wire::CdcOperationId {
+            session_id: r.id()?.to_vec(),
+            epoch: r.i64()?,
+            sequence: r.i64()?,
+        })
+    }
+    pub fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::digest(&self.canonical).into()
+    }
+    pub fn transaction_id(&self) -> Id {
+        let mut hash = Sha256::new();
+        hash.update(b"rockserver-operation-reroute");
+        hash.update(&self.canonical[..120]);
+        hash.finalize()[..16].try_into().unwrap()
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Decision {
     pub cluster_id: Id,
@@ -600,6 +690,7 @@ pub struct Decision {
     pub plan_digest: [u8; 32],
     pub phase: DecisionPhase,
     pub participants: Vec<Participant>,
+    pub origin: Option<RerouteOrigin>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Finalization {
@@ -611,7 +702,13 @@ pub struct Finalization {
 }
 impl Finalization {
     fn budget_bytes(&self) -> usize {
-        76 + 182 + 121 * self.decision.participants.len()
+        76 + 186
+            + self
+                .decision
+                .origin
+                .as_ref()
+                .map_or(0, |_| REROUTE_ORIGIN_BYTES)
+            + 121 * self.decision.participants.len()
     }
 }
 impl TryFrom<wire::CdcFinalization> for Finalization {
@@ -670,8 +767,26 @@ impl TryFrom<wire::CdcFinalization> for Finalization {
                 phase: DecisionPhase::try_from(d.phase)
                     .map_err(|_| invalid("unknown CDC decision phase"))?,
                 participants,
+                origin: d.origin.map(RerouteOrigin::decode).transpose()?,
             },
         };
+        if let Some(origin) = &result.decision.origin {
+            let decision = &result.decision;
+            if origin.cluster_id != decision.cluster_id
+                || origin.database_id != decision.database_id
+                || origin.domain_id != decision.domain_id
+                || origin.transaction_id() != decision.transaction_id
+                || origin.operation != decision.operation
+                || origin.target_participant_count as usize != decision.participants.len()
+            {
+                return Err(invalid(
+                    "reroute origin changed terminal business/participant identity",
+                ));
+            }
+        }
+        if result.budget_bytes() > MAX_FINALIZATION_BYTES {
+            return Err(invalid("oversized finalization"));
+        }
         if result.recovery_operation == result.decision.operation
             || !result
                 .decision
@@ -2423,6 +2538,7 @@ mod tests {
                 schema_digest: [11; 32].to_vec(),
                 plan_digest: [15; 32].to_vec(),
                 phase: DecisionPhase::DecisionCommit as i32,
+                origin: None,
                 participants: vec![wire::CdcParticipant {
                     lineage: Some(lineage().encode().unwrap()),
                     schema_digest: [11; 32].to_vec(),
@@ -2431,6 +2547,152 @@ mod tests {
                 }],
             }),
         }
+    }
+    // Shared current Java/Rust OperationRerouteOrigin carrier, including an absence cut at index zero.
+    const REROUTE_ORIGIN_HEX: &str = concat!(
+        "0303030303030303030303030303030304040404040404040404040404040404050505050505050505050505050505051f1f",
+        "1f1f1f1f1f1f1f1f1f1f1f1f1f1f2020202020202020202020202020202000000000000000040a0a0a0a0a0a0a0a0a0a0a0a",
+        "0a0a0a0a00000000000000010000000000000002222222222222222222222222222222222222222222222222222222222222",
+        "2222232323232323232323232323232323232323232323232323232323232323232300000000000000020000000000000000",
+        "2424242424242424242424242424242424242424242424242424242424242424252525252525252525252525252525252525",
+        "25252525252525252525252525250000000121212121212121212121212121212121000000000000000200000000000003e8",
+    );
+    fn reroute_origin_bytes() -> Vec<u8> {
+        REROUTE_ORIGIN_HEX
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| {
+                let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                digit(digits[0]) * 16 + digit(digits[1])
+            })
+            .collect()
+    }
+    fn reroute_finalization() -> wire::CdcFinalization {
+        let mut wire = finalization();
+        let origin = RerouteOrigin::decode(reroute_origin_bytes()).unwrap();
+        let decision = wire.decision.as_mut().unwrap();
+        decision.transaction_id = origin.transaction_id().to_vec();
+        decision.origin = Some(reroute_origin_bytes());
+        wire
+    }
+    #[test]
+    fn terminal_reroute_origin_roundtrips_shared_fixture_and_preserves_distinct_raw_plan() {
+        let origin = RerouteOrigin::decode(reroute_origin_bytes()).unwrap();
+        assert_eq!(origin.canonical(), reroute_origin_bytes());
+        assert_eq!(
+            origin.source,
+            Lineage {
+                range_id: [31; 16],
+                group_id: [32; 16],
+                range_epoch: 4
+            }
+        );
+        assert_eq!(
+            origin.operation,
+            OperationId::try_from(operation()).unwrap()
+        );
+        assert_eq!(origin.absence_cut, Position { term: 2, index: 0 });
+        assert_eq!(origin.original_receipt_digest, [34; 32]);
+        assert_eq!(origin.absence_commitment, [35; 32]);
+        assert_eq!(origin.target_directory_digest, [36; 32]);
+        assert_eq!(origin.plan_digest, [37; 32]);
+        assert_eq!(
+            origin.first_control,
+            OperationId {
+                session_id: [33; 16],
+                epoch: 2,
+                sequence: 1000
+            }
+        );
+        assert_eq!(
+            origin.digest(),
+            <[u8; 32]>::from(Sha256::digest(reroute_origin_bytes()))
+        );
+        assert_eq!(
+            origin.transaction_id(),
+            [104, 113, 229, 204, 149, 179, 68, 255, 98, 211, 49, 116, 133, 194, 219, 6]
+        );
+        for phase in [DecisionPhase::DecisionCommit, DecisionPhase::DecisionAbort] {
+            let mut wire = reroute_finalization();
+            wire.decision.as_mut().unwrap().phase = phase as i32;
+            let decoded = Finalization::try_from(
+                wire::CdcFinalization::decode(wire.encode_to_vec().as_slice()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(decoded.decision.origin, Some(origin.clone()));
+            assert_eq!(decoded.decision.phase, phase);
+            assert_eq!(decoded.decision.plan_digest, [15; 32]);
+            assert_ne!(decoded.decision.plan_digest, origin.plan_digest);
+            assert_eq!(
+                decoded.budget_bytes(),
+                76 + 186 + REROUTE_ORIGIN_BYTES + 121
+            );
+        }
+        let mut wire = batch();
+        wire.envelopes[0].transaction = Some(reroute_finalization());
+        assert!(Batch::try_from(wire).is_ok());
+        let ordinary = Finalization::try_from(finalization()).unwrap();
+        assert!(ordinary.decision.origin.is_none());
+        assert_eq!(ordinary.budget_bytes(), 76 + 186 + 121);
+    }
+    #[test]
+    fn reroute_origin_rejects_malformed_fixed_body_cut_and_control_allocation() {
+        for size in [0, 299, 301] {
+            assert!(RerouteOrigin::decode(vec![0; size]).is_err());
+        }
+        let bytes = reroute_origin_bytes();
+        for offset in [80, 104, 112, 192, 284, 292] {
+            let mut v = bytes.clone();
+            v[offset..offset + 8].copy_from_slice(&(-1i64).to_be_bytes());
+            assert!(RerouteOrigin::decode(v).is_err());
+        }
+        for offset in [184, 284] {
+            let mut v = bytes.clone();
+            v[offset..offset + 8].copy_from_slice(&0i64.to_be_bytes());
+            assert!(RerouteOrigin::decode(v).is_err());
+        }
+        for count in [0, 65] {
+            let mut v = bytes.clone();
+            v[264..268].copy_from_slice(&(count as i32).to_be_bytes());
+            assert!(RerouteOrigin::decode(v).is_err());
+        }
+        let mut v = bytes.clone();
+        v[292..300].copy_from_slice(&(i64::MAX - 255).to_be_bytes());
+        assert!(RerouteOrigin::decode(v).is_ok());
+        let mut v = bytes.clone();
+        v[292..300].copy_from_slice(&(i64::MAX - 254).to_be_bytes());
+        assert!(RerouteOrigin::decode(v).is_err());
+        let mut v = bytes;
+        let original = v[88..120].to_vec();
+        v[268..300].copy_from_slice(&original);
+        assert!(RerouteOrigin::decode(v).is_err());
+    }
+    #[test]
+    fn finalization_rejects_present_empty_crossed_origin_and_reserved_decisions() {
+        let mut v = reroute_finalization();
+        v.decision.as_mut().unwrap().origin = Some(vec![]);
+        assert!(Finalization::try_from(v).is_err());
+        let mut v = reroute_finalization();
+        v.decision.as_mut().unwrap().origin.as_mut().unwrap().pop();
+        assert!(Finalization::try_from(v).is_err());
+        for offset in [0, 16, 32, 48, 64, 88] {
+            let mut v = reroute_finalization();
+            v.decision.as_mut().unwrap().origin.as_mut().unwrap()[offset] ^= 1;
+            assert!(Finalization::try_from(v).is_err());
+        }
+        let mut v = reroute_finalization();
+        v.decision.as_mut().unwrap().origin.as_mut().unwrap()[264..268]
+            .copy_from_slice(&2i32.to_be_bytes());
+        assert!(Finalization::try_from(v).is_err());
+        let mut v = reroute_finalization();
+        v.decision.as_mut().unwrap().transaction_id = [99; 16].to_vec();
+        assert!(Finalization::try_from(v).is_err());
+        for phase in [2, 3, 99] {
+            let mut v = reroute_finalization();
+            v.decision.as_mut().unwrap().phase = phase;
+            assert!(Finalization::try_from(v).is_err());
+        }
+        assert_eq!(MAX_FINALIZATION_BYTES, 8306);
     }
     #[test]
     fn transaction_metadata_binds_commit_operation_preparation_and_namespace() {

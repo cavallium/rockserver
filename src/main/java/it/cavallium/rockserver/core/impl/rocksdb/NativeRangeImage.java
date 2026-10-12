@@ -755,6 +755,7 @@ public final class NativeRangeImage {
             var status=it.cavallium.rockserver.core.common.distributed.TransactionStatus.decode(value); var id=status.transactionId();
             byte[] expected=ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
             if (!status.clusterId().equals(context.cluster()) || !status.databaseId().equals(context.database()) || !Arrays.equals(key,expected)) throw new IOException("Qualified HOME image user identity differs");
+            if(status.reserved() && (status.origin()==null || status.consumed() || !status.participants().isEmpty()))throw new IOException("Invalid reserved HOME image row");
             var credit=homeCredits.get(id);
             if (ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)>0 && (credit==null || !credit.current().equals(status)) || ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)==0 && credit!=null) throw new IOException("Unfinished HOME image user row lacks exact promise");
             if (credit!=null) matched.add(id);

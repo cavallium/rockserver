@@ -99,7 +99,10 @@ public final class DistributedCdcWire {
         return new Mutation(kind,column,key,payload,mode);
     }
     public static CdcFinalization finalization(ParticipantFinalization value) {
-        var decision=value.decision(); var builder=CdcDecision.newBuilder().setClusterId(uuid(decision.clusterId())).setDatabaseId(uuid(decision.databaseId())).setDomainId(uuid(decision.domainId())).setTransactionId(uuid(decision.transactionId())).setOperation(operation(decision.operation())).setSchemaEpoch(decision.schemaEpoch()).setSchemaDigest(ByteString.copyFrom(decision.schemaDigest())).setPlanDigest(ByteString.copyFrom(decision.planDigest())).setPhase(decision.phase()==TransactionStatus.Phase.COMMIT ? CdcDecisionPhase.DECISION_COMMIT : CdcDecisionPhase.DECISION_ABORT);
+        var decision=value.decision();
+        if(decision.phase()!=TransactionStatus.Phase.COMMIT && decision.phase()!=TransactionStatus.Phase.ABORT) throw new IllegalArgumentException("CDC finalization requires a terminal decision");
+        var builder=CdcDecision.newBuilder().setClusterId(uuid(decision.clusterId())).setDatabaseId(uuid(decision.databaseId())).setDomainId(uuid(decision.domainId())).setTransactionId(uuid(decision.transactionId())).setOperation(operation(decision.operation())).setSchemaEpoch(decision.schemaEpoch()).setSchemaDigest(ByteString.copyFrom(decision.schemaDigest())).setPlanDigest(ByteString.copyFrom(decision.planDigest())).setPhase(decision.phase()==TransactionStatus.Phase.COMMIT ? CdcDecisionPhase.DECISION_COMMIT : CdcDecisionPhase.DECISION_ABORT);
+        if(decision.origin()!=null) builder.setOrigin(ByteString.copyFrom(decision.origin().encode()));
         for(var participant:decision.participants()) { var p=CdcParticipant.newBuilder().setLineage(lineage(new DistributedCdcCheckpoint.Lineage(participant.rangeId(),participant.groupId(),participant.rangeEpoch()))).setSchemaDigest(ByteString.copyFrom(participant.schemaDigest())).setPlanDigest(ByteString.copyFrom(participant.planDigest())); if(participant.prepared()!=null) p.setPrepared(position(participant.prepared())); builder.addParticipants(p); }
         return CdcFinalization.newBuilder().setHomeGroup(uuid(value.homeGroup())).setHomeEpoch(value.homeEpoch()).setParticipantGroup(uuid(value.participantGroup())).setRecoveryOperation(operation(value.operation())).setDecision(builder).build();
     }
@@ -109,6 +112,11 @@ public final class DistributedCdcWire {
         var participants=new ArrayList<TransactionStatus.Participant>();
         for(var p:d.getParticipantsList()) { if(!p.hasLineage()) throw new IllegalArgumentException("Missing CDC participant lineage"); exact(p.getSchemaDigest(),32); exact(p.getPlanDigest(),32); var l=lineage(p.getLineage()); participants.add(new TransactionStatus.Participant(l.rangeId(),l.groupId(),l.rangeEpoch(),p.getSchemaDigest().toByteArray(),p.getPlanDigest().toByteArray(),null,false)); }
         var decision=TransactionStatus.begin(uuid(d.getClusterId()),uuid(d.getDatabaseId()),uuid(d.getDomainId()),uuid(d.getTransactionId()),operation(d.getOperation()),d.getSchemaEpoch(),d.getSchemaDigest().toByteArray(),d.getPlanDigest().toByteArray(),participants);
+        if(d.hasOrigin()) {
+            exact(d.getOrigin(),OperationRerouteOrigin.MAX_BYTES);
+            var origin=OperationRerouteOrigin.decode(d.getOrigin().toByteArray());
+            decision=TransactionStatus.reserve(origin,d.getSchemaEpoch(),d.getSchemaDigest().toByteArray()).promote(decision);
+        }
         for(var p:d.getParticipantsList()) if(p.hasPrepared()) decision=decision.prepared(uuid(p.getLineage().getGroupId()),p.getPlanDigest().toByteArray(),position(p.getPrepared()));
         decision=decision.decide(d.getPhase()==CdcDecisionPhase.DECISION_COMMIT ? TransactionStatus.Phase.COMMIT : TransactionStatus.Phase.ABORT);
         return new ParticipantFinalization(uuid(value.getHomeGroup()),value.getHomeEpoch(),uuid(value.getParticipantGroup()),operation(value.getRecoveryOperation()),decision);

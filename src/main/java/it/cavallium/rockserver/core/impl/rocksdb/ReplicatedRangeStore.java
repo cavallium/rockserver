@@ -226,15 +226,15 @@ public final class ReplicatedRangeStore {
             if (rangeEpoch<0 || schema.length!=32 || position.term()<=0 || !cluster.equals(initial.clusterId()) || !database.equals(initial.databaseId()) || !initial.sameDefinition(current) || remaining(current)==0) throw new IllegalArgumentException("Invalid HOME recovery promise");
             var rebuilt=initial;
             for (var p:current.participants()) if (p.prepared()!=null) rebuilt=rebuilt.prepared(p.groupId(),p.planDigest(),p.prepared());
-            if (current.phase()!=TransactionStatus.Phase.PREPARING) rebuilt=rebuilt.decide(current.phase());
+            if (current.terminal()) rebuilt=rebuilt.decide(current.phase());
             for (var p:current.participants()) if (p.finalized()) rebuilt=rebuilt.finalized(p.groupId());
             if (current.consumed()) rebuilt=rebuilt.consume();
             if (!rebuilt.equals(current)) throw new IllegalArgumentException("HOME promise progress/generation changed"); schema=schema.clone();
         }
         @Override public byte[] schema() { return schema.clone(); }
-        public static int remaining(TransactionStatus status) { return (status.phase()==TransactionStatus.Phase.PREPARING ? 1 : 0)+(int)status.participants().stream().filter(p -> !p.finalized()).count(); }
+        public static int remaining(TransactionStatus status) { return status.reserved() ? 1+status.origin().targetParticipantCount() : (status.phase()==TransactionStatus.Phase.PREPARING ? 1 : 0)+(int)status.participants().stream().filter(p -> !p.finalized()).count(); }
         public int reservedCount() { return remaining(current); }
-        public long reservedBytes() { return reservedCount()*TRANSITION_BYTES+33L+encode().length; }
+        public long reservedBytes() { return reservedCount()*TRANSITION_BYTES+33L+(initial.origin()==null ? encode().length : 128L+2L*TransactionStatus.MAX_BYTES); }
         public byte[] userKey() { return uuidBytes(current.transactionId()); }
         public void requireCut(ApplyPosition cut) { if (cut==null || position.index()>cut.index() || position.term()>cut.term() || position.index()==cut.index() && position.term()!=cut.term()) throw new IllegalArgumentException("HOME promise differs from completed cut"); }
         public void requireOwner(RangeOwnership.Owner owner,RangeOwnership.Interval interval,byte[] digest) {
@@ -1395,11 +1395,11 @@ public final class ReplicatedRangeStore {
         var next=TransactionStatus.decode(mutation.value());
         if (!next.clusterId().equals(context.cluster()) || !next.databaseId().equals(context.database()) || !Arrays.equals(mutation.key(),uuidBytes(next.transactionId()))) throw new IllegalArgumentException("Promised HOME identity changed");
         var old=homeRecoveryCredits.get(next.transactionId()); TransactionStatus initial;
-        if (predicate.expectedValue()==null) { next.requireInitial(); if (old!=null) throw new IllegalStateException("HOME registration replaced a promise"); initial=next; }
+        if (predicate.expectedValue()==null) { next.requireInitial(); if(next.origin()!=null && !next.reserved())throw new IllegalArgumentException("Reroute HOME must reserve before installing accepted participants"); if (old!=null) throw new IllegalStateException("HOME registration replaced a promise"); initial=next; }
         else {
             var before=TransactionStatus.decode(predicate.expectedValue()); next.requireSuccessorOf(before);
             if (old==null && HomeRecoveryCredit.remaining(before)!=0) throw new IllegalStateException("Existing HOME has no future recovery promise");
-            if (old!=null && !old.current().equals(before)) throw new IllegalStateException("HOME row and promise differ"); initial=old==null ? before : old.initial();
+            if (old!=null && !old.current().equals(before)) throw new IllegalStateException("HOME row and promise differ"); initial=before.reserved() && next.phase()==TransactionStatus.Phase.PREPARING ? next.asInitial() : old==null ? before : old.initial();
         }
         var credit=HomeRecoveryCredit.remaining(next)==0 ? null : new HomeRecoveryCredit(groupId,rangeEpoch,schemaDigest,context.cluster(),context.database(),context.column(),initial,next,position);
         int count=(credit==null ? 0 : credit.reservedCount())-(old==null ? 0 : old.reservedCount()); long bytes=(credit==null ? 0 : credit.reservedBytes())-(old==null ? 0 : old.reservedBytes());
@@ -1523,17 +1523,34 @@ public final class ReplicatedRangeStore {
     }
     private boolean expiredHomeRegistration(DistributedCommand command) throws RocksDBException {
         var context=homeRecoveryContext!=null ? homeRecoveryContext : snapshotHomeContext;
-        if (context==null || command.kind()!=DistributedCommand.Kind.DATA || command.mutations().size()!=1 || command.predicates().size()!=1 || command.predicates().getFirst().expectedValue()!=null) return false;
+        if (context==null || command.kind()!=DistributedCommand.Kind.DATA || command.mutations().size()!=1 || command.predicates().size()!=1) return false;
         var mutation=command.mutations().getFirst();
         if (!mutation.columnId().equals(context.column()) || mutation.kind()!=Mutation.Kind.PUT) return false;
         if (snapshotHomeContext!=null) {
+            if(command.predicates().getFirst().expectedValue()!=null)return false;
             var initial=SnapshotFenceStatus.decode(mutation.value());
             requireSnapshotHomeUser(context,mutation.key(),initial);
             if (initial.phase()!=SnapshotFenceStatus.Phase.INSTALLING || initial.generation()!=0) throw new IllegalArgumentException("Snapshot HOME registration is not initial");
             return initial.fence().operation().epoch()<minimumSessionEpoch(null);
         }
-        var initial=TransactionStatus.decode(mutation.value()); initial.requireInitial();
-        return initial.operation().epoch()<minimumSessionEpoch(null);
+        var initial=TransactionStatus.decode(mutation.value());
+        var expected=command.predicates().getFirst().expectedValue();
+        if(expected==null)initial.requireInitial();
+        else {
+            var before=TransactionStatus.decode(expected);
+            if(!before.reserved() || initial.phase()!=TransactionStatus.Phase.PREPARING)return false;
+            initial.requireSuccessorOf(before);
+        }
+        if(initial.operation().epoch()<minimumSessionEpoch(null))return true;
+        if(initial.origin()!=null) {
+            var authority=sessionAuthority();
+            if(authority!=null) {
+                var binding=sessionBinding(initial.operation().epoch());
+                if(binding==null || !binding.grant().sessionId().equals(initial.operation().sessionId()))throw new IllegalStateException("Reroute HOME business has no exact native session binding");
+                return !authority.permits(binding.grant());
+            }
+        }
+        return false;
     }
     public void configureSnapshotHome(UUID cluster,UUID database,UUID column) {
         var context=new HomeRecoveryContext(Objects.requireNonNull(cluster),Objects.requireNonNull(database),Objects.requireNonNull(column));
@@ -1627,6 +1644,17 @@ public final class ReplicatedRangeStore {
         if (authority!=null && (!authority.clusterId().equals(context.cluster()) || !authority.databaseId().equals(context.database()))) throw new IllegalArgumentException("HOME identity differs from native session authority");
     }
     private record HomeState(TransactionStatus row,HomeRecoveryCredit credit,boolean matching) {}
+    private static boolean sameHomeReservationDefinition(TransactionStatus left,TransactionStatus right) {
+        if(left.sameDefinition(right))return true;
+        var reserved=left.reserved() ? left : right.reserved() ? right : null;var installed=reserved==left ? right : left;
+        if(reserved==null || installed.origin()==null || !Objects.equals(reserved.origin(),installed.origin()) || installed.participants().isEmpty())return false;
+        var initial=installed.asInitial();
+        try { return reserved.promote(TransactionStatus.begin(initial.clusterId(),initial.databaseId(),initial.domainId(),initial.transactionId(),initial.operation(),initial.schemaEpoch(),initial.schemaDigest(),initial.planDigest(),initial.participants())).sameDefinition(installed); }
+        catch(IllegalArgumentException different) { return false; }
+    }
+    private static boolean sameHomeReservationIdentity(HomeIdentity left,HomeIdentity right) {
+        return left.groupId().equals(right.groupId()) && left.rangeEpoch()==right.rangeEpoch() && Arrays.equals(left.schemaDigest(),right.schemaDigest()) && left.columnId().equals(right.columnId()) && sameHomeReservationDefinition(left.definition(),right.definition());
+    }
     private HomeState readHomeState(HomeIdentity identity,ReadOptions options,ApplyPosition cut) throws RocksDBException {
         requireHomeIdentity(identity,options,cut); byte[] key=uuidBytes(identity.transactionId()); var column=columns.get(identity.columnId());
         byte[] bytes=options==null ? db.get(column,key) : db.get(column,options,key); var row=bytes==null ? null : TransactionStatus.decode(bytes);
@@ -1638,7 +1666,7 @@ public final class ReplicatedRangeStore {
         }
         if (row!=null && HomeRecoveryCredit.remaining(row)>0 && credit==null) throw new IllegalStateException("Unfinished HOME USER row lacks recovery promise");
         boolean matching=row!=null && row.operation().equals(identity.business());
-        if (matching && !row.sameDefinition(identity.definition())) throw new IllegalArgumentException("Retained HOME definition changed");
+        if (matching && !sameHomeReservationDefinition(row,identity.definition())) throw new IllegalArgumentException("Retained HOME definition changed");
         return new HomeState(row,credit,matching);
     }
     private List<HomeRecoveryReceipt> matchingHomeReceipts(HomeIdentity identity,ReadOptions source,ApplyPosition cut,TransactionStatus row) throws RocksDBException {
@@ -1652,7 +1680,7 @@ public final class ReplicatedRangeStore {
                 var actual=HomeRecoveryReceipt.decode(bytes);
                 if (!actual.equals(cached)) throw new IllegalStateException("HOME recovery index payload changed");
                 requireHomeRecovery(recovery); actual.requireCut(cut);
-                if (!homeIdentity(recovery).equals(identity)) throw new IllegalArgumentException("Retained HOME recovery definition changed");
+                if (!sameHomeReservationIdentity(homeIdentity(recovery),identity)) throw new IllegalArgumentException("Retained HOME recovery definition changed");
                 requireHomeRecoverySuccessor(actual,row); matched.add(actual);
             }
             return List.copyOf(matched);
@@ -1667,7 +1695,7 @@ public final class ReplicatedRangeStore {
                 var receipt=HomeRecoveryReceipt.decode(iterator.value()); var recovery=receipt.recovery(); requireHomeRecovery(recovery); receipt.requireCut(cut);
                 if (!Arrays.equals(iterator.key(),homeRecoveryKey(recovery.operation()))) throw new IllegalArgumentException("HOME recovery key changed");
                 if (recovery.before().transactionId().equals(identity.transactionId()) && recovery.before().operation().equals(identity.business())) {
-                    if (!homeIdentity(recovery).equals(identity)) throw new IllegalArgumentException("Retained HOME recovery definition changed");
+                    if (!sameHomeReservationIdentity(homeIdentity(recovery),identity)) throw new IllegalArgumentException("Retained HOME recovery definition changed");
                     requireHomeRecoverySuccessor(receipt,row); matched.add(receipt);
                 }
                 iterator.next();

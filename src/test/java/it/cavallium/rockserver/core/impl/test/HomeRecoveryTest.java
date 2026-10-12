@@ -10,7 +10,7 @@ class HomeRecoveryTest {
     final UUID cluster=new UUID(0,1),database=new UUID(0,2),domain=new UUID(0,3),transaction=new UUID(0,4),home=new UUID(0,5),column=new UUID(0,6),data=new UUID(0,7);
     TransactionStatus initial() { return TransactionStatus.begin(cluster,database,domain,transaction,new OperationId(new UUID(0,8),1,0),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(data,data,1,new byte[32],new byte[32],null,false))); }
     DistributedCommand command(TransactionStatus before,TransactionStatus next,OperationId operation) {
-        byte[] key=ByteBuffer.allocate(16).putLong(transaction.getMostSignificantBits()).putLong(transaction.getLeastSignificantBits()).array();
+        UUID identity=before==null ? next.transactionId() : before.transactionId(); byte[] key=ByteBuffer.allocate(16).putLong(identity.getMostSignificantBits()).putLong(identity.getLeastSignificantBits()).array();
         return new DistributedCommand(home,1,new byte[32],operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,before==null ? null : before.encode())));
     }
     OperationId control(long n) { return new OperationId(new UUID(0,9),0,n); }
@@ -63,5 +63,12 @@ class HomeRecoveryTest {
             for (int n=0;n<receipt.encode().length;n++) { byte[] truncated=Arrays.copyOf(receipt.encode(),n); assertThrows(IllegalArgumentException.class,() -> HomeRecoveryReceipt.decode(truncated)); }
         }
         assertThrows(IllegalArgumentException.class,() -> new HomeRecoveryReceipt(recovery,new ApplyPosition(1,1),new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of())));
+    }    @Test void reservedHomeUsesProtectedNoEffectAbortAndNeverAcknowledgesReservation() {
+        var origin=new OperationRerouteOrigin(cluster,database,domain,new DistributedCdcCheckpoint.Lineage(data,data,1),initial().operation(),new byte[32],new byte[32],new ApplyPosition(2,3),new byte[32],new byte[32],1,new OperationId(new UUID(0,9),1,10)); var reserved=TransactionStatus.reserve(origin,1,new byte[32]); var aborted=reserved.decide(TransactionStatus.Phase.ABORT);
+        var recovery=new HomeRecovery(HomeRecovery.Action.ABORT,command(reserved,aborted,control(0)),null); assertEquals(reserved,recovery.before()); assertEquals(aborted,recovery.next()); assertEquals(recovery,HomeRecovery.decode(recovery.encode())); assertTrue(recovery.next().fullyFinalized()); assertEquals(origin,recovery.next().origin()); assertTrue(recovery.next().consume().gcEligible());
+        assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.ACK,command(reserved,aborted,control(1)),new HomeRecovery.Proof(data,new ApplyPosition(1,1),new byte[32])));
+        var accepted=TransactionStatus.begin(cluster,database,domain,reserved.transactionId(),reserved.operation(),1,new byte[32],new byte[32],List.of(new TransactionStatus.Participant(data,data,1,new byte[32],new byte[32],null,false))); var promoted=reserved.promote(accepted);
+        assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.ABORT,command(reserved,promoted,control(1)),null));
     }
+
 }

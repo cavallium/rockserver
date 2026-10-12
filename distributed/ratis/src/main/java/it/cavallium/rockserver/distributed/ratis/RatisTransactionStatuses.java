@@ -52,7 +52,7 @@ public final class RatisTransactionStatuses {
     /** Fresh committed decision and home authority captured by the same read; does not submit FINALIZE. */
     public ParticipantFinalization readFinalization(UUID transaction,UUID participant,OperationId recovery) throws IOException {
         var read=readRegistration(transaction);
-        if (read.status()==null || read.status().phase()==TransactionStatus.Phase.PREPARING) throw new IOException("Home has no terminal decision");
+        if (read.status()==null || !read.status().terminal()) throw new IOException("Home has no terminal decision");
         return new ParticipantFinalization(read.descriptor().groupId(),read.descriptor().rangeEpoch(),participant,recovery,read.status());
     }
     /** Each transition has its own caller-owned operation identity. An uncertain retry retains this exact command.
@@ -61,6 +61,31 @@ public final class RatisTransactionStatuses {
         byte[] key=key(next.transactionId()); requireIdentity(next,cluster,database,key);
         var prepared=routed.prepare(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,expected==null ? null : expected.encode())));
         validate(prepared); return prepared;
+    }
+    public RatisRoutedClient.PreparedCommand prepareReservation(OperationId control,OperationRerouteOrigin origin,long schemaEpoch,byte[] schemaDigest) {
+        if(!control.equals(origin.firstControl())) throw new IllegalArgumentException("Reservation changed original HOME control identity");
+        return prepare(control,null,TransactionStatus.reserve(origin,schemaEpoch,schemaDigest));
+    }
+    public RatisRoutedClient.PreparedCommand preparePromotion(OperationId control,TransactionStatus reserved,TransactionStatus acceptedInitial) {
+        return prepare(control,reserved,reserved.promote(acceptedInitial));
+    }
+    public static boolean requiresRerouteAdmission(DistributedCommand command) {
+        if(command.mutations().size()!=1 || command.predicates().size()!=1 || command.mutations().getFirst().key().length!=16) return false;
+        var next=TransactionStatus.decode(command.mutations().getFirst().value()); if(next.origin()==null) return false;
+        byte[] before=command.predicates().getFirst().expectedValue();
+        return before==null && next.reserved() || before!=null && TransactionStatus.decode(before).reserved() && next.phase()==TransactionStatus.Phase.PREPARING;
+    }
+    public static boolean isReservation(DistributedCommand command) { return requiresRerouteAdmission(command) && command.predicates().getFirst().expectedValue()==null; }
+    @FunctionalInterface public interface SourceAbsenceReader { RatisTopologyOperationOutcomeRpc.Reply read(OperationRerouteOrigin origin) throws IOException; }
+    /** Trusted fresh source lookup; the immutable row alone grants no reroute authority. */
+    public static void admitReservation(DistributedCommand command,SourceAbsenceReader reader) throws IOException {
+        if(!isReservation(command) || reader==null) throw new IOException("Fresh source absence reader is not configured");
+        var origin=TransactionStatus.decode(command.mutations().getFirst().value()).origin(); var reply=reader.read(origin);
+        if(reply==null || reply.outcome()!=RatisTopologyOperationOutcomeRpc.Outcome.ABSENT) throw new IOException("Reroute source no longer proves authoritative absence");
+        var expected=new RatisTopologyOperationOutcomeRpc.Request(origin.clusterId(),origin.databaseId(),origin.domainId(),origin.source(),origin.operation(),origin.originalReceiptDigest());
+        if(!expected.equals(reply.request()) || !Arrays.equals(origin.absenceCommitment(),OperatorUpload.sha256(reply.freeze().encode()))) throw new IOException("Reroute source changed original request/freeze commitment");
+        var cut=reply.cut();var original=origin.absenceCut();
+        if(cut.index()<original.index() || cut.term()<original.term() || cut.index()==original.index() && cut.term()!=original.term()) throw new IOException("Reroute source absence lacks original completed prefix");
     }
     public RatisRoutedClient.PreparedHomeRecoveryOperation prepareRecovery(OperationId operation,TransactionStatus expected,TransactionStatus next,ParticipantOutcome proof) {
         var command=prepare(operation,expected,next);
@@ -82,7 +107,7 @@ public final class RatisTransactionStatuses {
     public void cancelRecovery(RatisRoutedClient.PreparedHomeRecoveryOperation operation) throws IOException { validateRecovery(operation); routed.cancelHomeRecovery(operation); }
     private void validateRecovery(RatisRoutedClient.PreparedHomeRecoveryOperation operation) { restoreRecovery(operation.recovery(),operation.descriptor()); }
     /** Success means this CAS applied; it does not mean the complete distributed transaction finalized. */
-    public CommandResult execute(RatisRoutedClient.PreparedCommand prepared) throws IOException { validate(prepared); return routed.execute(prepared); }
+    public CommandResult execute(RatisRoutedClient.PreparedCommand prepared) throws IOException { validate(prepared); if(requiresRerouteAdmission(prepared.command())) routed.authorizeOperationReroute(prepared); return routed.execute(prepared); }
     private void validate(RatisRoutedClient.PreparedCommand prepared) {
         var descriptor=prepared.descriptor(); validator(cluster,database,descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,column).accept(prepared.command());
     }
@@ -102,7 +127,10 @@ public final class RatisTransactionStatuses {
             if (mutation.kind()!=Mutation.Kind.PUT || mutation.returnMode()!=Mutation.ReturnMode.NONE || !mutation.columnId().equals(column) || !predicate.columnId().equals(column)
                     || mutation.key().length!=16 || !Arrays.equals(mutation.key(),predicate.key())) throw new IllegalArgumentException("Invalid home CAS envelope");
             var next=TransactionStatus.decode(mutation.value()); requireIdentity(next,cluster,database,mutation.key());
-            if (predicate.expectedValue()==null) next.requireInitial();
+            if (predicate.expectedValue()==null) {
+                next.requireInitial();
+                if(next.origin()!=null && (!next.reserved() || !next.origin().firstControl().equals(command.operationId()))) throw new IllegalArgumentException("Origin-bearing HOME registration requires its original reservation control");
+            }
             else { var old=TransactionStatus.decode(predicate.expectedValue()); requireIdentity(old,cluster,database,mutation.key()); next.requireSuccessorOf(old); }
         };
     }

@@ -58,9 +58,14 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         }
         var home=snapshot.observedHome();
         if (home==null) {
-            journal.queueHome(homes.prepare(nextControl(snapshot),null,snapshot.initial())); journal.executeHome();
+            journal.queueHome(homes.prepare(nextControl(snapshot),journal.registrationExpected(),snapshot.initial())); journal.executeHome();
             return result(Action.REGISTRATION_ATTEMPTED,null);
         }
+        if(home.reserved()) {
+            if(!journal.noEffectReservationState(home))throw new IOException("HOME reservation has participant effects");
+            journal.queueRecovery(home.decide(TransactionStatus.Phase.ABORT));journal.executeHome();return result(Action.ABORT_ATTEMPTED,null);
+        }
+        if(journal.noEffectReservationState(home))return new Step(Action.COMPLETE,null,true);
         if (home.phase()!=TransactionStatus.Phase.PREPARING) {
             var step=terminal.stepTerminal(); return new Step(Action.valueOf(step.action().name()),step.participant(),step.complete());
         }

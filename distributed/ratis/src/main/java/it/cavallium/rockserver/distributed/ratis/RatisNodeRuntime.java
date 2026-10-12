@@ -105,6 +105,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisProofQueryService proofQueries;
     private RatisProofQueryService authorityQueries;
     private RatisProofQueryService importPublicationQueries;
+    private RatisProofQueryService operationRerouteQueries;
     private final Map<UUID,RatisReferencedFiles> importFiles=new LinkedHashMap<>();
     private ThreadPoolExecutor importFileIo;
     private RatisExportSourceService exportSources;
@@ -236,6 +237,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
         proofQueries=new RatisProofQueryService();
+        if(groups.raftGroups().stream().anyMatch(group->groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.TRANSACTION_HOME))
+            operationRerouteQueries=RatisProofQueryService.operationRerouteLane();
         if (groups.raftGroups().stream().anyMatch(group -> groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.CATALOGUE)) {
             authorityQueries=RatisProofQueryService.authorityLane();
             importPublicationQueries=RatisProofQueryService.importPublicationLane();
@@ -333,6 +336,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
                         machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
                         machine.homeRecoveryData(routed); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
+                        machine.operationRerouteQueries(operationRerouteQueries);
                     }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
@@ -635,6 +639,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         try {
             // Ordinary proofs can await both catalogue authority and local replica preparation.
+            if(operationRerouteQueries!=null) {
+                try { operationRerouteQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
+                catch(InterruptedException interrupted) { Thread.currentThread().interrupt();throw new IOException("Reroute preparation drain interrupted",interrupted); }
+                catch(ExecutionException | TimeoutException failure) { throw new IOException("Reroute preparation did not drain",failure); }
+            }
             if (proofQueries!=null) {
                 try { proofQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Proof query drain interrupted",interrupted); }

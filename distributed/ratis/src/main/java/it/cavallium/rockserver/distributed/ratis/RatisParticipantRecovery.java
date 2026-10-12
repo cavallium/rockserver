@@ -30,6 +30,7 @@ public final class RatisParticipantRecovery implements AutoCloseable {
         journal.refreshHome(); journal.resolveHomeFromObserved(); var snapshot=journal.snapshot();
         if (snapshot.pendingHome()!=null && snapshot.homeResult()==null && !snapshot.homeSuperseded()) { journal.executeHome(); return result(Action.RETRIED_HOME); }
         var home=snapshot.observedHome();
+        if(home.reserved())throw new IOException("HOME reservation cannot coordinate participant recovery");
         if (home.phase()==TransactionStatus.Phase.PREPARING) {
             if (!takeover) return result(Action.WAITING);
             return transition(snapshot,home.decide(TransactionStatus.Phase.ABORT),Action.ABORT_ATTEMPTED);
@@ -53,7 +54,7 @@ public final class RatisParticipantRecovery implements AutoCloseable {
     }
     private Step result(Action action) throws IOException {
         var snapshot=journal.snapshot(); var home=snapshot.observedHome(); UUID group=snapshot.participantRoute().groupId();
-        return new Step(action,(snapshot.outcome()!=null || snapshot.retirementProof()!=null && home.gcEligible()) && home.phase()!=TransactionStatus.Phase.PREPARING && home.participants().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow().finalized());
+        return new Step(action,(snapshot.outcome()!=null || snapshot.retirementProof()!=null && home.gcEligible()) && home.terminal() && home.participants().stream().filter(p -> p.groupId().equals(group)).findFirst().orElseThrow().finalized());
     }
     @Override public synchronized void close() throws IOException { if (active) throw new IOException("Participant recovery step active; ownership retained"); closed=true; }
 }

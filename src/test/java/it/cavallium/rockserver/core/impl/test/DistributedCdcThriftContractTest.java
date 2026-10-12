@@ -233,4 +233,20 @@ class DistributedCdcThriftContractTest {
         assertThrows(TProtocolException.class,()->new CdcPoll().read(input));
     }
 
+    @Test void rawFinalizationCodecPreservesPromotedRerouteOrigin() throws Exception {
+        var finalization=DistributedCdcGrpcContractTest.reroutedFinalization(TransactionStatus.Phase.COMMIT);
+        var position=new ApplyPosition(2,5); var event=new DistributedCdcRecord.Event(new DistributedCdcCheckpoint.Cursor(position,0),new Mutation(Mutation.Kind.MERGE,column,new byte[]{1},new byte[]{9}));
+        var envelope=new DistributedCdcSubscriptions.Envelope(position,new byte[32],finalization.decision().operation(),finalization,List.of(event));
+        var batch=new DistributedCdcSubscriptions.Batch(batchId,definition(),lineage,beginning,DistributedCdcCheckpoint.Cursor.after(position),position,List.of(envelope));
+        var poll=new DistributedCdcSubscriptions.Poll(lineage,DistributedCdcSubscriptions.Outcome.DATA,batch,0,beginning,position);
+        var wire=ThriftDistributedCdcWire.poll(poll,subscription,16,4096); var copy=new CdcPoll();
+        new org.apache.thrift.TDeserializer().deserialize(copy,new org.apache.thrift.TSerializer().serialize(wire));
+        var decoded=ThriftDistributedCdcWire.poll(copy,subscription,16,4096);
+        assertEquals(poll,decoded); assertEquals(finalization.decision().origin(),decoded.batch().envelopes().getFirst().transaction().decision().origin());
+        assertEquals(ParticipantFinalization.HEADER_BYTES+TransactionStatus.HEADER_BYTES+OperationRerouteOrigin.MAX_BYTES+TransactionStatus.PARTICIPANT_BYTES,finalization.encode().length);
+        var oversized=wire.deepCopy(); oversized.batch.envelopes.getFirst().setFinalization(new byte[ParticipantFinalization.MAX_BYTES+1]);
+        var input=ThriftDistributedCdcWire.boundedProtocol(new TBinaryProtocol(new org.apache.thrift.transport.TMemoryInputTransport(new org.apache.thrift.TSerializer().serialize(oversized))),false);
+        assertThrows(TProtocolException.class,()->new CdcPoll().read(input));
+    }
+
 }

@@ -1189,6 +1189,20 @@ public final class RatisRoutedClient implements AutoCloseable {
         try { return readOriginalOutcome(prepared); }
         finally { endCall(); }
     }
+    public void authorizeOperationReroute(PreparedCommand prepared) throws IOException {
+        Objects.requireNonNull(prepared);requireIdentity(prepared.source);beginCall();
+        try { RatisOperationRerouteAdmissionRpc.requireEcho(transport.transaction(prepared.descriptor,
+                RatisOperationRerouteAdmissionRpc.prepareRequest(prepared.command),true),RatisOperationRerouteAdmissionRpc.PREPARE,prepared.command); }
+        catch(IllegalArgumentException malformed) { throw new IOException("Invalid reroute admission reply",malformed); }
+        finally { endCall(); }
+    }
+    public void cancelOperationReroute(PreparedCommand prepared) throws IOException {
+        Objects.requireNonNull(prepared);requireIdentity(prepared.source);beginCall();
+        try { RatisOperationRerouteAdmissionRpc.requireEcho(transport.transaction(prepared.descriptor,
+                RatisOperationRerouteAdmissionRpc.cancelRequest(prepared.command),true),RatisOperationRerouteAdmissionRpc.CANCEL,prepared.command); }
+        catch(IllegalArgumentException malformed) { throw new IOException("Invalid reroute cancellation reply",malformed); }
+        finally { endCall(); }
+    }
     private RatisTopologyOperationOutcomeRpc.Reply readOriginalOutcome(PreparedCommand prepared) throws IOException {
         if(Thread.currentThread().isInterrupted())throw new java.io.InterruptedIOException("Original outcome lookup interrupted");
         var source=prepared.source;var descriptor=prepared.descriptor;

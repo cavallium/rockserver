@@ -101,6 +101,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         }
         requireTransition(observed,next);
         if (recoverySequence==Long.MAX_VALUE) throw new IOException("Protected recovery identity namespace exhausted");
+        if(observed.reserved())throw new IOException("HOME reservation cannot belong to a prepared participant");
         var request=homes.prepareRecovery(new OperationId(recoveryNamespace,0,recoverySequence),observed,next,observed.phase()==TransactionStatus.Phase.PREPARING ? null : outcome);
         requireHomeRoute(request.descriptor());
         if (request.recovery().action()==HomeRecovery.Action.ACK) request.recovery().requireOutcome(outcome);
@@ -176,7 +177,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         }
     }
     private void requireDecision(ParticipantFinalization value) {
-        if (observed==null || observed.phase()==TransactionStatus.Phase.PREPARING || !observed.terminalDecision().equals(value.decision())) throw new IllegalArgumentException("Participant finalization lacks verified terminal home");
+        if (observed==null || !observed.terminal() || !observed.terminalDecision().equals(value.decision())) throw new IllegalArgumentException("Participant finalization lacks verified terminal home");
         value.requirePrepared(prepared);
         if (!value.homeGroup().equals(homeRoute.groupId()) || value.homeEpoch()!=homeRoute.rangeEpoch()) throw new IllegalArgumentException("Participant finalization home binding changed");
     }
@@ -312,7 +313,7 @@ public final class RatisDurableParticipantRecovery implements AutoCloseable {
         for (var participant:status.participants()) { position(out,participant.prepared()); out.writeBoolean(participant.finalized()); }
     }
     private TransactionStatus status(ByteBuffer in) throws IOException {
-        if (!flag(in)) return null; int phase=in.get() & 255; if (phase>=TransactionStatus.Phase.values().length) throw new IOException("Invalid compact participant home phase"); boolean consumed=flag(in);
+        if (!flag(in)) return null; int phase=in.get() & 255; if (phase>=TransactionStatus.Phase.values().length || phase==TransactionStatus.Phase.RESERVED.ordinal()) throw new IOException("Invalid compact participant home phase"); boolean consumed=flag(in);
         var votes=new ArrayList<ApplyPosition>(); var finalized=new ArrayList<Boolean>();
         for (int i=0;i<definition.participants().size();i++) { votes.add(position(in)); finalized.add(flag(in)); }
         var status=definition;

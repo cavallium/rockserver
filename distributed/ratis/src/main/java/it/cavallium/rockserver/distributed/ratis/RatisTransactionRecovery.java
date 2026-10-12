@@ -43,7 +43,7 @@ public final class RatisTransactionRecovery implements AutoCloseable {
             if (journal.snapshot().homeRetirementProof()!=null) return new Step(Action.HOME_RETIRED,null,true);
             if (!terminalOnly) return advance();
             var snapshot=journal.snapshot();
-            if (snapshot.observedHome()==null || snapshot.observedHome().phase()==TransactionStatus.Phase.PREPARING || snapshot.homeResult()==null && !snapshot.homeSuperseded()) throw new IOException("Terminal completion requires a verified decision and resolved home request");
+            if (snapshot.observedHome()==null || !snapshot.observedHome().terminal() || snapshot.homeResult()==null && !snapshot.homeSuperseded()) throw new IOException("Terminal completion requires a verified decision and resolved home request");
             return finishTerminal(snapshot);
         }
         catch (RatisHomeRetiredException retired) { return new Step(Action.HOME_RETIRED,null,true); }
@@ -60,9 +60,13 @@ public final class RatisTransactionRecovery implements AutoCloseable {
         }
         var home=snapshot.observedHome();
         if (home==null) {
-            journal.queueHome(homes.prepare(nextControl(snapshot),null,snapshot.initial()));
+            journal.queueHome(homes.prepare(nextControl(snapshot),journal.registrationExpected(),snapshot.initial()));
             journal.executeHome();
             return result(Action.REGISTRATION_ATTEMPTED,null);
+        }
+        if(home.reserved()) {
+            if(!journal.noEffectReservationState(home))throw new IOException("HOME reservation has participant effects");
+            journal.queueRecovery(home.decide(TransactionStatus.Phase.ABORT));journal.executeHome();return result(Action.ABORT_ATTEMPTED,null);
         }
         if (home.phase()==TransactionStatus.Phase.PREPARING) {
             journal.queueRecovery(home.decide(TransactionStatus.Phase.ABORT));
@@ -73,6 +77,7 @@ public final class RatisTransactionRecovery implements AutoCloseable {
     }
     private Step finishTerminal(RatisDurableTransaction.Snapshot snapshot) throws IOException {
         var home=snapshot.observedHome();
+        if(journal.noEffectReservationState(home) && home.terminal())return new Step(Action.COMPLETE,null,true);
         if (complete(snapshot)) return new Step(Action.COMPLETE,null,true);
         UUID group=participants.get(cursor);
         cursor=(cursor+1)%participants.size();
