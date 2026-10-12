@@ -12,6 +12,8 @@ import java.util.*;
 public final class RatisDurableTransaction implements AutoCloseable {
     public static final int MAX_BYTES=64*1024*1024;
     private static final long MAX_AGGREGATE=16L*1024*1024;
+    public static final int MAX_RESERVATION_EVIDENCE_BYTES=20+DistributedCommandCodec.MAX_ENCODED_BYTES+2*RangeDirectoryCodec.MAX_ENCODED_BYTES+RatisTopologyOperationOutcomeRpc.MAX_REPLY_BYTES;
+    private byte[] reservationEvidence;
     private static final int MAGIC=0x54584a4c;
     public record Intent(RangeDescriptor route,DistributedCommand acceptedBusiness,OperationId prepareControl,OperationId finalizeControl,List<Integer> resultPositions,UUID captureId) {
         public Intent(RangeDescriptor route,DistributedCommand acceptedBusiness,OperationId prepareControl,OperationId finalizeControl) {
@@ -91,9 +93,17 @@ public final class RatisDurableTransaction implements AutoCloseable {
 
     public static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,
             TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents) throws IOException {
+        return create(path,homes,data,initial,registration,intents,null);
+    }
+    public static RatisDurableTransaction createReserved(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws IOException {
+        if(initial.origin()==null)throw new IllegalArgumentException("Reserved journal needs original HOME origin");
+        return create(path,homes,data,initial,registration,intents,evidence);
+    }
+    private static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws IOException {
         var journal=new RatisDurableTransaction(path,homes,data,true);
         try {
             journal.initial=Objects.requireNonNull(initial); initial.requireInitial(); if(initial.reserved())throw new IllegalArgumentException("Participant journal requires promoted HOME initial status");
+            journal.reservationEvidence=validateReservationEvidence(initial,evidence);
             journal.validateRegistration(registration);
             if (intents.size()!=initial.participants().size()) throw new IllegalArgumentException("Missing participant intents");
             for (var intent:intents) {
@@ -213,7 +223,8 @@ public final class RatisDurableTransaction implements AutoCloseable {
         synchronized (this) { idle(); if (pending==null) throw new IllegalStateException("No frozen home request"); if (homeResult!=null) return homeResult; if (homeSuperseded) throw new IllegalStateException("Observed home supersedes this request; exact RPC result is unknown"); request=pending; active=true; }
         try {
             var retained=pendingRecovery==null ? null : homes.executeRecovery(pendingRecovery);
-            var result=retained==null ? homes.execute(request) : retained.result();
+            var before=expected(request);
+            var result=retained!=null ? retained.result() : before!=null && before.reserved() && next(request).phase()==TransactionStatus.Phase.PREPARING ? homes.execute(request,promotionEvidence()) : homes.execute(request);
             if (retained!=null && !retained.recovery().equals(pendingRecovery.recovery())) throw new IOException("Protected home receipt changed frozen request");
             synchronized (this) {
                 if (result.valueCount()!=0) throw new IOException("Home CAS returned unexpected values");
@@ -402,6 +413,26 @@ public final class RatisDurableTransaction implements AutoCloseable {
         if (!Objects.equals(expected(registration),registrationExpected()) || !initial.equals(next(registration))) throw new IllegalArgumentException("Invalid frozen home registration");
         homeRoute=registration.descriptor();
     }
+    static byte[] validateReservationEvidence(TransactionStatus status,RatisOperationRerouteAdmissionRpc.Evidence evidence) {
+        var origin=status.origin();if(origin==null){if(evidence!=null)throw new IllegalArgumentException("Ordinary journal cannot have reserved evidence");return null;}
+        if(evidence==null || !evidence.intents().isEmpty())throw new IllegalArgumentException("Reserved journal requires immutable reservation-only evidence");
+        var original=evidence.original();var source=evidence.sourceDirectory();var target=evidence.targetDirectory();var absence=evidence.absence();
+        var route=source.ranges().stream().filter(r->r.groupId().equals(original.groupId())).findFirst().orElseThrow();
+        var lineage=new DistributedCdcCheckpoint.Lineage(route.rangeId(),route.groupId(),route.rangeEpoch());
+        var request=new RatisTopologyOperationOutcomeRpc.Request(origin.clusterId(),origin.databaseId(),origin.domainId(),origin.source(),origin.operation(),origin.originalReceiptDigest());
+        if(original.kind()!=DistributedCommand.Kind.DATA || !source.clusterId().equals(origin.clusterId()) || !source.databaseId().equals(origin.databaseId()) || !source.domainId().equals(origin.domainId())
+                || source.schemaEpoch()!=status.schemaEpoch() || target.schemaEpoch()!=status.schemaEpoch() || !Arrays.equals(source.schemaDigest(),status.schemaDigest()) || !Arrays.equals(target.schemaDigest(),status.schemaDigest()) || !Arrays.equals(original.schemaDigest(),source.schemaDigest()) || source.routingPrefixBytes()!=target.routingPrefixBytes() || !source.columns().equals(target.columns())
+                || !lineage.equals(origin.source()) || !original.operationId().equals(origin.operation()) || original.rangeEpoch()!=route.rangeEpoch() || !Arrays.equals(original.receiptDigest(),origin.originalReceiptDigest())
+                || !target.clusterId().equals(origin.clusterId()) || !target.databaseId().equals(origin.databaseId()) || !target.domainId().equals(origin.domainId()) || !Arrays.equals(target.payloadDigest(),origin.targetDirectoryDigest())
+                || !Arrays.equals(RatisOperationRerouteAdmissionRpc.normalizedDigest(original,target),origin.planDigest()) || RatisOperationRerouteAdmissionRpc.targetParticipantCount(original,target)!=origin.targetParticipantCount()
+                || !request.equals(absence.request()) || absence.outcome()!=RatisTopologyOperationOutcomeRpc.Outcome.ABSENT || !absence.cut().equals(origin.absenceCut()) || !Arrays.equals(OperatorUpload.sha256(absence.freeze().encode()),origin.absenceCommitment()))throw new IllegalArgumentException("Reserved journal evidence changed original binding");
+        byte[] encoded=evidence.encode();if(encoded.length>MAX_RESERVATION_EVIDENCE_BYTES)throw new IllegalArgumentException("Reservation evidence exceeds bound");return encoded;
+    }
+    public synchronized RatisOperationRerouteAdmissionRpc.Evidence promotionEvidence()throws IOException {
+        requireOpen();if(reservationEvidence==null)throw new IOException("Original reservation evidence missing");
+        var saved=RatisOperationRerouteAdmissionRpc.Evidence.decode(reservationEvidence);
+        return new RatisOperationRerouteAdmissionRpc.Evidence(saved.original(),saved.sourceDirectory(),saved.targetDirectory(),saved.absence(),entries.values().stream().map(e->e.intent).toList());
+    }
     synchronized TransactionStatus registrationExpected() {
         return initial.origin()==null ? null : TransactionStatus.reserve(initial.origin(),initial.schemaEpoch(),initial.schemaDigest());
     }
@@ -472,7 +503,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         routes+=pendingRouteReserve;
         if (plans>MAX_AGGREGATE || routes>MAX_AGGREGATE) throw new IOException("Transaction aggregate intent/route bound exceeded");
         // One initial and observed home, one bounded home CAS, and two finalization decisions per participant.
-        long reserve=plans+routes+4L*TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536L
+        long reserve=(reservationEvidence==null ? 0 : reservationEvidence.length)+plans+routes+4L*TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536L
                 +entries.size()*(2L*ParticipantFinalization.MAX_BYTES+TransactionStatus.MAX_BYTES+2L*ParticipantFenceProof.MAX_BYTES+512+17);
         if (reserve+32>MAX_BYTES) throw new IOException("Transaction future persistence capacity unavailable");
         if (lastHome.equals(initial.operation()) || controls.contains(lastHome)) throw new IOException("Home operation overlaps participant/business identity");
@@ -495,7 +526,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return count;
     }
     private byte[] encode() throws IOException {
-        long size=4+64+4L+initial.encode().length+SessionWindowJournal.routeSize(homeRoute)+32+24+4+(observed==null ? 0 : observed.encode().length)+1;
+        long size=4+64+4L+(reservationEvidence==null ? 0 : reservationEvidence.length)+4L+initial.encode().length+SessionWindowJournal.routeSize(homeRoute)+32+24+4+(observed==null ? 0 : observed.encode().length)+1;
         if (pending!=null) size+=4L+(pendingRecovery==null ? DistributedCommandCodec.encodedSize(pending.command()) : pendingRecovery.bytes().length)+SessionWindowJournal.routeSize(pending.descriptor());
         size+=positionSize(recoveryReceipt==null ? null : recoveryReceipt.position());
         size+=4+(homeResult==null ? 0 : homeResult.encode().length)+1+4+(homeRetirementProof==null ? 0 : homeRetirementProof.encode().length)+4;
@@ -505,7 +536,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         }
         if (size+32>MAX_BYTES) throw new IOException("Transaction journal bound exceeded");
         var output=ByteBuffer.allocate((int)size).putInt(MAGIC).put(identity).put(homeIdentity);
-        blob(output,initial.encode()); SessionWindowJournal.route(output,homeRoute); operation(output,lastHome); uuid(output,recoveryNamespace); output.putLong(recoverySequence); blob(output,observed==null ? null : observed.encode());
+        blob(output,reservationEvidence);blob(output,initial.encode()); SessionWindowJournal.route(output,homeRoute); operation(output,lastHome); uuid(output,recoveryNamespace); output.putLong(recoverySequence); blob(output,observed==null ? null : observed.encode());
         output.put((byte)(pending==null ? 0 : pendingRecovery==null ? 1 : 2)); if (pending!=null) { blob(output,pendingRecovery==null ? DistributedCommandCodec.encode(pending.command()) : pendingRecovery.bytes()); SessionWindowJournal.route(output,pending.descriptor()); }
         position(output,recoveryReceipt==null ? null : recoveryReceipt.position());
         blob(output,homeResult==null ? null : homeResult.encode()); output.put((byte)(homeSuperseded ? 1 : 0)); blob(output,homeRetirementProof==null ? null : homeRetirementProof.encode()); output.putInt(entries.size());
@@ -525,7 +556,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
             if (input.getInt()!=MAGIC) throw new IOException("Invalid transaction journal format");
             byte[] bound=new byte[32],homeBound=new byte[32]; input.get(bound).get(homeBound);
             if (!Arrays.equals(bound,identity) || !Arrays.equals(homeBound,homeIdentity)) throw new IOException("Wrong transaction journal client identity");
-            initial=TransactionStatus.decode(blob(input,TransactionStatus.MAX_BYTES,false)); initial.requireInitial(); if(initial.reserved())throw new IllegalArgumentException("Participant journal requires promoted HOME initial status"); homeRoute=SessionWindowJournal.route(input); lastHome=operation(input); recoveryNamespace=new UUID(input.getLong(),input.getLong()); recoverySequence=input.getLong();
+            reservationEvidence=blob(input,MAX_RESERVATION_EVIDENCE_BYTES,true);
+            initial=TransactionStatus.decode(blob(input,TransactionStatus.MAX_BYTES,false)); initial.requireInitial(); if(initial.reserved())throw new IllegalArgumentException("Participant journal requires promoted HOME initial status");
+            if(!Arrays.equals(reservationEvidence,validateReservationEvidence(initial,reservationEvidence==null ? null : RatisOperationRerouteAdmissionRpc.Evidence.decode(reservationEvidence))))throw new IOException("Noncanonical reservation evidence");
+            homeRoute=SessionWindowJournal.route(input); lastHome=operation(input); recoveryNamespace=new UUID(input.getLong(),input.getLong()); recoverySequence=input.getLong();
             byte[] status=blob(input,TransactionStatus.MAX_BYTES,true); observed=status==null ? null : TransactionStatus.decode(status);
             if (observed!=null && !noEffectReservationState(observed)) requireMonotone(initial,observed);
             int homeKind=input.get() & 255; if (homeKind>2) throw new IOException("Invalid pending home request kind");

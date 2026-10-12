@@ -337,6 +337,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
                         machine.homeRecoveryData(routed); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
                         machine.operationRerouteQueries(operationRerouteQueries);
+                        var rerouteAuthority=new RatisOperationRerouteAdmission(new RatisOperationRerouteAdmission.Authority(){
+                            public it.cavallium.rockserver.core.common.distributed.TopologyChange.State intent(UUID intent)throws IOException{return epochs.topologyCatalogue().readIntent(intent);}
+                            public it.cavallium.rockserver.core.common.distributed.TopologyChange.Definition definition(byte[] digest)throws IOException{return epochs.topologyCatalogue().readDefinition(digest);}
+                            public RangeDirectory directory(UUID domain)throws IOException{return epochs.catalogue().read(domain);}
+                            public RatisTopologyOperationOutcomeRpc.Reply outcome(RangeDirectory source,RangeDescriptor descriptor,it.cavallium.rockserver.core.common.distributed.DistributedCommand original)throws IOException{return routed.operationOutcome(routed.restoreSessionCommand(source,original,descriptor));}
+                        },plan.catalogue().groupId());
+                        machine.operationRerouteProofAdmission(rerouteAuthority::validate);
                     }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));

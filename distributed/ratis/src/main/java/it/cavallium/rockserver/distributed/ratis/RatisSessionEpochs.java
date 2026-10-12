@@ -36,6 +36,8 @@ public final class RatisSessionEpochs {
     RatisSchemaAuthority schemaAuthority() { return new RatisSchemaAuthority(client,cluster,database,group); }
     RatisRangeImportAuthority.Client importAuthority() { return new RatisRangeImportAuthority.Client(client,cluster,database,group); }
     RatisTopologyAuthority.Client topologyAuthority() { return new RatisTopologyAuthority.Client(client,cluster,database,group); }
+    RatisTopologyCatalogue topologyCatalogue() { return new RatisTopologyCatalogue(client,cluster,database,group,rangeEpoch,schema,column); }
+    RatisCatalogue catalogue() { return new RatisCatalogue(client,cluster,database,group,rangeEpoch,schema,column); }
     void requireDatabaseBinding(UUID expectedCluster,UUID expectedDatabase) {
         if (!cluster.equals(expectedCluster) || !database.equals(expectedDatabase)) throw new IllegalArgumentException("Wrong session authority database");
     }

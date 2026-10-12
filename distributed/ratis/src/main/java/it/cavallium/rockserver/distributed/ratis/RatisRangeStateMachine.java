@@ -137,13 +137,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private ImportPublicationAdmission topologyExecutionAdmission;
     @FunctionalInterface public interface OperationRerouteAdmission { void validate(DistributedCommand command) throws IOException; }
     private OperationRerouteAdmission rerouteReservationAdmission,reroutePromotionAdmission;
+    @FunctionalInterface interface OperationRerouteProofAdmission { void validate(DistributedCommand command,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws IOException; }
+    private OperationRerouteProofAdmission rerouteProofAdmission;
+    void operationRerouteProofAdmission(OperationRerouteProofAdmission admission){if(role!=RatisNodePlan.Role.TRANSACTION_HOME || getLifeCycleState()!=LifeCycle.State.NEW || rerouteProofAdmission!=null || rerouteReservationAdmission!=null)throw new IllegalStateException("Reroute proof admission is fixed before initialization");rerouteProofAdmission=java.util.Objects.requireNonNull(admission);}
     private ProofQueryExecutor operationRerouteQueries;
     void operationRerouteQueries(ProofQueryExecutor executor) {
         if(role!=RatisNodePlan.Role.TRANSACTION_HOME || getLifeCycleState()!=LifeCycle.State.NEW || operationRerouteQueries!=null)throw new IllegalStateException("Reroute preparation lane is fixed before HOME initialization");
         operationRerouteQueries=java.util.Objects.requireNonNull(executor);
     }
     void operationRerouteAdmission(OperationRerouteAdmission reservation,OperationRerouteAdmission promotion) {
-        if(role!=RatisNodePlan.Role.TRANSACTION_HOME || getLifeCycleState()!=LifeCycle.State.NEW || !homeReservations || rerouteReservationAdmission!=null || reroutePromotionAdmission!=null) throw new IllegalStateException("Reroute HOME admission is fixed before initialization");
+        if(role!=RatisNodePlan.Role.TRANSACTION_HOME || getLifeCycleState()!=LifeCycle.State.NEW || !homeReservations || rerouteReservationAdmission!=null || reroutePromotionAdmission!=null || rerouteProofAdmission!=null) throw new IllegalStateException("Reroute HOME admission is fixed before initialization");
         rerouteReservationAdmission=java.util.Objects.requireNonNull(reservation);reroutePromotionAdmission=promotion;
     }
     void topologyExecutionAdmission(ImportPublicationAdmission admission) {
@@ -196,9 +199,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 || !owner.ready() || hold.term!=owner.term() || hold.generation!=generation || generation!=admissionGeneration.get() || getLifeCycleState()!=LifeCycle.State.RUNNING
                 || schemaConfigurationPending || hold.configurationStamp!=schemaConfigurationStamp || !preparedCutMatches(hold,store.applied()) || !store.admissionOpen() || !proposalFootprints.drained(hold.lease))throw new IOException("Import publication lacks current prepared owner");
     }
-    private void prepareImportPublication(DistributedCommand command)throws Exception{
+    private void prepareImportPublication(DistributedCommand command)throws Exception{prepareImportPublication(command,null);}
+    private void prepareImportPublication(DistributedCommand command,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws Exception{
         boolean reroute=role==RatisNodePlan.Role.TRANSACTION_HOME && RatisTransactionStatuses.requiresRerouteAdmission(command);
-        ImportPublicationAdmission admission=reroute ? (RatisTransactionStatuses.isReservation(command)
+        ImportPublicationAdmission admission=reroute && rerouteProofAdmission!=null ? prepared->rerouteProofAdmission.validate(prepared,evidence) : reroute ? (RatisTransactionStatuses.isReservation(command)
                 ? rerouteReservationAdmission==null ? null : rerouteReservationAdmission::validate
                 : reroutePromotionAdmission==null ? null : reroutePromotionAdmission::validate)
                 : RatisTopologyCatalogue.requiresOwnerAdmission(command) ? topologyExecutionAdmission : RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command) ? cdcDeliveryAdmission : importPublicationAdmission;
@@ -3886,8 +3890,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> queryLinearizable(Message request) { return query(request,true); }
     private CompletableFuture<Message> query(Message request,boolean freshBarrier) {
         try {
+            int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisOperationRerouteAdmissionRpc.MAX_BYTES);
             byte[] encoded = request.getContent().toByteArray();
-            int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
             if (!ScopedTransactionRpc.ownerSnapshot(kind) && !ScopedTransactionRpc.ownerExport(kind)) requireHealthy();
             if (ScopedTransactionRpc.schemaReplica(kind)) {
                 requireDataRole(); var replicas=schemaReplicas;
@@ -3903,12 +3907,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             if(RatisOperationRerouteAdmissionRpc.kind(kind)) {
                 if(!freshBarrier || role!=RatisNodePlan.Role.TRANSACTION_HOME || !homeReservations || operationRerouteQueries==null)throw new IOException("Reroute admission requires configured fresh HOME barrier");
-                var command=RatisOperationRerouteAdmissionRpc.decode(encoded);
-                if(kind==RatisOperationRerouteAdmissionRpc.CANCEL) { cancelImportPublication(command);return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(encoded))); }
+                if(kind==RatisOperationRerouteAdmissionRpc.CANCEL) { var command=RatisOperationRerouteAdmissionRpc.decode(encoded);cancelImportPublication(command);return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(encoded))); }
                 long generation=admissionGeneration.get();
-                return operationRerouteQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.IMPORT_PUBLICATION_BYTES,false,owned->{
+                return operationRerouteQueries.submit(store.ownership().owner().groupId(),encoded,2*RatisProofQueryService.IMPORT_PUBLICATION_BYTES,false,owned->{
                     if(generation!=admissionGeneration.get())throw new IOException("Reroute preparation lost read-barrier owner");
-                    prepareImportPublication(RatisOperationRerouteAdmissionRpc.decode(owned));return Message.valueOf(ByteString.copyFrom(owned));
+                    var prepared=RatisOperationRerouteAdmissionRpc.decodeRequest(owned);prepareImportPublication(prepared.command(),prepared.evidence());return Message.valueOf(ByteString.copyFrom(RatisOperationRerouteAdmissionRpc.preparedReply(RatisOperationRerouteAdmissionRpc.PREPARE,prepared.command())));
                 });
             }
             if(kind==RatisTopologyOperationOutcomeRpc.KIND) {

@@ -1099,7 +1099,15 @@ public final class RatisRoutedClient implements AutoCloseable {
     }
     /** Restore an immutable user retry route without rebasing it onto the current topology. */
     PreparedCommand restoreSessionCommand(DistributedCommand command,RangeDescriptor descriptor) {
-        Objects.requireNonNull(command); Objects.requireNonNull(descriptor); var observed=schemaView(command.schemaDigest());
+        return restoreSessionCommandValidated(schemaView(command.schemaDigest()),command,descriptor);
+    }
+    PreparedCommand restoreSessionCommand(RangeDirectory observed,DistributedCommand command,RangeDescriptor descriptor) {
+        Objects.requireNonNull(command);Objects.requireNonNull(descriptor);Objects.requireNonNull(observed);requireIdentity(observed);
+        if(observed.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Recovered route is outside original directory");
+        return restoreSessionCommandValidated(observed,command,descriptor);
+    }
+    private PreparedCommand restoreSessionCommandValidated(RangeDirectory observed,DistributedCommand command,RangeDescriptor descriptor) {
+        Objects.requireNonNull(command);Objects.requireNonNull(descriptor);
         if (command.kind()!=DistributedCommand.Kind.DATA && command.kind()!=DistributedCommand.Kind.COMMIT_ACCEPTED || command.sessionControl()!=null || command.minimumSessionEpoch()!=-1 || !Arrays.equals(command.schemaDigest(),observed.schemaDigest())
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE
@@ -1195,6 +1203,12 @@ public final class RatisRoutedClient implements AutoCloseable {
                 RatisOperationRerouteAdmissionRpc.prepareRequest(prepared.command),true),RatisOperationRerouteAdmissionRpc.PREPARE,prepared.command); }
         catch(IllegalArgumentException malformed) { throw new IOException("Invalid reroute admission reply",malformed); }
         finally { endCall(); }
+    }
+    public void authorizeOperationReroute(PreparedCommand prepared,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws IOException {
+        Objects.requireNonNull(prepared);Objects.requireNonNull(evidence);requireIdentity(prepared.source);beginCall();
+        try {RatisOperationRerouteAdmissionRpc.requireEcho(transport.transaction(prepared.descriptor,RatisOperationRerouteAdmissionRpc.prepareRequest(prepared.command,evidence),true),RatisOperationRerouteAdmissionRpc.PREPARE,prepared.command);}
+        catch(IllegalArgumentException malformed){throw new IOException("Invalid reroute evidence reply",malformed);}
+        finally {endCall();}
     }
     public void cancelOperationReroute(PreparedCommand prepared) throws IOException {
         Objects.requireNonNull(prepared);requireIdentity(prepared.source);beginCall();

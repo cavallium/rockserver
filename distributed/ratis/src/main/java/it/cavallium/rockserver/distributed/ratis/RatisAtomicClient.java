@@ -80,8 +80,10 @@ public final class RatisAtomicClient implements AutoCloseable {
         }catch(java.io.IOException|java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
     }
     /** Verify an exact existing HOME reservation before opening any frozen target captures. */
-    public Operation executeReservedPlan(Path journal,Identity identity,TransactionStatus reservation,RatisTransactionPlan plan,Duration ttl,RequestContext context)throws IOException {
-        Objects.requireNonNull(reservation);Objects.requireNonNull(identity);Objects.requireNonNull(plan);
+    public Operation executeReservedPlan(Path journal,Identity identity,TransactionStatus reservation,RatisTransactionPlan plan,RatisOperationRerouteAdmissionRpc.Evidence evidence,Duration ttl,RequestContext context)throws IOException {
+        Objects.requireNonNull(reservation);Objects.requireNonNull(identity);Objects.requireNonNull(plan);Objects.requireNonNull(context);
+        if(context.profile()==WorkloadProfile.CONTROL)throw new IOException("Reserved input preparation requires a data workload profile");
+        byte[] retained=RatisDurableTransaction.validateReservationEvidence(reservation,evidence);
         var origin=reservation.origin();
         if(!reservation.reserved() || origin==null || !reservation.transactionId().equals(identity.transaction()) || !reservation.operation().equals(identity.business()) || !origin.firstControl().equals(identity.firstControl())
                 || !reservation.clusterId().equals(schema.clusterId()) || !reservation.databaseId().equals(schema.databaseId()) || !reservation.domainId().equals(schema.domainId())
@@ -89,7 +91,8 @@ public final class RatisAtomicClient implements AutoCloseable {
                 || !Arrays.equals(origin.planDigest(),rawPlanDigest(plan)) || origin.targetParticipantCount()!=plan.partitions().size())throw new IllegalArgumentException("Reserved atomic origin differs from frozen target plan/identities");
         long deadline=scheduler.resolveMonotonicDeadline(context);
         if(!identity.business().equals(plan.operation()) || !Arrays.equals(directory.payloadDigest(),plan.directory().payloadDigest()) || ttl.isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis())))throw new IllegalArgumentException("Reserved atomic plan/TTL changed");
-        var operation=admit(journal,identity,plan,ttl,estimate(plan));operation.reservation=reservation;operation.beginExecution(context,deadline);return operation;
+        long bytes=estimate(plan)+3L*retained.length;if(bytes>RatisDurableTransaction.MAX_BYTES)throw new IOException("Reserved evidence future persistence exceeds journal budget");
+        var operation=admit(journal,identity,plan,ttl,bytes);operation.reservation=reservation;operation.reservationEvidence=RatisOperationRerouteAdmissionRpc.Evidence.decode(retained);operation.beginExecution(context,deadline);return operation;
     }
     /** Submit a fully frozen captured projection without staging again or opening replacement cuts. */
     public Operation executeAccepted(Path path,Identity identity,RatisTransactionPlan.Accepted accepted,RequestContext context) throws IOException {
@@ -215,6 +218,7 @@ public final class RatisAtomicClient implements AutoCloseable {
             } catch (Exception unavailable) { task.fail(unavailable); }
         }
         private TransactionStatus reservation;
+        private RatisOperationRerouteAdmissionRpc.Evidence reservationEvidence;
         private boolean journalPublicationAttempted;
         private CommandResult drive(Task<CommandResult> task) throws Exception {
             task.check();
@@ -292,11 +296,12 @@ public final class RatisAtomicClient implements AutoCloseable {
                 journal=candidate;
             } else {
                 journalPublicationAttempted=true;
-                var created=RatisDurableTransaction.create(path,homes,data,initialization.initial(),registration,initialization.intents());
+                var created=reservationEvidence==null ? RatisDurableTransaction.create(path,homes,data,initialization.initial(),registration,initialization.intents())
+                        : RatisDurableTransaction.createReserved(path,homes,data,initialization.initial(),registration,initialization.intents(),reservationEvidence);
                 try{publicationObserver.published(path);journal=created;}
                 catch(IOException|RuntimeException|Error failure){try{created.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
             }
-            plan=null; initialization=null; registration=null;
+            plan=null; initialization=null; registration=null;reservationEvidence=null;
         }
         private void publishRejection() throws IOException {
             if (java.nio.file.Files.exists(path)) {

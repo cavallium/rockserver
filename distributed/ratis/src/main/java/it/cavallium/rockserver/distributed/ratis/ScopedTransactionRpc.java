@@ -59,7 +59,7 @@ public final class ScopedTransactionRpc {
         public Packet {
             requireKind(kind);
             Objects.requireNonNull(body);
-            if (body.length > MAX_REPLY_BYTES - HEADER_BYTES) throw invalid("Frame body exceeds budget");
+            if (body.length > frameLimit(kind) - HEADER_BYTES) throw invalid("Frame body exceeds budget");
             body = body.clone();
         }
         @Override public byte[] body() { return body.clone(); }
@@ -72,20 +72,20 @@ public final class ScopedTransactionRpc {
         }
     }
 
+    private static int frameLimit(int kind){return kind==RatisOperationRerouteAdmissionRpc.PREPARE ? RatisOperationRerouteAdmissionRpc.MAX_BYTES : MAX_REPLY_BYTES;}
     public static byte[] frame(int kind, byte[] body) {
         requireKind(kind); Objects.requireNonNull(body);
-        if (body.length > MAX_REPLY_BYTES - HEADER_BYTES) throw invalid("Frame body exceeds budget");
+        if (body.length > frameLimit(kind) - HEADER_BYTES) throw invalid("Frame body exceeds budget");
         return ByteBuffer.allocate(HEADER_BYTES + body.length).putInt(MAGIC)
                 .putInt(kind).putInt(body.length).put(body).array();
     }
 
-    public static int kind(byte[] encoded,int maxBytes) {
-        Objects.requireNonNull(encoded);
-        if (maxBytes<HEADER_BYTES || maxBytes>MAX_REPLY_BYTES || encoded.length>maxBytes) throw invalid("Invalid frame budget");
-        var input=ByteBuffer.wrap(encoded); require(input,HEADER_BYTES);
-        if (input.getInt()!=MAGIC) throw invalid("Unsupported read frame");
-        int kind=input.getInt(),length=input.getInt(); requireKind(kind);
-        if (length<0 || length!=input.remaining()) throw invalid("Invalid frame body length"); return kind;
+    public static int kind(byte[] encoded,int maxBytes) {return kind(ByteBuffer.wrap(Objects.requireNonNull(encoded)),maxBytes);}
+    static int kind(ByteBuffer encoded,int maxBytes){
+        var input=Objects.requireNonNull(encoded).asReadOnlyBuffer();int size=input.remaining();
+        if(maxBytes<HEADER_BYTES || size>maxBytes)throw invalid("Invalid frame budget");require(input,HEADER_BYTES);
+        if(input.getInt()!=MAGIC)throw invalid("Unsupported read frame");int kind=input.getInt(),length=input.getInt();requireKind(kind);
+        if(size>frameLimit(kind))throw invalid("Frame kind exceeds budget");if(length<0 || length!=input.remaining())throw invalid("Invalid frame body length");return kind;
     }
     public static Packet parse(byte[] encoded,int maxBytes) {
         int kind=kind(encoded,maxBytes); byte[] body=Arrays.copyOfRange(encoded,HEADER_BYTES,encoded.length); return new Packet(kind,body);

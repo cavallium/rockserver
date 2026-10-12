@@ -108,6 +108,7 @@ public final class RatisTransactionStatuses {
     private void validateRecovery(RatisRoutedClient.PreparedHomeRecoveryOperation operation) { restoreRecovery(operation.recovery(),operation.descriptor()); }
     /** Success means this CAS applied; it does not mean the complete distributed transaction finalized. */
     public CommandResult execute(RatisRoutedClient.PreparedCommand prepared) throws IOException { validate(prepared); if(requiresRerouteAdmission(prepared.command())) routed.authorizeOperationReroute(prepared); return routed.execute(prepared); }
+    public CommandResult execute(RatisRoutedClient.PreparedCommand prepared,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws IOException {validate(prepared);if(!requiresRerouteAdmission(prepared.command()))throw new IllegalArgumentException("Evidence requires reroute HOME command");routed.authorizeOperationReroute(prepared,evidence);return routed.execute(prepared);}
     private void validate(RatisRoutedClient.PreparedCommand prepared) {
         var descriptor=prepared.descriptor(); validator(cluster,database,descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,column).accept(prepared.command());
     }
