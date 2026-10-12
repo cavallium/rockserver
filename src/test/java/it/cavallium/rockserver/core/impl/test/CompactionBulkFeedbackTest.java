@@ -17,6 +17,7 @@ class CompactionBulkFeedbackTest {
         long metadataMicros = 1000, nativePointMean = -1;
         int foundPerCall = 72, returnedPerCall = 4096, readTasks = -1, acceptedTasks = -1, pointCallsPerSecond = 100, removalsPerSecond;
         boolean contentAvailable = true, arrivalsAvailable = true, outcomesAvailable = true;
+        int topologyWorkers = -1;
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
         boolean point = true, pointNative = true, bulkStats = true, sampleValid = true, pressure, stopped, bulkPending;
         Trace() { this(16L << 20); }
@@ -46,7 +47,7 @@ class CompactionBulkFeedbackTest {
                     bulkCount, bulkTime, bulkKeys, workers, active, latencyActive, queued, readDone, bulkPending, point && pointNative || extraPointCalls > 0 ? (pointTail > 0 ? pointTail : pointLatency) : 0,
                     bulkTail > 0 ? bulkTail : calls > 0 ? bulkCallMicros : 0, nativePoints, nativeBulks, nativeBulkKeys, nativePointNanos, contentAvailable ? foundKeys : -1, contentAvailable ? returnedBytes : -1,
                     contentAvailable ? readFailures : -1, arrivalsAvailable ? readArrivals : -1, outcomesAvailable ? terminalOutcomes : -1,
-                    outcomesAvailable ? nonRunOutcomes : -1));
+                    outcomesAvailable ? nonRunOutcomes : -1, topologyWorkers != -1 ? topologyWorkers : workers));
             if (p.readaheadBytes() != applied) {
                 applied = p.readaheadBytes();
                 try {
@@ -299,6 +300,44 @@ class CompactionBulkFeedbackTest {
         assertTrue(t.applied >= 65536, "steady full workers and a fixed queue must permit a measured prefetch seed");
         assertTrue(t.applied <= 16L << 20);
         assertTrue(t.veto(), "byte-rate demand pressure remains distinct from readahead latency safety");
+    }
+    @Test void legacySampleDefaultsTopologyToItsSelectedWorkers() {
+        var sample = new CompactionIoBudget.Sample(0, 0, 0, 0, false, false, false, true,
+                false, 0, true, false, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, false,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        assertEquals(8, sample.readTopologyWorkers());
+    }
+    @Test void invalidTopologyCannotAuthorizeReadahead() {
+        var t = new Trace(65536); t.topologyWorkers = 11;
+        t.active = t.latencyActive = t.workers; t.queued = 17; t.bulkCallMicros = 128000;
+        t.seconds(300); assertEquals(65536, t.applied);
+        t.topologyWorkers = -2; t.step(); assertEquals(0, t.applied);
+    }
+    @Test void alternatingSelectedGroupsDoNotInventTopologyChanges() {
+        var t = new Trace(65536); t.topologyWorkers = 11;
+        t.queued = 17; t.bulkCallMicros = 128000; t.readFailures = -1;
+        for (int i = 0; i < 300; i++) {
+            t.workers = i % 2 == 0 ? 8 : 3;
+            t.active = t.latencyActive = t.workers; t.step();
+        }
+        assertEquals(65536, t.applied, "stable full groups must eventually permit the bounded seed");
+        t.topologyWorkers = 12; t.step();
+        assertEquals(0, t.applied, "an actual topology change must still cut prefetch");
+        t.seconds(59); assertEquals(0, t.applied, "the topology change must preserve the full hold");
+    }
+    @Test void smallSelectedPoolStillProtectsQueueAndProgressWithIdleCapacityElsewhere() {
+        var t = new Trace(65536); t.topologyWorkers = 11;
+        t.workers = t.active = t.latencyActive = 3;
+        t.queued = 17; t.bulkCallMicros = 128000; t.readFailures = -1;
+        t.seconds(300); assertEquals(65536, t.applied);
+        t.queued = 30; t.seconds(2);
+        assertEquals(0, t.applied, "idle workers in the other group cannot dilute selected saturation");
+        var stalled = new Trace(65536); stalled.topologyWorkers = 11;
+        stalled.workers = stalled.active = stalled.latencyActive = 3;
+        stalled.queued = 17; stalled.bulkCallMicros = 128000; stalled.readFailures = -1;
+        stalled.seconds(300); assertEquals(65536, stalled.applied);
+        stalled.calls = 0; stalled.bulkPending = true; stalled.step();
+        assertEquals(0, stalled.applied, "missing bulk progress must retain the existing immediate cut");
     }
     @Test void steadyRecoveryCanStartBoundedPrefetchWhileDebtPersists() {
         var t = new Trace(); t.active = t.latencyActive = t.workers; t.queued = 16;

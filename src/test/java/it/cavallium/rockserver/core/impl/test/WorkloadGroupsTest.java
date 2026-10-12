@@ -121,6 +121,89 @@ class WorkloadGroupsTest {
 		}
 	}
 
+    @Test
+    void realGroupedSamplerKeepsTopologyWhenSelectedPressureMoves() throws Exception {
+        var cfg = config("grouped-sampler", "database.parallelism.read=8\n"
+                + "database.parallelism.workload-groups=[{name:slow,read:3,write:3,workload:{latency-queue-capacity:32,competing-batch-read-maximum-active:3}}]\n"
+                + "database.parallelism.workload.latency-queue-capacity=32\n"
+                + "database.global.adaptive-compaction-io=true\n");
+        var release = new CountDownLatch(1);
+        try (var connection = new EmbeddedConnection(tempDir.resolve("grouped-sampler-db"), "grouped-sampler", cfg)) {
+            var api = connection.getSyncApi(RequestContext.batch());
+            long slowId = api.createColumn("slow-column", SCHEMA), hotId = api.createColumn("hot-column", SCHEMA);
+            for (long id : new long[]{slowId, hotId}) api.put(0, id, KEY, VALUE, RequestType.none());
+            api.flush();
+            for (int i = 0; i < 64; i++) {
+                for (long id : new long[]{slowId, hotId}) {
+                    assertEquals(VALUE, api.get(0, id, KEY, RequestType.current()));
+                    assertEquals(java.util.List.of(true), api.existsMulti(0, id, java.util.List.of(KEY)));
+                }
+            }
+            var internal = connection.getInternalDB();
+            var controllerField = internal.getClass().getDeclaredField("compactionIoController"); controllerField.setAccessible(true);
+            var controller = controllerField.get(internal);
+            var limiterField = controller.getClass().getDeclaredField("limiter"); limiterField.setAccessible(true);
+            var limiter = (org.rocksdb.RateLimiter) limiterField.get(controller);
+            var sampleMethod = internal.getClass().getDeclaredMethod("sampleCompactionIo", org.rocksdb.RateLimiter.class);
+            sampleMethod.setAccessible(true);
+            var executorField = controller.getClass().getDeclaredField("executor"); executorField.setAccessible(true);
+            var sampler = (java.util.concurrent.ScheduledExecutorService) executorField.get(controller);
+            java.util.concurrent.Callable<it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample> sampleCall =
+                    () -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) sampleMethod.invoke(internal, limiter);
+            var budgetField = controller.getClass().getDeclaredField("budget"); budgetField.setAccessible(true);
+            var budget = budgetField.get(controller);
+            var previousField = budget.getClass().getDeclaredField("previous"); previousField.setAccessible(true);
+            var initial = sampler.submit(() -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) previousField.get(budget)).get(5, SECONDS);
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> {
+                while (true) {
+                    var polled = sampler.submit(() -> (it.cavallium.rockserver.core.impl.CompactionIoBudget.Sample) previousField.get(budget)).get(5, SECONDS);
+                    if (polled != null && (initial == null || polled.nanos() > initial.nanos())) {
+                        assertEquals(11, polled.readTopologyWorkers()); break;
+                    }
+                    Thread.sleep(10);
+                }
+            });
+            var root = connection.getScheduler(); var slow = internal.getSchedulerForColumn(slowId);
+            try {
+                for (var scheduler : new RWScheduler[]{root, slow}) {
+                    var executor = scheduler.executor(WorkloadProfile.LATENCY, OperationFamily.POINT_LOOKUP, Long.MAX_VALUE);
+                    int workers = scheduler.poolSnapshot(RWScheduler.Pool.READ).workerCount();
+                    var started = new CountDownLatch(workers);
+                    for (int i = 0; i < workers; i++) executor.execute(() -> {
+                        started.countDown();
+                        try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    });
+                    assertTrue(started.await(5, SECONDS));
+                }
+                var async = connection.getAsyncApi(RequestContext.latency(Duration.ofSeconds(20)));
+                var hot = new java.util.ArrayList<java.util.concurrent.CompletableFuture<Buf>>();
+                var cold = new java.util.ArrayList<java.util.concurrent.CompletableFuture<Buf>>();
+                for (int i = 0; i < 17; i++) hot.add(async.getAsync(0, hotId, KEY, RequestType.current()));
+                for (int i = 0; i < 16; i++) cold.add(async.getAsync(0, slowId, KEY, RequestType.current()));
+                assertEquals(17, root.poolSnapshot(RWScheduler.Pool.READ).queuedByProfile().get(WorkloadProfile.LATENCY));
+                assertEquals(16, slow.poolSnapshot(RWScheduler.Pool.READ).queuedByProfile().get(WorkloadProfile.LATENCY));
+                var first = sampler.submit(sampleCall).get(5, SECONDS);
+                assertEquals(11, first.readTopologyWorkers()); assertEquals(8, first.readWorkers());
+                assertEquals(8, first.readActive()); assertEquals(17, first.latencyReadQueued());
+                assertEquals(-1, first.readFailures()); assertTrue(first.nativePointCompletions() >= 128);
+                assertTrue(first.nativeBulkCompletions() >= 128); assertTrue(first.bulkKeys() >= 128);
+                assertTrue(hot.removeLast().cancel(false));
+                cold.add(async.getAsync(0, slowId, KEY, RequestType.current()));
+                assertEquals(16, root.poolSnapshot(RWScheduler.Pool.READ).queuedByProfile().get(WorkloadProfile.LATENCY));
+                assertEquals(17, slow.poolSnapshot(RWScheduler.Pool.READ).queuedByProfile().get(WorkloadProfile.LATENCY));
+                var second = sampler.submit(sampleCall).get(5, SECONDS);
+                assertEquals(11, second.readTopologyWorkers()); assertEquals(3, second.readWorkers());
+                assertEquals(3, second.readActive()); assertEquals(17, second.latencyReadQueued());
+                release.countDown();
+                for (var future : hot) assertEquals(VALUE, future.get(5, SECONDS));
+                for (var future : cold) assertEquals(VALUE, future.get(5, SECONDS));
+                var progressed = sampler.submit(sampleCall).get(5, SECONDS);
+                assertTrue(progressed.nativePointCompletions() > second.nativePointCompletions());
+                assertTrue(progressed.readCompletions() > second.readCompletions());
+            } finally { release.countDown(); }
+        }
+    }
+
 	@Test
 	@org.junit.jupiter.api.parallel.ResourceLock(org.junit.jupiter.api.parallel.Resources.SYSTEM_PROPERTIES)
 	void grpcLegacyAndFastReadsAndStreamedMutationsUseColumnGroups() throws Exception {

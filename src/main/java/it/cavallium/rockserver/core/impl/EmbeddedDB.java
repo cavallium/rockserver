@@ -362,9 +362,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Set<ActiveRangeResource> activeRangeResources = ConcurrentHashMap.newKeySet();
 	private final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
 	private final AtomicInteger activeNativeMultiGets = new AtomicInteger();
-	private final AtomicLong pointReadTailNanos = new AtomicLong();
-	private final AtomicLong nativePointReadCompletions = new AtomicLong();
-	private final AtomicLong nativePointReadNanos = new AtomicLong();
+	private final PointReadCompletionCounters pointReadCompletions = new PointReadCompletionCounters();
 	private final AtomicLong bulkReadTailNanos = new AtomicLong();
 	private final AtomicLong nativeBulkReadCompletions = new AtomicLong();
 	private final AtomicLong nativeBulkReadKeys = new AtomicLong();
@@ -3169,15 +3167,52 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		if (compactionIoController == null) return;
 		long elapsed = Math.max(0, System.nanoTime() - started);
 		if (bulkKeys <= 0) {
-			pointReadTailNanos.accumulateAndGet(elapsed, Math::max);
-			nativePointReadNanos.addAndGet(elapsed);
-			nativePointReadCompletions.incrementAndGet();
+			pointReadCompletions.record(elapsed);
 		}
 		else {
 			bulkReadTailNanos.accumulateAndGet(elapsed, Math::max);
 			nativeBulkReadCompletions.incrementAndGet();
 			nativeBulkReadKeys.addAndGet(bulkKeys);
 		}
+	}
+
+	// Each stripe publishes and drains a completed POINT cohort. The aggregate is a
+	// vector cut: count, duration and tail agree, although stripe cut times differ.
+	// Native calls and elapsed-time measurement stay outside the critical sections.
+	private static final class PointReadCompletionCounters {
+		private final Stripe[] stripes = new Stripe[64];
+
+		PointReadCompletionCounters() {
+			for (int i = 0; i < stripes.length; i++) stripes[i] = new Stripe();
+		}
+
+		void record(long elapsed) {
+			var stripe = stripes[(int) Thread.currentThread().threadId() & (stripes.length - 1)];
+			synchronized (stripe) {
+				stripe.nanos += elapsed;
+				stripe.count++;
+				stripe.tailNanos = Math.max(stripe.tailNanos, elapsed);
+			}
+		}
+
+		synchronized Snapshot sample() {
+			long count = 0, nanos = 0, tailNanos = 0;
+			for (var stripe : stripes) {
+				synchronized (stripe) {
+					count += stripe.count;
+					nanos += stripe.nanos;
+					tailNanos = Math.max(tailNanos, stripe.tailNanos);
+					stripe.tailNanos = 0;
+				}
+			}
+			return new Snapshot(count, nanos, tailNanos);
+		}
+
+		private static final class Stripe {
+			private long count, nanos, tailNanos;
+		}
+
+		record Snapshot(long count, long nanos, long tailNanos) {}
 	}
 
 	private record CompactionReadCompletion(long bytes, long micros, long count) {
@@ -3251,15 +3286,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				var compactionReads = sampleCompactionReadCompletion(statistics);
 				var prefetch = statistics.getHistogramData(org.rocksdb.HistogramType.COMPACTION_PREFETCH_BYTES);
 				var bulk = statistics.getHistogramData(org.rocksdb.HistogramType.DB_MULTIGET);
-				scheduler.copyCompactionReadTelemetry(readPoolTelemetry, groupReadPoolTelemetry);
+				int readTopologyWorkers = scheduler.copyCompactionReadTelemetryAndTopology(readPoolTelemetry, groupReadPoolTelemetry);
 				boolean background = nativeDb.getLongProperty("rocksdb.num-running-compactions") > 0
 						|| nativeDb.getLongProperty("rocksdb.num-running-flushes") > 0;
 				boolean foregroundPending = ops.getPendingOpsCount() > 1;
 				for (var profile : WorkloadProfile.values()) {
 					foregroundPending |= scheduler.activeTasks(profile) + scheduler.queuedTasks(profile) > 0;
 				}
-				long pointCount = nativePointReadCompletions.get();
-				long pointElapsed = nativePointReadNanos.get();
+				var point = pointReadCompletions.sample();
 				return new CompactionIoBudget.Sample(System.nanoTime(), histogram.getCount(), histogram.getSum(),
 						limiter.getTotalBytesThrough(), background, pressure, stopped, complete,
 						foregroundPending,
@@ -3273,15 +3307,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						(int) readPoolTelemetry[RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.LATENCY.ordinal()],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS],
 						activeNativeMultiGets.get() > 0 || !activeExistsMultiRequests.isEmpty(),
-						(long) Math.ceil(pointReadTailNanos.getAndSet(0) / 1000d),
+						(long) Math.ceil(point.tailNanos() / 1000d),
 						(long) Math.ceil(bulkReadTailNanos.getAndSet(0) / 1000d),
-						pointCount, nativeBulkReadCompletions.get(), nativeBulkReadKeys.get(), pointElapsed,
+						point.count(), nativeBulkReadCompletions.get(), nativeBulkReadKeys.get(), point.nanos(),
 						statistics.getTickerCount(org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND),
 						statistics.getHistogramData(org.rocksdb.HistogramType.BYTES_PER_MULTIGET).getSum(),
 						workloadGroups.isEmpty() ? readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] : -1,
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES]);
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES], readTopologyWorkers);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {
