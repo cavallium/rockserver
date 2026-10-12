@@ -13,14 +13,35 @@ import java.util.*;
 /** Session-owned reroute work on an already admitted mutation worker. Transports and scheduler are borrowed. */
 final class RatisOperationRerouteCoordinator implements AutoCloseable {
     private static final int MAGIC=0x52524353,MAX_STATE_BYTES=155+HomeFenceProof.MAX_BYTES+NativeSourceOutcomeCredit.Request.MAX_BYTES+RatisSourceOutcomeRecord.MAX_BYTES+CommandResult.MAX_BYTES;
+    static final int MAX_RETAINED_JOBS=4;
+    static final long JOB_DISK_RESERVATION=2L*(RatisOperationRerouteJournal.MAX_BYTES+RatisDurableTransaction.MAX_BYTES+MAX_STATE_BYTES+RatisRerouteReclamation.MAX_BYTES+2L*SessionEpochLedger.MAX_BYTES+4096+(2L*TransactionStatus.MAX_PARTICIPANTS+2)*(RangeDirectoryCodec.MAX_ENCODED_BYTES+16384L));
+    static final long MAX_DISK_RESERVATION=MAX_RETAINED_JOBS*JOB_DISK_RESERVATION;
     private static final int MAX_ACTIVE=1;private static final long CHARGE=6L*RatisSourceOutcomeRpc.MAX_REQUEST_BYTES+4L*RatisOperationRerouteJournal.MAX_BYTES+3L*MAX_STATE_BYTES+4L*RatisSessionClient.MAX_SOURCE_DIRECTORY_BYTES+2L*RatisTransactionPlan.MAX_BYTES,MAX_BYTES=CHARGE;
     private final Path root;private final DistributedSchema schema;private final RatisSessionEpochs epochs;private final RatisRoutedClient routed;private final RatisTransactionStatuses homes;private final RWScheduler scheduler;private final RatisRoutedClient.SourceAckDirectoryReader ackDirectory;
     private final RatisCatalogue directories;private final SessionEpochLedger.Grant business;private final RatisSessionClient.Limits limits;private final byte[] binding;
-    private int active,rerouting;private long bytes;private boolean closed;
+    private volatile boolean retainedWork;private int active,rerouting;private long bytes;private boolean closed;
+    private final FileChannel ownership;private final FileLock ownershipLock;private final RatisRerouteReclamation reclamation;
+    SessionJournalFiles.Removal removal=SessionJournalFiles.FILESYSTEM;
+    RatisRerouteReclamation.BeforeDelete beforeReclamation=job->{};
     RatisOperationRerouteCoordinator(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,SessionEpochLedger.Grant business,RatisSessionClient.Limits limits,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader ackDirectory)throws IOException {
         this.root=root.toAbsolutePath().normalize();this.schema=Objects.requireNonNull(schema);this.epochs=Objects.requireNonNull(epochs);this.routed=Objects.requireNonNull(routed);this.homes=Objects.requireNonNull(homes);this.scheduler=Objects.requireNonNull(scheduler);this.business=Objects.requireNonNull(business);this.limits=Objects.requireNonNull(limits);this.ackDirectory=Objects.requireNonNull(ackDirectory);this.directories=Objects.requireNonNull(directories);
         binding=OperatorUpload.sha256(ByteBuffer.allocate(136).put(schema.digest()).put(routed.sessionIdentityDigest()).put(homes.identityDigest()).putLong(business.epoch()).putLong(business.sessionId().getMostSignificantBits()).putLong(business.sessionId().getLeastSignificantBits()).putLong(business.issuedAtMillis()).putLong(business.expiresAtMillis()).array());
-        Files.createDirectories(this.root);SessionJournalFiles.force(this.root);SessionJournalFiles.force(this.root.getParent());
+        Files.createDirectories(this.root);if(!Files.isDirectory(this.root,LinkOption.NOFOLLOW_LINKS))throw new IOException("Reroute root must be an owned directory");SessionJournalFiles.force(this.root);SessionJournalFiles.force(this.root.getParent());
+        var lockPath=this.root.resolve("coordinator.lock");if(Files.exists(lockPath,LinkOption.NOFOLLOW_LINKS) && (!Files.isRegularFile(lockPath,LinkOption.NOFOLLOW_LINKS) || Files.size(lockPath)!=0))throw new IOException("Invalid coordinator ownership file");ownership=FileChannel.open(lockPath,StandardOpenOption.CREATE,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);FileLock acquired=null;
+        try{try{acquired=ownership.tryLock();}catch(OverlappingFileLockException owned){throw new IOException("Reroute root already owned",owned);}if(acquired==null)throw new IOException("Reroute root already owned");ownershipLock=acquired;reclamation=new RatisRerouteReclamation(this.root,binding,business,MAX_STATE_BYTES);retainedWork=!reclamation.jobs(MAX_RETAINED_JOBS).isEmpty() || reclamation.hasMarkers();SessionJournalFiles.force(this.root);}catch(IOException|RuntimeException failure){if(acquired!=null)acquired.release();ownership.close();throw failure;}
+    }
+    private void requireDone(Path directory)throws IOException {try(var job=new Job(directory);var input=RatisOperationRerouteJournal.reopen(directory.resolve("input.bin"),binding)){requireSelected(job,input);if(!job.done)throw new IOException("Pending reclamation lacks verified DONE");}}
+    private void recoverReclamation(RatisAtomicClient.InlineCheck check)throws IOException {
+        reclamation.recover(MAX_RETAINED_JOBS,this::requireDone,new SessionJournalFiles.Removal(){public void delete(Path path)throws IOException{check.check();removal.delete(path);}public void force(Path path)throws IOException{removal.force(path);}},beforeReclamation);
+    }
+    private void reserveSelection(Path directory,RatisAtomicClient.InlineCheck check)throws IOException {
+        recoverReclamation(check);var jobs=reclamation.jobs(MAX_RETAINED_JOBS);retainedWork=true;if(Files.exists(directory,LinkOption.NOFOLLOW_LINKS)){requireUnselected(directory);return;}
+        if(jobs.size()>=MAX_RETAINED_JOBS || JOB_DISK_RESERVATION>MAX_DISK_RESERVATION-jobs.size()*JOB_DISK_RESERVATION)throw new IOException("Retained reroute disk reservation exhausted");
+    }
+    private void requireUnselected(Path directory)throws IOException {
+        if(!Files.isDirectory(directory,LinkOption.NOFOLLOW_LINKS))throw new IOException("Unselected original directory changed type");var channels=new ArrayList<FileChannel>();
+        try{try(var files=Files.newDirectoryStream(directory)){for(var file:files){var name=file.getFileName().toString();if(!Set.of("owner.lock","input.bin.lock").contains(name) || !Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS) || Files.size(file)!=0)throw new IOException("Unpublished original input or sidecar requires exact recovery");var channel=FileChannel.open(file,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);channels.add(channel);try{if(channel.tryLock()==null)throw new IOException("Unselected original directory remains owned");}catch(OverlappingFileLockException owned){throw new IOException("Unselected original directory remains owned",owned);}}}}
+        finally{IOException failure=null;for(var channel:channels)try{channel.close();}catch(IOException cleanup){if(failure==null)failure=cleanup;else failure.addSuppressed(cleanup);}if(failure!=null)throw failure;}
     }
     private synchronized void enter()throws IOException {if(closed)throw new IOException("Reroute coordinator closed");active++;}
     private synchronized void enterReroute()throws IOException {if(closed || rerouting>=MAX_ACTIVE || CHARGE>MAX_BYTES-bytes)throw new IOException("Reroute coordinator at bounded ownership capacity");rerouting++;bytes+=CHARGE;}
@@ -36,12 +57,12 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                 try{return routed.execute(original);}catch(RatisRoutedClient.OriginalOperationAbsent absent) {
                     enterReroute();reroute=true;
                     if(RatisOperationRerouteAdmissionRpc.acknowledgementOnly(original.command()))throw new IOException("Absent original ACK has no reroute authority",absent);
-                    Files.createDirectories(directory);SessionJournalFiles.force(directory);SessionJournalFiles.force(root);
-                    var target=directories.read(schema.domainId());if(target==null)throw new IOException("Authoritative reroute target directory is absent");try{schema.requireMatches(target);}catch(IllegalArgumentException changed){throw new IOException("Reroute target changed original logical schema; original operation retained",changed);}routed.refresh(target);
+                    reserveSelection(directory,check);
+                    var target=directories.read(schema.domainId());if(target==null)throw new IOException("Authoritative reroute target directory is absent");try{schema.requireMatches(target);}catch(IllegalArgumentException changed){throw new IOException("Reroute target changed original logical schema; original operation retained",changed);}routed.refresh(target);Files.createDirectories(directory);SessionJournalFiles.force(directory);SessionJournalFiles.force(root);
                     try(var selected=RatisOperationRerouteJournal.select(input,binding,absent.originalDirectory(),original.command(),target,absent.evidence(),Duration.ofSeconds(30))){}
                 }
             }
-            if(!reroute){enterReroute();reroute=true;}
+            if(!reroute){enterReroute();reroute=true;recoverReclamation(check);}
             try(var job=new Job(directory);var selected=RatisOperationRerouteJournal.reopen(input,binding)) {
                 if(!Arrays.equals(DistributedCommandCodec.encode(original.command()),DistributedCommandCodec.encode(selected.originalCommand())))throw new IOException("Reroute changed original input");
                 return resolve(job,selected,context,check);
@@ -120,14 +141,12 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
     /** Caller has already forced application consumption in the original window. */
     void recoverConsumed(RatisDurableSessionClient window,RequestContext context,RatisAtomicClient.InlineCheck check)throws IOException {
         enter();boolean reroute=false;try {
-            long acknowledged=window.acknowledgedThrough();if(acknowledged<0)return;
-            List<Path> directories;try(var files=Files.list(root)){directories=files.filter(p->Files.isDirectory(p,LinkOption.NOFOLLOW_LINKS)).limit(4097).toList();}
-            if(directories.size()>4096)throw new IOException("Reroute cleanup directory bound exhausted");
-            for(var directory:directories.stream().sorted(Comparator.comparingLong(p->Long.parseLong(p.getFileName().toString()))).toList()) {
+            long acknowledged=window.acknowledgedThrough();if(acknowledged<0 || !retainedWork)return;enterReroute();reroute=true;
+            recoverReclamation(check);var directories=reclamation.jobs(MAX_RETAINED_JOBS);
+            for(var directory:directories) {
                 long sequence=Long.parseLong(directory.getFileName().toString());if(sequence>acknowledged || !Files.exists(directory.resolve("input.bin")))continue;
-                if(!reroute){enterReroute();reroute=true;}
                 try(var job=new Job(directory);var input=RatisOperationRerouteJournal.reopen(directory.resolve("input.bin"),binding)) {
-                    requireSelected(job,input);if(job.done || !job.published)continue;check.check();
+                    requireSelected(job,input);if(!job.published)continue;check.check();if(!job.done) {
                     if(!job.sourceAcknowledged) {
                         var pending=window.pending().stream().filter(p->job.ack!=null && p.command().operationId().equals(job.ack)).findFirst().orElse(null);
                         if(pending==null && job.ack!=null && window.acknowledgedThrough()>=job.ack.sequence())job.sourceAcknowledged=true;
@@ -158,11 +177,15 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                         }
                     }
                     job.done=true;job.persist();
+                    }
+                    check.check();reclamation.prepare(directory,input);
                 }
+                recoverReclamation(check);
             }
+            retainedWork=!reclamation.jobs(MAX_RETAINED_JOBS).isEmpty() || reclamation.hasMarkers();
         }catch(NumberFormatException invalid){throw new IOException("Unrecognized reroute cleanup directory",invalid);}finally{leave(reroute);}
     }
-    @Override public synchronized void close()throws IOException {if(active!=0)throw new IOException("Reroute work is still active");if(closed)return;closed=true;}
+    @Override public synchronized void close()throws IOException {if(active!=0)throw new IOException("Reroute work is still active");if(closed)return;ownershipLock.release();ownership.close();closed=true;}
     private final class Job implements AutoCloseable {
         final Path directory,state;final FileChannel channel;final FileLock lock;NativeSourceOutcomeCredit.Request request;RatisSourceOutcomeRecord publication;CommandResult result;OperationId abort,ack,consume;HomeFenceProof homeFence;boolean credited,published,sourceAcknowledged,done;
         Job(Path directory)throws IOException {
