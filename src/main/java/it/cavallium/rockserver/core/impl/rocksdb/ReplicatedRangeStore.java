@@ -2565,6 +2565,40 @@ public final class ReplicatedRangeStore {
             boolean more=records.size()>limit; return new PreparedRecoveryPage(applied,more ? records.subList(0,limit) : records,more);
         } finally { applyLane.unlock(); leaveNative(); }
     }
+    void enterCohortNative() { enterNative(); }
+    void leaveCohortNative() { leaveNative(); }
+    void lockCohortApply() { applyLane.lock(); }
+    void unlockCohortApply() { applyLane.unlock(); }
+    void requireCohortGate(SnapshotFence fence) throws RocksDBException {
+        requireActive();requireSchemaAdmission();requireSnapshotFence(fence);
+        if(schemaCaptureGate!=null)throw new IllegalStateException("INSTALL preparation blocks cohort capture");
+        if(fence.operation().epoch()<minimumSessionEpoch(null))throw new SnapshotRetentionExpiredException();requireActiveGate(fence);
+        var scope=fence.participant(groupId).scope();
+        if(scope.spans().size()!=columns.size() || columns.keySet().stream().anyMatch(column->scope.spans().stream().noneMatch(span->span.columnId().equals(column) && !span.isPoint() && Arrays.equals(span.lowerInclusive(),interval.lowerInclusive()) && Arrays.equals(span.upperExclusive(),interval.upperExclusive()))))throw new IllegalArgumentException("Cohort requires exact full-column full-interval gates");
+        requireUnlocked(scope);ensureReceiptUsage();
+    }
+    SnapshotPin cohortPin(Snapshot snapshot,PoolSnapshotAdmission.Lease lease,PhysicalSnapshotOwner physical,SnapshotFence fence) throws RocksDBException {
+        try(var options=new ReadOptions().setSnapshot(snapshot)){
+            byte[] marker=db.get(state,options,markerKey);var cut=marker==null ? null : decodePosition(marker);
+            if(!Objects.equals(cut,applied))throw new IllegalStateException("Cohort snapshot marker differs from completed apply");
+            var gate=readSnapshotGate(fence,options,cut);if(gate==null || !gate.active() || !Arrays.equals(gate.encode(),requireActiveGate(fence).encode()))throw new IllegalStateException("Cohort snapshot gate differs from completed state");
+            if(fence.operation().epoch()<minimumSessionEpoch(options))throw new SnapshotRetentionExpiredException();
+            return new SnapshotPin(snapshot,cut,lease,physical);
+        }
+    }
+    /** A physical snapshot holds all member charges until the final alias's actual native users drain. */
+    static final class PhysicalSnapshotOwner {
+        private final RocksDB db;private Snapshot snapshot;private final PoolSnapshotAdmission.Lease lease;private final List<ReplicatedRangeStore> members;private final Runnable beforeRelease;
+        private int remaining;private boolean releaseStarted;
+        PhysicalSnapshotOwner(RocksDB db,PoolSnapshotAdmission.Lease lease,List<ReplicatedRangeStore> members,Runnable beforeRelease){this.db=db;this.lease=lease;this.members=List.copyOf(members);this.beforeRelease=beforeRelease;remaining=members.size();}
+        void attach(Snapshot snapshot){this.snapshot=Objects.requireNonNull(snapshot);for(var member:members)member.snapshotPins.incrementAndGet();}
+        void dropAlias(){boolean release; synchronized(this){release=--remaining==0 && !releaseStarted;if(release)releaseStarted=true;}if(release)releaseNative();}
+        void abandon(){synchronized(this){if(releaseStarted)return;releaseStarted=true;}releaseNative();}
+        private void releaseNative(){if(snapshot==null){if(lease!=null)lease.close();return;}try {beforeRelease.run();db.releaseSnapshot(snapshot);}catch(Throwable failure){for(var member:members)member.recordSnapshotReleaseFailure(failure);throw failure;}
+            if(lease!=null)lease.close();for(var member:members)member.snapshotPins.decrementAndGet();for(var member:members){member.signalSchemaCaptureDrain();member.signalTopologyDrain();}
+        }
+    }
+
     public ScopedSnapshot captureGate(SnapshotFence fence) throws RocksDBException {
         Objects.requireNonNull(fence); enterNative(); applyLane.lock();
         try { requireActive(); requireSnapshotFence(fence); if (fence.operation().epoch()<minimumSessionEpoch(null)) throw new SnapshotRetentionExpiredException(); requireActiveGate(fence); var scope=fence.participant(groupId).scope(); requireUnlocked(scope); return new ScopedSnapshot(scope,captureUnderAdmission()); }
@@ -4180,7 +4214,7 @@ public final class ReplicatedRangeStore {
                     cut = marker == null ? null : decodePosition(marker);
                     if (!Objects.equals(cut, applied)) throw new IllegalStateException("Snapshot marker differs from completed apply");
                 }
-                var pin = new SnapshotPin(snapshot, cut, lease);
+                var pin = new SnapshotPin(snapshot, cut, lease,null);
                 snapshotPins.incrementAndGet();
                 return pin;
             } catch (Throwable failure) {
@@ -4263,16 +4297,19 @@ public final class ReplicatedRangeStore {
         private final PoolSnapshotAdmission.Lease admissionLease;
         private final byte[] capturedSchemaDigest;
         private final RangeOwnership.Interval capturedInterval;
+        private final Map<UUID,ColumnFamilyHandle> capturedHandles;
+        private final PhysicalSnapshotOwner physicalOwner;
         private final Set<UUID> capturedColumns,capturedMergeColumns;
         private boolean closed;
         private int nativeUsers;
         private long historyScopeBytes; private volatile boolean historyTracked;
-        private SnapshotPin(Snapshot snapshot, ApplyPosition position, PoolSnapshotAdmission.Lease lease) {
+        private SnapshotPin(Snapshot snapshot, ApplyPosition position, PoolSnapshotAdmission.Lease lease,PhysicalSnapshotOwner physicalOwner) {
             this.snapshot = snapshot;
             this.position = position;
-            this.admissionLease = lease;
-            capturedSchemaDigest=schemaDigest.clone(); capturedInterval=interval; capturedColumns=Set.copyOf(columns.keySet()); capturedMergeColumns=deterministicMergeColumns;
+            this.admissionLease = lease;this.physicalOwner=physicalOwner;capturedHandles=Map.copyOf(columns);
+            capturedSchemaDigest=schemaDigest.clone(); capturedInterval=interval; capturedColumns=Set.copyOf(columns.keySet()); capturedMergeColumns=Set.copyOf(deterministicMergeColumns);
         }
+        private boolean capturedContains(byte[] key){return (capturedInterval.lowerInclusive()==null || Arrays.compareUnsigned(key,capturedInterval.lowerInclusive())>=0) && (capturedInterval.upperExclusive()==null || Arrays.compareUnsigned(key,capturedInterval.upperExclusive())<0);}
         public ApplyPosition position() { return position; }
         public UUID groupId() { return groupId; }
         public long rangeEpoch() { return rangeEpoch; }
@@ -4284,7 +4321,7 @@ public final class ReplicatedRangeStore {
         public RangeStateView stateView() throws RocksDBException {
             acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) {
-                return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,columns.keySet(),interval.lowerInclusive(),interval.upperExclusive(),position,minimumSessionEpoch(options),sessionAuthority(options));
+                return new RangeStateView(groupId,rangeEpoch,capturedInterval.domainId(),capturedSchemaDigest,capturedColumns,capturedInterval.lowerInclusive(),capturedInterval.upperExclusive(),position,minimumSessionEpoch(options),sessionAuthority(options));
             } finally { releaseUse(); }
         }
         /** Local topology evidence is read from this owned native cut, never the live store cache. */
@@ -4310,9 +4347,9 @@ public final class ReplicatedRangeStore {
         public byte[] get(UUID columnId, byte[] key) throws RocksDBException {
             acquireUse();
             try {
-                var cf = columns.get(columnId);
+                var cf = capturedHandles.get(columnId);
                 if (cf == null) throw new IllegalArgumentException("Unknown logical column");
-                if (!contains(key)) throw new IllegalArgumentException("Read outside owned interval");
+                if (!capturedContains(key)) throw new IllegalArgumentException("Read outside owned interval");
                 try (ReadOptions options = new ReadOptions().setSnapshot(snapshot)) {
                     return db.get(cf, options, key);
                 }
@@ -4336,7 +4373,7 @@ public final class ReplicatedRangeStore {
             acquireUse();
             try (var options=new ReadOptions().setSnapshot(snapshot)) {
                 for (var credit:credits.values()) {
-                    var column=columns.get(credit.column()); if (column==null) throw new IllegalStateException("HOME promise column differs from snapshot owner");
+                    var column=capturedHandles.get(credit.column()); if (column==null) throw new IllegalStateException("HOME promise column differs from snapshot owner");
                     byte[] user=db.get(column,options,uuidBytes(credit.current().transactionId()));
                     if (user==null || !credit.current().equals(TransactionStatus.decode(user))) throw new IllegalStateException("HOME image promise has no exact USER row");
                 }
@@ -4426,19 +4463,19 @@ public final class ReplicatedRangeStore {
         /** Visits copied key/value rows from this exact native cut in physical comparator order. */
         public void visitColumn(UUID columnId, byte[] lowerInclusive, byte[] upperExclusive, SnapshotVisitor visitor)
                 throws RocksDBException, IOException {
-            var cf = columns.get(columnId);
+            var cf = capturedHandles.get(columnId);
             if (cf == null) throw new IllegalArgumentException("Unknown logical column");
-            byte[] lower = lowerInclusive == null ? interval.lowerInclusive() : lowerInclusive.clone();
-            byte[] upper = upperExclusive == null ? interval.upperExclusive() : upperExclusive.clone();
-            if ((interval.lowerInclusive() != null && (lower == null || Arrays.compareUnsigned(lower, interval.lowerInclusive()) < 0))
-                    || (interval.upperExclusive() != null && (upper == null || Arrays.compareUnsigned(upper, interval.upperExclusive()) > 0))) {
+            byte[] lower = lowerInclusive == null ? capturedInterval.lowerInclusive() : lowerInclusive.clone();
+            byte[] upper = upperExclusive == null ? capturedInterval.upperExclusive() : upperExclusive.clone();
+            if ((capturedInterval.lowerInclusive() != null && (lower == null || Arrays.compareUnsigned(lower, capturedInterval.lowerInclusive()) < 0))
+                    || (capturedInterval.upperExclusive() != null && (upper == null || Arrays.compareUnsigned(upper, capturedInterval.upperExclusive()) > 0))) {
                 throw new IllegalArgumentException("Export outside owned interval");
             }
             visit(cf, lower, upper, null, visitor);
         }
         private PhysicalRangePage page(UUID columnId, byte[] lower, byte[] upper, boolean reverse,
                                        byte[] resume, int itemLimit, int byteLimit) throws RocksDBException {
-            var cf = columns.get(columnId);
+            var cf = capturedHandles.get(columnId);
             if (cf == null) throw new IllegalArgumentException("Unknown logical column");
             acquireUse();
             try (var lowerBound = lower == null ? null : new org.rocksdb.Slice(lower);
@@ -4528,6 +4565,7 @@ public final class ReplicatedRangeStore {
             if (release) releaseNative();
         }
         private void releaseNative() {
+            if(physicalOwner!=null){physicalOwner.dropAlias();return;}
             try { db.releaseSnapshot(snapshot); }
             catch (Throwable failure) { recordSnapshotReleaseFailure(failure); throw failure; }
             if (admissionLease != null) admissionLease.close();

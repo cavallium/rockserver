@@ -1,0 +1,66 @@
+package it.cavallium.rockserver.core.impl.test;
+
+import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.distributed.*;
+import it.cavallium.rockserver.core.config.ConfigParser;
+import it.cavallium.rockserver.core.impl.rocksdb.*;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
+import static org.junit.jupiter.api.Assertions.*;
+
+class NativePoolSnapshotCohortTest {
+    @TempDir(factory=DiskTestDirectory.class) Path root;
+    final UUID cluster=new UUID(40,1),database=new UUID(40,2),domain=new UUID(40,3),column=new UUID(40,4),session=new UUID(40,5);
+    final DistributedSchema schema=new DistributedSchema(cluster,database,domain,1,0,List.of(new DistributedSchema.Column(1,column,"data",ColumnSchema.of(IntArrayList.of(2),new ObjectArrayList<>(),true),null)));
+    final PoolSnapshotAdmission.Limits one=new PoolSnapshotAdmission.Limits(1,1L<<30,Duration.ofMinutes(5),0);
+    byte[] key(int n){return new byte[]{(byte)n,0};}
+    final class Fixture implements AutoCloseable {
+        final DistributedStoragePool pool;final List<ReplicatedRangeStore> stores=new ArrayList<>();final List<SnapshotFence> fences=new ArrayList<>();
+        Fixture(Path path,int count,boolean gates,boolean partial)throws Exception {
+            pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));pool.configureSnapshotAdmission(one);
+            for(int n=0;n<count;n++){UUID group=new UUID(0,100+n);byte[] lower=n==0 ? null : key(n),upper=n==count-1 ? null : key(n+1);var store=pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(domain,Set.of(column),lower,upper),schema.digest(),Map.of(column,"shared"),Set.of());store.enableLogicalSchema(schema);store.initializeConfiguration(new byte[]{1});store.applyNoop(new ApplyPosition(1,0));store.enableScopedHistory(RangeMutationHistory.Limits.defaults());store.apply(new ApplyPosition(1,1),write(store,n,0,n));stores.add(store);}
+            for(int offset=0;offset<count;offset+=64){var participants=new ArrayList<SnapshotFence.Participant>();for(int n=offset;n<Math.min(count,offset+64);n++){var store=stores.get(n);var scope=partial ? new TransactionScope(List.of(TransactionScope.Span.point(column,key(n)))) : new TransactionScope(List.of(TransactionScope.Span.range(column,store.ownership().interval().lowerInclusive(),store.ownership().interval().upperExclusive())));participants.add(new SnapshotFence.Participant(store.ownership().owner().groupId(),store.ownership().owner().groupId(),1,schema.digest(),new OperationId(new UUID(0,500+n),1,0),new OperationId(new UUID(0,500+n),1,1),scope));}var fence=new SnapshotFence(cluster,database,domain,new UUID(0,800+offset),new UUID(0,900),1,new OperationId(new UUID(0,1000+offset),1,0),1,1,schema.digest(),participants);fences.add(fence);if(gates)for(var participant:participants)stores.get((int)participant.groupId().getLeastSignificantBits()-100).applyGateInstall(new ApplyPosition(1,2),fence);}
+        }
+        SnapshotFence fence(ReplicatedRangeStore store){return fences.stream().filter(f->f.participants().stream().anyMatch(p->p.groupId().equals(store.ownership().owner().groupId()))).findFirst().orElseThrow();}
+        List<DistributedStoragePool.GateCaptureRequest> requests(){return stores.stream().map(store->new DistributedStoragePool.GateCaptureRequest(store,fence(store))).toList();}
+        long nativeSnapshots()throws Exception {var field=DistributedStoragePool.class.getDeclaredField("loaded");field.setAccessible(true);return ((RocksDBLoader.LoadedDb)field.get(pool)).db().get().getLongProperty("rocksdb.num-snapshots");}
+        @Override public void close()throws Exception {pool.close();}
+    }
+    DistributedCommand write(ReplicatedRangeStore store,int n,long sequence,int value){return new DistributedCommand(store.ownership().owner().groupId(),1,schema.digest(),new OperationId(session,1,sequence),List.of(new Mutation(Mutation.Kind.PUT,column,key(n),new byte[]{(byte)value})));}
+    void release(Fixture fixture,DistributedStoragePool.SnapshotCohort cohort)throws Exception {
+        for(var fence:fixture.fences){var terminal=SnapshotFenceStatus.begin(fence);for(var p:fence.participants())terminal=terminal.ready(p.groupId(),new ApplyPosition(1,2));for(var p:fence.participants())terminal=terminal.capture(p.groupId(),new SnapshotFenceStatus.Capture(new UUID(0,1200),new UUID(0,1201),cohort.pins().get(p.groupId()).position()));terminal=terminal.complete();for(var p:fence.participants())fixture.stores.get((int)p.groupId().getLeastSignificantBits()-100).applyGateRelease(new ApplyPosition(1,3),terminal);}
+    }
+    @Test void sixtyFiveGroupsUseOnePhysicalSnapshotAndRetainEveryMemberUntilLastAlias()throws Exception {
+        try(var f=new Fixture(root.resolve("sixty-five"),65,true,false);var cohort=f.pool.captureGateCohort(f.requests())){
+            assertEquals(65,cohort.pins().size());assertEquals(1,f.pool.snapshotAdmissionStats().pins());assertEquals(1,f.nativeSnapshots());long bytes=f.pool.snapshotAdmissionStats().estimatedBytes();assertTrue(bytes>0);release(f,cohort);
+            for(int n=0;n<65;n++){var store=f.stores.get(n);store.apply(new ApplyPosition(1,4),write(store,n,1,99));store.applyNoop(new ApplyPosition(1,5),new byte[]{2});var pin=cohort.pins().get(store.ownership().owner().groupId());assertArrayEquals(new byte[]{(byte)n},pin.get(column,key(n)));assertArrayEquals(new byte[]{1},pin.configuration().data());assertEquals(new ApplyPosition(1,2),pin.stateView().applied());assertTrue(pin.snapshotGate(f.fence(store)).active());}
+            for(int n=0;n<64;n++)cohort.pins().get(f.stores.get(n).ownership().owner().groupId()).close();for(var store:f.stores)assertEquals(1,store.activeSnapshotPins());assertEquals(bytes,f.pool.snapshotAdmissionStats().estimatedBytes());assertEquals(1,f.nativeSnapshots());assertThrows(IllegalStateException.class,()->cohort.pins().get(f.stores.getFirst().ownership().owner().groupId()).get(column,key(0)));cohort.close();assertEquals(0,f.pool.snapshotAdmissionStats().pins());assertEquals(0,f.nativeSnapshots());for(var store:f.stores)assertEquals(0,store.activeSnapshotPins());
+        }
+    }
+    @Test void closingAllAliasesWhileRealVisitorRunsRetainsPoolUntilActualNativeUseDrains()throws Exception {
+        try(var f=new Fixture(root.resolve("busy"),2,true,false)) {var cohort=f.pool.captureGateCohort(f.requests());var pin=cohort.pins().get(f.stores.getFirst().ownership().owner().groupId());var entered=new CountDownLatch(1);var finish=new CountDownLatch(1);try(var executor=Executors.newSingleThreadExecutor()){var read=executor.submit(()->{pin.visitColumn(column,null,null,(key,value)->{entered.countDown();try {if(!finish.await(10,TimeUnit.SECONDS))throw new java.io.IOException("visitor drain timeout");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new java.io.IOException(interrupted);}});return null;});assertTrue(entered.await(10,TimeUnit.SECONDS));try {cohort.close();assertEquals(1,f.pool.snapshotAdmissionStats().pins());assertEquals(1,f.nativeSnapshots());for(var store:f.stores)assertEquals(1,store.activeSnapshotPins());assertFalse(f.pool.close(Duration.ZERO));}finally {finish.countDown();}read.get(10,TimeUnit.SECONDS);assertEquals(0,f.nativeSnapshots());assertEquals(0,f.pool.snapshotAdmissionStats().pins());for(var store:f.stores)assertEquals(0,store.activeSnapshotPins());assertTrue(f.pool.close(Duration.ofSeconds(1)));}}
+    }
+    @Test void malformedForeignDuplicatePartialExpiredAndReleasedRequestsEscapeNoPins()throws Exception {
+        try(var f=new Fixture(root.resolve("validation"),2,true,false);var foreign=new Fixture(root.resolve("foreign"),1,true,false);var partial=new Fixture(root.resolve("partial"),1,true,true)){
+            assertThrows(IllegalArgumentException.class,()->f.pool.captureGateCohort(List.of()));assertThrows(IllegalArgumentException.class,()->f.pool.captureGateCohort(Collections.nCopies(1025,f.requests().getFirst())));assertThrows(IllegalArgumentException.class,()->f.pool.captureGateCohort(List.of(f.requests().getFirst(),f.requests().getFirst())));assertThrows(IllegalArgumentException.class,()->f.pool.captureGateCohort(foreign.requests()));assertThrows(IllegalArgumentException.class,()->partial.pool.captureGateCohort(partial.requests()));assertEquals(0,partial.nativeSnapshots());
+            try(var cohort=f.pool.captureGateCohort(f.requests())){release(f,cohort);}assertThrows(IllegalStateException.class,()->f.pool.captureGateCohort(f.requests()));assertEquals(0,f.pool.snapshotAdmissionStats().pins());assertEquals(0,f.nativeSnapshots());
+            var expired=foreign.stores.getFirst();expired.apply(new ApplyPosition(1,3),DistributedCommand.advanceSessionEpochFloor(expired.ownership().owner().groupId(),1,schema.digest(),new OperationId(new UUID(0,1300),2,0),2));assertThrows(SnapshotRetentionExpiredException.class,()->foreign.pool.captureGateCohort(foreign.requests()));assertEquals(0,foreign.pool.snapshotAdmissionStats().pins());assertEquals(0,foreign.nativeSnapshots());
+        }
+    }
+    @Test void unresolvedPreparedParticipantRejectsCohortAndCaptureFailureReleasesUnpublishedOwner()throws Exception {
+        try(var f=new Fixture(root.resolve("prepared"),1,false,false)) {var store=f.stores.getFirst();var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,key(0))));var command=write(store,0,1,9);DistributedCommand accepted;try(var pin=store.captureTracked(scope)){accepted=store.planScopedCommit(pin,command,0,new UUID(0,1400));}var member=new TransactionStatus.Participant(store.ownership().owner().groupId(),store.ownership().owner().groupId(),1,schema.digest(),PreparedParticipant.Preparation.planDigest(accepted),null,false);var home=TransactionStatus.begin(cluster,database,domain,new UUID(0,1401),command.operationId(),1,schema.digest(),new byte[32],List.of(member));var preparation=new PreparedParticipant.Preparation(new UUID(0,1402),1,new OperationId(new UUID(0,1403),1,0),home,accepted);assertTrue(store.applyPrepared(new ApplyPosition(1,2),preparation).prepared());store.applyGateInstall(new ApplyPosition(1,3),f.fences.getFirst());assertThrows(IllegalStateException.class,()->f.pool.captureGateCohort(f.requests()));assertEquals(0,f.nativeSnapshots());assertEquals(0,f.pool.snapshotAdmissionStats().pins());}
+        try(var f=new Fixture(root.resolve("capture-failure"),2,true,false)){f.pool.snapshotCohortObserver(release->{if(!release)throw new IllegalStateException("unpublished capture failure");});assertThrows(IllegalStateException.class,()->f.pool.captureGateCohort(f.requests()));assertEquals(0,f.nativeSnapshots());assertEquals(0,f.pool.snapshotAdmissionStats().pins());for(var store:f.stores)assertEquals(0,store.activeSnapshotPins());f.pool.snapshotCohortObserver(release->{});try(var cohort=f.pool.captureGateCohort(f.requests())){assertEquals(1,f.nativeSnapshots());}}
+    }
+    @Test void uncertainReleaseKeepsAllMemberCountsChargeAndPoolFencedWithoutRetry()throws Exception {
+        // An uncertain actual native owner is deliberately quarantined; never force-close it for fixture cleanup.
+        var f=new Fixture(root.resolve("uncertain-release"),2,true,false);var attempts=new AtomicInteger();f.pool.snapshotCohortObserver(release->{if(release){attempts.incrementAndGet();throw new IllegalStateException("uncertain physical snapshot release");}});var cohort=f.pool.captureGateCohort(f.requests());cohort.pins().get(f.stores.getFirst().ownership().owner().groupId()).close();assertEquals(1,f.pool.snapshotAdmissionStats().pins());assertThrows(IllegalStateException.class,cohort::close);assertEquals(1,attempts.get());assertEquals(1,f.nativeSnapshots());for(var store:f.stores)assertEquals(1,store.activeSnapshotPins());assertEquals(1,f.pool.snapshotAdmissionStats().pins());assertThrows(RuntimeException.class,cohort::close);assertEquals(1,attempts.get());assertThrows(RuntimeException.class,()->f.pool.close(Duration.ZERO));
+    }
+}

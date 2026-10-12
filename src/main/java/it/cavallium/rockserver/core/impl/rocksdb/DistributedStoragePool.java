@@ -818,6 +818,38 @@ public final class DistributedStoragePool implements AutoCloseable {
         }
     }
 
+    public record GateCaptureRequest(ReplicatedRangeStore store,SnapshotFence fence) {
+        public GateCaptureRequest {Objects.requireNonNull(store);Objects.requireNonNull(fence);}
+    }
+    /** Every alias belongs to this owner; close the cohort even when only some images were exported. */
+    public static final class SnapshotCohort implements AutoCloseable {
+        private final Map<UUID,ReplicatedRangeStore.SnapshotPin> pins;
+        private SnapshotCohort(Map<UUID,ReplicatedRangeStore.SnapshotPin> pins){this.pins=java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(pins));}
+        public Map<UUID,ReplicatedRangeStore.SnapshotPin> pins(){return pins;}
+        @Override public void close(){Throwable failure=null;for(var pin:pins.values())try {pin.close();}catch(RuntimeException | Error problem){if(failure==null)failure=problem;else if(problem!=failure)failure.addSuppressed(problem);}if(failure instanceof RuntimeException problem)throw problem;if(failure instanceof Error problem)throw problem;}
+    }
+    @FunctionalInterface public interface SnapshotCohortObserver { void boundary(boolean beforeRelease); }
+    private volatile SnapshotCohortObserver snapshotCohortObserver=release -> {};
+    public void snapshotCohortObserver(SnapshotCohortObserver observer){snapshotCohortObserver=Objects.requireNonNull(observer);}
+    /** Full native intervals share one physical cut and one pool pressure reservation. */
+    public SnapshotCohort captureGateCohort(List<GateCaptureRequest> requested) throws RocksDBException {
+        Objects.requireNonNull(requested);if(requested.isEmpty() || requested.size()>1024)throw new IllegalArgumentException("Invalid native snapshot cohort size");var requests=List.copyOf(requested);var groups=new HashSet<UUID>();for(var request:requests)if(!groups.add(request.store().ownership().owner().groupId()))throw new IllegalArgumentException("Duplicate snapshot cohort group");
+        var ordered=requests.stream().sorted(Comparator.comparing(request->request.store().ownership().owner().groupId())).toList();nativeMutation.acquireUninterruptibly();PoolSnapshotAdmission.Lease lease=null;ReplicatedRangeStore.PhysicalSnapshotOwner physical=null;int nativeLocked=0,applyLocked=0;SnapshotCohort cohort;
+        var observer=snapshotCohortObserver;
+        try {
+            synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");for(var request:ordered)if(!ranges.contains(request.store()))throw new IllegalArgumentException("Foreign snapshot cohort range");}
+            var guard=Objects.requireNonNull(snapshotAdmission,"Snapshot cohort requires configured pool admission");lease=guard.reserve();
+            for(var request:ordered){request.store().enterCohortNative();nativeLocked++;}for(var request:ordered){request.store().lockCohortApply();applyLocked++;}for(var request:ordered)request.store().requireCohortGate(request.fence());
+            var members=ordered.stream().map(GateCaptureRequest::store).toList();physical=new ReplicatedRangeStore.PhysicalSnapshotOwner(loaded.db().get(),lease,members,()->observer.boundary(true));var snapshot=Objects.requireNonNull(loaded.db().get().getSnapshot(),"Native cohort snapshot creation failed");physical.attach(snapshot);
+            var pins=new java.util.LinkedHashMap<UUID,ReplicatedRangeStore.SnapshotPin>();for(var request:requests)pins.put(request.store().ownership().owner().groupId(),request.store().cohortPin(snapshot,lease,physical,request.fence()));cohort=new SnapshotCohort(pins);
+        } catch(Throwable failure) {
+            for(int n=applyLocked-1;n>=0;n--)ordered.get(n).store().unlockCohortApply();applyLocked=0;for(int n=nativeLocked-1;n>=0;n--)ordered.get(n).store().leaveCohortNative();nativeLocked=0;nativeMutation.release();
+            try {if(physical!=null)physical.abandon();else if(lease!=null)lease.close();}catch(Throwable release){if(release!=failure)release.addSuppressed(failure);throw release;}throw failure;
+        }
+        for(int n=applyLocked-1;n>=0;n--)ordered.get(n).store().unlockCohortApply();for(int n=nativeLocked-1;n>=0;n--)ordered.get(n).store().leaveCohortNative();nativeMutation.release();
+        try {observer.boundary(false);return cohort;}catch(Throwable failure){try {physical.abandon();}catch(Throwable release){if(release!=failure)release.addSuppressed(failure);throw release;}throw failure;}
+    }
+
     /** Configure once, before opening any range. Every native snapshot in this pool shares the guard. */
     public void configureSnapshotAdmission(PoolSnapshotAdmission.Limits limits) {
         Objects.requireNonNull(limits);
