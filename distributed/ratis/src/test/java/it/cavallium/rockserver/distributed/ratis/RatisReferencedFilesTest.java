@@ -84,6 +84,24 @@ class RatisReferencedFilesTest {
         Files.write(content,new byte[]{3,2,1}); try(var executor=Executors.newSingleThreadExecutor()) { assertThrows(java.io.IOException.class,() -> new RatisReferencedFiles(path,group,limits,executor)); }
         Files.delete(content); try(var executor=Executors.newSingleThreadExecutor()) { assertThrows(java.io.IOException.class,() -> new RatisReferencedFiles(path,group,limits,executor)); }
     }
+    @Test void storedVerificationRetainsActualOwnershipAndRejectsChangedBytesAcrossBufferBoundaries() throws Exception {
+        UUID group=UUID.randomUUID(),client=UUID.randomUUID();byte[] payload=new byte[65537];Arrays.fill(payload,(byte)7);
+        var executor=new ControlledExecutor();var path=root.resolve("stored-verification");
+        var limits=new RatisReferencedFiles.Limits(8,2,4,payload.length,2L*payload.length);var entry=entry(group,client,1,1,payload,true);
+        try(var owner=new RatisReferencedFiles(path,group,limits,executor)) {
+            var first=owner.write(entry);executor.runAll();first.get();owner.drain().get();
+        }
+        try(var owner=new RatisReferencedFiles(path,group,limits,executor)) {
+            var cancelled=owner.write(entry);cancelled.cancel(false);assertThrows(java.io.IOException.class,owner::close);
+            executor.runAll();owner.drain().get();
+            try(var reader=owner.pin(owner.reference(1,1))){reader.verify();}
+        }
+        try(var owner=new RatisReferencedFiles(path,group,limits,executor)) {
+            var reference=owner.reference(1,1);var retry=owner.write(entry);payload[payload.length-1]^=1;
+            Files.write(path.resolve("content").resolve(HexFormat.of().formatHex(reference.sha256())+".data"),payload);
+            executor.runAll();assertThrows(ExecutionException.class,retry::get);owner.drain().get();
+        }
+    }
     @Test void canceledCreationAndExecutorRejectionReleaseUnexposedStreamOwnership() throws Exception {
         UUID group=UUID.randomUUID(),client=UUID.randomUUID(); byte[] payload={1,2,3}; var executor=new ControlledExecutor(); var path=root.resolve("unexposed");
         try(var owner=new RatisReferencedFiles(path,group,new RatisReferencedFiles.Limits(8,1,2,8,32),executor)) {
