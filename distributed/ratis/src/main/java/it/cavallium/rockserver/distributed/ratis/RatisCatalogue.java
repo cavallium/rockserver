@@ -191,6 +191,15 @@ public final class RatisCatalogue {
                         List.of(command.mutations().get(0)),List.of(command.predicates().get(0),command.predicates().get(2),command.predicates().get(3),command.predicates().get(4))));
                 sessions.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
                         List.of(command.mutations().get(1)),List.of(command.predicates().get(1))));
+            } else if(command.mutations().size()==1 && command.predicates().size()==5 && command.mutations().getFirst().columnId().equals(directoryColumn)) {
+                var ledgerGuard=command.predicates().get(1);
+                if(command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1
+                        || command.predicates().getFirst().expectedValue()!=null || !ledgerGuard.columnId().equals(sessionColumn)
+                        || !Arrays.equals(ledgerGuard.key(),key(databaseId)) || ledgerGuard.expectedValue()==null)throw new IllegalArgumentException("Initial domain requires exact existing database ledger guard");
+                var ledger=SessionEpochLedger.decode(ledgerGuard.expectedValue());
+                if(!ledger.clusterId().equals(clusterId) || !ledger.databaseId().equals(databaseId))throw new IllegalArgumentException("Initial domain changed ledger identity");
+                directory.accept(new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),command.operationId(),
+                        command.mutations(),List.of(command.predicates().get(0),command.predicates().get(2),command.predicates().get(3),command.predicates().get(4))));
             } else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(sessionColumn)) sessions.accept(command);
             else if (command.mutations().size()==1 && command.mutations().getFirst().columnId().equals(directoryColumn)
                     && command.mutations().getFirst().key().length==33) schemas.accept(command);

@@ -53,7 +53,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             try { acquired=lockChannel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Bootstrap root already owned",owned); }
             if (acquired==null) throw new IOException("Bootstrap root already owned"); lock=acquired;
             if (schema!=null) publication=new RatisSchemaPublication(directory.resolve("schema.bin"),catalogueClient,plan,schema,allocationWitness,Map.of(),Map.of(),Map.of());
-            genesis=new RatisCatalogueGenesis(directory.resolve("genesis.bin"),catalogueClient,plan,initialTime);
+            genesis=new RatisCatalogueGenesis(directory.resolve("genesis.bin"),catalogueClient,plan,initialTime,null);
             clock=new RatisCatalogueClock(directory.resolve("clock.bin"),epochs);
             Path clocks=Files.createDirectories(directory.resolve("ranges")); SessionJournalFiles.force(clocks); SessionJournalFiles.force(directory);
             propagation=new RatisSessionPropagation(clocks,epochs,routed,maxRanges);
