@@ -37,3 +37,45 @@ HDD speedup. The registry includes initial inserts and misses pinned access
 frequency. Per-CF hotness, dictionaries, async observation, separate data/metadata
 quotas, cancellation/I/O budgets, compaction replacement, and crash-temp retention
 are not qualified. Production integration must address those limits first.
+
+== Asynchronous opening admission
+
+Native patch `native/opening-admission.patch` is commit
+`51d9fbfa183a4d6cc049d8e7b3089428c47e01c8`, based on the same `cc8367a` tree.
+Build that checkout with the qualified native feature flags. The tested shared
+library SHA256 is
+`af39c1e03eb2b0ef304460a7601dae3b9ceab763b47cce77bad2ea7338a5c90b`.
+
+The native admission patch adds an opt-in process-wide gate before `FindTable`,
+outside DB/cache loading locks. Existing synchronous opening and foreground
+reads bypass the gate. Pressure feedback halves the permit limit and spaces
+admissions; healthy feedback increases the limit. Running opens finish, queued
+workers observe shutdown and peer opening errors, and pressure still permits
+eventual progress. This controls concurrency, not bytes or IOPS. Shared storage
+and external feedback are assumptions of this first process-wide prototype.
+
+[source,shell]
+----
+python3 experiments/startup-cache/run_opening_admission.py /path/to/librocksdb.so.11.8.1 /new/local/opening-run
+----
+
+The harness uses three fresh JVMs and the C API from the same native library:
+seed 12 small SSTs, baseline asynchronous opening, and adaptive asynchronous
+opening. The read fixtures explicitly skip synchronous opening-statistics
+initialization, so it cannot pre-open all SSTs before the asynchronous worker.
+The adaptive fixture starts under commanded pressure, then supplies measured
+50 ms foreground p95 windows against twice the baseline's last-window p95.
+It verifies read values and that permits/waiters disappear before library close.
+
+The first final run completed 12 admitted operations, with peak admission 3
+and final limit 4. It applied 39 healthy windows; no naturally pressured window
+occurred. This is a small warm/page-cached fixture with a debug native library
+and FFM overhead. Its timings are not a production performance comparison,
+and admission counters do not attribute physical HDD reads. Native deterministic
+tests separately exercise forced pressure, foreground access while admission
+waits, failure cancellation, and shutdown: four focused tests passed 100 repeats,
+56 existing asynchronous-opening tests passed with the gate disabled, and the
+combined 60-test selection passed with the gate enabled. Full native-suite and
+io_uring-path acceptance were not run; local io_uring initialization fell back.
+Feedback integration with the actual
+Rockserver scheduler and device-aware policy remains future work.
