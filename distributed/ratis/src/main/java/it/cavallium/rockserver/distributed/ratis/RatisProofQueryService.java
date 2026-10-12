@@ -21,6 +21,9 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     public static RatisProofQueryService importPublicationLane(){return new RatisProofQueryService(1,"ratis-import-publication-",2,2*IMPORT_PUBLICATION_BYTES);}
     public static final long TOPOLOGY_IMAGE_BYTES=4*IMPORT_PUBLICATION_BYTES;
     public static RatisProofQueryService topologyImageLane(){return new RatisProofQueryService(1,"ratis-topology-image-",2,TOPOLOGY_IMAGE_BYTES);}
+    // Eight copies cover request decoding/canonical validation plus bounded configuration/native reply transients.
+    public static final long RELOCATION_OWNER_BYTES=8L*(RatisRelocationOwnerRpc.MAX_REQUEST_BYTES+RatisRelocationOwnerRpc.MAX_REPLY_BYTES);
+    public static RatisProofQueryService relocationOwnerLane(){return new RatisProofQueryService(1,"ratis-relocation-owner-",2,2*RELOCATION_OWNER_BYTES);}
     public static RatisProofQueryService sourceOutcomeLane(){return new RatisProofQueryService(1,"ratis-source-outcome-",2,2*IMPORT_PUBLICATION_BYTES);}
     public static RatisProofQueryService operationRerouteLane(){return new RatisProofQueryService(1,"ratis-home-reroute-",2,2*IMPORT_PUBLICATION_BYTES);}
     private RatisProofQueryService(int threads,String name) {this(threads,name,MAX_JOBS,MAX_BYTES);}

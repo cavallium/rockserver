@@ -7,6 +7,7 @@ import it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegi
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
 import it.cavallium.rockserver.core.common.distributed.TopologyChange;
+import it.cavallium.rockserver.core.common.distributed.OperatorUpload;
 import it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor;
 import it.cavallium.rockserver.core.common.distributed.RangeDescriptor;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof;
@@ -96,7 +97,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         public LearnerSourceEvidence { Objects.requireNonNull(image);Objects.requireNonNull(schema);Objects.requireNonNull(sourceOwner);Objects.requireNonNull(configuration);Objects.requireNonNull(completedCut);physicalNames=Map.copyOf(physicalNames);mergeColumns=Set.copyOf(mergeColumns);var rows=new HashMap<String,byte[]>();sourceSchemaRows.forEach((key,value)->rows.put(key,value.clone()));sourceSchemaRows=Map.copyOf(rows); }
         @Override public Map<String,byte[]> sourceSchemaRows(){var copy=new HashMap<String,byte[]>();sourceSchemaRows.forEach((key,value)->copy.put(key,value.clone()));return Map.copyOf(copy);}
     }
-    private LearnerSourceReader learnerSource;
+    private LearnerSourceReader learnerSource=this::loadLearnerSource;
     private NativeTopologyLearnerRegistration learnerAttempt;
     public synchronized void learnerSource(LearnerSourceReader reader){if(started || starting || installing || closeRequested)throw new IllegalStateException("Learner source policy is fixed before start");learnerSource=Objects.requireNonNull(reader);}
 
@@ -120,6 +121,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisSnapshotHelpService snapshotHelp;
     private RatisProofQueryService proofQueries;
     private RatisProofQueryService sourceOutcomeQueries;
+    private RatisProofQueryService topologyImageQueries,relocationOwnerQueries;private RatisTopologySourceSnapshotArtifacts sourceArtifacts;private RatisTopologySourceSnapshotService sourceSnapshots;private RatisRelocationDataClient relocationClients;
     private RatisProofQueryService authorityQueries;
     private RatisProofQueryService importPublicationQueries;
     private RatisProofQueryService operationRerouteQueries;
@@ -253,7 +255,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (snapshotPlan!=null) {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
-        proofQueries=new RatisProofQueryService();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();
+        proofQueries=new RatisProofQueryService();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();topologyImageQueries=RatisProofQueryService.topologyImageLane();relocationOwnerQueries=RatisProofQueryService.relocationOwnerLane();relocationClients=new RatisRelocationDataClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
         if(groups.raftGroups().stream().anyMatch(group->groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.TRANSACTION_HOME))
             operationRerouteQueries=RatisProofQueryService.operationRerouteLane();
         if (groups.raftGroups().stream().anyMatch(group -> groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.CATALOGUE)) {
@@ -275,8 +277,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
         pool=logicalSchema==null ? DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class))
                 : DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class),logicalSchema,plan.columns(),metadataBindings);
         pool.configureSnapshotAdmission(settings.exports().pins());
+        sourceArtifacts=new RatisTopologySourceSnapshotArtifacts(Files.createDirectories(root.resolve("topology-source-artifacts")),settings.images(),Math.multiplyExact(8,settings.images().maxImageBytes()),RatisTopologySourceSnapshotService.MAX_METADATA_BYTES,4);
+        sourceSnapshots=new RatisTopologySourceSnapshotService(sourceSnapshotHost(),RatisTopologySourceSnapshotService.Limits.defaults(settings.images().maxImageBytes()));
+
         for(var seed:pool.topologySeeds())groups.register(seed);
         for(var learner:pool.topologyLearners())groups.register(learner);
+        loadRelocationIntents();
         var allowed=new HashSet<UUID>(); for (var group:groups.raftGroups()) allowed.add(group.getGroupId().getUuid());
         try (var entries=Files.list(logs)) {
             for (var path:entries.toList()) if (Files.isDirectory(path)) {
@@ -321,9 +327,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     RatisTopologyCatalogue.OwnerProofReader cdcOwners=(definition,expected)->{var range=(expected.stage()==TopologyChange.Stage.FREEZE ? definition.parents() : definition.targets()).stream().filter(candidate->candidate.groupId().equals(expected.groupId())).findFirst().orElseThrow();var owner=range.replicas().stream().filter(candidate->candidate.replicaId().equals(expected.owner().replicaId())).findFirst().orElseThrow();var evidence=topologyOwners.read(definition,expected.stage(),range,owner);return new RatisTopologyCatalogue.QualifiedOwner(evidence.proof(),evidence.completedCut());};
                     var cdcAuthority=new RatisCdcDeliveryAuthority(routed,cdcDirectories,cdcLineages::read,cdcOwners,cdcDefinitions);
                     machine.cdcDeliveryAdmission(cdcAuthority::validate);
-                    machine.topologyExecutionAdmission(command->RatisTopologyCatalogue.admitExecution(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),(definition,expected)->{
+                    machine.topologyExecutionAdmission(command->{if(RatisTopologyCatalogue.relocationExecution(command)){RatisTopologyCatalogue.admitRelocation(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),this::qualifyRelocationPublication);return;}RatisTopologyCatalogue.admitExecution(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),(definition,expected)->{
                         var range=(expected.stage()==TopologyChange.Stage.FREEZE ? definition.parents() : definition.targets()).stream().filter(candidate->candidate.groupId().equals(expected.groupId())).findFirst().orElseThrow();var owner=range.replicas().stream().filter(candidate->candidate.replicaId().equals(expected.owner().replicaId())).findFirst().orElseThrow();var evidence=topologyOwners.read(definition,expected.stage(),range,owner);if(expected.stage()==TopologyChange.Stage.ACTIVATE){var activation=NativeTopologyActivation.decode(evidence.artifact());activation.requireCut(evidence.completedCut());if(!Arrays.equals(activation.proof().encode(),evidence.proof().encode()))throw new IOException("Clock witness differs from genuine owner activation proof");qualifyTopologyActivation(definition,activation);}return new RatisTopologyCatalogue.QualifiedOwner(evidence.proof(),evidence.completedCut());
-                    }));
+                    });});
                     machine.importPublicationAdmission(command->{
                         if(RatisRangeImportCatalogue.isPublication(command))RatisRangeImportCatalogue.admitPublication(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::receipt);
                         else RatisRangeImportCatalogue.admitCompletion(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::activation);
@@ -337,6 +343,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             directory.schemaDigest(),bindings,recipe!=null ? recipe.mergeColumns() : home==null ? plan.merges() : Set.of())
                             : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchema)
                             : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchema);
+                    if(registration.relocation()!=null){var configuration=store.configuration();var cut=store.applied();if(configuration==null || cut==null || configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term())throw new IOException("Relocation cold configuration lacks completed native prefix");group=groups.reconcileRelocationConfiguration(id,configuration.data());}
                     stores.put(id,store);
                     java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
@@ -379,7 +386,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority(),ownReplica(descriptor));
                     }
                 }
-                machine.proofQueries(proofQueries);
+                machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
             }
             for (var entry:machines.entrySet()) if (groups.require(entry.getKey().getUuid()).role()==RatisNodePlan.Role.DATA)
@@ -452,8 +459,18 @@ public final class RatisNodeRuntime implements AutoCloseable {
         for(var parent:seed.definition().parents()){var store=stores.get(parent.groupId());var schema=store==null ? null : store.installedSchema();if(schema!=null){schema.requireMatches(seed.definition().targetDirectory());return schema;}}
         throw new IOException("Forced topology seed has no qualified local native source schema");
     }
+    private RatisTopologyCatalogue.QualifiedRelocation qualifyRelocationPublication(TopologyChange.Definition definition,TopologyChange.RelocationProof expected)throws IOException {
+        var actual=relocationClients.read(new RatisRelocationOwnerRpc.Request(definition,expected.owner().replicaId(),RatisRelocationOwnerRpc.Expected.TARGET,expected.requiredCatchupCut(),null));
+        var configuration=actual.configuration();
+        if(!actual.caughtUp() || !actual.owner().equals(expected.owner()) || !new ApplyPosition(configuration.term(),configuration.index()).equals(expected.configurationPosition()) || !Arrays.equals(OperatorUpload.sha256(configuration.data()),expected.configurationDigest()) || !RatisRelocationOwnerRpc.covers(actual.completedCut(),expected.completedPosition()))throw new IOException("Relocation publication lost its original owner/configuration/catch-up proof");
+        for(var target:definition.targets().getFirst().replicas())if(definition.parents().getFirst().replicas().stream().noneMatch(old->old.replicaId().equals(target.replicaId()) && old.role()==target.role())){
+            var ready=relocationClients.read(new RatisRelocationOwnerRpc.Request(definition,target.replicaId(),RatisRelocationOwnerRpc.Expected.TARGET,expected.requiredCatchupCut(),null));
+            if(!ready.caughtUp() || !Arrays.equals(ready.configuration().data(),configuration.data()))throw new IOException("Changed target owner has not completed actual target configuration/tail");
+        }
+        return new RatisTopologyCatalogue.QualifiedRelocation(expected,actual.completedCut());
+    }
     private void configureDataMachine(RatisRangeStateMachine machine,RangeDirectory directory,it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor){
-        machine.role(RatisNodePlan.Role.DATA);machine.sourceOutcomeQueries(sourceOutcomeQueries);machine.cdcBinding(directory.clusterId(),directory.databaseId(),descriptor.rangeId());machine.schemaStorage(pool);machine.schemaActivated(this::observeSchemaActivation);
+        machine.role(RatisNodePlan.Role.DATA);machine.relocationOwnerQueries(relocationOwnerQueries);machine.sourceSnapshots(topologyImageQueries,sourceSnapshots);machine.relocationObserver(new RatisRangeStateMachine.RelocationObserver(){public void persist(RatisTopologyRelocationRecord record,ApplyPosition position)throws IOException{persistRelocation(record,position);}public boolean saved(RatisTopologyRelocationRecord record)throws IOException{return savedRelocation(record);}});machine.relocationAuthority(epochs.topologyJoinAuthority()::read);machine.sourceOutcomeQueries(sourceOutcomeQueries);machine.cdcBinding(directory.clusterId(),directory.databaseId(),descriptor.rangeId());machine.schemaStorage(pool);machine.schemaActivated(this::observeSchemaActivation);
         var authority=epochs.schemaAuthority();machine.schemaAuthority((header,digest)->readSchemaAuthority(authority,header,digest),directory);machine.schemaReplicas(schemaReplicas,ownReplica(descriptor));machine.topologyAuthority(epochs.topologyAuthority()::read,directory,ownReplica(descriptor),pool);machine.topologySeedInstaller(this::seedTopology);machine.topologyActivated(this::observeTopologyActivation);
         if(transactionHomes!=null)machine.sourceOutcomeAdmission(new RatisSourceOutcomeAdmission(new RatisSourceOutcomeAdmission.Authority(){
             public it.cavallium.rockserver.core.common.distributed.TransactionStatus home(it.cavallium.rockserver.core.common.distributed.HomeIdentity original)throws IOException{var configured=plan.home(RatisNodePlan.Role.TRANSACTION_HOME);if(configured==null || !configured.column().equals(original.columnId()))throw new IOException("Source proof HOME column is not configured");var read=transactionHomes.readRegistration(original.transactionId());if(!read.descriptor().groupId().equals(original.groupId()) || read.descriptor().rangeEpoch()!=original.rangeEpoch() || !Arrays.equals(configured.directory().schemaDigest(),original.schemaDigest()))throw new IOException("Source proof changed exact HOME placement");return read.status();}
@@ -461,6 +478,51 @@ public final class RatisNodeRuntime implements AutoCloseable {
             public it.cavallium.rockserver.core.common.distributed.ParticipantFenceProof fence(RangeDirectory frozen,RangeDescriptor route,it.cavallium.rockserver.core.common.distributed.ParticipantIdentity identity)throws IOException{return routed.participantFence(frozen,route,identity);}
         })::qualify);
         if(captureHomes!=null)machine.snapshotHomes(captureHomes);if(transactionHomes!=null){machine.transactionHomes(transactionHomes);machine.snapshotRecovery(this::recoverParticipant,snapshotHelp);}
+    }
+    static RatisTopologySourceSnapshotRpc.Request sourceRequest(TopologyChange.Definition definition,UUID catalogue,ReplicaDescriptor receiver){var bytes=ByteBuffer.allocate(64).put(definition.digest()).putLong(catalogue.getMostSignificantBits()).putLong(catalogue.getLeastSignificantBits()).putLong(receiver.replicaId().getMostSignificantBits()).putLong(receiver.replicaId().getLeastSignificantBits());return new RatisTopologySourceSnapshotRpc.Request(UUID.nameUUIDFromBytes(bytes.array()),definition.header(),catalogue,receiver);}
+    private LearnerSourceEvidence loadLearnerSource(RatisTopologyJoinAuthority.View view,ReplicaDescriptor receiver)throws IOException{if(view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Production learner bootstrap requires irreversible JOINING");var prepared=relocationClients.prepare(sourceRequest(view.definition(),view.catalogue(),receiver),view.definition());if(!plan.columns().keySet().equals(prepared.schema().columnIds()))throw new IOException("Receiver has no configured physical bindings for source schema");return new LearnerSourceEvidence(prepared.image(),prepared.schema(),prepared.sourceOwner(),prepared.sourceCfg(),prepared.image().position(),plan.columns(),plan.merges(),prepared.schemaRows());}
+    private RatisTopologyJoinAuthority.View sourceView(RatisTopologySourceSnapshotRpc.Request request)throws IOException{var query=RatisTopologyJoinAuthority.Request.of(request.header(),request.receiver().replicaId(),RatisTopologyJoinAuthority.Purpose.REGISTER);var view=joinAuthority.read(query);view.require(query);if(!view.catalogue().equals(plan.catalogue().groupId()) || !view.catalogue().equals(request.catalogue()) || view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Source image requires exact irreversible JOINING");return view;}
+    private RatisTopologySourceSnapshotService.Host sourceSnapshotHost(){return new RatisTopologySourceSnapshotService.Host(){
+        public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request)throws Exception{var view=sourceView(request);var machine=machines.get(RaftGroupId.valueOf(view.definition().parents().getFirst().groupId()));if(machine==null)throw new IOException("Source snapshot has no local actual source owner");return machine.captureSourceSnapshot(request,view.definition(),logicalSchema,sourceArtifacts);}
+        public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{var view=sourceView(lease.prepared().request());var machine=machines.get(RaftGroupId.valueOf(view.definition().parents().getFirst().groupId()));if(machine==null || lease.source().getStateMachine()!=machine)throw new IOException("Source snapshot division changed");var evidence=machine.relocationEvidence(new RatisRelocationOwnerRpc.Request(view.definition(),null,RatisRelocationOwnerRpc.Expected.SOURCE,null,null));if(!evidence.owner().replicaId().equals(lease.prepared().sourceOwner().replicaId()) || !RatisRelocationOwnerRpc.covers(evidence.completedCut(),lease.prepared().image().position()) || !Arrays.equals(evidence.configuration().data(),lease.prepared().sourceCfg().data()))throw new IOException("Retained source image lost actual native owner/configuration");}
+        public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{var view=sourceView(lease.prepared().request());var image=lease.prepared().image();var evidence=relocationClients.read(new RatisRelocationOwnerRpc.Request(view.definition(),lease.prepared().request().receiver().replicaId(),RatisRelocationOwnerRpc.Expected.IMAGE,image.position(),image.sha256()));if(!evidence.imageInstalled())throw new IOException("Receiver has not forced the exact native image");}
+        public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{sourceArtifacts.released(lease.prepared().request());}
+        public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return sourceArtifacts.isReleased(request);}
+        public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request)throws IOException{if(server==null || serverClosed)throw new IOException("Source server unavailable");var receiver=RaftPeerId.valueOf(request.getServerRequest().getReplyId());server.getServerRpc().addRaftPeers(List.of(RaftPeer.newBuilder().setId(receiver).setAddress(sourceViewFromRequest(request,receiver)).build()));return server.getServerRpc().installSnapshot(request);}
+    };}
+    private String sourceViewFromRequest(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request,RaftPeerId receiver)throws IOException{var group=org.apache.ratis.util.ProtoUtils.toRaftGroupId(request.getServerRequest().getRaftGroupId());var entry=groups.require(group.getUuid());if(entry.relocation()==null)throw new IOException("Snapshot transfer lacks forced relocation intent");return entry.relocation().definition().targets().getFirst().replicas().stream().filter(r->r.peerId().equals(receiver.toString())).findFirst().orElseThrow(()->new IOException("Snapshot receiver not in exact target")).address();}
+    interface RelocationJournalIo {
+        void write(Path file,byte[] body,int maximum)throws IOException;
+        void force(Path file)throws IOException;
+    }
+    static final RelocationJournalIo RELOCATION_FILES=new RelocationJournalIo(){
+        public void write(Path file,byte[] body,int maximum)throws IOException{SessionJournalFiles.write(file,body,maximum);}
+        public void force(Path file)throws IOException{try(var channel=FileChannel.open(file,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS)){channel.force(true);}SessionJournalFiles.force(file.getParent());SessionJournalFiles.force(file.getParent().getParent());}
+    };
+    private RelocationJournalIo relocationJournalIo=RELOCATION_FILES;
+    private Path relocationPath(RatisTopologyRelocationRecord record){return root.resolve("topology-relocations").resolve(record.definition().intentId()+"."+record.action().name());}
+    private void persistRelocation(RatisTopologyRelocationRecord record,ApplyPosition position)throws IOException{
+        var directory=Files.createDirectories(root.resolve("topology-relocations"));SessionJournalFiles.force(root);var path=relocationPath(record);byte[] encoded=record.encode();
+        if(Files.exists(path)){var original=SessionJournalFiles.read(path,RatisTopologyRelocationRecord.MAX_BYTES+16);if(original.length<16 || !Arrays.equals(Arrays.copyOfRange(original,16,original.length),encoded))throw new IOException("Relocation journal changed original committed record");relocationJournalIo.force(path);}
+        else{int count=0;long bytes=0;try(var files=Files.list(directory)){for(var file:files.toList())if(Files.isRegularFile(file)){count++;bytes+=Files.size(file);}}if(count>=128 || bytes+encoded.length+16>64L*1024*1024)throw new IOException("Node relocation history budget exhausted");var out=ByteBuffer.allocate(16+encoded.length).putLong(position.term()).putLong(position.index()).put(encoded);relocationJournalIo.write(path,out.array(),RatisTopologyRelocationRecord.MAX_BYTES+16);relocationJournalIo.force(path);}
+        groups.relocation(record);
+        if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && routed.directory().domainId().equals(record.definition().header().domainId()) && routed.directory().generation()<=record.definition().targetDirectory().generation())routed.refresh(record.definition().targetDirectory());
+    }
+    private boolean savedRelocation(RatisTopologyRelocationRecord record)throws IOException{
+        var path=relocationPath(record);if(!Files.exists(path))return false;var bytes=SessionJournalFiles.read(path,RatisTopologyRelocationRecord.MAX_BYTES+16);if(bytes.length<16 || !Arrays.equals(Arrays.copyOfRange(bytes,16,bytes.length),record.encode()))throw new IOException("Relocation saved record differs");relocationJournalIo.force(path);var in=ByteBuffer.wrap(bytes);var position=new ApplyPosition(in.getLong(),in.getLong());var store=stores.get(record.definition().parents().getFirst().groupId());return store!=null && store.applied()!=null && RatisRelocationOwnerRpc.covers(store.applied(),position);
+    }
+    private void recoverRelocationSidecars(Path directory)throws IOException{
+        try(var files=Files.list(directory)){for(var pending:files.filter(p->p.getFileName().toString().endsWith(".pending")).sorted().toList()){
+            if(!Files.isRegularFile(pending,LinkOption.NOFOLLOW_LINKS))throw new IOException("Relocation sidecar is not an owned regular file");
+            var body=SessionJournalFiles.read(pending,RatisTopologyRelocationRecord.MAX_BYTES+16);if(body.length<16)throw new IOException("Truncated relocation sidecar");var in=ByteBuffer.wrap(body);new ApplyPosition(in.getLong(),in.getLong());var record=RatisTopologyRelocationRecord.decode(Arrays.copyOfRange(body,16,body.length));var original=relocationPath(record);
+            if(!pending.equals(original.resolveSibling(original.getFileName()+".pending")) || !record.catalogue().equals(plan.catalogue().groupId()) || !record.definition().header().clusterId().equals(plan.directory().clusterId()) || !record.definition().header().databaseId().equals(plan.directory().databaseId()))throw new IOException("Foreign relocation sidecar");
+            if(Files.exists(original,LinkOption.NOFOLLOW_LINKS)){if(!Arrays.equals(body,SessionJournalFiles.read(original,RatisTopologyRelocationRecord.MAX_BYTES+16)))throw new IOException("Relocation sidecar changed original intent");relocationJournalIo.force(original);Files.delete(pending);SessionJournalFiles.force(directory);}
+            else{Files.move(pending,original,StandardCopyOption.ATOMIC_MOVE);relocationJournalIo.force(original);}
+        }}
+    }
+    private void loadRelocationIntents()throws IOException{
+        var directory=root.resolve("topology-relocations");if(!Files.exists(directory))return;recoverRelocationSidecars(directory);var records=new ArrayList<RatisTopologyRelocationRecord>();long bytes=0;try(var files=Files.list(directory)){for(var path:files.toList()){if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS) || (bytes+=Files.size(path))>64L*1024*1024 || records.size()>=128)throw new IOException("Invalid node relocation history");var encoded=SessionJournalFiles.read(path,RatisTopologyRelocationRecord.MAX_BYTES+16);if(encoded.length<16)throw new IOException("Truncated relocation history");var in=ByteBuffer.wrap(encoded);new ApplyPosition(in.getLong(),in.getLong());var record=RatisTopologyRelocationRecord.decode(Arrays.copyOfRange(encoded,16,encoded.length));if(!path.equals(relocationPath(record)) || !record.catalogue().equals(plan.catalogue().groupId()))throw new IOException("Foreign node relocation history");records.add(record);}}
+        records.sort(Comparator.comparingLong((RatisTopologyRelocationRecord r)->r.definition().sourceDirectory().generation()).thenComparing(r->r.action().ordinal()));for(var record:records)groups.relocation(record);
     }
     private boolean nativeAdmissionOpen(UUID group){var store=stores.get(group);return store!=null && store.admissionOpen();}
     private List<RatisRangeStateMachine> expiryMachines(){return groups.entries().stream().filter(entry->entry.role()==RatisNodePlan.Role.DATA && !entry.retired() && nativeAdmissionOpen(entry.group().getGroupId().getUuid())).map(entry->machines.get(entry.group().getGroupId())).filter(Objects::nonNull).toList();}
@@ -508,7 +570,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for(var target:forced.definition().targets()){
                 var id=RaftGroupId.valueOf(target.groupId());if(machines.containsKey(id))continue;var entry=groups.require(target.groupId());var store=pool.reopenTopologyRange(forced.birth(target.groupId()),seedSchema(forced));
                 var directory=store.schemaInstallation()==null ? entry.directory() : store.schemaInstallation().definition().targetDirectory();
-                var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,directory,settings.retention());configureDataMachine(machine,directory,target);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(target.groupId(),store);machines.put(id,machine);
+                var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,directory,settings.retention());configureDataMachine(machine,directory,target);machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(target.groupId(),store);machines.put(id,machine);
             }
             // Every machine and borrowed node service is configured before any target can vote.
             for(var target:forced.definition().targets())requireSeedStorage(groups.require(target.groupId()));
@@ -544,7 +606,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     private void installTopologyLearnerOwned(NativeTopologyLearnerRegistration registration)throws IOException,org.rocksdb.RocksDBException{
         var forced=pool.topologyLearners().stream().filter(registration::equals).findFirst().orElseThrow(()->new IOException("Learner is not exact forced native history"));groups.register(forced);var id=RaftGroupId.valueOf(forced.definition().targets().getFirst().groupId());var entry=groups.require(id.getUuid());
-        if(!machines.containsKey(id)){if(schemaReplicas==null)schemaReplicas=new RatisSchemaReplicaService(root.resolve("native"),root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());var store=pool.openTopologyLearner(forced);var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,entry.directory(),settings.retention());configureDataMachine(machine,entry.directory(),entry.descriptor());machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(id.getUuid(),store);machines.put(id,machine);}
+        if(!machines.containsKey(id)){if(schemaReplicas==null)schemaReplicas=new RatisSchemaReplicaService(root.resolve("native"),root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());var store=pool.openTopologyLearner(forced);var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,entry.directory(),settings.retention());configureDataMachine(machine,entry.directory(),entry.descriptor());machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(id.getUuid(),store);machines.put(id,machine);}
         requireSeedStorage(entry);markSeedExposure(entry);var actual=new HashSet<RaftGroupId>();server.getGroupIds().forEach(actual::add);if(!actual.contains(id))addGroup(entry.group());else verify(entry.group());
     }
     private List<ReplicatedRangeStore> requireSeedParents(RatisTopologySeedRpc.Request request,boolean fresh)throws IOException,org.rocksdb.RocksDBException{
@@ -682,7 +744,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public RatisParticipantRecoveryRegistry.Snapshot participantRecoveryStatus() { if (participantRecoveries==null) throw new IllegalStateException("Participant recovery is not configured"); return participantRecoveries.stats(); }
     public Throwable transactionExpiryFailure() { return transactionExpiry==null ? null : transactionExpiry.lastFailure(); }
     private void verify(RaftGroup group) throws IOException {
-        var division=server.getDivision(group.getGroupId()); var configuration=division.getRaftConf();
+        var division=server.getDivision(group.getGroupId()); var configuration=division.getRaftConf();var registration=groups.require(group.getGroupId().getUuid());
+        if(registration.relocation()!=null){var record=registration.relocation();try{RatisRangeStateMachine.requireActualMembership(configuration,record.definition().targets().getFirst());group=groups.group(record.definition().targets().getFirst());}catch(IOException notTarget){RatisRangeStateMachine.requireActualMembership(configuration,record.definition().parents().getFirst());group=groups.group(record.definition().parents().getFirst());}}
+
         for (var role:List.of(RaftPeerRole.FOLLOWER,RaftPeerRole.LISTENER)) {
             if (!configuration.getPreviousPeers(role).isEmpty()) throw new IOException("Joint membership requires topology reconciliation");
             var expected=new TreeMap<String,String>(); var actual=new TreeMap<String,String>();
@@ -700,6 +764,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (installing || starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            if(topologyImageQueries!=null){try{topologyImageQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Topology image drain interrupted",interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException("Topology image owners did not drain",failure);}}
+            if(sourceSnapshots!=null)sourceSnapshots.close();if(sourceArtifacts!=null)sourceArtifacts.close();
             // Ordinary proofs can await both catalogue authority and local replica preparation.
             if(operationRerouteQueries!=null) {
                 try { operationRerouteQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
@@ -722,6 +788,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Import publication drain interrupted",interrupted); }
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Import publication queries did not drain",failure); }
             }
+            if(relocationOwnerQueries!=null){try{relocationOwnerQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Relocation owner drain interrupted",interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException("Relocation owner lane did not drain",failure);}}
+            if(relocationClients!=null)relocationClients.close();
             if (schemaReplicas!=null) {
                 try { schemaReplicas.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Schema replica drain interrupted",interrupted); }
@@ -784,7 +852,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         } finally { synchronized (this) { closing=false; } }
     }
     private static RaftServer buildServer(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException {
-        RaftProperties properties=RatisDurability.properties(logs); org.apache.ratis.RaftConfigKeys.Rpc.setType(properties,org.apache.ratis.rpc.SupportedRpcType.GRPC);
+        RaftProperties properties=RatisDurability.properties(logs);GrpcConfigKeys.setMessageSizeMax(properties,org.apache.ratis.util.SizeInBytes.valueOf(RatisTopologySourceSnapshotRpc.MAX_REPLY_BYTES+4096L)); org.apache.ratis.RaftConfigKeys.Rpc.setType(properties,org.apache.ratis.rpc.SupportedRpcType.GRPC);
         String address=plan.address(); int colon=address.lastIndexOf(':'); String host=address.substring(0,colon);
         if (host.startsWith("[")) host=host.substring(1,host.length()-1);
         GrpcConfigKeys.Server.setHost(properties,host); GrpcConfigKeys.Server.setPort(properties,Integer.parseInt(address.substring(colon+1)));
