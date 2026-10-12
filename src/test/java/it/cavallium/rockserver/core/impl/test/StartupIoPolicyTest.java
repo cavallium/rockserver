@@ -79,19 +79,19 @@ class StartupIoPolicyTest {
         assertEquals(StartupIoPolicy.FOREGROUND, sample(0, 0, false).pressureMask());
     }
 
-    @Test void optionalSharedFailureBecomesNeutralAfterFreshIdleWindowsWithoutQualifyingGrowth() {
+    @Test void idleFailureBecomesNeutralAfterFreshWindowsWithoutQualifyingGrowth() {
         counters.recordBulk(100, 2, true);
         var failed = input(0, 0, false);
-        assertTrue(policy.sample(failed, failed.sampledNanos(), true).capturePressure());
+        assertTrue(policy.sample(failed, failed.sampledNanos()).capturePressure());
         for (int i = 0; i < StartupIoPolicy.RECOVERY_WINDOWS; i++) {
             var idle = input(0, 0, false);
-            var decision = policy.sample(idle, idle.sampledNanos(), true);
+            var decision = policy.sample(idle, idle.sampledNanos());
             assertEquals(i < StartupIoPolicy.RECOVERY_WINDOWS - 1, decision.capturePressure());
             assertFalse(decision.qualifiedHealthy());
-            assertSame(decision, policy.sample(idle, idle.sampledNanos(), true));
+            assertSame(decision, policy.sample(idle, idle.sampledNanos()));
         }
         var idle = input(0, 0, false);
-        assertEquals(StartupIoPolicy.UNKNOWN, policy.sample(idle, idle.sampledNanos(), true).pressureMask());
+        assertEquals(StartupIoPolicy.UNKNOWN, policy.sample(idle, idle.sampledNanos()).pressureMask());
     }
 
     @Test void aRepeatedHealthyWindowCannotUndoMissingOrContradictoryFeedback() {
