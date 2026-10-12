@@ -1170,14 +1170,60 @@ public final class RatisRoutedClient implements AutoCloseable {
         throw new IllegalArgumentException("Recovered schema has not been qualified for this client");
     }
 
+    /** A sealed source proved no original effect; the complete request still needs atomic rerouting. */
+    public static final class OriginalOperationAbsent extends IOException {
+        private final PreparedCommand original;
+        private final RatisTopologyOperationOutcomeRpc.Reply evidence;
+        private OriginalOperationAbsent(PreparedCommand original,RatisTopologyOperationOutcomeRpc.Reply evidence) {
+            super("Original operation is absent at its sealed parent; whole-operation coordination is required");
+            this.original=original;this.evidence=evidence;
+        }
+        public PreparedCommand original() { return original; }
+        public RangeDirectory originalDirectory() { return original.source; }
+        public RatisTopologyOperationOutcomeRpc.Reply evidence() { return evidence; }
+    }
+
+    /** Query the original receipt prefix, preserving the original group and complete payload digest. */
+    public RatisTopologyOperationOutcomeRpc.Reply operationOutcome(PreparedCommand prepared) throws IOException {
+        Objects.requireNonNull(prepared);requireNamespace(prepared.source);beginCall();
+        try { return readOriginalOutcome(prepared); }
+        finally { endCall(); }
+    }
+    private RatisTopologyOperationOutcomeRpc.Reply readOriginalOutcome(PreparedCommand prepared) throws IOException {
+        if(Thread.currentThread().isInterrupted())throw new java.io.InterruptedIOException("Original outcome lookup interrupted");
+        var source=prepared.source;var descriptor=prepared.descriptor;
+        var lineage=new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(descriptor.rangeId(),descriptor.groupId(),descriptor.rangeEpoch());
+        var request=new RatisTopologyOperationOutcomeRpc.Request(source.clusterId(),source.databaseId(),source.domainId(),lineage,
+                prepared.command.operationId(),prepared.command.receiptDigest());
+        try { return RatisTopologyOperationOutcomeRpc.decodeReply(transport.transaction(descriptor,RatisTopologyOperationOutcomeRpc.request(request),true),request); }
+        catch(IllegalArgumentException malformed) { throw new IOException("Invalid original operation outcome",malformed); }
+    }
+    private CommandResult resolvedOriginalOutcome(PreparedCommand prepared,RatisTopologyOperationOutcomeRpc.Reply reply) throws IOException {
+        return switch(reply.outcome()) {
+            case FOUND -> CommandResult.decode(reply.result());
+            case EXPIRED -> new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of());
+            case ABSENT -> throw new OriginalOperationAbsent(prepared,reply);
+        };
+    }
     public CommandResult execute(PreparedCommand prepared) throws IOException {
         Objects.requireNonNull(prepared, "prepared");
-        requireIdentity(prepared.source);
+        var observed=current();var descriptor=prepared.descriptor;
+        boolean moved=observed.ranges().stream().noneMatch(range->range.rangeId().equals(descriptor.rangeId())
+                && range.groupId().equals(descriptor.groupId()) && range.rangeEpoch()==descriptor.rangeEpoch());
+        if(moved)requireNamespace(prepared.source);else requireIdentity(prepared.source);
         beginCall();
         try {
-            CommandResult result = transport.command(prepared.descriptor(), prepared.command());
-            if (result == null) throw new IOException("Missing command result");
-            return result;
+            if(moved)return resolvedOriginalOutcome(prepared,readOriginalOutcome(prepared));
+            try {
+                CommandResult result=transport.command(prepared.descriptor(),prepared.command());
+                if(result==null)throw new IOException("Missing command result");
+                return result;
+            } catch(IOException unresolved) {
+                if(unresolved instanceof java.io.InterruptedIOException || Thread.currentThread().isInterrupted())throw unresolved;
+                try { return resolvedOriginalOutcome(prepared,readOriginalOutcome(prepared)); }
+                catch(OriginalOperationAbsent absent) { absent.addSuppressed(unresolved);throw absent; }
+                catch(IOException unavailable) { unresolved.addSuppressed(unavailable);throw unresolved; }
+            }
         } finally { endCall(); }
     }
 

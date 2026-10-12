@@ -166,6 +166,23 @@ public final class ReplicatedRangeStore {
         var cfg=configurationUnderAdmission();if(cfg==null || cfg.term()>applied.term() || cfg.index()>applied.index() || cfg.index()==applied.index() && cfg.term()!=applied.term())throw new IllegalStateException("Topology metadata native configuration exceeds completed prefix");
         var authority=sessionAuthority();if(authority!=null && (!authority.clusterId().equals(freeze.header().clusterId()) || !authority.databaseId().equals(freeze.header().databaseId())))throw new IllegalStateException("Topology metadata session authority namespace changed");
     }
+    public record TopologyOperationOutcome(ApplyPosition cut,NativeTopologyFreeze freeze,Configuration configuration,byte[] result) {
+        public TopologyOperationOutcome { Objects.requireNonNull(cut);Objects.requireNonNull(freeze);Objects.requireNonNull(configuration);result=result==null ? null : result.clone(); }
+        @Override public byte[] result() { return result==null ? null : result.clone(); }
+    }
+    /** Definitive original-parent outcome at a sealed prefix; null never authorizes a child retry. */
+    public TopologyOperationOutcome readTopologyOperationOutcome(UUID cluster,UUID database,UUID domain,
+            it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,OperationId operation,byte[] originalReceiptDigest) throws RocksDBException {
+        Objects.requireNonNull(cluster);Objects.requireNonNull(database);Objects.requireNonNull(domain);Objects.requireNonNull(lineage);Objects.requireNonNull(operation);
+        Objects.requireNonNull(originalReceiptDigest);if(originalReceiptDigest.length!=32)throw new IllegalArgumentException("Invalid original receipt digest");byte[] digest=originalReceiptDigest.clone();
+        enterNative();applyLane.lock();
+        try {
+            if(topologyBirthPending())throw new IllegalStateException("Pending topology birth has no sealed original-parent outcome");
+            requireTopologyMetadataOwner();var freeze=activeTopologyFreeze;var header=freeze.header();var parent=header.participant(TopologyChange.Stage.FREEZE,groupId);
+            if(!cluster.equals(header.clusterId()) || !database.equals(header.databaseId()) || !domain.equals(header.domainId()) || !lineage.rangeId().equals(parent.rangeId()) || !lineage.groupId().equals(groupId) || lineage.rangeEpoch()!=rangeEpoch || parent.rangeEpoch()!=rangeEpoch)throw new IllegalArgumentException("Topology operation outcome namespace/parent lineage differs");
+            return new TopologyOperationOutcome(applied,freeze,configurationUnderAdmission(),operationResultUnderAdmission(operation,digest));
+        } finally { applyLane.unlock();leaveNative(); }
+    }
     /** Cached shape classification for the adapter; validate/estimate/apply separately verify native evidence. */
     public boolean metadataTopologyControl(DistributedCommand command) {
         var freeze=activeTopologyFreeze;var control=command.sessionControl();
@@ -3448,8 +3465,11 @@ public final class ReplicatedRangeStore {
             if (pendingInstallation != null) throw new IllegalStateException("Range metadata is being installed");
             requireHomeRecoveryFree(id);
             if (id.epoch() < minimumSessionEpoch(null) || id.sequence() <= acknowledgedThrough(id, null)) return expiredResult();
-            byte[] saved = db.get(receipts, receiptKey(id));
-            return saved == null ? null : decodeReceipt(saved, payloadDigest);
+            byte[] key=receiptKey(id);int size=db.get(receipts,key,new byte[0]);
+            if(size==org.rocksdb.RocksDB.NOT_FOUND)return null;
+            if(size<36 || size>36+MAX_RESULT_BYTES)throw new IllegalStateException("Invalid durable receipt size");
+            byte[] saved=new byte[size];if(db.get(receipts,key,saved)!=size)throw new IllegalStateException("Durable receipt changed during bounded outcome read");
+            return decodeReceipt(saved,payloadDigest);
         } finally { applyLane.unlock(); }
     }
 

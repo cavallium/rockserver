@@ -80,9 +80,12 @@ class RatisRoutedClientTest {
             client.refresh(directory(2, 3));
             client.read(A, key(1));
             assertEquals(new UUID(8, 3), transport.lastDescriptor.groupId());
-            client.execute(prepared);
+            assertThrows(IOException.class,()->client.execute(prepared));
             assertEquals(new UUID(8, 1), transport.lastDescriptor.groupId());
-            assertArrayEquals(original, DistributedCommandCodec.encode(transport.commands.getFirst()));
+            assertArrayEquals(original,DistributedCommandCodec.encode(prepared.command()));
+            assertTrue(transport.commands.isEmpty());
+            assertEquals(prepared.command().operationId(),transport.outcomes.getFirst().operation());
+            assertArrayEquals(prepared.command().receiptDigest(),transport.outcomes.getFirst().receiptDigest());
             assertEquals(2, client.directory().generation());
         }
     }
@@ -208,10 +211,11 @@ class RatisRoutedClientTest {
             assertEquals(DistributedCommand.Kind.DATA,ack.command().kind()); assertEquals(4,ack.command().acknowledgedThrough());
             assertEquals(OPERATION,ack.command().operationId()); assertTrue(ack.command().mutations().isEmpty());
             var original = DistributedCommandCodec.encode(ack.command());
-            client.refresh(directory(2,3)); client.execute(ack);
+            client.refresh(directory(2,3)); assertThrows(IOException.class,()->client.execute(ack));
             assertEquals(new UUID(8,1),transport.lastDescriptor.groupId());
-            assertArrayEquals(original,DistributedCommandCodec.encode(transport.commands.getFirst()));
-            assertEquals(1,transport.commands.size());
+            assertArrayEquals(original,DistributedCommandCodec.encode(ack.command()));
+            assertTrue(transport.commands.isEmpty());
+            assertArrayEquals(ack.command().receiptDigest(),transport.outcomes.getFirst().receiptDigest());
             var piggyback = client.prepare(OPERATION,List.of(put(A,1)),List.of(),4);
             assertEquals(new UUID(8,3),piggyback.command().groupId());
             assertEquals(4,piggyback.command().acknowledgedThrough());
@@ -232,14 +236,32 @@ class RatisRoutedClientTest {
                     DistributedCommand.sessionControl(command.groupId(),8,new byte[32],OPERATION,control,-1)));
             client.refresh(directory(2,3));
             assertThrows(IllegalArgumentException.class,() -> client.prepareSessionControl(command));
-            client.execute(prepared); client.execute(prepared);
-            assertEquals(new UUID(8,1),transport.lastDescriptor.groupId()); assertEquals(2,transport.commands.size());
-            for (var submitted:transport.commands) assertArrayEquals(original,DistributedCommandCodec.encode(submitted));
+            assertThrows(IOException.class,()->client.execute(prepared)); assertThrows(IOException.class,()->client.execute(prepared));
+            assertEquals(new UUID(8,1),transport.lastDescriptor.groupId()); assertTrue(transport.commands.isEmpty());assertEquals(2,transport.outcomes.size());
+            assertArrayEquals(original,DistributedCommandCodec.encode(prepared.command()));
+            for(var request:transport.outcomes) { assertEquals(command.operationId(),request.operation());assertArrayEquals(command.receiptDigest(),request.receiptDigest()); }
+        }
+    }
+
+    @Test void interruptedOriginalSubmissionDoesNotStartAnotherLookup() throws Exception {
+        var interrupted=new java.io.InterruptedIOException("Original caller cancelled");
+        var transport=new RecordingTransport() {
+            @Override public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException { throw interrupted; }
+            @Override public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean fresh) { throw new AssertionError("Cancelled submission must not start an outcome RPC"); }
+        };
+        try(var client=new RatisRoutedClient(directory(1,1),transport)) {
+            var prepared=client.prepare(OPERATION,List.of(put(A,1)));
+            assertSame(interrupted,assertThrows(java.io.InterruptedIOException.class,()->client.execute(prepared)));
         }
     }
 
     private class RecordingTransport implements RatisRoutedClient.Transport {
         final List<DistributedCommand> commands = new ArrayList<>();
+        final List<RatisTopologyOperationOutcomeRpc.Request> outcomes = new ArrayList<>();
+        @Override public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean fresh) throws IOException {
+            assertTrue(fresh);lastDescriptor=descriptor;outcomes.add(RatisTopologyOperationOutcomeRpc.decodeRequest(request));
+            throw new IOException("No qualified original outcome in this recording transport");
+        }
         final AtomicInteger closes = new AtomicInteger();
         RangeDescriptor lastDescriptor;
         @Override public byte[] read(RangeDescriptor descriptor, UUID column, byte[] key) throws IOException {

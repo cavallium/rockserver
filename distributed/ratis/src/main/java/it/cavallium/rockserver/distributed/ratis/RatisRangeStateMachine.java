@@ -3886,6 +3886,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 return dispatcher.submit(store.ownership().owner().groupId(),kind,packet.body()).thenApply(payload ->
                         Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,payload))));
             }
+            if(kind==RatisTopologyOperationOutcomeRpc.KIND) {
+                requireDataRole();
+                if(!freshBarrier || proofQueries==null)throw new IOException("Topology operation outcome requires configured fresh metadata barrier");
+                var lookup=RatisTopologyOperationOutcomeRpc.decodeRequest(encoded);var owner=checkCdcMetadataOwner();
+                if(!owner.sealed())throw new IOException("Operation outcome parent is not sealed");
+                return proofQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyOperationOutcomeRpc.MAX_REPLY_BYTES,false,owned->{
+                    var before=checkCdcMetadataOwner();if(!before.sealed() || !sameCdcConfiguration(owner,before))throw new IOException("Topology outcome lost read-barrier owner");
+                    var original=RatisTopologyOperationOutcomeRpc.decodeRequest(owned);
+                    var result=store.readTopologyOperationOutcome(original.clusterId(),original.databaseId(),original.domainId(),original.lineage(),original.operation(),original.receiptDigest());
+                    var after=checkCdcMetadataOwner();
+                    if(!after.sealed() || !sameCdcConfiguration(owner,after) || !java.util.Objects.equals(result.cut(),after.cut())
+                            || result.configuration().term()!=after.configuration().term() || result.configuration().index()!=after.configuration().index() || !Arrays.equals(result.configuration().data(),after.configuration().data()))throw new IOException("Topology outcome native cut/configuration changed");
+                    return Message.valueOf(ByteString.copyFrom(RatisTopologyOperationOutcomeRpc.reply(original,result)));
+                });
+            }
             if(kind==RatisCdcPollRpc.KIND) {
                 requireDataRole();
                 if(!freshBarrier || cdcBinding==null || proofQueries==null) throw new IOException("CDC poll requires configured fresh DATA barrier");
