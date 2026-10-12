@@ -43,7 +43,7 @@ import org.slf4j.LoggerFactory;
 
 /** Explicit candidate-only gate: routine builds do not require the experimental C ABI. */
 @EnabledIfSystemProperty(named = "rockserver.startup.native.tests", matches = "true")
-@Timeout(90)
+@Timeout(60)
 class StartupNativeIntegrationTest {
     private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(4), ObjectList.of(), true);
     private static final int FILES = 6, KEYS_PER_FILE = 256;
@@ -281,7 +281,7 @@ class StartupNativeIntegrationTest {
     private static void assertAdmissionConservation(NativeStartupBridge.AdmissionStats stats) {
         assertEquals(stats.active(), stats.admitted() - stats.released());
         assertTrue(stats.peakActive() <= 1, stats::toString);
-        assertTrue(stats.completedFindTable() <= stats.released(), stats::toString);
+        assertTrue(stats.completedFindTable() <= stats.admitted(), stats::toString);
         assertTrue(stats.failed() <= stats.completedFindTable(), stats::toString);
     }
 

@@ -20,6 +20,15 @@ public record StartupSettings(StorageAdmission admission, Map<String, CacheSnaps
 
     public StartupSettings { Objects.requireNonNull(admission); caches = Map.copyOf(caches); }
 
+    /** Known collector, index/working-vector and payload quotas; excludes allocator/thread overhead. */
+    public long snapshotAuxiliaryBytes() {
+        long total = 0;
+        for (var cache : caches.values()) if (cache.enabled()) {
+            total = Math.addExact(total, Math.addExact(cache.data().auxiliaryBytes(), cache.metadata().auxiliaryBytes()));
+        }
+        return total;
+    }
+
     public record StorageAdmission(boolean enabled, String defaultStorageId, Map<String, StorageGroup> storageGroups) {
         public StorageAdmission { storageGroups = Map.copyOf(storageGroups); }
 
@@ -72,6 +81,8 @@ public record StartupSettings(StorageAdmission admission, Map<String, CacheSnaps
             if (lookupConcurrency < 1 || lookupConcurrency > 64)
                 throw invalid("lookup-concurrency must be in [1, 64]");
             if (maximumBlockBytes > 16 * MIB) throw invalid("maximum-block must not exceed 16MiB");
+            if (snapshotBudgetBytes < 128 + collectorEntries * 40 + Math.min(maximumBlockBytes, 4096))
+                throw invalid("snapshot-budget must cover the full candidate index and one small eligible block");
             if (indexRamBytes < collectorEntries * 240)
                 throw invalid("index-ram must cover collector-entries * 240 bytes of native index accounting");
             if (lookupBufferBytes < maximumBlockBytes * 4 + 65536)
@@ -83,6 +94,11 @@ public record StartupSettings(StorageAdmission admission, Map<String, CacheSnaps
             if (writeCeilingBytesPerSecond != 0
                     && writeCeilingBytesPerSecond < maximumBlockBytes + 128 + collectorEntries * 40)
                 throw invalid("write-ceiling must cover one maximum block plus the snapshot header and index");
+        }
+
+        public long auxiliaryBytes() {
+            return Math.addExact(collectorEntries * 32,
+                    Math.addExact(indexRamBytes, Math.addExact(maximumBlockBytes, lookupBufferBytes)));
         }
     }
 
@@ -105,7 +121,10 @@ public record StartupSettings(StorageAdmission admission, Map<String, CacheSnaps
             validateCapacity(name, cache.size(), cache.metadataSize(), null, resolved.enabled(), false);
             caches.put(name, resolved);
         }
-        return new StartupSettings(admission, caches);
+        var result = new StartupSettings(admission, caches);
+        try { result.snapshotAuxiliaryBytes(); }
+        catch (ArithmeticException overflow) { throw invalid("combined snapshot auxiliary quotas overflow"); }
+        return result;
     }
 
     private static StorageAdmission admission(DatabaseConfig config, GlobalDatabaseConfig global,
@@ -124,9 +143,12 @@ public record StartupSettings(StorageAdmission admission, Map<String, CacheSnaps
         var groups = new LinkedHashMap<String, StorageGroup>();
         for (var source : Objects.requireNonNullElse(io.storageGroups(), new StartupStorageConfig[0])) {
             String id = source.id(); identifier("storage id", id);
-            int maximum = or(source.maximumOpens(), defaultMaximumOpens); positive("maximum-opens", maximum);
+            int maximum = or(source.maximumOpens(), defaultMaximumOpens);
+            if (maximum < 1 || maximum > 1024) throw invalid("maximum-opens must be in [1, 1024]");
             long progress = millis("progress-interval", or(source.progressInterval(), Duration.ofSeconds(1)), false);
             long stale = millis("stale-after", or(source.staleAfter(), Duration.ofSeconds(2)), false);
+            if (progress < 1 || progress > 60000) throw invalid("progress-interval must be in [1ms, 60s]");
+            if (stale < 50 || stale > 60000) throw invalid("stale-after must be in [50ms, 60s]");
             if (stale < progress) throw invalid("stale-after must not be shorter than progress-interval");
             var paths = new ArrayList<Path>();
             for (var path : Objects.requireNonNullElse(source.paths(), new Path[0])) {

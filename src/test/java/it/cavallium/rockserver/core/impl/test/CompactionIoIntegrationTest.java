@@ -308,11 +308,14 @@ class CompactionIoIntegrationTest {
                     var cachedTrigger = configured.getClass().getDeclaredMethod("effectiveLevel0SlowdownWritesTrigger");
                     cachedTrigger.setAccessible(true);
                     assertEquals(trigger, cachedTrigger.invoke(configured));
+                    var cachedWorkload = configured.getClass().getDeclaredMethod("workloadGroup");
+                    cachedWorkload.setAccessible(true);
                     var constructor = configured.getClass().getDeclaredConstructors()[0];
                     constructor.setAccessible(true);
                     configured = constructor.newInstance((long) handle.getID(), handle, registeredColumn,
                             columnOptions.softPendingCompactionBytesLimit(), cachedTrigger.invoke(configured),
-                            columnOptions.maxWriteBufferNumber(), columnOptions.minWriteBufferNumberToMerge());
+                            columnOptions.maxWriteBufferNumber(), columnOptions.minWriteBufferNumberToMerge(),
+                            cachedWorkload.invoke(configured));
                     var snapshot = originalPressureColumns.clone();
                     var cachedHandle = configured.getClass().getDeclaredMethod("handle");
                     cachedHandle.setAccessible(true);
@@ -722,6 +725,7 @@ class CompactionIoIntegrationTest {
                         "system and dynamic columns must retain their own effective limits");
                 assertEquals(options.minWriteBufferNumberToMerge(), mergeBuffers.invoke(cached));
             }
+            var cachedWorkload = type.getDeclaredMethod("workloadGroup"); cachedWorkload.setAccessible(true);
             var constructor = type.getDeclaredConstructors()[0]; constructor.setAccessible(true);
             nativeDb.pauseBackgroundWork();
             try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(false)) {
@@ -743,7 +747,7 @@ class CompactionIoIntegrationTest {
                         for (int index = 0; index < snapshot.length; index++) {
                             if (((org.rocksdb.ColumnFamilyHandle) cachedHandle.invoke(snapshot[index])).getID() == handle.getID()) {
                                 snapshot[index] = constructor.newInstance((long) handle.getID(), handle, column,
-                                        Long.MAX_VALUE, -1, limits[0], limits[1]);
+                                        Long.MAX_VALUE, -1, limits[0], limits[1], cachedWorkload.invoke(snapshot[index]));
                             }
                         }
                         try {

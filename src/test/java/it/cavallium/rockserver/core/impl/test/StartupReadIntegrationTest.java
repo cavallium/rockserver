@@ -118,6 +118,71 @@ class StartupReadIntegrationTest {
         }
     }
 
+    @Test void columnRecoveryPressureDoesNotContaminateAnotherWorkload() throws Exception {
+        Path config = directory.resolve("pressure.conf");
+        Files.writeString(config, """
+                database.global.use-direct-io: false
+                database.parallelism.workload-groups: [{name: slow, read: 4, write: 4}]
+                database.global.column-options: [{name: slow-column, workload-group: slow}]
+                """);
+        try (var connection = new EmbeddedConnection(directory.resolve("pressure-db"), "startup-pressure", config)) {
+            var db = connection.getInternalDB();
+            var enabled = EmbeddedDB.class.getDeclaredField("startupReadsEnabled");
+            enabled.setAccessible(true);
+            enabled.setBoolean(db, true);
+            var api = connection.getSyncApi(RequestContext.batch());
+            var schema = ColumnSchema.of(IntList.of(1), ObjectList.of(), true);
+            long slow = api.createColumn("slow-column", schema);
+            api.createColumn("hot-column", schema);
+            var field = EmbeddedDB.class.getDeclaredField("storagePressureColumns");
+            field.setAccessible(true);
+            Object[] columns = ((Object[]) field.get(db)).clone();
+            var type = columns.getClass().componentType();
+            var components = type.getRecordComponents();
+            var parameters = java.util.Arrays.stream(components).map(java.lang.reflect.RecordComponent::getType).toArray(Class<?>[]::new);
+            var constructor = type.getDeclaredConstructor(parameters);
+            constructor.setAccessible(true);
+            for (int i = 0; i < columns.length; i++) {
+                Object[] values = new Object[components.length];
+                for (int j = 0; j < values.length; j++) {
+                    var accessor = components[j].getAccessor();
+                    accessor.setAccessible(true);
+                    values[j] = accessor.invoke(columns[i]);
+                }
+                if (((Long) values[0]) == slow) {
+                    // Inject this column's recovery threshold while retaining real native properties and leases.
+                    for (int j = 0; j < components.length; j++) {
+                        if (components[j].getName().equals("effectiveLevel0SlowdownWritesTrigger")) values[j] = 0;
+                    }
+                    columns[i] = constructor.newInstance(values);
+                }
+            }
+            field.set(db, columns);
+            var method = EmbeddedDB.class.getDeclaredMethod("sampleStartupIo", long.class);
+            method.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            var samples = (Map<String, it.cavallium.rockserver.core.impl.StartupIoPolicy.InputSample>) method.invoke(db, 1L);
+            assertTrue(samples.get("slow").urgentRecovery());
+            assertFalse(samples.get("default").urgentRecovery());
+            assertTrue(samples.get("default").complete());
+            // Model a sampler's old array after retirement removed the mutable name mapping.
+            var namesField = EmbeddedDB.class.getDeclaredField("columnWorkloadNames");
+            namesField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            var names = (Map<Long, String>) namesField.get(db);
+            names.remove(slow);
+            var columnsField = EmbeddedDB.class.getDeclaredField("columns");
+            columnsField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            var registered = (NonBlockingHashMapLong<it.cavallium.rockserver.core.impl.ColumnInstance>) columnsField.get(db);
+            registered.get(slow).uses().closeAdmission();
+            @SuppressWarnings("unchecked")
+            var retiring = (Map<String, it.cavallium.rockserver.core.impl.StartupIoPolicy.InputSample>) method.invoke(db, 2L);
+            assertFalse(retiring.get("slow").complete());
+            assertTrue(retiring.get("default").complete(), "retired identity must not fall into another storage workload");
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static NonBlockingHashMapLong<StartupReadCompletions> registrations(EmbeddedDB db) throws Exception {
         var field = EmbeddedDB.class.getDeclaredField("startupReadsByHandle");

@@ -57,7 +57,12 @@ public class RocksDBStatistics {
 	 * @param compactionReadaheadBytes readahead buffer size per compaction input file
 	 * @param writableFileMaxBufferBytes writable file buffer size per compaction output file
 	 */
-	public record MemoryUpperBoundConfig(int maxBackgroundJobs, long compactionReadaheadBytes, long writableFileMaxBufferBytes) {}
+	public record MemoryUpperBoundConfig(int maxBackgroundJobs, long compactionReadaheadBytes,
+			long writableFileMaxBufferBytes, long snapshotAuxiliaryBytes) {
+		public MemoryUpperBoundConfig(int maxBackgroundJobs, long compactionReadaheadBytes, long writableFileMaxBufferBytes) {
+			this(maxBackgroundJobs, compactionReadaheadBytes, writableFileMaxBufferBytes, 0);
+		}
+	}
 	record WalMetricsConfig(RocksDB rocksDB, Path walDirectory, long configuredLiveWalLimitBytes) {}
 
 	public RocksDBStatistics(String name,
@@ -229,7 +234,8 @@ public class RocksDBStatistics {
 		// Upper-bound memory estimate: uses block cache capacity (not usage) + memtables including
 		// pending free + table readers + worst-case compaction I/O buffers.
 		// Each background job can read from ~10 input files (readahead buffer each) and write 1 output
-		// file (writable file buffer). This gives a realistic upper bound on native memory.
+		// file (writable file buffer). Snapshot quotas cover collectors, indices, working vectors and payloads.
+		// Cache capacity is soft when pinned; allocator/thread overhead and custom decoder transients are not covered.
 		final int estimatedInputFilesPerCompaction = 10;
 		Gauge.builder("rocksdb.memory.max-estimate", () -> {
 			if (stopRequested) {
@@ -257,7 +263,8 @@ public class RocksDBStatistics {
 				long compactionBuffers = (long) memoryUpperBoundConfig.maxBackgroundJobs()
 						* (memoryUpperBoundConfig.compactionReadaheadBytes() * estimatedInputFilesPerCompaction
 						   + memoryUpperBoundConfig.writableFileMaxBufferBytes());
-				return blockCacheCapacity + allMemtables + tableReadersMem + compactionBuffers;
+				return (double) blockCacheCapacity + allMemtables + tableReadersMem + compactionBuffers
+						+ memoryUpperBoundConfig.snapshotAuxiliaryBytes();
 			} catch (Throwable ex) {
 				if (!stopRequested) {
 					LOG.error("Failed to compute max-estimate RocksDB memory", ex);
