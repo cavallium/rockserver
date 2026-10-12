@@ -124,11 +124,27 @@ public final class DistributedStoragePool implements AutoCloseable {
         var store=openRange(owner,interval,registration.schema().digest(),registration.physicalNames(),registration.mergeColumns());
         var schema=registration.schema();
         if(!Arrays.equals(store.schemaDigest(),schema.digest())) {
-            var checkpoint=recoverSchema(owner.groupId());
+            var preparation=store.learnerSchemaPreparation();if(preparation!=null && Arrays.equals(store.schemaDigest(),preparation.schema().digest()))schema=preparation.schema();
+            else {var checkpoint=recoverSchema(owner.groupId());
             if(checkpoint.current()==null || !Arrays.equals(store.schemaDigest(),checkpoint.current().definition().targetSchema().digest())) throw new IllegalArgumentException("Learner lacks verified current schema");
-            schema=checkpoint.current().definition().targetSchema();
+            schema=checkpoint.current().definition().targetSchema();}
         }
-        store.enableLogicalSchema(schema);return store;
+        store.enableLogicalSchema(schema);var preparation=store.learnerSchemaPreparation();if(preparation!=null && !store.pendingInstallation())prepareTopologyLearnerImage(store,preparation);return store;
+    }
+    /** Fresh authority has qualified this image; create only receiver-owned CF/operator bindings. */
+    public void prepareTopologyLearnerImage(ReplicatedRangeStore store,NativeTopologyLearnerImagePermission permission) throws RocksDBException {
+        Objects.requireNonNull(store);Objects.requireNonNull(permission);nativeMutation.acquireUninterruptibly();var options=new HashMap<String,PreparedColumn>();
+        try {
+            synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}if(!ranges.contains(store))throw new IllegalArgumentException("Foreign learner store");permission.requireRegistration(Objects.requireNonNull(store.topologyLearnerRegistration(),"No learner registration"));
+            for(var column:permission.physicalNames().entrySet()){if(RESERVED_COLUMNS.contains(column.getValue()))throw new IllegalArgumentException("Reserved learner CF alias");var old=bindings.get(column.getKey());if(old!=null && (!old.name().equals(column.getValue()) || old.mergeAdmitted()!=permission.mergeColumns().contains(column.getKey())))throw new IllegalArgumentException("Learner preparation changed permanent local binding");if(bindings.entrySet().stream().anyMatch(other->!other.getKey().equals(column.getKey()) && other.getValue().name().equals(column.getValue())))throw new IllegalArgumentException("Learner alias belongs to another column");}
+            try {if(artifacts.qualified() || !permission.mergeColumns().isEmpty())artifacts.validate(permission.schema(),permission.physicalNames());}catch(IOException invalid){throw new IllegalStateException("Learner schema operators are not locally qualified",invalid);}
+            store.prepareLearnerImageSchema(permission,()->{
+                try {if(artifacts.qualified() || !permission.mergeColumns().isEmpty()){artifacts.bindPermanentPlainBirths(plainBirths(bindings));artifacts.bind(permission.schema(),permission.physicalNames());}}catch(IOException invalid){throw new IllegalStateException("Cannot force receiver learner operator bindings",invalid);}
+            for(var column:permission.physicalNames().entrySet()){var name=column.getValue();if(handles.containsKey(name)){if((loaded.mergeOperators().get(name)!=null)!=permission.mergeColumns().contains(column.getKey()))throw new IllegalArgumentException("Learner prepared operator differs from actual CF");}else {var prepared=new PreparedColumn(name);options.put(name,prepared);if((prepared.options.mergeOperator()!=null)!=permission.mergeColumns().contains(column.getKey()))throw new IllegalArgumentException("Learner operator was not prepared");}}
+                reserveBirths(permission.physicalNames(),permission.mergeColumns(),BOOTSTRAP_BIRTH,Set.of());var owner=store.ownership();retainOwnershipHistory(owner.owner(),new RangeOwnership.Interval(owner.interval().domainId(),permission.physicalNames().keySet(),owner.interval().lowerInclusive(),owner.interval().upperExclusive()));
+                var target=new HashMap<UUID,ColumnFamilyHandle>();for(var column:permission.physicalNames().entrySet()){var handle=handles.get(column.getValue());if(handle==null)handle=createColumn(Objects.requireNonNull(options.get(column.getValue())));target.put(column.getKey(),handle);bindings.putIfAbsent(column.getKey(),new Binding(column.getValue(),permission.mergeColumns().contains(column.getKey())));}pressureColumns=List.copyOf(handles.values());return target;
+            });
+        } finally {options.values().forEach(PreparedColumn::close);nativeMutation.release();}
     }
     private volatile PendingTopologySeed pendingTopologySeed;
     @FunctionalInterface public interface TopologySeedForceObserver { void boundary(boolean afterPersistence) throws RocksDBException; }
@@ -958,10 +974,12 @@ public final class DistributedStoragePool implements AutoCloseable {
             if(topologySource!=null && (newImport!=null || !owner.equals(new RangeOwnership.Owner(owner.groupId(),topologySource.header().participant(TopologyChange.Stage.FREEZE,owner.groupId()).rangeEpoch())))) throw new IllegalArgumentException("Topology source cannot be reused");
             if(topologySource!=null || topologyChild!=null || learner!=null) for(var existing:ranges) if(existing.ownership().owner().equals(owner)) {
                 if(learner!=null && !Arrays.equals(existing.schemaDigest(),schema)) {
-                    var checkpoint=recoverSchema(owner.groupId());var current=checkpoint.current();
+                    var preparation=existing.learnerSchemaPreparation();
+                    if(preparation!=null){schema=preparation.schema().digest();names=preparation.physicalNames();merges=preparation.mergeColumns();}
+                    else {var checkpoint=recoverSchema(owner.groupId());var current=checkpoint.current();
                     if(current==null)throw new IllegalArgumentException("Opened learner lacks verified current schema");
                     current.requireRange(owner.groupId(),owner.epoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
-                    schema=current.definition().targetSchema().digest();names=current.targetNames();merges=current.targetMerges();
+                    schema=current.definition().targetSchema().digest();names=current.targetNames();merges=current.targetMerges();}
                     interval=new RangeOwnership.Interval(interval.domainId(),names.keySet(),interval.lowerInclusive(),interval.upperExclusive());
                 }
                 if(!existing.ownership().interval().equals(interval) || !Arrays.equals(existing.schemaDigest(),schema) || !schemaPhysicalNamesUnderMutation(existing).equals(names) || !existing.deterministicMergeColumns().equals(merges)) throw new IllegalArgumentException("Opened topology/range identity changed"); return existing;
@@ -1024,6 +1042,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 }
                 if(recoveryOwnership!=null) break;
             }
+            if(topologySource==null)ownership.validateRegistration(owner,interval);
             // No metadata monitor is held during loader calls, CF creation or store recovery.
             for (var entry : names.entrySet()) {
                 Binding existing = bindings.get(entry.getKey());

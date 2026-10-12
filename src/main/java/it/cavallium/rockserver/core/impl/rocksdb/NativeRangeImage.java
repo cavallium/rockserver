@@ -527,6 +527,7 @@ public final class NativeRangeImage {
                     } catch(IllegalArgumentException failure) { throw new IOException("Invalid image schema activation",failure); }
                 }
                 if(section==Section.STATE && key.length>16 && key[16]==0x29) throw new IOException("Uncompleted schema install cannot be exported");
+                if(section==Section.STATE && key.length>16 && key[16]==0x6c)throw new IOException("Incomplete learner schema adoption cannot export USER image");
                 if(section==Section.STATE && key.length>16 && key[16]==0x62) throw new IOException("Retired topology parents cannot export USER images");
                 if(section==Section.STATE && key.length>16 && (key[16]==0x61 || key[16]==0x63 || key[16]==0x64)) {
                     try {

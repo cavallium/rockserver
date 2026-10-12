@@ -149,6 +149,20 @@ public final class RangeOwnership {
         var result=new Ownership(owner,target,State.FENCED); owners.put(owner.groupId(),result); transition.completed.add(owner); return result;
     }
 
+    /** Receiver-local adoption reserves geometry without claiming historical schema membership. */
+    public synchronized LearnerSchemaLease claimLearnerSchema(Owner owner,Interval source,Interval target) {
+        var current=get(owner);requireFenced(current);
+        if(!current.interval().equals(source) || !source.domainId().equals(target.domainId()) || !Arrays.equals(source.lowerInclusive,target.lowerInclusive) || !Arrays.equals(source.upperExclusive,target.upperExclusive))throw new IllegalArgumentException("Learner adoption changed exact source geometry");
+        requireUnleased(source);requireUnleased(target);requireUnowned(target,Set.of(owner.groupId()));
+        var columns=new java.util.HashSet<>(source.columns());columns.addAll(target.columns());var installing=new Ownership(owner,source,State.INSTALLING);var reservation=new Lease(installing,true,new Interval(source.domainId(),columns,source.lowerInclusive,source.upperExclusive));owners.put(owner.groupId(),installing);leases.put(owner.groupId(),reservation);return new LearnerSchemaLease(reservation,target);
+    }
+    public final class LearnerSchemaLease implements AutoCloseable {
+        private final Lease reservation;private final Interval target;
+        private LearnerSchemaLease(Lease reservation,Interval target){this.reservation=reservation;this.target=target;}
+        public void publish(){synchronized(RangeOwnership.this){var owner=reservation.ownership.owner();if(reservation.closed || leases.get(owner.groupId())!=reservation || get(owner).state()!=State.INSTALLING)throw new IllegalStateException("Learner schema reservation lost");owners.put(owner.groupId(),new Ownership(owner,target,State.INSTALLING));}}
+        @Override public void close(){reservation.close();}
+    }
+
     /** Reserve the union of old and new columns through native DDL and durable generation publication. */
     public synchronized SchemaLease claimSchemaReplacement(Owner owner, Interval expectedSource, Interval target, SchemaTransition transition) {
         validateSchemaReplacement(owner,expectedSource,target,transition);
@@ -244,6 +258,11 @@ public final class RangeOwnership {
             throw new IllegalArgumentException("Interval is outside recorded schema transition");
     }
 
+    /** Check geometry before a native opener allocates or publishes CF bindings. */
+    public synchronized void validateRegistration(Owner owner,Interval interval) {
+        var existing=owners.get(owner.groupId());if(existing!=null){if(!existing.owner().equals(owner) || !existing.interval().equals(interval))throw new IllegalArgumentException("Registered owner geometry changed");return;}
+        requireNew(owner);requireUnleased(interval);requireUnowned(interval,Set.of());
+    }
     public synchronized Ownership register(Owner owner, Interval interval, State state) {
         Objects.requireNonNull(owner, "owner");
         Objects.requireNonNull(interval, "interval");
