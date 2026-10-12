@@ -575,6 +575,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
+    private RatisSnapshotPins.Limits snapshotPinLimits=RatisSnapshotPins.Limits.defaults();
+    private java.util.function.LongSupplier snapshotPinClock=System::nanoTime;
+    private boolean snapshotTtlConfigured;
+    void snapshotReadOnlyMaximumTtl(java.time.Duration maximum){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || snapshotTtlConfigured)throw new IllegalStateException("Snapshot read-only TTL fixed before initialization");RatisSnapshotCaptureRequest.requireTtl(maximum,RatisSnapshotCaptureRequest.Mode.READ_ONLY);var base=RatisSnapshotPins.Limits.defaults();snapshotPinLimits=new RatisSnapshotPins.Limits(base.captures(),base.bytes(),maximum);snapshotTtlConfigured=true;capturedSnapshots=newSnapshotPins(snapshotPinClock);}
     @FunctionalInterface interface SnapshotHelpAction { boolean run() throws Exception; }
     @FunctionalInterface interface SnapshotHelpExecutor { CompletableFuture<Boolean> submit(UUID group,ScopedTransactionRpc.SnapshotBinding binding,SnapshotHelpAction action); }
     @FunctionalInterface interface ProofQueryAction { Message run(byte[] ownedRequest) throws Exception; }
@@ -717,10 +721,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private ProofQueryExecutor importPreflightQueries;
     void importPreflightQueries(ProofQueryExecutor executor){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || importPreflightQueries!=null)throw new IllegalStateException("Import preflight lane fixed before initialization");importPreflightQueries=java.util.Objects.requireNonNull(executor);}
     private int qualifiedImportManifestBytes(Object record){var definition=rangeImportApply.definition();if(record instanceof RatisRangeImportRecord proposal)proposal.requireDefinition(definition);else if(!(record instanceof RatisReferencedFile.Request))throw new IllegalArgumentException("Unknown import preparation subject");var manifest=definition.manifest(store.ownership().owner().groupId());RatisRangeImportRecord.requirePolicy(manifest);return manifest.limits().maximumEncodedBytes();}
+    private void refreshPublishedReplicaRole(RangeDescriptor descriptor){
+        if(topologyLocalReplica==null)return;var local=descriptor.replicas().stream().filter(replica->sameReplicaIdentity(replica,topologyLocalReplica)).findFirst().orElse(null);if(local==null)return;topologyLocalReplica=local;if(schemaLocalReplica!=null){schemaLocalReplica=local;if(schemaReplicas!=null)schemaReplicas.rebindReplica(store.ownership().owner().groupId(),store,local);}
+    }
     private byte[] applyRelocation(ApplyPosition position,RatisTopologyRelocationRecord record)throws Exception{
         if(relocationObserver==null)throw new IOException("Committed relocation lacks durable node owner");relocationObserver.persist(record,position);byte[] result;
         if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && store.topologyLearnerRegistration()!=null)result=store.applyTopologyRelocationCompletion(position,record.definition(),record.targetConfiguration(),record.catalogue(),record.catalogueCut()).encode();else{store.applyNoop(position,null);result=new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode();}
-        if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE){var directory=record.definition().targetDirectory();var descriptor=record.definition().targets().getFirst();if((effectiveSessionDirectory==null || directory.generation()>=effectiveSessionDirectory.generation()) && (topologyDescriptor==null || descriptor.configurationVersion()>=topologyDescriptor.configurationVersion())){schemaDescriptor=descriptor;topologyDescriptor=descriptor;refreshSessionAdmission(directory);if(store.admissionOpen()){if(enableSessionControls)store.enableSessionControls();store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());}}}
+        if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE){var directory=record.definition().targetDirectory();var descriptor=record.definition().targets().getFirst();if((effectiveSessionDirectory==null || directory.generation()>=effectiveSessionDirectory.generation()) && (topologyDescriptor==null || descriptor.configurationVersion()>=topologyDescriptor.configurationVersion())){schemaDescriptor=descriptor;topologyDescriptor=descriptor;refreshPublishedReplicaRole(descriptor);refreshSessionAdmission(directory);if(store.admissionOpen()){if(enableSessionControls)store.enableSessionControls();store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());}}}
         synchronized(admissions){if(relocationHold!=null && relocationHold.record.equals(record))releaseRelocation(relocationHold);}return result;
     }
     Path sourceSnapshotDirectory(){return snapshots.getSnapshotFile(0,0).toPath().getParent();}
@@ -1277,7 +1284,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     void transactionClock(java.util.function.LongSupplier nanos) {
         if (getLifeCycleState()!=LifeCycle.State.NEW) throw new IllegalStateException("Transaction clock is fixed before initialization");
         scopedTransactions=new RatisScopedTransactions(this,RatisScopedTransactions.Limits.defaults(),nanos);
-        capturedSnapshots=newSnapshotPins(nanos);
+        snapshotPinClock=nanos;capturedSnapshots=newSnapshotPins(nanos);
     }
     long transactionGeneration() { return admissionGeneration.get(); }
     long transactionTerm() { var a=store.applied(); return a==null ? -1 : a.term(); }
@@ -1435,7 +1442,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (failure!=null) throw failure;
     }
     private RatisSnapshotPins newSnapshotPins(java.util.function.LongSupplier nanos) {
-        return new RatisSnapshotPins(transactionIncarnation,store.ownership().owner().groupId(),RatisSnapshotPins.Limits.defaults(),nanos,this::captureSnapshotGate,
+        return new RatisSnapshotPins(transactionIncarnation,store.ownership().owner().groupId(),snapshotPinLimits,nanos,this::captureSnapshotGate,
                 ReplicatedRangeStore.ScopedSnapshot::get,ReplicatedRangeStore.ScopedSnapshot::close,scopedTransactions::captureSnapshot,scopedTransactions::releaseAndDrain,scopedTransactions::snapshotLive);
     }
     /** Qualified coordinator seam; the caller freezes this incarnation before its first capture request. */

@@ -42,6 +42,26 @@ class RatisSnapshotPinsTest {
         }
         @Override public void close() throws Exception { data.close(); home.close(); }
     }
+    @Test void configuredLongReadonlyCaptureUsesOriginalDeadlineAndNeverRenewsOnRetry()throws Exception {
+        try(var f=new Fixture("long-readonly")) {
+            var clock=new AtomicLong();var calls=new AtomicInteger();var requested=Duration.ofMinutes(2);try(var pins=new RatisSnapshotPins(f.owner,f.data.f.groupId,new RatisSnapshotPins.Limits(16,16L<<20,Duration.ofMinutes(5)),clock::get,(homes,fence)->{calls.incrementAndGet();return f.data.f.machine.captureSnapshotGate(homes,fence);})) {
+                var token=pins.capture(f.home.homes,f.fence,f.owner,f.snapshot,requested,()->0);clock.set(Duration.ofSeconds(61).toNanos());assertEquals(token,pins.capture(f.home.homes,f.fence,f.owner,f.snapshot,requested,()->0));assertArrayEquals(new byte[]{7},pins.get(token,f.data.f.column,new byte[]{2}));clock.set(requested.toNanos()-1);assertEquals(token,pins.capture(f.home.homes,f.fence,f.owner,f.snapshot,requested,()->0));clock.set(requested.toNanos());pins.expire();assertThrows(RatisSnapshotLostException.class,()->pins.capture(f.home.homes,f.fence,f.owner,f.snapshot,requested,()->0));assertEquals(1,calls.get());assertEquals(0,pins.stats().pins());
+                var canceledFence=identity(f.fence,new UUID(0,10100),1,10);var canceledRequest=new RatisSnapshotCaptureRequest(canceledFence,f.owner,new UUID(0,10101),requested);var reserved=pins.reserveExternal(canceledRequest,()->0);pins.markPhysicalStarted(reserved);pins.cancelExternal(reserved);pins.failExternal(reserved);assertThrows(RatisSnapshotLostException.class,()->pins.capture(f.home.homes,canceledFence,f.owner,canceledRequest.snapshotId(),requested,()->0));assertEquals(1,calls.get());
+                assertThrows(IllegalArgumentException.class,()->pins.capture(f.home.homes,f.fence,f.owner,UUID.randomUUID(),Duration.ofMinutes(2),()->0,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED));
+            }
+        }
+    }
+    @Test void configuredServerLimitStillRejectsDeclaredReadonlyRetentionBeforeNativeCapture()throws Exception {
+        helper.helper.dataInitializer=machine->machine.snapshotReadOnlyMaximumTtl(Duration.ofMinutes(3));try(var f=new Fixture("server-retention")) {
+            assertThrows(IllegalArgumentException.class,()->f.data.f.machine.captureSnapshotPin(f.home.homes,f.fence,f.owner,f.snapshot,Duration.ofMinutes(4)));assertEquals(0,f.data.f.machine.snapshotPinStats().pins());var token=f.data.f.machine.captureSnapshotPin(f.home.homes,f.fence,f.owner,f.snapshot,Duration.ofMinutes(2));assertNotNull(token);f.data.f.machine.releaseSnapshotPin(token);
+        }
+    }
+    @Test void wholeMillisecondCodecKeepsFiniteModeCeilingsAndRejectsOverflowBeforeConversion()throws Exception {
+        try(var f=new Fixture("retention-codec")) {
+            var longRead=new RatisSnapshotCaptureRequest(f.fence,f.owner,f.snapshot,Duration.ofHours(24));assertArrayEquals(longRead.encode(),RatisSnapshotCaptureRequest.decode(longRead.encode()).encode());assertEquals(Duration.ofHours(24),RatisSnapshotCaptureRequest.maximumTtl(RatisSnapshotCaptureRequest.Mode.READ_ONLY));assertEquals(Duration.ofSeconds(60),RatisSnapshotCaptureRequest.maximumTtl(RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED));assertEquals(Duration.ofSeconds(60),RatisSnapshotPins.Limits.defaults().maximumTtl());
+            assertThrows(IllegalArgumentException.class,()->new RatisSnapshotCaptureRequest(f.fence,f.owner,f.snapshot,Duration.ofHours(24).plusMillis(1)));assertThrows(IllegalArgumentException.class,()->new RatisSnapshotCaptureRequest(f.fence,f.owner,f.snapshot,Duration.ofSeconds(Long.MAX_VALUE)));assertThrows(IllegalArgumentException.class,()->new RatisSnapshotCaptureRequest(f.fence,f.owner,f.snapshot,Duration.ofNanos(1)));assertThrows(IllegalArgumentException.class,()->new RatisSnapshotCaptureRequest(f.fence,f.owner,f.snapshot,Duration.ofSeconds(61),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED));var encoded=longRead.encode();encoded[40]=1;assertThrows(IllegalArgumentException.class,()->RatisSnapshotCaptureRequest.decode(encoded));assertThrows(IllegalArgumentException.class,()->new RatisSnapshotPins.Limits(16,16L<<20,Duration.ofHours(24).plusMillis(1)));
+        }
+    }
     @Test void exactCaptureRetryKeepsItsOriginalCutAndDeadlineThroughCompletionAndLeadershipLoss() throws Exception {
         try (var f=new Fixture("history")) {
             var clock=new AtomicLong(); var calls=new AtomicInteger();

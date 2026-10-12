@@ -233,5 +233,13 @@ class RatisExportJournalTest {
             assertEquals(RatisExportJournal.Phase.CAPTURING,journal.snapshot().phase()); assertTrue(journal.snapshot().captures().isEmpty());
         }
     }
+    @Test void extendedReadonlyRetentionRemainsExactAcrossJournalReopen() throws Exception {
+        var original=definition(directory(1));var ttl=Duration.ofHours(2);
+        var declared=new RatisExportJournal.Definition(original.jobId(),original.fence(),original.columns(),original.sourceJournal(),original.sourceIdentity(),original.limits(),ttl);
+        Path path=root.resolve("long-retention.export");
+        try(var journal=RatisExportJournal.create(path,declared)){assertEquals(ttl,journal.snapshot().definition().snapshotTtl());}
+        try(var journal=RatisExportJournal.reopen(path)){assertEquals(ttl,journal.snapshot().definition().snapshotTtl());}
+        assertThrows(IllegalArgumentException.class,()->new RatisExportJournal.Definition(original.jobId(),original.fence(),original.columns(),original.sourceJournal(),original.sourceIdentity(),original.limits(),Duration.ofHours(24).plusMillis(1)));
+    }
 
 }

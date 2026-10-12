@@ -35,9 +35,8 @@ final class RatisSnapshotPins implements AutoCloseable {
     record Captured(SnapshotFenceStatus.Capture token,ScopedTransactionRpc.Handle handle) {}
     record Limits(int captures,long bytes,Duration maximumTtl) {
         Limits {
-            Objects.requireNonNull(maximumTtl);
-            if (captures<1 || captures>MAX_CAPTURES || bytes<TOMBSTONE_BYTES || bytes>MAX_BYTES || maximumTtl.isNegative()
-                    || maximumTtl.isZero() || maximumTtl.compareTo(Duration.ofSeconds(60))>0) throw new IllegalArgumentException("Invalid snapshot pin limits");
+            RatisSnapshotCaptureRequest.requireTtl(maximumTtl,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
+            if (captures<1 || captures>MAX_CAPTURES || bytes<TOMBSTONE_BYTES || bytes>MAX_BYTES) throw new IllegalArgumentException("Invalid snapshot pin limits");
         }
         static Limits defaults() { return new Limits(MAX_CAPTURES,MAX_BYTES,Duration.ofSeconds(60)); }
     }
@@ -127,8 +126,9 @@ final class RatisSnapshotPins implements AutoCloseable {
     Captured capture(RatisSnapshotFences homes,SnapshotFence fence,UUID expectedOwner,UUID snapshotId,Duration ttl,LongSupplier floor,RatisSnapshotCaptureRequest.Mode mode) throws Exception {
         requireOwner(expectedOwner); Objects.requireNonNull(homes); Objects.requireNonNull(fence); Objects.requireNonNull(snapshotId); Objects.requireNonNull(ttl); Objects.requireNonNull(floor);
         Objects.requireNonNull(mode);
+        RatisSnapshotCaptureRequest.requireTtl(ttl,mode);
         if (mode==RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED && certifiedCapture==null) throw new UnsupportedOperationException("Writable capture is not configured");
-        if (ttl.isNegative() || ttl.isZero() || ttl.compareTo(limits.maximumTtl())>0) throw new IllegalArgumentException("Snapshot pin TTL exceeds advertised limit");
+        if (ttl.compareTo(limits.maximumTtl())>0) throw new IllegalArgumentException("Snapshot pin TTL exceeds advertised limit");
         long duration=ttl.toNanos(); byte[] definition=fence.encode(),digest=hash(definition); var participant=fence.participant(group);
         long bytes=TOMBSTONE_BYTES+(long)definition.length+RangeMutationHistory.accountedScopeBytes(participant.scope());
         Entry existing;

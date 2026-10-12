@@ -114,7 +114,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     }
     private synchronized void refund(long bytes,boolean read,boolean cursor) { chargedBytes-=bytes; if (read) reads--; if (cursor) cursors--; }
     private synchronized void remove(Lease lease) { if (leases.remove(lease.path,lease)) chargedBytes-=lease.bytes; }
-    private static void validateTtl(Duration ttl) { if (Objects.requireNonNull(ttl).isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Snapshot TTL must be 1..60000 whole milliseconds"); }
+    private void validateTtl(Duration ttl) { RatisSnapshotCaptureRequest.requireTtl(ttl,mode); }
     /** Per-group headers are not duplicated in the global result's single eight-byte header. */
     static long checkedResultBytes(long total,CommandResult result) throws IOException {
         if (total<8 || total>CommandResult.MAX_BYTES) throw new IllegalArgumentException("Invalid aggregate staged-result accounting");

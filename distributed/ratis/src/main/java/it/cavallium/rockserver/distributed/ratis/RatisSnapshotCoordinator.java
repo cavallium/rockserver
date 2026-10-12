@@ -26,7 +26,7 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
         this.journal=Objects.requireNonNull(journal); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
         this.controls=Objects.requireNonNull(controls);
         this.captureIds=Objects.requireNonNull(captureIds); this.ttl=Objects.requireNonNull(ttl);
-        if (ttl.isNegative() || ttl.isZero() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Invalid capture lifetime");
+        RatisSnapshotCaptureRequest.requireTtl(ttl,journal.mode());
         journal.requireClients(homes,data); groups=journal.snapshot().participants().stream().map(p -> p.route().groupId()).toList();
     }
     /** One active step and at most one state-changing RPC. Rotation happens before participant work. */

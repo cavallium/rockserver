@@ -51,6 +51,11 @@ public final class RatisSchemaReplicaService {
     synchronized void register(UUID group,ReplicatedRangeStore store,ReplicaDescriptor replica,AuthorityReader authority,TargetValidator validator) {
         if (stopping || parsing!=0 || !work.isEmpty() || locals.size()>=1024 || locals.putIfAbsent(group,new Local(store,replica,authority,validator))!=null) throw new IllegalStateException("Schema replica context already exposed or full");
     }
+    /** Server-owned published role update; in-flight jobs retain their immutable captured Local context. */
+    synchronized void rebindReplica(UUID group,ReplicatedRangeStore store,ReplicaDescriptor replica){
+        var before=locals.get(group);if(before==null || before.store()!=store || !before.replica().nodeId().equals(replica.nodeId()) || !before.replica().nodeIncarnation().equals(replica.nodeIncarnation()) || !before.replica().replicaId().equals(replica.replicaId()) || !before.replica().peerId().equals(replica.peerId()) || !before.replica().address().equals(replica.address()))throw new IllegalArgumentException("Published replica role update changed local identity/store");
+        locals.put(group,new Local(before.store(),replica,before.authority(),before.validator()));
+    }
     public CompletableFuture<byte[]> submit(UUID addressedGroup,byte[] encoded) {
         boolean parsingReserved=false; long parsingCharge=0;
         try {

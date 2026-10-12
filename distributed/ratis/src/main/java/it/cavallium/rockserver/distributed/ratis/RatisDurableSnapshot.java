@@ -66,7 +66,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
-        requireTtl(requestedTtl); Objects.requireNonNull(mode);
+        requireTtl(requestedTtl,mode);
         var journal=new RatisDurableSnapshot(path,homes,data,true);
         journal.requestedTtl=requestedTtl; journal.captureMode=mode;
         try {
@@ -552,7 +552,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
                 if (flag(in)) mergeRetirement(entry,new SnapshotFenceProof(initial.fence(),entry.route.groupId(),in.getLong(),positionValue(in)));
                 validateEntry(entry);
             }
-            releaseRequested=flag(in); long ttl=in.getLong(); requestedTtl=ttl== -1 ? null : Duration.ofMillis(ttl); requireTtl(requestedTtl);
+            releaseRequested=flag(in); long ttl=in.getLong(); requestedTtl=ttl== -1 ? null : Duration.ofMillis(ttl); requireTtl(requestedTtl,captureMode);
             if (requestedTtl!=null) for (var entry:entries.values()) if (entry.capture!=null && !requestedTtl.equals(entry.capture.request().ttl())) throw new IOException("Frozen capture differs from requested TTL");
             if (in.hasRemaining() || !lastHome.equals(pending.command().operationId())) throw new IOException("Invalid trailing snapshot journal/home identity");
             if (before!=null) { if (observed==null) throw new IOException("Pending home CAS lacks observed expected image"); monotone(before,observed); }
@@ -560,8 +560,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             if (homeResult!=null && homeResult.status()==CommandResult.Status.SUCCESS) { if (observed==null) throw new IOException("Successful home result lacks observed image"); monotone(after,observed); }
         } catch (RuntimeException invalid) { throw new IOException("Invalid snapshot journal",invalid); }
     }
-    private static void requireTtl(Duration ttl) {
-        if (ttl!=null && (ttl.isNegative() || ttl.isZero() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis())))) throw new IllegalArgumentException("Requested snapshot TTL must be 1..60000 whole milliseconds");
+    private static void requireTtl(Duration ttl,RatisSnapshotCaptureRequest.Mode mode) {
+        Objects.requireNonNull(mode);if(ttl!=null)RatisSnapshotCaptureRequest.requireTtl(ttl,mode);
     }
     private void validateEntry(Entry entry) throws IOException {
         if (entry.capture!=null && entry.capture.request().mode()!=captureMode || captureMode==RatisSnapshotCaptureRequest.Mode.READ_ONLY && entry.certifiedHandle!=null

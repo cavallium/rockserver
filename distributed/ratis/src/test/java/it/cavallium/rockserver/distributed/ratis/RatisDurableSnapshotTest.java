@@ -30,6 +30,19 @@ class RatisDurableSnapshotTest {
         return new RatisSnapshotCoordinator(journal,f.home.homes,f.client,
                 last -> new OperationId(last.sessionId(),last.epoch(),last.sequence()+1),UUID::randomUUID,Duration.ofSeconds(10));
     }
+    @Test void longReadonlyLifetimeReopensExactRequestAndModeWithoutChangingNativePin()throws Exception {
+        helper.helper.helper.dataInitializer=machine->machine.snapshotReadOnlyMaximumTtl(Duration.ofMinutes(5));Path path=root.resolve("long-readonly.journal");var lifetime=Duration.ofMinutes(2);try(var f=fixture("long-readonly")) {
+            var group=f.data.f.groupId;byte[] exact;SnapshotFenceStatus.Capture token;try(var journal=RatisDurableSnapshot.create(path,f.home.homes,f.client,f.initial,f.home.homes.prepare(control(0),null,f.initial),f.data.directory.ranges(),lifetime,RatisSnapshotCaptureRequest.Mode.READ_ONLY)){installed(journal,f);transition(journal,f,f.initial.ready(group,journal.snapshot().participant(group).readyProof()),1);var operation=f.client.prepareSnapshotCapture(f.client.snapshotTarget(f.fence,group),UUID.randomUUID(),lifetime);journal.freezeCapture(operation);exact=operation.bytes();token=journal.executeCapture(group);assertEquals(1,f.data.f.machine.snapshotPinStats().pins());}
+            try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)){assertEquals(lifetime,journal.snapshot().requestedTtl());assertEquals(RatisSnapshotCaptureRequest.Mode.READ_ONLY,journal.mode());assertArrayEquals(exact,journal.snapshot().participant(group).capture().bytes());assertEquals(token,journal.executeCapture(group));assertEquals(1,f.data.f.machine.snapshotPinStats().pins());}f.data.f.machine.releaseSnapshotPin(token);
+        }
+    }
+    @Test void modeBoundLifetimeRejectsBeforeJournalCreationAndOnColdCurrentFrameRead()throws Exception {
+        try(var f=fixture("ttl-mode")) {
+            var lifetime=Duration.ofMinutes(2);var invalid=root.resolve("write-long.journal");long home=f.home.wire.index;assertThrows(IllegalArgumentException.class,()->RatisDurableSnapshot.create(invalid,f.home.homes,f.client,f.initial,f.home.homes.prepare(control(0),null,f.initial),f.data.directory.ranges(),lifetime,RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED));assertFalse(Files.exists(invalid));assertEquals(home,f.home.wire.index);
+            Path path=root.resolve("mode-read.journal");try(var journal=RatisDurableSnapshot.create(path,f.home.homes,f.client,f.initial,f.home.homes.prepare(control(0),null,f.initial),f.data.directory.ranges(),lifetime,RatisSnapshotCaptureRequest.Mode.READ_ONLY)){assertEquals(lifetime,journal.snapshot().requestedTtl());}try(var journal=RatisDurableSnapshot.reopen(path,f.home.homes,f.client)){assertEquals(lifetime,journal.snapshot().requestedTtl());}
+            byte[] current=SessionJournalFiles.read(path,RatisDurableSnapshot.MAX_BYTES);current[68]=1;SessionJournalFiles.write(path,current,RatisDurableSnapshot.MAX_BYTES);assertThrows(IOException.class,()->RatisDurableSnapshot.reopen(path,f.home.homes,f.client));assertEquals(home,f.home.wire.index);
+        }
+    }
     @Test void externalCapturedCutIsForcedAndColdReopenAcceptsExactResultWithoutCaptureRpc()throws Exception {
         Path path=root.resolve("external.journal");try(var f=fixture("external")) {
             var group=f.data.f.groupId;RatisRoutedClient.PreparedSnapshotCapture prepared;SnapshotFenceStatus.Capture token;

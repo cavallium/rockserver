@@ -271,4 +271,15 @@ class RatisSchemaReplicaServiceTest {
             f.call(f.chunk(0)); assertTrue(f.call(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE)).chunks().get(0));
         }
     }
+    @Test void publishedRoleRebindPreservesIdentityAndCapturedLocalWhileOldTaskDrains()throws Exception{
+        try(var fixture=new Fixture(root,true)){
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);fixture.beforeAuthority=()->{entered.countDown();try{if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("Role rebind fixture timeout");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}};
+            var field=RatisSchemaReplicaService.class.getDeclaredField("locals");field.setAccessible(true);var locals=(Map<?,?>)field.get(fixture.service);var captured=locals.get(fixture.group);var job=fixture.submit(fixture.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN));
+            try{assertTrue(entered.await(5,TimeUnit.SECONDS));var old=fixture.local;var promoted=new ReplicaDescriptor(old.nodeId(),old.nodeIncarnation(),old.replicaId(),old.peerId(),old.address(),ReplicaDescriptor.Role.VOTER);fixture.service.rebindReplica(fixture.group,fixture.store,promoted);var current=locals.get(fixture.group);assertNotSame(captured,current);for(var name:List.of("store","authority","validator")){var getter=captured.getClass().getDeclaredMethod(name);getter.setAccessible(true);assertSame(getter.invoke(captured),getter.invoke(current));}var replica=captured.getClass().getDeclaredMethod("replica");replica.setAccessible(true);assertEquals(old,replica.invoke(captured));assertEquals(promoted,replica.invoke(current));
+                var changed=new ReplicaDescriptor(old.nodeId(),new UUID(50,1),old.replicaId(),old.peerId(),old.address(),old.role());assertThrows(IllegalArgumentException.class,()->fixture.service.rebindReplica(fixture.group,fixture.store,changed));assertSame(current,locals.get(fixture.group));
+                var rejected=fixture.submit(fixture.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE));assertThrows(ExecutionException.class,()->rejected.get(5,TimeUnit.SECONDS));
+            }finally{release.countDown();}job.get(10,TimeUnit.SECONDS);fixture.service.stop().get(10,TimeUnit.SECONDS);var work=RatisSchemaReplicaService.class.getDeclaredField("work");work.setAccessible(true);assertTrue(((Map<?,?>)work.get(fixture.service)).isEmpty());
+        }
+    }
+
 }

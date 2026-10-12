@@ -15,11 +15,17 @@ public record RatisSnapshotCaptureRequest(SnapshotFence fence,UUID owner,UUID sn
         }
     }
     public static final int HEADER_BYTES=45, MAX_BYTES=HEADER_BYTES+SnapshotFence.MAX_BYTES;
+    public static Duration maximumTtl(Mode mode) {return Objects.requireNonNull(mode)==Mode.READ_ONLY ? Duration.ofHours(24) : Duration.ofSeconds(60);}
+    /** Validate before converting; both current wire milliseconds and monotonic nanoseconds remain bounded. */
+    public static void requireTtl(Duration ttl,Mode mode) {
+        Objects.requireNonNull(ttl);var maximum=maximumTtl(mode);
+        if(ttl.isNegative() || ttl.isZero() || ttl.compareTo(maximum)>0)throw new IllegalArgumentException("Snapshot capture TTL exceeds mode bound");
+        long millis=ttl.toMillis();if(millis<1 || !ttl.equals(Duration.ofMillis(millis)))throw new IllegalArgumentException("Snapshot capture TTL must use positive whole milliseconds");
+    }
     public RatisSnapshotCaptureRequest(SnapshotFence fence,UUID owner,UUID snapshotId,Duration ttl) { this(fence,owner,snapshotId,ttl,Mode.READ_ONLY); }
     public RatisSnapshotCaptureRequest {
         Objects.requireNonNull(fence); Objects.requireNonNull(owner); Objects.requireNonNull(snapshotId); Objects.requireNonNull(ttl); Objects.requireNonNull(mode);
-        if (ttl.isNegative() || ttl.isZero() || ttl.compareTo(Duration.ofSeconds(60))>0) throw new IllegalArgumentException("Snapshot capture TTL exceeds bound");
-        long millis=ttl.toMillis(); if (millis<1 || millis>60000 || !ttl.equals(Duration.ofMillis(millis))) throw new IllegalArgumentException("Snapshot capture TTL must be 1..60000 whole milliseconds");
+        requireTtl(ttl,mode);
     }
     public ScopedTransactionRpc.SnapshotBinding binding() { return ScopedTransactionRpc.SnapshotBinding.of(fence); }
     public byte[] encode() {

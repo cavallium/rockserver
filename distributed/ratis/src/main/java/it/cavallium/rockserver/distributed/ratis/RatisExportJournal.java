@@ -21,7 +21,7 @@ public final class RatisExportJournal implements AutoCloseable {
     public record Definition(UUID jobId,SnapshotFence fence,List<UUID> columns,Path sourceJournal,byte[] sourceIdentity,Limits limits,Duration snapshotTtl) {
         public Definition {
             Objects.requireNonNull(jobId); Objects.requireNonNull(fence); columns=selectedColumns(fence,columns); Objects.requireNonNull(sourceJournal); Objects.requireNonNull(sourceIdentity); Objects.requireNonNull(limits); Objects.requireNonNull(snapshotTtl);
-            if (snapshotTtl.isZero() || snapshotTtl.isNegative() || snapshotTtl.compareTo(Duration.ofSeconds(60))>0 || !snapshotTtl.equals(Duration.ofMillis(snapshotTtl.toMillis()))) throw new IllegalArgumentException("Export snapshot TTL must be 1..60000 whole milliseconds");
+            RatisSnapshotCaptureRequest.requireTtl(snapshotTtl,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
             sourceJournal=sourceJournal.toAbsolutePath().normalize(); if (sourceIdentity.length!=32 || sourceJournal.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>4096) throw new IllegalArgumentException("Invalid export source binding"); sourceIdentity=sourceIdentity.clone();
             long future=2L*(MAX_RECORD+FRAME)+fence.encode().length+sourceJournal.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length+8192+16L*columns.size();
             if (future>limits.maximumJournalBytes()) throw new IllegalArgumentException("Export lacks reserved first-chunk/capture/READY capacity");
