@@ -37,8 +37,9 @@ class NativeHomeRetirementTest {
         } else proof=HomeRecovery.Proof.from(dataFence(initial,2));
         var acknowledged=terminal.finalized(helper.participant); var ack=new HomeRecovery(HomeRecovery.Action.ACK,helper.cas(new OperationId(helper.recoverySession,0,1),terminal,acknowledged),proof);
         var ackReceipt=f.store.applyHomeRecovery(new ApplyPosition(1,++index),ack).receipt(); if (first==null) { first=ack; receipt=ackReceipt; }
-        var consumed=acknowledged.consume(); helper.apply(f,++index,helper.cas(new OperationId(helper.user,2,3),acknowledged,consumed));
+        assertEquals(1,f.store.homeRecoveryCapacity().reservedCount());var consumed=acknowledged.consume();
         helper.apply(f,++index,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,3,0),2));
+        var consume=new HomeRecovery(HomeRecovery.Action.CONSUME,helper.cas(new OperationId(helper.recoverySession,0,2),acknowledged,consumed),null);assertTrue(f.store.estimateHomeRecovery(consume).creditCovered());assertEquals(CommandResult.Status.SUCCESS,f.store.applyHomeRecovery(new ApplyPosition(1,++index),consume).receipt().result().status());assertEquals(0,f.store.homeRecoveryCapacity().reservedCount());
         return new Finished(initial,consumed,first,receipt,new HomeRetirement(identity(initial),consumed,List.of(dataFence(initial,2))),index,registration);
     }
     @Test void consumedCommitAndAbortRetireAtomicallyWhilePinsAndOrdinaryReceiptsRemainHistorical() throws Exception {
@@ -91,14 +92,14 @@ class NativeHomeRetirementTest {
         try (var f=helper.new Fixture(root.resolve("uuid-reuse"))) {
             configure(f); var old=helper.initial(0); var request=helper.abort(old,0); f.store.applyHomeRecovery(new ApplyPosition(1,1),request);
             helper.apply(f,2,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,3,0),2)); var next=replacement(old); helper.apply(f,3,helper.cas(new OperationId(helper.user,3,0),null,next));
-            var retirement=new HomeRetirement(identity(old),null,List.of()); assertNotNull(f.store.homeFence(identity(old))); f.store.applyHomeRetirement(new ApplyPosition(1,4),retirement); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount());
+            var retirement=new HomeRetirement(identity(old),null,List.of()); assertNotNull(f.store.homeFence(identity(old))); f.store.applyHomeRetirement(new ApplyPosition(1,4),retirement); assertEquals(3,f.store.homeRecoveryCapacity().reservedCount());
             assertTrue(f.store.applyHomeRecovery(new ApplyPosition(1,5),request).retired()); f.store.applyHomeRetirement(new ApplyPosition(1,6),retirement); assertTrue(f.store.applyHomeRecovery(new ApplyPosition(1,1),request).retired());
             assertEquals(CommandResult.Status.SESSION_EXPIRED,helper.apply(f,7,helper.cas(new OperationId(helper.user,3,1),null,old)).status());
             try (var pin=f.store.capture()) { assertEquals(next,TransactionStatus.decode(pin.get(helper.column,helper.key(old)))); }
             var changed=TransactionStatus.begin(next.clusterId(),next.databaseId(),next.domainId(),next.transactionId(),next.operation(),next.schemaEpoch(),next.schemaDigest(),new byte[32],next.participants());
             assertThrows(IllegalArgumentException.class,() -> f.store.homeFence(identity(changed)));
-            helper.apply(f,8,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,3,1),3)); assertNull(f.store.homeFence(identity(next))); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount());
-            var abort=helper.abort(next,1); assertFalse(f.store.applyHomeRecovery(new ApplyPosition(1,9),abort).retired()); assertEquals(1,f.store.homeRecoveryCapacity().reservedCount());
+            helper.apply(f,8,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,3,1),3)); assertNull(f.store.homeFence(identity(next))); assertEquals(3,f.store.homeRecoveryCapacity().reservedCount());
+            var abort=helper.abort(next,1); assertFalse(f.store.applyHomeRecovery(new ApplyPosition(1,9),abort).retired()); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount());
         }
     }
     @Test void unconsumedHomeOrInsufficientFloorCannotBeCollected() throws Exception {

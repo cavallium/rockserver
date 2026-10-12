@@ -6,7 +6,7 @@ import java.util.*;
 
 /** Current protected transaction-HOME CAS. Serialized ACK evidence requires a qualified native read at admission. */
 public final class HomeRecovery {
-    public enum Action { ABORT, ACK }
+    public enum Action { ABORT, ACK, CONSUME }
     public static final int MAGIC=0x52485243,MAX_BYTES=2*TransactionStatus.MAX_BYTES+512;
     public record Proof(UUID participant,ApplyPosition position,byte[] digest,boolean fenced,long minimumEpoch) {
         public Proof {
@@ -41,6 +41,8 @@ public final class HomeRecovery {
         if (!Arrays.equals(key,mutation.key()) || command.operationId().equals(before.operation())) throw new IllegalArgumentException("HOME recovery key/business identity changed");
         if (action==Action.ABORT) {
             if (proof!=null || (before.phase()!=TransactionStatus.Phase.PREPARING && !before.reserved()) || !(before.reserved() ? before.abortReservation(next.noEffectOutcome()) : before.decide(TransactionStatus.Phase.ABORT)).equals(next)) throw new IllegalArgumentException("HOME recovery ABORT changed its transition");
+        } else if(action==Action.CONSUME) {
+            if(proof!=null || !before.terminal() || !before.fullyFinalized() || before.consumed() || !before.consume().equals(next))throw new IllegalArgumentException("HOME recovery CONSUME changed its terminal transition");
         } else {
             if (proof==null || !before.terminal() || proof.fenced() && before.phase()!=TransactionStatus.Phase.ABORT || !before.finalized(proof.participant()).equals(next)) throw new IllegalArgumentException("HOME recovery ACK changed its participant/transition");
         }
@@ -66,17 +68,17 @@ public final class HomeRecovery {
     }
     public byte[] digest() { return hash(encode()); }
     public byte[] encode() {
-        byte[] body=DistributedCommandCodec.encode(command); var out=ByteBuffer.allocate(9+body.length+(proof==null ? 0 : 73)).putInt(MAGIC).put((byte)(action==Action.ABORT ? 1 : 2)).putInt(body.length).put(body);
+        byte[] body=DistributedCommandCodec.encode(command); var out=ByteBuffer.allocate(9+body.length+(proof==null ? 0 : 73)).putInt(MAGIC).put((byte)(action.ordinal()+1)).putInt(body.length).put(body);
         if (proof!=null) out.put((byte)(proof.fenced() ? 1 : 0)).putLong(proof.participant().getMostSignificantBits()).putLong(proof.participant().getLeastSignificantBits()).putLong(proof.position().term()).putLong(proof.position().index()).put(proof.digest()).putLong(proof.minimumEpoch()); return out.array();
     }
     public static boolean isRecovery(byte[] bytes) { return bytes.length>=4 && ByteBuffer.wrap(bytes).getInt()==MAGIC; }
     public static HomeRecovery decode(byte[] bytes) {
         Objects.requireNonNull(bytes); if (bytes.length<9+DistributedCommandCodec.HEADER_BYTES || bytes.length>MAX_BYTES) throw new IllegalArgumentException("Invalid HOME recovery length");
         var in=ByteBuffer.wrap(bytes); if (in.getInt()!=MAGIC) throw new IllegalArgumentException("Invalid HOME recovery kind"); int action=in.get()&255,size=in.getInt();
-        if (action<1 || action>2 || size<DistributedCommandCodec.HEADER_BYTES || size>DistributedCommandCodec.MAX_ENCODED_BYTES || in.remaining()!=size+(action==2 ? 73 : 0)) throw new IllegalArgumentException("Invalid HOME recovery body/proof size");
+        if (action<1 || action>3 || size<DistributedCommandCodec.HEADER_BYTES || size>DistributedCommandCodec.MAX_ENCODED_BYTES || in.remaining()!=size+(action==2 ? 73 : 0)) throw new IllegalArgumentException("Invalid HOME recovery body/proof size");
         byte[] command=new byte[size]; in.get(command); Proof proof=null;
         if (action==2) { int source=in.get()&255; if (source>1) throw new IllegalArgumentException("Invalid HOME proof source"); UUID participant=new UUID(in.getLong(),in.getLong()); var position=new ApplyPosition(in.getLong(),in.getLong()); byte[] digest=new byte[32]; in.get(digest); proof=new Proof(participant,position,digest,source==1,in.getLong()); }
-        return new HomeRecovery(action==1 ? Action.ABORT : Action.ACK,DistributedCommandCodec.decode(command),proof);
+        return new HomeRecovery(Action.values()[action-1],DistributedCommandCodec.decode(command),proof);
     }
     @Override public boolean equals(Object other) { return other instanceof HomeRecovery r && Arrays.equals(encode(),r.encode()); }
     @Override public int hashCode() { return Arrays.hashCode(encode()); }

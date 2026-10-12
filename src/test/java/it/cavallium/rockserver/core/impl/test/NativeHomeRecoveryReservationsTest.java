@@ -18,11 +18,11 @@ class NativeHomeRecoveryReservationsTest {
     @Test void ordinaryRegistrationVotesDecisionAndAckUpdatePromisesAtomicallyWithoutProtectedReceipts() throws Exception {
         try (var f=helper.new Fixture(root.resolve("ordinary"))) {
             configure(f); configure(f); var initial=helper.initial(0); var registration=helper.cas(new OperationId(helper.user,1,0),null,initial);
-            var estimate=f.store.estimateHomeRegistration(registration); assertEquals(2,estimate.additionalCount()); assertTrue(estimate.additionalBytes()>2*ReplicatedRangeStore.HomeRecoveryCredit.TRANSITION_BYTES);
-            helper.apply(f,1,registration); var reserved=f.store.homeRecoveryCapacity(); assertEquals(0,reserved.count()); assertEquals(2,reserved.reservedCount()); assertEquals(estimate.additionalBytes(),reserved.reservedBytes());
+            var estimate=f.store.estimateHomeRegistration(registration); assertEquals(3,estimate.additionalCount()); assertTrue(estimate.additionalBytes()>3*ReplicatedRangeStore.HomeRecoveryCredit.TRANSITION_BYTES);
+            helper.apply(f,1,registration); var reserved=f.store.homeRecoveryCapacity(); assertEquals(0,reserved.count()); assertEquals(3,reserved.reservedCount()); assertEquals(estimate.additionalBytes(),reserved.reservedBytes());
             var voted=initial.prepared(helper.participant,new byte[32],new ApplyPosition(1,1)); helper.apply(f,2,helper.cas(new OperationId(helper.user,1,1),initial,voted)); assertEquals(reserved.reservedBytes(),f.store.homeRecoveryCapacity().reservedBytes());
-            var commit=voted.decide(TransactionStatus.Phase.COMMIT); helper.apply(f,3,helper.cas(new OperationId(helper.user,1,2),voted,commit)); assertEquals(1,f.store.homeRecoveryCapacity().reservedCount());
-            var acknowledged=commit.finalized(helper.participant); helper.apply(f,4,helper.cas(new OperationId(helper.user,1,3),commit,acknowledged)); assertEquals(0,f.store.homeRecoveryCapacity().reservedCount()); assertEquals(0,f.store.homeRecoveryCapacity().reservedBytes());
+            var commit=voted.decide(TransactionStatus.Phase.COMMIT); helper.apply(f,3,helper.cas(new OperationId(helper.user,1,2),voted,commit)); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount());
+            var acknowledged=commit.finalized(helper.participant); helper.apply(f,4,helper.cas(new OperationId(helper.user,1,3),commit,acknowledged)); assertEquals(1,f.store.homeRecoveryCapacity().reservedCount()); assertTrue(f.store.homeRecoveryCapacity().reservedBytes()>0);
             helper.apply(f,5,helper.cas(new OperationId(helper.user,1,4),acknowledged,acknowledged.consume())); assertEquals(0,f.store.homeRecoveryCapacity().effectiveCount());
             assertThrows(IllegalArgumentException.class,() -> f.store.configureHomeRecoveryReservations(initial.clusterId(),UUID.randomUUID(),helper.column));
         }
@@ -52,25 +52,28 @@ class NativeHomeRecoveryReservationsTest {
             var outcome=new ParticipantOutcome(finalization,new ApplyPosition(7,50),ParticipantVote.prepared(new ApplyPosition(1,1)),null);
             var ack=new HomeRecovery(HomeRecovery.Action.ACK,helper.cas(new OperationId(helper.recoverySession,0,20002),terminal,terminal.finalized(helper.participant)),HomeRecovery.Proof.from(outcome));
             assertTrue(f.store.estimateHomeRecovery(ack).creditCovered()); assertEquals(CommandResult.Status.SUCCESS,f.store.applyHomeRecovery(new ApplyPosition(1,++index),ack).receipt().result().status());
-            assertEquals(promises-2,f.store.homeRecoveryCapacity().reservedCount()); assertTrue(f.store.homeRecoveryCapacity().effectiveCount()<=ReplicatedRangeStore.MAX_HOME_RECOVERIES); assertTrue(f.store.homeRecoveryCapacity().effectiveBytes()<=ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES);
+            assertEquals(promises-2,f.store.homeRecoveryCapacity().reservedCount());
+            helper.apply(f,++index,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,5,0),5));var completed=terminal.finalized(helper.participant);
+            var consume=new HomeRecovery(HomeRecovery.Action.CONSUME,helper.cas(new OperationId(helper.recoverySession,0,20003),completed,completed.consume()),null);assertTrue(f.store.estimateHomeRecovery(consume).creditCovered());assertEquals(0,f.store.estimateHomeRecovery(consume).additionalCount());assertEquals(0,f.store.estimateHomeRecovery(consume).additionalBytes());var consumedReceipt=f.store.applyHomeRecovery(new ApplyPosition(1,++index),consume).receipt();assertEquals(CommandResult.Status.SUCCESS,consumedReceipt.result().status());assertEquals(promises-3,f.store.homeRecoveryCapacity().reservedCount());assertEquals(consumedReceipt,f.store.applyHomeRecovery(new ApplyPosition(2,++index),consume).receipt());
+            assertTrue(f.store.homeRecoveryCapacity().effectiveCount()<=ReplicatedRangeStore.MAX_HOME_RECOVERIES); assertTrue(f.store.homeRecoveryCapacity().effectiveBytes()<=ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES);
         }
     }
     @Test void promisesSurviveFloorsReopenAndImageWithoutAnActivationMarker() throws Exception {
         Path source=root.resolve("source"),image=root.resolve("credits.image"); var initial=helper.initial(0);
         try (var f=helper.new Fixture(source)) {
             configure(f); helper.apply(f,1,helper.cas(new OperationId(helper.user,1,0),null,initial));
-            helper.apply(f,2,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,5,0),5)); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount());
+            helper.apply(f,2,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,5,0),5)); assertEquals(3,f.store.homeRecoveryCapacity().reservedCount());
             try (var pin=f.store.capture()) { NativeRangeImage.write(image,pin,f.store.ownership().interval(),helper.limits); }
         }
         NativeRangeImage.inspect(image,helper.limits);
         try (var f=helper.new Fixture(source)) {
-            assertEquals(2,f.store.homeRecoveryCapacity().reservedCount()); assertTrue(f.store.estimateHomeRecovery(helper.abort(initial,0)).creditCovered());
+            assertEquals(3,f.store.homeRecoveryCapacity().reservedCount()); assertTrue(f.store.estimateHomeRecovery(helper.abort(initial,0)).creditCovered());
             var vote=initial.prepared(helper.participant,new byte[32],new ApplyPosition(1,1));
             assertThrows(IllegalStateException.class,() -> helper.apply(f,3,helper.cas(new OperationId(helper.user,5,0),initial,vote))); assertEquals(new ApplyPosition(1,2),f.store.applied());
-            f.store.applyHomeRecovery(new ApplyPosition(1,3),helper.abort(initial,0)).receipt(); assertEquals(1,f.store.homeRecoveryCapacity().reservedCount());
+            f.store.applyHomeRecovery(new ApplyPosition(1,3),helper.abort(initial,0)).receipt(); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount());
         }
         try (var f=helper.new Fixture(root.resolve("target"))) {
-            f.store.fence(); f.store.installSnapshot(image,helper.limits); f.store.activate(); assertEquals(2,f.store.homeRecoveryCapacity().reservedCount()); configure(f);
+            f.store.fence(); f.store.installSnapshot(image,helper.limits); f.store.activate(); assertEquals(3,f.store.homeRecoveryCapacity().reservedCount()); configure(f);
             assertThrows(IllegalArgumentException.class,() -> f.store.configureHomeRecoveryReservations(initial.clusterId(),UUID.randomUUID(),helper.column));
         }
     }

@@ -77,4 +77,11 @@ class HomeRecoveryTest {
         assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.ACK,command(before,next,control(1)),new HomeRecovery.Proof(data,new ApplyPosition(3,4),new byte[32])));
     }
 
+    @Test void consumeUsesCurrentTagThreeAndOnlyExactFinalizedTerminalWithoutProof() {
+        var terminal=initial().decide(TransactionStatus.Phase.ABORT);var finalized=terminal.finalized(data);var consumed=finalized.consume();var recovery=new HomeRecovery(HomeRecovery.Action.CONSUME,command(finalized,consumed,control(5)),null);
+        assertEquals(3,recovery.encode()[4]);assertEquals(recovery,HomeRecovery.decode(recovery.encode()));assertNull(recovery.proof());for(int size=0;size<recovery.encode().length;size++) { byte[] truncated=Arrays.copyOf(recovery.encode(),size);assertThrows(IllegalArgumentException.class,()->HomeRecovery.decode(truncated)); }
+        assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.CONSUME,command(finalized,consumed,control(5)),HomeRecovery.Proof.from(abort(terminal,0))));assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.CONSUME,command(initial(),terminal,control(5)),null));assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.CONSUME,command(terminal,finalized,control(5)),null));assertThrows(IllegalArgumentException.class,()->new HomeRecovery(HomeRecovery.Action.CONSUME,command(finalized,consumed,new OperationId(new UUID(0,9),1,5)),null));
+        byte[] unknown=recovery.encode();unknown[4]=4;assertThrows(IllegalArgumentException.class,()->HomeRecovery.decode(unknown));byte[] extra=Arrays.copyOf(recovery.encode(),recovery.encode().length+73);assertThrows(IllegalArgumentException.class,()->HomeRecovery.decode(extra));
+    }
+
 }

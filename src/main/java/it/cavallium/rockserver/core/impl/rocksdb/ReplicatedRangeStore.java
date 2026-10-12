@@ -336,13 +336,13 @@ public final class ReplicatedRangeStore {
             if (rangeEpoch<0 || schema.length!=32 || position.term()<=0 || !cluster.equals(initial.clusterId()) || !database.equals(initial.databaseId()) || !initial.sameDefinition(current) || remaining(current)==0) throw new IllegalArgumentException("Invalid HOME recovery promise");
             var rebuilt=initial;
             for (var p:current.participants()) if (p.prepared()!=null) rebuilt=rebuilt.prepared(p.groupId(),p.planDigest(),p.prepared());
-            if (current.terminal()) rebuilt=rebuilt.decide(current.phase());
+            if (current.terminal()) rebuilt=rebuilt.reserved() ? rebuilt.abortReservation(current.noEffectOutcome()) : rebuilt.decide(current.phase());
             for (var p:current.participants()) if (p.finalized()) rebuilt=rebuilt.finalized(p.groupId());
             if (current.consumed()) rebuilt=rebuilt.consume();
             if (!rebuilt.equals(current)) throw new IllegalArgumentException("HOME promise progress/generation changed"); schema=schema.clone();
         }
         @Override public byte[] schema() { return schema.clone(); }
-        public static int remaining(TransactionStatus status) { return status.reserved() ? 1+status.origin().targetParticipantCount() : (status.phase()==TransactionStatus.Phase.PREPARING ? 1 : 0)+(int)status.participants().stream().filter(p -> !p.finalized()).count(); }
+        public static int remaining(TransactionStatus status) { return status.reserved() ? 2+status.origin().targetParticipantCount() : (status.consumed() ? 0 : 1)+(status.phase()==TransactionStatus.Phase.PREPARING ? 1 : 0)+(int)status.participants().stream().filter(p -> !p.finalized()).count(); }
         public int reservedCount() { return remaining(current); }
         public long reservedBytes() { return reservedCount()*TRANSITION_BYTES+33L+(initial.origin()==null ? encode().length : 128L+2L*TransactionStatus.MAX_BYTES); }
         public byte[] userKey() { return uuidBytes(current.transactionId()); }
