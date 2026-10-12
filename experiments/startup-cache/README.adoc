@@ -1,0 +1,57 @@
+= Isolated startup/cache experiments
+
+These fixtures use Java 25 FFM and one native runtime per process. They do not
+change Rockserver service defaults or connect to production. All DB paths are
+new local fixture directories. Output directories must not already exist.
+
+== Cache restart reuse
+
+Native patch `native/hot-cache-snapshot.patch` is commit
+`04f4224a5ee5e36d1d27000638ccff9cad6b0c22`, based on native
+`cc8367a1076b6245574f209c7d007118cf9016b1` (tree
+`82d609e8e224076fb5065679735ce8d6e14e5d22`). Apply it to that exact native
+checkout, then follow `experiments/hot_cache/README.md` there. The shim build
+rejects an incompatible runtime before linking. The required runtime is
+`librocksdbjni-linux64.so`, SHA256
+`18d5865e39cccede36d63146eb9037837b423199930504e3730d2d91d9ff6214`.
+
+[source,shell]
+----
+python3 experiments/startup-cache/run_hot_cache.py /path/to/libhot_cache_probe.so /new/local/cache-run
+----
+
+The runner compiles Java 25 and uses separate JVMs to verify capture, restart,
+recapture and another restart. It checks distinct values and foreground DATA,
+INDEX and FILTER reuse in both CFs. It also checks corrupt/truncated/missing
+snapshots, pre-rename failure, post-rename durability uncertainty, SST/value
+replacement, recapture of the new generation, byte caps and invalid paths.
+A crash or unexpected error code cannot pass an expected-failure test.
+
+The native fixture has one 16 MiB HyperClock cache and two CFs. Only scoped
+foreground Gets populate the bounded 4096-key recent-entry registry. Known keys
+reuse their list/map entries; read/replacement modes attach no registry.
+Missing, empty and rejected snapshots bypass the secondary adapter. Capture
+uses primary-only handles and native serializers; handles are released before
+SSD writes. Original SST identity excludes obsolete entries when recapturing.
+
+Format 2 includes the exact runtime identity, checked framing and CRC32C.
+Snapshots are capped at 64 MiB, records at 1 MiB; the header is 84 bytes.
+Capture reserves its bounded generation buffer, so RAM scales with the chosen
+cap (the runner defaults to 8 MiB). Five-second deadlines are cooperative:
+blocking filesystem calls cannot be interrupted by this implementation.
+Publication reports `durable` only after file and directory fsync. Failure
+before rename preserves the previous file; failure after rename reports
+`published_durability_uncertain`, because the new file is already installed.
+
+For the restoration test, metadata pinning is disabled and primary mappings
+for every saved key are explicitly erased and checked before Gets. HyperClock's
+bulk unreferenced erase alone is best effort and is insufficient for this
+boundary. `unscoped_hits` includes Open, generation-marker reads and compaction;
+foreground hit counters exclude them.
+
+This is a controlled mechanism experiment. Pinned metadata, dictionaries,
+asynchronous reads, separate cache quotas, crash-temp retention and concurrent
+snapshot stress remain unqualified. It does not measure production HDD speedup.
+The fixture marker and canonical destination checks protect against accidentally
+opening a different DB or overwriting a live fixture SST. Callers must serialize
+operations sharing paths. CRC detects corruption; it is not authentication.
