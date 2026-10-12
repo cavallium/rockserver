@@ -14,13 +14,13 @@ import java.util.*;
 final class RatisOperationRerouteCoordinator implements AutoCloseable {
     private static final int MAGIC=0x52524353,MAX_STATE_BYTES=155+HomeFenceProof.MAX_BYTES+NativeSourceOutcomeCredit.Request.MAX_BYTES+RatisSourceOutcomeRecord.MAX_BYTES+CommandResult.MAX_BYTES;
     private static final int MAX_ACTIVE=1;private static final long CHARGE=6L*RatisSourceOutcomeRpc.MAX_REQUEST_BYTES+4L*RatisOperationRerouteJournal.MAX_BYTES+3L*MAX_STATE_BYTES+4L*RatisSessionClient.MAX_SOURCE_DIRECTORY_BYTES+2L*RatisTransactionPlan.MAX_BYTES,MAX_BYTES=CHARGE;
-    private final Path root;private final DistributedSchema schema;private final RatisSessionEpochs epochs;private final RatisRoutedClient routed;private final RatisTransactionStatuses homes;private final RatisAtomicClient atomic;private final RatisRoutedClient.SourceAckDirectoryReader ackDirectory;
-    private final SessionEpochLedger.Grant business;private final RatisSessionClient.Limits limits;private final byte[] binding;
+    private final Path root;private final DistributedSchema schema;private final RatisSessionEpochs epochs;private final RatisRoutedClient routed;private final RatisTransactionStatuses homes;private final RWScheduler scheduler;private final RatisRoutedClient.SourceAckDirectoryReader ackDirectory;
+    private final RatisCatalogue directories;private final SessionEpochLedger.Grant business;private final RatisSessionClient.Limits limits;private final byte[] binding;
     private int active,rerouting;private long bytes;private boolean closed;
-    RatisOperationRerouteCoordinator(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,SessionEpochLedger.Grant business,RatisSessionClient.Limits limits,RatisRoutedClient.SourceAckDirectoryReader ackDirectory)throws IOException {
-        this.root=root.toAbsolutePath().normalize();this.schema=Objects.requireNonNull(schema);this.epochs=Objects.requireNonNull(epochs);this.routed=Objects.requireNonNull(routed);this.homes=Objects.requireNonNull(homes);this.business=Objects.requireNonNull(business);this.limits=Objects.requireNonNull(limits);this.ackDirectory=Objects.requireNonNull(ackDirectory);
+    RatisOperationRerouteCoordinator(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,SessionEpochLedger.Grant business,RatisSessionClient.Limits limits,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader ackDirectory)throws IOException {
+        this.root=root.toAbsolutePath().normalize();this.schema=Objects.requireNonNull(schema);this.epochs=Objects.requireNonNull(epochs);this.routed=Objects.requireNonNull(routed);this.homes=Objects.requireNonNull(homes);this.scheduler=Objects.requireNonNull(scheduler);this.business=Objects.requireNonNull(business);this.limits=Objects.requireNonNull(limits);this.ackDirectory=Objects.requireNonNull(ackDirectory);this.directories=Objects.requireNonNull(directories);
         binding=OperatorUpload.sha256(ByteBuffer.allocate(136).put(schema.digest()).put(routed.sessionIdentityDigest()).put(homes.identityDigest()).putLong(business.epoch()).putLong(business.sessionId().getMostSignificantBits()).putLong(business.sessionId().getLeastSignificantBits()).putLong(business.issuedAtMillis()).putLong(business.expiresAtMillis()).array());
-        Files.createDirectories(this.root);SessionJournalFiles.force(this.root);SessionJournalFiles.force(this.root.getParent());atomic=new RatisAtomicClient(schema,homes,routed,scheduler,RatisAtomicClient.Limits.defaults());
+        Files.createDirectories(this.root);SessionJournalFiles.force(this.root);SessionJournalFiles.force(this.root.getParent());
     }
     private synchronized void enter()throws IOException {if(closed)throw new IOException("Reroute coordinator closed");active++;}
     private synchronized void enterReroute()throws IOException {if(closed || rerouting>=MAX_ACTIVE || CHARGE>MAX_BYTES-bytes)throw new IOException("Reroute coordinator at bounded ownership capacity");rerouting++;bytes+=CHARGE;}
@@ -37,7 +37,8 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                     enterReroute();reroute=true;
                     if(RatisOperationRerouteAdmissionRpc.acknowledgementOnly(original.command()))throw new IOException("Absent original ACK has no reroute authority",absent);
                     Files.createDirectories(directory);SessionJournalFiles.force(directory);SessionJournalFiles.force(root);
-                    try(var selected=RatisOperationRerouteJournal.select(input,binding,absent.originalDirectory(),original.command(),routed.directory(schema),absent.evidence(),Duration.ofSeconds(30))){}
+                    var target=directories.read(schema.domainId());if(target==null)throw new IOException("Authoritative reroute target directory is absent");try{schema.requireMatches(target);}catch(IllegalArgumentException changed){throw new IOException("Reroute target changed original logical schema; original operation retained",changed);}routed.refresh(target);
+                    try(var selected=RatisOperationRerouteJournal.select(input,binding,absent.originalDirectory(),original.command(),target,absent.evidence(),Duration.ofSeconds(30))){}
                 }
             }
             if(!reroute){enterReroute();reroute=true;}
@@ -85,7 +86,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
             var home=homes.read(reserved.transactionId());
             if(home!=null && home.terminal() && home.participants().isEmpty())actual=home.terminalBusinessResult();
             else {
-                check.check();try(var operation=Files.exists(input.atomicPath()) ? atomic.reopenInline(input.atomicPath(),context,check) : atomic.executeReservedPlanInline(input.atomicPath(),identity,reserved,RatisTransactionPlan.fromOriginal(input.targetDirectory(),input.originalCommand()),evidence,input.captureTtl(),context,check)) {
+                check.check();try(var atomic=new RatisAtomicClient(schema,input.targetDirectory(),homes,routed,scheduler,RatisAtomicClient.Limits.defaults());var operation=Files.exists(input.atomicPath()) ? atomic.reopenInline(input.atomicPath(),context,check) : atomic.executeReservedPlanInline(input.atomicPath(),identity,reserved,RatisTransactionPlan.fromOriginal(input.targetDirectory(),input.originalCommand()),evidence,input.captureTtl(),context,check)) {
                     actual=operation.resumeInline(context,check);
                     if(operation.rejectedBeforeRegistration())abort(job,reserved,check);else intents=operation.snapshot().participants().stream().map(p->p.intent()).toList();
                 }
@@ -138,13 +139,13 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                             }
                             check.check();var result=window.execute(pending,routed::execute);
                             if(result.status()!=CommandResult.Status.SUCCESS && result.status()!=CommandResult.Status.SESSION_EXPIRED)throw new IOException("Original source ACK did not advance or verify its fence");
-                            window.acknowledge(pending);job.sourceAcknowledged=true;
+                            window.acknowledgeLocally(pending);job.sourceAcknowledged=true;
                         }
                         job.persist();
                     }
                     boolean atomicPresent=Files.exists(input.atomicPath()),rejected=atomicPresent && RatisAtomicRejection.isRejection(input.atomicPath());
                     if(atomicPresent) {
-                        try(var operation=atomic.reopenForConsumptionInline(input.atomicPath(),context,check)){operation.consumeInline(context,check);}
+                        try(var atomic=new RatisAtomicClient(schema,input.targetDirectory(),homes,routed,scheduler,RatisAtomicClient.Limits.defaults());var operation=atomic.reopenForConsumptionInline(input.atomicPath(),context,check)){operation.consumeInline(context,check);}
                     }
                     if((!atomicPresent || rejected) && input.origin()!=null) {
                         if(!rejected && job.credited && input.originalCommand().kind()==DistributedCommand.Kind.DATA)throw new IOException("Accepted reroute lost its atomic journal; reserved identity cannot prove promoted retirement");
@@ -161,7 +162,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
             }
         }catch(NumberFormatException invalid){throw new IOException("Unrecognized reroute cleanup directory",invalid);}finally{leave(reroute);}
     }
-    @Override public synchronized void close()throws IOException {if(active!=0)throw new IOException("Reroute work is still active");if(closed)return;atomic.close();closed=true;}
+    @Override public synchronized void close()throws IOException {if(active!=0)throw new IOException("Reroute work is still active");if(closed)return;closed=true;}
     private final class Job implements AutoCloseable {
         final Path directory,state;final FileChannel channel;final FileLock lock;NativeSourceOutcomeCredit.Request request;RatisSourceOutcomeRecord publication;CommandResult result;OperationId abort,ack,consume;HomeFenceProof homeFence;boolean credited,published,sourceAcknowledged,done;
         Job(Path directory)throws IOException {

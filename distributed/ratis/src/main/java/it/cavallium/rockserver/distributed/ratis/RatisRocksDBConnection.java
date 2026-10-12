@@ -58,12 +58,13 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         @Override public byte[] schemaDigest() { return schemaDigest.clone(); }
     }
     public BatchLimits batchLimits() { return new BatchLimits(RatisRocksDBBatches.MAX_INPUT_ITEMS,RatisRocksDBBatches.MAX_INPUT_BYTES,RatisRocksDBBatches.MAX_CHUNK_ITEMS,RatisRocksDBBatches.MAX_CHUNK_BYTES); }
-    public static GenerationFactory durableGenerationFactory(RatisRoutedClient routed,RWScheduler scheduler,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisRocksDBAdapter.AllocationSource allocations,SessionFactory sessions) {
+    public static GenerationFactory durableGenerationFactory(RatisRoutedClient routed,RWScheduler scheduler,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisSessionEpochs epochs,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader acknowledgementDirectories,RatisRocksDBAdapter.AllocationSource allocations,SessionFactory sessions) {
         return (schema,directory,root,ids) -> {
             RatisDurableSessionClient session=null,bulkSession=null; RatisRocksDBBatches batches=null; RatisTransactionClient tx=null; RatisSnapshotClient snapshots=null; RatisRocksDBRanges ranges=null; RatisRocksDBDirect direct=null;
             try {
                 session=sessions.open(Files.createDirectories(root.resolve("point-session")),schema,directory); bulkSession=sessions.open(Files.createDirectories(root.resolve("bulk-session")),schema,directory);
                 if(session==bulkSession || session.grant().sessionId().equals(bulkSession.grant().sessionId()) && session.grant().epoch()==bulkSession.grant().epoch()) throw new IOException("Point and bulk sessions require distinct exclusively owned grants");
+                session.installReroutes(root.resolve("point-reroutes"),schema,epochs,routed,transactionHomes,scheduler,directories,acknowledgementDirectories);bulkSession.installReroutes(root.resolve("bulk-reroutes"),schema,epochs,routed,transactionHomes,scheduler,directories,acknowledgementDirectories);
                 batches=new RatisRocksDBBatches(schema,routed,bulkSession,scheduler,root.resolve("bulk"),RatisRocksDBBatches.SessionOwnership.OWNED); bulkSession=null;
                 tx=new RatisTransactionClient(schema,snapshotHomes,transactionHomes,routed,scheduler,RatisTransactionClient.Limits.defaults()); snapshots=new RatisSnapshotClient(schema,snapshotHomes,routed,scheduler,RatisSnapshotClient.Limits.defaults()); ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); direct=new RatisRocksDBDirect(schema,routed,session,scheduler,root.resolve("direct"));
                 return new Generation(new RatisRocksDBAdapter(schema,directory,tx,allocations,direct,ranges,ids,batches),direct,ranges,tx,snapshots,List.of(session),batches);

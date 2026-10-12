@@ -52,12 +52,18 @@ public final class RatisAtomicClient implements AutoCloseable {
 
     /** Clients, scheduler, and grant maintenance are borrowed. Install adequate DATA/HOME grant windows before use. */
     public RatisAtomicClient(DistributedSchema schema,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
-        this(schema,homes,data,scheduler,limits,path -> {});
+        this(schema,data.directory(schema),homes,data,scheduler,limits,path -> {});
     }
     RatisAtomicClient(DistributedSchema schema,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,PublicationObserver publicationObserver) {
+        this(schema,data.directory(schema),homes,data,scheduler,limits,publicationObserver);
+    }
+    RatisAtomicClient(DistributedSchema schema,RangeDirectory frozenTarget,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
+        this(schema,frozenTarget,homes,data,scheduler,limits,path -> {});
+    }
+    private RatisAtomicClient(DistributedSchema schema,RangeDirectory frozenTarget,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,PublicationObserver publicationObserver) {
         this.publicationObserver=Objects.requireNonNull(publicationObserver);
         this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
-        data.requireKnownSchema(schema); directory=data.directory(schema); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
+        data.requireKnownSchema(schema);directory=Objects.requireNonNull(frozenTarget);schema.requireMatches(directory); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
         try { binding=java.security.MessageDigest.getInstance("SHA-256").digest(java.nio.ByteBuffer.allocate(96).put(schema.digest()).put(homes.identityDigest()).put(data.sessionIdentityDigest()).array()); }
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
@@ -264,7 +270,7 @@ public final class RatisAtomicClient implements AutoCloseable {
             try {
                 var saved=candidate.snapshot();var first=saved.participants().stream().map(p->p.intent().prepareControl()).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();var restored=new Identity(saved.initial().transactionId(),saved.initial().operation(),first);int n=0;
                 for(var p:saved.participants())if(p.intent().captureId()==null || !p.intent().prepareControl().equals(restored.control(n)) || !p.intent().finalizeControl().equals(restored.control(64+n++)))throw new IOException("Consumption journal changed original control allocation");
-                restored.requireHome(saved.lastHome());if(saved.initial().origin()!=null && !saved.initial().origin().firstControl().equals(first))throw new IOException("Consumption journal changed reserved CONTROL grant");identity=restored;journal=candidate;
+                restored.requireHome(saved.lastHome());if(saved.initial().origin()!=null && (!saved.initial().origin().firstControl().equals(first) || !Arrays.equals(saved.initial().origin().targetDirectoryDigest(),directory.payloadDigest())))throw new IOException("Consumption journal changed reserved CONTROL grant");identity=restored;journal=candidate;
             }catch(IOException|RuntimeException failure){try{candidate.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
         }
         private TransactionStatus reservation;
@@ -283,7 +289,7 @@ public final class RatisAtomicClient implements AutoCloseable {
                         var restored=new Identity(saved.initial().transactionId(),saved.initial().operation(),first);
                         int n=0; for (var p:saved.participants()) if (p.intent().captureId()==null || !p.intent().prepareControl().equals(restored.control(n)) || !p.intent().finalizeControl().equals(restored.control(64+n++))) throw new IOException("Journal differs from remote atomic identity block");
                         restored.requireHome(saved.lastHome());
-                        if(saved.initial().origin()!=null && !saved.initial().origin().firstControl().equals(first))throw new IOException("Reserved atomic journal changed control allocation"); if (saved.pendingRecovery()==null && saved.pendingHome()!=null) restored.requireHome(saved.pendingHome().command().operationId());
+                        if(saved.initial().origin()!=null && (!saved.initial().origin().firstControl().equals(first) || !Arrays.equals(saved.initial().origin().targetDirectoryDigest(),directory.payloadDigest())))throw new IOException("Reserved atomic journal changed control allocation"); if (saved.pendingRecovery()==null && saved.pendingHome()!=null) restored.requireHome(saved.pendingHome().command().operationId());
                         identity=restored; journal=candidate;
                     } catch (Exception invalid) { try { candidate.close(); } catch (IOException cleanup) { invalid.addSuppressed(cleanup); } throw invalid; }
                 } else initialize(task);

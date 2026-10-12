@@ -93,7 +93,7 @@ public final class RatisRocksDBDirect implements AutoCloseable {
     }
     /** Publish only a known complete outcome; unknown or incomplete work cannot be discarded. */
     public CompletableFuture<Object> consumeRetained(RequestContext context) {
-        return submit(context,OperationFamily.MUTATION,true,task -> { persistence.lock(); try { var request=journal.request(); if (request==null || !request.terminal()) throw new IOException("Direct request is not definitively complete"); reconcileAcknowledgement(request); task.check(); return output(request,task); } finally { persistence.unlock(); } });
+        return submit(context,OperationFamily.MUTATION,true,task -> { persistence.lock(); try { var request=journal.request(); if (request==null || !request.terminal()) throw new IOException("Direct request is not definitively complete"); reconcileAcknowledgement(request,task); task.check(); return output(request,task); } finally { persistence.unlock(); } });
     }
     private Object execute(RatisDirectRequestJournal.Request candidate,Task task) throws Exception {
         persistence.lock();
@@ -102,7 +102,7 @@ public final class RatisRocksDBDirect implements AutoCloseable {
             if (request==null || published) { journal.begin(candidate); published=false; request=candidate; }
             else if (!request.same(candidate)) throw new IOException("Resolve the exact retained callback and full direct request before issuing another");
             while (true) {
-                reconcileAcknowledgement(request); if (request.terminal()) { task.check(); return output(request,task); }
+                reconcileAcknowledgement(request,task); if (request.terminal()) { task.check(); return output(request,task); }
                 var pending=findPending(request.pending);
                 if (pending==null) {
                     var unresolved=session.pending().stream().filter(p -> !p.consumed()).toList(); var item=request.items.get(request.cursor());
@@ -118,20 +118,20 @@ public final class RatisRocksDBDirect implements AutoCloseable {
                     }
                     journal.bind(pending.command().operationId());
                 }
-                requireItem(request.items.get(request.pendingIndex),pending); task.check(); var result=session.execute(pending);
+                requireItem(request.items.get(request.pendingIndex),pending); task.check(); var result=session.execute(pending,task.context,task::check);
                 journal.result(result); // Never ACK until raw result and cursor are forced in the full envelope.
-                session.acknowledge(pending); journal.acknowledged(); var hook=acknowledgementHook; if (hook!=null) hook.run(); task.check();
+                session.acknowledge(pending,task.context,task::check); journal.acknowledged(); var hook=acknowledgementHook; if (hook!=null) hook.run(); task.check();
             }
         } finally { persistence.unlock(); }
     }
-    private void reconcileAcknowledgement(RatisDirectRequestJournal.Request request) throws IOException {
+    private void reconcileAcknowledgement(RatisDirectRequestJournal.Request request,Task task) throws IOException {
         if (request.pending==null || request.pendingIndex>=request.cursor()) return;
         var pending=findPending(request.pending);
         if (pending!=null) {
             requireItem(request.items.get(request.pendingIndex),pending);
-            var saved=pending.savedResult(); if (saved==null || !Arrays.equals(saved.encode(),request.results.get(request.pendingIndex).encode())) throw new IOException("Direct/session saved outcome differs"); session.acknowledge(pending);
+            var saved=pending.savedResult(); if (saved==null || !Arrays.equals(saved.encode(),request.results.get(request.pendingIndex).encode())) throw new IOException("Direct/session saved outcome differs"); session.acknowledge(pending,task.context,task::check);
         } else if (session.acknowledgedThrough()<request.pending.sequence()) throw new IOException("Direct saved result lacks original session ACK/identity");
-        journal.acknowledged();
+        session.recoverReroutes(task.context,task::check,false);journal.acknowledged();
     }
     private RatisDurableSessionClient.Pending findPending(OperationId operation) throws IOException { if (operation==null) return null; for (var pending:session.pending()) if (pending.command().operationId().equals(operation)) return pending; return null; }
     private static void requireItem(DistributedCommand item,RatisDurableSessionClient.Pending pending) throws IOException {
@@ -154,7 +154,7 @@ public final class RatisRocksDBDirect implements AutoCloseable {
     @FunctionalInterface private interface Work { Object run(Task task) throws Exception; }
     private Task reserve(RequestContext context,OperationFamily family,boolean write) {
         long deadline=scheduler.resolveMonotonicDeadline(context); long charge=write ? WRITE_BYTES : READ_BYTES;
-        synchronized (this) { if (closed || active>=MAX_TASKS || charge>MAX_BYTES-RatisDirectRequestJournal.MAX_BYTES-bytes || write && writing) throw RocksDBException.of(SERVER_OVERLOADED,"Direct request capacity exhausted"); var task=new Task(deadline,write,charge); active++; bytes+=charge; actualCompletions.put(task.view,task.drained); if (write) writing=true; return task; }
+        synchronized (this) { if (closed || active>=MAX_TASKS || charge>MAX_BYTES-RatisDirectRequestJournal.MAX_BYTES-bytes || write && writing) throw RocksDBException.of(SERVER_OVERLOADED,"Direct request capacity exhausted"); var task=new Task(context,deadline,write,charge); active++; bytes+=charge; actualCompletions.put(task.view,task.drained); if (write) writing=true; return task; }
     }
     private CompletableFuture<Object> submit(RequestContext context,OperationFamily family,boolean write,Work work) {
         try { var task=reserve(context,family,write); task.work=work; dispatch(task,context,family); return task.view; } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
@@ -165,8 +165,8 @@ public final class RatisRocksDBDirect implements AutoCloseable {
         if (value instanceof List<?> list) { var copy=new ArrayList<Object>(list.size()); list.forEach(item -> copy.add(copyResult(item))); return Collections.unmodifiableList(copy); } return value;
     }
     private final class Task implements Runnable,RWScheduler.RejectionAwareTask {
-        final long deadline,charge; final boolean write; Work work; Throwable definiteFailure; final AtomicInteger phase=new AtomicInteger(); final CompletableFuture<Object> result=new CompletableFuture<>(),view=result.copy(); final CompletableFuture<Void> drained=new CompletableFuture<>();
-        Task(long deadline,boolean write,long charge) { this.deadline=deadline; this.write=write; this.charge=charge; }
+        final RequestContext context;final long deadline,charge; final boolean write; Work work; Throwable definiteFailure; final AtomicInteger phase=new AtomicInteger(); final CompletableFuture<Object> result=new CompletableFuture<>(),view=result.copy(); final CompletableFuture<Void> drained=new CompletableFuture<>();
+        Task(RequestContext context,long deadline,boolean write,long charge) { this.context=context;this.deadline=deadline; this.write=write; this.charge=charge; }
         void check() throws IOException { if (deadline!=Long.MAX_VALUE && scheduler.isMonotonicDeadlineExpired(deadline)) throw new IOException("Direct deadline expired; full durable request retained",new TimeoutException()); }
         public void run() { if (!phase.compareAndSet(0,1)) return; Object value=null; Throwable failure=null; try { check(); value=copyResult(work.run(this)); check(); } catch (Throwable problem) { failure=problem; } work=null; phase.set(2); finish(value,failure); if (failure instanceof Error fatal) throw fatal; }
         public void reject(RuntimeException failure) { fail(failure); }

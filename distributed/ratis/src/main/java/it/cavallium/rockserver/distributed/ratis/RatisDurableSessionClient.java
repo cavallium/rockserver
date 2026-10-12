@@ -4,6 +4,10 @@ import it.cavallium.rockserver.core.common.distributed.*;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.*;
+import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.common.OperationFamily;
 import java.util.concurrent.locks.ReentrantLock;
 
 /** Durable exclusive user window. Journal transitions serialize; disjoint synchronous RPC owners may overlap. */
@@ -26,6 +30,7 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     private final RatisSessionClient client; private final RatisSessionClient.Limits limits; private final SessionWindowJournal journal;
     private final ReentrantLock lane=new ReentrantLock(); private final TreeMap<Long,Pending> retained=new TreeMap<>();
     private int active; private boolean closed,fenced,journalClosed;
+    private RatisOperationRerouteCoordinator reroutes;private RWScheduler rerouteScheduler;private boolean recoveryPending;
     private RatisDurableSessionClient(RatisSessionClient client,RatisSessionClient.Limits limits,SessionWindowJournal journal) {
         this.client=client; this.limits=limits; this.journal=journal;
         for (var entry:client.retained()) retained.put(entry.command().operationId().sequence(),new Pending(this,entry,client.resolved(entry),client.consumed(entry)));
@@ -42,6 +47,9 @@ public final class RatisDurableSessionClient implements AutoCloseable {
         var journal=SessionWindowJournal.open(path,routed,false);
         try { var saved=journal.read(); return new RatisDurableSessionClient(RatisSessionClient.restore(routed,saved.grant(),saved.limits(),saved.state()),saved.limits(),journal); }
         catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
+    }
+    void installReroutes(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader reader)throws IOException {
+        lane.lock();try{requireOpen();if(active!=0 || reroutes!=null)throw new IOException("Durable reroute owner already configured or active");reroutes=new RatisOperationRerouteCoordinator(root,schema,epochs,routed,homes,scheduler,grant(),limits,directories,reader);rerouteScheduler=scheduler;recoveryPending=true;}finally{lane.unlock();}
     }
     public SessionEpochLedger.Grant grant() { return client.grant(); }
     RatisSessionClient.Limits limits() { return limits; }
@@ -93,7 +101,26 @@ public final class RatisDurableSessionClient implements AutoCloseable {
         var pending=new Pending(this,entry,null,false); retained.put(entry.command().operationId().sequence(),pending); return pending;
     }
     public CommandResult execute(Pending pending) throws IOException {
-        return execute(pending,null);
+        return reroutes==null ? execute(pending,(RatisSessionClient.Execution)null) : admitted(()->execute(pending,RequestContext.batch(),()->{}));
+    }
+    CommandResult execute(Pending pending,RequestContext context,RatisAtomicClient.InlineCheck check)throws IOException {
+        recoverReroutes(context,check,true);return execute(pending,reroutes==null ? null : original->reroutes.execute(original,context,check));
+    }
+    void recoverReroutes(RequestContext context,RatisAtomicClient.InlineCheck check,boolean onlyPending)throws IOException {
+        lane.lock();try{requireOpen();if(reroutes==null || onlyPending && !recoveryPending)return;active++;}finally{lane.unlock();}
+        try{reroutes.recoverConsumed(this,context,check);lane.lock();try{recoveryPending=false;}finally{lane.unlock();}}finally{lane.lock();try{active--;}finally{lane.unlock();}}
+    }
+    @FunctionalInterface private interface Admitted<T>{T run()throws IOException;}
+    private <T> T admitted(Admitted<T> work)throws IOException {
+        lane.lock();try{requireOpen();active++;}finally{lane.unlock();}var result=new CompletableFuture<T>();
+        final class Task implements Runnable,RWScheduler.RejectionAwareTask {
+            final java.util.concurrent.atomic.AtomicInteger phase=new java.util.concurrent.atomic.AtomicInteger();
+            public void run(){if(!phase.compareAndSet(0,1))return;T value=null;Throwable failure=null;try{value=work.run();}catch(Throwable problem){failure=problem;}settle(value,failure);}
+            public void reject(RuntimeException failure){if(phase.compareAndSet(0,1))settle(null,failure);}
+            void settle(T value,Throwable failure){lane.lock();try{active--;}finally{lane.unlock();}phase.set(2);if(failure==null)result.complete(value);else result.completeExceptionally(failure);}
+        }
+        var task=new Task();try{rerouteScheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH,OperationFamily.MUTATION,Long.MAX_VALUE).execute(task,Math.min(SessionWindowJournal.MAX_WINDOW_BYTES,it.cavallium.rockserver.core.common.WorkloadCost.MAX_ESTIMATED_BYTES));}catch(RuntimeException rejected){task.reject(rejected);}
+        try{return result.get();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Durable work remains owned until completion",interrupted);}catch(ExecutionException failure){if(failure.getCause() instanceof IOException io)throw io;throw new IOException("Durable session execution failed",failure.getCause());}
     }
     /** Keeps the original pending identity active until the resolved outcome has been forced. */
     CommandResult execute(Pending pending,RatisSessionClient.Execution resolution) throws IOException {
@@ -111,6 +138,10 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     }
     /** Application must durably consume the returned outcome first. Persist consumption before any later piggyback ACK. */
     public void acknowledge(Pending pending) throws IOException {
+        if(reroutes==null){acknowledgeLocally(pending);return;}admitted(()->{acknowledge(pending,RequestContext.batch(),()->{});return null;});
+    }
+    void acknowledge(Pending pending,RequestContext context,RatisAtomicClient.InlineCheck check)throws IOException {acknowledgeLocally(pending);recoverReroutes(context,check,false);}
+    void acknowledgeLocally(Pending pending) throws IOException {
         lane.lock();
         try {
             requireOpen(); owned(pending);
@@ -132,6 +163,6 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     private void owned(Pending pending) { if (pending==null || pending.owner!=this) throw new IllegalArgumentException("Operation belongs to another durable session"); }
     private void requireOpen() throws IOException { if (closed || fenced) throw new IOException("Durable session is closed/fenced; reopen its journal"); }
     @Override public void close() throws IOException {
-        lane.lock(); try { if (journalClosed) return; if (active!=0) throw new IOException("Durable session RPC work is active"); closed=true; journal.close(); journalClosed=true; } finally { lane.unlock(); }
+        lane.lock(); try { if (journalClosed) return; if (active!=0) throw new IOException("Durable session RPC work is active"); if(reroutes!=null)reroutes.close();closed=true; journal.close(); journalClosed=true; } finally { lane.unlock(); }
     }
 }

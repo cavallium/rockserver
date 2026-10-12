@@ -115,9 +115,9 @@ public final class RatisRocksDBBatches implements AutoCloseable {
         while(!r.chunks.isEmpty() && r.failure==null) {
             var expected=r.chunks.get(r.cursor); var pending=find(r.pending);
             if(r.result!=null) {
-                if(pending!=null) { require(expected,pending); if(pending.savedResult()==null || !Arrays.equals(pending.savedResult().encode(),r.result.encode())) throw new IOException("Bulk saved receipt disagrees with session"); session.acknowledge(pending); }
+                if(pending!=null) { require(expected,pending); if(pending.savedResult()==null || !Arrays.equals(pending.savedResult().encode(),r.result.encode())) throw new IOException("Bulk saved receipt disagrees with session"); session.acknowledge(pending,task.context,task::check); }
                 else if(session.acknowledgedThrough()<r.pending.sequence()) throw new IOException("Bulk result lacks original durable ACK");
-                journal.acknowledged(); refreshProgress(); continue;
+                session.recoverReroutes(task.context,task::check,false);journal.acknowledged(); refreshProgress(); continue;
             }
             task.check();
             if(pending==null) {
@@ -125,7 +125,7 @@ public final class RatisRocksDBBatches implements AutoCloseable {
                 var unresolved=session.pending().stream().filter(p -> !p.consumed()).toList(); if(unresolved.size()>1) throw new IOException("Bulk session lost exclusive ownership");
                 pending=unresolved.isEmpty() ? session.prepareAt(r.directory,expected.mutations(),List.of()) : unresolved.getFirst(); require(expected,pending); journal.bind(pending.command().operationId());
             }
-            require(expected,pending); var result=session.execute(pending); journal.result(result); session.acknowledge(pending); var hook=beforeAcknowledgementMarker; if(hook!=null) hook.run(); journal.acknowledged(); refreshProgress(); task.check();
+            require(expected,pending); var result=session.execute(pending,task.context,task::check); journal.result(result); session.acknowledge(pending,task.context,task::check); var hook=beforeAcknowledgementMarker; if(hook!=null) hook.run(); journal.acknowledged(); refreshProgress(); task.check();
         }
     }
     @FunctionalInterface private interface Work { void run() throws Exception; }
