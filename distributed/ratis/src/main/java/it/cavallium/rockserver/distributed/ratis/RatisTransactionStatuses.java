@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed.ratis;
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.function.Consumer;
 
@@ -43,6 +44,15 @@ public final class RatisTransactionStatuses {
     }
     public record RegistrationRead(TransactionStatus status,RangeDescriptor descriptor) {}
     public TransactionStatus read(UUID transaction) throws IOException { return readRegistration(transaction).status(); }
+    /** One HOME group selected by the exact transaction key; maintenance clients remain borrowed. */
+    void ensureBinding(Path journal,RatisSessionEpochs epochs,UUID transaction,SessionEpochLedger.Grant grant,int window)throws IOException {
+        var directory=routed.directory();var route=directory.route(column,key(transaction));
+        try(var maintenance=new RatisSessionMaintenance(journal,epochs,routed,route.groupId())) {
+            var pending=maintenance.pendingCommand();if(pending==null)pending=maintenance.prepareBinding(grant,window);
+            if(pending.sessionControl()==null || !pending.sessionControl().binding() || !pending.sessionControl().grant().equals(grant) || pending.sessionControl().outstandingWindow()!=window)throw new IOException("HOME binding changed frozen grant/window");
+            if(maintenance.execute().status()!=CommandResult.Status.SUCCESS)throw new IOException("HOME binding did not apply");
+        }
+    }
     public RegistrationRead readRegistration(UUID transaction) throws IOException {
         var read=routed.readWithRoute(column,key(transaction)); byte[] bytes=read.value();
         if (bytes==null) return new RegistrationRead(null,read.descriptor());
@@ -89,7 +99,8 @@ public final class RatisTransactionStatuses {
     }
     public RatisRoutedClient.PreparedHomeRecoveryOperation prepareRecovery(OperationId operation,TransactionStatus expected,TransactionStatus next,ParticipantOutcome proof) {
         var command=prepare(operation,expected,next);
-        var recovery=new HomeRecovery(proof==null ? HomeRecovery.Action.ABORT : HomeRecovery.Action.ACK,command.command(),proof==null ? null : HomeRecovery.Proof.from(proof));
+        var action=proof!=null ? HomeRecovery.Action.ACK : expected.terminal() && expected.fullyFinalized() && !expected.consumed() && expected.consume().equals(next) ? HomeRecovery.Action.CONSUME : HomeRecovery.Action.ABORT;
+        var recovery=new HomeRecovery(action,command.command(),proof==null ? null : HomeRecovery.Proof.from(proof));
         if (proof!=null) recovery.requireOutcome(proof);
         return routed.restoreHomeRecovery(recovery,command.descriptor());
     }

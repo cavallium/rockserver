@@ -59,6 +59,9 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     public Pending prepareAt(RangeDirectory original,List<Mutation> mutations,List<KeyPredicate> predicates) throws IOException {
         lane.lock(); try { requireOpen(); var pending=client.prepareAt(original,mutations,predicates); checkpoint(); return retain(pending); } finally { lane.unlock(); }
     }
+    Pending prepareAcknowledgementAt(RangeDirectory source,RangeDescriptor parent)throws IOException {
+        lane.lock();try{requireOpen();var pending=client.prepareAcknowledgementAt(source,parent);checkpoint();return retain(pending);}finally{lane.unlock();}
+    }
     public Pending prepareTransactionIntent(List<Mutation> mutations,List<KeyPredicate> predicates) throws IOException {
         lane.lock(); try { requireOpen(); var pending=client.prepareTransactionIntent(mutations,predicates); checkpoint(); return retain(pending); } finally { lane.unlock(); }
     }

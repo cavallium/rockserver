@@ -255,19 +255,19 @@ public final class RatisDurableTransaction implements AutoCloseable {
         } else {
             if (expected==null || !expected.equals(observed)) throw new IllegalArgumentException("Home CAS does not use current observed image");
             next.requireSuccessorOf(observed); validateEvidence(next);
-            if (protectedTransition(observed,next)) throw new IllegalArgumentException("ABORT/ACK requires protected recovery journal request");
+            if (protectedTransition(observed,next)) throw new IllegalArgumentException("ABORT/ACK/CONSUME requires protected recovery journal request");
         }
         advance(request.command().operationId());
         pending=request; pendingRecovery=null; recoveryReceipt=null; homeResult=null; homeSuperseded=false; persist();
     }
-    /** Freezes a journal-owned protected ABORT or one proven participant ACK before any RPC. */
+    /** Freezes a journal-owned protected ABORT, participant ACK, or terminal consumption before any RPC. */
     public synchronized void queueRecovery(TransactionStatus next) throws IOException {
         idle(); Objects.requireNonNull(next);
         if (pending!=null && homeResult==null && !homeSuperseded) {
             if (pendingRecovery!=null && pendingRecovery.recovery().next().equals(next)) return;
             throw new IllegalStateException("Uncertain home request must retain its exact request");
         }
-        if (observed==null || !protectedTransition(observed,next)) throw new IllegalArgumentException("Protected recovery requires existing home ABORT or one local ACK");
+        if (observed==null || !protectedTransition(observed,next)) throw new IllegalArgumentException("Protected recovery requires an exact HOME ABORT, ACK, or CONSUME transition");
         next.requireSuccessorOf(observed); validateEvidence(next);
         ParticipantOutcome proof=null; ParticipantFenceProof fence=null;
         if (observed.phase()!=TransactionStatus.Phase.PREPARING) {
@@ -282,6 +282,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     }
     private static boolean protectedTransition(TransactionStatus before,TransactionStatus next) {
         if (before.phase()==TransactionStatus.Phase.PREPARING || before.reserved()) return next.phase()==TransactionStatus.Phase.ABORT;
+        if (before.terminal() && before.fullyFinalized() && !before.consumed() && before.consume().equals(next)) return true;
         return next.participants().stream().anyMatch(p -> p.finalized() && !before.participants().stream().filter(old -> old.groupId().equals(p.groupId())).findFirst().orElseThrow().finalized());
     }
     public TransactionStatus refreshHome() throws IOException {

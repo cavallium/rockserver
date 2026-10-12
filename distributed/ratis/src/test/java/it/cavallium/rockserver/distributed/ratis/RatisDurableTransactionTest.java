@@ -52,7 +52,7 @@ class RatisDurableTransactionTest {
                 var outcome=journal.resolveParticipant(data.f.groupId).outcome(); assertNotNull(outcome); assertEquals(TransactionStatus.Phase.COMMIT,outcome.finalization().decision().phase());
                 assertArrayEquals(plan.intent().acceptedBusiness().acceptance().result(),outcome.result()); assertArrayEquals(new byte[]{7},data.routed.read(data.f.column,new byte[]{2}));
                 var ack=commit.finalized(data.f.groupId); journal.queueRecovery(ack); journal.executeHome();
-                var consumed=ack.consume(); journal.queueHome(home.statuses.prepare(homeOperation(4),ack,consumed)); journal.executeHome(); assertTrue(journal.snapshot().observedHome().gcEligible());
+                var consumed=ack.consume(); journal.queueRecovery(consumed); journal.executeHome(); assertTrue(journal.snapshot().observedHome().gcEligible());
                 journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);
                 assertTrue(journal.snapshot().observedHome().gcEligible()); assertEquals(outcome,journal.snapshot().participant(data.f.groupId).outcome()); helper.released(data);
             } finally { journal.close(); }
@@ -85,8 +85,8 @@ class RatisDurableTransactionTest {
                 assertArrayEquals(frozenAck.bytes(),journal.snapshot().pendingRecovery().bytes()); journal.executeHome(); assertEquals(nativeAck,journal.snapshot().recoveryReceipt());
                 long index=home.wire.index; journal.executeHome(); assertEquals(index,home.wire.index); assertEquals(CommandResult.Status.CONFLICT,journal.result().status()); assertFalse(journal.snapshot().observedHome().consumed());
                 journal.close(); journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed); assertEquals(nativeAck,journal.snapshot().recoveryReceipt()); assertEquals(ordinary,journal.snapshot().lastHome());
-                var consumeControl=new OperationId(new UUID(0,1509),3,0); journal.queueHome(home.statuses.prepare(consumeControl,ack,ack.consume())); journal.executeHome();
-                assertEquals(consumeControl,journal.snapshot().lastHome()); assertNull(journal.snapshot().pendingRecovery()); assertNull(journal.snapshot().recoveryReceipt());
+                journal.queueRecovery(ack.consume());var frozenConsume=journal.snapshot().pendingRecovery();assertEquals(HomeRecovery.Action.CONSUME,frozenConsume.recovery().action());assertEquals(frozenAck.recovery().operation().sessionId(),frozenConsume.recovery().operation().sessionId());assertEquals(2,frozenConsume.recovery().operation().sequence());journal.executeHome();
+                assertEquals(ordinary,journal.snapshot().lastHome());assertEquals(frozenConsume.recovery(),journal.snapshot().recoveryReceipt().recovery());journal.close();journal=RatisDurableTransaction.reopen(path,home.statuses,data.routed);assertArrayEquals(frozenConsume.bytes(),journal.snapshot().pendingRecovery().bytes());assertTrue(journal.snapshot().observedHome().consumed());
             } finally { journal.close(); }
         }
     }

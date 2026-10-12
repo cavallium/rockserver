@@ -141,6 +141,12 @@ public final class RatisAtomicClient implements AutoCloseable {
         Objects.requireNonNull(check);if(context.profile()==WorkloadProfile.CONTROL)throw new IOException("Atomic recovery requires a data workload profile");
         var operation=admit(journal,null,null,null,RatisDurableTransaction.MAX_BYTES);operation.beginInline(context,check);return operation;
     }
+    /** Only the session owner may use this after forcing its application ACK. No result or capture is recreated. */
+    Operation reopenForConsumptionInline(Path path,RequestContext context,InlineCheck check)throws IOException {
+        Objects.requireNonNull(check);if(context.profile()==WorkloadProfile.CONTROL)throw new IOException("Atomic journal consumption requires a data workload profile");
+        var operation=admit(path,null,null,null,RatisDurableTransaction.MAX_BYTES);operation.consumptionOnly=true;
+        try{check.check();operation.openConsumptionJournal();return operation;}catch(IOException|RuntimeException failure){try{operation.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
+    }
     public synchronized Operation operation(Path journal) { return operations.get(journal.toAbsolutePath().normalize()); }
     public synchronized Stats stats() { return new Stats(operations.size(),chargedBytes); }
     private synchronized void requireOpen() throws IOException { if (closing || closed) throw new IOException("Atomic client closing/closed"); }
@@ -227,21 +233,39 @@ public final class RatisAtomicClient implements AutoCloseable {
         public synchronized CompletableFuture<Void> consume(RequestContext context) {
             if (active!=null) return CompletableFuture.failedFuture(new IOException("Atomic operation already active"));
             if (journal==null && rejected==null) return CompletableFuture.failedFuture(new IOException("Atomic journal not initialized"));
-            var task=new Task<Void>(this,Kind.CONSUME,scheduler.resolveMonotonicDeadline(context),work -> {
+            var task=new Task<Void>(this,Kind.CONSUME,scheduler.resolveMonotonicDeadline(context),this::consumeWork); submit(task,context); return task.view();
+        }
+        private Void consumeWork(Task<Void> work)throws Exception {
                 work.check();
                 if (rejected!=null) { rejected.consume(); return null; }
-                journal.refreshHome(); journal.resolveHomeFromObserved(); var saved=journal.snapshot();
+                try{journal.refreshHome();}catch(RatisHomeRetiredException retired){if(!consumptionOnly || !retired.proof().equals(journal.snapshot().homeRetirementProof()))throw retired;return null;}
+                journal.resolveHomeFromObserved(); var saved=journal.snapshot();
                 if (saved.observedHome()!=null && saved.observedHome().consumed()) return null;
-                journal.result();
-                if (saved.pendingHome()!=null && saved.homeResult()==null && !saved.homeSuperseded()) throw new IOException("Resume the exact pending HOME request before consumption");
-                journal.queueHome(homes.prepare(identity.next(saved.lastHome()),saved.observedHome(),saved.observedHome().consume()));
-                work.check(); if (journal.executeHome().status()!=CommandResult.Status.SUCCESS) throw new IOException("Consumption CAS conflicted; refresh and retry this operation"); return null;
-            }); submit(task,context); return task.view();
+                if(consumptionOnly){if(saved.observedHome()==null || !saved.observedHome().fullyFinalized())throw new IOException("Application-ACK cleanup lacks a fully finalized HOME");}else journal.result();
+                var consumed=saved.observedHome().consume();
+                if (saved.pendingHome()!=null && saved.homeResult()==null && !saved.homeSuperseded() && (saved.pendingRecovery()==null || !saved.pendingRecovery().recovery().next().equals(consumed))) throw new IOException("Resume the exact pending HOME request before consumption");
+                journal.queueRecovery(consumed);
+                work.check();try { if (journal.executeHome().status()!=CommandResult.Status.SUCCESS) throw new IOException("Consumption CAS conflicted; refresh and retry this operation"); } catch(RatisHomeRetiredException retired) { if(!consumptionOnly || !retired.proof().equals(journal.snapshot().homeRetirementProof()))throw retired; } return null;
+        }
+        void consumeInline(RequestContext context,InlineCheck check)throws IOException {
+            Objects.requireNonNull(check);if(context.profile()==WorkloadProfile.CONTROL)throw new IOException("Inline journal consumption requires a data workload profile");final Task<Void> task;
+            synchronized(this){requireOpen();if(closed || closeRequested || active!=null || closingOperation)throw new IOException("Atomic consumption owner unavailable");if(journal==null && rejected==null)throw new IOException("Atomic journal not initialized");task=new Task<>(this,Kind.CONSUME,scheduler.resolveMonotonicDeadline(context),this::consumeWork);task.inlineCheck=check;active=task;}
+            task.run();try{task.result.getNow(null);}catch(CompletionException failure){if(failure.getCause() instanceof IOException io)throw io;throw new IOException("Inline atomic consumption failed",failure.getCause());}
         }
         private <T> void submit(Task<T> task,RequestContext context) {
             try { requireOpen(); if (closed || closeRequested) throw new IOException("Atomic operation closing/closed"); active=task;
                 scheduler.executor(context.profile(),OperationFamily.MUTATION,task.deadline).execute(task,Math.min(bytes,WorkloadCost.MAX_ESTIMATED_BYTES));
             } catch (Exception unavailable) { task.fail(unavailable); }
+        }
+        private boolean consumptionOnly;
+        private void openConsumptionJournal()throws IOException {
+            if(RatisAtomicRejection.isRejection(path)){rejected=RatisAtomicRejection.reopen(path,binding);identity=rejected.identity();return;}
+            var candidate=RatisDurableTransaction.reopen(path,homes,data);
+            try {
+                var saved=candidate.snapshot();var first=saved.participants().stream().map(p->p.intent().prepareControl()).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();var restored=new Identity(saved.initial().transactionId(),saved.initial().operation(),first);int n=0;
+                for(var p:saved.participants())if(p.intent().captureId()==null || !p.intent().prepareControl().equals(restored.control(n)) || !p.intent().finalizeControl().equals(restored.control(64+n++)))throw new IOException("Consumption journal changed original control allocation");
+                restored.requireHome(saved.lastHome());if(saved.initial().origin()!=null && !saved.initial().origin().firstControl().equals(first))throw new IOException("Consumption journal changed reserved CONTROL grant");identity=restored;journal=candidate;
+            }catch(IOException|RuntimeException failure){try{candidate.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
         }
         private TransactionStatus reservation;
         private RatisOperationRerouteAdmissionRpc.Evidence reservationEvidence;

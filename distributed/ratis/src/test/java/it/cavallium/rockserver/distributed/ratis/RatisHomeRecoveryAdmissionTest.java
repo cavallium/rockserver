@@ -130,7 +130,7 @@ class RatisHomeRecoveryAdmissionTest {
             } finally { reader.release.countDown(); executor.shutdownNow(); assertTrue(executor.awaitTermination(5,TimeUnit.SECONDS)); }
         }
     }
-    @Test void concurrentRegistrationsReserveFutureCreditsAndFullCapacityStillFundsAbortAndAck() throws Exception {
+    @Test void concurrentRegistrationsReserveFutureCreditsAndFullCapacityStillFundsAbortAckAndConsume() throws Exception {
         try (var reader=new ProofReader(); var f=fixture("credits",reader,4096,true)) {
             var pending=new ArrayList<TransactionContext>(); var statuses=new ArrayList<TransactionStatus>();
             for (int i=1;i<=1024;i++) {
@@ -141,7 +141,7 @@ class RatisHomeRecoveryAdmissionTest {
             assertFalse(pending.isEmpty()); assertTrue(pending.size()<1024,"Future credit envelope limits registrations before ordinary queue saturation");
             assertTrue(f.counter("reservedHomeCount")>0); long index=0;
             for (var request:pending) assertEquals(CommandResult.Status.SUCCESS,f.apply(request,++index));
-            assertEquals(0,f.counter("reservedHomeCount")); assertEquals(2*statuses.size(),f.store.homeRecoveryCapacity().reservedCount());
+            assertEquals(0,f.counter("reservedHomeCount")); assertEquals(3*statuses.size(),f.store.homeRecoveryCapacity().reservedCount());
             assertNotNull(f.propose(cas(f,2000,null,initial(2000),false)).getException());
             var initial=statuses.getFirst(); var recovery=abort(f,0,initial);
             try (var prepared=f.machine.prepareHomeRecovery(recovery)) {
@@ -151,7 +151,16 @@ class RatisHomeRecoveryAdmissionTest {
             var terminal=initial.decide(TransactionStatus.Phase.ABORT);
             outcome.set(new ParticipantOutcome(new ParticipantFinalization(f.groupId,1,participant,new OperationId(new UUID(13,1),0,0),terminal),new ApplyPosition(7,50),null,null));
             try (var prepared=f.machine.prepareHomeRecovery(ack(f,1,terminal))) { assertEquals(CommandResult.Status.SUCCESS,apply(f,propose(f,prepared.recovery()),++index).result().status()); }
-            released(f); assertEquals(2*statuses.size()-2,f.store.homeRecoveryCapacity().reservedCount());
+            released(f); assertEquals(3*statuses.size()-2,f.store.homeRecoveryCapacity().reservedCount());
+            var finalized=terminal.finalized(participant);
+            var consume=new HomeRecovery(HomeRecovery.Action.CONSUME,cas(f,2,finalized,finalized.consume(),true),null);
+            try(var prepared=f.machine.prepareHomeRecovery(consume)) {
+                assertEquals(0,f.machine.reservedHomeRecoveryCount(),"Consumption uses its original future credit at full capacity");
+                assertEquals(CommandResult.Status.SUCCESS,apply(f,propose(f,prepared.recovery()),++index).result().status());
+            }
+            released(f);assertEquals(3*statuses.size()-3,f.store.homeRecoveryCapacity().reservedCount());
+            var key=consume.command().mutations().getFirst().key();
+            assertTrue(TransactionStatus.decode(f.store.readCurrentPoint(column,key)).consumed());
         }
     }
     @Test void submittedUnknownRetainsExclusiveRowUntilNewerCompletedNativeTerm() throws Exception {

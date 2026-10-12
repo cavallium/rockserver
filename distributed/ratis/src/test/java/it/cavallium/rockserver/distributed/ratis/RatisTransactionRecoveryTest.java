@@ -66,7 +66,7 @@ class RatisTransactionRecoveryTest {
             try (var recovery=f.recovery()) { assertTrue(recovery.step().complete()); }
             assertEquals(writes,f.home.wire.index+f.data.wire.index);
             var acknowledged=f.journal.snapshot().observedHome();
-            f.journal.queueHome(f.home.statuses.prepare(next(f.journal.snapshot().lastHome()),acknowledged,acknowledged.consume())); f.journal.executeHome();
+            f.journal.queueRecovery(acknowledged.consume()); f.journal.executeHome();
             f.reopen(); assertTrue(f.journal.snapshot().observedHome().gcEligible()); assertEquals(CommandResult.Status.CONFLICT,f.journal.result().status());
             var retired=f.data.routed.executeParticipant(original); assertTrue(retired.retired());
             assertNull(f.data.routed.preparedParticipant(f.data.f.groupId,f.plan.initial().transactionId()));
