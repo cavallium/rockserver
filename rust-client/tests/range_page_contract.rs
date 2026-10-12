@@ -181,7 +181,7 @@ fn cdc_mode_is_explicit_and_respects_backend_semantics() {
     let vector = Capabilities::try_from(distributed.clone()).unwrap();
     assert_eq!(vector.maximum_vector_cdc_records(), 256);
     assert_eq!(vector.maximum_vector_cdc_source_bytes(), 8 * 1024 * 1024);
-    assert_eq!(vector.maximum_vector_cdc_batch_bytes(), 10_551_536);
+    assert_eq!(vector.maximum_vector_cdc_batch_bytes(), 10_614_008);
     assert!(Capabilities::try_from(CapabilitiesResponse {
         cdc_mode: CdcMode::Scalar as i32,
         ..distributed.clone()

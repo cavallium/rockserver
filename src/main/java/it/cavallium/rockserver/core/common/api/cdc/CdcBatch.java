@@ -17,6 +17,7 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
   private static final org.apache.thrift.protocol.TField NEXT_CURSOR_FIELD_DESC = new org.apache.thrift.protocol.TField("nextCursor", org.apache.thrift.protocol.TType.STRUCT, (short)8);
   private static final org.apache.thrift.protocol.TField CUT_FIELD_DESC = new org.apache.thrift.protocol.TField("cut", org.apache.thrift.protocol.TType.STRUCT, (short)9);
   private static final org.apache.thrift.protocol.TField ENVELOPES_FIELD_DESC = new org.apache.thrift.protocol.TField("envelopes", org.apache.thrift.protocol.TType.LIST, (short)30);
+  private static final org.apache.thrift.protocol.TField CURRENT_STARTS_FIELD_DESC = new org.apache.thrift.protocol.TField("currentStarts", org.apache.thrift.protocol.TType.STRING, (short)27);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new CdcBatchStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new CdcBatchTupleSchemeFactory();
@@ -28,6 +29,7 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
   public @org.apache.thrift.annotation.Nullable CdcCursor nextCursor; // required
   public @org.apache.thrift.annotation.Nullable CdcPosition cut; // required
   public @org.apache.thrift.annotation.Nullable java.util.List<CdcEnvelope> envelopes; // required
+  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer currentStarts; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -37,7 +39,8 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     FROM_CURSOR((short)7, "fromCursor"),
     NEXT_CURSOR((short)8, "nextCursor"),
     CUT((short)9, "cut"),
-    ENVELOPES((short)30, "envelopes");
+    ENVELOPES((short)30, "envelopes"),
+    CURRENT_STARTS((short)27, "currentStarts");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -67,6 +70,8 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
           return CUT;
         case 30: // ENVELOPES
           return ENVELOPES;
+        case 27: // CURRENT_STARTS
+          return CURRENT_STARTS;
         default:
           return null;
       }
@@ -128,6 +133,8 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     tmpMap.put(_Fields.ENVELOPES, new org.apache.thrift.meta_data.FieldMetaData("envelopes", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
             new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, CdcEnvelope.class))));
+    tmpMap.put(_Fields.CURRENT_STARTS, new org.apache.thrift.meta_data.FieldMetaData("currentStarts", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(CdcBatch.class, metaDataMap);
   }
@@ -142,7 +149,8 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     CdcCursor fromCursor,
     CdcCursor nextCursor,
     CdcPosition cut,
-    java.util.List<CdcEnvelope> envelopes)
+    java.util.List<CdcEnvelope> envelopes,
+    java.nio.ByteBuffer currentStarts)
   {
     this();
     this.batchId = org.apache.thrift.TBaseHelper.copyBinary(batchId);
@@ -152,6 +160,7 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     this.nextCursor = nextCursor;
     this.cut = cut;
     this.envelopes = envelopes;
+    this.currentStarts = org.apache.thrift.TBaseHelper.copyBinary(currentStarts);
   }
 
   /**
@@ -183,6 +192,9 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
       }
       this.envelopes = __this__envelopes;
     }
+    if (other.isSetCurrentStarts()) {
+      this.currentStarts = org.apache.thrift.TBaseHelper.copyBinary(other.currentStarts);
+    }
   }
 
   @Override
@@ -199,6 +211,7 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     this.nextCursor = null;
     this.cut = null;
     this.envelopes = null;
+    this.currentStarts = null;
   }
 
   public byte[] getBatchId() {
@@ -410,6 +423,40 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     }
   }
 
+  public byte[] getCurrentStarts() {
+    setCurrentStarts(org.apache.thrift.TBaseHelper.rightSize(currentStarts));
+    return currentStarts == null ? null : currentStarts.array();
+  }
+
+  public java.nio.ByteBuffer bufferForCurrentStarts() {
+    return org.apache.thrift.TBaseHelper.copyBinary(currentStarts);
+  }
+
+  public CdcBatch setCurrentStarts(byte[] currentStarts) {
+    this.currentStarts = currentStarts == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(currentStarts.clone());
+    return this;
+  }
+
+  public CdcBatch setCurrentStarts(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer currentStarts) {
+    this.currentStarts = org.apache.thrift.TBaseHelper.copyBinary(currentStarts);
+    return this;
+  }
+
+  public void unsetCurrentStarts() {
+    this.currentStarts = null;
+  }
+
+  /** Returns true if field currentStarts is set (has been assigned a value) and false otherwise */
+  public boolean isSetCurrentStarts() {
+    return this.currentStarts != null;
+  }
+
+  public void setCurrentStartsIsSet(boolean value) {
+    if (!value) {
+      this.currentStarts = null;
+    }
+  }
+
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -477,6 +524,18 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
       }
       break;
 
+    case CURRENT_STARTS:
+      if (value == null) {
+        unsetCurrentStarts();
+      } else {
+        if (value instanceof byte[]) {
+          setCurrentStarts((byte[])value);
+        } else {
+          setCurrentStarts((java.nio.ByteBuffer)value);
+        }
+      }
+      break;
+
     }
   }
 
@@ -505,6 +564,9 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     case ENVELOPES:
       return getEnvelopes();
 
+    case CURRENT_STARTS:
+      return getCurrentStarts();
+
     }
     throw new java.lang.IllegalStateException();
   }
@@ -531,6 +593,8 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
       return isSetCut();
     case ENVELOPES:
       return isSetEnvelopes();
+    case CURRENT_STARTS:
+      return isSetCurrentStarts();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -611,6 +675,15 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
         return false;
     }
 
+    boolean this_present_currentStarts = true && this.isSetCurrentStarts();
+    boolean that_present_currentStarts = true && that.isSetCurrentStarts();
+    if (this_present_currentStarts || that_present_currentStarts) {
+      if (!(this_present_currentStarts && that_present_currentStarts))
+        return false;
+      if (!this.currentStarts.equals(that.currentStarts))
+        return false;
+    }
+
     return true;
   }
 
@@ -645,6 +718,10 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     hashCode = hashCode * 8191 + ((isSetEnvelopes()) ? 131071 : 524287);
     if (isSetEnvelopes())
       hashCode = hashCode * 8191 + envelopes.hashCode();
+
+    hashCode = hashCode * 8191 + ((isSetCurrentStarts()) ? 131071 : 524287);
+    if (isSetCurrentStarts())
+      hashCode = hashCode * 8191 + currentStarts.hashCode();
 
     return hashCode;
   }
@@ -723,6 +800,16 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     }
     if (isSetEnvelopes()) {
       lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.envelopes, other.envelopes);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetCurrentStarts(), other.isSetCurrentStarts());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetCurrentStarts()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.currentStarts, other.currentStarts);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -806,6 +893,14 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
       sb.append(this.envelopes);
     }
     first = false;
+    if (!first) sb.append(", ");
+    sb.append("currentStarts:");
+    if (this.currentStarts == null) {
+      sb.append("null");
+    } else {
+      org.apache.thrift.TBaseHelper.toString(this.currentStarts, sb);
+    }
+    first = false;
     sb.append(")");
     return sb.toString();
   }
@@ -832,6 +927,9 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
     }
     if (envelopes == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'envelopes' was not present! Struct: " + toString());
+    }
+    if (currentStarts == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'currentStarts' was not present! Struct: " + toString());
     }
     // check for sub-struct validity
     if (lineage != null) {
@@ -955,6 +1053,14 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
+          case 27: // CURRENT_STARTS
+            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+              struct.currentStarts = iprot.readBinary();
+              struct.setCurrentStartsIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
           default:
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
         }
@@ -1001,6 +1107,11 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
         oprot.writeBinary(struct.definition);
         oprot.writeFieldEnd();
       }
+      if (struct.currentStarts != null) {
+        oprot.writeFieldBegin(CURRENT_STARTS_FIELD_DESC);
+        oprot.writeBinary(struct.currentStarts);
+        oprot.writeFieldEnd();
+      }
       if (struct.envelopes != null) {
         oprot.writeFieldBegin(ENVELOPES_FIELD_DESC);
         {
@@ -1044,6 +1155,7 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
           _iter20.write(oprot);
         }
       }
+      oprot.writeBinary(struct.currentStarts);
     }
 
     @Override
@@ -1077,6 +1189,8 @@ public class CdcBatch implements org.apache.thrift.TBase<CdcBatch, CdcBatch._Fie
         }
       }
       struct.setEnvelopesIsSet(true);
+      struct.currentStarts = iprot.readBinary();
+      struct.setCurrentStartsIsSet(true);
     }
   }
 

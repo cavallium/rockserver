@@ -77,11 +77,11 @@ public final class RatisCdcPollRpc {
         int tag=bytes.get()&255; if(tag>=Outcome.values().length) throw new IllegalArgumentException("Invalid CDC reply outcome"); var outcome=Outcome.values()[tag];
         var cut=new ApplyPosition(bytes.getLong(),bytes.getLong()); var floor=cursor(bytes); var next=cursor(bytes); int verified=bytes.get()&255;
         if(verified>1) throw new IllegalArgumentException("Invalid CDC cursor witness"); int required=bytes.getInt(),count=bytes.getInt();
-        if(count<0 || count>request.maxRecords() || count>bytes.remaining()/(4+DistributedCdcRecord.HEADER_BYTES+DistributedCommandCodec.HEADER_BYTES)) throw new IllegalArgumentException("Invalid CDC reply record count");
+        if(count<0 || count>request.maxRecords() || count>bytes.remaining()/(4+DistributedCdcRecord.MIN_BYTES)) throw new IllegalArgumentException("Invalid CDC reply record count");
         var records=new ArrayList<DistributedCdcRecord>(count);
         for(int i=0;i<count;i++) {
             if(bytes.remaining()<4) throw new IllegalArgumentException("Truncated CDC record size"); int size=bytes.getInt();
-            if(size<DistributedCdcRecord.HEADER_BYTES+DistributedCommandCodec.HEADER_BYTES || size>DistributedCdcRecord.MAX_BYTES || size>bytes.remaining()) throw new IllegalArgumentException("Invalid CDC record length");
+            if(size<DistributedCdcRecord.MIN_BYTES || size>DistributedCdcRecord.MAX_BYTES || size>bytes.remaining()) throw new IllegalArgumentException("Invalid CDC record length");
             byte[] record=new byte[size]; bytes.get(record); records.add(DistributedCdcRecord.decode(record));
         }
         if(bytes.hasRemaining()) throw new IllegalArgumentException("Trailing CDC reply bytes"); return new Result(request,outcome,cut,floor,next,verified==1,required,records);

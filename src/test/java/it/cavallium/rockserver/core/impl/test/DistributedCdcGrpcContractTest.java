@@ -111,4 +111,70 @@ class DistributedCdcGrpcContractTest {
         assertSame(wire,DistributedCdcWire.bounded(wire,wire.getSerializedSize())); assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.bounded(wire,wire.getSerializedSize()-1));
     }
     private static void assertStatus(Status.Code expected,Runnable call) { var error=assertThrows(RuntimeException.class,call::run); assertEquals(expected,Status.fromThrowable(error).getCode()); }
+    @Test void terminalBarrierRoundtripRejectsMixedMalformedAndOversizedPayloads() throws Exception {
+        var freeze=DistributedCdcSubscriptionsTest.freeze(id(1),id(2),id(3),lineage,column);
+        var envelope=new DistributedCdcSubscriptions.Envelope(freeze.position(),freeze.header().schemaDigest(),null,null,List.of(),freeze);
+        var wire=DistributedCdcWire.envelope(envelope);
+        assertTrue(wire.hasTerminalBarrier()); assertFalse(wire.hasOperation()); assertEquals(0,wire.getEventsCount());
+        assertEquals(envelope,DistributedCdcWire.envelope(CdcEnvelope.parseFrom(wire.toByteArray())));
+        var end=DistributedCdcCheckpoint.Cursor.after(freeze.position());
+        var batch=new DistributedCdcSubscriptions.Batch(id(90),definition(),lineage,DistributedCdcCheckpoint.Cursor.beginning(),end,new ApplyPosition(1,3),List.of(envelope));
+        assertEquals(batch,DistributedCdcWire.batch(DistributedCdcWire.batch(batch),subscription));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.envelope(wire.toBuilder().setOperation(DistributedCdcWire.operation(operation)).build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.envelope(wire.toBuilder().addEvents(DistributedCdcWire.envelope(poll().batch().envelopes().getFirst()).getEvents(0)).build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.envelope(wire.toBuilder().setTerminalBarrier(ByteString.EMPTY).build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.envelope(wire.toBuilder().clearTerminalBarrier().build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.envelope(wire.toBuilder().setTerminalBarrier(ByteString.copyFrom(new byte[NativeTopologyFreeze.MAX_BYTES+1])).build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.envelope(wire.toBuilder().setPosition(DistributedCdcWire.position(new ApplyPosition(1,3))).build()));
+    }
+
+    @Test void compactFreezeMatchesRustCanonicalFixtureAndRejectsUnknownKind() throws Exception {
+        byte[] encoded=HexFormat.of().parseHex("4e544652000002145443484412121212121212121212121212121212030303030303030303030303030303030404040404040404040404040404040405050505050505050505050505050505000000000000000001000000000000000000000000000000010b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b131313131313131313131313131313131313131313131313131313131313131308080808080808080808080808080808080808080808080808080808080808081414141414141414141414141414141414141414141414141414141414141414000000010101010101010101010101010101010102020202020202020202020202020202000000000000000300000000000000000000000110101010101010101010101010101010001111111111111111111111111111111111111111111111111111111111111111000000021515151515151515151515151515151516161616161616161616161616161616000000000000000400000000000000000000000119191919191919191919191919191919001b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b171717171717171717171717171717171818181818181818181818181818181800000000000000040000000000000000000000011a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a001c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c02020202020202020202020202020202000000000000000200000000000000041d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e");
+        var freeze=NativeTopologyFreeze.decode(encoded);
+        assertArrayEquals(encoded,freeze.encode()); assertEquals(new ApplyPosition(2,4),freeze.position());
+        assertEquals(TopologyChange.Kind.SPLIT,freeze.header().kind()); assertEquals(2,freeze.header().targets().size());
+        var envelope=new DistributedCdcSubscriptions.Envelope(freeze.position(),freeze.header().schemaDigest(),null,null,List.of(),freeze);
+        assertEquals(envelope,DistributedCdcWire.envelope(CdcEnvelope.parseFrom(DistributedCdcWire.envelope(envelope).toByteArray())));
+        byte[] malformed=encoded.clone(); malformed[76]=(byte)255;
+        assertThrows(IllegalArgumentException.class,()->NativeTopologyFreeze.decode(malformed));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.envelope(DistributedCdcWire.envelope(envelope).toBuilder().setTerminalBarrier(ByteString.copyFrom(malformed)).build()));
+    }
+
+    @Test void successorCurrentStartsRoundtripIsRequiredAndBounded() {
+        var child=new DistributedCdcCheckpoint.Lineage(id(104),id(105),2); var activation=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,4));
+        var starts=new DistributedCdcCheckpoint(Map.of(child,activation));
+        var batch=new DistributedCdcSubscriptions.Batch(id(8),definition(),child,activation,activation,new ApplyPosition(2,5),List.of(),starts);
+        var wire=DistributedCdcWire.batch(batch); assertEquals(batch,DistributedCdcWire.batch(wire,subscription));
+        assertFalse(batch.definition().start().cursors().containsKey(child)); assertEquals(starts,DistributedCdcWire.batch(wire,subscription).currentStarts());
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.batch(wire.toBuilder().clearCurrentStarts().build(),subscription));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.batch(wire.toBuilder().setCurrentStarts(DistributedCdcWire.checkpoint(definition().start())).build(),subscription));
+        var entry=wire.getCurrentStarts().getEntries(0);
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.batch(wire.toBuilder().setCurrentStarts(CdcCheckpoint.newBuilder().addAllEntries(Collections.nCopies(1025,entry))).build(),subscription));
+    }
+
+    @Test void successorStatusPreservesCurrentFrontierAndCanonicalHandoff() throws Exception {
+        var freeze=DistributedCdcSubscriptionsTest.freeze(id(1),id(2),id(3),lineage,column);
+        var terminal=new DistributedCdcCheckpoint(Map.of(lineage,DistributedCdcCheckpoint.Cursor.after(freeze.position())));
+        var children=new TreeMap<DistributedCdcCheckpoint.Lineage,DistributedCdcCheckpoint.Cursor>();
+        for(var child:freeze.header().targets()) children.put(new DistributedCdcCheckpoint.Lineage(child.rangeId(),child.groupId(),child.rangeEpoch()),DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,4)));
+        var starts=new DistributedCdcCheckpoint(children); var handoff=new DistributedCdcBarrierHandoff(freeze.header(),terminal,starts);
+        var state=DistributedCdcSubscription.initial(definition()).deliver(terminal).acknowledge(terminal).lineageTransition(handoff);
+        var status=new DistributedCdcSubscriptions.Status(state,DistributedCdcSubscriptions.Phase.ACTIVE);
+        var wire=DistributedCdcWire.status(status,subscription);
+        assertTrue(wire.getState().hasCurrentStarts()); assertTrue(wire.getState().hasLatestHandoff());
+        assertEquals(status,DistributedCdcWire.status(CdcStatus.parseFrom(wire.toByteArray()),subscription));
+        assertEquals(definition(),state.definition()); assertEquals(starts,DistributedCdcWire.state(wire.getState()).currentStarts());
+        assertEquals(handoff,DistributedCdcWire.state(wire.getState()).latestHandoff());
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.state(wire.getState().toBuilder().clearCurrentStarts().build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.state(wire.getState().toBuilder().clearLatestHandoff().build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.state(wire.getState().toBuilder().setCurrentStarts(DistributedCdcWire.checkpoint(definition().start())).build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.state(wire.getState().toBuilder().setLatestHandoff(ByteString.EMPTY).build()));
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.state(wire.getState().toBuilder().setLatestHandoff(ByteString.copyFrom(new byte[DistributedCdcBarrierHandoff.MAX_BYTES+1])).build()));
+        var foreign=DistributedCdcSubscriptionsTest.freeze(id(1),id(2),id(99),lineage,column);
+        var foreignHandoff=new DistributedCdcBarrierHandoff(foreign.header(),terminal,starts);
+        assertThrows(IllegalArgumentException.class,()->DistributedCdcWire.state(wire.getState().toBuilder().setLatestHandoff(ByteString.copyFrom(foreignHandoff.encode())).build()));
+        var thrift=it.cavallium.rockserver.core.common.cdc.ThriftDistributedCdcWire.status(status,subscription);
+        assertEquals(status,it.cavallium.rockserver.core.common.cdc.ThriftDistributedCdcWire.status(thrift,subscription));
+    }
+
 }

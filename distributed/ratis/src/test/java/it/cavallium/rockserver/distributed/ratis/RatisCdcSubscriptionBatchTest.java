@@ -37,4 +37,47 @@ class RatisCdcSubscriptionBatchTest {
         var later=state.deliver(new DistributedCdcCheckpoint(Map.of(lineage,record.end()))).acknowledge(new DistributedCdcCheckpoint(Map.of(lineage,record.end())));
         assertThrows(IllegalArgumentException.class,()->new RatisCdcSubscriptionBatch(id(11),later,reply));
     }
+    @Test void terminalBarrierProjectsWithoutColumnEventsAndEmptyMutationProjectionStillAdvances() {
+        var state=state(DistributedCdcCheckpoint.Cursor.beginning()); var d=state.definition();
+        var peer=new ReplicaDescriptor(id(101),id(102),id(103),"barrier","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
+        var parent=new RangeDescriptor(lineage.rangeId(),group,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var source=new RangeDirectory(d.clusterId(),d.databaseId(),d.domainId(),1,new byte[32],1,Set.of(selected,other),1,List.of(parent));
+        var left=new RangeDescriptor(id(104),id(105),1,1,null,new byte[]{(byte)128},RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var right=new RangeDescriptor(id(106),id(107),1,1,new byte[]{(byte)128},null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var target=new RangeDirectory(d.clusterId(),d.databaseId(),d.domainId(),1,new byte[32],2,Set.of(selected,other),1,List.of(left,right));
+        var freeze=new NativeTopologyFreeze(new TopologyChange.Definition(id(108),source,target).header(),group,new ApplyPosition(1,2),NativeTopologyFreeze.boundsDigest(null,null),new byte[32]);
+        var barrier=DistributedCdcRecord.terminalBarrier(freeze);
+        var request=new RatisCdcPollRpc.Request(new RatisCdcPollRpc.Binding(d.clusterId(),d.databaseId(),d.domainId(),lineage),DistributedCdcCheckpoint.Cursor.beginning(),2,4096);
+        var command=new DistributedCommand(group,1,new byte[32],new OperationId(id(10),1,0),List.of(new Mutation(Mutation.Kind.PUT,other,new byte[]{1},new byte[]{99})));
+        var mutation=new DistributedCdcRecord(lineage,new ApplyPosition(1,1),command,null);
+        var empty=new RatisCdcSubscriptionBatch(id(11),state,result(state,mutation)).projected();
+        assertTrue(empty.envelopes().isEmpty()); assertEquals(mutation.end(),empty.next());
+        var reply=new RatisCdcPollRpc.Result(request,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(1,3),DistributedCdcCheckpoint.Cursor.beginning(),barrier.end(),true,0,List.of(mutation,barrier));
+        var projected=new RatisCdcSubscriptionBatch(id(12),state,reply).projected();
+        assertEquals(1,projected.envelopes().size()); var envelope=projected.envelopes().getFirst();
+        assertEquals(freeze,envelope.terminalBarrier()); assertTrue(envelope.events().isEmpty()); assertNull(envelope.operation()); assertNull(envelope.transaction()); assertEquals(barrier.end(),projected.next());
+    }
+
+    @Test void successorDeliveryProjectsCurrentStartsFromCommittedSubscriptionState() {
+        var initial=state(DistributedCdcCheckpoint.Cursor.beginning()); var d=initial.definition();
+        var peer=new ReplicaDescriptor(id(101),id(102),id(103),"successor","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
+        var parent=new RangeDescriptor(lineage.rangeId(),group,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var source=new RangeDirectory(d.clusterId(),d.databaseId(),d.domainId(),1,new byte[32],1,Set.of(selected),1,List.of(parent));
+        var left=new RangeDescriptor(id(104),id(105),1,1,null,new byte[]{(byte)128},RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var right=new RangeDescriptor(id(106),id(107),1,1,new byte[]{(byte)128},null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var target=new RangeDirectory(d.clusterId(),d.databaseId(),d.domainId(),1,new byte[32],2,Set.of(selected),1,List.of(left,right));
+        var topology=new TopologyChange.Definition(id(108),source,target);
+        var terminal=new DistributedCdcCheckpoint(Map.of(lineage,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2))));
+        var child=new DistributedCdcCheckpoint.Lineage(left.rangeId(),left.groupId(),left.rangeEpoch());
+        var sibling=new DistributedCdcCheckpoint.Lineage(right.rangeId(),right.groupId(),right.rangeEpoch());
+        var start=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,4)); var starts=new DistributedCdcCheckpoint(Map.of(child,start,sibling,start));
+        var transitioned=initial.deliver(terminal).acknowledge(terminal).lineageTransition(new DistributedCdcBarrierHandoff(topology.header(),terminal,starts));
+        var command=new DistributedCommand(child.groupId(),child.rangeEpoch(),new byte[32],new OperationId(id(10),1,0),List.of(new Mutation(Mutation.Kind.PUT,selected,new byte[]{1},new byte[]{2})));
+        var record=new DistributedCdcRecord(child,new ApplyPosition(1,5),command,null);
+        var request=new RatisCdcPollRpc.Request(new RatisCdcPollRpc.Binding(d.clusterId(),d.databaseId(),d.domainId(),child),start,1,4096);
+        var reply=new RatisCdcPollRpc.Result(request,RatisCdcPollRpc.Outcome.DATA,new ApplyPosition(1,6),start,record.end(),true,0,List.of(record));
+        var projected=new RatisCdcSubscriptionBatch(id(12),transitioned,reply).projected();
+        assertEquals(d,projected.definition()); assertFalse(d.start().cursors().containsKey(child)); assertEquals(starts,projected.currentStarts()); assertEquals(1,projected.envelopes().size());
+    }
+
 }

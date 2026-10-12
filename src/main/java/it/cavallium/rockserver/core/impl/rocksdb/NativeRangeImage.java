@@ -452,7 +452,7 @@ public final class NativeRangeImage {
                 if(section==Section.STATE) {
                     try {
                         cdc.accept(key,value,header.owner(),header.position());
-                        if(key.length>16 && key[16]==0x50) acceptSchema(it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord.decode(value).command().schemaDigest());
+                        if(key.length>16 && key[16]==0x50) acceptSchema(it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord.decode(value).schemaDigest());
                     }
                     catch(IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Invalid CDC image metadata",invalid); }
                 }

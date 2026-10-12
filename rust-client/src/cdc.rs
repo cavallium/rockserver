@@ -19,7 +19,11 @@ pub const MIN_POLL_BYTES: i32 = 111;
 pub const MAX_POLL_BYTES: i32 = 8 * 1024 * 1024;
 pub const MAX_EVENTS_PER_ENVELOPE: i32 = 2048;
 pub const MAX_EVENTS: usize = MAX_RECORDS as usize * MAX_EVENTS_PER_ENVELOPE as usize;
-pub const MAX_BATCH_BYTES: usize = 10_551_536;
+pub const MAX_BATCH_BYTES: usize = 10_614_008;
+pub const MAX_HANDOFF_BYTES: usize = 12 + MAX_TOPOLOGY_HEADER_BYTES + 2 * (4 + 2 * 60);
+pub const MAX_TOPOLOGY_HEADER_BYTES: usize = 8192;
+pub const MAX_BARRIER_BYTES: usize = 104 + MAX_TOPOLOGY_HEADER_BYTES;
+const ENVELOPE_HEADER_BYTES: usize = 92;
 pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
@@ -219,6 +223,49 @@ impl Checkpoint {
         }
         Ok(())
     }
+    fn budget_bytes(&self) -> usize {
+        4 + 60 * self.0.len()
+    }
+    fn decode_handoff_checkpoint(encoded: &[u8]) -> Result<Self> {
+        if !(4..=124).contains(&encoded.len()) {
+            return Err(invalid("invalid handoff checkpoint size"));
+        }
+        let mut r = Reader(encoded);
+        let count = r.count(1, 2)?;
+        if r.0.len() != count * 60 {
+            return Err(invalid("invalid handoff checkpoint count"));
+        }
+        let mut entries = BTreeMap::new();
+        let mut previous = None;
+        for _ in 0..count {
+            let lineage = Lineage {
+                range_id: r.id()?,
+                group_id: r.id()?,
+                range_epoch: r.i64()?,
+            };
+            lineage.validate()?;
+            if previous.is_some_and(|p| p >= lineage) {
+                return Err(invalid("noncanonical handoff lineage order"));
+            }
+            previous = Some(lineage);
+            let cursor = Cursor {
+                position: Position {
+                    term: r.i64()?,
+                    index: r.i64()?,
+                },
+                mutation_ordinal: r.i32()?,
+            };
+            cursor.validate()?;
+            if cursor.position.term < 1
+                || cursor.position.index < 1
+                || cursor.mutation_ordinal != MAX_EVENTS_PER_ENVELOPE
+            {
+                return Err(invalid("handoff requires committed terminal cut"));
+            }
+            entries.insert(lineage, cursor);
+        }
+        Ok(Self(entries))
+    }
     pub fn advance(&self, lineage: Lineage, next: Cursor) -> Result<Self> {
         self.validate()?;
         if !next.covers(
@@ -354,34 +401,68 @@ pub struct State {
     pub generation: i64,
     pub checkpoint: Checkpoint,
     pub delivered: Checkpoint,
+    pub current_starts: Checkpoint,
+    pub latest_handoff: Option<Handoff>,
 }
 impl TryFrom<wire::CdcState> for State {
     type Error = RpcStatus;
     fn try_from(v: wire::CdcState) -> Result<Self> {
+        if v.encoded_len() > MAX_FRAME_BYTES {
+            return Err(invalid("oversized CDC state"));
+        }
         let result = Self {
             definition: required(v.definition)?.try_into()?,
             phase: StatePhase::try_from(v.phase).map_err(|_| invalid("unknown CDC state phase"))?,
             generation: v.generation,
             checkpoint: required(v.checkpoint)?.try_into()?,
             delivered: required(v.delivered)?.try_into()?,
+            current_starts: required(v.current_starts)?.try_into()?,
+            latest_handoff: v.latest_handoff.map(Handoff::decode).transpose()?,
         };
         let closed = result.phase == StatePhase::SubscriptionClosed;
-        let initial = result.delivered == result.definition.start;
-        let minimum = if result.checkpoint == result.definition.start {
-            1
-        } else {
-            2
-        } + closed as i64;
         if result.generation < 0
-            || !result.checkpoint.covers(&result.definition.start)?
+            || !result.checkpoint.covers(&result.current_starts)?
             || !result.delivered.covers(&result.checkpoint)?
-            || if initial {
-                result.generation != closed as i64
-            } else {
-                result.generation < minimum
-            }
         {
             return Err(invalid("invalid CDC subscription progress"));
+        }
+        if let Some(handoff) = &result.latest_handoff {
+            let header = &handoff.header;
+            if header.cluster_id != result.definition.cluster_id
+                || header.database_id != result.definition.database_id
+                || header.domain_id != result.definition.domain_id
+                || result.generation < if closed { 2 } else { 1 }
+                || handoff
+                    .child_starts
+                    .0
+                    .iter()
+                    .any(|(l, c)| result.current_starts.0.get(l) != Some(c))
+                || handoff
+                    .parent_terminal
+                    .0
+                    .keys()
+                    .any(|l| result.current_starts.0.contains_key(l))
+            {
+                return Err(invalid("CDC handoff namespace/generation/frontier changed"));
+            }
+        } else {
+            let initial = result.delivered == result.definition.start;
+            let minimum = if result.checkpoint == result.definition.start {
+                1
+            } else {
+                2
+            } + closed as i64;
+            if result.current_starts != result.definition.start
+                || if initial {
+                    result.generation != closed as i64
+                } else {
+                    result.generation < minimum
+                }
+            {
+                return Err(invalid(
+                    "CDC frontier changed without handoff or invalid generation",
+                ));
+            }
         }
         Ok(result)
     }
@@ -605,20 +686,306 @@ impl TryFrom<wire::CdcFinalization> for Finalization {
         Ok(result)
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyKind {
+    Split,
+    Merge,
+    Relocate,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerRole {
+    Voter,
+    Listener,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopologyOwner {
+    pub replica_id: Id,
+    pub role: OwnerRole,
+    pub identity_digest: [u8; 32],
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopologyParticipant {
+    pub lineage: Lineage,
+    pub configuration_version: i64,
+    pub owners: Vec<TopologyOwner>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopologyHeader {
+    pub intent_id: Id,
+    pub cluster_id: Id,
+    pub database_id: Id,
+    pub domain_id: Id,
+    pub kind: TopologyKind,
+    pub schema_epoch: i64,
+    pub source_generation: i64,
+    pub target_generation: i64,
+    pub schema_digest: [u8; 32],
+    pub definition_digest: [u8; 32],
+    pub source_directory_digest: [u8; 32],
+    pub target_directory_digest: [u8; 32],
+    pub parents: Vec<TopologyParticipant>,
+    pub targets: Vec<TopologyParticipant>,
+}
+impl TopologyHeader {
+    pub fn decode(encoded: &[u8]) -> Result<Self> {
+        if !(229..=MAX_TOPOLOGY_HEADER_BYTES).contains(&encoded.len()) {
+            return Err(invalid("invalid topology header size"));
+        }
+        let mut r = Reader(encoded);
+        if r.i32()? != 0x54434844 {
+            return Err(invalid("invalid topology header magic"));
+        }
+        let intent_id = r.id()?;
+        let cluster_id = r.id()?;
+        let database_id = r.id()?;
+        let domain_id = r.id()?;
+        let kind = match r.take(1)?[0] {
+            0 => TopologyKind::Split,
+            1 => TopologyKind::Merge,
+            2 => TopologyKind::Relocate,
+            _ => return Err(invalid("unknown topology kind")),
+        };
+        let schema_epoch = r.i64()?;
+        let source_generation = r.i64()?;
+        let target_generation = r.i64()?;
+        let schema_digest = r.take(32)?.try_into().unwrap();
+        let definition_digest = r.take(32)?.try_into().unwrap();
+        let source_directory_digest = r.take(32)?.try_into().unwrap();
+        let target_directory_digest = r.take(32)?.try_into().unwrap();
+        let parents = Self::participants(&mut r)?;
+        let targets = Self::participants(&mut r)?;
+        if !r.0.is_empty()
+            || schema_epoch < 0
+            || source_generation < 0
+            || source_generation.checked_add(1) != Some(target_generation)
+            || parents.len() != if kind == TopologyKind::Merge { 2 } else { 1 }
+            || targets.len() != if kind == TopologyKind::Split { 2 } else { 1 }
+        {
+            return Err(invalid("invalid topology shape/generation"));
+        }
+        if kind == TopologyKind::Relocate {
+            let (p, t) = (&parents[0], &targets[0]);
+            if p.lineage != t.lineage
+                || p.configuration_version.checked_add(1) != Some(t.configuration_version)
+            {
+                return Err(invalid("relocation changed lineage/configuration step"));
+            }
+        } else if parents.iter().any(|p| {
+            targets.iter().any(|t| {
+                p.lineage.range_id == t.lineage.range_id || p.lineage.group_id == t.lineage.group_id
+            })
+        }) {
+            return Err(invalid("topology reused parent identity"));
+        }
+        Ok(Self {
+            intent_id,
+            cluster_id,
+            database_id,
+            domain_id,
+            kind,
+            schema_epoch,
+            source_generation,
+            target_generation,
+            schema_digest,
+            definition_digest,
+            source_directory_digest,
+            target_directory_digest,
+            parents,
+            targets,
+        })
+    }
+    fn participants(r: &mut Reader<'_>) -> Result<Vec<TopologyParticipant>> {
+        let count = r.count(1, 2)?;
+        let mut result = Vec::with_capacity(count);
+        let mut previous_group = None;
+        let mut ranges = HashSet::new();
+        for _ in 0..count {
+            let lineage = Lineage {
+                range_id: r.id()?,
+                group_id: r.id()?,
+                range_epoch: r.i64()?,
+            };
+            lineage.validate()?;
+            let configuration_version = r.i64()?;
+            if configuration_version < 0
+                || previous_group.is_some_and(|id| id >= lineage.group_id)
+                || !ranges.insert(lineage.range_id)
+            {
+                return Err(invalid(
+                    "noncanonical topology participant identity/configuration",
+                ));
+            }
+            previous_group = Some(lineage.group_id);
+            let count = r.count(1, 16)?;
+            let mut owners = Vec::with_capacity(count);
+            let mut previous_replica = None;
+            let mut voters = 0;
+            for _ in 0..count {
+                let replica_id = r.id()?;
+                if previous_replica.is_some_and(|id| id >= replica_id) {
+                    return Err(invalid("duplicate or noncanonical topology owner"));
+                }
+                previous_replica = Some(replica_id);
+                let role = match r.take(1)?[0] {
+                    0 => {
+                        voters += 1;
+                        OwnerRole::Voter
+                    }
+                    1 => OwnerRole::Listener,
+                    _ => return Err(invalid("invalid topology owner role")),
+                };
+                let identity_digest = r.take(32)?.try_into().unwrap();
+                owners.push(TopologyOwner {
+                    replica_id,
+                    role,
+                    identity_digest,
+                });
+            }
+            if !(1..=5).contains(&voters) {
+                return Err(invalid("topology participant requires 1..5 voters"));
+            }
+            result.push(TopologyParticipant {
+                lineage,
+                configuration_version,
+                owners,
+            });
+        }
+        Ok(result)
+    }
+}
+/// Current frontier replacement from committed terminal/activation cuts. This is structural evidence, not admission authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Handoff {
+    canonical: Vec<u8>,
+    pub header: TopologyHeader,
+    pub parent_terminal: Checkpoint,
+    pub child_starts: Checkpoint,
+}
+impl Handoff {
+    pub fn decode(encoded: Vec<u8>) -> Result<Self> {
+        if !(12..=MAX_HANDOFF_BYTES).contains(&encoded.len()) {
+            return Err(invalid("invalid CDC handoff size"));
+        }
+        let mut r = Reader(&encoded);
+        let header_size = r.count(0, MAX_TOPOLOGY_HEADER_BYTES)?;
+        let header = TopologyHeader::decode(r.take(header_size)?)?;
+        let parents_size = r.count(0, 124)?;
+        let parent_terminal = Checkpoint::decode_handoff_checkpoint(r.take(parents_size)?)?;
+        let children_size = r.count(0, 124)?;
+        let child_starts = Checkpoint::decode_handoff_checkpoint(r.take(children_size)?)?;
+        if !r.0.is_empty()
+            || header.kind == TopologyKind::Relocate
+            || header
+                .parents
+                .iter()
+                .map(|p| p.lineage)
+                .collect::<HashSet<_>>()
+                != parent_terminal.0.keys().copied().collect()
+            || header
+                .targets
+                .iter()
+                .map(|p| p.lineage)
+                .collect::<HashSet<_>>()
+                != child_starts.0.keys().copied().collect()
+        {
+            return Err(invalid("CDC handoff changed participant coverage"));
+        }
+        Ok(Self {
+            canonical: encoded,
+            header,
+            parent_terminal,
+            child_starts,
+        })
+    }
+    pub fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+/// Compact committed parent FREEZE evidence; this carries no catalogue admission authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Barrier {
+    canonical: Vec<u8>,
+    pub header: TopologyHeader,
+    pub group_id: Id,
+    pub position: Position,
+    pub bounds_digest: [u8; 32],
+    pub admission_digest: [u8; 32],
+}
+impl Barrier {
+    pub fn decode(encoded: Vec<u8>) -> Result<Self> {
+        if !(104..=MAX_BARRIER_BYTES).contains(&encoded.len()) {
+            return Err(invalid("invalid terminal barrier size"));
+        }
+        let mut r = Reader(&encoded);
+        if r.i32()? != 0x4e544652 {
+            return Err(invalid("invalid terminal barrier magic"));
+        }
+        let length = r.count(0, MAX_TOPOLOGY_HEADER_BYTES)?;
+        if length != r.0.len().saturating_sub(96) {
+            return Err(invalid("invalid terminal barrier header length"));
+        }
+        let header = TopologyHeader::decode(r.take(length)?)?;
+        let group_id = r.id()?;
+        let position = Position {
+            term: r.i64()?,
+            index: r.i64()?,
+        };
+        position.validate(true)?;
+        let bounds_digest = r.take(32)?.try_into().unwrap();
+        let admission_digest = r.take(32)?.try_into().unwrap();
+        if !r.0.is_empty()
+            || position.index == 0
+            || header.kind == TopologyKind::Relocate
+            || !header
+                .parents
+                .iter()
+                .any(|p| p.lineage.group_id == group_id)
+        {
+            return Err(invalid("invalid terminal parent/cut"));
+        }
+        Ok(Self {
+            canonical: encoded,
+            header,
+            group_id,
+            position,
+            bounds_digest,
+            admission_digest,
+        })
+    }
+    pub fn canonical(&self) -> &[u8] {
+        &self.canonical
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::digest(&self.canonical).into()
+    }
+    pub fn parent(&self) -> Result<&TopologyParticipant> {
+        self.header
+            .parents
+            .iter()
+            .find(|p| p.lineage.group_id == self.group_id)
+            .ok_or_else(|| invalid("terminal barrier parent is absent"))
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Envelope {
     pub position: Position,
     pub schema_digest: [u8; 32],
-    pub operation: OperationId,
+    pub operation: Option<OperationId>,
     pub transaction: Option<Finalization>,
     pub events: Vec<Event>,
+    pub terminal_barrier: Option<Barrier>,
 }
 impl Envelope {
     fn budget_bytes(&self) -> usize {
-        88 + self
-            .transaction
-            .as_ref()
-            .map_or(0, Finalization::budget_bytes)
+        ENVELOPE_HEADER_BYTES
+            + self
+                .terminal_barrier
+                .as_ref()
+                .map_or(0, |b| b.canonical.len())
+            + self
+                .transaction
+                .as_ref()
+                .map_or(0, Finalization::budget_bytes)
             + self
                 .events
                 .iter()
@@ -629,7 +996,14 @@ impl Envelope {
 impl TryFrom<wire::CdcEnvelope> for Envelope {
     type Error = RpcStatus;
     fn try_from(v: wire::CdcEnvelope) -> Result<Self> {
-        if v.events.is_empty() || v.events.len() > MAX_EVENTS_PER_ENVELOPE as usize {
+        let is_barrier = v.terminal_barrier.is_some();
+        if v.events.len() > MAX_EVENTS_PER_ENVELOPE as usize
+            || if is_barrier {
+                !v.events.is_empty() || v.operation.is_some() || v.transaction.is_some()
+            } else {
+                v.events.is_empty() || v.operation.is_none()
+            }
+        {
             return Err(invalid("invalid CDC envelope event count"));
         }
         let position: Position = required(v.position)?.try_into()?;
@@ -663,10 +1037,16 @@ impl TryFrom<wire::CdcEnvelope> for Envelope {
         let result = Self {
             position,
             schema_digest: digest(v.schema_digest)?,
-            operation: required(v.operation)?.try_into()?,
+            operation: v.operation.map(OperationId::try_from).transpose()?,
+            terminal_barrier: v.terminal_barrier.map(Barrier::decode).transpose()?,
             transaction: v.transaction.map(Finalization::try_from).transpose()?,
             events,
         };
+        if let Some(b) = &result.terminal_barrier {
+            if b.position != result.position || b.header.schema_digest != result.schema_digest {
+                return Err(invalid("terminal barrier changed envelope cut/schema"));
+            }
+        }
         if let Some(t) = &result.transaction {
             let p = t
                 .decision
@@ -678,7 +1058,7 @@ impl TryFrom<wire::CdcEnvelope> for Envelope {
                 .prepared
                 .ok_or_else(|| invalid("missing CDC prepared position"))?;
             if t.decision.phase != DecisionPhase::DecisionCommit
-                || t.decision.operation != result.operation
+                || Some(&t.decision.operation) != result.operation.as_ref()
                 || p.schema_digest != result.schema_digest
                 || prepared.index >= position.index
                 || prepared.term > position.term
@@ -698,10 +1078,12 @@ pub struct Batch {
     pub next: Cursor,
     pub cut: Position,
     pub envelopes: Vec<Envelope>,
+    pub current_starts: Checkpoint,
 }
 impl Batch {
     pub fn budget_bytes(&self) -> usize {
-        116 + self.definition.budget_bytes()
+        120 + self.definition.budget_bytes()
+            + self.current_starts.budget_bytes()
             + self
                 .envelopes
                 .iter()
@@ -715,7 +1097,9 @@ impl TryFrom<wire::CdcBatch> for Batch {
         if v.envelopes.len() > MAX_RECORDS as usize {
             return Err(invalid("too many CDC envelopes"));
         }
+        let current_starts: Checkpoint = required(v.current_starts)?.try_into()?;
         let result = Self {
+            current_starts,
             id: id(v.id)?,
             definition: required(v.definition)?.try_into()?,
             lineage: required(v.lineage)?.try_into()?,
@@ -730,8 +1114,7 @@ impl TryFrom<wire::CdcBatch> for Batch {
         };
         let end = Cursor::after(result.cut)?;
         let start = result
-            .definition
-            .start
+            .current_starts
             .0
             .get(&result.lineage)
             .ok_or_else(|| invalid("foreign CDC batch lineage"))?;
@@ -751,6 +1134,19 @@ impl TryFrom<wire::CdcBatch> for Batch {
                 return Err(invalid("CDC envelopes changed order/cut"));
             }
             previous = e.position.index;
+            if let Some(barrier) = &e.terminal_barrier {
+                let header = &barrier.header;
+                if barrier.parent()?.lineage != result.lineage
+                    || header.cluster_id != result.definition.cluster_id
+                    || header.database_id != result.definition.database_id
+                    || header.domain_id != result.definition.domain_id
+                    || result.from.covers(&Cursor::after(barrier.position)?)?
+                {
+                    return Err(invalid(
+                        "terminal barrier changed namespace/lineage or precedes cursor",
+                    ));
+                }
+            }
             for event in &e.events {
                 if !result
                     .definition
@@ -1393,6 +1789,7 @@ mod tests {
             schema_digest: [11; 32].to_vec(),
             operation: Some(operation()),
             transaction: None,
+            terminal_barrier: None,
             events: vec![wire::CdcEvent {
                 mutation_ordinal: 3,
                 mutation: Some(wire::CdcMutation {
@@ -1415,6 +1812,7 @@ mod tests {
             next: Some(Cursor::after(position()).unwrap().encode().unwrap()),
             cut: Some(position().encode()),
             envelopes: vec![envelope()],
+            current_starts: Some(checkpoint().encode().unwrap()),
         }
     }
     fn poll() -> wire::CdcPoll {
@@ -1426,6 +1824,415 @@ mod tests {
             floor: Some(Cursor::beginning().encode().unwrap()),
             cut: Some(position().encode()),
         }
+    }
+    // Shared Java/Rust compact FREEZE fixture: canonical TopologyChange.Header + parent cut.
+    const BARRIER_HEX: &str = concat!(
+        "4e5446520000021454434844121212121212121212121212121212120303030303030303030303030303030304040404",
+        "040404040404040404040404050505050505050505050505050505050000000000000000010000000000000000000000",
+        "00000000010b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b1313131313131313131313",
+        "131313131313131313131313131313131313131313080808080808080808080808080808080808080808080808080808",
+        "080808080814141414141414141414141414141414141414141414141414141414141414140000000101010101010101",
+        "010101010101010101020202020202020202020202020202020000000000000003000000000000000000000001101010",
+        "101010101010101010101010100011111111111111111111111111111111111111111111111111111111111111110000",
+        "000215151515151515151515151515151515161616161616161616161616161616160000000000000004000000000000",
+        "00000000000119191919191919191919191919191919001b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b",
+        "1b1b1b1b1b1b1b1717171717171717171717171717171718181818181818181818181818181818000000000000000400",
+        "00000000000000000000011a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a001c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c",
+        "1c1c1c1c1c1c1c1c1c1c1c1c02020202020202020202020202020202000000000000000200000000000000041d1d1d1d",
+        "1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e",
+        "1e1e1e1e1e1e1e1e1e1e1e1e",
+    );
+    fn barrier_bytes() -> Vec<u8> {
+        BARRIER_HEX
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| {
+                let digit = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+                digit(digits[0]) * 16 + digit(digits[1])
+            })
+            .collect()
+    }
+    fn barrier_envelope() -> wire::CdcEnvelope {
+        wire::CdcEnvelope {
+            position: Some(position().encode()),
+            schema_digest: [11; 32].to_vec(),
+            operation: None,
+            transaction: None,
+            events: vec![],
+            terminal_barrier: Some(barrier_bytes()),
+        }
+    }
+    #[test]
+    fn terminal_barrier_preserves_shared_compact_header_and_has_no_fake_operation() {
+        let barrier = Barrier::decode(barrier_bytes()).unwrap();
+        assert_eq!(barrier.canonical(), barrier_bytes());
+        assert_eq!(barrier.header.kind, TopologyKind::Split);
+        assert_eq!(barrier.parent().unwrap().lineage, lineage());
+        assert_eq!(barrier.parent().unwrap().configuration_version, 0);
+        assert_eq!(
+            barrier.parent().unwrap().owners[0].identity_digest,
+            [17; 32]
+        );
+        assert_eq!(
+            barrier.digest(),
+            <[u8; 32]>::from(Sha256::digest(barrier_bytes()))
+        );
+        let wire = barrier_envelope();
+        let decoded =
+            Envelope::try_from(wire::CdcEnvelope::decode(wire.encode_to_vec().as_slice()).unwrap())
+                .unwrap();
+        assert!(decoded.operation.is_none());
+        assert!(decoded.transaction.is_none());
+        assert!(decoded.events.is_empty());
+        assert_eq!(decoded.terminal_barrier.unwrap(), barrier);
+        let mut b = batch();
+        b.envelopes = vec![barrier_envelope()];
+        let decoded = Batch::try_from(b).unwrap();
+        assert_eq!(
+            decoded.budget_bytes(),
+            120 + definition().budget_bytes()
+                + checkpoint().budget_bytes()
+                + ENVELOPE_HEADER_BYTES
+                + barrier_bytes().len()
+        );
+    }
+    #[test]
+    fn terminal_barrier_rejects_mixed_missing_and_oversized_payloads() {
+        let mut v = barrier_envelope();
+        v.operation = Some(operation());
+        assert!(Envelope::try_from(v).is_err());
+        let mut v = barrier_envelope();
+        v.events = envelope().events;
+        assert!(Envelope::try_from(v).is_err());
+        let mut v = barrier_envelope();
+        v.transaction = Some(finalization());
+        assert!(Envelope::try_from(v).is_err());
+        let mut v = barrier_envelope();
+        v.terminal_barrier = None;
+        assert!(Envelope::try_from(v).is_err());
+        let mut v = barrier_envelope();
+        v.terminal_barrier = Some(vec![]);
+        assert!(Envelope::try_from(v).is_err());
+        assert!(Barrier::decode(vec![0; MAX_BARRIER_BYTES + 1]).is_err());
+        let mut encoded = barrier_bytes();
+        encoded.pop();
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[0] ^= 1;
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[7] ^= 1;
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[8] ^= 1;
+        assert!(Barrier::decode(encoded).is_err());
+    }
+    #[test]
+    fn terminal_barrier_rejects_changed_owner_configuration_generation_and_parent_identity() {
+        // Compact body starts with its eight-byte frame header; Header parent list begins at221.
+        let header = 8usize;
+        let parent = header + 225;
+        let owner = parent + 52;
+        let mut encoded = barrier_bytes();
+        encoded[owner + 16] = 2;
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[owner + 16] = 1;
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[parent + 40..parent + 48].copy_from_slice(&(-1i64).to_be_bytes());
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[header + 85..header + 93].copy_from_slice(&2i64.to_be_bytes());
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[header + 69..header + 77].copy_from_slice(&(-1i64).to_be_bytes());
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        encoded[header + 68] = 2;
+        assert!(Barrier::decode(encoded).is_err());
+        let first_target = parent + 101 + 4;
+        let mut encoded = barrier_bytes();
+        encoded[first_target..first_target + 16].copy_from_slice(&lineage().range_id);
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        let duplicate_range = encoded[first_target..first_target + 16].to_vec();
+        encoded[first_target + 101..first_target + 117].copy_from_slice(&duplicate_range);
+        assert!(Barrier::decode(encoded).is_err());
+        let mut encoded = barrier_bytes();
+        let cut_index = encoded.len() - 72;
+        encoded[cut_index..cut_index + 8].copy_from_slice(&0i64.to_be_bytes());
+        assert!(Barrier::decode(encoded).is_err());
+    }
+    #[test]
+    fn compact_topology_header_rejects_duplicate_owners_and_generation_overflow() {
+        let encoded = barrier_bytes();
+        let mut header = encoded[8..540].to_vec();
+        let duplicate_owner = header[277..326].to_vec();
+        header[273..277].copy_from_slice(&2i32.to_be_bytes());
+        header.splice(326..326, duplicate_owner);
+        assert!(TopologyHeader::decode(&header).is_err());
+        let mut header = encoded[8..540].to_vec();
+        header[77..85].copy_from_slice(&i64::MAX.to_be_bytes());
+        header[85..93].copy_from_slice(&i64::MIN.to_be_bytes());
+        assert!(TopologyHeader::decode(&header).is_err());
+    }
+    #[test]
+    fn compact_merge_header_has_two_parents_and_one_distinct_target() {
+        let encoded = barrier_bytes();
+        let mut header = encoded[8..229].to_vec();
+        header[68] = 1;
+        header.extend_from_slice(&2i32.to_be_bytes());
+        header.extend_from_slice(&encoded[233..334]);
+        header.extend_from_slice(&encoded[338..439]);
+        header.extend_from_slice(&1i32.to_be_bytes());
+        header.extend_from_slice(&encoded[439..540]);
+        let mut freeze = encoded[..8].to_vec();
+        freeze.extend_from_slice(&header);
+        freeze.extend_from_slice(&encoded[540..]);
+        let barrier = Barrier::decode(freeze).unwrap();
+        assert_eq!(barrier.header.kind, TopologyKind::Merge);
+        assert_eq!(barrier.header.parents.len(), 2);
+        assert_eq!(barrier.header.targets.len(), 1);
+        assert_eq!(barrier.parent().unwrap().lineage, lineage());
+    }
+    #[test]
+    fn terminal_barrier_binds_schema_cut_namespace_lineage_and_consumed_frontier() {
+        let mut v = barrier_envelope();
+        v.schema_digest = [99; 32].to_vec();
+        assert!(Envelope::try_from(v).is_err());
+        let mut v = barrier_envelope();
+        v.position.as_mut().unwrap().index += 1;
+        assert!(Envelope::try_from(v).is_err());
+        for namespace in 0..3 {
+            let mut b = batch();
+            b.envelopes = vec![barrier_envelope()];
+            let encoded = b.envelopes[0].terminal_barrier.as_mut().unwrap();
+            let offset = 8 + 20 + 16 * namespace;
+            encoded[offset] ^= 1;
+            assert!(Batch::try_from(b).is_err());
+        }
+        let mut b = batch();
+        b.envelopes = vec![barrier_envelope()];
+        b.envelopes[0].terminal_barrier.as_mut().unwrap()[8 + 225 + 39] ^= 1;
+        assert!(Batch::try_from(b).is_err());
+        let mut b = batch();
+        b.envelopes = vec![barrier_envelope()];
+        b.from = b.next.clone();
+        assert!(Batch::try_from(b).is_err());
+        let mut b = batch();
+        b.envelopes = vec![barrier_envelope()];
+        b.cut.as_mut().unwrap().index -= 1;
+        assert!(Batch::try_from(b).is_err());
+    }
+    fn binary_checkpoint(checkpoint: &Checkpoint) -> Vec<u8> {
+        let mut encoded = (checkpoint.0.len() as i32).to_be_bytes().to_vec();
+        for (lineage, cursor) in &checkpoint.0 {
+            encoded.extend_from_slice(&lineage.range_id);
+            encoded.extend_from_slice(&lineage.group_id);
+            encoded.extend_from_slice(&lineage.range_epoch.to_be_bytes());
+            encoded.extend_from_slice(&cursor.position.term.to_be_bytes());
+            encoded.extend_from_slice(&cursor.position.index.to_be_bytes());
+            encoded.extend_from_slice(&cursor.mutation_ordinal.to_be_bytes());
+        }
+        encoded
+    }
+    fn child_starts() -> Checkpoint {
+        Checkpoint(BTreeMap::from([
+            (
+                Lineage {
+                    range_id: [21; 16],
+                    group_id: [22; 16],
+                    range_epoch: 4,
+                },
+                Cursor::after(Position { term: 1, index: 4 }).unwrap(),
+            ),
+            (
+                Lineage {
+                    range_id: [23; 16],
+                    group_id: [24; 16],
+                    range_epoch: 4,
+                },
+                Cursor::after(Position { term: 1, index: 4 }).unwrap(),
+            ),
+        ]))
+    }
+    fn handoff_bytes() -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let parent = checkpoint()
+            .advance(lineage(), Cursor::after(position()).unwrap())
+            .unwrap();
+        for body in [
+            barrier_bytes()[8..540].to_vec(),
+            binary_checkpoint(&parent),
+            binary_checkpoint(&child_starts()),
+        ] {
+            encoded.extend_from_slice(&(body.len() as i32).to_be_bytes());
+            encoded.extend_from_slice(&body);
+        }
+        encoded
+    }
+    fn successor_status() -> wire::CdcStatus {
+        let starts = child_starts().encode().unwrap();
+        wire::CdcStatus {
+            phase: LocalPhase::Active as i32,
+            state: Some(wire::CdcState {
+                definition: Some(definition().encode().unwrap()),
+                phase: StatePhase::SubscriptionActive as i32,
+                generation: 3,
+                checkpoint: Some(starts.clone()),
+                delivered: Some(starts.clone()),
+                current_starts: Some(starts),
+                latest_handoff: Some(handoff_bytes()),
+            }),
+        }
+    }
+    fn child_batch() -> wire::CdcBatch {
+        let starts = child_starts();
+        let (lineage, from) = starts.0.first_key_value().unwrap();
+        let position = Position { term: 1, index: 5 };
+        let mut event = envelope();
+        event.position = Some(position.encode());
+        wire::CdcBatch {
+            id: [12; 16].to_vec(),
+            definition: Some(definition().encode().unwrap()),
+            lineage: Some(lineage.encode().unwrap()),
+            from: Some(from.encode().unwrap()),
+            next: Some(Cursor::after(position).unwrap().encode().unwrap()),
+            cut: Some(position.encode()),
+            envelopes: vec![event],
+            current_starts: Some(starts.encode().unwrap()),
+        }
+    }
+    #[test]
+    fn successor_status_preserves_original_definition_and_current_child_frontier() {
+        let wire = successor_status();
+        let decoded = Status::decode(
+            wire::CdcStatus::decode(wire.encode_to_vec().as_slice()).unwrap(),
+            definition().subscription_id,
+        )
+        .unwrap();
+        assert_eq!(decoded.state.definition, definition());
+        assert_eq!(decoded.state.generation, 3);
+        assert_eq!(decoded.state.current_starts, child_starts());
+        assert_eq!(decoded.state.checkpoint, child_starts());
+        let handoff = decoded.state.latest_handoff.unwrap();
+        assert_eq!(handoff.canonical(), handoff_bytes());
+        assert_eq!(
+            handoff.parent_terminal.0[&lineage()],
+            Cursor::after(position()).unwrap()
+        );
+        assert_eq!(handoff.child_starts, child_starts());
+    }
+    #[test]
+    fn child_batch_is_admitted_by_current_starts_without_rewriting_original_selection() {
+        let wire = child_batch();
+        let decoded =
+            Batch::try_from(wire::CdcBatch::decode(wire.encode_to_vec().as_slice()).unwrap())
+                .unwrap();
+        assert!(!decoded.definition.start.0.contains_key(&decoded.lineage));
+        assert!(decoded.current_starts.0.contains_key(&decoded.lineage));
+        assert_eq!(decoded.definition.columns, definition().columns);
+        assert_eq!(
+            decoded.budget_bytes(),
+            120 + definition().budget_bytes()
+                + child_starts().budget_bytes()
+                + ENVELOPE_HEADER_BYTES
+                + 4
+                + 28
+        );
+        let mut wire = child_batch();
+        wire.current_starts = None;
+        assert!(Batch::try_from(wire).is_err());
+        let mut wire = child_batch();
+        wire.current_starts = Some(checkpoint().encode().unwrap());
+        assert!(Batch::try_from(wire).is_err());
+        let mut wire = child_batch();
+        let mut starts = wire.current_starts.take().unwrap();
+        starts.entries = vec![starts.entries[0].clone(); MAX_LINEAGES + 1];
+        wire.current_starts = Some(starts);
+        assert!(Batch::try_from(wire).is_err());
+        let mut wire = child_batch();
+        wire.from = Some(Cursor::beginning().encode().unwrap());
+        assert!(Batch::try_from(wire).is_err());
+    }
+    #[test]
+    fn successor_status_rejects_missing_handoff_and_crossed_current_delivery_coverage() {
+        let subscription = definition().subscription_id;
+        let mut wire = successor_status();
+        wire.state.as_mut().unwrap().current_starts = None;
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        wire.state.as_mut().unwrap().latest_handoff = None;
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        wire.state.as_mut().unwrap().latest_handoff = Some(vec![]);
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        wire.state.as_mut().unwrap().latest_handoff = Some(vec![0; MAX_HANDOFF_BYTES + 1]);
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        wire.state.as_mut().unwrap().checkpoint = Some(checkpoint().encode().unwrap());
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        wire.state
+            .as_mut()
+            .unwrap()
+            .latest_handoff
+            .as_mut()
+            .unwrap()[24] ^= 1;
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        wire.state.as_mut().unwrap().generation = 0;
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        let state = wire.state.as_mut().unwrap();
+        let mut starts = child_starts();
+        starts.0.values_mut().next().unwrap().position.index += 1;
+        state.current_starts = Some(starts.encode().unwrap());
+        state.checkpoint = state.current_starts.clone();
+        state.delivered = state.current_starts.clone();
+        assert!(Status::decode(wire, subscription).is_err());
+        let mut wire = successor_status();
+        let state = wire.state.as_mut().unwrap();
+        let mut starts = child_starts();
+        starts
+            .0
+            .insert(lineage(), Cursor::after(position()).unwrap());
+        state.current_starts = Some(starts.encode().unwrap());
+        state.checkpoint = state.current_starts.clone();
+        state.delivered = state.current_starts.clone();
+        assert!(Status::decode(wire, subscription).is_err());
+    }
+    #[test]
+    fn compact_handoff_requires_canonical_qualified_terminal_and_activation_cuts() {
+        let encoded = handoff_bytes();
+        assert_eq!(encoded.len(), 732);
+        assert!(Handoff::decode(encoded.clone()).is_ok());
+        let mut malformed = encoded.clone();
+        malformed.push(0);
+        assert!(Handoff::decode(malformed).is_err());
+        let mut malformed = encoded.clone();
+        malformed[3] ^= 1;
+        assert!(Handoff::decode(malformed).is_err());
+        // header blob532 + length4, parent blob64 + length4, then child blob124 + length4.
+        let parent = 4 + 532 + 4;
+        let children = parent + 64 + 4;
+        let mut malformed = encoded.clone();
+        malformed[parent + 4 + 56..parent + 4 + 60].copy_from_slice(&0i32.to_be_bytes());
+        assert!(Handoff::decode(malformed).is_err());
+        let mut malformed = encoded.clone();
+        malformed[children + 4 + 39] ^= 1;
+        assert!(Handoff::decode(malformed).is_err());
+        let mut malformed = encoded.clone();
+        let first = malformed[children + 4..children + 64].to_vec();
+        let second = malformed[children + 64..children + 124].to_vec();
+        malformed[children + 4..children + 64].copy_from_slice(&second);
+        malformed[children + 64..children + 124].copy_from_slice(&first);
+        assert!(Handoff::decode(malformed).is_err());
+        let mut malformed = encoded;
+        malformed[parent + 4 + 48..parent + 4 + 56].copy_from_slice(&0i64.to_be_bytes());
+        assert!(Handoff::decode(malformed).is_err());
     }
     #[test]
     fn definition_and_checkpoint_roundtrip_qualified_lineages() {
@@ -1487,7 +2294,11 @@ mod tests {
         assert_eq!(batch.next, Cursor::after(position()).unwrap());
         assert_eq!(
             batch.budget_bytes(),
-            116 + definition().budget_bytes() + 88 + 4 + 28
+            120 + definition().budget_bytes()
+                + checkpoint().budget_bytes()
+                + ENVELOPE_HEADER_BYTES
+                + 4
+                + 28
         );
     }
     #[test]
@@ -1663,6 +2474,8 @@ mod tests {
             generation: 0,
             checkpoint: Some(checkpoint().encode().unwrap()),
             delivered: Some(checkpoint().encode().unwrap()),
+            current_starts: Some(checkpoint().encode().unwrap()),
+            latest_handoff: None,
         };
         let status = wire::CdcStatus {
             state: Some(state()),

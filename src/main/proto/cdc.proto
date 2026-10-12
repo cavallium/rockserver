@@ -16,7 +16,7 @@ message CdcDefinition {
   bytes directory_digest = 6; repeated bytes columns = 7; CdcCheckpoint start = 8;
 }
 enum CdcStatePhase { SUBSCRIPTION_ACTIVE = 0; SUBSCRIPTION_CLOSED = 1; }
-message CdcState { CdcDefinition definition = 1; CdcStatePhase phase = 2; int64 generation = 3; CdcCheckpoint checkpoint = 4; CdcCheckpoint delivered = 5; }
+message CdcState { CdcDefinition definition = 1; CdcStatePhase phase = 2; int64 generation = 3; CdcCheckpoint checkpoint = 4; CdcCheckpoint delivered = 5; CdcCheckpoint current_starts = 6; optional bytes latest_handoff = 7; }
 enum CdcLocalPhase { CREATE = 0; ACTIVE = 1; CLOSING = 2; CLOSED = 3; CONFLICT = 4; }
 message CdcStatus { CdcState state = 1; CdcLocalPhase phase = 2; }
 enum CdcMutationKind { MUTATION_PUT = 0; MUTATION_DELETE = 1; MUTATION_MERGE = 2; MUTATION_DELETE_RANGE = 3; MUTATION_BUCKET_PUT = 4; MUTATION_BUCKET_DELETE = 5; MUTATION_BUCKET_MERGE = 6; }
@@ -31,8 +31,8 @@ message CdcDecision {
   CdcDecisionPhase phase = 9; repeated CdcParticipant participants = 10;
 }
 message CdcFinalization { bytes home_group = 1; int64 home_epoch = 2; bytes participant_group = 3; CdcOperationId recovery_operation = 4; CdcDecision decision = 5; }
-message CdcEnvelope { CdcPosition position = 1; bytes schema_digest = 2; CdcOperationId operation = 3; CdcFinalization transaction = 4; repeated CdcEvent events = 5; }
-message CdcBatch { bytes id = 1; CdcDefinition definition = 2; CdcLineage lineage = 3; CdcCursor from = 4; CdcCursor next = 5; CdcPosition cut = 6; repeated CdcEnvelope envelopes = 7; }
+message CdcEnvelope { CdcPosition position = 1; bytes schema_digest = 2; CdcOperationId operation = 3; CdcFinalization transaction = 4; repeated CdcEvent events = 5; optional bytes terminal_barrier = 6; }
+message CdcBatch { bytes id = 1; CdcDefinition definition = 2; CdcLineage lineage = 3; CdcCursor from = 4; CdcCursor next = 5; CdcPosition cut = 6; repeated CdcEnvelope envelopes = 7; CdcCheckpoint current_starts = 8; }
 enum CdcOutcome { DATA = 0; GAP = 1; TOO_LARGE = 2; }
 message CdcPoll { CdcLineage lineage = 1; CdcOutcome outcome = 2; CdcBatch batch = 3; int32 required_bytes = 4; CdcCursor floor = 5; CdcPosition cut = 6; }
 enum CdcTopology { RANGE_ACTIVE = 0; RANGE_FENCED = 1; RANGE_RETIRED = 2; }

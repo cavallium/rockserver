@@ -47,7 +47,7 @@ public final class RatisCdcSubscriptionCatalogue {
         try { return Capacity.decode(bytes); } catch(IllegalArgumentException invalid) { throw new IOException("Invalid CDC capacity reply",invalid); }
     }
     public DistributedCommand prepareCreate(OperationId operation,DistributedCdcSubscription.Definition definition,RangeDirectory source,Capacity expected) {
-        var state=DistributedCdcSubscription.initial(definition); byte[] encoded=state.encode(); var capacity=(expected==null ? new Capacity(0,0) : expected).reserve(encoded.length);
+        var state=DistributedCdcSubscription.initial(definition); byte[] encoded=state.encode(); var capacity=(expected==null ? new Capacity(0,0) : expected).reserve(DistributedCdcSubscription.MAX_BYTES);
         var command=new DistributedCommand(group,epoch,schema,operation,List.of(new Mutation(Mutation.Kind.PUT,column,stateKey(definition.subscriptionId()),encoded),new Mutation(Mutation.Kind.PUT,column,capacityKey(),capacity.encode())),
                 List.of(new KeyPredicate(column,stateKey(definition.subscriptionId()),null),new KeyPredicate(column,capacityKey(),expected==null ? null : expected.encode()),new KeyPredicate(column,domainKey(definition.domainId()),RangeDirectoryCodec.encode(source))));
         validator.accept(command); return command;
@@ -62,6 +62,12 @@ public final class RatisCdcSubscriptionCatalogue {
     }
     public DistributedCommand prepareAcknowledgement(OperationId operation,DistributedCdcSubscription expected,DistributedCdcCheckpoint acknowledged) {
         return transition(operation,expected,expected.acknowledge(acknowledged));
+    }
+    /** Committed topology metadata is guarded together with the exact subscription predecessor. Fresh native admission is mandatory. */
+    public DistributedCommand prepareLineageTransition(OperationId operation,DistributedCdcSubscription expected,DistributedCdcBarrierHandoff handoff,TopologyChange.Definition topology,TopologyChange.State committed) {
+        handoff.requireAuthority(topology,committed); var next=expected.lineageTransition(handoff); byte[] key=stateKey(expected.definition().subscriptionId());
+        var command=new DistributedCommand(group,epoch,schema,operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,next.encode())),List.of(new KeyPredicate(column,key,expected.encode()),new KeyPredicate(column,RatisTopologyCatalogue.identityKey(topology.intentId()),topology.digest()),new KeyPredicate(column,RatisTopologyCatalogue.stateKey(topology.intentId()),committed.encode())));
+        validator.accept(command); return command;
     }
     private DistributedCommand transition(OperationId operation,DistributedCdcSubscription expected,DistributedCdcSubscription next) {
         byte[] key=stateKey(expected.definition().subscriptionId()); var command=new DistributedCommand(group,epoch,schema,operation,
@@ -87,10 +93,23 @@ public final class RatisCdcSubscriptionCatalogue {
     public static boolean isCommand(DistributedCommand command) {
         return command.mutations().stream().anyMatch(m->{ var key=m.key(); return key.length==17 && key[0]==STATE || key.length==1 && key[0]==CAPACITY; });
     }
+    /** Qualify unchanged original cuts despite optional late topology proof rows. Native CAS still saves CONFLICT for the stale exact guard. */
+    static boolean requalifiesTopologyGuard(DistributedCommand command,int index,byte[] currentValue) {
+        if(index!=2 || currentValue==null || !isLineageTransition(command)) return false;
+        try {
+            var next=DistributedCdcSubscription.decode(command.mutations().getFirst().value()); var current=TopologyChange.State.decode(currentValue); var original=next.latestHandoff();
+            return original!=null && original.equals(DistributedCdcBarrierHandoff.from(original.header(),current));
+        } catch(IllegalArgumentException invalid) { return false; }
+    }
+    public static boolean isLineageTransition(DistributedCommand command) {
+        if(!isCommand(command) || command.mutations().size()!=1 || command.predicates().size()!=3 || command.predicates().getFirst().expectedValue()==null) return false;
+        var next=DistributedCdcSubscription.decode(command.mutations().getFirst().value()); var old=DistributedCdcSubscription.decode(command.predicates().getFirst().expectedValue());
+        return next.phase()==DistributedCdcSubscription.Phase.ACTIVE && !next.currentStarts().equals(old.currentStarts());
+    }
     public static boolean requiresOwnerAdmission(DistributedCommand command) {
-        if(!isCommand(command) || command.mutations().size()!=1 || command.predicates().size()!=1 || command.predicates().getFirst().expectedValue()==null) return false;
+        if(!isCommand(command) || command.mutations().size()!=1 || (command.predicates().size()!=1 && command.predicates().size()!=3) || command.predicates().getFirst().expectedValue()==null) return false;
         var next=DistributedCdcSubscription.decode(command.mutations().getFirst().value()); var previous=DistributedCdcSubscription.decode(command.predicates().getFirst().expectedValue());
-        return next.phase()==DistributedCdcSubscription.Phase.ACTIVE && next.checkpoint().equals(previous.checkpoint()) && !next.delivered().equals(previous.delivered());
+        return next.phase()==DistributedCdcSubscription.Phase.ACTIVE && (!next.currentStarts().equals(previous.currentStarts()) || next.checkpoint().equals(previous.checkpoint()) && !next.delivered().equals(previous.delivered()));
     }
     public static Consumer<DistributedCommand> validator(UUID cluster,UUID database,UUID group,long epoch,byte[] schema,UUID column) {
         Objects.requireNonNull(cluster); Objects.requireNonNull(database); Objects.requireNonNull(group); Objects.requireNonNull(column); byte[] digest=schema.clone();
@@ -107,16 +126,23 @@ public final class RatisCdcSubscriptionCatalogue {
                 predicate(command.predicates().get(0),column,mutation.key()); if(command.predicates().get(0).expectedValue()!=null) throw new IllegalArgumentException("CDC creation needs absent identity");
                 var ledger=command.mutations().get(1); predicate(command.predicates().get(1),column,capacityKey());
                 if(ledger.kind()!=Mutation.Kind.PUT || ledger.returnMode()!=Mutation.ReturnMode.NONE || !ledger.columnId().equals(column) || !Arrays.equals(ledger.key(),capacityKey())
-                        || !Capacity.decode(ledger.value()).equals(Capacity.decode(command.predicates().get(1).expectedValue()).reserve(mutation.value().length))) throw new IllegalArgumentException("CDC capacity reservation changed");
+                        || !Capacity.decode(ledger.value()).equals(Capacity.decode(command.predicates().get(1).expectedValue()).reserve(DistributedCdcSubscription.MAX_BYTES))) throw new IllegalArgumentException("CDC capacity reservation changed");
                 var source=command.predicates().get(2); predicate(source,column,domainKey(definition.domainId()));
                 if(source.expectedValue()==null || source.expectedValue().length>RatisCatalogue.MAX_DIRECTORY_BYTES) throw new IllegalArgumentException("CDC creation lacks bounded source directory");
                 var directory=RangeDirectoryCodec.decode(source.expectedValue());
                 if(!definition.equals(DistributedCdcSubscription.Definition.create(definition.subscriptionId(),definition.incarnationId(),directory,definition.columns(),definition.start()))) throw new IllegalArgumentException("CDC creation source binding changed");
-            } else if(command.mutations().size()==1 && command.predicates().size()==1) {
+            } else if(command.mutations().size()==1 && (command.predicates().size()==1 || command.predicates().size()==3)) {
                 var previous=command.predicates().getFirst(); predicate(previous,column,mutation.key()); if(previous.expectedValue()==null) throw new IllegalArgumentException("CDC closure lacks predecessor");
                 var old=DistributedCdcSubscription.decode(previous.expectedValue());
-                if(mutation.value().length!=previous.expectedValue().length) throw new IllegalArgumentException("CDC transition changed reserved capacity");
+
                 next.requireSuccessorOf(old);
+                boolean handoff=!next.currentStarts().equals(old.currentStarts());
+                if(handoff) {
+                    if(command.predicates().size()!=3 || next.latestHandoff()==null) throw new IllegalArgumentException("CDC handoff lacks immutable topology witnesses");
+                    var handoffProof=next.latestHandoff(); var header=handoffProof.header(); var committed=TopologyChange.State.decode(command.predicates().get(2).expectedValue());
+                    predicate(command.predicates().get(1),column,RatisTopologyCatalogue.identityKey(header.intentId())); predicate(command.predicates().get(2),column,RatisTopologyCatalogue.stateKey(header.intentId()));
+                    if(!Arrays.equals(command.predicates().get(1).expectedValue(),header.definitionDigest()) || !handoffProof.equals(DistributedCdcBarrierHandoff.from(header,committed))) throw new IllegalArgumentException("CDC handoff changed immutable identity/original committed cuts");
+                } else if(command.predicates().size()!=1) throw new IllegalArgumentException("CDC ordinary progress has topology witnesses");
             } else throw new IllegalArgumentException("Invalid CDC lifecycle command shape");
         };
     }

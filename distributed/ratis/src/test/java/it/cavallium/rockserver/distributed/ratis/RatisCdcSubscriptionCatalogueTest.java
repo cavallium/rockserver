@@ -42,7 +42,7 @@ class RatisCdcSubscriptionCatalogueTest {
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(create).status()); // Successful response is lost by the caller.
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(create).status());
             var state=catalogue.read(definition.subscriptionId()); assertEquals(DistributedCdcSubscription.initial(definition),state);
-            var capacity=catalogue.readCapacity(); assertEquals(1,capacity.count()); assertEquals(17+state.encode().length,capacity.bytes());
+            var capacity=catalogue.readCapacity(); assertEquals(1,capacity.count()); assertEquals(17+DistributedCdcSubscription.MAX_BYTES,capacity.bytes());
             var close=catalogue.prepareClose(f.operation(2),state); assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(close).status());
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(close).status()); closed=catalogue.read(definition.subscriptionId());
             assertEquals(state.close(),closed); assertEquals(capacity,catalogue.readCapacity());

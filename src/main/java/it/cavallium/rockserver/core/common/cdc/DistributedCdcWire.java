@@ -50,11 +50,20 @@ public final class DistributedCdcWire {
         bounded(value,MAX_REQUEST_BYTES); count(value.getColumnsCount(),DistributedCdcSubscription.MAX_COLUMNS); exact(value.getDirectoryDigest(),32); if(!value.hasStart()) throw new IllegalArgumentException("Missing CDC initial checkpoint");
         return new DistributedCdcSubscription.Definition(uuid(value.getClusterId()),uuid(value.getDatabaseId()),uuid(value.getDomainId()),uuid(value.getSubscriptionId()),uuid(value.getIncarnationId()),value.getDirectoryDigest().toByteArray(),value.getColumnsList().stream().map(DistributedCdcWire::uuid).toList(),checkpoint(value.getStart()));
     }
-    public static CdcState state(DistributedCdcSubscription value) { return CdcState.newBuilder().setDefinition(definition(value.definition())).setGeneration(value.generation()).setPhase(value.phase()==DistributedCdcSubscription.Phase.ACTIVE ? CdcStatePhase.SUBSCRIPTION_ACTIVE : CdcStatePhase.SUBSCRIPTION_CLOSED).setCheckpoint(checkpoint(value.checkpoint())).setDelivered(checkpoint(value.delivered())).build(); }
+    public static CdcState state(DistributedCdcSubscription value) {
+        var builder=CdcState.newBuilder().setDefinition(definition(value.definition())).setGeneration(value.generation()).setPhase(value.phase()==DistributedCdcSubscription.Phase.ACTIVE ? CdcStatePhase.SUBSCRIPTION_ACTIVE : CdcStatePhase.SUBSCRIPTION_CLOSED).setCheckpoint(checkpoint(value.checkpoint())).setDelivered(checkpoint(value.delivered())).setCurrentStarts(checkpoint(value.currentStarts()));
+        if(value.latestHandoff()!=null) builder.setLatestHandoff(ByteString.copyFrom(value.latestHandoff().encode()));
+        return builder.build();
+    }
     public static DistributedCdcSubscription state(CdcState value) {
-        bounded(value,MAX_FRAME_BYTES); if(!value.hasDefinition() || !value.hasCheckpoint() || !value.hasDelivered() || value.getPhaseValue()<0 || value.getPhaseValue()>1) throw new IllegalArgumentException("Missing/invalid CDC state fields");
-        byte[] definition=definition(value.getDefinition()).encode(),ack=checkpoint(value.getCheckpoint()).encode(),delivered=checkpoint(value.getDelivered()).encode();
-        var encoded=ByteBuffer.allocate(DistributedCdcSubscription.HEADER_BYTES+definition.length+ack.length+delivered.length).putLong(value.getGeneration()).put((byte)value.getPhaseValue()).putInt(definition.length).put(definition).putInt(ack.length).put(ack).putInt(delivered.length).put(delivered).array();
+        bounded(value,MAX_FRAME_BYTES); if(!value.hasDefinition() || !value.hasCheckpoint() || !value.hasDelivered() || !value.hasCurrentStarts() || value.getPhaseValue()<0 || value.getPhaseValue()>1) throw new IllegalArgumentException("Missing/invalid CDC state fields");
+        byte[] definition=definition(value.getDefinition()).encode(),ack=checkpoint(value.getCheckpoint()).encode(),delivered=checkpoint(value.getDelivered()).encode(),starts=checkpoint(value.getCurrentStarts()).encode();
+        byte[] handoff=new byte[0];
+        if(value.hasLatestHandoff()) {
+            if(value.getLatestHandoff().size()>DistributedCdcBarrierHandoff.MAX_BYTES) throw new IllegalArgumentException("Oversized CDC handoff");
+            handoff=DistributedCdcBarrierHandoff.decode(value.getLatestHandoff().toByteArray()).encode();
+        }
+        var encoded=ByteBuffer.allocate(DistributedCdcSubscription.HEADER_BYTES+definition.length+ack.length+delivered.length+starts.length+handoff.length).putLong(value.getGeneration()).put((byte)value.getPhaseValue()).putInt(definition.length).put(definition).putInt(ack.length).put(ack).putInt(delivered.length).put(delivered).putInt(starts.length).put(starts).putInt(handoff.length).put(handoff).array();
         return DistributedCdcSubscription.decode(encoded);
     }
     public static CdcStatus status(DistributedCdcSubscriptions.Status value,UUID expected) {
@@ -105,11 +114,17 @@ public final class DistributedCdcWire {
         return new ParticipantFinalization(uuid(value.getHomeGroup()),value.getHomeEpoch(),uuid(value.getParticipantGroup()),operation(value.getRecoveryOperation()),decision);
     }
     public static CdcEnvelope envelope(DistributedCdcSubscriptions.Envelope value) {
-        var builder=CdcEnvelope.newBuilder().setPosition(position(value.position())).setSchemaDigest(ByteString.copyFrom(value.schemaDigest())).setOperation(operation(value.operation())); if(value.transaction()!=null) builder.setTransaction(finalization(value.transaction()));
+        var builder=CdcEnvelope.newBuilder().setPosition(position(value.position())).setSchemaDigest(ByteString.copyFrom(value.schemaDigest())); if(value.operation()!=null) builder.setOperation(operation(value.operation())); if(value.terminalBarrier()!=null) builder.setTerminalBarrier(ByteString.copyFrom(value.terminalBarrier().encode())); if(value.transaction()!=null) builder.setTransaction(finalization(value.transaction()));
         value.events().forEach(e->builder.addEvents(CdcEvent.newBuilder().setMutationOrdinal(e.cursor().mutationOrdinal()).setMutation(mutation(e.mutation())))); return builder.build();
     }
     public static DistributedCdcSubscriptions.Envelope envelope(CdcEnvelope value) {
-        bounded(value,MAX_FRAME_BYTES); count(value.getEventsCount(),DistributedCdcSubscriptions.MAX_EVENTS_PER_ENVELOPE); exact(value.getSchemaDigest(),32); if(!value.hasPosition() || !value.hasOperation()) throw new IllegalArgumentException("Missing CDC envelope metadata");
+        bounded(value,MAX_FRAME_BYTES); if(value.getEventsCount()>DistributedCdcSubscriptions.MAX_EVENTS_PER_ENVELOPE) throw new IllegalArgumentException("CDC envelope event count exceeds bound"); exact(value.getSchemaDigest(),32); if(!value.hasPosition()) throw new IllegalArgumentException("Missing CDC envelope position");
+        if(value.hasTerminalBarrier()) {
+            if(value.hasOperation() || value.hasTransaction() || value.getEventsCount()!=0 || value.getTerminalBarrier().size()>NativeTopologyFreeze.MAX_BYTES) throw new IllegalArgumentException("Mixed or oversized CDC barrier payload");
+            return new DistributedCdcSubscriptions.Envelope(position(value.getPosition()),value.getSchemaDigest().toByteArray(),null,null,List.of(),NativeTopologyFreeze.decode(value.getTerminalBarrier().toByteArray()));
+        }
+        if(!value.hasOperation()) throw new IllegalArgumentException("Missing CDC mutation operation");
+        count(value.getEventsCount(),DistributedCdcSubscriptions.MAX_EVENTS_PER_ENVELOPE);
         long payload=0;
         for(var event:value.getEventsList()) {
             var mutation=event.getMutation(); payload+=26L+mutation.getKey().size()+mutation.getValue().size();
@@ -121,12 +136,14 @@ public final class DistributedCdcWire {
         return new DistributedCdcSubscriptions.Envelope(position,value.getSchemaDigest().toByteArray(),operation(value.getOperation()),value.hasTransaction() ? finalization(value.getTransaction()) : null,events);
     }
     public static CdcBatch batch(DistributedCdcSubscriptions.Batch value) {
-        var builder=CdcBatch.newBuilder().setId(uuid(value.id())).setDefinition(definition(value.definition())).setLineage(lineage(value.lineage())).setFrom(cursor(value.from())).setNext(cursor(value.next())).setCut(position(value.cut())); value.envelopes().forEach(e->builder.addEnvelopes(envelope(e))); return bounded(builder.build(),MAX_FRAME_BYTES);
+        var builder=CdcBatch.newBuilder().setId(uuid(value.id())).setDefinition(definition(value.definition())).setCurrentStarts(checkpoint(value.currentStarts())).setLineage(lineage(value.lineage())).setFrom(cursor(value.from())).setNext(cursor(value.next())).setCut(position(value.cut())); value.envelopes().forEach(e->builder.addEnvelopes(envelope(e))); return bounded(builder.build(),MAX_FRAME_BYTES);
     }
     public static DistributedCdcSubscriptions.Batch batch(CdcBatch value,UUID expected) {
         bounded(value,MAX_FRAME_BYTES); if(value.getEnvelopesCount()>DistributedCdcSubscriptions.MAX_RECORDS || !value.hasDefinition() || !value.hasLineage() || !value.hasFrom() || !value.hasNext() || !value.hasCut()) throw new IllegalArgumentException("Missing/oversized CDC batch");
         var definition=definition(value.getDefinition()); if(!definition.subscriptionId().equals(expected)) throw new IllegalArgumentException("Crossed CDC batch identity");
-        return new DistributedCdcSubscriptions.Batch(uuid(value.getId()),definition,lineage(value.getLineage()),cursor(value.getFrom()),cursor(value.getNext()),position(value.getCut()),value.getEnvelopesList().stream().map(DistributedCdcWire::envelope).toList());
+        if(!value.hasCurrentStarts()) throw new IllegalArgumentException("Missing CDC current start frontier");
+        var starts=checkpoint(value.getCurrentStarts());
+        return new DistributedCdcSubscriptions.Batch(uuid(value.getId()),definition,lineage(value.getLineage()),cursor(value.getFrom()),cursor(value.getNext()),position(value.getCut()),value.getEnvelopesList().stream().map(DistributedCdcWire::envelope).toList(),starts);
     }
     /** New-page limits never replace the identity/budget of an already retained observation. */
     public static CdcPoll poll(DistributedCdcSubscriptions.Poll value,UUID expected,int maxRecords,int maxBytes) {

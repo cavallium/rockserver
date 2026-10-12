@@ -237,6 +237,7 @@ public final class RatisTopologyCatalogue {
         }
     }
     public static byte[] stateKey(UUID id) { return idKey(STATE,id); }
+    public static byte[] statePrefix() { return new byte[]{STATE}; }
     public static byte[] headKey(UUID id) { return idKey(HEAD,id); }
     public static byte[] identityKey(UUID id) { return idKey(IDENTITY,id); }
     public static byte[] definitionKey(byte[] digest) { if(digest.length!=32) throw new IllegalArgumentException("Invalid topology digest"); return ByteBuffer.allocate(33).put(DEFINITION).put(digest).array(); }

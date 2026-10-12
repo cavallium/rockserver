@@ -1077,6 +1077,16 @@ public final class RatisRoutedClient implements AutoCloseable {
         return new PreparedCommand(observed,descriptor,command);
     }
 
+    /** Trusted clock archive path only: no USER payload or session binding can use this frozen metadata route. */
+    PreparedCommand prepareMetadataSessionControl(DistributedCommand command,RangeDirectory frozen,RangeDescriptor descriptor){
+        Objects.requireNonNull(command);Objects.requireNonNull(frozen);Objects.requireNonNull(descriptor);requireNamespace(frozen);var control=command.sessionControl();
+        if(control==null || control.binding() || command.kind()!=DistributedCommand.Kind.SESSION_CONTROL || !control.authority().clusterId().equals(frozen.clusterId()) || !control.authority().databaseId().equals(frozen.databaseId()) || !Arrays.equals(command.schemaDigest(),frozen.schemaDigest()) || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch() || frozen.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Invalid frozen metadata clock route");
+        return new PreparedCommand(frozen,descriptor,command);
+    }
+    PreparedCommand restoreMetadataSessionControl(DistributedCommand command,RangeDirectory frozen,RangeDescriptor descriptor){return prepareMetadataSessionControl(command,frozen,descriptor);}
+    CommandResult executeMetadataSessionControl(PreparedCommand prepared)throws IOException{
+        prepareMetadataSessionControl(prepared.command(),prepared.source,prepared.descriptor());beginCall();try{var result=transport.command(prepared.descriptor(),prepared.command());if(result==null)throw new IOException("Missing metadata clock result");return result;}finally{endCall();}
+    }
     // Journal recovery preserves the exact original peer route even after a directory refresh.
     PreparedCommand restoreSessionControl(DistributedCommand command,RangeDescriptor descriptor) {
         var observed=schemaView(command.schemaDigest()); var control=command.sessionControl();

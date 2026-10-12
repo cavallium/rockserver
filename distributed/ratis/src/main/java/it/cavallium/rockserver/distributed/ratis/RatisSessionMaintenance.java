@@ -14,6 +14,8 @@ public final class RatisSessionMaintenance implements AutoCloseable {
                          RatisRoutedClient.PreparedCommand pending) {}
     private final RatisSessionEpochs epochs;
     private final RatisRoutedClient routed;
+    record ClockRoute(RangeDirectory directory,RangeDescriptor descriptor,boolean metadataOnly){ClockRoute{Objects.requireNonNull(directory);Objects.requireNonNull(descriptor);if(directory.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Clock route is outside frozen directory");}}
+    private final ClockRoute clockRoute;
     private final UUID group;
     private final long rangeEpoch;
     private final Path journal;
@@ -25,6 +27,10 @@ public final class RatisSessionMaintenance implements AutoCloseable {
 
     /** Parent directory must already exist on durable storage. Journal and stable .lock/.pending files belong to this owner. */
     public RatisSessionMaintenance(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group) throws IOException {
+        this(journal,epochs,routed,group,null);
+    }
+    RatisSessionMaintenance(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,ClockRoute clockRoute)throws IOException{
+        this.clockRoute=clockRoute;
         this.journal=journal.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs); this.routed=Objects.requireNonNull(routed);
         this.group=Objects.requireNonNull(group); identity=routed.maintenanceIdentityDigest();
         if (!Files.isDirectory(this.journal.getParent())) throw new IOException("Maintenance journal parent is absent");
@@ -46,7 +52,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
                 // Also seals an atomic rename whose previous owner could not confirm the directory force.
                 force(this.journal); force(this.journal.getParent());
             } else {
-                rangeEpoch=target(routed.directory()).rangeEpoch();
+                rangeEpoch=clockRoute==null ? target(routed.directory()).rangeEpoch() : clockRoute.descriptor().rangeEpoch();
                 state=new State(UUID.randomUUID(),0,0,-1,null,null); persist(state);
             }
         } catch (IOException | RuntimeException | Error failure) {
@@ -72,7 +78,8 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             executing=true; before=state;
         }
         try {
-            var directory=routed.directory(); var descriptor=target(directory);
+            var directory=clockRoute==null ? routed.directory() : clockRoute.directory();var descriptor=clockRoute==null ? target(directory) : clockRoute.descriptor();
+            if(clockRoute!=null && clockRoute.metadataOnly() && grant!=null)throw new IOException("Retired clock route cannot bind sessions");
             if (descriptor.rangeEpoch()!=rangeEpoch) throw new IOException("Maintenance range changed incarnation");
             var ledger=epochs.read(); if (ledger==null) throw new IOException("Session catalogue is not initialized");
             var authority=SessionAuthority.from(ledger);
@@ -83,7 +90,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             if (acknowledged==Long.MAX_VALUE) throw new IOException("Maintenance sequence space exhausted");
             var control=grant==null ? RangeSessionControl.advance(ledger) : RangeSessionControl.bind(ledger,grant,window);
             var command=DistributedCommand.sessionControl(group,rangeEpoch,directory.schemaDigest(),new OperationId(before.session(),epoch,sequence),control,acknowledged);
-            var prepared=routed.prepareSessionControl(command);
+            var prepared=clockRoute!=null && grant==null ? routed.prepareMetadataSessionControl(command,directory,descriptor) : routed.prepareSessionControl(command);
             var next=new State(before.session(),epoch,sequence,acknowledged,before.propagated(),prepared);
             synchronized (this) { persist(next); state=next; }
             return command;
@@ -98,7 +105,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             executing=true; before=state;
         }
         try {
-            var result=routed.execute(before.pending());
+            var result=clockRoute!=null && !before.pending().command().sessionControl().binding() ? routed.executeMetadataSessionControl(before.pending()) : routed.execute(before.pending());
             synchronized (this) {
                 var propagated=result.status()==CommandResult.Status.SUCCESS ? before.pending().command().sessionControl().authority() : before.propagated();
                 long sequence=before.nextSequence();
@@ -152,7 +159,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
                 var command=DistributedCommandCodec.decode(pending); var descriptor=route(input);
                 if (!command.operationId().equals(new OperationId(session,epoch,sequence)) || command.acknowledgedThrough()!=acknowledged
                         || !command.groupId().equals(group) || command.rangeEpoch()!=rangeEpoch) throw new IOException("Pending maintenance identity changed");
-                prepared=routed.restoreSessionControl(command,descriptor);
+                prepared=clockRoute!=null && !command.sessionControl().binding() ? routed.restoreMetadataSessionControl(command,clockRoute.directory(),descriptor) : routed.restoreSessionControl(command,descriptor);
             }
             return new State(session,epoch,sequence,acknowledged,cut==null ? null : cut.authority(),prepared);
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid maintenance journal state",invalid); }

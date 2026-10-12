@@ -198,4 +198,39 @@ class DistributedCdcThriftContractTest {
         assertEquals(RocksDBErrorType.SERVER_OVERLOADED,assertThrows(RocksDBThriftException.class,()->service.status(ThriftDistributedCdcWire.uuid(subscription),wireContext())).errorType);
         assertEquals(RocksDBErrorType.NOT_IMPLEMENTED,assertThrows(RocksDBThriftException.class,()->new DistributedCdcThriftService(null,32*1024*1024).status(ThriftDistributedCdcWire.uuid(subscription),wireContext())).errorType);
     }
+    @Test void terminalBarrierRoundtripAndPreallocationGuardKeepPayloadExclusive() throws Exception {
+        var freeze=DistributedCdcSubscriptionsTest.freeze(id(1),id(2),id(3),lineage,column);
+        var envelope=new DistributedCdcSubscriptions.Envelope(freeze.position(),freeze.header().schemaDigest(),null,null,List.of(),freeze);
+        var end=DistributedCdcCheckpoint.Cursor.after(freeze.position());
+        var batch=new DistributedCdcSubscriptions.Batch(id(90),definition(),lineage,DistributedCdcCheckpoint.Cursor.beginning(),end,new ApplyPosition(1,3),List.of(envelope));
+        var poll=new DistributedCdcSubscriptions.Poll(lineage,DistributedCdcSubscriptions.Outcome.DATA,batch,0,DistributedCdcCheckpoint.Cursor.beginning(),new ApplyPosition(1,3));
+        var wire=ThriftDistributedCdcWire.poll(poll,subscription,16,4096);
+        assertNull(wire.batch.envelopes.getFirst().operation); assertTrue(wire.batch.envelopes.getFirst().events.isEmpty());
+        var bytes=new org.apache.thrift.TSerializer().serialize(wire); var copy=new CdcPoll(); new org.apache.thrift.TDeserializer().deserialize(copy,bytes);
+        assertEquals(poll,ThriftDistributedCdcWire.poll(copy,subscription,16,4096));
+        var mixed=wire.deepCopy(); mixed.batch.envelopes.getFirst().setOperation(new CdcOperation(java.nio.ByteBuffer.wrap(it.cavallium.rockserver.core.common.cdc.DistributedCdcWire.uuid(operation.sessionId()).toByteArray()),operation.epoch(),operation.sequence()));
+        assertThrows(IllegalArgumentException.class,()->ThriftDistributedCdcWire.poll(mixed,subscription,16,4096));
+        var malformed=wire.deepCopy(); malformed.batch.envelopes.getFirst().setTerminalBarrier(new byte[0]);
+        assertThrows(IllegalArgumentException.class,()->ThriftDistributedCdcWire.poll(malformed,subscription,16,4096));
+        var oversized=wire.deepCopy(); oversized.batch.envelopes.getFirst().setTerminalBarrier(new byte[NativeTopologyFreeze.MAX_BYTES+1]);
+        assertThrows(IllegalArgumentException.class,()->ThriftDistributedCdcWire.poll(oversized,subscription,16,4096));
+        var bounded=ThriftDistributedCdcWire.boundedProtocol(new TBinaryProtocol(new org.apache.thrift.transport.TMemoryInputTransport(new org.apache.thrift.TSerializer().serialize(oversized))),false);
+        assertThrows(TProtocolException.class,()->new CdcPoll().read(bounded));
+    }
+
+    @Test void successorCurrentStartsRoundtripAndFrameGuardPreserveImmutableDefinition() throws Exception {
+        var child=new DistributedCdcCheckpoint.Lineage(id(104),id(105),2); var activation=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,4));
+        var starts=new DistributedCdcCheckpoint(Map.of(child,activation)); var cut=new ApplyPosition(2,5);
+        var batch=new DistributedCdcSubscriptions.Batch(id(8),definition(),child,activation,activation,cut,List.of(),starts);
+        var poll=new DistributedCdcSubscriptions.Poll(child,DistributedCdcSubscriptions.Outcome.DATA,batch,0,activation,cut);
+        var wire=ThriftDistributedCdcWire.poll(poll,subscription,16,4096);
+        var copy=new CdcPoll(); new org.apache.thrift.TDeserializer().deserialize(copy,new org.apache.thrift.TSerializer().serialize(wire));
+        assertEquals(poll,ThriftDistributedCdcWire.poll(copy,subscription,16,4096)); assertEquals(definition(),poll.batch().definition());
+        var crossed=wire.deepCopy(); crossed.batch.setCurrentStarts(definition().start().encode());
+        assertThrows(IllegalArgumentException.class,()->ThriftDistributedCdcWire.poll(crossed,subscription,16,4096));
+        var oversized=wire.deepCopy(); oversized.batch.setCurrentStarts(new byte[DistributedCdcCheckpoint.MAX_BYTES+1]);
+        var input=ThriftDistributedCdcWire.boundedProtocol(new TBinaryProtocol(new org.apache.thrift.transport.TMemoryInputTransport(new org.apache.thrift.TSerializer().serialize(oversized))),false);
+        assertThrows(TProtocolException.class,()->new CdcPoll().read(input));
+    }
+
 }

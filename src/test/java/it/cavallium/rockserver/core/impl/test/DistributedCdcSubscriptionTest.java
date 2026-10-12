@@ -119,7 +119,7 @@ class DistributedCdcSubscriptionTest {
         for(int i=0;i<DistributedCdcCheckpoint.MAX_LINEAGES;i++) { var lineage=new DistributedCdcCheckpoint.Lineage(id(1000+i),id(3000+i),1); start.put(lineage,DistributedCdcCheckpoint.Cursor.beginning()); bounds.put(lineage,cursor(1,1,0)); }
         var columns=new ArrayList<UUID>(); for(int i=0;i<DistributedCdcSubscription.MAX_COLUMNS;i++) columns.add(id(5000+i));
         var definition=new DistributedCdcSubscription.Definition(id(1),id(2),id(3),id(4),id(5),new byte[32],columns,new DistributedCdcCheckpoint(start));
-        var initial=DistributedCdcSubscription.initial(definition); assertEquals(DistributedCdcSubscription.MAX_BYTES,initial.encode().length);
+        var initial=DistributedCdcSubscription.initial(definition); assertTrue(initial.encode().length<=DistributedCdcSubscription.MAX_BYTES);
         var next=new DistributedCdcCheckpoint(bounds); var delivered=initial.deliver(next); var active=delivered.acknowledge(next);
         assertEquals(initial.encode().length,delivered.encode().length); assertEquals(initial.encode().length,active.encode().length); assertEquals(initial.encode().length,active.close().encode().length);
         assertEquals(active.close(),DistributedCdcSubscription.decode(active.close().encode()));

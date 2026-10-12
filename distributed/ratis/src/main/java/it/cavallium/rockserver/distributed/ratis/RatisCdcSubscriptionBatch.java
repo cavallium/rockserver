@@ -9,9 +9,10 @@ import it.cavallium.rockserver.core.common.cdc.DistributedCdcSubscriptions.Envel
 public final class RatisCdcSubscriptionBatch {
     private final UUID id;
     private final DistributedCdcSubscription.Definition definition;
+    private final DistributedCdcCheckpoint currentStarts;
     private final RatisCdcPollRpc.Result result;
     public RatisCdcSubscriptionBatch(UUID id,DistributedCdcSubscription state,RatisCdcPollRpc.Result result) {
-        this.id=Objects.requireNonNull(id); Objects.requireNonNull(state); this.result=Objects.requireNonNull(result); definition=state.definition();
+        this.id=Objects.requireNonNull(id); Objects.requireNonNull(state); this.result=Objects.requireNonNull(result); definition=state.definition(); currentStarts=state.currentStarts();
         var request=result.request(); var binding=request.binding();
         if(state.phase()!=DistributedCdcSubscription.Phase.ACTIVE || result.outcome()!=RatisCdcPollRpc.Outcome.DATA
                 || !definition.clusterId().equals(binding.clusterId()) || !definition.databaseId().equals(binding.databaseId()) || !definition.domainId().equals(binding.domainId())
@@ -21,6 +22,10 @@ public final class RatisCdcSubscriptionBatch {
     public List<Envelope> envelopes() {
         var request=result.request(); var selected=new HashSet<>(definition.columns()); var projected=new ArrayList<Envelope>();
         for(var record:result.records()) {
+            if(record.kind()==DistributedCdcRecord.Kind.TERMINAL_BARRIER) {
+                projected.add(new Envelope(record.position(),record.schemaDigest(),null,null,List.of(),record.barrier()));
+                continue;
+            }
             var events=new ArrayList<DistributedCdcRecord.Event>();
             for(int i=0;i<record.command().mutations().size();i++) {
                 var mutation=record.command().mutations().get(i); var cursor=new DistributedCdcCheckpoint.Cursor(record.position(),i);
@@ -30,7 +35,7 @@ public final class RatisCdcSubscriptionBatch {
         }
         return List.copyOf(projected);
     }
-    public DistributedCdcSubscriptions.Batch projected() { return new DistributedCdcSubscriptions.Batch(id,definition,lineage(),from(),next(),cut(),envelopes()); }
+    public DistributedCdcSubscriptions.Batch projected() { return new DistributedCdcSubscriptions.Batch(id,definition,lineage(),from(),next(),cut(),envelopes(),currentStarts); }
     public UUID id() { return id; }
     public DistributedCdcSubscription.Definition definition() { return definition; }
     public DistributedCdcCheckpoint.Lineage lineage() { return result.request().binding().lineage(); }

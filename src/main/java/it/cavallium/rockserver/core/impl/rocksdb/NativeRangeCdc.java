@@ -18,7 +18,8 @@ final class NativeRangeCdc {
     private record Entry(long term,int bytes,int mutations,long age) {}
     private TreeMap<Long,Entry> sizes=new TreeMap<>();
     private long retainedBytes,lastClock=-1;
-    private boolean initialized;
+    private boolean initialized,terminalCommitted;
+    private ApplyPosition terminalCut;
     private DistributedCdcCheckpoint.Cursor floor=DistributedCdcCheckpoint.Cursor.beginning();
 
     /** Bounded image metadata validation; only event metadata and matching age cells survive this scan. */
@@ -30,16 +31,20 @@ final class NativeRangeCdc {
         private byte[] summary;
         private DistributedCdcCheckpoint.Cursor floor=DistributedCdcCheckpoint.Cursor.beginning();
         private long clock=-1;
+        private NativeTopologyFreeze freeze,terminal;
         void accept(byte[] key,byte[] value,RangeOwnership.Owner owner,ApplyPosition cut) {
+            if(key.length==17 && key[16]==0x60) { if(freeze!=null)throw new IllegalArgumentException("Duplicate CDC native terminal proof");freeze=NativeTopologyFreeze.decode(value);freeze.requireCut(cut);return; }
             if(key.length<=16 || key[16]!=0x50 && key[16]!=0x51 && key[16]!=0x52) return;
             if(key[16]==0x50) {
                 if(key.length!=25 || records.size()>=MAX_RECORDS || value.length>DistributedCdcRecord.MAX_BYTES) throw new IllegalArgumentException("Invalid CDC image record shape/capacity");
                 var record=DistributedCdcRecord.decode(value); var actual=record.lineage();
+                if(terminal!=null)throw new IllegalArgumentException("CDC events follow terminal barrier");
+                if(record.barrier()!=null)terminal=record.barrier();
                 if(!actual.groupId().equals(owner.groupId()) || actual.rangeEpoch()!=owner.epoch() || lineage!=null && !lineage.equals(actual)) throw new IllegalArgumentException("CDC image lineage changed");
                 lineage=actual; long index=record.position().index();
                 if(ByteBuffer.wrap(key,17,8).getLong()!=index || !records.isEmpty() && records.lastKey()>=index || lastTerm>record.position().term()) throw new IllegalArgumentException("CDC image order/entry identity changed");
                 requireCursorCut(record.end(),cut); lastTerm=record.position().term();
-                records.put(index,new Entry(record.position().term(),value.length,record.command().mutations().size(),-1));
+                records.put(index,new Entry(record.position().term(),value.length,record.mutationCount(),-1));
                 bytes+=ROW_OVERHEAD+value.length; if(bytes>MAX_RETAINED_BYTES) throw new IllegalArgumentException("CDC image byte capacity exceeded");
             } else if(key[16]==0x51) {
                 if(key.length!=17 || summary!=null || value.length!=80) throw new IllegalArgumentException("Invalid CDC image retention summary"); summary=value.clone();
@@ -50,6 +55,7 @@ final class NativeRangeCdc {
             }
         }
         void finish(RangeOwnership.Owner owner,ApplyPosition cut) {
+            if(terminal!=null && !terminal.equals(freeze))throw new IllegalArgumentException("CDC barrier differs from committed native FREEZE");
             if(summary==null) { if(!records.isEmpty() || !ages.isEmpty()) throw new IllegalArgumentException("CDC image rows lack retention summary"); return; }
             var input=ByteBuffer.wrap(summary); var actual=new DistributedCdcCheckpoint.Lineage(uuid(input),uuid(input),input.getLong());
             floor=new DistributedCdcCheckpoint.Cursor(new ApplyPosition(input.getLong(),input.getLong()),input.getInt());
@@ -58,6 +64,10 @@ final class NativeRangeCdc {
                     || count!=records.size() || declaredBytes!=bytes || clock < -1 || !floor.equals(DistributedCdcCheckpoint.Cursor.beginning()) && floor.mutationOrdinal()!=DistributedCommandCodec.MAX_MUTATIONS
                     || !records.keySet().equals(ages.keySet())) throw new IllegalArgumentException("CDC image summary/age cells differ from retained rows");
             requireCursorCut(floor,cut);
+            if(freeze!=null) {
+                if(!records.isEmpty() && records.lastKey()>freeze.position().index())throw new IllegalArgumentException("CDC retained event follows original FREEZE");
+                if(!floor.covers(DistributedCdcCheckpoint.Cursor.after(freeze.position())) && terminal==null)throw new IllegalArgumentException("CDC retained history lacks committed terminal barrier");
+            }
             if(!records.isEmpty() && floor.position().term()!=0 && floor.position().index()>=records.firstKey()) throw new IllegalArgumentException("CDC image rows precede eviction floor");
             long previous=-1; boolean pending=false;
             for(var entry:ages.entrySet()) {
@@ -106,11 +116,12 @@ final class NativeRangeCdc {
             }
             iterator.status();
         }
+        byte[] freezeKey=summaryKey.clone();freezeKey[16]=0x60;byte[] freeze=db.get(state,freezeKey);if(freeze!=null)validation.accept(freezeKey,freeze,owner,cut);
         validation.finish(owner,cut); validation.requireAuthorityClock(baselineClock);
         if(validation.lineage!=null && !lineage.equals(validation.lineage)) throw new IllegalStateException("CDC recovered lineage differs");
         sizes=validation.records; retainedBytes=validation.bytes; lastClock=validation.summary==null ? baselineClock : validation.clock;
         floor=validation.summary==null && cut!=null ? DistributedCdcCheckpoint.Cursor.after(cut) : validation.floor;
-        initialized=validation.summary!=null;
+        initialized=validation.summary!=null;terminalCommitted=validation.freeze!=null;terminalCut=validation.freeze==null ? null : validation.freeze.position();
     }
     private void requireRecord(DistributedCdcRecord record,ApplyPosition cut) {
         if(!record.lineage().equals(lineage)) throw new IllegalStateException("CDC record lineage differs"); requireCursorCut(record.end(),cut);
@@ -122,7 +133,7 @@ final class NativeRangeCdc {
     }
     /** Prepare bounded evictions in the same native batch; publish bookkeeping only after db.write returns. */
     Runnable append(WriteBatch batch,DistributedCdcRecord record) throws RocksDBException {
-        if(!lineage.equals(record.lineage()) || sizes.containsKey(record.position().index()) || !sizes.isEmpty() && sizes.lastKey()>=record.position().index()) throw new IllegalArgumentException("CDC append is not new ordered progress");
+        if(terminalCommitted || !lineage.equals(record.lineage()) || sizes.containsKey(record.position().index()) || !sizes.isEmpty() && sizes.lastKey()>=record.position().index()) throw new IllegalArgumentException("CDC append is not new ordered progress");
         byte[] encoded=record.encode(); long bytes=retainedBytes+ROW_OVERHEAD+encoded.length; var nextFloor=floor;
         var evictions=new ArrayList<Long>(); var candidates=sizes.entrySet().iterator();
         while(sizes.size()-evictions.size()>=MAX_RECORDS || bytes>MAX_RETAINED_BYTES) {
@@ -132,8 +143,8 @@ final class NativeRangeCdc {
         }
         batch.put(state,key(record.position().index()),encoded); batch.put(state,ageKey(record.position().index()),ByteBuffer.allocate(8).putLong(-1).array());
         batch.put(state,summaryKey,summary(nextFloor,sizes.size()-evictions.size()+1,bytes,lastClock)); long publishedBytes=bytes; var publishedFloor=nextFloor;
-        var metadata=new Entry(record.position().term(),encoded.length,record.command().mutations().size(),-1);
-        return ()->{ evictions.forEach(sizes::remove); sizes.put(record.position().index(),metadata); retainedBytes=publishedBytes; floor=publishedFloor; initialized=true; };
+        var metadata=new Entry(record.position().term(),encoded.length,record.mutationCount(),-1);
+        return ()->{ evictions.forEach(sizes::remove); sizes.put(record.position().index(),metadata); retainedBytes=publishedBytes; floor=publishedFloor; initialized=true;terminalCommitted=record.barrier()!=null;terminalCut=record.barrier()==null ? null : record.barrier().position(); };
     }
     /** Evict cached anchored metadata, then anchor pending cohorts only at a strictly newer committed tick. */
     Runnable advanceClock(WriteBatch batch,long logicalTimeMillis) throws RocksDBException {
@@ -175,9 +186,11 @@ final class NativeRangeCdc {
     }
     ReplicatedRangeStore.CdcPage poll(DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes,ApplyPosition cut) throws RocksDBException {
         requireCursorCut(from,cut);
+        if(terminalCut!=null && (from.position().index()>terminalCut.index() || from.position().index()==terminalCut.index() && from.position().term()!=terminalCut.term()))throw new IllegalArgumentException("Sealed CDC cursor exceeds original terminal boundary");
         if(!from.covers(floor)) throw new ReplicatedRangeStore.CdcGap(new ReplicatedRangeStore.CdcPage(lineage,cut,floor,from,false,List.of()));
         var boundary=sizes.get(from.position().index());
-        boolean verified=from.equals(DistributedCdcCheckpoint.Cursor.beginning()) || cut!=null && from.equals(DistributedCdcCheckpoint.Cursor.after(cut))
+        if(boundary!=null && boundary.mutations()==0 && (boundary.term()!=from.position().term() || from.mutationOrdinal()!=DistributedCommandCodec.MAX_MUTATIONS))throw new IllegalArgumentException("Terminal CDC barrier requires its exact EOF cursor");
+        boolean verified=from.equals(floor) || from.equals(DistributedCdcCheckpoint.Cursor.beginning()) || cut!=null && from.equals(DistributedCdcCheckpoint.Cursor.after(cut))
                 || boundary!=null && boundary.term()==from.position().term() && (from.mutationOrdinal()==DistributedCommandCodec.MAX_MUTATIONS || from.mutationOrdinal()<boundary.mutations());
         var records=new ArrayList<DistributedCdcRecord>(); int bytes=0; var next=from;
         for(var entry:sizes.tailMap(from.position().index(),true).entrySet()) {

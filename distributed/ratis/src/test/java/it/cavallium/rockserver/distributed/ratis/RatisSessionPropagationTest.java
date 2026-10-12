@@ -87,12 +87,16 @@ class RatisSessionPropagationTest {
             try (var driver=f.driver(journals)) {
                 driver.begin(); assertTrue(driver.step(2).complete());
                 var updated=f.updated(2,2); f.routed.refresh(updated); f.directory=updated;
-                driver.begin();
+                assertThrows(IOException.class,driver::begin,"A changed incarnation needs a committed topology witness");
+                assertTrue(driver.progress().complete());
                 var first=f.groups.getFirst();
-                Files.copy(journals.resolve(first+"-1.clock"),journals.resolve(first+"-2.clock"));
-                var progress=driver.step(2); assertFalse(progress.complete()); assertEquals(1,progress.completed()); assertEquals(1,progress.failures().size());
-                var later=f.updated(3,2); f.routed.refresh(later); f.directory=later;
-                assertThrows(IOException.class,() -> driver.step(2)); assertThrows(IllegalStateException.class,driver::begin);
+                Path wrongIncarnation=journals.resolve(first+"-2.clock");
+                Files.copy(journals.resolve(first+"-1.clock"),wrongIncarnation);
+                try (var maintenance=new RatisSessionMaintenance(wrongIncarnation,f.catalogue.epochs,f.routed,first)) {
+                    assertEquals(1,maintenance.rangeEpoch(),"The original journal incarnation must survive reopening");
+                    assertThrows(IOException.class,maintenance::prepareAdvance);
+                    assertNull(maintenance.pendingCommand(),"A copied journal cannot create a new-incarnation proof");
+                }
             }
         }
     }

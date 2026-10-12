@@ -30,7 +30,7 @@ class DistributedCdcSubscriptionsTest {
         byte[] value=envelope.events().getFirst().mutation().value(); value[0]=7; assertEquals(2,envelope.events().getFirst().mutation().value()[0]);
         assertThrows(UnsupportedOperationException.class,()->batch.envelopes().clear()); assertThrows(UnsupportedOperationException.class,()->envelope.events().clear());
         var same=new DistributedCdcSubscriptions.Envelope(new ApplyPosition(1,2),new byte[32],operation,null,List.of(event(2,2,column))); assertEquals(envelope,same); assertEquals(envelope.hashCode(),same.hashCode());
-        int charge=DistributedCdcSubscriptions.BATCH_HEADER_BYTES+definition().encode().length+DistributedCdcSubscriptions.ENVELOPE_HEADER_BYTES+4+26+1+1;
+        int charge=DistributedCdcSubscriptions.BATCH_HEADER_BYTES+definition().encode().length+definition().start().encode().length+DistributedCdcSubscriptions.ENVELOPE_HEADER_BYTES+4+26+1+1;
         assertEquals(charge,batch.budgetBytes());
     }
     @Test void lineageCursorSelectionAndEnvelopeOrderingMustMatchDefinition() {
@@ -101,4 +101,46 @@ class DistributedCdcSubscriptionsTest {
         var otherDefinition=new DistributedCdcSubscription.Definition(id(99),id(2),id(3),id(6),id(7),new byte[32],List.of(column),definition().start());
         assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Batch(id(8),otherDefinition,lineage,beginning,DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(1,2)),new ApplyPosition(1,3),List.of(envelope)));
     }
+    static NativeTopologyFreeze freeze(UUID cluster,UUID database,UUID domain,DistributedCdcCheckpoint.Lineage lineage,UUID column) {
+        var peer=new ReplicaDescriptor(id(101),id(102),id(103),"barrier","127.0.0.1:9999",ReplicaDescriptor.Role.VOTER);
+        var parent=new RangeDescriptor(lineage.rangeId(),lineage.groupId(),lineage.rangeEpoch(),1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var source=new RangeDirectory(cluster,database,domain,1,new byte[32],1,Set.of(column),1,List.of(parent));
+        var left=new RangeDescriptor(id(104),id(105),1,1,null,new byte[]{(byte)128},RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var right=new RangeDescriptor(id(106),id(107),1,1,new byte[]{(byte)128},null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
+        var target=new RangeDirectory(cluster,database,domain,1,new byte[32],2,Set.of(column),1,List.of(left,right));
+        var topology=new TopologyChange.Definition(id(108),source,target);
+        return new NativeTopologyFreeze(topology.header(),lineage.groupId(),new ApplyPosition(1,2),NativeTopologyFreeze.boundsDigest(null,null),new byte[32]);
+    }
+    @Test void terminalBarrierHasNoInventedOperationAndKeepsItsBoundedNativeCut() {
+        var freeze=freeze(id(1),id(2),id(3),lineage,column);
+        var envelope=new DistributedCdcSubscriptions.Envelope(freeze.position(),freeze.header().schemaDigest(),null,null,List.of(),freeze);
+        var end=DistributedCdcCheckpoint.Cursor.after(freeze.position()); var value=batch(beginning,end,new ApplyPosition(1,3),List.of(envelope));
+        assertNull(envelope.operation()); assertTrue(envelope.events().isEmpty()); assertEquals(freeze,envelope.terminalBarrier());
+        assertEquals(DistributedCdcSubscriptions.ENVELOPE_HEADER_BYTES+freeze.encode().length,envelope.budgetBytes());
+        assertEquals(value.envelopes(),batch(beginning,end,new ApplyPosition(1,3),List.of(envelope)).envelopes());
+        assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Envelope(freeze.position(),new byte[32],operation,null,List.of(),freeze));
+        assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Envelope(freeze.position(),new byte[32],null,null,List.of(event(2,0,column)),freeze));
+        assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Envelope(new ApplyPosition(1,3),new byte[32],null,null,List.of(),freeze));
+        byte[] foreignSchema=new byte[32]; foreignSchema[0]=1;
+        assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Envelope(freeze.position(),foreignSchema,null,null,List.of(),freeze));
+        assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Envelope(freeze.position(),new byte[32],null,null,List.of()));
+        assertThrows(IllegalArgumentException.class,()->batch(end,end,new ApplyPosition(1,3),List.of(envelope)));
+        var foreign=freeze(id(1),id(2),id(99),lineage,column);
+        assertThrows(IllegalArgumentException.class,()->batch(beginning,end,new ApplyPosition(1,3),List.of(new DistributedCdcSubscriptions.Envelope(foreign.position(),new byte[32],null,null,List.of(),foreign))));
+        var foreignLineage=new DistributedCdcCheckpoint.Lineage(id(98),lineage.groupId(),lineage.rangeEpoch());
+        var wrongParent=freeze(id(1),id(2),id(3),foreignLineage,column);
+        assertThrows(IllegalArgumentException.class,()->batch(beginning,end,new ApplyPosition(1,3),List.of(new DistributedCdcSubscriptions.Envelope(wrongParent.position(),new byte[32],null,null,List.of(),wrongParent))));
+    }
+
+    @Test void successorBatchUsesCommittedCurrentStartsWithoutChangingOriginalDefinition() {
+        var child=new DistributedCdcCheckpoint.Lineage(id(104),id(105),2); var activation=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,4));
+        var starts=new DistributedCdcCheckpoint(Map.of(child,activation)); var next=DistributedCdcCheckpoint.Cursor.after(new ApplyPosition(2,5));
+        var envelope=new DistributedCdcSubscriptions.Envelope(new ApplyPosition(2,5),new byte[32],operation,null,List.of(new DistributedCdcRecord.Event(new DistributedCdcCheckpoint.Cursor(new ApplyPosition(2,5),0),new Mutation(Mutation.Kind.PUT,column,new byte[]{1},new byte[]{2}))));
+        var batch=new DistributedCdcSubscriptions.Batch(id(8),definition(),child,activation,next,new ApplyPosition(2,6),List.of(envelope),starts);
+        assertEquals(definition(),batch.definition()); assertFalse(batch.definition().start().cursors().containsKey(child)); assertEquals(starts,batch.currentStarts());
+        assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Batch(id(8),definition(),child,activation,next,new ApplyPosition(2,6),List.of(envelope)));
+        assertThrows(IllegalArgumentException.class,()->new DistributedCdcSubscriptions.Batch(id(8),definition(),child,beginning,next,new ApplyPosition(2,6),List.of(envelope),starts));
+        assertEquals(DistributedCdcSubscriptions.BATCH_HEADER_BYTES+definition().encode().length+starts.encode().length+envelope.budgetBytes(),batch.budgetBytes());
+    }
+
 }

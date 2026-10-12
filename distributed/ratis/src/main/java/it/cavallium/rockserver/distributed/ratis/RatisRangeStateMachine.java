@@ -219,7 +219,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             ApplyPosition cut=null;int checked=0;
             for(int offset=0;offset<points.size();offset+=4){var keys=points.subList(offset,Math.min(offset+4,points.size()));int[] bounds=new int[keys.size()];for(int i=0;i<bounds.length;i++){byte[] expected=command.predicates().get(offset+i).expectedValue();bounds[i]=expected==null ? 1 : Math.max(1,expected.length);}var witnesses=RatisTopologyCatalogue.requiresOwnerAdmission(command) ? store.readSchemaAuthorityPoints(keys,bounds) : store.readCurrentPoints(keys);if(cut!=null && (RatisTopologyCatalogue.requiresOwnerAdmission(command)
                     ? witnesses.position()==null || witnesses.position().term()!=hold.term || witnesses.position().index()<cut.index()
-                    : !cut.equals(witnesses.position())))throw new IOException("Import publication witness cut advanced");cut=witnesses.position();var values=witnesses.values();for(var value:values)if(!Arrays.equals(value,command.predicates().get(checked++).expectedValue()))throw new IOException("Import publication current native witness changed");}
+                    : !cut.equals(witnesses.position())))throw new IOException("Import publication witness cut advanced");cut=witnesses.position();var values=witnesses.values();for(var value:values){int index=checked++;if(!Arrays.equals(value,command.predicates().get(index).expectedValue()) && !RatisCdcSubscriptionCatalogue.requalifiesTopologyGuard(command,index,value))throw new IOException("Import publication current native witness changed");}}
             hold.cut=cut;admission.validate(command);
             var current=leadership();
             synchronized(admissions){hold.reading=false;requireImportPublicationForQualification(hold,current);hold.qualified=true;qualified=true;}
@@ -1182,6 +1182,47 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         requireDataRole(); requireHealthy(); var current=leadership(); var a=store.applied();
         if (!current.ready() || a==null || a.term()!=current.term() || !store.admissionOpen()) throw new IOException("Transaction leader changed or is not ready");
     }
+    private record CdcMetadataOwner(ApplyPosition cut,long term,long generation,long stamp,boolean sealed,ReplicatedRangeStore.Configuration configuration) {}
+    /** Metadata authority only: this never opens a USER snapshot or changes DATA admission. */
+    private CdcMetadataOwner checkCdcMetadataOwner() throws IOException {
+        requireDataRole(); requireHealthy(); var leader=leadership(); var cut=store.applied(); long generation=admissionGeneration.get(); final long stamp;
+        synchronized(admissions) { if(schemaConfigurationPending) throw new IOException("CDC metadata waits for configuration apply"); stamp=schemaConfigurationStamp; }
+        if(getLifeCycleState()!=LifeCycle.State.RUNNING || !leader.ready() || cut==null || cut.term()!=leader.term() || store.topologyBirthPending()) throw new IOException("CDC metadata lacks completed current-term owner");
+        var freeze=store.topologyFreeze(); boolean sealed=freeze!=null;
+        if(!store.admissionOpen() && !sealed) throw new IOException("CDC metadata has no qualified active/sealed producer");
+        if(sealed) {
+            var ownership=store.ownership(); var interval=ownership.interval();
+            try {
+                freeze.requireParent(ownership.owner().groupId(),ownership.owner().epoch(),interval.domainId(),store.schemaDigest(),interval.lowerInclusive(),interval.upperExclusive()); freeze.requireCut(cut);
+                if(cdcBinding!=null) {
+                    var parent=freeze.header().participant(it.cavallium.rockserver.core.common.distributed.TopologyChange.Stage.FREEZE,freeze.groupId());
+                    if(!cdcBinding.clusterId().equals(freeze.header().clusterId()) || !cdcBinding.databaseId().equals(freeze.header().databaseId()) || !cdcBinding.domainId().equals(freeze.header().domainId())
+                            || !cdcBinding.lineage().rangeId().equals(parent.rangeId()) || !cdcBinding.lineage().groupId().equals(parent.groupId()) || cdcBinding.lineage().rangeEpoch()!=parent.rangeEpoch()) throw new IllegalArgumentException("CDC metadata original lineage differs");
+                }
+            } catch(IllegalArgumentException invalid) { throw new IOException("CDC metadata parent proof differs",invalid); }
+        }
+        final ReplicatedRangeStore.Configuration configuration;
+        try { configuration=store.configuration(); if(configuration==null) throw new IOException("CDC metadata native configuration missing"); requireCdcMembership(configuration.data()); }
+        catch(org.rocksdb.RocksDBException invalid) { throw new IOException("CDC metadata configuration read failed",invalid); }
+        if(configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term()) throw new IOException("CDC metadata configuration exceeds completed prefix");
+        synchronized(admissions) { if(generation!=admissionGeneration.get() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || !java.util.Objects.equals(cut,store.applied())) throw new IOException("CDC metadata owner changed during qualification"); }
+        return new CdcMetadataOwner(cut,leader.term(),generation,stamp,sealed,configuration);
+    }
+    private void requireCdcMembership(byte[] encoded) throws IOException {
+        if(topologyDescriptor!=null) { requireSchemaMembership(topologyDescriptor,encoded); return; }
+        var configuration=org.apache.ratis.proto.RaftProtos.RaftConfigurationProto.parseFrom(encoded);
+        if(configuration.getOldPeersCount()!=0 || configuration.getOldListenersCount()!=0) throw new IOException("CDC metadata requires stable membership");
+        var actual=new java.util.HashSet<String>();
+        for(var peer:configuration.getPeersList()) actual.add(peer.getId().toStringUtf8()+"/"+peer.getAddress()+"/VOTER");
+        for(var peer:configuration.getListenersList()) actual.add(peer.getId().toStringUtf8()+"/"+peer.getAddress()+"/LISTENER");
+        var expected=new java.util.HashSet<String>();
+        for(var peer:initialGroup.getPeers()) expected.add(peer.getId()+"/"+(peer.getAddress()==null ? "" : peer.getAddress())+"/"+(peer.getStartupRole()==org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER ? "LISTENER" : "VOTER"));
+        if(!actual.equals(expected)) throw new IOException("CDC metadata original membership changed");
+    }
+    private static boolean sameCdcConfiguration(CdcMetadataOwner first,CdcMetadataOwner next) {
+        return first.term()==next.term() && first.generation()==next.generation() && first.stamp()==next.stamp() && first.sealed()==next.sealed()
+                && first.configuration().term()==next.configuration().term() && first.configuration().index()==next.configuration().index() && Arrays.equals(first.configuration().data(),next.configuration().data());
+    }
     /** Bounded local retirement hints. Mutation admission independently revalidates qualified HOME/DATA proofs. */
     ReplicatedRangeStore.RetirementPage retirementCandidates(boolean orphans,byte[] after,int scans) throws IOException {
         if (role!=RatisNodePlan.Role.TRANSACTION_HOME && role!=RatisNodePlan.Role.SNAPSHOT_HOME) return null;
@@ -1288,6 +1329,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         long homeCreditCount,homeCreditBytes;
         SchemaHold fencingHold;
         ImportPublicationHold importPublicationHold;
+        boolean sessionBinding;
+        DistributedCommand topologyMetadataControl;
+        CdcMetadataOwner topologyMetadataOwner;
         boolean retentionReleased,maybeAppended,settled;
         int owners = 1;
         Admission(OperationId id, byte[] digest, int bytes, long term, long generation,
@@ -1524,7 +1568,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             activateRecoveredOwner();
             if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
             else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
-            if (enableSessionControls && !store.importPending() && !store.topologyBirthPending() && !store.topologyRetired()) store.enableSessionControls();
+            if (enableSessionControls && !store.importPending() && !store.topologyBirthPending()) store.enableSessionControls();
             getLifeCycle().transition(LifeCycle.State.RUNNING);
         } catch (Exception failure) { throw failRecovery(failure); }
     }
@@ -1897,7 +1941,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 activateRecoveredOwner();
                 if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
                 else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
-                if (enableSessionControls && !store.importPending() && !store.topologyBirthPending() && !store.topologyRetired()) store.enableSessionControls();
+                if (enableSessionControls && !store.importPending() && !store.topologyBirthPending()) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
                 synchronized (admissions) {
                     for (var terminal:verifiedAdmissions.terminalScopes()) if (admissions.get(terminal.id)==terminal) retirePreparationScope(terminal);
@@ -1989,7 +2033,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (command.transactionRejection()) throw new IllegalArgumentException("Internal rejection records cannot be submitted by clients");
             // Fresh publication metadata/owner reads belong to the independently bounded preparation lane.
             if(!requiresCataloguePreparation(command))commandValidator.accept(command);
+            if(role==RatisNodePlan.Role.DATA && store.topologyFreeze()!=null && command.sessionControl()!=null && command.sessionControl().binding()) throw new IOException("Sealed topology parent cannot acquire session grants");
             store.validate(command);
+            var metadataOwner=role==RatisNodePlan.Role.DATA && store.metadataTopologyControl(command) ? checkCdcMetadataOwner() : null;
             byte[] digest = command.payloadDigest();
             boolean fencing=role==RatisNodePlan.Role.CATALOGUE && RatisSchemaAdministration.isFencing(command);
             var rejection=command.acceptance()==null ? null : DistributedCommand.rejectAcceptedTransaction(command);
@@ -2019,7 +2065,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     var estimate=originalEstimate;
                     requireHealthy();
                     if (generation != admissionGeneration.get()) throw new IllegalStateException("Admission leadership generation changed");
-                    if (!store.admissionOpen()) throw new IllegalStateException("Native range admission is closed");
+                    if (!store.admissionOpen() && metadataOwner==null) throw new IllegalStateException("Native range admission is closed");
+                    if(metadataOwner!=null && (getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || metadataOwner.stamp()!=schemaConfigurationStamp || metadataOwner.generation()!=generation || metadataOwner.term()!=leadership.term())) throw new IOException("Topology metadata control lost configuration/owner");
                     if (!java.util.Objects.equals(observed, store.applied())) continue;
                     reconcileOlderProposalTerms(leadership.term());
                     if (retirementIdentityBusy(command.operationId()) || snapshotControlCharges.containsKey(command.operationId()) || finalizationOwners.containsKey(command.operationId()) || participantOwners.containsKey(command.operationId())) throw new IllegalStateException("Operation identity belongs to participant preparation");
@@ -2074,6 +2121,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                             admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation,
                                     estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl,lease,accepted==null ? null : accepted.reservation.lease,reject ? rejectionData : null);
                             admission.importPublicationHold=importOwner;if(importOwner!=null)importOwner.submitted=true;
+                            admission.sessionBinding=command.sessionControl()!=null && command.sessionControl().binding();
+                            if(metadataOwner!=null) { admission.topologyMetadataControl=command; admission.topologyMetadataOwner=metadataOwner; }
                             admission.fencingHold=fencingOwner;
                             if (fencingOwner!=null) fencingOwner.submitted=true;
                             if (homeCredit!=null) { admission.homeCreditCount=homeCredit.additionalCount(); admission.homeCreditBytes=homeCredit.additionalBytes(); }
@@ -2341,6 +2390,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public TransactionContext preAppendTransaction(TransactionContext transaction) throws IOException {
         try {
             requireHealthy();
+            // This callback owns Raft append locks: native proof/configuration was qualified at start/estimate.
+            boolean metadataQualified=transaction.getStateMachineContext() instanceof Admission input && input.topologyMetadataControl!=null
+                    && role==RatisNodePlan.Role.DATA && store.metadataTopologyControl(input.topologyMetadataControl);
             Leadership current = leadership();
             var nativePosition = store.applied();
             synchronized (admissions) {
@@ -2365,9 +2417,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         || admissions.get(admission.id) != admission || admission.owners <= 0
                         || !current.ready() || admission.term != current.term()
                         || admission.generation != admissionGeneration.get()
-                        || nativePosition == null || nativePosition.term() != current.term() || !store.admissionOpen()) {
+                        || nativePosition == null || nativePosition.term() != current.term() || !store.admissionOpen() && !metadataQualified) {
                     throw new IOException("Admission lost its completed current-term owner before append");
                 }
+                if(admission.sessionBinding && store.topologyFreeze()!=null) throw new IOException("Sealed topology parent cannot append session grants");
+                if(admission.topologyMetadataControl!=null && (!metadataQualified || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || store.topologyBirthPending()
+                        || admission.topologyMetadataOwner==null || admission.topologyMetadataOwner.stamp()!=schemaConfigurationStamp || admission.topologyMetadataOwner.term()!=current.term()
+                        || admission.topologyMetadataOwner.generation()!=admissionGeneration.get() || !admission.id.equals(admission.topologyMetadataControl.operationId()) || !Arrays.equals(admission.digest,admission.topologyMetadataControl.payloadDigest()))) throw new IOException("Topology metadata control lost its original configuration/generation");
                 if(admission.importPublicationHold!=null && !admission.settled)requireImportPublication(admission.importPublicationHold,admission.importPublicationHold.command,current,admissionGeneration.get());
                 if (admission.fencingHold!=null && !admission.settled) requireFencingOwner(admission.fencingHold,(DistributedCommand)admission.fencingHold.record,current,admissionGeneration.get());
                 if (admission.snapshotHold!=null && admission.snapshotHold.install && admission.snapshotHold.lease!=null
@@ -3835,15 +3891,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if(!freshBarrier || cdcBinding==null || proofQueries==null) throw new IOException("CDC poll requires configured fresh DATA barrier");
                 var poll=RatisCdcPollRpc.decodeRequest(encoded);
                 if(!cdcBinding.equals(poll.binding())) throw new IOException("CDC poll namespace/lineage differs");
-                checkTransactionOwner(); long generation=admissionGeneration.get(); var leader=leadership(); final long stamp;
-                synchronized(admissions){if(schemaConfigurationPending)throw new IOException("CDC poll waits for configuration apply");stamp=schemaConfigurationStamp;}
+                var owner=checkCdcMetadataOwner();
                 return proofQueries.submit(store.ownership().owner().groupId(),encoded,Math.max(4096,4L*poll.maxBytes()),false,owned->{
-                    checkTransactionOwner();
-                    if(generation!=admissionGeneration.get() || leadership().term()!=leader.term()) throw new IOException("CDC poll lost read-barrier owner");
+                    var before=checkCdcMetadataOwner();
+                    if(!sameCdcConfiguration(owner,before)) throw new IOException("CDC poll lost read-barrier owner");
                     var ownedPoll=RatisCdcPollRpc.decodeRequest(owned);
+                    if(before.sealed()) {
+                        var terminal=store.topologyFreeze().position(); var from=ownedPoll.from().position();
+                        if(from.index()>terminal.index() || from.index()==terminal.index() && from.term()!=terminal.term()) throw new IOException("CDC parent cursor exceeds original terminal boundary");
+                    }
                     ReplicatedRangeStore.CdcPage page; byte[] reply;
                     try {
-                        var data=store.pollCdc(ownedPoll.binding().lineage(),ownedPoll.from(),ownedPoll.maxRecords(),ownedPoll.maxBytes()-RatisCdcPollRpc.REPLY_BASE_BYTES);
+                        var data=before.sealed() ? store.pollRetiredCdc(ownedPoll.binding().lineage(),ownedPoll.from(),ownedPoll.maxRecords(),ownedPoll.maxBytes()-RatisCdcPollRpc.REPLY_BASE_BYTES)
+                                : store.pollCdc(ownedPoll.binding().lineage(),ownedPoll.from(),ownedPoll.maxRecords(),ownedPoll.maxBytes()-RatisCdcPollRpc.REPLY_BASE_BYTES);
                         page=data; reply=RatisCdcPollRpc.reply(ownedPoll,data);
                     } catch(ReplicatedRangeStore.CdcGap gap) {
                         var status=gap.page(); page=status;
@@ -3852,8 +3912,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         var status=large.page(); page=status;
                         reply=RatisCdcPollRpc.reply(new RatisCdcPollRpc.Result(ownedPoll,RatisCdcPollRpc.Outcome.TOO_LARGE,status.cut(),status.floor(),status.next(),status.fromVerified(),RatisCdcPollRpc.REPLY_BASE_BYTES+large.requiredPayloadBytes(),List.of()));
                     }
-                    checkTransactionOwner(); var current=leadership();
-                    synchronized(admissions){if(generation!=admissionGeneration.get() || current.term()!=leader.term() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || page.cut()==null || page.cut().term()!=current.term())throw new IOException("CDC poll lost native cut/configuration");}
+                    var after=checkCdcMetadataOwner();
+                    if(!sameCdcConfiguration(owner,after) || !java.util.Objects.equals(page.cut(),after.cut())) throw new IOException("CDC poll lost native cut/configuration");
                     return Message.valueOf(ByteString.copyFrom(reply));
                 });
             }

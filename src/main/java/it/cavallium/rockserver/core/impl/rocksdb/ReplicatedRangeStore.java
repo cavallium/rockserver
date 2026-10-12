@@ -147,6 +147,32 @@ public final class ReplicatedRangeStore {
             return cdc.poll(from,maxRecords,maxBytes,applied);
         } finally { applyLane.unlock(); leaveNative(); }
     }
+    /** Retired/sealed producer metadata only; never acquires a USER snapshot or reads child rows. */
+    public CdcPage pollRetiredCdc(it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage lineage,
+            it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Cursor from,int maxRecords,int maxBytes) throws RocksDBException {
+        Objects.requireNonNull(lineage);Objects.requireNonNull(from);if(maxRecords<1 || maxRecords>256 || maxBytes<1 || maxBytes>8*1024*1024)throw new IllegalArgumentException("Invalid CDC poll budget");
+        enterNative();applyLane.lock();try {
+            requireTopologyMetadataOwner();if(cdc==null || !cdc.lineage().equals(lineage))throw new IllegalArgumentException("CDC retired lineage is not configured");return cdc.poll(from,maxRecords,maxBytes,applied);
+        } finally { applyLane.unlock();leaveNative(); }
+    }
+    private void requireTopologyMetadataOwner() throws RocksDBException {
+        var ownershipState=ownership.get(owner).state();var freeze=activeTopologyFreeze;
+        if(closing || pendingInstallation!=null || importPending() || freeze==null || applied==null || applied.term()<=0 || applied.index()<0
+                || ownershipState!=RangeOwnership.State.ACTIVE && ownershipState!=RangeOwnership.State.FENCED && ownershipState!=RangeOwnership.State.RETIRED
+                || ownershipState==RangeOwnership.State.RETIRED && !topologyRetired())throw new IllegalStateException("Topology metadata lacks a completed sealed native owner");
+        var original=db.get(state,topologyFreezeKey());if(original==null || !freeze.equals(NativeTopologyFreeze.decode(original)) || !groupId.equals(freeze.groupId()) || !Arrays.equals(freeze.header().schemaDigest(),schemaDigest))throw new IllegalStateException("Topology metadata original FREEZE changed");freeze.requireCut(applied);
+        if(topologyRetired() && !Arrays.equals(topologyRetirement,db.get(state,topologyOwnershipKey(0x62))))throw new IllegalStateException("Topology metadata retirement proof changed");
+        byte[] marker=db.get(state,markerKey);if(marker==null || !applied.equals(decodePosition(marker)))throw new IllegalStateException("Topology metadata completed marker changed");
+        var cfg=configurationUnderAdmission();if(cfg==null || cfg.term()>applied.term() || cfg.index()>applied.index() || cfg.index()==applied.index() && cfg.term()!=applied.term())throw new IllegalStateException("Topology metadata native configuration exceeds completed prefix");
+        var authority=sessionAuthority();if(authority!=null && (!authority.clusterId().equals(freeze.header().clusterId()) || !authority.databaseId().equals(freeze.header().databaseId())))throw new IllegalStateException("Topology metadata session authority namespace changed");
+    }
+    /** Cached shape classification for the adapter; validate/estimate/apply separately verify native evidence. */
+    public boolean metadataTopologyControl(DistributedCommand command) {
+        var freeze=activeTopologyFreeze;var control=command.sessionControl();
+        return freeze!=null && control!=null && !control.binding() && groupId.equals(command.groupId()) && rangeEpoch==command.rangeEpoch()
+                && Arrays.equals(schemaDigest,command.schemaDigest()) && command.mutations().isEmpty() && command.predicates().isEmpty() && command.acceptance()==null && !command.transactionRejection()
+                && freeze.header().clusterId().equals(control.authority().clusterId()) && freeze.header().databaseId().equals(control.authority().databaseId());
+    }
     private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
     public static final int MAX_SCHEMA_AUTHORITY_BYTES=5*1024*1024;
@@ -710,10 +736,11 @@ public final class ReplicatedRangeStore {
             synchronized(ownership) {
             if(ownership.get(owner).state()!=RangeOwnership.State.FENCED) throw new IllegalStateException("Topology activation requires fenced child");
             requireNext(position); ensureReceiptUsage(); var receipt=new NativeTopologyActivation(seed,topologyBirth,position,catalogueGroup,catalogueCut,publicationCommitment); var history=prepareScopedWrites(false,List.of(),Map.of());
+            Runnable publishCdc=()->{};
             try(var lease=ownership.claimInstall(owner);var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)) {
-                if(cdc!=null) cdc.initialize(batch); batch.put(state,topologyOwnershipKey(0x63),receipt.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+                if(cdc!=null)publishCdc=cdc.importedBaseline(batch,receipt.position(),cdcAuthorityTime()); batch.put(state,topologyOwnershipKey(0x63),receipt.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
-            topologyActivation=receipt; publishScoped(position,history,false); applied=position; ownership.activate(owner); return receipt;
+            publishCdc.run();topologyActivation=receipt; publishScoped(position,history,false); applied=position; ownership.activate(owner); return receipt;
             }
         } finally { applyLane.unlock(); leaveNative(); }
     }
@@ -802,10 +829,11 @@ public final class ReplicatedRangeStore {
             if(trackedSnapshotPins.get()!=0 || preparedIndex.records().stream().anyMatch(p -> !isFinalized(p.preparation().transactionId())) || snapshotGates.values().stream().anyMatch(SnapshotGate::active)) throw new IllegalStateException("Topology parent writable/native work has not drained");
             if(topologyPreparation!=null) topologyPreparation.requireRequest(definition.header(),admission);
             requireNext(position); var freeze=new NativeTopologyFreeze(definition.header(),groupId,position,NativeTopologyFreeze.boundsDigest(interval.lowerInclusive(),interval.upperExclusive()),admission); var history=prepareScopedWrites(false,List.of(),Map.of());
+            Runnable publishCdc=()->{};
             try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
-                if(cdc!=null) cdc.initialize(batch); batch.put(state,topologyFreezeKey(),freeze.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
+                if(cdc!=null)publishCdc=cdc.append(batch,it.cavallium.rockserver.core.common.distributed.DistributedCdcRecord.terminalBarrier(freeze)); batch.put(state,topologyFreezeKey(),freeze.encode()); batch.put(state,markerKey,encodePosition(position)); batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position)); db.write(options,batch);
             }
-            activeTopologyFreeze=freeze; publishScoped(position,history,false); applied=position; return freeze;
+            publishCdc.run();activeTopologyFreeze=freeze; publishScoped(position,history,false); applied=position; return freeze;
         } finally { applyLane.unlock(); try { drainScopedReleases(); } finally { leaveNative(); } }
     }
 
@@ -1059,7 +1087,7 @@ public final class ReplicatedRangeStore {
     /** Bootstrap must install catalogue proposal authority before enabling new controls. Persisted data enforcement is unconditional. */
     public void enableSessionControls() {
         enterNative(); applyLane.lock();
-        try { requireActive(); sessionControlsEnabled=true; }
+        try { if(topologyRetired()) { try { requireTopologyMetadataOwner(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot configure sealed topology controls",failure); } } else requireActive(); sessionControlsEnabled=true; }
         finally { applyLane.unlock(); leaveNative(); }
     }
 
@@ -1201,6 +1229,11 @@ public final class ReplicatedRangeStore {
                 && (command.kind()==DistributedCommand.Kind.DATA && command.acknowledgedThrough()>=0 || command.kind()==DistributedCommand.Kind.SESSION_FLOOR && command.minimumSessionEpoch()>=0);
     }
     public void validate(DistributedCommand command) {
+        if(metadataTopologyControl(command)) {
+            enterNative();applyLane.lock();try { requireTopologyMetadataOwner();validateCommand(command,false); }
+            catch(RocksDBException failure) { throw new IllegalStateException("Cannot validate sealed topology control",failure); }
+            finally { applyLane.unlock();leaveNative(); }return;
+        }
         if(metadataSchemaControl(command) || topologyAccountingControl(command) && activeSchemaFence==null || activeTopologyFreeze==null && topologyPreparation==null && activeSchemaFence==null && Arrays.equals(schemaDigest,command.schemaDigest())) { validateCommand(command,true); return; }
         enterNative(); applyLane.lock();
         try {
@@ -2676,6 +2709,38 @@ public final class ReplicatedRangeStore {
             return java.util.Collections.unmodifiableList(copy);
         }
     }
+    public record MetadataEntry(byte[] key,byte[] value) {
+        public MetadataEntry { key=Objects.requireNonNull(key).clone();value=Objects.requireNonNull(value).clone(); }
+        @Override public byte[] key() { return key.clone(); }
+        @Override public byte[] value() { return value.clone(); }
+    }
+    public record CurrentMetadataPrefix(ApplyPosition position,List<MetadataEntry> entries) {
+        public CurrentMetadataPrefix { entries=List.copyOf(entries); }
+    }
+    /** Bounded server-owned topology status inventory, exclusively for active CATALOGUE metadata. */
+    public CurrentMetadataPrefix readCurrentMetadataPrefix(UUID column,byte[] prefix,int exactKeyBytes,int maxRows,int maxBytes) throws RocksDBException {
+        Objects.requireNonNull(column);byte[] low=Objects.requireNonNull(prefix).clone();
+        if(low.length!=1 || low[0]!=(byte)0x82 || exactKeyBytes!=17 || maxRows<1 || maxRows>128 || maxBytes<1 || maxBytes>MAX_SCHEMA_AUTHORITY_BYTES)throw new IllegalArgumentException("Invalid topology metadata prefix/budget");
+        enterNative();applyLane.lock();
+        try {
+            requireActive();if(!catalogueScopeCompaction || !columns.containsKey(column))throw new IllegalStateException("Topology prefix inventory requires active CATALOGUE column");ensureReceiptUsage();
+            byte[] marker=db.get(state,markerKey);var cut=marker==null ? null : decodePosition(marker);if(cut==null || !cut.equals(applied))throw new IllegalStateException("Catalogue prefix marker differs from completed apply");
+            var entries=new ArrayList<MetadataEntry>();long bytes=0;byte[] sizing=new byte[0],high={(byte)0x83};
+            try(var lower=new org.rocksdb.Slice(low);var upper=new org.rocksdb.Slice(high);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);var iterator=db.newIterator(columns.get(column),options)) {
+                iterator.seekToFirst();
+                while(iterator.isValid()) {
+                    int keyBytes=iterator.key(sizing);
+                    if(keyBytes==16) { iterator.next();continue; } // Shared-column directory UUIDs are not status rows.
+                    if(keyBytes!=exactKeyBytes)throw new IllegalStateException("Topology metadata status key shape changed");
+                    int valueBytes=iterator.value(sizing);
+                    if(entries.size()>=maxRows || keyBytes+(long)valueBytes>maxBytes-bytes)throw new IllegalStateException("Topology metadata prefix exceeds inventory budget");
+                    byte[] key=iterator.key(),value=iterator.value();if(key.length!=keyBytes || value.length!=valueBytes || key[0]!=(byte)0x82)throw new IllegalStateException("Topology metadata iterator cut changed");entries.add(new MetadataEntry(key,value));bytes+=keyBytes+(long)valueBytes;iterator.next();
+                }
+                iterator.status();
+            }
+            marker=db.get(state,markerKey);if(marker==null || !cut.equals(decodePosition(marker)) || !cut.equals(applied))throw new IllegalStateException("Catalogue prefix completed cut changed");return new CurrentMetadataPrefix(cut,entries);
+        } finally { applyLane.unlock();leaveNative(); }
+    }
     /** Small atomic metadata/user point read at one completed cut, without acquiring a native snapshot. */
     public CurrentPoints readCurrentPoints(List<PhysicalPoint> points) throws RocksDBException { return readCurrentPoints(points,MAX_RESULT_BYTES); }
     /** Explicit bounded schema-authority control read; ordinary foreground reads retain their smaller reply budget. */
@@ -2755,7 +2820,7 @@ public final class ReplicatedRangeStore {
         byte[] receiptKey = receiptKey(command.operationId());
         applyLane.lock();
         try {
-            requireActive();
+            if(metadataTopologyControl(command))requireTopologyMetadataOwner();else requireActive();
             ensureReceiptUsage(); requireHomeRecoveryFree(command.operationId());
             if(!metadataSchemaControl(command) && (activeTopologyFreeze!=null && !topologyAccountingControl(command) || activeSchemaFence!=null || !Arrays.equals(schemaDigest,command.schemaDigest()))) {
                 byte[] retained=db.get(receipts,receiptKey);

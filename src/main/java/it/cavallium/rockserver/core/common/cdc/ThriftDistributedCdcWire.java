@@ -103,10 +103,12 @@ public final class ThriftDistributedCdcWire {
             var envelopes=new ArrayList<CdcEnvelope>(batch.envelopes().size());
             for(var envelope:batch.envelopes()) {
                 var projected=new CdcEnvelope().setPosition(position(envelope.position())).setSchemaDigest(envelope.schemaDigest())
-                        .setOperation(operation(envelope.operation())).setEvents(envelope.events().stream().map(e->new CdcEvent(e.cursor().mutationOrdinal(),mutation(e.mutation()))).toList());
+                        .setEvents(envelope.events().stream().map(e->new CdcEvent(e.cursor().mutationOrdinal(),mutation(e.mutation()))).toList());
+                if(envelope.operation()!=null) projected.setOperation(operation(envelope.operation()));
+                if(envelope.terminalBarrier()!=null) projected.setTerminalBarrier(envelope.terminalBarrier().encode());
                 if(envelope.transaction()!=null) projected.setFinalization(envelope.transaction().encode()); envelopes.add(projected);
             }
-            result.setBatch(new CdcBatch(uuid(batch.id()),definition(batch.definition()),lineage(batch.lineage()),cursor(batch.from()),cursor(batch.next()),position(batch.cut()),envelopes));
+            result.setBatch(new CdcBatch(uuid(batch.id()),definition(batch.definition()),lineage(batch.lineage()),cursor(batch.from()),cursor(batch.next()),position(batch.cut()),envelopes,ByteBuffer.wrap(batch.currentStarts().encode())));
         }
         return result;
     }
@@ -119,15 +121,18 @@ public final class ThriftDistributedCdcWire {
             if(value.outcome!=CdcOutcome.DATA) throw new IllegalArgumentException("Non-DATA response carried CDC batch");
             var definition=definition(wire.definition); requireSubscription(definition,subscription);
             if(wire.envelopes==null || wire.envelopes.size()>MAX_RECORDS) throw new IllegalArgumentException("CDC envelope count exceeds global bound");
-            var selected=new HashSet<>(definition.columns()); long budget=DistributedCdcSubscriptions.BATCH_HEADER_BYTES+wire.definition.remaining(); long totalEvents=0;
+            var starts=DistributedCdcCheckpoint.decode(bytes(wire.currentStarts,DistributedCdcCheckpoint.MAX_BYTES));
+            var selected=new HashSet<>(definition.columns()); long budget=DistributedCdcSubscriptions.BATCH_HEADER_BYTES+wire.definition.remaining()+wire.currentStarts.remaining(); long totalEvents=0;
             // Check the entire projected body before copying binary mutation data or allocating event lists.
             for(var envelope:wire.envelopes) {
-                if(envelope.events==null || envelope.events.isEmpty() || envelope.events.size()>DistributedCdcSubscriptions.MAX_EVENTS_PER_ENVELOPE
+                if(envelope.events==null || envelope.events.size()>DistributedCdcSubscriptions.MAX_EVENTS_PER_ENVELOPE
                         || envelope.schemaDigest==null || envelope.schemaDigest.remaining()!=32
                         || envelope.finalization!=null && envelope.finalization.remaining()>ParticipantFinalization.MAX_BYTES)
                     throw new IllegalArgumentException("Invalid CDC envelope bounds");
+                if(envelope.terminalBarrier==null ? envelope.operation==null || envelope.events.isEmpty() : envelope.operation!=null || envelope.finalization!=null || !envelope.events.isEmpty()
+                        || envelope.terminalBarrier.remaining()>NativeTopologyFreeze.MAX_BYTES) throw new IllegalArgumentException("Mixed or missing CDC envelope payload");
                 totalEvents+=envelope.events.size(); long mutations=0;
-                budget+=DistributedCdcSubscriptions.ENVELOPE_HEADER_BYTES+(envelope.finalization==null?0:envelope.finalization.remaining());
+                budget+=DistributedCdcSubscriptions.ENVELOPE_HEADER_BYTES+(envelope.finalization==null?0:envelope.finalization.remaining())+(envelope.terminalBarrier==null?0:envelope.terminalBarrier.remaining());
                 for(var event:envelope.events) {
                     if(!selected.contains(uuid(event.mutation.columnId))) throw new IllegalArgumentException("Unselected CDC column");
                     long size=mutationBudget(event.mutation); mutations+=size; budget+=DistributedCdcSubscriptions.EVENT_ORDINAL_BYTES+size;
@@ -140,9 +145,10 @@ public final class ThriftDistributedCdcWire {
                 var position=position(envelope.position);
                 var events=envelope.events.stream().map(e->new DistributedCdcRecord.Event(new DistributedCdcCheckpoint.Cursor(position,e.ordinal),mutation(e.mutation))).toList();
                 var transaction=envelope.finalization==null?null:ParticipantFinalization.decode(bytes(envelope.finalization,ParticipantFinalization.MAX_BYTES));
-                envelopes.add(new DistributedCdcSubscriptions.Envelope(position,bytes(envelope.schemaDigest,32),operation(envelope.operation),transaction,events));
+                var barrier=envelope.terminalBarrier==null?null:NativeTopologyFreeze.decode(bytes(envelope.terminalBarrier,NativeTopologyFreeze.MAX_BYTES));
+                envelopes.add(new DistributedCdcSubscriptions.Envelope(position,bytes(envelope.schemaDigest,32),envelope.operation==null?null:operation(envelope.operation),transaction,events,barrier));
             }
-            batch=new DistributedCdcSubscriptions.Batch(uuid(wire.batchId),definition,lineage(wire.lineage),cursor(wire.fromCursor),cursor(wire.nextCursor),position(wire.cut),envelopes);
+            batch=new DistributedCdcSubscriptions.Batch(uuid(wire.batchId),definition,lineage(wire.lineage),cursor(wire.fromCursor),cursor(wire.nextCursor),position(wire.cut),envelopes,starts);
         }
         return new DistributedCdcSubscriptions.Poll(identity,DistributedCdcSubscriptions.Outcome.valueOf(value.outcome.name()),batch,value.requiredBytes,floor,cut);
     }
@@ -167,12 +173,14 @@ public final class ThriftDistributedCdcWire {
                 int length=readI32();
                 int maximum=request?switch(field) { case 1,2,3,4,5 -> 16; case 24 -> DistributedCdcSubscription.Definition.MAX_BYTES; default -> 0; }:switch(field) {
                     case 1,2,3,4,5 -> 16;
+                    case 9 -> NativeTopologyFreeze.MAX_BYTES;
                     case 20 -> 32;
                     case 21,22 -> DistributedCommandCodec.MAX_ENCODED_BYTES;
                     case 23 -> DistributedCdcSubscription.MAX_BYTES;
                     case 24 -> DistributedCdcSubscription.Definition.MAX_BYTES;
                     case 25 -> RangeDirectoryCodec.MAX_ENCODED_BYTES;
                     case 26 -> ParticipantFinalization.MAX_BYTES;
+                    case 27 -> DistributedCdcCheckpoint.MAX_BYTES;
                     case 32 -> 65535;
                     default -> DistributedCdcSubscription.Definition.MAX_BYTES;
                 };

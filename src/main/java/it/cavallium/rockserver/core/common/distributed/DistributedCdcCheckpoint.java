@@ -75,6 +75,16 @@ public final class DistributedCdcCheckpoint {
         var copy=new TreeMap<>(cursors); copy.put(lineage,next); return new DistributedCdcCheckpoint(copy);
     }
 
+    /** Replace every affected parent together only after explicit consumer ACK of its terminal boundary. */
+    public DistributedCdcCheckpoint handoff(DistributedCdcBarrierHandoff handoff) {
+        Objects.requireNonNull(handoff); var copy=new TreeMap<>(cursors);
+        for(var entry:handoff.parentTerminal().cursors().entrySet()) {
+            var cursor=copy.get(entry.getKey()); if(cursor==null || !cursor.covers(entry.getValue())) throw new IllegalArgumentException("CDC parent terminal boundary has not been acknowledged");
+        }
+        for(var lineage:handoff.childStarts().cursors().keySet()) if(copy.containsKey(lineage)) throw new IllegalArgumentException("CDC child lineage already present");
+        handoff.parentTerminal().cursors().keySet().forEach(copy::remove); copy.putAll(handoff.childStarts().cursors()); return new DistributedCdcCheckpoint(copy);
+    }
+
     public byte[] encode() {
         var bytes=ByteBuffer.allocate(4+cursors.size()*ENTRY_BYTES).putInt(cursors.size());
         cursors.forEach((lineage,cursor)->{

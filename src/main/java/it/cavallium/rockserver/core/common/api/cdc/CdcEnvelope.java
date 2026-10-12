@@ -15,15 +15,17 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
   private static final org.apache.thrift.protocol.TField OPERATION_FIELD_DESC = new org.apache.thrift.protocol.TField("operation", org.apache.thrift.protocol.TType.STRUCT, (short)8);
   private static final org.apache.thrift.protocol.TField FINALIZATION_FIELD_DESC = new org.apache.thrift.protocol.TField("finalization", org.apache.thrift.protocol.TType.STRING, (short)26);
   private static final org.apache.thrift.protocol.TField EVENTS_FIELD_DESC = new org.apache.thrift.protocol.TField("events", org.apache.thrift.protocol.TType.LIST, (short)31);
+  private static final org.apache.thrift.protocol.TField TERMINAL_BARRIER_FIELD_DESC = new org.apache.thrift.protocol.TField("terminalBarrier", org.apache.thrift.protocol.TType.STRING, (short)9);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new CdcEnvelopeStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new CdcEnvelopeTupleSchemeFactory();
 
   public @org.apache.thrift.annotation.Nullable CdcPosition position; // required
   public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer schemaDigest; // required
-  public @org.apache.thrift.annotation.Nullable CdcOperation operation; // required
+  public @org.apache.thrift.annotation.Nullable CdcOperation operation; // optional
   public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer finalization; // optional
   public @org.apache.thrift.annotation.Nullable java.util.List<CdcEvent> events; // required
+  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer terminalBarrier; // optional
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -31,7 +33,8 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
     SCHEMA_DIGEST((short)20, "schemaDigest"),
     OPERATION((short)8, "operation"),
     FINALIZATION((short)26, "finalization"),
-    EVENTS((short)31, "events");
+    EVENTS((short)31, "events"),
+    TERMINAL_BARRIER((short)9, "terminalBarrier");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -57,6 +60,8 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
           return FINALIZATION;
         case 31: // EVENTS
           return EVENTS;
+        case 9: // TERMINAL_BARRIER
+          return TERMINAL_BARRIER;
         default:
           return null;
       }
@@ -100,7 +105,7 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
   }
 
   // isset id assignments
-  private static final _Fields[] optionals = {_Fields.FINALIZATION};
+  private static final _Fields[] optionals = {_Fields.OPERATION,_Fields.FINALIZATION,_Fields.TERMINAL_BARRIER};
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
@@ -108,13 +113,15 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
         new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, CdcPosition.class)));
     tmpMap.put(_Fields.SCHEMA_DIGEST, new org.apache.thrift.meta_data.FieldMetaData("schemaDigest", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
-    tmpMap.put(_Fields.OPERATION, new org.apache.thrift.meta_data.FieldMetaData("operation", org.apache.thrift.TFieldRequirementType.REQUIRED,
+    tmpMap.put(_Fields.OPERATION, new org.apache.thrift.meta_data.FieldMetaData("operation", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, CdcOperation.class)));
     tmpMap.put(_Fields.FINALIZATION, new org.apache.thrift.meta_data.FieldMetaData("finalization", org.apache.thrift.TFieldRequirementType.OPTIONAL,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     tmpMap.put(_Fields.EVENTS, new org.apache.thrift.meta_data.FieldMetaData("events", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.ListMetaData(org.apache.thrift.protocol.TType.LIST,
             new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, CdcEvent.class))));
+    tmpMap.put(_Fields.TERMINAL_BARRIER, new org.apache.thrift.meta_data.FieldMetaData("terminalBarrier", org.apache.thrift.TFieldRequirementType.OPTIONAL,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(CdcEnvelope.class, metaDataMap);
   }
@@ -125,13 +132,11 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
   public CdcEnvelope(
     CdcPosition position,
     java.nio.ByteBuffer schemaDigest,
-    CdcOperation operation,
     java.util.List<CdcEvent> events)
   {
     this();
     this.position = position;
     this.schemaDigest = org.apache.thrift.TBaseHelper.copyBinary(schemaDigest);
-    this.operation = operation;
     this.events = events;
   }
 
@@ -158,6 +163,9 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
       }
       this.events = __this__events;
     }
+    if (other.isSetTerminalBarrier()) {
+      this.terminalBarrier = org.apache.thrift.TBaseHelper.copyBinary(other.terminalBarrier);
+    }
   }
 
   @Override
@@ -172,6 +180,7 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
     this.operation = null;
     this.finalization = null;
     this.events = null;
+    this.terminalBarrier = null;
   }
 
   @org.apache.thrift.annotation.Nullable
@@ -333,6 +342,40 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
     }
   }
 
+  public byte[] getTerminalBarrier() {
+    setTerminalBarrier(org.apache.thrift.TBaseHelper.rightSize(terminalBarrier));
+    return terminalBarrier == null ? null : terminalBarrier.array();
+  }
+
+  public java.nio.ByteBuffer bufferForTerminalBarrier() {
+    return org.apache.thrift.TBaseHelper.copyBinary(terminalBarrier);
+  }
+
+  public CdcEnvelope setTerminalBarrier(byte[] terminalBarrier) {
+    this.terminalBarrier = terminalBarrier == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(terminalBarrier.clone());
+    return this;
+  }
+
+  public CdcEnvelope setTerminalBarrier(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer terminalBarrier) {
+    this.terminalBarrier = org.apache.thrift.TBaseHelper.copyBinary(terminalBarrier);
+    return this;
+  }
+
+  public void unsetTerminalBarrier() {
+    this.terminalBarrier = null;
+  }
+
+  /** Returns true if field terminalBarrier is set (has been assigned a value) and false otherwise */
+  public boolean isSetTerminalBarrier() {
+    return this.terminalBarrier != null;
+  }
+
+  public void setTerminalBarrierIsSet(boolean value) {
+    if (!value) {
+      this.terminalBarrier = null;
+    }
+  }
+
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -384,6 +427,18 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
       }
       break;
 
+    case TERMINAL_BARRIER:
+      if (value == null) {
+        unsetTerminalBarrier();
+      } else {
+        if (value instanceof byte[]) {
+          setTerminalBarrier((byte[])value);
+        } else {
+          setTerminalBarrier((java.nio.ByteBuffer)value);
+        }
+      }
+      break;
+
     }
   }
 
@@ -405,6 +460,9 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
 
     case EVENTS:
       return getEvents();
+
+    case TERMINAL_BARRIER:
+      return getTerminalBarrier();
 
     }
     throw new java.lang.IllegalStateException();
@@ -428,6 +486,8 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
       return isSetFinalization();
     case EVENTS:
       return isSetEvents();
+    case TERMINAL_BARRIER:
+      return isSetTerminalBarrier();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -490,6 +550,15 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
         return false;
     }
 
+    boolean this_present_terminalBarrier = true && this.isSetTerminalBarrier();
+    boolean that_present_terminalBarrier = true && that.isSetTerminalBarrier();
+    if (this_present_terminalBarrier || that_present_terminalBarrier) {
+      if (!(this_present_terminalBarrier && that_present_terminalBarrier))
+        return false;
+      if (!this.terminalBarrier.equals(that.terminalBarrier))
+        return false;
+    }
+
     return true;
   }
 
@@ -516,6 +585,10 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
     hashCode = hashCode * 8191 + ((isSetEvents()) ? 131071 : 524287);
     if (isSetEvents())
       hashCode = hashCode * 8191 + events.hashCode();
+
+    hashCode = hashCode * 8191 + ((isSetTerminalBarrier()) ? 131071 : 524287);
+    if (isSetTerminalBarrier())
+      hashCode = hashCode * 8191 + terminalBarrier.hashCode();
 
     return hashCode;
   }
@@ -578,6 +651,16 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
         return lastComparison;
       }
     }
+    lastComparison = java.lang.Boolean.compare(isSetTerminalBarrier(), other.isSetTerminalBarrier());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetTerminalBarrier()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.terminalBarrier, other.terminalBarrier);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
     return 0;
   }
 
@@ -617,14 +700,16 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
       org.apache.thrift.TBaseHelper.toString(this.schemaDigest, sb);
     }
     first = false;
-    if (!first) sb.append(", ");
-    sb.append("operation:");
-    if (this.operation == null) {
-      sb.append("null");
-    } else {
-      sb.append(this.operation);
+    if (isSetOperation()) {
+      if (!first) sb.append(", ");
+      sb.append("operation:");
+      if (this.operation == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.operation);
+      }
+      first = false;
     }
-    first = false;
     if (isSetFinalization()) {
       if (!first) sb.append(", ");
       sb.append("finalization:");
@@ -643,6 +728,16 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
       sb.append(this.events);
     }
     first = false;
+    if (isSetTerminalBarrier()) {
+      if (!first) sb.append(", ");
+      sb.append("terminalBarrier:");
+      if (this.terminalBarrier == null) {
+        sb.append("null");
+      } else {
+        org.apache.thrift.TBaseHelper.toString(this.terminalBarrier, sb);
+      }
+      first = false;
+    }
     sb.append(")");
     return sb.toString();
   }
@@ -654,9 +749,6 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
     }
     if (schemaDigest == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'schemaDigest' was not present! Struct: " + toString());
-    }
-    if (operation == null) {
-      throw new org.apache.thrift.protocol.TProtocolException("Required field 'operation' was not present! Struct: " + toString());
     }
     if (events == null) {
       throw new org.apache.thrift.protocol.TProtocolException("Required field 'events' was not present! Struct: " + toString());
@@ -759,6 +851,14 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
+          case 9: // TERMINAL_BARRIER
+            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+              struct.terminalBarrier = iprot.readBinary();
+              struct.setTerminalBarrierIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
           default:
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
         }
@@ -781,9 +881,18 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
         oprot.writeFieldEnd();
       }
       if (struct.operation != null) {
-        oprot.writeFieldBegin(OPERATION_FIELD_DESC);
-        struct.operation.write(oprot);
-        oprot.writeFieldEnd();
+        if (struct.isSetOperation()) {
+          oprot.writeFieldBegin(OPERATION_FIELD_DESC);
+          struct.operation.write(oprot);
+          oprot.writeFieldEnd();
+        }
+      }
+      if (struct.terminalBarrier != null) {
+        if (struct.isSetTerminalBarrier()) {
+          oprot.writeFieldBegin(TERMINAL_BARRIER_FIELD_DESC);
+          oprot.writeBinary(struct.terminalBarrier);
+          oprot.writeFieldEnd();
+        }
       }
       if (struct.schemaDigest != null) {
         oprot.writeFieldBegin(SCHEMA_DIGEST_FIELD_DESC);
@@ -829,7 +938,6 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
       org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
       struct.position.write(oprot);
       oprot.writeBinary(struct.schemaDigest);
-      struct.operation.write(oprot);
       {
         oprot.writeI32(struct.events.size());
         for (CdcEvent _iter12 : struct.events)
@@ -838,12 +946,24 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
         }
       }
       java.util.BitSet optionals = new java.util.BitSet();
-      if (struct.isSetFinalization()) {
+      if (struct.isSetOperation()) {
         optionals.set(0);
       }
-      oprot.writeBitSet(optionals, 1);
+      if (struct.isSetFinalization()) {
+        optionals.set(1);
+      }
+      if (struct.isSetTerminalBarrier()) {
+        optionals.set(2);
+      }
+      oprot.writeBitSet(optionals, 3);
+      if (struct.isSetOperation()) {
+        struct.operation.write(oprot);
+      }
       if (struct.isSetFinalization()) {
         oprot.writeBinary(struct.finalization);
+      }
+      if (struct.isSetTerminalBarrier()) {
+        oprot.writeBinary(struct.terminalBarrier);
       }
     }
 
@@ -855,9 +975,6 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
       struct.setPositionIsSet(true);
       struct.schemaDigest = iprot.readBinary();
       struct.setSchemaDigestIsSet(true);
-      struct.operation = new CdcOperation();
-      struct.operation.read(iprot);
-      struct.setOperationIsSet(true);
       {
         org.apache.thrift.protocol.TList _list13 = iprot.readListBegin(org.apache.thrift.protocol.TType.STRUCT);
         struct.events = new java.util.ArrayList<CdcEvent>(_list13.size);
@@ -870,10 +987,19 @@ public class CdcEnvelope implements org.apache.thrift.TBase<CdcEnvelope, CdcEnve
         }
       }
       struct.setEventsIsSet(true);
-      java.util.BitSet incoming = iprot.readBitSet(1);
+      java.util.BitSet incoming = iprot.readBitSet(3);
       if (incoming.get(0)) {
+        struct.operation = new CdcOperation();
+        struct.operation.read(iprot);
+        struct.setOperationIsSet(true);
+      }
+      if (incoming.get(1)) {
         struct.finalization = iprot.readBinary();
         struct.setFinalizationIsSet(true);
+      }
+      if (incoming.get(2)) {
+        struct.terminalBarrier = iprot.readBinary();
+        struct.setTerminalBarrierIsSet(true);
       }
     }
   }

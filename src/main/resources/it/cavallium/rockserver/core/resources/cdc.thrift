@@ -15,13 +15,13 @@ struct CdcMutation {
 }
 struct CdcEvent { 7: required i32 ordinal, 8: required CdcMutation mutation }
 struct CdcEnvelope {
- 6: required CdcPosition position, 20: required binary schemaDigest, 8: required CdcOperation operation,
- 26: optional binary finalization, 31: required list<CdcEvent> events
+ 6: required CdcPosition position, 20: required binary schemaDigest, 8: optional CdcOperation operation,
+ 26: optional binary finalization, 31: required list<CdcEvent> events, 9: optional binary terminalBarrier
 }
 struct CdcBatch {
  1: required binary batchId, 24: required binary definition, 6: required CdcLineage lineage,
  7: required CdcCursor fromCursor, 8: required CdcCursor nextCursor, 9: required CdcPosition cut,
- 30: required list<CdcEnvelope> envelopes
+ 30: required list<CdcEnvelope> envelopes, 27: required binary currentStarts
 }
 struct CdcPoll {
  6: required CdcLineage lineage, 7: required CdcOutcome outcome, 8: optional CdcBatch batch,

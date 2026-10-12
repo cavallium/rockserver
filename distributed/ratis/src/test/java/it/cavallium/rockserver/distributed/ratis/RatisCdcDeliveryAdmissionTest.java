@@ -23,6 +23,38 @@ class RatisCdcDeliveryAdmissionTest {
         return f.machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(f.peer.getId()).setGroupId(f.group.getGroupId()).setCallId(1)
                 .setType(RaftClientRequest.writeRequestType()).setMessage(message(DistributedCommandCodec.encode(command))).build());
     }
+    @Test void retiredTerminalEofNeedsFreshPreparedDeliveryAndCanBeAcknowledged() throws Exception {
+        var authority=new AtomicReference<RatisCdcDeliveryAuthority>(); var checks=new AtomicInteger();
+        var helper=new RatisImportPublicationAdmissionTest();helper.root=root.resolve("catalogue");
+        try(var f=helper.new Fixture(null,machine->machine.cdcDeliveryAdmission(command->{checks.incrementAndGet();authority.get().validate(command);}));
+                var source=new RatisTopologyCdcPollTest.Fixture(root.resolve("parent"),f.catalogue.outer.cluster,f.catalogue.outer.database,new UUID(9,604))) {
+            source.seal(true); var directory=source.directory;
+            try(var client=new RatisRoutedClient(directory,new RatisRoutedClient.Transport(){
+                public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key){throw new AssertionError();}
+                public CommandResult command(RangeDescriptor descriptor,DistributedCommand command){throw new AssertionError();}
+                public byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean fresh)throws IOException{
+                    assertTrue(fresh);try{return source.machine.queryLinearizable(message(request)).get(5,TimeUnit.SECONDS).getContent().toByteArray();}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException(failure);}
+                }
+            })) {
+                authority.set(new RatisCdcDeliveryAuthority(client,domain->directory));
+                byte[] key=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();
+                var seed=new DistributedCommand(f.catalogue.outer.catalogue,1,new byte[32],new OperationId(new UUID(9,605),1,0),List.of(new Mutation(Mutation.Kind.PUT,f.catalogue.outer.directoryColumn,key,RangeDirectoryCodec.encode(directory))));
+                f.catalogue.nativeCatalogue.store.apply(new ApplyPosition(1,f.catalogue.nativeCatalogue.next.getAndIncrement()),seed);
+                var catalogue=new RatisCdcSubscriptionCatalogue(f.catalogue.client,directory.clusterId(),directory.databaseId(),f.catalogue.outer.catalogue,1,new byte[32],f.catalogue.outer.directoryColumn);
+                var lineage=new DistributedCdcCheckpoint.Lineage(source.rangeId,source.groupId,1);var initialCursor=new DistributedCdcCheckpoint(Map.of(lineage,DistributedCdcCheckpoint.Cursor.beginning()));
+                var definition=DistributedCdcSubscription.Definition.create(new UUID(9,606),new UUID(9,607),directory,directory.columns(),initialCursor);
+                catalogue.execute(catalogue.prepareCreate(f.catalogue.operation(710),definition,directory,null));f.machine.notifyTermIndexUpdated(1,f.catalogue.nativeCatalogue.store.applied().index());
+                var initial=catalogue.read(definition.subscriptionId());var terminal=initial.delivered().advance(lineage,DistributedCdcCheckpoint.Cursor.after(source.freeze.position()));
+                var delivery=catalogue.prepareDelivery(f.catalogue.operation(711),initial,terminal);assertNotNull(propose(f,delivery).getException());
+                byte[] prepare=RatisCdcDeliveryRpc.request(RatisCdcDeliveryRpc.PREPARE,delivery);assertThrows(ExecutionException.class,()->f.machine.query(message(prepare)).get(5,TimeUnit.SECONDS));
+                RatisCdcDeliveryRpc.requireEcho(f.machine.queryLinearizable(message(prepare)).get(5,TimeUnit.SECONDS).getContent().toByteArray(),RatisCdcDeliveryRpc.PREPARE,delivery);
+                f.apply(propose(f,delivery));var issued=catalogue.read(definition.subscriptionId());assertEquals(terminal,issued.delivered());assertEquals(initialCursor,issued.checkpoint());
+                var ack=catalogue.prepareAcknowledgement(f.catalogue.operation(712),issued,terminal);f.apply(propose(f,ack));assertEquals(terminal,catalogue.read(definition.subscriptionId()).checkpoint());
+                f.apply(propose(f,delivery));assertEquals(1,checks.get());assertEquals(0,source.store.activeSnapshotPins());assertTrue(source.child.topologyBirthPending());
+            }
+        }
+    }
     @Test void qualifiedDeliveryPersistsBeforeAckAndExactRetriesNeedNoNewSourceRead() throws Exception {
         var authority=new AtomicReference<RatisCdcDeliveryAuthority>(); var checks=new AtomicInteger(); var unavailable=new AtomicBoolean();
         var helper=new RatisImportPublicationAdmissionTest(); helper.root=root.resolve("catalogue");
