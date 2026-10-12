@@ -19,6 +19,7 @@ import it.cavallium.rockserver.core.common.distributed.SessionEpochLedger;
 import org.rocksdb.RocksDBException;
 
 import java.io.*;
+import java.util.HexFormat;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
@@ -417,6 +418,7 @@ public final class NativeRangeImage {
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaActivationProof currentSchemaActivation;
         private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest importBirth;
         private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.Receipt importReceipt;
+        private it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration learnerAdoption;
         private NativeRangeSstImport.Activation importActivation;
         private int importFileReceipts;
         private long importFileReceiptCount;
@@ -533,6 +535,7 @@ public final class NativeRangeImage {
                         }
                     } catch(IllegalArgumentException invalid) { throw new IOException("Invalid topology image provenance",invalid); }
                 }
+                if(section==Section.STATE && key.length==17 && key[16]==0x67){try{learnerAdoption=it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.decode(value);}catch(IllegalArgumentException invalid){throw new IOException("Invalid learner adoption evidence",invalid);}}
                 if(section==Section.STATE && key.length>16 && (key[16]==0x65 || key[16]==0x66)) {
                     try {
                         if(key.length!=49 || (sourceOutcomeBytes+=49L+value.length)>it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IllegalArgumentException("Source outcome image key/capacity changed");
@@ -829,12 +832,15 @@ public final class NativeRangeImage {
                 if(topologyOrigin==null || topologyBirth==null || topologyActivation==null || topologyFreeze!=null || importBirth!=null
                         || !topologyBirth.equals(topologyOrigin.activation().birth()) || !Arrays.equals(topologyActivation.encode(),topologyOrigin.activation().encode())) throw new IOException("Topology image lacks exact complete birth/activation/origin provenance");
                 var seed=topologyOrigin.seed(); var source=seed.definition().sourceDirectory();
+                Map<String,byte[]> adoptedMutable=Map.of();if(topologyOrigin.learnerAdoptionDigest()!=null){if(learnerAdoption==null || !Arrays.equals(topologyOrigin.learnerAdoptionDigest(),learnerAdoption.digest()) || !Arrays.equals(seed.encode(),learnerAdoption.origin().seed().encode()) || !Arrays.equals(topologyActivation.encode(),learnerAdoption.origin().activation().encode()))throw new IOException("Topology alias bridge lacks exact original learner adoption");adoptedMutable=learnerAdoption.localSchemaRows();for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] expected=adoptedMutable.get(HexFormat.of().formatHex(key));if(expected!=null && !Arrays.equals(expected,record.encode()))throw new IOException("Learner image changed normalized historical alias evidence");}}
+
+                final Map<String,byte[]> adopted=adoptedMutable;
                 boolean original=Arrays.equals(source.schemaDigest(),header.schema()) && source.columns().equals(header.interval().columns()) && seed.mergeColumns().equals(header.mergeColumns());
                 if(!original) {
                     boolean qualified=false;
                     if(schemaInstallation!=null && currentSchemaActivation!=null) for(var record:schemaInstallations) {
                         var position=topologyActivation.position(); var fence=record.fence().position();
-                        if(Arrays.equals(record.definition().sourceSchema().digest(),source.schemaDigest()) && record.sourceNames().equals(seed.physicalNames()) && record.sourceMerges().equals(seed.mergeColumns())
+                        if(Arrays.equals(record.definition().sourceSchema().digest(),source.schemaDigest()) && (record.sourceNames().equals(seed.physicalNames()) || topologyOrigin.learnerAdoptionDigest()!=null && adopted.values().stream().anyMatch(value->{try{var known=it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation.decode(value);return known.definition().changeId().equals(record.definition().changeId()) && known.sourceNames().equals(record.sourceNames());}catch(IllegalArgumentException wrongType){return false;}})) && record.sourceMerges().equals(seed.mergeColumns())
                                 && fence.index()>position.index() && fence.term()>=position.term()) { qualified=true; break; }
                     }
                     if(!qualified) throw new IOException("Topology image original schema lacks complete qualified subsequent lifecycle");

@@ -99,7 +99,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         try { var found=new HashMap<UUID,NativeTopologyLearnerRegistration>();long bytes=0;
             for(var history:ownershipHistory) { UUID group=history.owner().groupId();if(found.containsKey(group))continue;byte[] key=groupSchemaKey(group,0x67);int size=loaded.db().get().get(handles.get(STATE_COLUMN),key,new byte[0]);if(size==org.rocksdb.RocksDB.NOT_FOUND)continue;
                 if(size>NativeTopologyLearnerRegistration.MAX_BYTES || found.size()>=MAX_TOPOLOGY_LEARNERS || (bytes+=size)>MAX_TOPOLOGY_LEARNER_BYTES)throw new IllegalArgumentException("Learner registration retention exceeded");var registration=NativeTopologyLearnerRegistration.decode(loaded.db().get().get(handles.get(STATE_COLUMN),key));var descriptor=registration.definition().targets().getFirst();
-                if(!descriptor.groupId().equals(group) || !history.owner().equals(new RangeOwnership.Owner(group,descriptor.rangeEpoch())) || !history.interval().equals(learnerInterval(registration)) || topologyBirths.containsKey(group) || topologyRetirements.containsKey(group))throw new IllegalArgumentException("Learner lacks exact permanent receiver history");found.put(group,registration);
+                if(!descriptor.groupId().equals(group) || !history.owner().equals(new RangeOwnership.Owner(group,descriptor.rangeEpoch())) || !history.interval().domainId().equals(learnerInterval(registration).domainId()) || !history.interval().columns().containsAll(registration.schema().columnIds()) || !Arrays.equals(history.interval().lowerInclusive(),descriptor.lowerInclusive()) || !Arrays.equals(history.interval().upperExclusive(),descriptor.upperExclusive()) || topologyBirths.containsKey(group) || topologyRetirements.containsKey(group))throw new IllegalArgumentException("Learner lacks exact permanent receiver history");found.put(group,registration);
             }
             topologyLearners=Map.copyOf(found);
         } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover learner registration",failure); }
@@ -112,7 +112,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             synchronized(admission) { if(closing)throw new IllegalStateException("Pool is closing"); }
             if(pendingTopologySeed!=null || !newImportReservations.isEmpty())throw new IllegalStateException("Unknown seed/import history requires exact original retry");
             if(pendingLearnerHistory!=null && !pendingLearnerHistory.equals(group))throw new IllegalStateException("Unknown learner history requires exact original retry");
-            if(!Arrays.equals(registration.schema().digest(),registration.origin().seed().header().schemaDigest()) || !registration.physicalNames().equals(registration.origin().seed().physicalNames()) || !registration.mergeColumns().equals(registration.origin().seed().mergeColumns()))throw new UnsupportedOperationException("Evolved learner images require receiver-owned verified schema/CF preparation");
+            try { if(artifacts.qualified() || !registration.mergeColumns().isEmpty())artifacts.bind(registration.schema(),registration.physicalNames()); } catch(IOException failure) { throw new IllegalStateException("Learner current operators are not locally qualified",failure); }
             var pending=pendingTopologyLearners.get(group);var saved=topologyLearners.get(group);if(pending!=null && !pending.equals(registration) || saved!=null && !saved.equals(registration))throw new IllegalArgumentException("Learner registration changed original authorization/image");
             byte[] persisted=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(group,0x67));if(persisted!=null && !Arrays.equals(persisted,registration.encode()))throw new IllegalArgumentException("Persisted learner identity changed");
             if(saved==null) {
@@ -121,7 +121,14 @@ public final class DistributedStoragePool implements AutoCloseable {
                 var history=proposedOwnershipHistory(owner,interval);final byte[] historyBytes;try { historyBytes=encodeOwnershipHistory(history); } catch(IOException invalid) { throw new IllegalStateException("Learner ownership history capacity exhausted",invalid); }ownershipHistory=history;ownershipHistoryDurable=false;pendingLearnerHistory=group;try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)) {batch.put(handles.get(STATE_COLUMN),OWNERSHIP_HISTORY_KEY,historyBytes);batch.put(handles.get(STATE_COLUMN),groupSchemaKey(group,0x67),registration.encode());loaded.db().get().write(options,batch);}topologyLearnerForceObserver.boundary(true);loaded.db().get().flushWal(true);ownershipHistory=history;ownershipHistoryDurable=true;var next=new HashMap<>(topologyLearners);next.put(group,registration);topologyLearners=Map.copyOf(next);pendingTopologyLearners.remove(group);pendingLearnerHistory=null;
             }
         } finally { nativeMutation.release(); }
-        var store=openRange(owner,interval,registration.schema().digest(),registration.physicalNames(),registration.mergeColumns());store.enableLogicalSchema(registration.schema());return store;
+        var store=openRange(owner,interval,registration.schema().digest(),registration.physicalNames(),registration.mergeColumns());
+        var schema=registration.schema();
+        if(!Arrays.equals(store.schemaDigest(),schema.digest())) {
+            var checkpoint=recoverSchema(owner.groupId());
+            if(checkpoint.current()==null || !Arrays.equals(store.schemaDigest(),checkpoint.current().definition().targetSchema().digest())) throw new IllegalArgumentException("Learner lacks verified current schema");
+            schema=checkpoint.current().definition().targetSchema();
+        }
+        store.enableLogicalSchema(schema);return store;
     }
     private volatile PendingTopologySeed pendingTopologySeed;
     @FunctionalInterface public interface TopologySeedForceObserver { void boundary(boolean afterPersistence) throws RocksDBException; }
@@ -950,6 +957,13 @@ public final class DistributedStoragePool implements AutoCloseable {
             }
             if(topologySource!=null && (newImport!=null || !owner.equals(new RangeOwnership.Owner(owner.groupId(),topologySource.header().participant(TopologyChange.Stage.FREEZE,owner.groupId()).rangeEpoch())))) throw new IllegalArgumentException("Topology source cannot be reused");
             if(topologySource!=null || topologyChild!=null || learner!=null) for(var existing:ranges) if(existing.ownership().owner().equals(owner)) {
+                if(learner!=null && !Arrays.equals(existing.schemaDigest(),schema)) {
+                    var checkpoint=recoverSchema(owner.groupId());var current=checkpoint.current();
+                    if(current==null)throw new IllegalArgumentException("Opened learner lacks verified current schema");
+                    current.requireRange(owner.groupId(),owner.epoch(),interval.domainId(),interval.lowerInclusive(),interval.upperExclusive());
+                    schema=current.definition().targetSchema().digest();names=current.targetNames();merges=current.targetMerges();
+                    interval=new RangeOwnership.Interval(interval.domainId(),names.keySet(),interval.lowerInclusive(),interval.upperExclusive());
+                }
                 if(!existing.ownership().interval().equals(interval) || !Arrays.equals(existing.schemaDigest(),schema) || !schemaPhysicalNamesUnderMutation(existing).equals(names) || !existing.deterministicMergeColumns().equals(merges)) throw new IllegalArgumentException("Opened topology/range identity changed"); return existing;
             }
             byte[] importBirth=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(owner.groupId(),0x40));
@@ -991,12 +1005,13 @@ public final class DistributedStoragePool implements AutoCloseable {
                             || Arrays.equals(schema,historical.definition().targetSchema().digest()) && names.equals(historical.targetNames()) && merges.equals(historical.targetMerges())) original=true;
                 }
                 if(!original) throw new IllegalArgumentException("Bootstrap differs from verified schema lifecycle");
+
                 var definition=recovered.definition(); schemaOrigins.put(definition.sourceSchema().domainId(),definition);
-                if(topologySource==null && topologyChild==null) recoveryOwnership=prepareSchemaRecovery(interval.domainId(),checkpoint.chain());
+                if(topologySource==null && topologyChild==null && learner==null) recoveryOwnership=prepareSchemaRecovery(interval.domainId(),checkpoint.chain());
                 schema=definition.targetSchema().digest(); names=recovered.targetNames(); merges=recovered.targetMerges();
                 interval=new RangeOwnership.Interval(interval.domainId(),names.keySet(),interval.lowerInclusive(),interval.upperExclusive());
             }
-            if(topologySource==null && topologyChild==null && recoveryOwnership==null) for(var origin:schemaOrigins.values()) {
+            if(topologySource==null && topologyChild==null && learner==null && recoveryOwnership==null) for(var origin:schemaOrigins.values()) {
                 if(!origin.sourceSchema().domainId().equals(interval.domainId())) continue;
                 var descriptor=origin.sourceDirectory().ranges().stream().filter(participant -> participant.groupId().equals(owner.groupId()) && participant.rangeEpoch()==owner.epoch()).findFirst().orElse(null);
                 if(descriptor==null || !Arrays.equals(descriptor.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(descriptor.upperExclusive(),interval.upperExclusive())) continue;
@@ -1046,7 +1061,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             }
             pressureColumns = List.copyOf(handles.values());
             retainOwnershipHistory(owner,interval);
-            if(topologySource==null && topologyChild==null && recoveryOwnership==null && recoveryTransition==null) {
+            if(topologySource==null && topologyChild==null && learner==null && recoveryOwnership==null && recoveryTransition==null) {
                 for(var origin:schemaOrigins.values()) if(origin.sourceSchema().domainId().equals(interval.domainId())
                         && Arrays.equals(origin.sourceSchema().digest(),schema) && origin.sourceSchema().columnIds().equals(interval.columns())
                         && origin.sourceDirectory().ranges().stream().anyMatch(participant -> participant.groupId().equals(owner.groupId()) && participant.rangeEpoch()==owner.epoch())) {
@@ -1064,7 +1079,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                         handles.get(STATE_COLUMN), handles.get(RECEIPTS_COLUMN), merges);
                 store.configureSnapshotAdmission(snapshotAdmission); store.configureSchemaPreparationPool(this);
                 store.validateTopologyActivationRecovery();
-                if(topologySource==null && topologyChild!=null && store.topologyActivation()!=null && !store.pendingInstallation()) ownership.activate(owner);
+                if(topologySource==null && (topologyChild!=null && learner==null && store.topologyActivation()!=null || learner!=null && store.topologyLearnerServing()) && !store.pendingInstallation()) ownership.activate(owner);
                 for(var entry:names.entrySet()) bindings.putIfAbsent(entry.getKey(),new Binding(entry.getValue(),merges.contains(entry.getKey())));
                 ranges.add(store);
                 if(newImport!=null)newImportReservations.remove(owner.groupId());
