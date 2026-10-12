@@ -45,8 +45,8 @@ class RatisLogicalTransactionTest {
                             writes.incrementAndGet(); f.lost.add(command.groupId());
                             try {
                                 byte[] journal=SessionJournalFiles.read(path.resolve("window.bin"),SessionWindowJournal.MAX_BYTES);
-                                int length=ByteBuffer.wrap(journal).getInt(121);
-                                assertArrayEquals(DistributedCommandCodec.encode(command),Arrays.copyOfRange(journal,125,125+length));
+                                var frame=ByteBuffer.wrap(journal);int directories=frame.getInt(121);frame.position(125);for(int n=0;n<directories;n++){int bytes=frame.getInt();frame.position(frame.position()+bytes);}int length=frame.getInt();
+                                assertArrayEquals(DistributedCommandCodec.encode(command),Arrays.copyOfRange(journal,frame.position(),frame.position()+length));
                             } catch (IOException failure) { throw new AssertionError(failure); }
                         }
                     };
@@ -109,7 +109,7 @@ class RatisLogicalTransactionTest {
                 }
             };
             Path path=Files.createDirectory(root.resolve("plan-retry"));
-            try (var routed=new RatisRoutedClient(f.directory,transport); var session=RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,routed,1000,RatisSessionClient.Limits.defaults())) {
+            try (var routed=new RatisRoutedClient(f.directory,transport); var session=RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements(),1000,RatisSessionClient.Limits.defaults())) {
                 session.advance();
                 try (var tx=session.openTransaction(scope(schema,7),Duration.ofSeconds(5))) {
                     var changes=changes(h.key(7),7); tx.stage(changes); assertThrows(IOException.class,() -> tx.commit(changes));
@@ -153,7 +153,7 @@ class RatisLogicalTransactionTest {
         var h=helper(); var schema=h.schema();
         try (var f=new RatisSessionPropagationTest.Fixture(root,true,schema.digest(),schema)) {
             Path path=Files.createDirectory(root.resolve("handle-budget"));
-            try (var session=RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,f.routed,1000,new RatisSessionClient.Limits(1,1024*1024,1024*1024))) {
+            try (var session=RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,f.routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements(),1000,new RatisSessionClient.Limits(1,1024*1024,1024*1024))) {
                 session.advance();
                 try (var tx=session.openTransaction(scope(schema,7),Duration.ofSeconds(5))) {
                     assertThrows(IOException.class,session::close); assertThrows(IOException.class,() -> h.reopen(path,f,schema));

@@ -24,7 +24,7 @@ class RatisBucketSessionTest {
         var schema=schema(true);
         try (var f=new RatisSessionPropagationTest.Fixture(root,true,schema.digest(),schema)) {
             Path path=Files.createDirectory(root.resolve("session")); byte[] frozen;
-            try (var session=RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,f.routed,1000,RatisSessionClient.Limits.defaults())) {
+            try (var session=RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,f.routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements(),1000,RatisSessionClient.Limits.defaults())) {
                 session.advance(); var pending=session.prepare(List.of(
                         RatisLogicalClient.Change.put(71,key(1),Buf.wrap(new byte[]{1}),Mutation.ReturnMode.PREVIOUS),
                         RatisLogicalClient.Change.put(71,key(2),Buf.wrap(new byte[]{2}),Mutation.ReturnMode.CURRENT)),
@@ -34,7 +34,7 @@ class RatisBucketSessionTest {
                 f.lost.add(pending.descriptor().groupId()); assertThrows(IOException.class,() -> session.execute(pending));
             }
             long catalogueCommands=f.catalogue.next.get();
-            try (var session=RatisDurableLogicalSession.reopen(path,schema,f.catalogue.epochs,f.routed)) {
+            try (var session=RatisDurableLogicalSession.reopen(path,schema,f.catalogue.epochs,f.routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements())) {
                 var original=session.pending().getFirst(); assertArrayEquals(frozen,DistributedCommandCodec.encode(original.command()));
                 var later=session.preparePut(71,key(1),Buf.wrap(new byte[]{9}),Mutation.ReturnMode.PREVIOUS);
                 assertArrayEquals(new byte[]{1},session.execute(later).value(0)); session.acknowledge(later);

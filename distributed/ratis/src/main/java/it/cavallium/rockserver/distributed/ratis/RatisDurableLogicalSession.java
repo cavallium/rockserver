@@ -4,6 +4,7 @@ import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.io.IOException;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
 import java.nio.file.*;
@@ -28,22 +29,23 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
     }
     private static final int MAGIC=0x44534c53, BODY_BYTES=109;
     private final Path root,intent; private final DistributedSchema schema; private final RatisSessionEpochs epochs;
+    private final RatisTransactionStatuses homes;private final RWScheduler scheduler;private final RatisCatalogue directories;private final RatisRoutedClient.SourceAckDirectoryReader acknowledgementDirectories;
     private final RatisRoutedClient routed; private final byte[] identity; private final long expires;
     private final RatisSessionClient.Limits limits; private final FileChannel channel; private final FileLock lock;
     private final ReentrantLock lane=new ReentrantLock(); private RatisGrantIssuer issuer; private RatisDurableSessionClient window;
     private Phase phase; private SessionEpochLedger.Grant activatedGrant; private int active,transactionHandles; private boolean advancing,fenced,closeRequested,closed;
-    public static RatisDurableLogicalSession create(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,
+    public static RatisDurableLogicalSession create(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader acknowledgementDirectories,
             long expiresAtMillis,RatisSessionClient.Limits limits) throws IOException {
-        return new RatisDurableLogicalSession(root,schema,epochs,routed,true,expiresAtMillis,limits);
+        return new RatisDurableLogicalSession(root,schema,epochs,routed,homes,scheduler,directories,acknowledgementDirectories,true,expiresAtMillis,limits);
     }
-    public static RatisDurableLogicalSession reopen(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed) throws IOException {
-        return new RatisDurableLogicalSession(root,schema,epochs,routed,false,0,null);
+    public static RatisDurableLogicalSession reopen(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader acknowledgementDirectories) throws IOException {
+        return new RatisDurableLogicalSession(root,schema,epochs,routed,homes,scheduler,directories,acknowledgementDirectories,false,0,null);
     }
-    private RatisDurableLogicalSession(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,
+    private RatisDurableLogicalSession(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader acknowledgementDirectories,
             boolean create,long expires,RatisSessionClient.Limits limits) throws IOException {
         this.root=root.toAbsolutePath(); this.intent=this.root.resolve("session.bin"); this.schema=Objects.requireNonNull(schema);
-        this.epochs=Objects.requireNonNull(epochs); this.routed=Objects.requireNonNull(routed); schema.requireMatches(routed.directory()); epochs.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
-        try { identity=MessageDigest.getInstance("SHA-256").digest(ByteBuffer.allocate(96).put(schema.digest()).put(epochs.identityDigest()).put(routed.sessionIdentityDigest()).array()); }
+        this.homes=Objects.requireNonNull(homes);this.scheduler=Objects.requireNonNull(scheduler);this.directories=Objects.requireNonNull(directories);this.acknowledgementDirectories=Objects.requireNonNull(acknowledgementDirectories);homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());this.epochs=Objects.requireNonNull(epochs); this.routed=Objects.requireNonNull(routed); schema.requireMatches(routed.directory()); epochs.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
+        try { identity=MessageDigest.getInstance("SHA-256").digest(ByteBuffer.allocate(128).put(schema.digest()).put(epochs.identityDigest()).put(routed.sessionIdentityDigest()).put(homes.identityDigest()).array()); }
         catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
         if (!Files.isDirectory(this.root)) throw new IOException("Logical session root is absent");
         if (create) validate(expires,limits);
@@ -78,7 +80,7 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
             } else { issuer=RatisGrantIssuer.reopen(issuing,epochs); requireExpiry(); }
             if (phase==Phase.ACTIVE) {
                 if (issuer.issued()==null) throw new IOException("Active logical session has no successful grant issuance");
-                window=RatisDurableSessionClient.reopen(data,routed); requireWindow(false);
+                window=RatisDurableSessionClient.reopen(data,routed); requireWindow(false);installReroutes();
             } else if (Files.exists(data) && issuer.issued()==null) throw new IOException("Unissued logical session contains a user window");
         } catch (IOException | RuntimeException | Error failure) {
             try { if (window!=null) window.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
@@ -87,6 +89,7 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure;
         }
     }
+    private void installReroutes()throws IOException {window.installReroutes(root.resolve("reroutes"),schema,epochs,routed,homes,scheduler,directories,acknowledgementDirectories);}
     private static void validate(long expires,RatisSessionClient.Limits limits) {
         Objects.requireNonNull(limits);
         if (expires<=0 || limits.commandBytes()>SessionWindowJournal.MAX_WINDOW_BYTES || limits.resultBytes()>SessionWindowJournal.MAX_WINDOW_BYTES) throw new IllegalArgumentException("Invalid durable logical session limits/expiry");
@@ -106,7 +109,7 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
                     Path path=root.resolve("window.bin");
                     if (window==null) window=Files.exists(path) ? RatisDurableSessionClient.reopen(path,routed)
                             : RatisDurableSessionClient.create(path,routed,issuer.issued().issuance(),issuer.issued().grant(),limits);
-                    requireWindow(true); persist(Phase.ACTIVE); activatedGrant=issuer.issued().grant(); phase=Phase.ACTIVE;
+                    requireWindow(true);installReroutes();persist(Phase.ACTIVE); activatedGrant=issuer.issued().grant(); phase=Phase.ACTIVE;
                 }
                 return progress();
             } finally { lane.unlock(); }

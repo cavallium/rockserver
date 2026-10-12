@@ -22,17 +22,17 @@ class RatisDurableLogicalSessionTest {
     }
     Keys key(int key) { return new Keys(Buf.wrap(new byte[]{(byte)key})); }
     RatisDurableLogicalSession create(Path path,RatisSessionPropagationTest.Fixture f,DistributedSchema schema,long expiry) throws IOException {
-        return RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,f.routed,expiry,RatisSessionClient.Limits.defaults());
+        return RatisDurableLogicalSession.create(path,schema,f.catalogue.epochs,f.routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements(),expiry,RatisSessionClient.Limits.defaults());
     }
     RatisDurableLogicalSession reopen(Path path,RatisSessionPropagationTest.Fixture f,DistributedSchema schema) throws IOException {
-        return RatisDurableLogicalSession.reopen(path,schema,f.catalogue.epochs,f.routed);
+        return RatisDurableLogicalSession.reopen(path,schema,f.catalogue.epochs,f.routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements());
     }
     @Test void issuedLogicalWindowLostBindingAndDataRepliesReopenConsumedHolesWithoutAnotherGrant() throws Exception {
         var schema=schema();
         try (var f=new RatisSessionPropagationTest.Fixture(root,true,schema.digest())) {
             Path wrong=Files.createDirectory(root.resolve("wrong-authority"));
             var foreign=new RatisSessionEpochs(f.catalogue.client,UUID.randomUUID(),f.outer.database,f.outer.catalogue,1,new byte[32],f.outer.sessions);
-            assertThrows(IllegalArgumentException.class,() -> RatisDurableLogicalSession.create(wrong,schema,foreign,f.routed,1000,RatisSessionClient.Limits.defaults()));
+            assertThrows(IllegalArgumentException.class,() -> RatisDurableLogicalSession.create(wrong,schema,foreign,f.routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements(),1000,RatisSessionClient.Limits.defaults()));
             try (var files=Files.list(wrong)) { assertEquals(0,files.count()); }
             Path path=Files.createDirectory(root.resolve("logical")); SessionEpochLedger.Grant grant; byte[] frozen;
             try (var session=create(path,f,schema,1000)) {

@@ -120,7 +120,7 @@ public final class RatisDurableSessionClient implements AutoCloseable {
             void settle(T value,Throwable failure){lane.lock();try{active--;}finally{lane.unlock();}phase.set(2);if(failure==null)result.complete(value);else result.completeExceptionally(failure);}
         }
         var task=new Task();try{rerouteScheduler.executor(it.cavallium.rockserver.core.common.WorkloadProfile.BATCH,OperationFamily.MUTATION,Long.MAX_VALUE).execute(task,Math.min(SessionWindowJournal.MAX_WINDOW_BYTES,it.cavallium.rockserver.core.common.WorkloadCost.MAX_ESTIMATED_BYTES));}catch(RuntimeException rejected){task.reject(rejected);}
-        try{return result.get();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Durable work remains owned until completion",interrupted);}catch(ExecutionException failure){if(failure.getCause() instanceof IOException io)throw io;throw new IOException("Durable session execution failed",failure.getCause());}
+        try{return result.get();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Durable work remains owned until completion",interrupted);}catch(ExecutionException failure){if(failure.getCause() instanceof IOException io)throw io;if(failure.getCause() instanceof RuntimeException runtime)throw runtime;if(failure.getCause() instanceof Error error)throw error;throw new IOException("Durable session execution failed",failure.getCause());}
     }
     /** Keeps the original pending identity active until the resolved outcome has been forced. */
     CommandResult execute(Pending pending,RatisSessionClient.Execution resolution) throws IOException {

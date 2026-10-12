@@ -148,7 +148,7 @@ class RatisLogicalPagesTest {
                 }
             };
             try (var routed=new RatisRoutedClient(f.directory,transport);
-                 var session=RatisDurableLogicalSession.create(Files.createDirectory(root.resolve("quantum")),schema,f.catalogue.epochs,routed,1000,RatisSessionClient.Limits.defaults())) {
+                 var session=RatisDurableLogicalSession.create(Files.createDirectory(root.resolve("quantum")),schema,f.catalogue.epochs,routed,f.logicalHomes(),f.logicalScheduler(),f.logicalDirectories(),f.logicalAcknowledgements(),1000,RatisSessionClient.Limits.defaults())) {
                 session.advance();
                 try (var tx=session.openTransaction(scope(schema,new byte[]{0,0,0},new byte[]{32,0,1}),Duration.ofSeconds(5))) {
                     var low=new Keys(Buf.wrap(new byte[]{0,0}),Buf.wrap(new byte[]{0})); var high=new Keys(Buf.wrap(new byte[]{32,0}),Buf.wrap(new byte[]{0}));

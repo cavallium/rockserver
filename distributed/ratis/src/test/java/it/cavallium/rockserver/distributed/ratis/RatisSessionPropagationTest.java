@@ -162,12 +162,12 @@ class RatisSessionPropagationTest {
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>(); final List<RaftStorage> storage=new ArrayList<>();
         final Set<UUID> failed=new HashSet<>(),lost=new HashSet<>(); RangeDirectory directory; SessionEpochLedger ledger;
         java.util.function.Consumer<DistributedCommand> beforeCommand=command -> {};
-        final RatisRoutedClient routed; final byte[] dataSchemaDigest; int submissions,metadataReads,customerReads; CountDownLatch started,release;
+        final Path fixtureRoot;private RatisAtomicClientTest.Fixture logicalResources;final RatisRoutedClient routed; final byte[] dataSchemaDigest; int submissions,metadataReads,customerReads; CountDownLatch started,release;
         Fixture(Path root) throws Exception { this(root,true); }
         Fixture(Path root,boolean initialized) throws Exception { this(root,initialized,new byte[32]); }
         Fixture(Path root,boolean initialized,byte[] dataSchemaDigest) throws Exception { this(root,initialized,dataSchemaDigest,null); }
         Fixture(Path root,boolean initialized,byte[] dataSchemaDigest,DistributedSchema schema) throws Exception {
-            this.dataSchemaDigest=dataSchemaDigest.clone();
+            this.fixtureRoot=root;this.dataSchemaDigest=dataSchemaDigest.clone();
             catalogue=outer.new Fixture(root.resolve("catalogue"));
             var initial=SessionEpochLedger.initial(outer.cluster,outer.database,10);
             if (initialized) catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,initial));
@@ -243,8 +243,14 @@ class RatisSessionPropagationTest {
         void advance(long time) throws Exception {
             var next=ledger.advanceTime(time); catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(ledger.generation()+1),ledger,next)); ledger=next;
         }
+        synchronized RatisTransactionStatuses logicalHomes()throws IOException {
+            if(logicalResources==null)try{logicalResources=new RatisAtomicClientTest.Fixture(fixtureRoot.resolve("logical-home"));}catch(Exception failure){throw new IOException("Actual logical HOME fixture failed",failure);}return logicalResources.homes;
+        }
+        it.cavallium.rockserver.core.impl.RWScheduler logicalScheduler()throws IOException {logicalHomes();return logicalResources.scheduler;}
+        RatisCatalogue logicalDirectories(){return catalogue.epochs.catalogue(outer.directoryColumn);}
+        RatisRoutedClient.SourceAckDirectoryReader logicalAcknowledgements(){return header->catalogue.epochs.topologyCatalogue(outer.directoryColumn).readDefinition(header.definitionDigest()).sourceDirectory();}
         public void close() throws Exception {
-            routed.close(); for (var machine:machines.values()) { machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); }
+            if(logicalResources!=null)logicalResources.close();routed.close(); for (var machine:machines.values()) { machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); }
             for (var nativeStorage:storage) nativeStorage.close(); catalogue.close();
         }
     }
