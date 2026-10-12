@@ -404,6 +404,9 @@ public final class NativeRangeImage {
         private NativeTopologyBirth topologyBirth;
         private NativeTopologyActivation topologyActivation;
         private NativeTopologyImageOrigin topologyOrigin;
+        private final Map<OperationId,it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit> sourceCredits=new HashMap<>();
+        private final Map<OperationId,it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication> sourcePublications=new HashMap<>();
+        private long sourceOutcomeBytes;
         private it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation schemaInstallation;
         private final Map<String,it.cavallium.rockserver.core.common.distributed.DistributedSchema> schemaHistory=new HashMap<>();
         private final List<byte[]> referencedSchemas=new ArrayList<>();
@@ -529,6 +532,17 @@ public final class NativeRangeImage {
                             topologyOrigin.requireImage(header.owner().groupId(),header.owner().epoch(),header.interval().domainId(),lower,upper,header.position());
                         }
                     } catch(IllegalArgumentException invalid) { throw new IOException("Invalid topology image provenance",invalid); }
+                }
+                if(section==Section.STATE && key.length>16 && (key[16]==0x65 || key[16]==0x66)) {
+                    try {
+                        if(key.length!=49 || (sourceOutcomeBytes+=49L+value.length)>it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IllegalArgumentException("Source outcome image key/capacity changed");
+                        OperationId operation;
+                        if(key[16]==0x65) {
+                            var credit=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value);credit.requireCut(header.position());operation=credit.request().original().operationId();
+                            if(!credit.request().original().groupId().equals(header.owner().groupId()) || credit.request().original().rangeEpoch()!=header.owner().epoch() || sourceCredits.size()>=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_CREDITS || sourceCredits.put(operation,credit)!=null)throw new IllegalArgumentException("Source credit image owner/count changed");
+                        } else { var publication=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication.decode(value);publication.requireCut(header.position());operation=publication.operation();if(!publication.group().equals(header.owner().groupId()) || sourcePublications.size()>=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_PUBLICATIONS || sourcePublications.put(operation,publication)!=null)throw new IllegalArgumentException("Source publication image owner/count changed"); }
+                        byte[] expected=ByteBuffer.allocate(49).put(groupPrefix).put(key[16]).putLong(operation.sessionId().getMostSignificantBits()).putLong(operation.sessionId().getLeastSignificantBits()).putLong(operation.epoch()).putLong(operation.sequence()).array();if(!Arrays.equals(key,expected))throw new IllegalArgumentException("Source outcome image original operation key changed");
+                    } catch(IllegalArgumentException invalid) { throw new IOException("Invalid source outcome image",invalid); }
                 }
                 if(section==Section.STATE && key.length>16 && key[16]==0x60) {
                     try {
@@ -744,7 +758,7 @@ public final class NativeRangeImage {
                 if (context!=null && !context.equals(actual)) throw new IOException("Qualified HOME image context differs from promises"); context=actual;
             }
             if (context!=null) {
-                if(topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null || topologyFreeze!=null || schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null || importBirth!=null) throw new IOException("HOME image contains DATA schema/import lifecycle");
+                if(!sourceCredits.isEmpty() || !sourcePublications.isEmpty() || topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null || topologyFreeze!=null || schemaFence!=null || schemaInstallation!=null || !schemaActivations.isEmpty() || currentSchemaActivation!=null || importBirth!=null) throw new IOException("HOME image contains DATA schema/import lifecycle");
                 if (!header.interval().columns().equals(Set.of(context.column()))) throw new IOException("Qualified HOME image column differs from ownership");
                 for (var receipt:homeRecoveries.values()) if (!receipt.recovery().before().clusterId().equals(context.cluster()) || !receipt.recovery().before().databaseId().equals(context.database()) || !receipt.recovery().command().mutations().getFirst().columnId().equals(context.column())) throw new IOException("Qualified HOME receipt database differs");
             }
@@ -832,6 +846,11 @@ public final class NativeRangeImage {
                 if(!qualified)throw new IOException("Historical import image birth lacks qualified subsequent schema lifecycle");
             }
             if (!marker) throw new IOException("Image has no applied marker");
+            if(!sourceCredits.isEmpty() || !sourcePublications.isEmpty()) {
+                if(topologyFreeze==null || sourceCredits.keySet().stream().anyMatch(sourcePublications::containsKey) || sourceCredits.size()+sourcePublications.size()>it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_PUBLICATIONS)throw new IOException("Source outcome image lacks exact sealed prefix or duplicates original publication");
+                for(var credit:sourceCredits.values())if(!credit.request().freeze().equals(topologyFreeze))throw new IOException("Source credit image changed original seal");
+                if(sourceOutcomeBytes+sourceCredits.size()*(49L+it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication.BYTES)>it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IOException("Source image would consume promised publication metadata");
+            }
             if (homeRecoveries.size()+homeCreditCount>ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeRecoveryBytes+homeCreditBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES) throw new IOException("HOME image actual/future capacity exceeded");
             long terminalOnly=0;
             for (var record:prepared) {

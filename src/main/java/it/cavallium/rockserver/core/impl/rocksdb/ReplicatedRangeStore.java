@@ -5,6 +5,8 @@ import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
+import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit;
+import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyBirth;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyActivation;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyImageOrigin;
@@ -166,7 +168,7 @@ public final class ReplicatedRangeStore {
         var cfg=configurationUnderAdmission();if(cfg==null || cfg.term()>applied.term() || cfg.index()>applied.index() || cfg.index()==applied.index() && cfg.term()!=applied.term())throw new IllegalStateException("Topology metadata native configuration exceeds completed prefix");
         var authority=sessionAuthority();if(authority!=null && (!authority.clusterId().equals(freeze.header().clusterId()) || !authority.databaseId().equals(freeze.header().databaseId())))throw new IllegalStateException("Topology metadata session authority namespace changed");
     }
-    public record TopologyOperationOutcome(ApplyPosition cut,NativeTopologyFreeze freeze,Configuration configuration,byte[] result) {
+    public record TopologyOperationOutcome(ApplyPosition cut,NativeTopologyFreeze freeze,Configuration configuration,NativeSourceOutcomeCredit credit,byte[] result) {
         public TopologyOperationOutcome { Objects.requireNonNull(cut);Objects.requireNonNull(freeze);Objects.requireNonNull(configuration);result=result==null ? null : result.clone(); }
         @Override public byte[] result() { return result==null ? null : result.clone(); }
     }
@@ -180,8 +182,115 @@ public final class ReplicatedRangeStore {
             if(topologyBirthPending())throw new IllegalStateException("Pending topology birth has no sealed original-parent outcome");
             requireTopologyMetadataOwner();var freeze=activeTopologyFreeze;var header=freeze.header();var parent=header.participant(TopologyChange.Stage.FREEZE,groupId);
             if(!cluster.equals(header.clusterId()) || !database.equals(header.databaseId()) || !domain.equals(header.domainId()) || !lineage.rangeId().equals(parent.rangeId()) || !lineage.groupId().equals(groupId) || lineage.rangeEpoch()!=rangeEpoch || parent.rangeEpoch()!=rangeEpoch)throw new IllegalArgumentException("Topology operation outcome namespace/parent lineage differs");
-            return new TopologyOperationOutcome(applied,freeze,configurationUnderAdmission(),operationResultUnderAdmission(operation,digest));
+            var credit=sourceOutcomeCredits.get(operation);if(credit!=null && !Arrays.equals(credit.request().original().receiptDigest(),digest))throw new IllegalArgumentException("Source original credit digest changed");
+            return new TopologyOperationOutcome(applied,freeze,configurationUnderAdmission(),credit,operationResultUnderAdmission(operation,digest));
         } finally { applyLane.unlock();leaveNative(); }
+    }
+    private volatile Map<OperationId,NativeSourceOutcomeCredit> sourceOutcomeCredits=Map.of();
+    private volatile Map<OperationId,NativeSourceOutcomePublication> sourceOutcomePublications=Map.of();
+    private long sourceOutcomeCountLimit,sourceOutcomeByteLimit;
+    /** Trusted adapter bootstrap; ordinary standalone admission is unchanged without promises. */
+    public void configureSourceOutcomeCapacity(long count,long bytes) {
+        if(count<1 || bytes<92)throw new IllegalArgumentException("Invalid source receipt capacity");enterNative();applyLane.lock();
+        try { if(sourceOutcomeCountLimit!=0 && (sourceOutcomeCountLimit!=count || sourceOutcomeByteLimit!=bytes))throw new IllegalStateException("Source receipt capacity already configured");sourceOutcomeCountLimit=count;sourceOutcomeByteLimit=bytes;if(!sourceOutcomeCredits.isEmpty())checkSourceOutcomeUsage(readUsage(usageKey),null); }
+        catch(RocksDBException failure) { throw new IllegalStateException("Cannot qualify source receipt capacity",failure); }
+        finally { applyLane.unlock();leaveNative(); }
+    }
+    private byte[] sourceOutcomeKey(int tag,OperationId operation) { return ByteBuffer.allocate(49).put(markerKey).put((byte)tag).put(uuidBytes(operation.sessionId())).putLong(operation.epoch()).putLong(operation.sequence()).array(); }
+    private Usage sourceOutcomePromises(OperationId consuming) {
+        Usage promises=new Usage(0,0);for(var entry:sourceOutcomeCredits.entrySet())if(!entry.getKey().equals(consuming))promises=promises.plus(new Usage(1,entry.getValue().request().reservedBytes()));return promises;
+    }
+    private void checkSourceOutcomeUsage(Usage total,OperationId consuming) {
+        if(sourceOutcomeCredits.isEmpty())return;
+        if(sourceOutcomeCountLimit==0)throw new IllegalStateException("Source receipt promises require configured capacity");var effective=total.plus(sourceOutcomePromises(consuming));if(effective.count()>sourceOutcomeCountLimit || effective.bytes()>sourceOutcomeByteLimit)throw new IllegalStateException("Ordinary receipts would consume promised source outcome capacity");
+    }
+    private long sourceOutcomeMetadataBytes() { long bytes=0;for(var credit:sourceOutcomeCredits.values())bytes+=49L+credit.encode().length+49+NativeSourceOutcomePublication.BYTES;return bytes+sourceOutcomePublications.size()*(49L+NativeSourceOutcomePublication.BYTES); }
+    private void requireSourceCreditOriginal(DistributedCommand command) {
+        var credit=sourceOutcomeCredits.get(command.operationId());
+        if(credit!=null && !Arrays.equals(credit.request().original().payloadDigest(),command.payloadDigest()))throw new IllegalArgumentException("Operation identity is reserved for the exact source original payload");
+    }
+    private boolean sourceOperationFenced(OperationId operation) throws RocksDBException { return operation.epoch()<minimumSessionEpoch(null) || operation.sequence()<=acknowledgedThrough(operation,null); }
+    private void requireSourceOutcomeRequest(NativeSourceOutcomeCredit.Request request) throws RocksDBException {
+        requireTopologyMetadataOwner();if(!activeTopologyFreeze.equals(request.freeze()) || !request.original().groupId().equals(groupId) || request.original().rangeEpoch()!=rangeEpoch)throw new IllegalArgumentException("Source outcome differs from sealed native owner");
+        if(!request.targetDirectory().columns().equals(columns.keySet()) || logicalSchema!=null && request.targetDirectory().routingPrefixBytes()!=logicalSchema.routingPrefixBytes())throw new IllegalArgumentException("Source recovery target projection changed");
+        request.freeze().requireCut(request.origin().absenceCut());if(request.origin().absenceCut().index()>applied.index() || request.origin().absenceCut().term()>applied.term())throw new IllegalArgumentException("Source credit absence cut exceeds native prefix");
+    }
+    public NativeSourceOutcomeCredit sourceOutcomeCredit(OperationId operation,byte[] originalReceiptDigest) throws RocksDBException {
+        Objects.requireNonNull(operation);Objects.requireNonNull(originalReceiptDigest);if(originalReceiptDigest.length!=32)throw new IllegalArgumentException("Invalid source original receipt digest");
+        enterNative();applyLane.lock();try { requireTopologyMetadataOwner();var credit=sourceOutcomeCredits.get(operation);if(credit!=null && !Arrays.equals(credit.request().original().receiptDigest(),originalReceiptDigest))throw new IllegalArgumentException("Source original credit digest changed");return credit; } finally { applyLane.unlock();leaveNative(); }
+    }
+    public List<NativeSourceOutcomeCredit> sourceOutcomeCredits() { enterNative();applyLane.lock();try { return List.copyOf(sourceOutcomeCredits.values()); } finally { applyLane.unlock();leaveNative(); } }
+    public record SourceOutcomeCreditEstimate(ReceiptUsage usage,boolean existing,boolean fenced,long additionalCount,long additionalBytes,long metadataBytes,long metadataUsageBytes) {}
+    public SourceOutcomeCreditEstimate estimateSourceOutcomeCredit(NativeSourceOutcomeCredit.Request request) throws RocksDBException {
+        Objects.requireNonNull(request);enterNative();applyLane.lock();try {
+            requireSourceOutcomeRequest(request);ensureReceiptUsage();var id=request.original().operationId();var total=readUsage(usageKey).plus(sourceOutcomePromises(null));var usage=new ReceiptUsage(applied,total.count(),total.bytes());
+            var saved=sourceOutcomeCredits.get(id);if(saved!=null) { if(!saved.request().equals(request))throw new IllegalArgumentException("Source credit original input changed");return new SourceOutcomeCreditEstimate(usage,true,sourceOperationFenced(id),0,0,0,sourceOutcomeMetadataBytes()); }
+            var published=sourceOutcomePublications.get(id);if(published!=null) { if(!Arrays.equals(published.requestDigest(),request.digest()))throw new IllegalArgumentException("Source publication original input changed");return new SourceOutcomeCreditEstimate(usage,true,sourceOperationFenced(id),0,0,0,sourceOutcomeMetadataBytes()); }
+            if(sourceOperationFenced(id))return new SourceOutcomeCreditEstimate(usage,false,true,0,0,0,sourceOutcomeMetadataBytes());
+            if(operationResultUnderAdmission(id,request.original().receiptDigest())!=null)throw new IllegalStateException("Source original operation already has an ordinary outcome");
+            long metadata=49L+24+request.encode().length+49+NativeSourceOutcomePublication.BYTES;
+            if(sourceOutcomeCountLimit==0 || total.count()+1>sourceOutcomeCountLimit || total.bytes()+request.reservedBytes()>sourceOutcomeByteLimit || sourceOutcomeCredits.size()>=NativeSourceOutcomeCredit.MAX_CREDITS || sourceOutcomePublications.size()+sourceOutcomeCredits.size()>=NativeSourceOutcomeCredit.MAX_PUBLICATIONS || sourceOutcomeMetadataBytes()+metadata>NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IllegalStateException("Source outcome receipt/metadata capacity exhausted");
+            return new SourceOutcomeCreditEstimate(usage,false,false,1,request.reservedBytes(),metadata,sourceOutcomeMetadataBytes());
+        } finally { applyLane.unlock();leaveNative(); }
+    }
+    /** Trusted committed reservation after HOME RESERVED; fresh HOME/source authority is adapter-owned. */
+    public NativeSourceOutcomeCredit applySourceOutcomeCredit(ApplyPosition position,NativeSourceOutcomeCredit.Request request) throws RocksDBException {
+        enterNative();applyLane.lock();try {
+            var estimate=estimateSourceOutcomeCredit(request);var id=request.original().operationId();var existing=sourceOutcomeCredits.get(id);if(existing!=null) { advanceCompletedMarker(position);return existing; }
+            var publication=sourceOutcomePublications.get(id);if(publication!=null) { advanceCompletedMarker(position);return new NativeSourceOutcomeCredit(request,publication.creditPosition()); }
+            if(estimate.fenced()) { advanceCompletedMarker(position);return null; }
+            requireNext(position);var credit=new NativeSourceOutcomeCredit(request,position);var next=new HashMap<>(sourceOutcomeCredits);next.put(id,credit);
+            try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) { batch.put(state,sourceOutcomeKey(0x65,id),credit.encode());batch.put(state,markerKey,encodePosition(position));batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));db.write(options,batch); }
+            sourceOutcomeCredits=Map.copyOf(next);applied=position;return credit;
+        } finally { applyLane.unlock();leaveNative(); }
+    }
+    public SourceOutcomePublicationResult sourceOutcomePublication(NativeSourceOutcomeCredit.Request request,byte[] result) throws RocksDBException {
+        Objects.requireNonNull(request);Objects.requireNonNull(result);if(result.length>request.maximumResultBytes())throw new IllegalArgumentException("Source publication result exceeds promise");
+        enterNative();applyLane.lock();try { requireSourceOutcomeRequest(request);var id=request.original().operationId();var saved=sourceOutcomePublications.get(id);if(saved!=null){saved.requireRequest(request,result);saved.requireCut(applied);return new SourceOutcomePublicationResult(sourceOperationFenced(id)?NativeSourceOutcomePublication.Outcome.FENCED:saved.outcome(),saved);}return sourceOperationFenced(id) && !sourceOutcomeCredits.containsKey(id)?new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.FENCED,null):null; } finally { applyLane.unlock();leaveNative(); }
+    }
+    public record SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome outcome,NativeSourceOutcomePublication publication) {}
+    /** Trusted verified terminal HOME result; no USER access or original grant revalidation. */
+    public SourceOutcomePublicationResult publishSourceOutcome(ApplyPosition position,NativeSourceOutcomeCredit.Request request,byte[] result) throws RocksDBException {
+        Objects.requireNonNull(position);Objects.requireNonNull(request);Objects.requireNonNull(result);if(result.length>request.maximumResultBytes())throw new IllegalArgumentException("Source publication result exceeds promise");byte[] stable=result.clone();CommandResult.decode(stable);
+        enterNative();applyLane.lock();try {
+            requireSourceOutcomeRequest(request);ensureReceiptUsage();var id=request.original().operationId();boolean fenced=sourceOperationFenced(id);var saved=sourceOutcomePublications.get(id);
+            if(saved!=null) { saved.requireRequest(request,stable);saved.requireCut(applied);advanceCompletedMarker(position);return new SourceOutcomePublicationResult(fenced?NativeSourceOutcomePublication.Outcome.FENCED:saved.outcome(),saved); }
+            var credit=sourceOutcomeCredits.get(id);if(credit==null) { if(fenced) { advanceCompletedMarker(position);return new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.FENCED,null); }throw new IllegalStateException("Source publication has no durable exact receipt credit"); }
+            if(!credit.request().equals(request))throw new IllegalArgumentException("Source publication changed credited input");requireNext(position);
+            byte[] old=operationResultUnderAdmission(id,request.original().receiptDigest());if(!fenced && old!=null && !Arrays.equals(old,stable))throw new IllegalArgumentException("Source original outcome already differs");
+            var outcome=fenced?NativeSourceOutcomePublication.Outcome.FENCED:NativeSourceOutcomePublication.Outcome.RETAINED;var publication=new NativeSourceOutcomePublication(groupId,id,request.digest(),sourceOutcomeHash(stable),credit.position(),position,outcome);
+            var next=new HashMap<>(sourceOutcomeCredits);next.remove(id);var published=new HashMap<>(sourceOutcomePublications);
+            try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
+                if(!fenced && old==null) {
+                    var command=request.original();long minimum=minimumSessionEpoch(null),floor=acknowledgedThrough(id,null);long ack=command.acknowledgedThrough();
+                    if(ack>floor) { batch.put(state,sessionFloorKey(id),ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(ack).array());batch.deleteRange(receipts,receiptKey(new OperationId(id.sessionId(),id.epoch(),0)),receiptKey(new OperationId(id.sessionId(),id.epoch(),ack+1))); }
+                    for(var prior:List.copyOf(published.keySet()))if(prior.epoch()<minimum || prior.sessionId().equals(id.sessionId()) && prior.epoch()==id.epoch() && prior.sequence()<=ack) { batch.delete(state,sourceOutcomeKey(0x66,prior));published.remove(prior); }
+                    byte[] receipt=encodeReceipt(command.receiptDigest(),stable);updateReceiptUsage(batch,command,-1,ack,minimum,floor,receipt.length,position,id);batch.put(receipts,receiptKey(id),receipt);
+                } else batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));
+                published.put(id,publication);batch.delete(state,sourceOutcomeKey(0x65,id));batch.put(state,sourceOutcomeKey(0x66,id),publication.encode());batch.put(state,markerKey,encodePosition(position));db.write(options,batch);
+            }
+            sourceOutcomeCredits=Map.copyOf(next);sourceOutcomePublications=Map.copyOf(published);applied=position;return new SourceOutcomePublicationResult(outcome,publication);
+        } finally { applyLane.unlock();leaveNative(); }
+    }
+    private static byte[] sourceOutcomeHash(byte[] value) { try { return java.security.MessageDigest.getInstance("SHA-256").digest(value); } catch(java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); } }
+    private void recoverSourceOutcomes(ApplyPosition cut) throws RocksDBException {
+        var credits=new HashMap<OperationId,NativeSourceOutcomeCredit>();var publications=new HashMap<OperationId,NativeSourceOutcomePublication>();long bytes=0;
+        for(int tag:List.of(0x65,0x66))try(var iterator=db.newIterator(state)) {
+            byte[] prefix=ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array();iterator.seek(prefix);byte[] sizing=new byte[0];
+            while(iterator.isValid()) { byte[] key=iterator.key();if(key.length<17 || !Arrays.equals(key,0,17,prefix,0,17))break;int size=iterator.value(sizing);if(key.length!=49 || size>(tag==0x65?NativeSourceOutcomeCredit.MAX_BYTES:NativeSourceOutcomePublication.BYTES) || (bytes+=49L+size)>NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IllegalStateException("Source outcome metadata exceeds bound");
+                if(tag==0x65) { var credit=NativeSourceOutcomeCredit.decode(iterator.value());credit.requireCut(cut);var id=credit.request().original().operationId();if(!groupId.equals(credit.request().original().groupId()) || !Arrays.equals(key,sourceOutcomeKey(tag,id)) || credits.size()>=NativeSourceOutcomeCredit.MAX_CREDITS || credits.put(id,credit)!=null)throw new IllegalStateException("Source credit identity/capacity changed"); }
+                else { var publication=NativeSourceOutcomePublication.decode(iterator.value());publication.requireCut(cut);if(!groupId.equals(publication.group()) || !Arrays.equals(key,sourceOutcomeKey(tag,publication.operation())) || publications.size()>=NativeSourceOutcomeCredit.MAX_PUBLICATIONS || publications.put(publication.operation(),publication)!=null)throw new IllegalStateException("Source publication identity/capacity changed"); }
+                iterator.next();
+            }iterator.status();
+        }
+        if(bytes+credits.size()*(49L+NativeSourceOutcomePublication.BYTES)>NativeSourceOutcomeCredit.MAX_METADATA_BYTES || credits.keySet().stream().anyMatch(publications::containsKey) || publications.size()+credits.size()>NativeSourceOutcomeCredit.MAX_PUBLICATIONS)throw new IllegalStateException("Source credit/publication overlap");
+        sourceOutcomeCredits=Map.copyOf(credits);sourceOutcomePublications=Map.copyOf(publications);
+        if((!credits.isEmpty() || !publications.isEmpty()) && activeTopologyFreeze==null)throw new IllegalStateException("Source outcomes lack sealed parent");for(var credit:credits.values())if(!credit.request().freeze().equals(activeTopologyFreeze))throw new IllegalStateException("Source credit original seal changed");
+    }
+    private Runnable sourcePublicationGc(WriteBatch batch,long minimum,long ack,OperationId operation) throws RocksDBException {
+        if(sourceOutcomePublications.isEmpty())return ()->{};var next=new HashMap<>(sourceOutcomePublications);
+        for(var id:sourceOutcomePublications.keySet())if(id.epoch()<minimum || id.sessionId().equals(operation.sessionId()) && id.epoch()==operation.epoch() && id.sequence()<=ack) { batch.delete(state,sourceOutcomeKey(0x66,id));next.remove(id); }
+        return ()->sourceOutcomePublications=Map.copyOf(next);
     }
     /** Cached shape classification for the adapter; validate/estimate/apply separately verify native evidence. */
     public boolean metadataTopologyControl(DistributedCommand command) {
@@ -584,7 +693,7 @@ public final class ReplicatedRangeStore {
             recoverImportMetadata();
             ensureReceiptUsage();
             validateReceiptUsage(applied);
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);recoverSourceOutcomes(applied);
         }
     }
 
@@ -667,7 +776,7 @@ public final class ReplicatedRangeStore {
             if(topologyRetired() || topologyBirthPending()) throw new IllegalStateException("Topology owner requires qualified future activation");
             if (pendingInstallation != null || importPending()) throw new IllegalStateException("Installation remains incomplete or unpublished");
             try { validateTopologyActivationRecovery(); recoverSchemaMetadata(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover schema generation",failure); }
-            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied); validateSnapshotHomeUsersUnchecked();
+            homeRecoveries=loadHomeRecoveries(); homeRecoveryCredits=loadHomeCredits(applied); validateHomeCreditCapacity(); abortedIndex=loadAbortedIndex(); committedIndex=loadCommittedIndex(); rejectedIndex=loadRejectedIndex(); snapshotGates=loadSnapshotGates(); preparedIndex=loadPreparedIndex(); validateAbortedIndex(); validateCommittedIndex(); validateRejectedIndex(); validateSnapshotGates(); validateHomeRecoveries(); activeSchemaFence=loadSchemaFence(applied); activeTopologyFreeze=loadTopologyFreeze(applied);try { recoverSourceOutcomes(applied); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot recover source outcome promises",failure); } validateSnapshotHomeUsersUnchecked();
             ownership.activate(owner);
         } finally { applyLane.unlock(); }
     }
@@ -1269,6 +1378,7 @@ public final class ReplicatedRangeStore {
     }
     private void validateCommand(DistributedCommand command,boolean active) { validateCommand(command,active,true); }
     private void validateCommand(DistributedCommand command,boolean active,boolean logical) {
+        requireSourceCreditOriginal(command);
         requireHomeRecoveryFree(command.operationId());
         if (command.sessionControl()!=null && !sessionControlsEnabled) throw new UnsupportedOperationException("Replicated session binding is not activated");
         if (closing) throw new IllegalStateException("Range admission is closed");
@@ -2867,7 +2977,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();
         try {
             if(metadataTopologyControl(command))requireTopologyMetadataOwner();else requireActive();
-            ensureReceiptUsage(); requireHomeRecoveryFree(command.operationId());
+            ensureReceiptUsage(); requireSourceCreditOriginal(command);requireHomeRecoveryFree(command.operationId());
             if(!metadataSchemaControl(command) && (activeTopologyFreeze!=null && !topologyAccountingControl(command) || activeSchemaFence!=null || !Arrays.equals(schemaDigest,command.schemaDigest()))) {
                 byte[] retained=db.get(receipts,receiptKey);
                 if(retained==null) {
@@ -2937,7 +3047,7 @@ public final class ReplicatedRangeStore {
             var creditChange=homeCreditChange(command,position,saved==null && installUserEffects);
             if (creditChange!=null) checkHomeCapacity(creditChange.count(),creditChange.bytes());
             var writes=prepareScopedWrites(saved==null && installUserEffects,effects,bucketEffects);
-            Runnable publishCdc=()->{};
+            Runnable publishCdc=()->{},publishSourceGc=()->{};
             try (WriteBatch batch = new WriteBatch();
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                 if(cdc!=null) publishCdc=cdc.initialize(batch);
@@ -2975,13 +3085,14 @@ public final class ReplicatedRangeStore {
                     }
                     byte[] encodedReceipt = encodeReceipt(digest, stableResult);
                     updateReceiptUsage(batch, command, effectiveMinimum, effectiveAcknowledgement, currentEpochFloor, currentFloor, encodedReceipt.length, position);
+                    publishSourceGc=sourcePublicationGc(batch,Math.max(currentEpochFloor,effectiveMinimum),effectiveAcknowledgement,command.operationId());
                     batch.put(receipts, receiptKey, encodedReceipt);
                 }
                 writeHomeCredit(batch,creditChange); batch.put(state, markerKey, encodePosition(position));
                 if (saved != null) batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 db.write(options, batch);
             }
-            publishCdc.run();
+            publishCdc.run();publishSourceGc.run();
             publishHomeCredit(creditChange); publishScoped(position,writes,false); applied = position;
             return saved == null ? stableResult : original;
         } catch (RocksDBException | RuntimeException | Error failure) { if (activeSchemaFence==null && activeTopologyFreeze==null && topologyPreparation==null) resetScopedUnderLane(); throw failure; }
@@ -3333,6 +3444,11 @@ public final class ReplicatedRangeStore {
         try {
             final NativeTopologyActivation localActivation=qualifyTopologyImageOrigin(expected.topologyOrigin());
             final Map<String,byte[]> localSchemaRows=localActivation==null ? null : validateTopologySchemaImage(image,limits);
+            if(!sourceOutcomeCredits.isEmpty()) {
+                var incomingCredits=new HashMap<OperationId,NativeSourceOutcomeCredit>();var incomingPublications=new HashMap<OperationId,NativeSourceOutcomePublication>();
+                NativeRangeImage.visit(image,limits,(section,column,key,value)->{ if(section==NativeRangeImage.Section.STATE && key.length==49) { if(key[16]==0x65){var credit=NativeSourceOutcomeCredit.decode(value);incomingCredits.put(credit.request().original().operationId(),credit);}if(key[16]==0x66){var publication=NativeSourceOutcomePublication.decode(value);incomingPublications.put(publication.operation(),publication);} } });
+                for(var entry:sourceOutcomeCredits.entrySet()) { var retained=incomingCredits.get(entry.getKey());var terminal=incomingPublications.get(entry.getKey());if(retained!=null ? !retained.equals(entry.getValue()) : terminal==null || !Arrays.equals(terminal.requestDigest(),entry.getValue().request().digest()) || !terminal.creditPosition().equals(entry.getValue().position()))throw new IOException("Snapshot discards/changes durable source outcome credit"); }
+            }
             if(topologyPreparation!=null) throw new IllegalStateException("Topology preparation owns native replacement admission");
             if(activeTopologyFreeze!=null) {
                 var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visit(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); });
@@ -3408,7 +3524,7 @@ public final class ReplicatedRangeStore {
                     recoverSchemaMetadata(expected.position());
                     if(cdc!=null) cdc.recover(expected.position(),cdcAuthorityTime());
                     validateReceiptUsage(expected.position());
-                    activeSchemaFence=loadSchemaFence(expected.position()); activeTopologyFreeze=loadTopologyFreeze(expected.position(),false);
+                    activeSchemaFence=loadSchemaFence(expected.position()); activeTopologyFreeze=loadTopologyFreeze(expected.position(),false);recoverSourceOutcomes(expected.position());
                     homeRecoveries=loadHomeRecoveries(expected.position()); homeRecoveryCredits=loadHomeCredits(expected.position()); validateHomeCreditCapacity();
                     // Flush every prior CF mutation before publishing the final applied marker.
                     db.flushWal(true);
@@ -4401,7 +4517,7 @@ public final class ReplicatedRangeStore {
         try {
             validate(command);
             ensureReceiptUsage();
-            Usage total = readUsage(usageKey);
+            Usage total = readUsage(usageKey).plus(sourceOutcomePromises(null));
             var usage = new ReceiptUsage(applied, total.count, total.bytes);
             boolean staleControl=canonicalStaleSchemaControl(command);
             boolean maintenance=!staleControl && (command.acknowledgedThrough()>=0 || command.minimumSessionEpoch()>=0);
@@ -4500,6 +4616,9 @@ public final class ReplicatedRangeStore {
 
     private void updateReceiptUsage(WriteBatch batch, DistributedCommand command, long minimumEpoch, long acknowledgement, long epochFloor,
             long acknowledged, int valueBytes, ApplyPosition position) throws RocksDBException {
+        updateReceiptUsage(batch,command,minimumEpoch,acknowledgement,epochFloor,acknowledged,valueBytes,position,null);
+    }
+    private void updateReceiptUsage(WriteBatch batch,DistributedCommand command,long minimumEpoch,long acknowledgement,long epochFloor,long acknowledged,int valueBytes,ApplyPosition position,OperationId consuming) throws RocksDBException {
         Usage total = readUsage(usageKey);
         byte[] bucketKey = usageBucketKey(command.operationId());
         Usage bucket = readUsage(bucketKey);
@@ -4515,7 +4634,7 @@ public final class ReplicatedRangeStore {
             total = total.minus(removed);
             bucket = bucket.minus(removed);
         }
-        Usage added = new Usage(1, 48L + valueBytes);
+        Usage added = new Usage(1, 48L + valueBytes);checkSourceOutcomeUsage(total.plus(added),consuming);
         batch.put(state, bucketKey, bucket.plus(added).encode());
         batch.put(state, usageKey, encodeTotalUsage(total.plus(added), position));
     }
