@@ -91,10 +91,6 @@ public record StartupSettings(StorageAdmission admission, Map<String, CacheSnaps
         Objects.requireNonNull(config); Objects.requireNonNull(databaseDirectory);
         Path base = databaseDirectory.toAbsolutePath().normalize();
         var global = config.global();
-        var workloadGroups = config.parallelism().workloadGroups();
-        if (workloadGroups != null) for (var group : workloadGroups) {
-            if ("__shared".equals(group.name())) throw invalid("workload group __shared is reserved for shared foreground feedback");
-        }
         var admission = admission(config, global, base, defaultMaximumOpens);
         var parent = snapshot(global.hotCacheSnapshot(), null, base);
         var caches = new LinkedHashMap<String, CacheSnapshot>();

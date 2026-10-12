@@ -78,4 +78,19 @@ class StartupIoPolicyTest {
         counters.recordBulk(100, 5, true);
         assertEquals(StartupIoPolicy.FOREGROUND, sample(0, 0, false).pressureMask());
     }
+
+    @Test void optionalSharedFailureBecomesNeutralAfterFreshIdleWindowsWithoutQualifyingGrowth() {
+        counters.recordBulk(100, 2, true);
+        var failed = input(0, 0, false);
+        assertTrue(policy.sample(failed, failed.sampledNanos(), true).capturePressure());
+        for (int i = 0; i < StartupIoPolicy.RECOVERY_WINDOWS; i++) {
+            var idle = input(0, 0, false);
+            var decision = policy.sample(idle, idle.sampledNanos(), true);
+            assertEquals(i < StartupIoPolicy.RECOVERY_WINDOWS - 1, decision.capturePressure());
+            assertFalse(decision.qualifiedHealthy());
+            assertSame(decision, policy.sample(idle, idle.sampledNanos(), true));
+        }
+        var idle = input(0, 0, false);
+        assertEquals(StartupIoPolicy.UNKNOWN, policy.sample(idle, idle.sampledNanos(), true).pressureMask());
+    }
 }

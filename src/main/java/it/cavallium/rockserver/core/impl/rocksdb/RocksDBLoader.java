@@ -1302,7 +1302,8 @@ public class RocksDBLoader {
         }
     }
 
-    private static String physicalStorageFor(StartupSettings settings, Path directory) {
+    /** Uses the same canonical path routing for opening and foreground feedback. */
+    public static String physicalStorageFor(StartupSettings settings, Path directory) {
         Path physical = canonicalStartupDirectory(directory);
         String storage = settings.admission().defaultStorageId();
         int depth = -1;
