@@ -12,7 +12,7 @@ import java.util.*;
 /** Native PUT-table qualification and immutable local original-file ownership. */
 public final class NativeRangeSstImport {
     public static final int MAX_ROW_BYTES=3*1024*1024;
-    public enum Stage { ORIGINALS_FORCED, INTENT_FORCED, INTERVAL_RESET, COLUMN_INGESTED, DATA_DURABLE, RECEIPT_FORCED }
+    public enum Stage { ORIGINALS_FORCED, INTENT_FORCED, INTERVAL_RESET, BATCH_INGESTED, COLUMN_INGESTED, DATA_DURABLE, RECEIPT_FORCED }
     @FunctionalInterface public interface Observer { void at(Stage stage) throws IOException; }
     /** Trusted catalogue publication authority, supplied only after the matching global import is published. */
     public record Activation(NativeSstImportManifest.Receipt receipt,UUID catalogueGroup,ApplyPosition cataloguePosition,byte[] publicationDigest,ApplyPosition position) {
@@ -66,10 +66,10 @@ public final class NativeRangeSstImport {
             reader.open(path.toString()); reader.verifyChecksum(); var properties=reader.getTableProperties();
             if(properties.getNumDeletions()!=0 || properties.getNumMergeOperands()!=0 || properties.getNumRangeDeletions()!=0 || properties.getNumEntries()!=file.entries())throw new IOException("Import requires exact materialized PUT-only SST");
             if(!"leveldb.BytewiseComparator".equals(properties.getComparatorName()))throw new IOException("Import comparator differs");
-            long count=0; byte[] previous=null,first=null;
+            long count=0; byte[] previous=null,first=null;var sizing=ByteBuffer.allocate(0);
             try(var iterator=reader.newIterator(reads)) {
                 for(iterator.seekToFirst();iterator.isValid();iterator.next()) {
-                    byte[] key=iterator.key(),value=iterator.value(); if(key.length+(long)value.length>MAX_ROW_BYTES || value.length>DistributedCommandCodec.MAX_ENCODED_BYTES || !manifest.contains(key) || previous!=null && Arrays.compareUnsigned(previous,key)>=0)throw new IOException("Invalid import row bounds/order/public value limit");
+                    int keyBytes=iterator.key(sizing),valueBytes=iterator.value(sizing);if(keyBytes<0 || valueBytes<0 || keyBytes+(long)valueBytes>MAX_ROW_BYTES || valueBytes>DistributedCommandCodec.MAX_ENCODED_BYTES)throw new IOException("SST row exceeds bounded native/public value allocation");byte[] key=iterator.key(),value=iterator.value(); if(key.length+(long)value.length>MAX_ROW_BYTES || value.length>DistributedCommandCodec.MAX_ENCODED_BYTES || !manifest.contains(key) || previous!=null && Arrays.compareUnsigned(previous,key)>=0)throw new IOException("Invalid import row bounds/order/public value limit");
                     var shape=schema.column(column).schema();
                     try { if(shape.variableLengthKeysCount()!=0) schema.decodeBucket(column,key,value); else { schema.requireFixedKey(column,key); if(!shape.hasValue() && value.length!=0)throw new IllegalArgumentException("Key-only import has value bytes"); } } catch(IllegalArgumentException invalid) { throw new IOException("SST row differs from logical schema",invalid); }
                     if(first==null)first=key; previous=key; count++;

@@ -297,6 +297,16 @@ class NativeRangeImageTest {
         }
     }
 
+    @Test void importBirthAndIntentTypedBoundsRejectBeforeAllocatingOrDeliveringOversizedValues()throws Exception {
+        byte[] header;
+        try(var pool=new Pool(directory.resolve("import-bounds"))){pool.store.applyNoop(new ApplyPosition(1,0));Path valid=directory.resolve("import-header.image");try(var pin=pool.store.capture()){NativeRangeImage.write(valid,pin,interval(),LIMITS);}byte[] bytes=Files.readAllBytes(valid);header=Arrays.copyOf(bytes,headerEnd(bytes));}
+        for(int tag:new int[]{0x40,0x41}){
+            int length=NativeSstImportManifest.MAX_BYTES+(tag==0x41 ? 24 : 0)+1;Path invalid=directory.resolve("oversized-import-"+tag+".image");
+            try(var channel=java.nio.channels.FileChannel.open(invalid,StandardOpenOption.CREATE_NEW,StandardOpenOption.WRITE)){channel.write(ByteBuffer.wrap(header));var row=ByteBuffer.allocate(26).put((byte)(Section.STATE.ordinal()+1)).putInt(17).putInt(length).putLong(GROUP.getMostSignificantBits()).putLong(GROUP.getLeastSignificantBits()).put((byte)tag);row.flip();channel.write(row);channel.position(channel.position()+length);channel.write(ByteBuffer.allocate(41));}
+            var calls=new java.util.concurrent.atomic.AtomicInteger();var failure=assertThrows(IOException.class,()->NativeRangeImage.visit(invalid,new Limits(32<<20,64<<20,4),(section,column,key,value)->calls.incrementAndGet()));assertEquals("Import birth/intent exceeds native metadata bound",failure.getMessage());assertEquals(0,calls.get());
+        }
+    }
+
     private int headerEnd(byte[] image) {
         var input = ByteBuffer.wrap(image);
         input.position(96);

@@ -237,6 +237,7 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && key[16]==0x64 && valueLength>NativeTopologyImageOrigin.MAX_BYTES) throw new IOException("Topology image origin exceeds canonical bound");
                 if(section==Section.STATE && key.length>16 && (key[16]==0x69 || key[16]==0x6b) && (key.length!=17 || valueLength!=48))throw new IOException("Invalid learner image receipt length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x6a && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerImagePermission.MAX_BYTES))throw new IOException("Later image permission exceeds canonical bound");
+                if(section==Section.STATE && key.length>16 && (key[16]==0x40 || key[16]==0x41) && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES+(key[16]==0x41 ? 24 : 0)))throw new IOException("Import birth/intent exceeds native metadata bound");
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);

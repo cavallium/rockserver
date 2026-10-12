@@ -13,7 +13,7 @@ class RangeImportAdmissionTest {
         var a=new RangeDescriptor(id(10),id(11),2,3,null,new byte[]{64},RangeDescriptor.TopologyState.FENCED,List.of(voter,listener));
         var b=new RangeDescriptor(id(12),id(13),4,5,new byte[]{64},null,RangeDescriptor.TopologyState.FENCED,List.of(voter,listener));
         var directory=new RangeDirectory(id(20),id(21),id(22),1,new byte[32],7,Set.of(id(23)),1,List.of(a,b)); UUID imported=id(24);
-        var manifests=new ArrayList<NativeSstImportManifest>(); for(var range:directory.ranges()) manifests.add(new NativeSstImportManifest(imported,range.groupId(),range.rangeEpoch(),directory.domainId(),directory.schemaDigest(),range.lowerInclusive(),range.upperExclusive(),List.of(new NativeSstImportManifest.Column(id(23),"data",false,List.of()))));
+        var manifests=new ArrayList<NativeSstImportManifest>(); for(var range:directory.ranges()) manifests.add(new NativeSstImportManifest(imported,range.groupId(),range.rangeEpoch(),directory.domainId(),directory.schemaDigest(),range.lowerInclusive(),range.upperExclusive(),List.of(new NativeSstImportManifest.Column(id(23),"data",false,List.of())),NativeSstImportManifest.Limits.defaults()));
         return new RangeImportDefinition(imported,new OperationId(id(25),1,20),directory,manifests);
     }
     static List<RangeImportAdmission.OwnerReceipt> receipts(RangeImportDefinition definition) {

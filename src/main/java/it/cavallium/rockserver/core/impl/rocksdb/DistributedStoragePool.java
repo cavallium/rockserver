@@ -1201,7 +1201,11 @@ public final class DistributedStoragePool implements AutoCloseable {
                 observer.at(NativeRangeSstImport.Stage.ORIGINALS_FORCED);
             },(db,columns) -> {
                 try(var options=new org.rocksdb.IngestExternalFileOptions().setMoveFiles(false).setIngestBehind(false).setWriteGlobalSeqno(false).setSnapshotConsistency(true).setAllowGlobalSeqNo(true).setAllowBlockingFlush(true)) {
-                    for(var column:manifest.columns()) { if(!column.files().isEmpty())db.ingestExternalFile(columns.get(column.columnId()),column.files().stream().map(file->NativeRangeSstImport.original(root,manifest,file).toString()).toList(),options); observer.at(NativeRangeSstImport.Stage.COLUMN_INGESTED); }
+                    for(var column:manifest.columns()) {
+                        int width=manifest.limits().jniFilesPerBatch();
+                        for(int start=0;start<column.files().size();start+=width){int end=Math.min(column.files().size(),start+width);var paths=new ArrayList<String>(end-start);for(int n=start;n<end;n++)paths.add(NativeRangeSstImport.original(root,manifest,column.files().get(n)).toString());db.ingestExternalFile(columns.get(column.columnId()),paths,options);observer.at(NativeRangeSstImport.Stage.BATCH_INGESTED);}
+                        observer.at(NativeRangeSstImport.Stage.COLUMN_INGESTED);
+                    }
                 }
                 for(var column:manifest.columns())for(var file:column.files())NativeRangeSstImport.verifyBytes(NativeRangeSstImport.original(root,manifest,file),file);
             },observer);

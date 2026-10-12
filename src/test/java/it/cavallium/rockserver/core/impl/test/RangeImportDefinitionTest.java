@@ -15,7 +15,7 @@ class RangeImportDefinitionTest {
                 new RangeDescriptor(UUID.randomUUID(),right,1,2,new byte[]{100},null,RangeDescriptor.TopologyState.FENCED,List.of(replica))));
     }
     NativeSstImportManifest manifest(UUID group,byte[] lower,byte[] upper) {
-        return new NativeSstImportManifest(job,group,1,domain,new byte[32],lower,upper,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of())));
+        return new NativeSstImportManifest(job,group,1,domain,new byte[32],lower,upper,List.of(new NativeSstImportManifest.Column(column,"data",false,List.of())),NativeSstImportManifest.Limits.defaults());
     }
     @Test void derivesOnlyTheExactSelectedSuccessorAndRetainsImmutableOriginalAuthority() {
         var source=directory(RangeDescriptor.TopologyState.FENCED); var manifest=manifest(left,null,new byte[]{100});

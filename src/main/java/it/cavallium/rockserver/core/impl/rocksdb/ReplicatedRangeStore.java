@@ -574,6 +574,8 @@ public final class ReplicatedRangeStore {
     public NativeRangeSstImport.Activation importActivation() throws RocksDBException { return readSchemaMetadata(() -> { recoverImportMetadata(); return importActivation; }); }
     private byte[] importKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
     private void recoverImportMetadata() throws RocksDBException {
+        int[] tags={0x40,0x41,0x42,0x43},bounds={NativeSstImportManifest.MAX_BYTES,NativeSstImportManifest.MAX_BYTES+24,NativeSstImportManifest.Receipt.BYTES,168};
+        for(int n=0;n<tags.length;n++){int size=db.get(state,importKey(tags[n]),new byte[0]);if(size!=RocksDB.NOT_FOUND && size>bounds[n])throw new IllegalArgumentException("Native import metadata exceeds accepted bound");}
         byte[] birth=db.get(state,importKey(0x40)),intent=db.get(state,importKey(0x41)),receipt=db.get(state,importKey(0x42)),activation=db.get(state,importKey(0x43));
         if(birth==null) { if(intent!=null || receipt!=null || activation!=null)throw new IllegalStateException("Import metadata lacks virgin birth"); return; }
         var manifest=NativeSstImportManifest.decode(birth);
