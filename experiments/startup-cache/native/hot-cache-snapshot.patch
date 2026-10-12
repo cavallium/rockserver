@@ -1,0 +1,692 @@
+From 34979508c36842d811f8900228951934a9efb061 Mon Sep 17 00:00:00 2001
+From: Andrea Cavalli <andrea@cavallium.it>
+Date: Mon, 12 Oct 2026 17:17:43 +0200
+Subject: [PATCH] Experiment with bounded resident-block snapshots across
+ restarts
+
+---
+ experiments/hot_cache/README.md |  53 ++++
+ experiments/hot_cache/build.sh  |  13 +
+ experiments/hot_cache/probe.cc  | 498 ++++++++++++++++++++++++++++++++
+ experiments/hot_cache/probe.h   |  16 +
+ experiments/hot_cache/test.py   |  63 ++++
+ 5 files changed, 643 insertions(+)
+ create mode 100644 experiments/hot_cache/README.md
+ create mode 100755 experiments/hot_cache/build.sh
+ create mode 100644 experiments/hot_cache/probe.cc
+ create mode 100644 experiments/hot_cache/probe.h
+ create mode 100644 experiments/hot_cache/test.py
+
+diff --git a/experiments/hot_cache/README.md b/experiments/hot_cache/README.md
+new file mode 100644
+index 0000000..cb2df6f
+--- /dev/null
++++ b/experiments/hot_cache/README.md
+@@ -0,0 +1,53 @@
++# Bounded hot-cache restart feasibility probe
++
++This is an isolated native experiment, not production wiring. Base native source
++is `cc8367a1076b6245574f209c7d007118cf9016b1`; link the matching qualified
++`librocksdbjni-linux64.so` (SHA256
++`18d5865e39cccede36d63146eb9037837b423199930504e3730d2d91d9ff6214`).
++The image's older standalone librocksdb is ABI incompatible with these headers
++and was rejected after a fixture crash. Build uses the image only as a compiler
++container; no packaged JNI artifact is modified.
++
++Run `build.sh SOURCE CANDIDATE OUTPUT` inside
++`codex-paired-compaction-qualified-build-cache:20261011`, with at most 3 CPUs and
++8 GiB, then `python3 test.py OUTPUT/probe OUTPUT`. Each test opens a separate
++process and verifies actual values from both column families. The C ABI in
++`probe.h` keeps all C++ object ownership inside one call. A Java 25 FFM caller
++needs only strings, scalar values, and an output buffer.
++
++The cache is one 16 MiB HyperClock cache for DATA and METADATA. A bounded registry
++retains up to 4096 latest Insert/Lookup keys. Capture performs primary-only lookup,
++serializes supported resident entries, and filters stable SST key prefixes from
++all live column families. Handles are released before disk writes. Basic helpers
++on previously restored blocks are recovered through role plus deleter identity.
++On SSD, an immutable snapshot retains only offsets/keys in its RAM index; values
++are read on demand. Serialized bytes have `kVolatileTier` source even on SSD:
++`cache/typed_cache.h` requires this for already-serialized primary objects.
++
++Format v1 is intentionally specific to x86 little-endian RocksDB 11.8.1 and the
++matched native build, with an 8-byte build-family magic, format version, count,
++bounded per-record lengths and CRC32C over lengths, role, key and value. Files
++are capped at 64 MiB, blocks at 1 MiB. All records validate before activation;
++lookup rechecks CRC before deserialization. Missing or invalid snapshots are
++misses. Unique temporary files, file fsync, atomic rename, and directory fsync
++publish a generation. Test-only `RSHC_TEST_FAIL_BEFORE_RENAME` injects a failure
++which preserves the previous generation; stale temporary names do not block
++subsequent capture. Calls sharing paths must be serialized.
++
++Observed mechanism: 2048 verified Gets in each process, with 488 restored blocks
++(484 DATA and 4 INDEX/FILTER metadata); 2,006,192-byte snapshots survive capture,
++restart, recapture and another restart. Tests cover absent snapshots, byte caps,
++checksum corruption, truncation, invalid lengths/version, failed publication,
++and recovery. IO_uring is unavailable in the Docker test and falls back to POSIX.
++
++Limits: this fixture proves no HDD latency/throughput improvement. Observation
++is aggregate across CFs; equal per-CF capture coverage is not established.
++Insert includes startup/build activity, and pinned accesses bypass Lookup, so it
++is not a faithful foreground hotness ranking. Ambiguous OtherBlock roles,
++including dictionaries, are excluded. There is no cancellation/time/I/O budget,
++separate DATA/METADATA quota, background concurrency stress, compaction replacement
++test, or production API yet. Capture buffers the bounded generation in RAM and
++startup scans/checksums its payload before retaining the index, so cost scales
++with the configured cap. Hard process crashes can leave owned temporary files;
++scoped retention/cleanup remains future work. CRC is corruption detection, not
++an adversarial authentication scheme.
+diff --git a/experiments/hot_cache/build.sh b/experiments/hot_cache/build.sh
+new file mode 100755
+index 0000000..e2cdf28
+--- /dev/null
++++ b/experiments/hot_cache/build.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++set -euo pipefail
++# Run in qualified Docker image with <=3 CPUs/8GiB. Source is exact cc8367a
++# experiment checkout, runtime is the already-qualified cc8367a native artifact.
++source_root=${1:?source checkout}
++candidate=${2:?exact native candidate directory}
++output=${3:?owned output directory}
++mkdir -p "$output"
++cp "$candidate/librocksdbjni-linux64.so" "$output/"
++flags=(-std=c++20 -O1 -g -DROCKSDB_PLATFORM_POSIX -DROCKSDB_LIB_IO_POSIX -DROCKSDB_USE_RTTI -I"$source_root" -I"$source_root/include")
++g++-12 "${flags[@]}" -fPIC -shared "$source_root/experiments/hot_cache/probe.cc" -L"$output" -lrocksdbjni-linux64 '-Wl,-rpath,$ORIGIN' -o "$output/libhot_cache_probe.so"
++g++-12 "${flags[@]}" -DRSHC_MAIN "$source_root/experiments/hot_cache/probe.cc" -L"$output" -lrocksdbjni-linux64 '-Wl,-rpath,$ORIGIN' -o "$output/probe"
++sha256sum "$output/librocksdbjni-linux64.so" "$output/libhot_cache_probe.so"
+diff --git a/experiments/hot_cache/probe.cc b/experiments/hot_cache/probe.cc
+new file mode 100644
+index 0000000..9c29789
+--- /dev/null
++++ b/experiments/hot_cache/probe.cc
+@@ -0,0 +1,498 @@
++// Copyright (c) 2026, Rockserver contributors.
++// Licensed under the Apache License, Version 2.0 (LICENSE.Apache).
++// Isolated restart experiment. No service defaults or packaged JNI are changed.
++#include "probe.h"
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <atomic>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <list>
++#include <mutex>
++#include <sstream>
++#include <stdexcept>
++#include <unordered_map>
++#include <unordered_set>
++
++#include "cache/cache_key.h"
++#include "rocksdb/db.h"
++#include "rocksdb/filter_policy.h"
++#include "rocksdb/secondary_cache.h"
++#include "rocksdb/table.h"
++#include "table/block_based/block_based_table_reader.h"
++#include "table/block_based/block_cache.h"
++#include "util/crc32c.h"
++using ROCKSDB_NAMESPACE::BlockBasedTable;
++using ROCKSDB_NAMESPACE::BlockBasedTableOptions;
++using ROCKSDB_NAMESPACE::BlockType;
++using ROCKSDB_NAMESPACE::Cache;
++using ROCKSDB_NAMESPACE::CacheEntryRole;
++using ROCKSDB_NAMESPACE::CacheTier;
++using ROCKSDB_NAMESPACE::CacheWrapper;
++using ROCKSDB_NAMESPACE::ColumnFamilyDescriptor;
++using ROCKSDB_NAMESPACE::ColumnFamilyHandle;
++using ROCKSDB_NAMESPACE::CompressionType;
++using ROCKSDB_NAMESPACE::CreateDBStatistics;
++using ROCKSDB_NAMESPACE::DB;
++using ROCKSDB_NAMESPACE::FlushOptions;
++using ROCKSDB_NAMESPACE::GetCacheItemHelper;
++using ROCKSDB_NAMESPACE::HyperClockCacheOptions;
++using ROCKSDB_NAMESPACE::kNoCompression;
++using ROCKSDB_NAMESPACE::kNumCacheEntryRoles;
++using ROCKSDB_NAMESPACE::NewBlockBasedTableFactory;
++using ROCKSDB_NAMESPACE::NewBloomFilterPolicy;
++using ROCKSDB_NAMESPACE::OffsetableCacheKey;
++using ROCKSDB_NAMESPACE::Options;
++using ROCKSDB_NAMESPACE::ReadOptions;
++using ROCKSDB_NAMESPACE::SecondaryCache;
++using ROCKSDB_NAMESPACE::SecondaryCacheResultHandle;
++using ROCKSDB_NAMESPACE::Slice;
++using ROCKSDB_NAMESPACE::Statistics;
++using ROCKSDB_NAMESPACE::Status;
++using ROCKSDB_NAMESPACE::TablePropertiesCollection;
++using ROCKSDB_NAMESPACE::WriteOptions;
++namespace crc32c = ROCKSDB_NAMESPACE::crc32c;
++namespace {
++constexpr uint64_t kMaxBytes = 64ULL << 20;
++constexpr uint32_t kMaxBlock = 1U << 20, kMaxEntries = 4096;
++constexpr char kMagic[] = "RSHC1181";
++void Check(Status s) {
++  if (!s.ok()) throw std::runtime_error(s.ToString());
++}
++void WriteAll(int fd, const char* p, size_t n) {
++  while (n) {
++    ssize_t k = write(fd, p, n);
++    if (k < 0 && errno == EINTR) continue;
++    if (k <= 0) throw std::runtime_error("snapshot write");
++    p += k;
++    n -= k;
++  }
++}
++bool ReadAt(int fd, void* p, size_t n, uint64_t off) {
++  while (n) {
++    ssize_t k = pread(fd, p, n, off);
++    if (k < 0 && errno == EINTR) continue;
++    if (k <= 0) return false;
++    p = static_cast<char*>(p) + k;
++    n -= k;
++    off += k;
++  }
++  return true;
++}
++const Cache::CacheItemHelper* Full(CacheEntryRole role) {
++  BlockType type;
++  switch (role) {
++    case CacheEntryRole::kDataBlock:
++      type = BlockType::kData;
++      break;
++    case CacheEntryRole::kIndexBlock:
++      type = BlockType::kIndex;
++      break;
++    case CacheEntryRole::kFilterBlock:
++      type = BlockType::kFilter;
++      break;
++    case CacheEntryRole::kFilterMetaBlock:
++      type = BlockType::kFilterPartitionIndex;
++      break;
++    default:
++      return nullptr;  // OtherBlock is ambiguous; dictionaries need typed
++                       // observation.
++  }
++  return GetCacheItemHelper(type, CacheTier::kNonVolatileBlockTier);
++}
++struct Ready : SecondaryCacheResultHandle {
++  Cache::ObjectPtr object;
++  size_t charge;
++  Ready(Cache::ObjectPtr v, size_t c) : object(v), charge(c) {}
++  bool IsReady() override { return true; }
++  void Wait() override {}
++  Cache::ObjectPtr Value() override { return object; }
++  size_t Size() override { return charge; }
++};
++struct Disk : SecondaryCache {
++  struct Record {
++    uint64_t offset;
++    uint32_t size, crc, role;
++  };
++  int fd = -1;
++  bool rejected = false;
++  std::unordered_map<std::string, Record> index;
++  std::atomic<uint64_t> attempts{0}, matches{0}, hits{0}, data_hits{0},
++      metadata_hits{0};
++  explicit Disk(const std::string& path, uint64_t cap) {
++    try {
++      fd = open(path.c_str(), O_RDONLY);
++      if (fd < 0) return;
++      struct stat st{};
++      if (fstat(fd, &st) != 0 || st.st_size < 16 ||
++          uint64_t(st.st_size) > cap) {
++        Reject();
++        return;
++      }
++      char magic[8];
++      uint32_t count = 0, version = 0;
++      if (!ReadAt(fd, magic, 8, 0) || memcmp(magic, kMagic, 8) ||
++          !ReadAt(fd, &version, 4, 8) || version != 1 ||
++          !ReadAt(fd, &count, 4, 12) || count > kMaxEntries) {
++        Reject();
++        return;
++      }
++      uint64_t off = 16;
++      for (uint32_t i = 0; i < count; ++i) {
++        uint32_t header[4];
++        if (!ReadAt(fd, header, 16, off)) {
++          Reject();
++          return;
++        }
++        off += 16;
++        auto kn = header[0], n = header[1], role = header[2], crc = header[3];
++        if (kn == 0 || kn > 64 || n == 0 || n > kMaxBlock ||
++            role >= kNumCacheEntryRoles || !Full(CacheEntryRole(role)) ||
++            off + kn + n > uint64_t(st.st_size)) {
++          Reject();
++          return;
++        }
++        std::string key(kn, '\0'), value(n, '\0');
++        if (!ReadAt(fd, key.data(), kn, off) ||
++            !ReadAt(fd, value.data(), n, off + kn)) {
++          Reject();
++          return;
++        }
++        std::string checked(reinterpret_cast<char*>(header), 12);
++        checked += key;
++        checked += value;
++        if (crc32c::Value(checked.data(), checked.size()) != crc ||
++            index.count(key)) {
++          Reject();
++          return;
++        }
++        index.emplace(key, Record{off + kn, n, crc, role});
++        off += kn + n;
++      }
++      if (off != uint64_t(st.st_size)) Reject();
++    } catch (...) {
++      Reject();
++    }
++  }
++  void Reject() {
++    rejected = true;
++    index.clear();
++    if (fd >= 0) {
++      close(fd);
++      fd = -1;
++    }
++  }
++  ~Disk() override {
++    if (fd >= 0) close(fd);
++  }
++  const char* Name() const override { return "HotSnapshotExperiment"; }
++  Status Insert(const Slice&, Cache::ObjectPtr, const Cache::CacheItemHelper*,
++                bool) override {
++    return Status::OK();
++  }
++  Status InsertSaved(const Slice&, const Slice&, CompressionType,
++                     CacheTier) override {
++    return Status::NotSupported();
++  }
++  bool SupportForceErase() const override { return false; }
++  void Erase(const Slice&) override {}
++  void WaitAll(std::vector<SecondaryCacheResultHandle*>) override {}
++  std::unique_ptr<SecondaryCacheResultHandle> Lookup(
++      const Slice& key, const Cache::CacheItemHelper* helper,
++      Cache::CreateContext* context, bool, bool, Statistics*,
++      bool& kept) override {
++    kept = true;
++    try {
++      ++attempts;
++      auto it = index.find(key.ToString());
++      if (it != index.end()) ++matches;
++      if (it == index.end() || !helper || !helper->create_cb ||
++          uint32_t(helper->role) != it->second.role)
++        return nullptr;
++      auto r = it->second;
++      std::string data(r.size, '\0');
++      if (!ReadAt(fd, data.data(), data.size(), r.offset)) return nullptr;
++      uint32_t header[3] = {uint32_t(key.size()), r.size, r.role};
++      std::string checked(reinterpret_cast<char*>(header), 12);
++      checked.append(key.data(), key.size());
++      checked += data;
++      if (crc32c::Value(checked.data(), checked.size()) != r.crc)
++        return nullptr;
++      auto result = std::make_unique<Ready>(nullptr, 0);
++      Cache::ObjectPtr object = nullptr;
++      size_t charge = 0;
++      auto status =
++          helper->create_cb(data, kNoCompression, CacheTier::kVolatileTier,
++                            context, nullptr, &object, &charge);
++      if (!status.ok()) return nullptr;
++      result->object = object;
++      result->charge = charge;
++      ++hits;
++      if (helper->role == CacheEntryRole::kDataBlock)
++        ++data_hits;
++      else
++        ++metadata_hits;
++      return result;
++    } catch (...) {
++      return nullptr;
++    }
++  }
++};
++// Bounded latest-observation registry. Captures Insert and Lookup, not pinned
++// table-reader accesses. It is a fixture approximation to foreground hotness.
++struct Observe : CacheWrapper {
++  std::mutex mu;
++  std::list<std::string> recent;
++  struct Seen {
++    CacheEntryRole role;
++    std::list<std::string>::iterator pos;
++  };
++  std::unordered_map<std::string, Seen> seen;
++  explicit Observe(std::shared_ptr<Cache> cache)
++      : CacheWrapper(std::move(cache)) {}
++  const char* Name() const override { return "HotObservationExperiment"; }
++  Cache* target() { return target_.get(); }
++  void Record(const Slice& key, const CacheItemHelper* helper) noexcept {
++    try {
++      if (!helper || !Full(helper->role) || key.size() > 64) return;
++      std::lock_guard<std::mutex> lock(mu);
++      auto s = key.ToString();
++      auto it = seen.find(s);
++      if (it != seen.end()) {
++        recent.erase(it->second.pos);
++        seen.erase(it);
++      }
++      recent.push_front(s);
++      seen.emplace(s, Seen{helper->role, recent.begin()});
++      if (seen.size() > kMaxEntries) {
++        seen.erase(recent.back());
++        recent.pop_back();
++      }
++    } catch (
++        ...) {  // Observation is optional; recover bounded registry invariants.
++      std::lock_guard<std::mutex> lock(mu);
++      seen.clear();
++      recent.clear();
++    }
++  }
++  Status Insert(const Slice& key, ObjectPtr value,
++                const CacheItemHelper* helper, size_t charge, Handle** handle,
++                Priority priority, const Slice& compressed,
++                CompressionType type) override {
++    auto s = CacheWrapper::Insert(key, value, helper, charge, handle, priority,
++                                  compressed, type);
++    if (s.ok()) Record(key, helper);
++    return s;
++  }
++  Handle* Lookup(const Slice& key, const CacheItemHelper* helper,
++                 CreateContext* context, Priority priority,
++                 Statistics* stats) override {
++    auto* h = CacheWrapper::Lookup(key, helper, context, priority, stats);
++    if (h) Record(key, helper);
++    return h;
++  }
++};
++struct Capture {
++  uint64_t bytes = 0, data = 0, metadata = 0;
++  uint32_t count = 0;
++};
++Capture Save(Observe& cache, DB& db,
++             const std::vector<ColumnFamilyHandle*>& cfs,
++             const std::string& path, uint64_t cap) {
++  std::unordered_set<std::string> stable;
++  for (auto* cf : cfs) {
++    TablePropertiesCollection props;
++    Check(db.GetPropertiesOfAllTables(cf, &props));
++    for (auto& p : props) {
++      OffsetableCacheKey base;
++      bool valid = false;
++      BlockBasedTable::SetupBaseCacheKey(p.second.get(), "", 0, &base, &valid);
++      if (valid) stable.insert(base.CommonPrefixSlice().ToString());
++    }
++  }
++  std::vector<std::pair<std::string, CacheEntryRole>> keys;
++  {
++    std::lock_guard<std::mutex> lock(cache.mu);
++    for (auto& key : cache.recent)
++      keys.emplace_back(key, cache.seen.at(key).role);
++  }
++  std::string records;
++  Capture result;
++  result.bytes = 16;
++  for (auto& entry : keys) {
++    auto& key = entry.first;
++    if (key.size() < OffsetableCacheKey::kCommonPrefixSize ||
++        !stable.count(key.substr(0, OffsetableCacheKey::kCommonPrefixSize)))
++      continue;
++    auto* h = cache.target()->BasicLookup(key, nullptr);
++    if (!h) continue;
++    struct Release {
++      Cache* cache;
++      Cache::Handle* h;
++      ~Release() { cache->Release(h); }
++    } release{cache.target(), h};
++    auto* helper = Full(entry.second);
++    auto* actual = cache.GetCacheItemHelper(h);
++    if (!actual || actual->del_cb != helper->del_cb) continue;
++    auto* value = cache.Value(h);
++    if (!value) continue;
++    size_t n = helper->size_cb(value);
++    if (n == 0 || n > kMaxBlock || result.bytes + 16 + key.size() + n > cap)
++      continue;
++    std::string saved(n, '\0');
++    Check(helper->saveto_cb(value, 0, n, saved.data()));
++    uint32_t header[4] = {uint32_t(key.size()), uint32_t(n),
++                          uint32_t(entry.second), 0};
++    std::string checked(reinterpret_cast<char*>(header), 12);
++    checked += key;
++    checked += saved;
++    header[3] = crc32c::Value(checked.data(), checked.size());
++    records.append(reinterpret_cast<char*>(header), 16);
++    records += key;
++    records += saved;
++    result.bytes += 16 + key.size() + n;
++    ++result.count;
++    if (entry.second == CacheEntryRole::kDataBlock)
++      ++result.data;
++    else
++      ++result.metadata;
++  }
++  // Serialized bounded records are copied before disk I/O; no cache locks held.
++  std::string tmp = path + ".tmp.XXXXXX";
++  int fd = mkstemp(tmp.data());
++  if (fd < 0) throw std::runtime_error("snapshot temporary cannot create");
++  try {
++    uint32_t header[2] = {1, result.count};
++    WriteAll(fd, kMagic, 8);
++    WriteAll(fd, reinterpret_cast<char*>(header), 8);
++    WriteAll(fd, records.data(), records.size());
++    if (fsync(fd)) throw std::runtime_error("snapshot fsync");
++    close(fd);
++    fd = -1;
++    if (getenv("RSHC_TEST_FAIL_BEFORE_RENAME"))
++      throw std::runtime_error("injected publication failure");
++    if (rename(tmp.c_str(), path.c_str()))
++      throw std::runtime_error("snapshot rename");
++    auto slash = path.find_last_of('/');
++    auto dir = slash == std::string::npos ? "." : path.substr(0, slash);
++    int parent = open(dir.c_str(), O_DIRECTORY | O_RDONLY);
++    if (parent < 0) throw std::runtime_error("snapshot directory open");
++    int sync = fsync(parent);
++    close(parent);
++    if (sync) throw std::runtime_error("snapshot directory fsync");
++  } catch (...) {
++    if (fd >= 0) close(fd);
++    unlink(tmp.c_str());
++    throw;
++  }
++  return result;
++}
++std::string Run(const std::string& path, const std::string& snapshot, int mode,
++                uint64_t cap) {
++  if (mode < 0 || mode > 2 || cap < 16 || cap > kMaxBytes)
++    throw std::runtime_error("invalid mode or bounded cap");
++  if (mode == 0 && access(path.c_str(), F_OK) == 0)
++    throw std::runtime_error("seed requires absent fixture path");
++  auto disk = std::make_shared<Disk>(snapshot, cap);
++  HyperClockCacheOptions hc(16ULL << 20, 4096, 2);
++  hc.secondary_cache = disk;
++  auto cache = std::make_shared<Observe>(hc.MakeSharedCache());
++  BlockBasedTableOptions table;
++  table.block_cache = cache;
++  table.metadata_block_cache = cache;
++  table.cache_index_and_filter_blocks = true;
++  table.pin_l0_filter_and_index_blocks_in_cache = true;
++  table.filter_policy.reset(NewBloomFilterPolicy(10, false));
++  table.block_size = 4096;
++  Options options;
++  options.create_if_missing = mode == 0;
++  options.create_missing_column_families = mode == 0;
++  options.compression = kNoCompression;
++  options.disable_auto_compactions = true;
++  options.max_open_files = -1;
++  options.table_factory.reset(NewBlockBasedTableFactory(table));
++  options.statistics = CreateDBStatistics();
++  std::unique_ptr<DB> opened;
++  std::vector<ColumnFamilyHandle*> cfs;
++  std::vector<ColumnFamilyDescriptor> desc{{"default", options},
++                                           {"metadata_fixture", options}};
++  Check(DB::Open(options, path, desc, &cfs, &opened));
++  DB* raw = opened.release();
++  struct Owned {
++    DB* db;
++    std::vector<ColumnFamilyHandle*>& cfs;
++    ~Owned() {
++      for (auto* c : cfs) db->DestroyColumnFamilyHandle(c);
++      delete db;
++    }
++  } owned{raw, cfs};
++  if (mode == 0) {
++    std::string value(1000, 'x');
++    for (auto* cf : cfs) {
++      for (int i = 0; i < 2048; ++i)
++        Check(raw->Put(WriteOptions(), cf, "key" + std::to_string(i), value));
++      FlushOptions f;
++      f.wait = true;
++      Check(raw->Flush(f, cf));
++    }
++  }
++  options.statistics->Reset();
++  uint64_t reads = 0;
++  for (int round = 0; round < 2; ++round)
++    for (auto* cf : cfs)
++      for (int i = 0; i < 512; ++i) {
++        std::string value;
++        Check(raw->Get(ReadOptions(), cf, "key" + std::to_string(i), &value));
++        if (value != std::string(1000, 'x'))
++          throw std::runtime_error("wrong value");
++        ++reads;
++      }
++  Capture captured;
++  if (mode != 1) captured = Save(*cache, *raw, cfs, snapshot, cap);
++  std::ostringstream out;
++  out << "{\"abi\":1,\"reads\":" << reads
++      << ",\"snapshot_entries\":" << disk->index.size()
++      << ",\"snapshot_rejected\":" << (disk->rejected ? "true" : "false")
++      << ",\"secondary_attempts\":" << disk->attempts
++      << ",\"secondary_matches\":" << disk->matches
++      << ",\"secondary_hits\":" << disk->hits
++      << ",\"data_hits\":" << disk->data_hits
++      << ",\"metadata_hits\":" << disk->metadata_hits
++      << ",\"written_bytes\":" << captured.bytes
++      << ",\"captured_data\":" << captured.data
++      << ",\"captured_metadata\":" << captured.metadata << "}";
++  return out.str();
++}
++}  // namespace
++extern "C" uint32_t rshc_abi_version() { return 1; }
++extern "C" int rshc_run(const char* db, const char* snapshot, int mode,
++                        uint64_t cap, char* output, size_t output_cap) {
++  if (!db || !snapshot || !output || output_cap == 0) return 2;
++  try {
++    auto result = Run(db, snapshot, mode, cap);
++    if (result.size() + 1 > output_cap) return 2;
++    memcpy(output, result.c_str(), result.size() + 1);
++    return 0;
++  } catch (const std::exception& e) {
++    snprintf(output, output_cap, "native experiment: %s", e.what());
++    return 1;
++  } catch (...) {
++    snprintf(output, output_cap, "native experiment failed");
++    return 1;
++  }
++}
++#ifdef RSHC_MAIN
++int main(int argc, char** argv) {
++  if (argc != 5) return 2;
++  char out[4096];
++  int code = rshc_run(argv[1], argv[2], atoi(argv[3]),
++                      strtoull(argv[4], nullptr, 10), out, sizeof(out));
++  puts(out);
++  return code;
++}
++#endif
+diff --git a/experiments/hot_cache/probe.h b/experiments/hot_cache/probe.h
+new file mode 100644
+index 0000000..73bbb0e
+--- /dev/null
++++ b/experiments/hot_cache/probe.h
+@@ -0,0 +1,16 @@
++// Copyright (c) 2026, Rockserver contributors.
++// Licensed under the Apache License, Version 2.0 (LICENSE.Apache).
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++uint32_t rshc_abi_version(void);
++// mode 0 seeds an isolated fixture, reads, and captures; 1 reads; 2 recaptures.
++// A call owns all native resources. Calls sharing paths must be serialized.
++int rshc_run(const char* db, const char* snapshot, int mode,
++             uint64_t max_snapshot_bytes, char* output, size_t output_cap);
++#ifdef __cplusplus
++}
++#endif
+diff --git a/experiments/hot_cache/test.py b/experiments/hot_cache/test.py
+new file mode 100644
+index 0000000..de50b3a
+--- /dev/null
++++ b/experiments/hot_cache/test.py
+@@ -0,0 +1,63 @@
++"""Isolated fixture correctness tests; no production performance claims."""
++import json
++import os
++import pathlib
++import subprocess
++import sys
++import tempfile
++
++probe = pathlib.Path(sys.argv[1]).resolve()
++root = pathlib.Path(tempfile.mkdtemp(prefix="hot-cache-fixture-", dir=sys.argv[2]))
++db, snapshot = root / "db", root / "snapshot"
++
++
++def run(mode, cap=8 * 1024 * 1024, ok=True, fail_publish=False):
++    p = subprocess.run([str(probe), str(db), str(snapshot), str(mode), str(cap)],
++                       text=True, capture_output=True, timeout=30,
++                       env=dict(os.environ, **({"RSHC_TEST_FAIL_BEFORE_RENAME": "1"} if fail_publish else {})))
++    if not ok:
++        assert p.returncode != 0, p.stdout
++        return
++    assert p.returncode == 0, (p.stdout, p.stderr)
++    result = json.loads(next(line for line in p.stdout.splitlines() if line.startswith("{")))
++    assert result["reads"] == 2048
++    return result
++
++
++seed = run(0)
++assert seed["captured_data"] > 0 and seed["captured_metadata"] > 0
++assert seed["written_bytes"] <= 8 * 1024 * 1024
++for mode in (1, 2, 1):
++    r = run(mode)
++    assert r["data_hits"] > 0 and r["metadata_hits"] > 0, r
++    assert not r["snapshot_rejected"]
++print("restart-recapture-restart", json.dumps(r))
++original = snapshot.read_bytes()
++# Atomic publication failure preserves the previous complete generation.
++(snapshot.parent / "snapshot.tmp").write_bytes(b"occupied")
++run(2, ok=False, fail_publish=True)
++assert snapshot.read_bytes() == original
++run(2)  # stale/foreign temporary is ignored and publication resumes.
++assert (snapshot.parent / "snapshot.tmp").read_bytes() == b"occupied"
++(snapshot.parent / "snapshot.tmp").unlink()
++run(0, ok=False)  # Never seed over an existing fixture.
++# Reject bad format before passing bytes to native block decoders.
++for label, damaged in (
++    ("truncation", original[:-1]),
++    ("checksum", original[:-1] + bytes([original[-1] ^ 1])),
++    ("version", original[:8] + (2).to_bytes(4, "little") + original[12:]),
++    ("oversized-length", original[:20] + (0xffffffff).to_bytes(4, "little") + original[24:]),
++):
++    snapshot.write_bytes(damaged)
++    r = run(1)
++    assert r["snapshot_rejected"] and r["secondary_hits"] == 0, r
++    print(label, "fallback verified")
++snapshot.write_bytes(original)
++r = run(2, 16)
++assert r["written_bytes"] == 16 and r["captured_data"] == r["captured_metadata"] == 0
++r = run(1, 16)
++assert not r["snapshot_rejected"] and r["snapshot_entries"] == 0
++snapshot.unlink()
++r = run(1)
++assert not r["snapshot_rejected"] and r["secondary_hits"] == 0
++print("byte-cap and missing-snapshot fallback verified; retained fixture", root)

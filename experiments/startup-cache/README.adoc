@@ -1,0 +1,39 @@
+= Isolated startup/cache experiments
+
+These fixtures use Java 25 FFM and one native runtime per process. They do not
+change Rockserver service defaults or connect to production. All DB paths are
+new local fixture directories. Output directories must not already exist.
+
+== Cache restart reuse
+
+Native patch `native/hot-cache-snapshot.patch` is commit
+`34979508c36842d811f8900228951934a9efb061`, based on native
+`cc8367a1076b6245574f209c7d007118cf9016b1` (tree
+`82d609e8e224076fb5065679735ce8d6e14e5d22`). Apply it to that native checkout,
+then follow `experiments/hot_cache/README.md` there to build the shim.
+The qualified runtime is `librocksdbjni-linux64.so`, SHA256
+`18d5865e39cccede36d63146eb9037837b423199930504e3730d2d91d9ff6214`.
+An older cached library was ABI incompatible and is not valid for this probe.
+
+[source,shell]
+----
+python3 experiments/startup-cache/run_hot_cache.py /path/to/libhot_cache_probe.so /new/local/cache-run
+----
+
+The harness compiles the standalone driver with `javac --release 25` and starts
+seven separate JVMs. It verifies capture, reopen, recapture, another reopen,
+and corrupt/truncated/missing snapshot fallback. Reports, exit codes, native
+diagnostics and fixture storage remain in the output directory.
+
+The initial fixture has one 16 MiB HyperClock cache and two CFs. A bounded
+4096-key Insert/Lookup registry selects resident DATA/index/filter entries;
+serialization and reconstruction stay native. The snapshot is capped at 64 MiB
+with 1 MiB records and validated lengths/version/CRC before activation. The
+generation is buffered before atomic publication, so capture RAM scales with
+the cap. No cache handles are retained during SSD writes.
+
+This proves actual cross-process reuse and corruption fallback, not production
+HDD speedup. The registry includes initial inserts and misses pinned access
+frequency. Per-CF hotness, dictionaries, async observation, separate data/metadata
+quotas, cancellation/I/O budgets, compaction replacement, and crash-temp retention
+are not qualified. Production integration must address those limits first.
