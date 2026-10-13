@@ -235,6 +235,8 @@ public final class ReplicatedRangeStore {
             var published=sourceOutcomePublications.get(id);if(published!=null) { if(!Arrays.equals(published.requestDigest(),request.digest()))throw new IllegalArgumentException("Source publication original input changed");return new SourceOutcomeCreditEstimate(usage,true,sourceOperationFenced(id),0,0,0,sourceOutcomeMetadataBytes()); }
             if(sourceOperationFenced(id))return new SourceOutcomeCreditEstimate(usage,false,true,0,0,0,sourceOutcomeMetadataBytes());
             if(operationResultUnderAdmission(id,request.original().receiptDigest())!=null)throw new IllegalStateException("Source original operation already has an ordinary outcome");
+            if(sessionAckEpochs==null)validateSessionMetadata(null);
+            if(sessionAckCount+sourceSessionMetadataPromises(minimumSessionEpoch(null),null,request.original())>sessionAckLimit)throw new IllegalStateException("Source outcome ACK namespace promise capacity exhausted");
             long metadata=49L+24+request.encode().length+49+NativeSourceOutcomePublication.BYTES;
             if(sourceOutcomeCountLimit==0 || total.count()+1>sourceOutcomeCountLimit || total.bytes()+request.reservedBytes()>sourceOutcomeByteLimit || sourceOutcomeCredits.size()>=NativeSourceOutcomeCredit.MAX_CREDITS || sourceOutcomePublications.size()+sourceOutcomeCredits.size()>=NativeSourceOutcomeCredit.MAX_PUBLICATIONS || sourceOutcomeMetadataBytes()+metadata>NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IllegalStateException("Source outcome receipt/metadata capacity exhausted");
             return new SourceOutcomeCreditEstimate(usage,false,false,1,request.reservedBytes(),metadata,sourceOutcomeMetadataBytes());
@@ -267,16 +269,18 @@ public final class ReplicatedRangeStore {
             byte[] old=operationResultUnderAdmission(id,request.original().receiptDigest());if(!fenced && old!=null && !Arrays.equals(old,stable))throw new IllegalArgumentException("Source original outcome already differs");
             var outcome=fenced?NativeSourceOutcomePublication.Outcome.FENCED:NativeSourceOutcomePublication.Outcome.RETAINED;var publication=new NativeSourceOutcomePublication(groupId,id,request.digest(),sourceOutcomeHash(stable),credit.position(),position,outcome);
             var next=new HashMap<>(sourceOutcomeCredits);next.remove(id);var published=new HashMap<>(sourceOutcomePublications);
+            var sessionMetadata=!fenced && old==null ? sessionMetadataChange(request.original(),-1,request.original().acknowledgedThrough()) : null;
             try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(false)) {
                 if(!fenced && old==null) {
                     var command=request.original();long minimum=minimumSessionEpoch(null),floor=acknowledgedThrough(id,null);long ack=command.acknowledgedThrough();
+                    if(sessionMetadata!=null)batch.put(state,sessionAckCountKey(),ByteBuffer.allocate(8).putLong(sessionMetadata.count()).array());
                     if(ack>floor) { batch.put(state,sessionFloorKey(id),ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(ack).array());batch.deleteRange(receipts,receiptKey(new OperationId(id.sessionId(),id.epoch(),0)),receiptKey(new OperationId(id.sessionId(),id.epoch(),ack+1))); }
                     for(var prior:List.copyOf(published.keySet()))if(prior.epoch()<minimum || prior.sessionId().equals(id.sessionId()) && prior.epoch()==id.epoch() && prior.sequence()<=ack) { batch.delete(state,sourceOutcomeKey(0x66,prior));published.remove(prior); }
                     byte[] receipt=encodeReceipt(command.receiptDigest(),stable);updateReceiptUsage(batch,command,-1,ack,minimum,floor,receipt.length,position,id);batch.put(receipts,receiptKey(id),receipt);
                 } else batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));
                 published.put(id,publication);batch.delete(state,sourceOutcomeKey(0x65,id));batch.put(state,sourceOutcomeKey(0x66,id),publication.encode());batch.put(state,markerKey,encodePosition(position));db.write(options,batch);
             }
-            sourceOutcomeCredits=Map.copyOf(next);sourceOutcomePublications=Map.copyOf(published);applied=position;return new SourceOutcomePublicationResult(outcome,publication);
+            publishSessionMetadata(sessionMetadata);sourceOutcomeCredits=Map.copyOf(next);sourceOutcomePublications=Map.copyOf(published);applied=position;return new SourceOutcomePublicationResult(outcome,publication);
         } finally { applyLane.unlock();leaveNative(); }
     }
     private static byte[] sourceOutcomeHash(byte[] value) { try { return java.security.MessageDigest.getInstance("SHA-256").digest(value); } catch(java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); } }
@@ -1509,7 +1513,7 @@ public final class ReplicatedRangeStore {
         for (var pin:scopedPins.values()) scopedReleases.add(pin.snapshot); scopedPins.clear();
     }
     private void resetScopedUnderLane() {
-        catalogueHistoryCache=null;catalogueDirectorySlots=-1;
+        catalogueHistoryCache=null;catalogueDirectorySlots=-1;sessionAckEpochs=null;
         homeStatusCapacityKnown=false;
         if (scopedHistory==null) return;
         scopedGeneration=new Object(); scopedHistory.reset();
@@ -3395,6 +3399,8 @@ public final class ReplicatedRangeStore {
             if (saved==null && sessionStatus!=CommandResult.Status.SUCCESS) {
                 stableResult=new CommandResult(sessionStatus,List.of()).encode(); installUserEffects=false;
             }
+            var sessionMetadata=saved==null && acceptMaintenance ? sessionMetadataChange(command,effectiveMinimum,effectiveAcknowledgement) : null;
+            if(sessionMetadata!=null && sessionMetadata.count()+sourceSessionMetadataPromises(Math.max(currentEpochFloor,effectiveMinimum),null,null)>sessionAckLimit){stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode();installUserEffects=false;acceptMaintenance=false;effectiveMinimum=-1;effectiveAcknowledgement=-1;sessionMetadata=null;}
             List<Mutation> effects=command.mutations(); Map<BucketKey,DistributedBucket> bucketEffects=Map.of();
             if (saved==null && stableResult==null && command.transactionRejection()) {
                 stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode(); installUserEffects=false;
@@ -3443,6 +3449,8 @@ public final class ReplicatedRangeStore {
                     if (effectiveMinimum > currentEpochFloor) {
                         batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(effectiveMinimum).array());
                         batch.deleteRange(state, bindingPrefix(), bindingKey(effectiveMinimum));
+                        batch.deleteRange(state,sessionFloorPrefix(),sessionFloorEpoch(effectiveMinimum));
+                        batch.deleteRange(receipts,markerKey,receiptEpoch(effectiveMinimum));
                     }
                     if (effectiveAcknowledgement > currentFloor) {
                         long floor = effectiveAcknowledgement;
@@ -3451,6 +3459,7 @@ public final class ReplicatedRangeStore {
                         batch.deleteRange(receipts, receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), 0)),
                                 receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), floor + 1)));
                     }
+                    if(sessionMetadata!=null)batch.put(state,sessionAckCountKey(),ByteBuffer.allocate(8).putLong(sessionMetadata.count()).array());
                     byte[] encodedReceipt = encodeReceipt(digest, stableResult);
                     updateReceiptUsage(batch, command, effectiveMinimum, effectiveAcknowledgement, currentEpochFloor, currentFloor, encodedReceipt.length, position);
                     publishSourceGc=sourcePublicationGc(batch,Math.max(currentEpochFloor,effectiveMinimum),effectiveAcknowledgement,command.operationId());
@@ -3460,7 +3469,7 @@ public final class ReplicatedRangeStore {
                 if (saved != null) batch.put(state, usageKey, encodeTotalUsage(readUsage(usageKey), position));
                 db.write(options, batch);
             }
-            publishCdc.run();publishSourceGc.run();
+            publishCdc.run();publishSourceGc.run();publishSessionMetadata(sessionMetadata);
             if(catalogueChange!=null){catalogueHistoryWriteObserver.afterWrite();catalogueHistoryCache=catalogueChange.update().state();catalogueDirectorySlots+=catalogueChange.directoryDelta();}
             if(homeStatusChange!=null)homeStatusWriteObserver.afterWrite();
             publishHomeCredit(creditChange); publishHomeStatus(homeStatusChange); publishScoped(position,writes,false); applied = position;
@@ -4561,6 +4570,7 @@ public final class ReplicatedRangeStore {
                 validateHomeUserCredits(credits,context,snapshot);
             } finally { releaseUse(); }
         }
+        void validateSessionMetadataImage() throws RocksDBException {acquireUse();try{validateSessionMetadata(snapshot);}finally{releaseUse();}}
         void validateCatalogueHistoryImage() throws RocksDBException {if(catalogueHistoryColumn==null)return;acquireUse();try {verifyCatalogueHistory(snapshot);}finally {releaseUse();}}
         void validateSnapshotHomeImage() throws RocksDBException { acquireUse(); try { validateSnapshotHomeUsers(snapshot,snapshotHomeContext); } finally { releaseUse(); } }
         public SnapshotHomeFenceProof snapshotHomeFence(SnapshotHomeIdentity identity) throws RocksDBException {
@@ -4676,7 +4686,7 @@ public final class ReplicatedRangeStore {
                 long minimum = minimumSessionEpoch(options);
                 visit(state, markerKey, null, markerKey, (key, value) -> {
                     if (key.length == 41 && key[16] == 2) {
-                        long epoch = ByteBuffer.wrap(key,33,8).getLong();
+                        long epoch = ByteBuffer.wrap(key,17,8).getLong();
                         if (epoch >= 0 && epoch < minimum) return;
                     }
                     visitor.accept(key,value);
@@ -4689,7 +4699,7 @@ public final class ReplicatedRangeStore {
                 long minimum = minimumSessionEpoch(options);
                 visit(receipts, markerKey, null, markerKey, (key, value) -> {
                     if (key.length == 48) {
-                        long epoch = ByteBuffer.wrap(key,32,8).getLong();
+                        long epoch = ByteBuffer.wrap(key,16,8).getLong();
                         if (epoch >= 0 && epoch < minimum) return;
                     }
                     visitor.accept(key,value);
@@ -4874,7 +4884,7 @@ public final class ReplicatedRangeStore {
                                     break;
                                 }
                                 byte[] key = iterator.key();
-                                long epoch = ByteBuffer.wrap(key,phase == 0 ? 33 : 32,8).getLong();
+                                long epoch = ByteBuffer.wrap(key,phase == 0 ? 17 : 16,8).getLong();
                                 if (epoch < 0) throw new IllegalStateException("Invalid reclamation session epoch");
                                 if (epoch < cutoff) { batch.delete(cf,key); deleted++; }
                                 examined++; bytes += needed; after = key;
@@ -5052,7 +5062,7 @@ public final class ReplicatedRangeStore {
     }
 
     private static void validateReceiptRow(byte[] key, byte[] value) {
-        if (key.length != 48 || ByteBuffer.wrap(key, 32, 8).getLong() < 0
+        if (key.length != 48 || ByteBuffer.wrap(key, 16, 8).getLong() < 0
                 || ByteBuffer.wrap(key, 40, 8).getLong() < 0 || value.length < 36
                 || value.length > 36 + MAX_RESULT_BYTES || ByteBuffer.wrap(value).getInt() != STATE_VERSION) {
             throw new IllegalStateException("Invalid durable receipt row");
@@ -5109,8 +5119,8 @@ public final class ReplicatedRangeStore {
                 if (end!=null && Arrays.compareUnsigned(key,end)>=0) break;
                 byte[] value=iterator.value(); validateReceiptRow(key,value);
                 var input=ByteBuffer.wrap(key,16,32);
-                var id=new OperationId(new UUID(input.getLong(),input.getLong()),input.getLong(),input.getLong());
-                if (id.epoch()<minimum) continue;
+                long epoch=input.getLong();var id=new OperationId(new UUID(input.getLong(),input.getLong()),epoch,input.getLong());
+                if (id.epoch()<minimum) throw new IllegalStateException("Obsolete physical receipt survived epoch GC");
                 byte[] currentBucket=usageBucketKey(id);
                 if (!Arrays.equals(previousBucket,currentBucket)) {
                     if (previousBucket!=null && bucket.count!=0) { requireUsageBucket(previousBucket,bucket); validatedBuckets++; }
@@ -5143,8 +5153,72 @@ public final class ReplicatedRangeStore {
         if (expected.count==0 || !expected.equals(decodeUsage(db.get(state,key)))) {
             throw new IllegalStateException("Receipt usage bucket differs from retained receipts");
         }
+        validateSessionMetadata(null);
     }
 
+    public static final int MAX_SESSION_ACK_NAMESPACES=65_536;
+    public static final long MAX_SESSION_ACK_BYTES=25L+53L*MAX_SESSION_ACK_NAMESPACES;
+    private int sessionAckLimit=MAX_SESSION_ACK_NAMESPACES;
+    private java.util.TreeMap<Long,Integer> sessionAckEpochs;
+    private int sessionAckCount;
+    private byte[] sessionAckCountKey(){return ByteBuffer.allocate(17).put(markerKey).put((byte)0x15).array();}
+    private int validateSessionMetadata(Snapshot snapshot) throws RocksDBException {
+        int count=0;var epochs=new java.util.TreeMap<Long,Integer>();
+        try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false);var iterator=db.newIterator(state,options)) {
+            long minimum=minimumSessionEpoch(options);byte[] prefix=sessionFloorPrefix();var sizing=new byte[0];iterator.seek(prefix);
+            for(;iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length);iterator.next()) {
+                byte[] key=iterator.key();if(key.length!=41 || iterator.value(sizing)!=12)throw new IllegalStateException("Invalid session ACK namespace shape");long epoch=ByteBuffer.wrap(key,17,8).getLong();
+                var value=ByteBuffer.wrap(iterator.value());int encoding=value.getInt();long floor=value.getLong();if(epoch<minimum || encoding!=STATE_VERSION || floor<0 || floor==Long.MAX_VALUE || ++count>MAX_SESSION_ACK_NAMESPACES)throw new IllegalStateException("Session ACK namespace inventory corrupt or unbounded");epochs.merge(epoch,1,Integer::sum);
+            }
+            iterator.status();byte[] total=db.get(state,options,sessionAckCountKey());if(total==null ? count!=0 : total.length!=8 || ByteBuffer.wrap(total).getLong()!=count)throw new IllegalStateException("Session ACK namespace count differs from inventory");
+        }
+        if(snapshot==null){sessionAckCount=count;sessionAckEpochs=epochs;}return count;
+    }
+    public void configureSessionMetadataCapacity(int maximumNamespaces) throws RocksDBException {
+        if(maximumNamespaces<1 || maximumNamespaces>MAX_SESSION_ACK_NAMESPACES)throw new IllegalArgumentException("Invalid session ACK namespace capacity");enterNative();applyLane.lock();try {if(validateSessionMetadata(null)>maximumNamespaces)throw new IllegalStateException("Existing session ACK namespaces exceed configured capacity");sessionAckLimit=maximumNamespaces;}finally {applyLane.unlock();leaveNative();}
+    }
+    public record SessionMetadataEstimate(ApplyPosition position,int retainedNamespaces,int reservedNamespaces,int maximumNamespaces,int removedNamespaces,int additionalNamespaces,boolean existingReceipt) {}
+    private record SessionMetadataChange(int count,long minimumEpoch,long newEpoch,boolean additional) {}
+    private SessionMetadataChange sessionMetadataChange(DistributedCommand command,long minimum,long acknowledgement) throws RocksDBException {
+        if(sessionAckEpochs==null)validateSessionMetadata(null);int removed=0;
+        if(minimum>=0)for(var value:sessionAckEpochs.headMap(minimum,false).values())removed+=value;
+        var id=command.operationId();boolean add=acknowledgement>=0 && id.epoch()>=Math.max(0,minimum) && db.get(state,sessionFloorKey(id))==null;
+        return new SessionMetadataChange(sessionAckCount-removed+(add?1:0),minimum,id.epoch(),add);
+    }
+    private SessionMetadataEstimate sessionMetadataEstimate(SessionMetadataChange change,boolean saved,DistributedCommand candidate) throws RocksDBException {
+        long current=minimumSessionEpoch(null),minimum=Math.max(current,change.minimumEpoch());
+        int reserved=sourceSessionMetadataPromises(minimum,null,null);
+        if(change.additional()){var key=sessionFloorKey(candidate.operationId());for(var credit:sourceOutcomeCredits.values()){var original=credit.request().original();if(original.acknowledgedThrough()>=0 && original.operationId().epoch()>=minimum && Arrays.equals(key,sessionFloorKey(original.operationId()))){reserved--;break;}}}
+        return new SessionMetadataEstimate(applied,sessionAckCount,reserved,sessionAckLimit,sessionAckCount+(change.additional()?1:0)-change.count(),change.additional()?1:0,saved);
+    }
+    public SessionMetadataEstimate estimateSessionMetadata(DistributedCommand command) throws RocksDBException {
+        Objects.requireNonNull(command);enterNative();applyLane.lock();try {
+            validateCommand(command,false);if(sessionAckEpochs==null)validateSessionMetadata(null);boolean saved=db.get(receipts,receiptKey(command.operationId()))!=null;
+            long minimum=minimumSessionEpoch(null);var id=command.operationId();long floor=id.epoch()<minimum ? -1 : acknowledgedThrough(id,null);
+            boolean eligible=!saved && id.epoch()>=minimum && id.sequence()>floor;
+            if(eligible){var authority=sessionAuthority();var status=expiredHomeRegistration(command) ? CommandResult.Status.SESSION_EXPIRED : sessionDecision(command,floor,authority);eligible=status==CommandResult.Status.SUCCESS || status==CommandResult.Status.SESSION_EXPIRED && expiredBoundOutcome(command,floor,authority);}
+            var change=eligible ? sessionMetadataChange(command,command.minimumSessionEpoch(),command.acknowledgedThrough()) : new SessionMetadataChange(sessionAckCount,-1,0,false);
+            return sessionMetadataEstimate(change,saved,command);
+        }finally {applyLane.unlock();leaveNative();}
+    }
+    /** Protected publication promise estimate: no original USER read or old-grant revalidation. */
+    public SessionMetadataEstimate estimateSourceSessionMetadata(NativeSourceOutcomeCredit.Request request) throws RocksDBException {
+        Objects.requireNonNull(request);enterNative();applyLane.lock();try {
+            requireSourceOutcomeRequest(request);if(sessionAckEpochs==null)validateSessionMetadata(null);var original=request.original();var id=original.operationId();
+            boolean saved=sourceOutcomeCredits.containsKey(id) || sourceOutcomePublications.containsKey(id);
+            var change=!saved && !sourceOperationFenced(id) ? sessionMetadataChange(original,-1,original.acknowledgedThrough()) : new SessionMetadataChange(sessionAckCount,-1,0,false);
+            return sessionMetadataEstimate(change,saved,original);
+        }finally {applyLane.unlock();leaveNative();}
+    }
+    private int sourceSessionMetadataPromises(long minimum,OperationId consuming,DistributedCommand additional) throws RocksDBException {
+        var keys=new java.util.HashSet<String>();
+        for(var credit:sourceOutcomeCredits.values()){var original=credit.request().original();if(consuming!=null && consuming.equals(original.operationId()))continue;var id=original.operationId();if(original.acknowledgedThrough()>=0 && id.epoch()>=minimum && db.get(state,sessionFloorKey(id))==null)keys.add(java.util.HexFormat.of().formatHex(sessionFloorKey(id)));}
+        if(additional!=null){var id=additional.operationId();if(additional.acknowledgedThrough()>=0 && id.epoch()>=minimum && db.get(state,sessionFloorKey(id))==null)keys.add(java.util.HexFormat.of().formatHex(sessionFloorKey(id)));}return keys.size();
+    }
+    private void publishSessionMetadata(SessionMetadataChange change){if(change==null)return;if(change.minimumEpoch()>=0)sessionAckEpochs.headMap(change.minimumEpoch(),false).clear();if(change.additional())sessionAckEpochs.merge(change.newEpoch(),1,Integer::sum);sessionAckCount=change.count();}
+    private byte[] sessionFloorPrefix(){return ByteBuffer.allocate(17).put(markerKey).put((byte)2).array();}
+    private byte[] sessionFloorEpoch(long epoch){return ByteBuffer.allocate(25).put(sessionFloorPrefix()).putLong(epoch).array();}
+    private byte[] receiptEpoch(long epoch){return ByteBuffer.allocate(24).put(markerKey).putLong(epoch).array();}
     private byte[] epochFloorKey() { return ByteBuffer.allocate(17).put(uuidBytes(groupId)).put((byte) 3).array(); }
     private long minimumSessionEpoch(ReadOptions options) throws RocksDBException {
         byte[] value = options == null ? db.get(state, epochFloorKey()) : db.get(state, options, epochFloorKey());
@@ -5161,7 +5235,7 @@ public final class ReplicatedRangeStore {
         return new CommandResult(CommandResult.Status.SESSION_EXPIRED, List.of()).encode();
     }
     private byte[] sessionFloorKey(OperationId id) {
-        return ByteBuffer.allocate(41).put(uuidBytes(groupId)).put((byte) 2).put(uuidBytes(id.sessionId())).putLong(id.epoch()).array();
+        return ByteBuffer.allocate(41).put(uuidBytes(groupId)).put((byte) 2).putLong(id.epoch()).put(uuidBytes(id.sessionId())).array();
     }
     private long acknowledgedThrough(OperationId id, ReadOptions options) throws RocksDBException {
         byte[] value = options == null ? db.get(state, sessionFloorKey(id)) : db.get(state, options, sessionFloorKey(id));
@@ -5175,8 +5249,7 @@ public final class ReplicatedRangeStore {
     }
 
     private byte[] receiptKey(OperationId id) {
-        return ByteBuffer.allocate(48).put(uuidBytes(groupId)).put(uuidBytes(id.sessionId()))
-                .putLong(id.epoch()).putLong(id.sequence()).array();
+        return ByteBuffer.allocate(48).put(uuidBytes(groupId)).putLong(id.epoch()).put(uuidBytes(id.sessionId())).putLong(id.sequence()).array();
     }
     private static byte[] uuidBytes(UUID id) {
         return ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();

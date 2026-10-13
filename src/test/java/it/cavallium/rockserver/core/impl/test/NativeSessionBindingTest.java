@@ -106,6 +106,24 @@ class NativeSessionBindingTest {
             assertEquals(CommandResult.Status.SUCCESS,target.apply(put(USER,1,0,-1)));
         }
     }
+    @Test void epochGcPhysicallyDeletesExpiredNamespacesAndReceipts() throws Exception {
+        try(var f=new Fixture(root)) {
+            f.store.enableSessionControls();var ledger=SessionEpochLedger.initial(CLUSTER,DB,0);
+            for(int n=0;n<16;n++) {
+                ledger=ledger.issue(new UUID(0,1000+n),ledger.logicalTimeMillis()+1);long epoch=ledger.grants().getLast().epoch();var issuer=new UUID(0,2000+n);
+                assertEquals(CommandResult.Status.SUCCESS,f.apply(control(new OperationId(issuer,epoch,0),RangeSessionControl.advance(ledger))));
+                assertEquals(CommandResult.Status.SUCCESS,f.apply(DistributedCommand.sessionControl(GROUP,1,new byte[32],new OperationId(issuer,epoch,1),RangeSessionControl.advance(ledger),0)));
+                ledger=ledger.advanceTime(ledger.logicalTimeMillis()+1);
+                assertEquals(CommandResult.Status.SUCCESS,f.apply(control(new OperationId(ADMIN,ledger.nextEpoch(),n),RangeSessionControl.advance(ledger))));
+                assertTrue(f.store.receiptUsage().retainedCount()<=2);
+            }
+            int acknowledgements=0,receipts=0;
+            try(var iterator=f.db.newIterator(f.state())){for(iterator.seekToFirst();iterator.isValid();iterator.next()){byte[] key=iterator.key();if(key.length==41 && key[16]==2)acknowledgements++;}iterator.status();}
+            try(var iterator=f.db.newIterator(f.handles.get(3))){for(iterator.seekToFirst();iterator.isValid();iterator.next())receipts++;iterator.status();}
+            assertEquals(0,acknowledgements);assertEquals(f.store.receiptUsage().retainedCount(),receipts);assertTrue(receipts<=2);
+        }
+    }
+
     static final class Fixture implements AutoCloseable {
         final DBOptions options=new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
         final ColumnFamilyOptions cfOptions=new ColumnFamilyOptions(); final List<ColumnFamilyHandle> handles=new ArrayList<>();

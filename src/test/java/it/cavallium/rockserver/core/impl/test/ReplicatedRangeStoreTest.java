@@ -641,9 +641,9 @@ class ReplicatedRangeStoreTest {
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(oldCut.operationResult(ack.operationId(),ack.payloadDigest())).status());
                 Path before = path.resolve("before-clean.image"), after = path.resolve("after-clean.image");
                 try (var pin = pool.store.capture()) { it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.write(before,pin,pin.interval(),limits); }
-                assertThrows(IllegalArgumentException.class,() -> pool.store.reclaimExpiredSessions(null,1,52));
-                var page = pool.store.reclaimExpiredSessions(null,1,53);
-                assertEquals(1,page.examined()); assertEquals(1,page.deleted()); assertEquals(53,page.scannedBytes());
+                assertThrows(IllegalArgumentException.class,() -> pool.store.reclaimExpiredSessions(null,1,91));
+                var page = pool.store.reclaimExpiredSessions(null,1,92);
+                assertEquals(1,page.examined()); assertEquals(0,page.deleted()); assertEquals(92,page.scannedBytes());
                 assertNotNull(page.continuation());
                 int scanned = page.examined(), deleted = page.deleted(), pages = 1;
                 while (page.continuation()!=null) {
@@ -651,7 +651,7 @@ class ReplicatedRangeStoreTest {
                     assertTrue(page.examined()<=1); scanned+=page.examined(); deleted+=page.deleted();
                     assertTrue(++pages<10);
                 }
-                assertEquals(4,scanned); assertEquals(2,deleted);
+                assertEquals(2,scanned); assertEquals(0,deleted);
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(oldCut.operationResult(ack.operationId(),ack.payloadDigest())).status(),
                         "Pre-fence native pin retains the physically collected receipt");
                 assertEquals(new ApplyPosition(1,3),pool.store.applied());
@@ -699,7 +699,8 @@ class ReplicatedRangeStoreTest {
             while (page.continuation()!=null) page = pool.store.reclaimExpiredSessions(page.continuation(),1,1024);
             assertEquals(2,page.minimumEpoch());
             var later = pool.store.reclaimExpiredSessions(null,4096,8*1024*1024);
-            assertEquals(3,later.minimumEpoch()); assertEquals(1,later.deleted());
+            assertEquals(3,later.minimumEpoch()); assertEquals(0,later.deleted());
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,status(pool.store,epoch2),"Committed epoch floor already physically reclaimed the receipt");
             pool.store.fence(); pool.store.installSnapshot(oldImage,limits); pool.store.activate();
             assertThrows(IllegalArgumentException.class,() -> pool.store.reclaimExpiredSessions(stale,1,1024));
             assertEquals(CommandResult.Status.SUCCESS,status(pool.store,epoch2));

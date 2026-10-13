@@ -857,7 +857,12 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
 
     /** Configure once, before opening any range. Every native snapshot in this pool shares the guard. */
-    public void configureSnapshotAdmission(PoolSnapshotAdmission.Limits limits) {
+    /** Bounded durable group inventory, including virgin births and retained inactive metadata. */
+    public Set<UUID> persistedRangeGroups(int maximum) throws RocksDBException {
+        if(maximum<1 || maximum>65536)throw new IllegalArgumentException("Invalid native group inventory ceiling");nativeMutation.acquireUninterruptibly();handleLifetime.readLock().lock();try{synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}var groups=new HashSet<UUID>();for(var entry:ownershipHistory){groups.add(entry.owner().groupId());if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");}try(var iterator=loaded.db().get().newIterator(handles.get(STATE_COLUMN))){iterator.seekToFirst();while(iterator.isValid()){var key=iterator.key();if(key.length<17){iterator.next();continue;}var input=java.nio.ByteBuffer.wrap(key);groups.add(new UUID(input.getLong(),input.getLong()));if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");var next=Arrays.copyOf(key,16);int index=15;while(index>=0 && (next[index]&255)==255){next[index]=0;index--;}if(index<0)break;next[index]++;iterator.seek(next);}iterator.status();}return Set.copyOf(groups);}finally{handleLifetime.readLock().unlock();nativeMutation.release();}
+    }
+    public void configureSnapshotAdmission(PoolSnapshotAdmission.Limits limits) {configureSnapshotAdmission(limits,null);}
+    public void configureSnapshotAdmission(PoolSnapshotAdmission.Limits limits,PoolSnapshotAdmission.Shared shared) {
         Objects.requireNonNull(limits);
         nativeMutation.acquireUninterruptibly();
         try {
@@ -880,7 +885,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             }
             storageVolumes = List.copyOf(volumes);
             pressureColumns = List.copyOf(handles.values());
-            snapshotAdmission = new PoolSnapshotAdmission(limits, this::sampleSnapshotPressure, System::nanoTime);
+            snapshotAdmission = new PoolSnapshotAdmission(limits, this::sampleSnapshotPressure, System::nanoTime,shared);
         } finally { nativeMutation.release(); }
     }
 

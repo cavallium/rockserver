@@ -158,7 +158,7 @@ public final class NativeRangeImage {
                 if(originBytes!=null && !originWritten[0]) append.accept(Section.STATE,null,originKey,originBytes);
                 pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
                 tracker.finish();
-                try { pin.validateCatalogueHistoryImage(); pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
+                try { pin.validateSessionMetadataImage(); pin.validateCatalogueHistoryImage(); pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
                 pin.validateSnapshotHomeImage(); }
                 catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("HOME image user/promise/recovery proof differs",invalid); }
                 output.writeByte(0);
@@ -255,6 +255,7 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && (key[16]==0x40 || key[16]==0x41) && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES+(key[16]==0x41 ? 24 : 0)))throw new IOException("Import birth/intent exceeds native metadata bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x78 && (key.length!=17 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.STATE_BYTES))throw new IOException("Invalid catalogue history state length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x79 && (key.length!=49 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.CREDIT_BYTES))throw new IOException("Invalid catalogue history credit length");
+                if(section==Section.STATE && key.length>16 && key[16]==0x15 && (key.length!=17 || valueLength!=8))throw new IOException("Invalid ACK namespace count length");
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
@@ -412,6 +413,9 @@ public final class NativeRangeImage {
         private UUID previousColumn;
         private byte[] previousKey;
         private long count;
+        private long acknowledgementNamespaces;
+        private long minimumAcknowledgementEpoch=Long.MAX_VALUE;
+        private Long acknowledgementNamespaceCount;
         private boolean marker;
         private boolean usagePresent;
         private SessionAuthority sessionAuthority;
@@ -734,11 +738,11 @@ public final class NativeRangeImage {
                 }
                 if (section == Section.RECEIPTS) {
                     if (key.length != 48 || value.length < 36 || value.length > 36 + 2 * 1024 * 1024
-                            || ByteBuffer.wrap(value).getInt() != 1 || ByteBuffer.wrap(key, 32, 8).getLong() < epochFloor
+                            || ByteBuffer.wrap(value).getInt() != 1 || ByteBuffer.wrap(key, 16, 8).getLong() < epochFloor
                             || ByteBuffer.wrap(key, 40, 8).getLong() < 0) {
                         throw new IOException("Invalid image receipt row");
                     }
-                    var receipt=ByteBuffer.wrap(key); receipt.position(16); var id=new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(receipt.getLong(),receipt.getLong()),receipt.getLong(),receipt.getLong());
+                    var receipt=ByteBuffer.wrap(key); receipt.position(16);long receiptEpoch=receipt.getLong();var id=new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(receipt.getLong(),receipt.getLong()),receiptEpoch,receipt.getLong());
                     for (var commit:committed.values()) if (commit.ownsOperation(id)) throw new IOException("COMMIT image identity also has ordinary receipt");
                     for (var abort:aborted.values()) if (abort.ownsOperation(id)) throw new IOException("ABORT image identity also has ordinary receipt");
                     for (var record:rejected.values()) if (record.ownsOperation(id)) throw new IOException("Rejected image identity also has ordinary receipt");
@@ -752,10 +756,12 @@ public final class NativeRangeImage {
                     var epochValue = ByteBuffer.wrap(value);
                     if (epochValue.getInt() != 1 || (epochFloor = epochValue.getLong()) < 0) throw new IOException("Invalid image epoch floor");
                 }
+                if(section==Section.STATE && key.length>16 && key[16]==0x15){if(key.length!=17 || value.length!=8 || acknowledgementNamespaceCount!=null)throw new IOException("Invalid image ACK namespace count");acknowledgementNamespaceCount=ByteBuffer.wrap(value).getLong();}
                 if (section == Section.STATE && key.length > 16 && key[16] == 2) {
-                    if (key.length != 41 || value.length != 12 || ByteBuffer.wrap(key, 33, 8).getLong() < 0) {
+                    if (++acknowledgementNamespaces>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES || key.length != 41 || value.length != 12 || ByteBuffer.wrap(key, 17, 8).getLong() < 0) {
                         throw new IOException("Invalid image session floor shape");
                     }
+                    minimumAcknowledgementEpoch=Math.min(minimumAcknowledgementEpoch,ByteBuffer.wrap(key,17,8).getLong());
                     var floorValue = ByteBuffer.wrap(value);
                     if (floorValue.getInt() != 1) throw new IOException("Unsupported image session floor version");
                     long floor = floorValue.getLong();
@@ -834,6 +840,7 @@ public final class NativeRangeImage {
         }
 
         void finish() throws IOException {
+            if(minimumAcknowledgementEpoch<epochFloor || (acknowledgementNamespaceCount==null ? acknowledgementNamespaces!=0 : acknowledgementNamespaceCount!=acknowledgementNamespaces))throw new IOException("Image ACK namespace count or epoch differs from inventory");
             if(topologyFreeze!=null && (schemaFence!=null || prepared.stream().anyMatch(p -> !committed.containsKey(p.preparation().transactionId()) && !aborted.containsKey(p.preparation().transactionId())) || gates.values().stream().anyMatch(SnapshotGate::active))) throw new IOException("Frozen topology image contains unresolved native work");
             try { cdc.finish(header.owner(),header.position()); cdc.requireAuthorityClock(sessionAuthority==null ? -1 : sessionAuthority.logicalTimeMillis()); }
             catch(IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Invalid CDC image retention",invalid); }
