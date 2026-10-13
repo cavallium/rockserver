@@ -160,9 +160,9 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
                 }
                 if(!export.snapshot().sourceCleanup().isEmpty()){
                     UUID group=export.snapshot().sourceCleanup().iterator().next();await(b.chunks().release(RatisExportJournal.sourceDefinition(export.snapshot(),group),context));
-                    b.journal().releaseCapture(group);export.sourceReleased(group);return;
+                    export.sourceReleased(group);return;
                 }
-                settleExport(export,b);
+                // All local copies are durable; public pins remain owned until the whole global graph is complete.
             }
         }
         var seen=new HashSet<String>();for(var d:journal.definition().domains())for(var c:d.schema().columns())if(c.operator()!=null && seen.add(HexFormat.of().formatHex(c.operator().artifactSha256()))) {
@@ -198,6 +198,7 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
     }
     private void completeArchive(DatabaseBackupManifest manifest)throws IOException {try{archive.complete(manifest);}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Archive native qualification failed",invalid);}}
     private boolean cleanupPending()throws IOException {
+        if(!cohortsDrained)return true;
         for(var b:ordered()){
             if(b.journal().snapshot().participants().stream().anyMatch(p->!p.captureReleased() && !p.captureReleaseLost()))return true;
             if(Files.exists(b.exportPath(),LinkOption.NOFOLLOW_LINKS))try(var export=RatisExportJournal.reopen(b.exportPath())){if(!export.snapshot().sourceCleanup().isEmpty() || export.snapshot().phase()!=RatisExportJournal.Phase.RELEASED || !export.snapshot().artifactsReclaimed())return true;}
@@ -205,12 +206,17 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
     }
     /** Archive publication is independent of pins; resource completion still requires this actual cleanup drain. */
     private void cleanupSources(RequestContext context)throws IOException {
+        // Finish every remote writer before closing any aliases of a shared native pool cohort.
         for(var b:ordered())if(Files.exists(b.exportPath(),LinkOption.NOFOLLOW_LINKS))try(var export=RatisExportJournal.reopen(b.exportPath())){
-            if(!export.snapshot().sourceCleanup().isEmpty())b.chunks().bind(export.snapshot());
             if(!export.snapshot().sourceCleanup().isEmpty()){
-                UUID group=export.snapshot().sourceCleanup().iterator().next();await(b.chunks().release(RatisExportJournal.sourceDefinition(export.snapshot(),group),context));b.journal().releaseCapture(group);export.sourceReleased(group);return;
+                b.chunks().bind(export.snapshot());UUID group=export.snapshot().sourceCleanup().iterator().next();
+                await(b.chunks().release(RatisExportJournal.sourceDefinition(export.snapshot(),group),context));export.sourceReleased(group);return;
             }
-            settleExport(export,b);
+        }
+        if(!cohortsDrained){for(var request:journal.snapshot().requests())transport.cancelAndDrain(request);cohortsDrained=true;}
+        for(var b:ordered()){
+            for(var p:b.journal().snapshot().participants())if(p.captureToken()!=null && !p.captureReleased() && !p.captureReleaseLost()){b.journal().releaseCapture(p.route().groupId());return;}
+            if(Files.exists(b.exportPath(),LinkOption.NOFOLLOW_LINKS))try(var export=RatisExportJournal.reopen(b.exportPath())){settleExport(export,b);}
         }
     }
     private boolean copy(RatisExportJournal export,Binding binding,RatisExportJournal.Chunk chunk)throws IOException{

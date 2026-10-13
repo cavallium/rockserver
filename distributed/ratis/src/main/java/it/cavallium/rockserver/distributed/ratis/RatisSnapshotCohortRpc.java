@@ -8,7 +8,7 @@ import java.util.*;
 
 /** Current owner-directed cohort protocol; identities describe the actual open process and pool. */
 public final class RatisSnapshotCohortRpc {
-    public static final int OWNER=110,CAPTURE=111,STATE=112,CANCEL=113,MAX_MEMBERS=1024,MAX_REQUEST_BYTES=16*1024*1024,MAX_REPLY_BYTES=256*1024,MAX_CAPABILITIES_BYTES=177;
+    public static final int OWNER=112,CAPTURE=113,STATE=114,CANCEL=115,MAX_MEMBERS=1024,MAX_REQUEST_BYTES=16*1024*1024,MAX_REPLY_BYTES=256*1024,MAX_CAPABILITIES_BYTES=177;
     public record Capabilities(UUID nodeId,UUID nodeIncarnation,UUID processIncarnation,UUID poolId,int maximumCohorts,int currentCohorts,long maximumMetadataBytes,long metadataBytes,
             int registryMaximumEntries,int registryEntries,long registryMaximumBytes,long registryBytes,long maximumReadonlyMillis,int poolMaximumPins,int poolPins,long poolMaximumBytes,long poolBytes,long poolMaximumAgeMillis,long poolNextEstimatedBytes,long poolFreeBytes,long poolMinimumFreeBytes) {
         public Capabilities {Objects.requireNonNull(nodeId);Objects.requireNonNull(nodeIncarnation);Objects.requireNonNull(processIncarnation);Objects.requireNonNull(poolId);if(maximumCohorts<1 || currentCohorts<0 || currentCohorts>maximumCohorts || maximumMetadataBytes<1 || metadataBytes<0 || metadataBytes>maximumMetadataBytes || registryMaximumEntries<1 || registryEntries<0 || registryEntries>registryMaximumEntries || registryMaximumBytes<1 || registryBytes<0 || registryBytes>registryMaximumBytes || maximumReadonlyMillis<1 || maximumReadonlyMillis>RatisSnapshotCaptureRequest.maximumTtl(RatisSnapshotCaptureRequest.Mode.READ_ONLY).toMillis() || poolMaximumPins<1 || poolPins<0 || poolMaximumBytes<1 || poolBytes<0 || poolMaximumAgeMillis<1 || poolNextEstimatedBytes<0 || poolFreeBytes<0 || poolMinimumFreeBytes<0)throw new IllegalArgumentException("Invalid actual cohort capabilities");}
@@ -20,7 +20,7 @@ public final class RatisSnapshotCohortRpc {
         public Reference {Objects.requireNonNull(cohortId);Objects.requireNonNull(nodeIncarnation);Objects.requireNonNull(processIncarnation);Objects.requireNonNull(poolId);if(digest.length!=32)throw new IllegalArgumentException("Invalid cohort reference");digest=digest.clone();}
         @Override public byte[] digest(){return digest.clone();}
     }
-    public enum Phase { PENDING, CAPTURED, LOST, DRAINING, RELEASED }
+    public enum Phase { PENDING, CAPTURED, LOST, DRAINING, RELEASED, GONE }
     public record Reply(Reference reference,Phase phase,Map<UUID,RatisSnapshotCaptureRequest.Result> captures) {
         public Reply {Objects.requireNonNull(reference);Objects.requireNonNull(phase);captures=Map.copyOf(captures);if(captures.size()>MAX_MEMBERS || phase!=Phase.CAPTURED && !captures.isEmpty())throw new IllegalArgumentException("Invalid cohort result vector");}
     }

@@ -18,6 +18,8 @@ public final class RatisSnapshotCohortService implements AutoCloseable {
     public interface Host {
         UUID nodeId();UUID nodeIncarnation();UUID processIncarnation();UUID poolId();DistributedStoragePool pool();PoolSnapshotAdmission.Limits poolLimits();
         Member member(UUID group,SnapshotFence fence,boolean ready)throws Exception;
+        /** Authoritative proof that the exact old process/pool has no retained native resources; absence is insufficient. */
+        boolean originalGone(Reference original)throws Exception;
     }
     private static final class Owned {final Member member;final RatisSnapshotPins.ExternalReservation reservation;Owned(Member member,RatisSnapshotPins.ExternalReservation reservation){this.member=member;this.reservation=reservation;}}
     private static final class Entry {final Request request;final Reference reference;final long bytes,opened;final List<Owned> owned=new ArrayList<>();Map<UUID,RatisSnapshotCaptureRequest.Result> results=Map.of();DistributedStoragePool.SnapshotCohort cohort;int readers;boolean busy=true,started,cancelled,lost,released,cleaning;Entry(Request request,long bytes,long opened){this.request=request;reference=reference(request);this.bytes=bytes;this.opened=opened;}}
@@ -34,7 +36,7 @@ public final class RatisSnapshotCohortService implements AutoCloseable {
     private void process(Reference reference)throws IOException {if(!reference.nodeIncarnation().equals(host.nodeIncarnation()) || !reference.processIncarnation().equals(host.processIncarnation()) || !reference.poolId().equals(host.poolId()))throw new RatisSnapshotLostException("Original cohort process/pool no longer exists");}
     private Entry existing(Reference reference)throws IOException {process(reference);var entry=entries.get(reference.cohortId());if(entry==null)throw new RatisSnapshotLostException("Original cohort is not retained");if(!Arrays.equals(reference(reference),reference(entry.reference)))throw new IOException("Cohort identity changed original request");return entry;}
     public Reply capture(Request request)throws Exception {
-        byte[] encoded=request(request);var reference=reference(request);process(reference);final Entry entry;
+        byte[] encoded=request(request);var reference=reference(request);if(originalGone(reference))return new Reply(reference,Phase.GONE,Map.of());process(reference);final Entry entry;
         synchronized(this){var old=released.get(reference.cohortId());if(old!=null){if(!Arrays.equals(reference(old),reference(reference)))throw new IOException("Released cohort request changed");return new Reply(reference,Phase.RELEASED,Map.of());}var previous=entries.get(reference.cohortId());if(previous!=null){entry=existing(reference);if(entry.busy)return new Reply(reference,Phase.PENDING,Map.of());}else{if(stopping)throw new IOException("Cohort service stopping");long bytes=4L*encoded.length+256L*request.cohort().members().size();if(entries.size()>=limits.cohorts || entries.size()+released.size()>=1024 || bytes>limits.metadataBytes-metadataBytes-actionBytes)throw new IOException("Cohort metadata admission exhausted");entry=new Entry(request,bytes,nanos.getAsLong());entries.put(reference.cohortId(),entry);metadataBytes+=bytes;}}
         if(!entry.owned.isEmpty() || entry.started || entry.lost || entry.cancelled || entry.released)return live(entry);
         Throwable failure=null;try {
@@ -57,8 +59,11 @@ public final class RatisSnapshotCohortService implements AutoCloseable {
         finally{boolean cleanup;synchronized(this){entry.readers--;cleanup=entry.cancelled;}if(cleanup)cleanup(entry);}
     }
     private boolean expired(Entry entry){long duration=entry.request.cohort().members().stream().mapToLong(RatisDatabaseBackupJournal.Member::ttlMillis).min().orElseThrow()*1_000_000L;return nanos.getAsLong()-entry.opened>=duration;}
-    public Reply state(Reference reference)throws Exception {final Entry entry;synchronized(this){if(released.containsKey(reference.cohortId()))return released(reference);entry=existing(reference);}return live(entry);}
-    public Reply cancel(Reference reference)throws Exception {final Entry entry;synchronized(this){if(released.containsKey(reference.cohortId()))return released(reference);entry=existing(reference);entry.cancelled=true;if(entry.busy)return new Reply(reference,Phase.DRAINING,Map.of());}cleanup(entry);return new Reply(reference,entry.released?Phase.RELEASED:Phase.DRAINING,Map.of());}
+    private boolean originalGone(Reference reference)throws Exception {return reference.nodeIncarnation().equals(host.nodeIncarnation()) && host.originalGone(reference);}
+    public Reply state(Reference reference)throws Exception {if(originalGone(reference))return new Reply(reference,Phase.GONE,Map.of());final Entry entry;synchronized(this){if(released.containsKey(reference.cohortId()))return released(reference);entry=existing(reference);}return live(entry);}
+    public Reply cancel(Reference reference)throws Exception {
+        if(originalGone(reference))return new Reply(reference,Phase.GONE,Map.of());
+        final Entry entry;synchronized(this){if(released.containsKey(reference.cohortId()))return released(reference);entry=existing(reference);entry.cancelled=true;if(entry.busy)return new Reply(reference,Phase.DRAINING,Map.of());}cleanup(entry);return new Reply(reference,entry.released?Phase.RELEASED:Phase.DRAINING,Map.of());}
     private Reply released(Reference reference)throws IOException {process(reference);if(!Arrays.equals(reference(reference),reference(released.get(reference.cohortId()))))throw new IOException("Released cohort identity changed");return new Reply(reference,Phase.RELEASED,Map.of());}
     private void cleanup(Entry entry)throws Exception {
         synchronized(this){if(entry.busy || entry.readers!=0 || entry.cleaning)return;entry.cleaning=true;}try {for(var owned:entry.owned)if(!owned.member.registry.externalSettled(owned.reservation))owned.member.registry.cancelExternal(owned.reservation);

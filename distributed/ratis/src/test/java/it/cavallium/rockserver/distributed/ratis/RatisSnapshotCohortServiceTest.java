@@ -36,6 +36,7 @@ class RatisSnapshotCohortServiceTest {
             var cfg=store.configuration();return new RatisSnapshotCohortService.Member(store,nativeState.registries.get(index),new RatisSnapshotOwner(group,1,new byte[32],nativeState.request(index).owner(),"peer-"+index,null),new ReplicaDescriptor(node,incarnation,new UUID(861,index),"peer-"+index,"127.0.0.1:"+(18000+index),ReplicaDescriptor.Role.VOTER),changeAfterCapture && read>2?2:1,1,hash(cfg.data()),new ApplyPosition(1,2));
         }
         Request request(){var members=new ArrayList<RatisDatabaseBackupJournal.Member>();var captures=new HashMap<UUID,RatisSnapshotCaptureRequest>();for(int n=0;n<2;n++){var request=nativeState.request(n);var group=nativeState.stores.get(n).ownership().owner().groupId();members.add(new RatisDatabaseBackupJournal.Member(request.fence().fenceId(),group,request.snapshotId(),request.owner(),new UUID(861,n),request.ttl().toMillis(),hash(ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_CAPTURE,request.encode()))));captures.put(group,request);}return new Request(new RatisDatabaseBackupJournal.CohortRequest(new UUID(862,1),incarnation,process,poolIdentity,members),captures);}
+        public boolean originalGone(Reference original){return false;}
         public void close()throws Exception {try{service.close();}finally{scheduler.dispose();nativeState.close();}}
     }
     @Test void dictionaryRoundTripOneNativeCutExactRetryAndIndependentCancel()throws Exception {

@@ -292,6 +292,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
         snapshotCohorts=new RatisSnapshotCohortService(new RatisSnapshotCohortService.Host(){
             public UUID nodeId(){return plan.nodeId();}public UUID nodeIncarnation(){return plan.nodeIncarnation();}public UUID processIncarnation(){return snapshotProcessIncarnation;}public UUID poolId(){return snapshotPoolId;}
             public DistributedStoragePool pool(){return pool;}public PoolSnapshotAdmission.Limits poolLimits(){return settings.exports().pins();}
+            public boolean originalGone(RatisSnapshotCohortRpc.Reference reference)throws IOException{
+                synchronized(RatisNodeRuntime.this){
+                    if(!reference.nodeIncarnation().equals(plan.nodeIncarnation()) || reference.processIncarnation().equals(snapshotProcessIncarnation) || !started || closeRequested || closing || closed || lock==null || !lock.isValid() || lockChannel==null || !lockChannel.isOpen())return false;
+                    // This incarnation has one established root. Its prior owner must drain native resources before surrendering this lock, or exit the process.
+                    return identityExposed(SessionJournalFiles.read(root.resolve("node.identity"),128));
+                }
+            }
             public RatisSnapshotCohortService.Member member(UUID group,SnapshotFence fence,boolean ready)throws Exception{
                 synchronized(RatisNodeRuntime.this){if(!started || closeRequested || closing || closed)throw new IOException("Cohort node owner unavailable");}
                 var entry=groups.require(group);var machine=machines.get(RaftGroupId.valueOf(group));if(entry.role()!=RatisNodePlan.Role.DATA || entry.retired() || machine==null || stores.get(group)==null)throw new IOException("Cohort has no actual local DATA owner");

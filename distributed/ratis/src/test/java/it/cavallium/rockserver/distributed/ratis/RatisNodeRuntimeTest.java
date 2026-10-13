@@ -39,6 +39,25 @@ class RatisNodeRuntimeTest {
         }
         return bytes.toByteArray();
     }
+    @Test void exclusiveRecoveredRootAttestsOnlyPreviousProcessCohortsGone()throws Exception{
+        try(var env=new Env(root)){
+            UUID process,pool;var first=new FakeServer();
+            try(var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first)){
+                node.start();var processField=RatisNodeRuntime.class.getDeclaredField("snapshotProcessIncarnation");processField.setAccessible(true);process=(UUID)processField.get(node);var poolField=RatisNodeRuntime.class.getDeclaredField("snapshotPoolId");poolField.setAccessible(true);pool=(UUID)poolField.get(node);
+            }
+            var old=new RatisSnapshotCohortRpc.Reference(UUID.randomUUID(),env.plan.nodeIncarnation(),process,pool,new byte[32]);var second=new FakeServer();
+            try(var node=env.open(RatisNodeRuntime.Startup.RECOVER,second)){
+                var field=RatisNodeRuntime.class.getDeclaredField("snapshotCohorts");field.setAccessible(true);var service=(RatisSnapshotCohortService)field.get(node);
+                assertThrows(RatisSnapshotLostException.class,()->service.cancel(old));node.start();assertEquals(RatisSnapshotCohortRpc.Phase.GONE,service.cancel(old).phase());
+                var processField=RatisNodeRuntime.class.getDeclaredField("snapshotProcessIncarnation");processField.setAccessible(true);UUID current=(UUID)processField.get(node);
+                var missing=new RatisSnapshotCohortRpc.Reference(old.cohortId(),env.plan.nodeIncarnation(),current,UUID.randomUUID(),old.digest());assertThrows(RatisSnapshotLostException.class,()->service.cancel(missing));
+                var foreign=new RatisSnapshotCohortRpc.Reference(old.cohortId(),UUID.randomUUID(),old.processIncarnation(),old.poolId(),old.digest());assertThrows(RatisSnapshotLostException.class,()->service.cancel(foreign));
+                var storeField=RatisRangeStateMachine.class.getDeclaredField("store");storeField.setAccessible(true);var machine=second.machines.get(RaftGroupId.valueOf(env.plan.domains().getFirst().directory().ranges().getFirst().groupId()));var store=(ReplicatedRangeStore)storeField.get(machine);
+                try(var pin=store.capture()){assertThrows(IOException.class,node::close);assertThrows(IOException.class,()->env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));assertThrows(RatisSnapshotLostException.class,()->service.cancel(old));}
+                node.close();
+            }
+        }
+    }
     @Test void qualifiedOperatorBootstrapAndReopenRetainExactArtifactAndMergeResults() throws Exception {
         byte[] artifact=appendArtifact();
         var operator=new DistributedSchema.Operator("append",1,AppendOperator.class.getName(),java.security.MessageDigest.getInstance("SHA-256").digest(artifact),1,1,"pure-append",1);
