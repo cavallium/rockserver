@@ -11,7 +11,7 @@ class RatisCommittedApplyGroupCapacityTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     static RatisNodeRuntime.Settings limits(RatisNodeRuntime.Settings base,int nodeGroups,int poolGroups){
         var r=base.resources();var p=r.committedApply();var n=p.node();var b=p.pool();var policy=new RatisCommittedApplyDispatcher.Policy(new RatisCommittedApplyDispatcher.Limits(n.read(),n.ordinary(),n.protectedLane(),nodeGroups),new RatisCommittedApplyDispatcher.Limits(b.read(),b.ordinary(),b.protectedLane(),poolGroups));
-        return new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports(),new RatisNodeRuntime.ResourceLimits(r.node(),r.pool(),r.maximumSourceImageDiskBytes(),r.maximumDurableMetadataBytes(),r.maximumOperatorCacheBytes(),r.maximumNativeCacheBytes(),policy));
+        return new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports(),new RatisNodeRuntime.ResourceLimits(r.node(),r.pool(),r.maximumSourceImageDiskBytes(),r.maximumDurableMetadataBytes(),r.maximumOperatorCacheBytes(),r.maximumNativeCacheBytes(),policy,RatisDiskRunway.Policy.defaults()));
     }
     @Test void initialNodeAndPoolCeilingsRejectBeforeNodeOwnershipOrNativeOpen()throws Exception {
         for(boolean node:List.of(true,false))try(var env=new RatisNodeRuntimeTest.Env(root.resolve("initial-"+node))){

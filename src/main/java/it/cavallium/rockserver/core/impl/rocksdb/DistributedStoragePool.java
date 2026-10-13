@@ -1599,6 +1599,23 @@ public final class DistributedStoragePool implements AutoCloseable {
         try {localMaintenanceObserver.accept(column);return action.run(loaded.db().get(),handle,paths);}
         finally {handleLifetime.readLock().unlock();}
     }
+    /** Exact configured data/WAL/log paths; the caller groups their actual filesystems. No byte estimate. */
+    public List<Path> storagePaths()throws IOException {
+        handleLifetime.readLock().lock();try {
+            synchronized(admission){if(closing || closed)throw new IOException("Pool is closing");}
+            var paths=new java.util.LinkedHashSet<Path>(storageVolumes);paths.add(loaded.definitiveDbPath());
+            for(String configured:new String[]{loaded.dbOptions().walDir(),loaded.dbOptions().dbLogDir()})if(configured!=null && !configured.isEmpty())paths.add(Path.of(configured));
+            return paths.stream().map(path->path.toAbsolutePath().normalize()).toList();
+        }finally{handleLifetime.readLock().unlock();}
+    }
+    /** Flush all actual CFs, including metadata, while drop/close cannot invalidate the handles. WAL sync setting is unchanged. */
+    public void flushWholePool()throws RocksDBException,IOException {
+        List<ColumnFamilyHandle> retained;nativeMutation.acquireUninterruptibly();
+        try{synchronized(admission){if(closing || closed)throw new IOException("Pool is closing");}handleLifetime.readLock().lock();retained=List.copyOf(handles.values());}
+        finally{nativeMutation.release();}
+        try{localMaintenanceObserver.accept(maintenanceSession);try(var options=new org.rocksdb.FlushOptions().setWaitForFlush(true)){loaded.db().get().flush(options,retained);}}
+        finally{handleLifetime.readLock().unlock();}
+    }
     public void flushLocal(UUID session,UUID column) throws RocksDBException,IOException {
         localMaintenance(session,column,(db,handle,paths)->{try(var options=new org.rocksdb.FlushOptions().setWaitForFlush(true)){db.flush(options,handle);}return null;});
     }
@@ -1620,9 +1637,21 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     private static long checkedMaintenanceProperty(long value) throws IOException {if(value<0)throw new IOException("Unsigned physical table property exceeds signed range");return value;}
     public record LocalTableProperties(long files,long entries,long deletions,long mergeOperands,long dataBytes,long indexBytes,long filterBytes) {}
-    public LocalTableProperties tablePropertiesLocal(UUID session,UUID column,int maxFiles) throws RocksDBException,IOException {
-        if(maxFiles<1 || maxFiles>it.cavallium.rockserver.core.common.SstMaintenance.MAX_INPUT_FILES)throw new IllegalArgumentException("Invalid table inventory limit");
-        return localMaintenance(session,column,(db,handle,paths)->{var tables=db.getPropertiesOfAllTables(handle);if(tables.size()>maxFiles)throw new IOException("Physical table inventory exceeds maintenance limit");long entries=0,deletions=0,merges=0,data=0,index=0,filter=0;for(var table:tables.values()){entries=Math.addExact(entries,checkedMaintenanceProperty(table.getNumEntries()));deletions=Math.addExact(deletions,checkedMaintenanceProperty(table.getNumDeletions()));merges=Math.addExact(merges,checkedMaintenanceProperty(table.getNumMergeOperands()));data=Math.addExact(data,checkedMaintenanceProperty(table.getDataSize()));index=Math.addExact(index,checkedMaintenanceProperty(table.getIndexSize()));filter=Math.addExact(filter,checkedMaintenanceProperty(table.getFilterSize()));}return new LocalTableProperties(tables.size(),entries,deletions,merges,data,index,filter);});
+    // One native inspection graph per pool: caller-bounded inventory plus <=1MiB property-block scratch.
+    private final Semaphore tablePropertyInspection=new Semaphore(1);
+    public LocalTableProperties tablePropertiesLocal(UUID session,UUID column,int maxFiles,long maxBytes) throws RocksDBException,IOException {
+        if(maxFiles<1 || maxFiles>it.cavallium.rockserver.core.common.SstMaintenance.MAX_INPUT_FILES
+                || maxBytes<1 || maxBytes>it.cavallium.rockserver.core.common.SstMaintenance.MAX_METADATA_RESPONSE_BYTES)throw new IllegalArgumentException("Invalid table inventory limit");
+        if(!tablePropertyInspection.tryAcquire())throw new IOException("Physical table inspection is already active");
+        try {
+            return localMaintenance(session,column,(db,handle,paths)->{
+                // Native inventory admission precedes selected-file copies; property blocks are scanned serially.
+                var tables=db.getBoundedTableProperties(handle,maxFiles,maxBytes,1024*1024,4096,64*1024);
+                return new LocalTableProperties(checkedMaintenanceProperty(tables.files),checkedMaintenanceProperty(tables.numEntries),
+                        checkedMaintenanceProperty(tables.numDeletions),checkedMaintenanceProperty(tables.numMergeOperands),
+                        checkedMaintenanceProperty(tables.dataSize),checkedMaintenanceProperty(tables.indexSize),checkedMaintenanceProperty(tables.filterSize));
+            });
+        }finally{tablePropertyInspection.release();}
     }
 
     /** Export a caller-owned cut with this pool's exact column options; no schema lock spans file I/O. */

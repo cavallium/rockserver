@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
+import it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest;
 import it.cavallium.rockserver.core.common.distributed.RangeImportAdmission;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
@@ -21,6 +22,7 @@ import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit
 import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication;
 import it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool;
 import it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec;
+import it.cavallium.rockserver.core.common.distributed.RangeSessionControl;
 import it.cavallium.rockserver.core.common.distributed.HomeRecovery;
 import it.cavallium.rockserver.core.common.distributed.HomeIdentity;
 import it.cavallium.rockserver.core.common.distributed.HomeFenceProof;
@@ -90,7 +92,7 @@ import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Initial synchronous apply adapter; the pool owner drains Ratis before closing native handles. */
-public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.impl.LinearizableQueryStateMachine, org.apache.ratis.server.impl.CommittedApplyStateMachine {
+public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.impl.LinearizableQueryStateMachine, org.apache.ratis.server.impl.CommittedApplyStateMachine,org.apache.ratis.server.impl.LogResourceStateMachine {
     private RatisReferencedFiles referencedFiles;
     private static final org.apache.ratis.statemachine.StateMachine.DataApi NO_REFERENCED_DATA=new org.apache.ratis.statemachine.StateMachine.DataApi() {
         @Override public CompletableFuture<?> write(org.apache.ratis.proto.RaftProtos.LogEntryProto entry) {
@@ -1352,6 +1354,112 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (snapshotHomes!=null) throw new IllegalStateException("Snapshot home reader already configured"); snapshotHomes=java.util.Objects.requireNonNull(homes);
     }
 
+    private RatisLogResourceBudget logResources;
+    public void logResources(RatisLogResourceBudget resources){if(getLifeCycleState()!=LifeCycle.State.NEW || logResources!=null)throw new IllegalStateException("Log resources fixed before initialization");logResources=java.util.Objects.requireNonNull(resources);}
+    @Override public org.apache.ratis.server.impl.LogResourceStateMachine.Resources logResources(){return logResources;}
+    /** Structural completion classification only; native apply still proves the exact predecessor/authority. */
+    @Override public boolean isProtectedLogEntry(org.apache.ratis.proto.RaftProtos.LogEntryProto entry) throws IOException {
+        if(entry==null || !entry.hasStateMachineLogEntry() || entry.getSerializedSize()>NativeSstImportManifest.MAX_FILE_BYTES+4096L)return false;
+        var data=entry.getStateMachineLogEntry();
+        if(data.hasStateMachineEntry())return false; // External payloads are fresh bulk work.
+        var wire=data.getLogData();
+        var prefix=new byte[Math.min(wire.size(),DistributedCommandCodec.HEADER_BYTES)];
+        for(int i=0;i<prefix.length;i++)prefix[i]=wire.byteAt(i);
+        long maximum=protectedLogMaximum(wire,prefix);
+        if(maximum==0 || wire.size()>maximum)return false;
+        if(logResources==null)throw new IOException("Protected log classification requires physical resource admission");
+        // Encoded copy, nested decoder clones/canonical encoders and bounded model graphs coexist.
+        try(var scratch=logResources.reserveClassification(Math.addExact(65536,Math.multiplyExact(16,maximum)))) {
+            byte[] encoded=wire.toByteArray();UUID group=initialGroup.getGroupId().getUuid();
+            if(RatisParticipantRecord.isParticipant(encoded)) {
+                if(role!=RatisNodePlan.Role.DATA)return false;
+                if(RatisParticipantRecord.isFinalization(encoded))return group.equals(RatisParticipantRecord.decodeFinalization(encoded).participantGroup());
+                if(RatisParticipantRecord.isRetirement(encoded))return group.equals(RatisParticipantRecord.decodeRetirement(encoded).identity().participantGroup());
+                return RatisParticipantRecord.isNegative(encoded) && group.equals(RatisParticipantRecord.decode(encoded).business().groupId());
+            }
+            if(HomeRecovery.isRecovery(encoded))return role==RatisNodePlan.Role.TRANSACTION_HOME && group.equals(HomeRecovery.decode(encoded).command().groupId());
+            if(RatisHomeRetirementRecord.isRetirement(encoded)) {
+                var retirement=RatisHomeRetirementRecord.decode(encoded);requireHomeRetirement(retirement);return group.equals(retirement.identity().groupId());
+            }
+            if(RatisSnapshotHomeRetirementRecord.isRetirement(encoded)) {
+                var retirement=RatisSnapshotHomeRetirementRecord.decode(encoded);requireSnapshotHomeIdentity(retirement.identity());return group.equals(retirement.identity().groupId());
+            }
+            if(RatisSnapshotRetirementRecord.isRetirement(encoded))return role==RatisNodePlan.Role.DATA && group.equals(RatisSnapshotRetirementRecord.decode(encoded).participantGroup());
+            if(RatisSnapshotRecord.isSnapshot(encoded)) {
+                var snapshot=RatisSnapshotRecord.decode(encoded);return role==RatisNodePlan.Role.DATA && snapshot.isRelease() && group.equals(snapshot.participantGroup());
+            }
+            if(RatisSourceOutcomeRecord.isRecord(encoded)) {
+                var outcome=RatisSourceOutcomeRecord.decode(encoded);return role==RatisNodePlan.Role.DATA && outcome.kind()==RatisSourceOutcomeRecord.Kind.PUBLISH && group.equals(outcome.request().original().groupId());
+            }
+            if(RatisTopologyActivationRecord.isActivation(encoded))return role==RatisNodePlan.Role.DATA && group.equals(RatisTopologyActivationRecord.decode(encoded).groupId());
+            if(RatisSchemaActivateRecord.isActivate(encoded))return role==RatisNodePlan.Role.DATA && group.equals(RatisSchemaActivateRecord.decode(encoded).groupId());
+            if(RatisTopologyRelocationRecord.isRecord(encoded)) {
+                var relocation=RatisTopologyRelocationRecord.decode(encoded);return role==RatisNodePlan.Role.DATA && relocation.action()==RatisTopologyRelocationRecord.Action.COMPLETE && group.equals(relocation.definition().parents().getFirst().groupId());
+            }
+            var command=DistributedCommandCodec.decode(encoded);
+            if(!group.equals(command.groupId()) || !Arrays.equals(encoded,DistributedCommandCodec.encode(command)))return false;
+            return switch(command.kind()) {
+                case SESSION_FLOOR,COMMIT_REJECTED -> true;
+                case SESSION_CONTROL -> !command.sessionControl().binding();
+                case COMMIT_ACCEPTED -> false;
+                case DATA -> command.mutations().isEmpty() && command.predicates().isEmpty()
+                        || protectedSnapshotHomeSuccessor(command,encoded);
+            };
+        } catch(IllegalArgumentException | java.nio.BufferUnderflowException malformed) {return false;}
+    }
+    private long protectedLogMaximum(ByteString wire,byte[] prefix) {
+        if(RatisParticipantRecord.isParticipant(prefix)) {
+            if(role!=RatisNodePlan.Role.DATA)return 0;
+            if(RatisParticipantRecord.isFinalization(prefix))return 8L+ParticipantFinalization.MAX_BYTES;
+            if(RatisParticipantRecord.isRetirement(prefix))return 8L+ParticipantRetirement.MAX_BYTES;
+            return RatisParticipantRecord.isNegative(prefix)?8L+PreparedParticipant.Preparation.MAX_BYTES:0;
+        }
+        if(HomeRecovery.isRecovery(prefix))return role==RatisNodePlan.Role.TRANSACTION_HOME?HomeRecovery.MAX_BYTES:0;
+        if(RatisHomeRetirementRecord.isRetirement(prefix))return role==RatisNodePlan.Role.TRANSACTION_HOME?4L+HomeRetirement.MAX_BYTES:0;
+        if(RatisSnapshotHomeRetirementRecord.isRetirement(prefix))return role==RatisNodePlan.Role.SNAPSHOT_HOME?4L+SnapshotHomeRetirement.MAX_BYTES:0;
+        if(RatisSnapshotRetirementRecord.isRetirement(prefix))return role==RatisNodePlan.Role.DATA?4L+SnapshotGateRetirement.MAX_BYTES:0;
+        if(RatisSnapshotRecord.isSnapshot(prefix))return role==RatisNodePlan.Role.DATA && prefix.length>=8 && ByteBuffer.wrap(prefix).getInt(4)==2?DistributedCommandCodec.MAX_ENCODED_BYTES:0;
+        if(RatisSourceOutcomeRecord.isRecord(prefix))return role==RatisNodePlan.Role.DATA && prefix.length>=8 && ByteBuffer.wrap(prefix).getInt(4)==RatisSourceOutcomeRecord.Kind.PUBLISH.ordinal()?RatisSourceOutcomeRecord.MAX_BYTES:0;
+        if(RatisTopologyActivationRecord.isActivation(prefix))return role==RatisNodePlan.Role.DATA?RatisTopologyActivationRecord.MAX_BYTES:0;
+        if(RatisSchemaActivateRecord.isActivate(prefix))return role==RatisNodePlan.Role.DATA?RatisSchemaActivateRecord.MAX_BYTES:0;
+        if(RatisTopologyRelocationRecord.isRecord(prefix))return role==RatisNodePlan.Role.DATA && prefix.length>=5 && prefix[4]==RatisTopologyRelocationRecord.Action.COMPLETE.ordinal()?RatisTopologyRelocationRecord.MAX_BYTES:0;
+        if(prefix.length<DistributedCommandCodec.HEADER_BYTES || ByteBuffer.wrap(prefix).getInt()!=DistributedCommandCodec.FORMAT_VERSION)return 0;
+        return switch(prefix[4]&255) {
+            case 1 -> ByteBuffer.wrap(prefix).getInt(101)==0 && ByteBuffer.wrap(prefix).getInt(105)==0?DistributedCommandCodec.HEADER_BYTES
+                    : snapshotHomeProgressShape(wire)?DistributedCommandCodec.MAX_ENCODED_BYTES:0;
+            case 2 -> DistributedCommandCodec.HEADER_BYTES+8L;
+            case 3 -> wire.size()>=DistributedCommandCodec.HEADER_BYTES+4 && logWireInt(wire,DistributedCommandCodec.HEADER_BYTES)==RangeSessionControl.ADVANCE_BYTES
+                    ?DistributedCommandCodec.HEADER_BYTES+4L+RangeSessionControl.ADVANCE_BYTES:0;
+            case 5 -> DistributedCommandCodec.HEADER_BYTES+32L;
+            default -> 0;
+        };
+    }
+    /** Project an existing snapshot HOME CAS without coalescing a possibly segmented ByteString. */
+    private boolean snapshotHomeProgressShape(ByteString wire) {
+        if(!snapshotHomeConfigured || role!=RatisNodePlan.Role.SNAPSHOT_HOME || wire.size()>DistributedCommandCodec.MAX_ENCODED_BYTES)return false;
+        try {
+            if(logWireLong(wire,93)!=-1 || logWireInt(wire,101)!=1 || logWireInt(wire,105)!=1)return false;
+            int p=DistributedCommandCodec.HEADER_BYTES;
+            if(wire.byteAt(p++)!=1 || wire.byteAt(p++)!=0 || logWireLong(wire,p)!=homeColumn.getMostSignificantBits() || logWireLong(wire,p+8)!=homeColumn.getLeastSignificantBits() || logWireInt(wire,p+16)!=16)return false;
+            p+=20;long keyHigh=logWireLong(wire,p),keyLow=logWireLong(wire,p+8);p+=16;int bytes=logWireInt(wire,p);p+=4;
+            if(bytes<SnapshotFenceStatus.HEADER_BYTES || bytes>SnapshotFenceStatus.MAX_BYTES || bytes>wire.size()-p)return false;p+=bytes;
+            if(wire.byteAt(p++)!=1 || logWireLong(wire,p)!=homeColumn.getMostSignificantBits() || logWireLong(wire,p+8)!=homeColumn.getLeastSignificantBits() || logWireInt(wire,p+16)!=16)return false;
+            p+=20;if(logWireLong(wire,p)!=keyHigh || logWireLong(wire,p+8)!=keyLow)return false;p+=16;int expected=logWireInt(wire,p);p+=4;
+            return expected>=SnapshotFenceStatus.HEADER_BYTES && expected<=SnapshotFenceStatus.MAX_BYTES && expected==wire.size()-p;
+        } catch(IndexOutOfBoundsException malformed) {return false;}
+    }
+    private static int logWireInt(ByteString wire,int offset) {int value=0;for(int i=0;i<4;i++)value=(value<<8)|(wire.byteAt(offset+i)&255);return value;}
+    private static long logWireLong(ByteString wire,int offset) {long value=0;for(int i=0;i<8;i++)value=(value<<8)|(wire.byteAt(offset+i)&255);return value;}
+    private boolean protectedSnapshotHomeSuccessor(DistributedCommand command,byte[] encoded) {
+        if(!snapshotHomeProgressInput(ByteBuffer.wrap(encoded)))return false;
+        var before=SnapshotFenceStatus.decode(command.predicates().getFirst().expectedValue());
+        var next=SnapshotFenceStatus.decode(command.mutations().getFirst().value());next.requireSuccessorOf(before);
+        requireSnapshotHomeIdentity(new SnapshotHomeIdentity(command.groupId(),command.rangeEpoch(),command.schemaDigest(),homeColumn,before.fence()));
+        byte[] key=ByteBuffer.allocate(16).putLong(before.fence().fenceId().getMostSignificantBits()).putLong(before.fence().fenceId().getLeastSignificantBits()).array();
+        return Arrays.equals(key,command.mutations().getFirst().key());
+    }
+    private RatisDiskRunway diskRunway;private UUID diskPool;
+    public void diskRunway(RatisDiskRunway runway,UUID pool){if(getLifeCycleState()!=LifeCycle.State.NEW || diskRunway!=null)throw new IllegalStateException("Disk runway fixed before initialization");diskRunway=java.util.Objects.requireNonNull(runway);diskPool=java.util.Objects.requireNonNull(pool);}
     private RatisNodeResourceBudget nodeResourceBudget;
     private UUID nodeResourcePool;
     /** Shared volatile limits are bound once before any proposal or native handle is admitted. */
@@ -1362,6 +1470,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         nodeResourcePool=pool; nodeResourceBudget=budget;
     }
     RatisNodeResourceBudget.Lease reserveNodeResources(RatisNodeResourceBudget.Kind kind,long bytes,int owners) throws IOException {
+        if(kind==RatisNodeResourceBudget.Kind.ORDINARY && diskRunway!=null)diskRunway.requireOrdinary();
         return nodeResourceBudget==null ? null : nodeResourceBudget.reserve(nodeResourcePool,kind,bytes,owners);
     }
 
@@ -2069,6 +2178,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public long takeSnapshot() throws IOException {
         // A retired parent's shared USER rows may already belong to its children.
         if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending())return -1;
+        var recovery=diskRunway==null?null:diskRunway.reserveRecovery(diskPool,Math.addExact(2*limits.maxImageBytes(),65536));
         try (var pin = snapshotPin()) {
             if (pin.position() == null) return -1;
             var position = TermIndex.valueOf(pin.position().term(), pin.position().index());
@@ -2089,6 +2199,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             return position.getIndex();
         } catch (Exception failure) { throw new IOException("Could not publish native snapshot", failure); }
+        finally {if(recovery!=null)recovery.actualFinished();}
     }
 
     private ReplicatedRangeStore.SnapshotPin snapshotPin() throws Exception {
@@ -2884,6 +2995,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                         || nativePosition == null || nativePosition.term() != current.term() || !store.admissionOpen() && !metadataQualified) {
                     throw new IOException("Admission lost its completed current-term owner before append");
                 }
+                if(!admission.protectedControl && diskRunway!=null)diskRunway.requireOrdinary();
                 if(admission.sessionBinding && store.topologyFreeze()!=null) throw new IOException("Sealed topology parent cannot append session grants");
                 if(admission.topologyMetadataControl!=null && (!metadataQualified || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || store.topologyBirthPending()
                         || admission.topologyMetadataOwner==null || admission.topologyMetadataOwner.stamp()!=schemaConfigurationStamp || admission.topologyMetadataOwner.term()!=current.term()

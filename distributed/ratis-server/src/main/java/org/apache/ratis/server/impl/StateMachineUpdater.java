@@ -274,7 +274,9 @@ class StateMachineUpdater implements Runnable {
     CommittedApplyStateMachine.ApplyPermit permit = null;
     try {
       try (CommittedApplyStateMachine.ReadPermit read = admission.awaitRead(index)) {
-        entry = reader.get(index);
+        try (var admittedRead = LogResourceScope.admittedRead()) {
+          entry = reader.get(index);
+        }
         if (entry != null) {
           var decoded = admission.describe(entry);
           descriptor = new CommittedApplyStateMachine.Descriptor(decoded.term(),decoded.index(),decoded.bodyCase(),decoded.lane(),decoded.bytes(),decoded.digest(),read.generation());
@@ -285,7 +287,9 @@ class StateMachineUpdater implements Runnable {
         entry = null; // Only the scalar descriptor survives the execution wait.
         permit = admission.awaitDispatch(descriptor);
         admission.validate(descriptor);
-        entry = reader.get(index);
+        try (var admittedRead = LogResourceScope.admittedRead()) {
+          entry = reader.get(index);
+        }
         var reread = entry == null ? null : admission.describe(entry);
         var checked = reread == null ? null : new CommittedApplyStateMachine.Descriptor(reread.term(),reread.index(),reread.bodyCase(),reread.lane(),reread.bytes(),reread.digest(),descriptor.generation());
         if (checked == null || !descriptor.sameEntry(checked)) {

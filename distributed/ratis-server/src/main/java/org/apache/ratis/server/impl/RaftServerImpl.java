@@ -1586,8 +1586,19 @@ class RaftServerImpl implements RaftServer.Division,
       }
       assertGroup(getMemberId(), leaderId, leaderGroupId);
       assertEntries(r, previous, state);
-      return TraceServer.traceAppendEntriesAsync(() -> appendEntriesAsync(leaderId, request.getCallId(), previous, r),
-          r, getMemberId().toString());
+      if(!(stateMachine instanceof LogResourceStateMachine))return TraceServer.traceAppendEntriesAsync(() -> appendEntriesAsync(leaderId,request.getCallId(),previous,r,null),r,getMemberId().toString());
+      if(!(state.getLog() instanceof org.apache.ratis.server.raftlog.segmented.SegmentedRaftLog boundedLog))throw new ServerNotReadyException("Bounded follower intake requires the pinned segmented log");
+      final var reservation=boundedLog.reserveFollowerAppend(r.getEntriesList(),Math.addExact(r.getSerializedSize(),512L*r.getEntriesCount()),r.getEntriesCount()==0);
+      try(var scope=LogResourceScope.enter(reservation)) {
+        final CompletableFuture<AppendEntriesReplyProto> result;
+        try { result=TraceServer.traceAppendEntriesAsync(()->appendEntriesAsync(leaderId,request.getCallId(),previous,r,reservation),r,getMemberId().toString()); }
+        catch(Throwable failure) {
+          var failed=scope.actualDrain().thenCompose(ignored->CompletableFuture.<AppendEntriesReplyProto>failedFuture(failure));
+          failed.whenComplete((value,error)->{ reservation.actualFinished(); reservation.close(); }); return failed.copy();
+        }
+        var actual=CompletableFuture.allOf(result.handle((value,error)->null),scope.actualDrain()).thenCompose(ignored->result);
+        actual.whenComplete((value,error)->{ reservation.actualFinished(); reservation.close(); }); return actual.copy();
+      }
     } catch(Exception t) {
       LOG.error("{}: Failed appendEntries* {}", getMemberId(),
           toAppendEntriesRequestString(r, stateMachine::toStateMachineLogEntryString), t);
@@ -1655,7 +1666,7 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   private CompletableFuture<AppendEntriesReplyProto> appendEntriesAsync(RaftPeerId leaderId, long callId,
-      TermIndex previous, AppendEntriesRequestProto proto) throws IOException {
+      TermIndex previous, AppendEntriesRequestProto proto,LogResourceStateMachine.AppendReservation reservation) throws IOException {
     final List<LogEntryProto> entries = proto.getEntriesList();
     final boolean isHeartbeat = entries.isEmpty();
     logAppendEntries(isHeartbeat, () -> getMemberId() + ": appendEntries* "
@@ -1679,6 +1690,7 @@ class RaftServerImpl implements RaftServer.Division,
       }
       try {
         future = changeToFollowerAndPersistMetadata(leaderTerm, true, Op.APPEND_ENTRIES);
+        LogResourceScope.track(future);
       } catch (IOException e) {
         return JavaUtils.completeExceptionally(e);
       }
@@ -1710,8 +1722,8 @@ class RaftServerImpl implements RaftServer.Division,
     }
     future.join();
     final CompletableFuture<Void> appendFuture = entries.isEmpty()? CompletableFuture.completedFuture(null)
-        : appendLogTermIndices != null ? appendLogTermIndices.append(entries, this::appendLog)
-        : JavaUtils.allOf(state.getLog().append(entries));
+        : appendLogTermIndices != null ? appendLogTermIndices.append(entries,values->appendLog(values,reservation))
+        : appendLogReserved(entries,reservation);
 
     proto.getCommitInfosList().forEach(commitInfoCache::update);
 
@@ -1749,9 +1761,18 @@ class RaftServerImpl implements RaftServer.Division,
     });
   }
 
-  private CompletableFuture<Void> appendLog(List<LogEntryProto> entries) {
+  private CompletableFuture<Void> appendLog(List<LogEntryProto> entries,LogResourceStateMachine.AppendReservation reservation) {
     return CompletableFuture.completedFuture(null)
-        .thenComposeAsync(dummy -> JavaUtils.allOf(state.getLog().append(entries)), serverExecutor);
+        .thenComposeAsync(dummy -> appendLogReserved(entries,reservation), serverExecutor);
+  }
+  private CompletableFuture<Void> appendLogReserved(List<LogEntryProto> entries,LogResourceStateMachine.AppendReservation reservation) {
+    if(reservation==null)return JavaUtils.allOf(state.getLog().append(entries));
+    try(var scope=LogResourceScope.enter(reservation)) {
+      final CompletableFuture<Void> result;
+      try { result=JavaUtils.allOf(state.getLog().append(entries)); }
+      catch(Throwable failure) { return scope.actualDrain().thenCompose(ignored->CompletableFuture.failedFuture(failure)); }
+      return CompletableFuture.allOf(result.handle((value,error)->null),scope.actualDrain()).thenCompose(ignored->result);
+    }
   }
 
   private long checkInconsistentAppendEntries(TermIndex previous, List<LogEntryProto> entries) {

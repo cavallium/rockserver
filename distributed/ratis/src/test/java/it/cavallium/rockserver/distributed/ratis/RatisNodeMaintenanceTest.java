@@ -42,6 +42,20 @@ class RatisNodeMaintenanceTest {
             }
         }
     }
+    @Test void boundedScalarTableInspectionRejectsOversizedInventoryAndRetainsActualInspectionSlot()throws Exception {
+        try(var f=new RatisTopologyFreezeTest.Fixture(root);var workers=Executors.newVirtualThreadPerTaskExecutor()){
+            for(int n=0;n<2;n++){f.apply(f.propose(DistributedCommandCodec.encode(f.put(n,9+n))),n+1).get(5,TimeUnit.SECONDS);f.pool.flushLocal(f.pool.maintenanceSession(),f.column);}
+            var cut=f.store.applied();var properties=f.pool.tablePropertiesLocal(f.pool.maintenanceSession(),f.column,128,1024*1024);
+            assertTrue(properties.files()>=2);assertTrue(properties.entries()>=2);assertTrue(properties.dataBytes()>0);
+            assertThrows(org.rocksdb.RocksDBException.class,()->f.pool.tablePropertiesLocal(f.pool.maintenanceSession(),f.column,1,1024*1024));
+            assertThrows(org.rocksdb.RocksDBException.class,()->f.pool.tablePropertiesLocal(f.pool.maintenanceSession(),f.column,128,1));
+            assertEquals(cut,f.store.applied());assertArrayEquals(new byte[]{10},f.store.readCurrentPoint(f.column,new byte[]{1}));
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);f.pool.localMaintenanceObserver(column->{entered.countDown();try{if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("inspection drain timeout");}catch(InterruptedException failed){throw new AssertionError(failed);}});
+            var owner=workers.submit(()->f.pool.tablePropertiesLocal(f.pool.maintenanceSession(),f.column,128,1024*1024));
+            try{assertTrue(entered.await(5,TimeUnit.SECONDS));assertThrows(java.io.IOException.class,()->f.pool.tablePropertiesLocal(f.pool.maintenanceSession(),f.column,128,1024*1024));assertFalse(f.pool.close(Duration.ofMillis(10)));release.countDown();assertEquals(properties,owner.get(5,TimeUnit.SECONDS));}
+            finally{release.countDown();f.pool.localMaintenanceObserver(column->{});}
+        }
+    }
     @Test void staleNodeProcessColumnAndSessionRejectBeforeNativeWork() throws Exception {
         try(var f=new RatisTopologyFreezeTest.Fixture(root);var threads=new Threads()) {
             try(var maintenance=new RatisNodeMaintenance(NODE,INCARNATION,List.of(f.pool),threads.scheduler,POLICY);

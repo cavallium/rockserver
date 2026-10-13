@@ -24,6 +24,7 @@
     <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-metrics-api</artifactId><version>${ratis.version}</version></dependency>
     <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>2.0.18</version></dependency>
     <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.14.3</version><scope>test</scope></dependency>
+    <dependency><groupId>org.apache.ratis</groupId><artifactId>ratis-metrics-default</artifactId><version>${ratis.version}</version><scope>test</scope></dependency>
   </dependencies>
   <build><plugins>
     <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.8.1</version>
@@ -35,7 +36,7 @@
         <execution><id>unchanged-release-classes</id><phase>generate-resources</phase><goals><goal>unpack</goal></goals><configuration><artifactItems><artifactItem>
           <groupId>org.apache.ratis</groupId><artifactId>ratis-server</artifactId><version>${ratis.version}</version><type>jar</type>
           <outputDirectory>${project.build.outputDirectory}</outputDirectory>
-          <excludes>org/apache/ratis/server/leader/InstallSnapshotRequests*.class,org/apache/ratis/server/impl/ReadIndexHeartbeats*.class,org/apache/ratis/server/impl/LeaderStateImpl*.class,org/apache/ratis/server/impl/RaftServerImpl*.class,org/apache/ratis/server/impl/StateMachineUpdater*.class,META-INF/MANIFEST.MF,META-INF/*.SF,META-INF/*.RSA,META-INF/*.DSA</excludes>
+          <excludes>org/apache/ratis/server/leader/InstallSnapshotRequests*.class,org/apache/ratis/server/impl/ReadIndexHeartbeats*.class,org/apache/ratis/server/impl/LeaderStateImpl*.class,org/apache/ratis/server/impl/RaftServerImpl*.class,org/apache/ratis/server/impl/StateMachineUpdater*.class,org/apache/ratis/server/raftlog/RaftLogBase*.class,org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.class,org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog$*.class,org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache*.class,org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker*.class,org/apache/ratis/server/raftlog/segmented/BufferedWriteChannel*.class,org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogOutputStream*.class,org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogReader*.class,org/apache/ratis/server/raftlog/segmented/LogSegment.class,org/apache/ratis/server/raftlog/segmented/LogSegment$*.class,META-INF/MANIFEST.MF,META-INF/*.SF,META-INF/*.RSA,META-INF/*.DSA</excludes>
         </artifactItem></artifactItems></configuration></execution>
       </executions>
     </plugin>

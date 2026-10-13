@@ -63,7 +63,7 @@ public final class RatisNodeMaintenance implements AutoCloseable {
         return submit(target,OperationFamily.COMPACTION,pool->pool.compactFilesLocal(target.pool(),target.column(),request,policy.maximumFiles(),policy.maximumMetadataBytes()));
     }
     public CompletableFuture<DistributedStoragePool.LocalTableProperties> tableProperties(Target target) {
-        return submit(target,OperationFamily.COMPACTION,pool->pool.tablePropertiesLocal(target.pool(),target.column(),policy.maximumFiles()));
+        return submit(target,OperationFamily.COMPACTION,pool->pool.tablePropertiesLocal(target.pool(),target.column(),policy.maximumFiles(),policy.maximumMetadataBytes()));
     }
     public synchronized int pending(){return owners.size();}
     /** Stop new jobs; the returned future completes only after actual queued/running ownership exits. */
