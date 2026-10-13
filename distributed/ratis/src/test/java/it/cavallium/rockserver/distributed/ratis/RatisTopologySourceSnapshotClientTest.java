@@ -16,16 +16,16 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 class RatisTopologySourceSnapshotClientTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     @Test void borrowedClientCarriesExactIdentityThroughControlledSourceActions()throws Exception {
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
             var raft=mock(RaftClient.class);var io=mock(BlockingApi.class);when(raft.getGroupId()).thenReturn(RaftGroupId.valueOf(fixture.group));when(raft.io()).thenReturn(io);
             when(io.sendReadOnly(any())).thenAnswer(call->{var input=((Message)call.getArgument(0)).getContent().toByteArray();var request=request(input);int kind=ScopedTransactionRpc.kind(input,MAX_REQUEST_BYTES);byte[] result;
-                if(kind==RELEASE){service.release(request);result=input;}else result=reply(kind,kind==PREPARE?service.prepare(request):service.transfer(request));
+                if(kind==RELEASE){service.release(request);result=input;}else result=reply(kind,kind==PREPARE?service.prepare(request):service.transfer(request).get(5,java.util.concurrent.TimeUnit.SECONDS));
                 return RaftClientReply.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(fixture.donor.peerId())).setGroupId(raft.getGroupId()).setCallId(0).setSuccess().setMessage(Message.valueOf(ByteString.copyFrom(result))).build();});
             var client=new RatisTopologySourceSnapshotClient(raft);var request=fixture.request(50);var prepared=client.prepare(request);var transferred=client.transfer(request);assertArrayEquals(prepared.image().sha256(),transferred.image().sha256());client.release(request);client.release(request);assertEquals(1,fixture.captures.get());assertEquals(1,fixture.pinCloses.get());verify(raft,never()).close();
         }
     }
     @Test void malformedOrCrossedRepliesDoNotInventSuccess()throws Exception {
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
             var raft=mock(RaftClient.class);var io=mock(BlockingApi.class);when(raft.getGroupId()).thenReturn(RaftGroupId.valueOf(fixture.group));when(raft.io()).thenReturn(io);var request=fixture.request(50);var prepared=service.prepare(request);
             var response=RaftClientReply.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("other")).setGroupId(raft.getGroupId()).setCallId(0).setSuccess().setMessage(Message.valueOf(ByteString.copyFrom(reply(PREPARE,prepared)))).build();when(io.sendReadOnly(any())).thenReturn(response);
             var client=new RatisTopologySourceSnapshotClient(raft);assertThrows(IOException.class,()->client.prepare(request));assertEquals(0,fixture.pinCloses.get());

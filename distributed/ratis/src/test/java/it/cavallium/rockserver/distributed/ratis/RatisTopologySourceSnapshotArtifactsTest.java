@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
+import java.util.concurrent.TimeUnit;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -98,7 +99,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
                     public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request)throws IOException{return fixture.send(request);}
                 };
-                try(var service=new RatisTopologySourceSnapshotService(host,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){service.prepare(request);service.close();assertEquals(1,fixture.pinCloses.get());assertEquals(0,fixture.durableReleases.get());}
+                try(var service=new RatisTopologySourceSnapshotService(host,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){service.prepare(request);service.close();assertEquals(1,fixture.pinCloses.get());assertEquals(0,fixture.durableReleases.get());}
             }
             try(var helper=open(owned)){assertNotNull(helper.lookup(request));assertFalse(Files.exists(owned.resolve(request.transferId()+".released")));}
         }
@@ -121,7 +122,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
                     public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request)throws IOException{return fixture.send(request);}
                 };
-                try(var service=new RatisTopologySourceSnapshotService(host,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){service.prepare(request);service.transfer(request);service.release(request);}
+                try(var service=new RatisTopologySourceSnapshotService(host,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){service.prepare(request);service.transfer(request).get(5,TimeUnit.SECONDS);service.release(request);}
             }
             try(var helper=open(owned)){
                 var replayOnly=new RatisTopologySourceSnapshotService.Host(){
@@ -134,7 +135,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
                     public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request){throw new AssertionError("Cold release cannot send chunks");}
                 };
-                try(var service=new RatisTopologySourceSnapshotService(replayOnly,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+                try(var service=new RatisTopologySourceSnapshotService(replayOnly,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
                     var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver(),request.purpose());
                     assertThrows(IOException.class,()->service.release(changed));service.release(request);service.release(request);
                     assertThrows(IOException.class,()->service.release(fixture.request(51)));assertFalse(helper.isReleased(fixture.request(51)));
