@@ -15,6 +15,8 @@ import it.cavallium.rockserver.core.impl.rocksdb.NativeStartupBridge;
 import it.cavallium.rockserver.core.impl.rocksdb.RocksDBLoader;
 import it.cavallium.rockserver.core.impl.rocksdb.SnapshotCache;
 import it.cavallium.rockserver.core.impl.rocksdb.TransactionalDB;
+import io.micrometer.core.instrument.composite.CompositeMeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
@@ -56,8 +58,10 @@ class StartupNativeIntegrationTest {
         Path config = config("workflow", true, "0B");
         seed(dbPath, config, "seed");
         List<SnapshotCache> closedCaches;
-        try (var connection = new EmbeddedConnection(dbPath, "capture", config)) {
+        try (var exported = new SimpleMeterRegistry();
+                var connection = new EmbeddedConnection(dbPath, "capture", config)) {
             var internal = connection.getInternalDB();
+            ((CompositeMeterRegistry) internal.getMetricsRegistry()).add(exported);
             var resources = resources(internal);
             closedCaches = resources.snapshotCaches();
             assertEquals(2, closedCaches.size());
@@ -73,6 +77,15 @@ class StartupNativeIntegrationTest {
                 assertTrue(counter(cache, "snapshots") > 0);
                 assertTrue(counter(cache, "snapshot_bytes") > 128);
                 assertEquals(0, counter(cache, "errors"));
+            }
+            for (String role : List.of("data", "metadata")) {
+                var snapshots = exported.get("rockserver.startup.cache.snapshots")
+                        .tags("db", "capture", "cache", "default", "role", role).gauge();
+                await(() -> snapshots.value() > 0, role + " snapshot publication metric");
+                assertTrue(exported.get("rockserver.startup.cache.snapshot.bytes")
+                        .tags("db", "capture", "cache", "default", "role", role).gauge().value() > 128);
+                assertEquals(0, exported.get("rockserver.startup.cache.errors")
+                        .tags("db", "capture", "cache", "default", "role", role).gauge().value());
             }
             var api = connection.getSyncApi(RequestContext.batch());
             long temporary = api.createColumn("temporary", SCHEMA);
@@ -283,6 +296,7 @@ class StartupNativeIntegrationTest {
         assertTrue(stats.peakActive() <= 1, stats::toString);
         assertTrue(stats.completedFindTable() <= stats.admitted(), stats::toString);
         assertTrue(stats.failed() <= stats.completedFindTable(), stats::toString);
+        assertTrue(stats.ownedSuccessfulFileOpens() <= stats.completedFindTable(), stats::toString);
     }
 
     private boolean stagingFileExists() {
