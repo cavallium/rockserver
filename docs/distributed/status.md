@@ -95,11 +95,20 @@ This section and the remaining gates at the end describe the current branch.
   original snapshot capture vector, atomic destination effects/checkpoints, lost
   replies and MERGE deduplication. A retention gap invalidates incomplete staging.
   This does not establish adoption by an external consumer.
+- Public export passed a direct gRPC service workflow over actual native two-range
+  sources, with bounded manifest/file pages, forced destination SST/checkpoint work
+  before ACK, discarded replies, exact connection-journal reopening and public
+  RELEASE pin drain. Native source stores stayed live during journal reopening;
+  no network listener, quorum or external-consumer adoption is established.
 - Replica-local maintenance passed actual flush/SST preview/execution/property
   checks, stale target rejection, cancellation with retained JNI ownership and
   node-owned shutdown. It requires explicit policy and process/pool/CF identities.
   Common distributed SST commands remain unsupported. Java response limits do
   not establish a bound on RocksDB's eager inventory allocation.
+
+Standalone embedded column, deletion and transaction behavior plus native merge
+operator regressions passed 53 unique cases in
+`/tmp/rockserver-standalone-regression-oct13.log`.
 
 All evidence above uses controlled native/Ratis interface fixtures. No sockets,
 independent quorum, production deployment or representative hardware/density
