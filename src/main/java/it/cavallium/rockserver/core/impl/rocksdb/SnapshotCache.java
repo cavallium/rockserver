@@ -45,6 +45,12 @@ public final class SnapshotCache extends Cache {
         return NativeStartupBridge.cacheStats(nativeHandle_);
     }
 
+    /** Parse only during telemetry polling, never on a cache lookup. */
+    public synchronized NativeStartupBridge.CacheStats statsSnapshot() {
+        requireAlive();
+        return NativeStartupBridge.parseCacheStats(NativeStartupBridge.cacheStats(nativeHandle_));
+    }
+
     public String compatibilityId() { return NativeStartupBridge.cacheCompatibilityId(); }
 
     @Override public synchronized long getUsage() {
