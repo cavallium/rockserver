@@ -201,7 +201,7 @@ public final class NativeStartupBridge {
         static final MethodHandle VERSION = bind("rocksdb_async_open_admission_abi_version", JAVA_INT);
         static {
             int version = (int) call(VERSION);
-            if (version != 3) throw new LinkageError("Unsupported admission ABI version " + version);
+            if (version != 4) throw new LinkageError("Unsupported admission ABI version " + version);
         }
         static final MethodHandle CREATE_BUDGET = bind("rocksdb_async_open_admission_budget_create", JAVA_INT,
                 ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS);
