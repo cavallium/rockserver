@@ -61,6 +61,7 @@ def main():
     p.add_argument("--pairs", type=int, default=3)
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--capture-period-ms", type=int, default=300000)
+    p.add_argument("--read-ceiling-mib", type=int, default=8, help="DATA/METADATA read MiB/s; default8 preserves benchmark profile,0 means unlimited")
     p.add_argument("--data-sample-every", type=int, default=64)
     p.add_argument("--metadata-sample-every", type=int, default=16)
     p.add_argument("--seed-hot-keys", type=int, default=4096, help="Declared seed keys, clipped to dataset; original default4096")
@@ -69,6 +70,9 @@ def main():
     p.add_argument("--buffered-reads", action="store_true")
     p.add_argument("--prepare-only", action="store_true")
     a = p.parse_args()
+    if not 0 <= a.read_ceiling_mib <= (2**63 - 1) // (1024**2):
+        p.error("Read ceiling must be nonnegative and representable in signed bytes/second")
+    read_ceiling_bytes = a.read_ceiling_mib * 1024**2
     if len(a.disk) != len(a.cache_disk):
         p.error("Supply a separate matching cache parent for every DB parent")
     if not (1 <= a.dataset_mib <= 1024 and 1 <= a.operations <= 1000000 and 1 <= a.pairs <= 10
@@ -110,6 +114,8 @@ def main():
                     "passes": a.seed_passes, "verified_gets": effective_seed_keys * a.seed_passes,
                     "order": "sequential" if a.seed_passes == 1 else "deterministic per-pass shuffle",
                     "permission": "Actual controller idle before history and before/after manual capture; never override feedback"},
+                "read_ceiling": {"mib_per_second": a.read_ceiling_mib, "bytes_per_second": read_ceiling_bytes,
+                    "roles": ["data", "metadata"], "scope": "unlimited, matching production default" if read_ceiling_bytes == 0 else "explicit standalone benchmark profile"},
                 "startup_window_scope": "Separate public request-start window after EmbeddedConnection open returns; service latency includes queue/native/future wait; full-workload thresholds unchanged",
                 "ownership": "New task-owned roots. Sequential exited child JVMs; immutable seed backups restore the same canonical DB/cache paths before every trial. No namespace rebasing.",
                 "feedback": "Actual production loader/controller, native-call completion cohorts and scheduler pools. Observer reads counters every100ms; never publishes feedback.",
@@ -148,7 +154,7 @@ def main():
                    str(classes) + os.pathsep + a.classpath, "it.cavallium.rockserver.core.impl.rocksdb.StartupEmbeddedQualification",
                    str(db), str(cache), mode, str(a.dataset_mib), str(a.operations), str(not a.buffered_reads).lower(),
                    str(a.data_sample_every), str(a.metadata_sample_every), str(a.capture_period_ms), str(a.timeout),
-                   str(a.seed_hot_keys), str(a.seed_passes), str(a.startup_window_ms)]
+                   str(a.seed_hot_keys), str(a.seed_passes), str(a.startup_window_ms), str(a.read_ceiling_mib)]
         save(out / (label + ".command.json"), command)
         save(out / (label + ".identity-expected.json"), {"user_home": str(home),
             "native_artifact": native_artifact, "code_sources": expected_sources,

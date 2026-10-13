@@ -118,7 +118,7 @@ public final class StartupEmbeddedQualification {
         awaitCapturePermission(resources);
         return status;
     }
-    private static Path config(Path db, Path cache, String mode, boolean direct, int dataSample, int metadataSample, long period) throws Exception {
+    private static Path config(Path db, Path cache, String mode, boolean direct, int dataSample, int metadataSample, long period, long readCeilingBytes) throws Exception {
         boolean seed = mode.equals("seed"), snapshots = seed || mode.equals("cache") || mode.equals("both");
         boolean admission = mode.equals("admission") || mode.equals("both");
         String text = """
@@ -145,21 +145,26 @@ public final class StartupEmbeddedQualification {
                     data: {disk-budget: 36MiB, snapshot-budget: 12MiB, collector-entries: 8192, index-ram: 4MiB,
                       maximum-block: 256KiB, lookup-buffer: 2MiB, minimum-free-disk: 64MiB,
                       snapshot-deadline: PT5S, period: "PT%sS", sample-every: %d, lookup-concurrency: 2,
-                      read-ceiling: 8MiB, write-ceiling: 8MiB},
+                      read-ceiling: "%dB", write-ceiling: 8MiB},
                     metadata: {disk-budget: 12MiB, snapshot-budget: 4MiB, collector-entries: 2048, index-ram: 2MiB,
                       maximum-block: 256KiB, lookup-buffer: 2MiB, minimum-free-disk: 64MiB,
                       snapshot-deadline: PT5S, period: "PT%sS", sample-every: %d, lookup-concurrency: 2,
-                      read-ceiling: 8MiB, write-ceiling: 8MiB}}
+                      read-ceiling: "%dB", write-ceiling: 8MiB}}
                   fallback-column-options: {volumes: [], levels: [], first-level-sst-size: 16MiB, max-last-level-sst-size: 16MiB,
                     write-buffer-size: 8MiB, block-size: 16KiB, cache-index-and-filter-blocks: true,
                     pin-index-and-filter-blocks: false}
                 }
                 """.formatted(direct, !seed && !mode.equals("verify"), admission, db, snapshots, cache,
-                seed ? "0" : period / 1000.0, dataSample, seed ? "0" : period / 1000.0, metadataSample);
+                seed ? "0" : period / 1000.0, dataSample, readCeilingBytes,
+                seed ? "0" : period / 1000.0, metadataSample, readCeilingBytes);
         return Files.writeString(db.resolveSibling(db.getFileName() + ".embedded.conf"), text);
     }
     public static void main(String[] args) throws Exception {
-        if (args.length != 13) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB operations direct dataSampling metadataSampling periodMs workloadTimeoutSeconds seedHotKeys seedPasses startupWindowMs");
+        if (args.length != 14) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB operations direct dataSampling metadataSampling periodMs workloadTimeoutSeconds seedHotKeys seedPasses startupWindowMs readCeilingMiB");
+        long readCeilingMiB = Long.parseLong(args[13]);
+        if (readCeilingMiB < 0 || readCeilingMiB > Long.MAX_VALUE / MIB)
+            throw new IllegalArgumentException("Read ceiling must be nonnegative and representable in signed bytes/second");
+        long readCeilingBytes = Math.multiplyExact(readCeilingMiB, MIB);
         Path db = Path.of(args[0]).toAbsolutePath(), cache = Path.of(args[1]).toAbsolutePath();
         String mode = args[2];
         if (!Set.of("seed", "none", "cache", "admission", "both", "verify").contains(mode)) throw new IllegalArgumentException(mode);
@@ -191,11 +196,13 @@ public final class StartupEmbeddedQualification {
         output.put("cache_geometry", "Loader HCC DATA28MiB/METADATA4MiB; loader WBM auto16MiB charged within DATA; matched modes");
         output.put("data_sample_every", dataSample); output.put("metadata_sample_every", metadataSample);
         output.put("capture_period_ms", period); output.put("capture_period_override", period != 300000);
+        output.put("read_ceiling_mib", readCeilingMiB); output.put("read_ceiling_bytes_per_second", readCeilingBytes);
+        output.put("read_ceiling_scope", readCeilingBytes == 0 ? "unlimited, matching production default" : "explicit standalone benchmark profile");
         output.put("workload_timeout_seconds", workloadSeconds);
         output.put("bounded_inflight_requests_per_lane", 1);
         output.put("caller_lanes", "two asynchronous read lanes plus one asynchronous put/readback lane");
         output.put("native_identity", nativeIdentity());
-        Path conf = config(db, cache, mode, direct, dataSample, metadataSample, period);
+        Path conf = config(db, cache, mode, direct, dataSample, metadataSample, period, readCeilingBytes);
         output.put("effective_config", Files.readString(conf));
         long beforeOpen = System.nanoTime();
         List<SnapshotCache> retainedCaches = List.of();
