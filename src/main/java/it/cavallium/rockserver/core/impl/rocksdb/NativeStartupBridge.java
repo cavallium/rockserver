@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import java.io.IOException;
+import io.vertx.core.json.JsonObject;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.nio.file.Files;
@@ -42,10 +43,42 @@ public final class NativeStartupBridge {
         public BudgetConfig { Objects.requireNonNull(storageId); }
     }
     public record SnapshotResult(int status, String message) {}
+    /** One native stats poll; cache hit counters describe secondary-cache replay. */
+    public record CacheStats(long sampleCandidates, long sampled, long dropped,
+            long snapshots, long snapshotBytes, long aborts, long errors, long rejected,
+            long dataHits, long indexHits, long filterHits, long dictionaryHits,
+            long replayBytes, long lookupReservedBytes, long oversizedDecoderRejections,
+            long feedback) {}
+
+    static CacheStats parseCacheStats(String json) {
+        try {
+            var values = new JsonObject(json);
+            return new CacheStats(counter(values, "sample_candidates"), counter(values, "sampled"),
+                    counter(values, "dropped"), counter(values, "snapshots"), counter(values, "snapshot_bytes"),
+                    counter(values, "aborts"), counter(values, "errors"), counter(values, "rejected"),
+                    counter(values, "data_hits"), counter(values, "index_hits"), counter(values, "filter_hits"),
+                    counter(values, "dictionary_hits"), counter(values, "replay_bytes"),
+                    counter(values, "lookup_reserved_bytes"), counter(values, "oversized_decoder_rejections"),
+                    counter(values, "feedback"));
+        } catch (RuntimeException failure) {
+            throw new IllegalStateException("Invalid native snapshot cache stats", failure);
+        }
+    }
+
+    private static long counter(JsonObject values, String field) {
+        Object value = values.getValue(field);
+        if (!(value instanceof Long || value instanceof Integer) || ((Number) value).longValue() < 0) {
+            throw new IllegalArgumentException("Invalid or missing native snapshot cache counter " + field);
+        }
+        return ((Number) value).longValue();
+    }
+
+    /** File opens count successful owned FS opens, including later reader failure, not device reads. */
     public record AdmissionStats(long active, long queued, long admitted, long cancelled,
             long waitMicros, long limit, long pressure, long released, long peakActive,
             long completedFindTable, long failed, long findTableMicros, long logicalBytes,
-            long pressuredAdmissions, long pressureMask, long publishers, long healthyEpoch) {}
+            long pressuredAdmissions, long pressureMask, long publishers, long healthyEpoch,
+            long ownedSuccessfulFileOpens) {}
 
     private static MethodHandle bind(String name, MemoryLayout result, MemoryLayout... args) {
         var symbol = SymbolLookup.loaderLookup().find(name).orElseThrow(() ->
@@ -168,7 +201,7 @@ public final class NativeStartupBridge {
         static final MethodHandle VERSION = bind("rocksdb_async_open_admission_abi_version", JAVA_INT);
         static {
             int version = (int) call(VERSION);
-            if (version != 2) throw new LinkageError("Unsupported admission ABI version " + version);
+            if (version != 3) throw new LinkageError("Unsupported admission ABI version " + version);
         }
         static final MethodHandle CREATE_BUDGET = bind("rocksdb_async_open_admission_budget_create", JAVA_INT,
                 ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS);
@@ -214,11 +247,11 @@ public final class NativeStartupBridge {
         }
         public synchronized AdmissionStats snapshot() {
             try (var arena = Arena.ofConfined()) {
-                var values = arena.allocate(JAVA_LONG, 17);
-                check((int) call(AdmissionApi.SNAPSHOT, requireOpen(), values, 17), "Admission snapshot");
+                var values = arena.allocate(JAVA_LONG, 18);
+                check((int) call(AdmissionApi.SNAPSHOT, requireOpen(), values, 18), "Admission snapshot");
                 long[] v = values.toArray(JAVA_LONG);
                 return new AdmissionStats(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
-                        v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16]);
+                        v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[16], v[17]);
             }
         }
         @Override public synchronized void close() {
