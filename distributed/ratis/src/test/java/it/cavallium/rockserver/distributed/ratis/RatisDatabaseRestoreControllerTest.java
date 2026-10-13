@@ -28,10 +28,10 @@ class RatisDatabaseRestoreControllerTest {
     static Message message(byte[] bytes){return Message.valueOf(ByteString.copyFrom(bytes));}
     final class Target implements RatisDatabaseRestoreController.Provisioner,RatisRangeImportController.DataPlane,AutoCloseable {
         final RatisNodeRuntimeTest.Env resources;
-        final RatisNodeRuntimeTest.FakeServer fake=new RatisNodeRuntimeTest.FakeServer();
+        RatisNodeRuntimeTest.FakeServer fake=new RatisNodeRuntimeTest.FakeServer();
         final Map<UUID,RatisRoutedClient> routes=new HashMap<>();
         RatisNodeRuntime node;RatisNodePlan plan;RaftClient client;RatisDatabaseRestorePlanner.Plan frozen;
-        boolean loseGrant,loseInstall;
+        boolean loseGrant,loseInstall,recovering;
         Target()throws Exception{resources=new RatisNodeRuntimeTest.Env(root.resolve("resources"),false);}
         public RatisDatabaseRestoreController.Execution provision(RatisDatabaseRestorePlanner.Plan restored,Map<UUID,Path> operators)throws IOException{
             try {
@@ -51,7 +51,7 @@ class RatisDatabaseRestoreControllerTest {
                 var c=plan.catalogue();var epochs=new RatisSessionEpochs(client,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
                 Path targetRoot=Files.createDirectories(root.resolve("fresh-node"));SessionJournalFiles.force(targetRoot);SessionJournalFiles.force(root);
                 var base=resources.settings();int columns=Math.max(2,restored.domains().stream().mapToInt(d->d.schema().columnIds().size()).max().orElse(0));var limits=new NativeRangeImage.Limits(base.images().maxRowBytes(),base.images().maxImageBytes(),columns);var settings=new RatisNodeRuntime.Settings(limits,base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports());
-                node=RatisNodeRuntime.open(plan,targetRoot,ConfigParser.parseDefault(),epochs,routes,resources.scheduler,resources.timer,()->restored.authority().logicalTimeMillis(),settings,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,restored.domains().stream().map(RatisDatabaseRestorePlanner.Domain::schema).toList());
+                node=RatisNodeRuntime.open(plan,targetRoot,ConfigParser.parseDefault(),epochs,routes,resources.scheduler,resources.timer,()->restored.authority().logicalTimeMillis(),settings,recovering ? RatisNodeRuntime.Startup.RECOVER : RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,restored.domains().stream().map(RatisDatabaseRestorePlanner.Domain::schema).toList());
                 // Replace only network transport lookup with actual local native owner replies at the same admission boundary.
                 RatisTopologySeedRuntimeTest.field(machine(c.groupId()),"importPublicationAdmission",(RatisRangeStateMachine.ImportPublicationAdmission)command->{
                     var read=(RatisRangeImportCatalogue.ImmutableReader)key->{try{return store(c.groupId()).readCurrentPoint(c.directoryColumn(),key);}catch(Exception failure){throw new IllegalStateException(failure);}};
@@ -77,7 +77,8 @@ class RatisDatabaseRestoreControllerTest {
         public RangeImportAdmission.OwnerReceipt receipt(RangeImportDefinition definition,RangeDescriptor range,ReplicaDescriptor owner)throws IOException{var status=status(definition,range,owner);return new RangeImportAdmission.OwnerReceipt(range.groupId(),range.rangeId(),range.configurationVersion(),owner,status.receipt(),status.applied());}
         public RangeImportActivationAdmission.OwnerActivation activation(RangeImportDefinition definition,RatisRangeImportCatalogue.Head head,RangeDescriptor range,ReplicaDescriptor owner)throws IOException{var status=status(definition,range,owner);return new RangeImportActivationAdmission.OwnerActivation(range.groupId(),range.rangeId(),range.configurationVersion(),owner,RangeImportActivationAdmission.Activation.decode(status.activation().encode()),status.applied());}
         public RatisRangeImportApply.PublicationView publication(RangeImportDefinition definition)throws IOException{var c=plan.catalogue();try{return RatisRangeImportAuthority.readNative(store(c.groupId()),c.directoryColumn(),plan.clusterId(),plan.databaseId(),RatisRangeImportAuthority.Request.of(definition));}catch(Exception failure){throw new IOException(failure);}}
-        public void close()throws Exception{if(node!=null)node.close();for(var route:routes.values())route.close();resources.close();}
+        void cold()throws Exception{if(node!=null){node.close();node=null;}for(var route:routes.values())route.close();routes.clear();fake=new RatisNodeRuntimeTest.FakeServer();recovering=true;}
+        public void close()throws Exception{cold();resources.close();}
     }
     private static boolean causedBy(Throwable failure,String text){for(var current=failure;current!=null;current=current.getCause())if(current.getMessage()!=null && current.getMessage().contains(text))return true;return false;}
     @Test void independentArchiveWithOriginalDirectoriesAbsentRestoresThroughNativeImportGrantAndQualifiedReads()throws Exception{
@@ -112,6 +113,23 @@ class RatisDatabaseRestoreControllerTest {
             for(int i=0;i<1000 && restore.phase()!=RatisDatabaseRestoreController.Phase.READY;i++)restore.step(1);assertEquals(RatisDatabaseRestoreController.Phase.READY,restore.phase());var ledger=restore.issuedLedger();assertEquals(1,ledger.grants().size());var grant=ledger.grants().getFirst();var roster=new RatisDatabaseDomainRoster(target.client,restore.plan().roster().clusterId(),restore.plan().roster().databaseId(),restore.plan().catalogue()).readComplete();assertEquals(2,roster.directories().size());
             for(int n=0;n<restore.plan().domains().size();n++){var domain=restore.plan().domains().get(n);var client=new RatisLogicalClient(domain.schema(),target.routes.get(domain.schema().domainId()),ledger,grant,RatisSessionClient.Limits.defaults());assertArrayEquals(new byte[]{(byte)(11*(n+1))},client.get(n==0 ? 17 : 18,new Keys(it.cavallium.buffer.Buf.wrap(new byte[]{7}))).toByteArray());if(n==0)assertNull(client.get(99,new Keys(it.cavallium.buffer.Buf.wrap(new byte[]{7}))));}
             assertEquals(99,RatisColumnAllocation.counter(new RatisColumnAllocation(target.client,restore.plan().catalogue().groupId(),0,new byte[32],restore.plan().catalogue().directoryColumn()).readCounter()));
+        }
+    }
+
+    @Test void coldTargetReopensExactPlanGrantAndUserDataWithOriginalSourceAbsent()throws Exception {
+        Path original=root.resolve("cold-original"),archiveRoot=root.resolve("cold-archive");var source=twoDomainArchive(original,archiveRoot);Path journal=Files.createDirectory(root.resolve("cold-restore"));var membership=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"restored","localhost:19010",ReplicaDescriptor.Role.VOTER);
+        try(var archive=new RatisDatabaseBackupArchive(archiveRoot,source.definition(),source.destination());var target=new Target()) {
+            byte[] planBytes,ledgerBytes;
+            try(var restore=RatisDatabaseRestoreController.create(journal,archive,UUID.randomUUID(),List.of(membership),UUID.randomUUID(),10,target)) {
+                for(int i=0;i<1000 && restore.phase()!=RatisDatabaseRestoreController.Phase.READY;i++)restore.step(1);
+                assertEquals(RatisDatabaseRestoreController.Phase.READY,restore.phase());planBytes=restore.plan().encode();ledgerBytes=restore.issuedLedger().encode();
+            }
+            target.cold();assertFalse(Files.exists(original));
+            try(var restore=RatisDatabaseRestoreController.reopen(journal,archive,target)) {
+                assertArrayEquals(planBytes,restore.plan().encode());var ledger=restore.issuedLedger();assertArrayEquals(ledgerBytes,ledger.encode());assertEquals(RatisDatabaseRestoreController.Phase.READY,restore.phase());
+                for(int n=0;n<restore.plan().domains().size();n++) {var domain=restore.plan().domains().get(n);var routed=target.routes.get(domain.schema().domainId());assertArrayEquals(domain.finalDirectory().payloadDigest(),routed.directory().payloadDigest());var logical=new RatisLogicalClient(domain.schema(),routed,ledger,ledger.grants().getFirst(),RatisSessionClient.Limits.defaults());assertArrayEquals(new byte[]{(byte)(11*(n+1))},logical.get(n==0 ? 17 : 18,new Keys(it.cavallium.buffer.Buf.wrap(new byte[]{7}))).toByteArray());if(n==0)assertNull(logical.get(99,new Keys(it.cavallium.buffer.Buf.wrap(new byte[]{7}))));}
+                assertEquals(2,new RatisDatabaseDomainRoster(target.client,restore.plan().roster().clusterId(),restore.plan().roster().databaseId(),restore.plan().catalogue()).readComplete().directories().size());
+            }
         }
     }
 
