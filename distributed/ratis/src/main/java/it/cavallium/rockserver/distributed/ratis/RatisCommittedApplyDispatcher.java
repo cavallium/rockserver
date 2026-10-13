@@ -18,7 +18,13 @@ public final class RatisCommittedApplyDispatcher implements AutoCloseable {
     }
     public record Policy(Limits node,Limits pool) {
         public Policy {Objects.requireNonNull(node);Objects.requireNonNull(pool);}
-        public static Policy defaults(){return new Policy(new Limits(new Lane(1280L<<20,2),new Lane(1280L<<20,4),new Lane(1280L<<20,16),RatisNodePlan.MAX_LOCAL_GROUPS),new Limits(new Lane(640L<<20,1),new Lane(640L<<20,2),new Lane(640L<<20,8),RatisNodePlan.MAX_LOCAL_GROUPS));}
+        public static Policy defaults(){
+            long maximumEntry=it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES+4096;
+            long read=RatisRangeStateMachine.committedReadWeight(maximumEntry),execution=RatisRangeStateMachine.committedExecutionWeight(maximumEntry);
+            // Two maximum-size heads node-wide, one per pool; smaller heads share the bounded owner slots.
+            return new Policy(new Limits(new Lane(Math.multiplyExact(2,read),2),new Lane(Math.multiplyExact(2,execution),4),new Lane(Math.multiplyExact(2,execution),16),RatisNodePlan.MAX_LOCAL_GROUPS),
+                    new Limits(new Lane(read,1),new Lane(execution,2),new Lane(execution,8),RatisNodePlan.MAX_LOCAL_GROUPS));
+        }
     }
     public record Usage(long readBytes,int reads,long ordinaryBytes,int ordinary,long protectedBytes,int protectedOwners,int waiters) {}
     private static final class Counter {long bytes;int owners;}

@@ -14,6 +14,15 @@ class RatisCommittedApplyDispatcherTest {
     private static RatisCommittedApplyDispatcher.Limits limits(){return new RatisCommittedApplyDispatcher.Limits(new RatisCommittedApplyDispatcher.Lane(100,1),new RatisCommittedApplyDispatcher.Lane(100,1),new RatisCommittedApplyDispatcher.Lane(100,1),4);}
     private static CommittedApplyStateMachine.Descriptor descriptor(CommittedApplyStateMachine.Lane lane,long index){return new CommittedApplyStateMachine.Descriptor(1,index,1,lane,100,new byte[32],0);}
     private static RatisCommittedApplyDispatcher.Group group(RatisCommittedApplyDispatcher dispatcher,UUID id,UUID pool){return dispatcher.register(id,pool,100,100,8,entry->descriptor(CommittedApplyStateMachine.Lane.ORDINARY,entry.getIndex()));}
+    @Test void defaultEnvelopesCoverLegalColdReadAndNativePlanWithoutAnIndependentReadQuota(){
+        long entry=it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES+4096;
+        long read=RatisRangeStateMachine.committedReadWeight(entry),execution=RatisRangeStateMachine.committedExecutionWeight(entry);
+        var policy=RatisCommittedApplyDispatcher.Policy.defaults();
+        assertTrue(read>=2*entry+65536);assertTrue(execution>=2*entry+65536);
+        assertEquals(read,policy.pool().read().bytes());assertEquals(execution,policy.pool().ordinary().bytes());assertEquals(execution,policy.pool().protectedLane().bytes());
+        assertEquals(2*read,policy.node().read().bytes());assertEquals(2*execution,policy.node().ordinary().bytes());
+        try(var dispatcher=new RatisCommittedApplyDispatcher(policy.node(),Map.of(A,policy.pool()))){assertNotNull(dispatcher.register(new UUID(1,1),A,read,execution,RatisRangeStateMachine.COMMITTED_SEGMENT_BYTES,entryProto->descriptor(CommittedApplyStateMachine.Lane.ORDINARY,1)));}
+    }
     @Test void twoPoolsShareReadBoundBeforeAnyMaterialization()throws Exception {
         try(var dispatcher=new RatisCommittedApplyDispatcher(limits(),Map.of(A,limits(),B,limits()));var workers=Executors.newVirtualThreadPerTaskExecutor()){
             var a=group(dispatcher,new UUID(1,1),A);var b=group(dispatcher,new UUID(1,2),B);var read=a.awaitRead(1);var entered=new CountDownLatch(1);

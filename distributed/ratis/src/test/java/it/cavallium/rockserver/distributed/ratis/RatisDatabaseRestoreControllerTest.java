@@ -28,6 +28,7 @@ class RatisDatabaseRestoreControllerTest {
     static Message message(byte[] bytes){return Message.valueOf(ByteString.copyFrom(bytes));}
     final class Target implements RatisDatabaseRestoreController.Provisioner,RatisRangeImportController.DataPlane,AutoCloseable {
         final RatisNodeRuntimeTest.Env resources;
+        final ExecutorService controlledUpdater=Executors.newSingleThreadExecutor(Thread.ofPlatform().daemon(true).name("restore-controlled-updater").factory());
         RatisNodeRuntimeTest.FakeServer fake=new RatisNodeRuntimeTest.FakeServer();
         final Map<UUID,RatisRoutedClient> routes=new HashMap<>();
         RatisNodeRuntime node;RatisNodePlan plan;RaftClient client;RatisDatabaseRestorePlanner.Plan frozen;
@@ -72,10 +73,25 @@ class RatisDatabaseRestoreControllerTest {
         ReplicatedRangeStore store(UUID group)throws Exception{return RatisTopologySeedRuntimeTest.field(machine(group),"store",ReplicatedRangeStore.class);}
         RaftClientReply reply(UUID group,byte[] bytes){return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(group)).setCallId(1).setSuccess(true).setMessage(message(bytes)).build();}
         byte[] append(UUID group,Message message)throws Exception{
-            var machine=machine(group);var transaction=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(group)).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(message).build());if(transaction.getException()!=null)throw transaction.getException();machine.preAppendTransaction(transaction);transaction.initLogEntry(1,store(group).applied().index()+1);var reply=machine.applyTransaction(transaction).get(10,TimeUnit.SECONDS);return reply.getContent().toByteArray();
+            // Env uses a manual periodic timer. Run its actual native/free-space sampler before proposals.
+            RatisTopologySeedRuntimeTest.field(node,"poolPressure",RatisPoolPressureService.class).refresh().get(10,TimeUnit.SECONDS);
+            var machine=machine(group);var transaction=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(group)).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(message).build());if(transaction.getException()!=null)throw transaction.getException();machine.preAppendTransaction(transaction);transaction.initLogEntry(1,store(group).applied().index()+1);var reply=applyCommitted(machine,transaction);return reply.getContent().toByteArray();
+        }
+        private Message applyCommitted(RatisRangeStateMachine machine,TransactionContext transaction)throws Exception {
+            // FakeServer has no library updater: preserve its two-stage admission and pump on one owned thread.
+            return controlledUpdater.submit(()->{
+                var admission=machine.committedApplyAdmission();org.apache.ratis.server.impl.CommittedApplyStateMachine.Descriptor descriptor;
+                long index=transaction.getLogEntry().getIndex();
+                try(var read=admission.awaitRead(index)){descriptor=admission.describe(transaction.getLogEntry());}
+                var permit=admission.awaitDispatch(descriptor);admission.offer(descriptor,permit);
+                CompletableFuture<Message> result;
+                try{result=machine.applyTransaction(transaction);}finally{admission.withdraw(descriptor,permit);if(!permit.claimed())permit.close();}
+                // awaitRead pumps ready JNI continuations and waits for actual owner drainage before the next head.
+                try(var next=admission.awaitRead(index+1)){}return result.get(10,TimeUnit.SECONDS);
+            }).get(10,TimeUnit.SECONDS);
         }
         public RatisReferencedFile transfer(RangeImportDefinition definition,RatisReferencedFile.Request request,Path source)throws IOException{
-            try{long index=store(request.groupId()).applied().index()+1;var files=(RatisReferencedFiles)RatisTopologySeedRuntimeTest.field(node,"importFiles",Map.class).get(request.groupId());byte[] bytes=Files.readAllBytes(source);var entry=RatisReferencedFilesTest.entry(request.groupId(),request.clientId(),request.callId(),index,bytes,true);files.write(entry).get(10,TimeUnit.SECONDS);files.flush(index).get(10,TimeUnit.SECONDS);var machine=machine(request.groupId());var transaction=TransactionContext.newBuilder().setStateMachine(machine).setServerRole(RaftPeerRole.FOLLOWER).setLogEntry(entry).build();machine.applyTransaction(transaction).get(10,TimeUnit.SECONDS);return files.reference(1,index);}catch(Exception failure){throw new IOException(failure);}
+            try{long index=store(request.groupId()).applied().index()+1;var files=(RatisReferencedFiles)RatisTopologySeedRuntimeTest.field(node,"importFiles",Map.class).get(request.groupId());byte[] bytes=Files.readAllBytes(source);var entry=RatisReferencedFilesTest.entry(request.groupId(),request.clientId(),request.callId(),index,bytes,true);files.write(entry).get(10,TimeUnit.SECONDS);files.flush(index).get(10,TimeUnit.SECONDS);var machine=machine(request.groupId());var transaction=TransactionContext.newBuilder().setStateMachine(machine).setServerRole(RaftPeerRole.FOLLOWER).setLogEntry(entry).build();applyCommitted(machine,transaction);return files.reference(1,index);}catch(Exception failure){throw new IOException(failure);}
         }
         public NativeSstImportManifest.Receipt install(RangeImportDefinition definition,RatisRangeImportRecord.Install record)throws IOException{
             try{var machine=machine(record.groupId());machine.queryLinearizable(message(RatisRangeImportRpc.prepare(record))).get(10,TimeUnit.SECONDS);var receipt=NativeSstImportManifest.Receipt.decode(append(record.groupId(),message(record.encode())));if(loseInstall){loseInstall=false;throw new IOException("Lost actual native INSTALL reply");}return receipt;}catch(Exception failure){throw new IOException(failure);}
@@ -86,7 +102,7 @@ class RatisDatabaseRestoreControllerTest {
         public RangeImportActivationAdmission.OwnerActivation activation(RangeImportDefinition definition,RatisRangeImportCatalogue.Head head,RangeDescriptor range,ReplicaDescriptor owner)throws IOException{var status=status(definition,range,owner);return new RangeImportActivationAdmission.OwnerActivation(range.groupId(),range.rangeId(),range.configurationVersion(),owner,RangeImportActivationAdmission.Activation.decode(status.activation().encode()),status.applied());}
         public RatisRangeImportApply.PublicationView publication(RangeImportDefinition definition)throws IOException{var c=plan.catalogue();try{return RatisRangeImportAuthority.readNative(store(c.groupId()),c.directoryColumn(),plan.clusterId(),plan.databaseId(),RatisRangeImportAuthority.Request.of(definition));}catch(Exception failure){throw new IOException(failure);}}
         void cold()throws Exception{if(node!=null){node.close();node=null;}for(var route:routes.values())route.close();routes.clear();fake=new RatisNodeRuntimeTest.FakeServer();recovering=true;}
-        public void close()throws Exception{cold();resources.close();}
+        public void close()throws Exception{try{cold();resources.close();}finally{controlledUpdater.shutdown();if(!controlledUpdater.awaitTermination(10,TimeUnit.SECONDS))throw new IOException("Controlled restore updater did not drain");}}
     }
     private static boolean causedBy(Throwable failure,String text){for(var current=failure;current!=null;current=current.getCause())if(current.getMessage()!=null && current.getMessage().contains(text))return true;return false;}
     @Test void independentArchiveWithOriginalDirectoriesAbsentRestoresThroughNativeImportGrantAndQualifiedReads()throws Exception{

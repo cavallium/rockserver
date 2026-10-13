@@ -13,17 +13,23 @@ public final class RatisDurability {
         var properties = new RaftProperties();
         RaftServerConfigKeys.setStorageDir(properties, List.of(logDirectory.toFile()));
         RaftServerConfigKeys.Log.setUseMemory(properties, false);
+        // Framing streams large legal entries through this small, lifetime-owned buffer.
+        RaftServerConfigKeys.Log.setWriteBufferSize(properties, SizeInBytes.valueOf(64L * 1024));
+        RaftServerConfigKeys.Log.Appender.setBufferByteLimit(properties, SizeInBytes.valueOf(
+                it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES + 4096L));
         RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf(RatisRangeStateMachine.COMMITTED_SEGMENT_BYTES));
         RaftServerConfigKeys.Log.setUnsafeFlushEnabled(properties, false);
         RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, false);
         RaftServerConfigKeys.Log.StateMachineData.setSync(properties, true);
         RaftServerConfigKeys.Log.setQueueElementLimit(properties, 1024);
-        RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf("16MB"));
+        // Each new row reserves its data and future metadata IO tasks before append.
+        RaftServerConfigKeys.Log.Appender.setBufferElementLimit(properties,128);
+        RaftServerConfigKeys.Log.setQueueByteLimit(properties, SizeInBytes.valueOf(it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_FILE_BYTES+8192L));
         RaftServerConfigKeys.Read.setOption(properties, RaftServerConfigKeys.Read.Option.LINEARIZABLE);
         RaftServerConfigKeys.Read.setLeaderLeaseEnabled(properties, false);
         RaftServerConfigKeys.Read.setLeaderHeartbeatCheckEnabled(properties, true);
         RaftServerConfigKeys.Read.ReadIndex.setType(properties, RaftServerConfigKeys.Read.ReadIndex.Type.COMMIT_INDEX);
-        // Until portable snapshot publication is implemented, keep every log entry.
+        // Running recovery snapshots are requested locally; the updater owns publication and log purge.
         RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, false);
         return properties;
     }

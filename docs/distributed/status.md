@@ -1216,6 +1216,28 @@ range-delete and cold reopen pass together. JNI extraction uses the selected bin
 content hash rather than artifact coordinates as its cache identity. These local
 candidate checks do not establish production ABI, hardware or filesystem bounds.
 
+Shared follower intake, resident log/cache headers, actual decoder and classification
+scratch now have separate node/pool/group admission ownership. Idle append streams
+retain scalar credits; frame memory is charged on arrival. Trusted completion
+controls use a bounded protected lane before leader and follower append. Log writes
+stream through a fixed 64 KiB owned buffer, and cold reads retain their actual owners.
+A fresh filesystem sweep reconciles completed append debt separately from the longer
+bounded inventory census. Snapshot/whole-pool flush recovery is node-owned.
+
+The combined gate passes 99 distinct cases: 3 fork, 9 gRPC and 87 app/native/runtime
+cases, including actual operator installation and reopen with the private native
+candidate. The smaller-buffer/max-entry/runtime gate passes 37 cases;
+controlled restore quota/controller checks pass seven after their updater and
+manual-timer sampling follow the actual lifecycle. These fixtures do not establish
+measured throughput or real-group density. Evidence: `/tmp/rockserver-resource-scratch-and-native-final-gate.log`.
+Core native consumers pass another 21 cases; real FFM merge/cache behavior passes
+43 cases with the repaired candidate. Packaging and runtime dependency checks find
+one server fork and one gRPC fork, without upstream replacement jars at runtime.
+Native SST/table inventory now receives limits before JNI copies; standalone full
+properties remain unchanged. This establishes the tested ownership/admission paths,
+not hard filesystem containment: WAL preallocation and unbounded flush/merge output
+still require native pre-I/O enforcement and bounded recovery work.
+
 ## Remaining architecture gates
 
 - Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold
@@ -1225,9 +1247,9 @@ candidate checks do not establish production ABI, hardware or filesystem bounds.
 - Verify adoption of aggregate exports by the intended external consumers. The frontend route and controlled aggregate
   export/cleanup workflows are implemented; independent endpoint acceptance remains
   open. Controlled snapshot/CDC resynchronization is recorded above.
-- Complete shared follower intake and resident Raft-log cache bounds, learner
-  pressure/rate controls and running Raft-log/WAL runway policy. Qualify opaque native allocation bounds
-  for eager maintenance inventory where Java accounting alone is insufficient.
+- Complete learner pressure/rate controls and native pre-I/O file-growth admission.
+  Qualify bounded native CF/MANIFEST startup and recovery output; filesystem size
+  observations and declared flush headroom are not hard allocation bounds.
 - Verify all documented topology, schema, import, retirement and repair workflows
   together under the final source/configuration, then reconcile contracts and status.
 - Independent quorum/restart/fault and representative performance/resource gates

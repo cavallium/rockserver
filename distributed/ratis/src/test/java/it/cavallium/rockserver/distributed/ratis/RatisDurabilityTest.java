@@ -1,0 +1,19 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+import java.nio.file.Path;
+import it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest;
+import org.apache.ratis.server.RaftServerConfigKeys;
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class RatisDurabilityTest {
+    @Test void smallOwnedWriteBufferPreservesLegalEntryAndSynchronousDurability() {
+        var properties=RatisDurability.properties(Path.of("raft-config-fixture"));
+        assertEquals(64L*1024,RaftServerConfigKeys.Log.writeBufferSize(properties).getSize());
+        assertEquals(NativeSstImportManifest.MAX_FILE_BYTES+4096L,RaftServerConfigKeys.Log.Appender.bufferByteLimit(properties).getSize());
+        assertFalse(RaftServerConfigKeys.Log.unsafeFlushEnabled(properties));
+        assertFalse(RaftServerConfigKeys.Log.asyncFlushEnabled(properties));
+        assertTrue(RaftServerConfigKeys.Log.StateMachineData.sync(properties));
+        assertFalse(RaftServerConfigKeys.Log.StateMachineData.cachingEnabled(properties));
+    }
+}
