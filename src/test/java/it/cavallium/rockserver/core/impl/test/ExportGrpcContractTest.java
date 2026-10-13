@@ -4,9 +4,6 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import io.grpc.Status;
 import it.cavallium.rockserver.core.common.RequestContext;
-import it.cavallium.rockserver.core.common.ColumnSchema;
-import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
-import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
 import it.cavallium.rockserver.core.common.api.export.proto.*;
 import it.cavallium.rockserver.core.common.export.*;
 import it.cavallium.rockserver.core.server.ExportGrpcService;
@@ -21,34 +18,53 @@ import static org.mockito.Mockito.*;
 class ExportGrpcContractTest {
     private final UUID job = new UUID(0, 1);
     private ExportJobs.ChunkId id() { return new ExportJobs.ChunkId(job, new UUID(0, 2), new UUID(0, 3), 1, 1, 2, 0, new byte[32]); }
-    private ExportJobs.Status status() { return new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false, schemaBytes()); }
-    private byte[] schemaBytes() {
-        var column = new DistributedSchema.Column(1, new UUID(0, 10), "entries",
-                ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntList.of(8), it.unimi.dsi.fastutil.objects.ObjectList.of(), true), null);
-        return DistributedSchemaCodec.encode(new DistributedSchema(new UUID(0, 11), new UUID(0, 12),
-                new UUID(0, 13), 1, 8, List.of(column)));
+    private ExportJobs.Status status() {
+        return new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false,
+                new byte[32], 128, 0, 2, new byte[32], 64);
     }
-    @Test void statusCarriesMandatoryCanonicalFrozenSchema() throws Exception {
-        var bytes = schemaBytes();
-        var status = new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false, bytes);
-        bytes[0] ^= 1;
-        var wire = ExportStatus.parseFrom(ExportWire.status(status).toByteArray());
+    @Test void statusCarriesMandatoryDefinitionAndOptionalCaptureSummaries() throws Exception {
+        var value = status();
+        var wire = ExportStatus.parseFrom(ExportWire.status(value).toByteArray());
         var decoded = ExportWire.status(wire);
-        assertEquals(status, decoded);
-        assertArrayEquals(schemaBytes(), decoded.schemaBytes());
-        assertArrayEquals(DistributedSchemaCodec.decode(schemaBytes()).digest(), decoded.decodedSchema().digest());
-        var exposed = decoded.schemaBytes(); exposed[0] ^= 1;
-        assertArrayEquals(schemaBytes(), decoded.schemaBytes());
-        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().clearSchema().build()));
-        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().clearColumns().addColumns(2L).build()));
-        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(-1L), 1, 0, 0, 0, false, schemaBytes()));
-        var tampered = schemaBytes(); tampered[0] ^= 1;
-        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setSchema(ByteString.copyFrom(tampered)).build()));
-        var trailing = java.util.Arrays.copyOf(schemaBytes(), schemaBytes().length + 1);
-        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setSchema(ByteString.copyFrom(trailing)).build()));
-        var oversized = ByteString.copyFrom(new byte[DistributedSchemaCodec.MAX_BYTES + 1]);
-        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setSchema(oversized).build()));
-        assertThrows(NullPointerException.class, () -> new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false, null));
+        assertEquals(value, decoded); assertEquals(value.hashCode(), decoded.hashCode());
+        var exposed = decoded.definitionDigest(); exposed[0] ^= 1;
+        assertArrayEquals(new byte[32], decoded.definitionDigest());
+        exposed = decoded.captureDigest(); exposed[0] ^= 1;
+        assertArrayEquals(new byte[32], decoded.captureDigest());
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().clearDefinitionDigest().build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setDefinitionDigest(ByteString.copyFrom(new byte[33])).build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setDefinitionBytes(0).build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setDefinitionBytes(ExportJobs.MAX_WITNESS_BYTES+1L).build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setRosterGeneration(-1).build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setDomainCount(65).build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().clearCaptureDigest().build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setCaptureBytes(0).build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().clearCaptureDigest().setCaptureBytes(0).build()));
+        var capturing = wire.toBuilder().setPhase(ExportPhase.CAPTURING).clearCaptureDigest().setCaptureBytes(0).build();
+        assertArrayEquals(new byte[0], ExportWire.status(capturing).captureDigest());
+    }
+    @Test void witnessPagesRoundTripAndRequireExactIdentityAndProgress() throws Exception {
+        var request = new ExportJobs.WitnessRequest(job, ExportJobs.WitnessKind.DEFINITION, new byte[32], 3, ExportJobs.MIN_PAGE_BYTES);
+        assertEquals(request, ExportWire.witnessRequest(ExportWitnessRequest.parseFrom(ExportWire.witnessRequest(request).toByteArray())));
+        var page = new ExportJobs.WitnessPage(job, request.kind(), request.expectedDigest(), 8, 3, new byte[]{1,2,3}, true);
+        var wire = ExportWitnessPage.parseFrom(ExportWire.witness(page, request).toByteArray());
+        assertEquals(page, ExportWire.witness(wire, request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setJobId(ExportWire.uuid(new UUID(1,1))).build(), request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setKind(ExportWitnessKind.CAPTURES).build(), request));
+        var wrong = new byte[32]; wrong[0]=1;
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setDigest(ByteString.copyFrom(wrong)).build(), request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setOffset(4).build(), request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setHasMore(false).build(), request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().clearData().build(), request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setData(ByteString.copyFrom(new byte[request.maximumBytes()+1])).build(), request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setTotalBytes(ExportJobs.MAX_WITNESS_BYTES+1L).build(), request));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.witness(wire.toBuilder().setKindValue(10).build(), request));
+        var backend = mock(ExportAsyncAPI.class);
+        when(backend.exportWitness(eq(request), any())).thenReturn(CompletableFuture.completedFuture(page));
+        assertEquals(wire, new ExportGrpcService(backend).exportWitness(ExportWire.witnessRequest(request)).block());
+        when(backend.exportWitness(eq(request), any())).thenReturn(CompletableFuture.completedFuture(
+                new ExportJobs.WitnessPage(job, ExportJobs.WitnessKind.CAPTURES, request.expectedDigest(), 8, 3, new byte[]{1,2,3}, true)));
+        assertStatus(Status.Code.INVALID_ARGUMENT, () -> new ExportGrpcService(backend).exportWitness(ExportWire.witnessRequest(request)).block());
     }
     @Test void pathFreeRoundTripPreservesSignedIdsAndBoundPresence() throws Exception {
         var create = new ExportJobs.Create(job, List.of(Long.MIN_VALUE, -1L, Long.MAX_VALUE), ExportJobs.Limits.defaults());
@@ -71,6 +87,12 @@ class ExportGrpcContractTest {
         assertStatus(Status.Code.INVALID_ARGUMENT, () -> service.exportStatus(ExportJobRequest.newBuilder().setJobId(ByteString.copyFrom(new byte[17])).build()).block());
         assertStatus(Status.Code.INVALID_ARGUMENT, () -> service.acknowledgeExport(ExportAcknowledgeRequest.newBuilder()
                 .setId(ExportWire.id(id()).toBuilder().setContentHash(ByteString.copyFrom(new byte[33]))).build()).block());
+        assertStatus(Status.Code.INVALID_ARGUMENT, () -> service.exportWitness(ExportWitnessRequest.newBuilder()
+                .setJobId(ExportWire.uuid(job)).setExpectedDigest(ByteString.copyFrom(new byte[32]))
+                .setMaximumBytes(ExportJobs.MIN_PAGE_BYTES - 1).build()).block());
+        assertStatus(Status.Code.INVALID_ARGUMENT, () -> service.exportWitness(ExportWitnessRequest.newBuilder()
+                .setJobId(ExportWire.uuid(job)).setExpectedDigest(ByteString.copyFrom(new byte[33]))
+                .setMaximumBytes(ExportJobs.MIN_PAGE_BYTES).build()).block());
         verifyNoInteractions(backend);
     }
     @Test void cancellationOnlyDiscardsCreateObservationAndRetryCanObserveJob() {
@@ -159,7 +181,7 @@ class ExportGrpcContractTest {
         var bounded = implementation.bindBoundedService();
         assertEquals(generated.getServiceDescriptor().getName(), bounded.getServiceDescriptor().getName());
         assertSame(generated.getServiceDescriptor().getSchemaDescriptor(), bounded.getServiceDescriptor().getSchemaDescriptor());
-        assertEquals(10, bounded.getMethods().size());
+        assertEquals(11, bounded.getMethods().size());
         for (var original : generated.getMethods()) {
             var descriptor = original.getMethodDescriptor();
             var wrapped = bounded.getMethod(descriptor.getFullMethodName()).getMethodDescriptor();

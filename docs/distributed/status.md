@@ -1186,6 +1186,36 @@ cannot export/install USER images; their adapter snapshots are disabled until th
 appropriate recovery/retirement workflow exists. No server sockets or quorum were exercised.
 Relocation currently admits preparation/abort while its source stays writable.
 
+The node frontend now attaches the aggregate export API. A parent freezes the
+complete database roster, selected columns and schemas, forces all native cohort
+capture tokens before HOME reports, and publishes bounded paged definition and
+capture witnesses. Children share the original native capture graph and settle
+remote writers before releasing it. Capture and cohort cleanup compose actual
+futures under scheduler pressure; routed client leases and bounded retirement
+remain owned through actual completion. Controlled validation covers 73 distinct
+Ratis cases and 27 public gRPC/Thrift/core cases. The runtime cleanup case restarts
+the exclusive node root and advances current directories before retrying original
+cleanup, with no recapture or new grants. A further cold-recovery fixture reconstructs the factory after actual node shutdown,
+preserves the original forced capture graph and refuses to recreate missing bound
+snapshot journals. Cleanup and release retain the original grants and tokens after
+current directories advance. Independent-node acceptance remains open.
+Evidence: `/tmp/rockserver-native-callers-ownership-and-cold-factory-gate.log`
+(28 core/Ratis cases, including both cold-cleanup cases),
+`/tmp/rockserver-native-export-pool-interaction-gate.log` (21 client/export cases),
+`/tmp/rockserver-aggregate-gone-and-pool-final-gate.log`,
+`/tmp/rockserver-aggregate-async-consumer-regression.log` with repaired backup/capture
+cases in `/tmp/rockserver-aggregate-backup-typed-validation-gate.log`, and
+`/tmp/rockserver-aggregate-public-protocol-final-gate.log`.
+
+Bounded native SST inventory and scalar table qualification now precede JNI copies
+and reject excessive file/property/key inventory. The same Debug native candidate
+passes import, archive and selective-compaction checks. Range iterators use the
+retained owning database wrapper so closing them releases native references; atomic
+range-delete writes retain the required base database. Import, historical snapshot,
+range-delete and cold reopen pass together. JNI extraction uses the selected binary
+content hash rather than artifact coordinates as its cache identity. These local
+candidate checks do not establish production ABI, hardware or filesystem bounds.
+
 Shared follower intake, resident log/cache headers, actual decoder and classification
 scratch now have separate node/pool/group admission ownership. Idle append streams
 retain scalar credits; frame memory is charged on arrival. Trusted completion
@@ -1207,6 +1237,21 @@ Native SST/table inventory now receives limits before JNI copies; standalone ful
 properties remain unchanged. This establishes the tested ownership/admission paths,
 not hard filesystem containment: WAL preallocation and unbounded flush/merge output
 still require native pre-I/O enforcement and bounded recovery work.
+
+Snapshot/export metadata now composes actual asynchronous Ratis operations through
+HOME reads/CAS, gate install, readiness, report, capture and release. Each pooled
+client lease remains owned through its actual reply; durable intent/known-result
+forcing and cleanup retain their original identities beyond observer cancellation.
+A same-client STATE barrier discovers a frozen voter before the single WRITE.
+Only READ and Ratis's exact no-effect WATCH handshake have bounded discovery retries;
+a WRITE failure remains an unknown outcome. Malformed capture replies persist loss,
+and frozen cleanup views forward only original guarded release operations.
+
+The combined native regression gate passes 104 cases, including held metadata under
+scheduler pressure, cold leader discovery, post-barrier WRITE loss without retry,
+capture-loss/ABORT replay, borrowed cleanup ownership, backup/export and fresh-factory
+recovery. Evidence: `/tmp/rockserver-async-metadata-combined-acceptance-gate.log`.
+No network listener, independent quorum or external-consumer acceptance is established.
 
 Learner migration now shares configured node/pool byte rates and finite ownership
 across source-image preparation, snapshot chunks and outgoing listener log tails.
@@ -1230,10 +1275,9 @@ controlled correctness/resource evidence, not measured throughput or quorum dens
   artifact quotas against the architecture. Controlled restore quota/unknown-force,
   durable ownership claims and custom proof accounting checks are recorded above;
   they do not prove the full resource envelope.
-- Compose the production frontend export backend: the current node launcher
-  creates the database connection but does not attach the public export route.
-  Establish adoption by the intended external consumers. Controlled snapshot/CDC
-  resynchronization and public frozen-schema export migration are recorded above.
+- Verify adoption of aggregate exports by the intended external consumers. The frontend route and controlled aggregate
+  export/cleanup workflows are implemented; independent endpoint acceptance remains
+  open. Controlled snapshot/CDC resynchronization is recorded above.
 - Complete native pre-I/O file-growth admission and its application ownership wiring.
   Qualify bounded native CF/MANIFEST startup and recovery output; filesystem size
   observations and declared flush headroom are not hard allocation bounds.

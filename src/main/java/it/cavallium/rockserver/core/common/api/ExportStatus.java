@@ -18,7 +18,12 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
   private static final org.apache.thrift.protocol.TField ACKNOWLEDGED_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("acknowledgedCount", org.apache.thrift.protocol.TType.I32, (short)6);
   private static final org.apache.thrift.protocol.TField FILE_BYTES_FIELD_DESC = new org.apache.thrift.protocol.TField("fileBytes", org.apache.thrift.protocol.TType.I64, (short)7);
   private static final org.apache.thrift.protocol.TField CLEANUP_PENDING_FIELD_DESC = new org.apache.thrift.protocol.TField("cleanupPending", org.apache.thrift.protocol.TType.BOOL, (short)8);
-  private static final org.apache.thrift.protocol.TField SCHEMA_FIELD_DESC = new org.apache.thrift.protocol.TField("schema", org.apache.thrift.protocol.TType.STRING, (short)9);
+  private static final org.apache.thrift.protocol.TField DEFINITION_DIGEST_FIELD_DESC = new org.apache.thrift.protocol.TField("definitionDigest", org.apache.thrift.protocol.TType.STRING, (short)9);
+  private static final org.apache.thrift.protocol.TField DEFINITION_BYTES_FIELD_DESC = new org.apache.thrift.protocol.TField("definitionBytes", org.apache.thrift.protocol.TType.I64, (short)10);
+  private static final org.apache.thrift.protocol.TField ROSTER_GENERATION_FIELD_DESC = new org.apache.thrift.protocol.TField("rosterGeneration", org.apache.thrift.protocol.TType.I64, (short)11);
+  private static final org.apache.thrift.protocol.TField DOMAIN_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("domainCount", org.apache.thrift.protocol.TType.I32, (short)12);
+  private static final org.apache.thrift.protocol.TField CAPTURE_DIGEST_FIELD_DESC = new org.apache.thrift.protocol.TField("captureDigest", org.apache.thrift.protocol.TType.STRING, (short)13);
+  private static final org.apache.thrift.protocol.TField CAPTURE_BYTES_FIELD_DESC = new org.apache.thrift.protocol.TField("captureBytes", org.apache.thrift.protocol.TType.I64, (short)14);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new ExportStatusStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new ExportStatusTupleSchemeFactory();
@@ -35,7 +40,12 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
   public int acknowledgedCount; // required
   public long fileBytes; // required
   public boolean cleanupPending; // required
-  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer schema; // required
+  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer definitionDigest; // required
+  public long definitionBytes; // required
+  public long rosterGeneration; // required
+  public int domainCount; // required
+  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer captureDigest; // required
+  public long captureBytes; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -51,7 +61,12 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     ACKNOWLEDGED_COUNT((short)6, "acknowledgedCount"),
     FILE_BYTES((short)7, "fileBytes"),
     CLEANUP_PENDING((short)8, "cleanupPending"),
-    SCHEMA((short)9, "schema");
+    DEFINITION_DIGEST((short)9, "definitionDigest"),
+    DEFINITION_BYTES((short)10, "definitionBytes"),
+    ROSTER_GENERATION((short)11, "rosterGeneration"),
+    DOMAIN_COUNT((short)12, "domainCount"),
+    CAPTURE_DIGEST((short)13, "captureDigest"),
+    CAPTURE_BYTES((short)14, "captureBytes");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -83,8 +98,18 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
           return FILE_BYTES;
         case 8: // CLEANUP_PENDING
           return CLEANUP_PENDING;
-        case 9: // SCHEMA
-          return SCHEMA;
+        case 9: // DEFINITION_DIGEST
+          return DEFINITION_DIGEST;
+        case 10: // DEFINITION_BYTES
+          return DEFINITION_BYTES;
+        case 11: // ROSTER_GENERATION
+          return ROSTER_GENERATION;
+        case 12: // DOMAIN_COUNT
+          return DOMAIN_COUNT;
+        case 13: // CAPTURE_DIGEST
+          return CAPTURE_DIGEST;
+        case 14: // CAPTURE_BYTES
+          return CAPTURE_BYTES;
         default:
           return null;
       }
@@ -133,7 +158,11 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
   private static final int __ACKNOWLEDGEDCOUNT_ISSET_ID = 2;
   private static final int __FILEBYTES_ISSET_ID = 3;
   private static final int __CLEANUPPENDING_ISSET_ID = 4;
-  private byte __isset_bitfield = 0;
+  private static final int __DEFINITIONBYTES_ISSET_ID = 5;
+  private static final int __ROSTERGENERATION_ISSET_ID = 6;
+  private static final int __DOMAINCOUNT_ISSET_ID = 7;
+  private static final int __CAPTUREBYTES_ISSET_ID = 8;
+  private short __isset_bitfield = 0;
   public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
   static {
     java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
@@ -154,8 +183,18 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     tmpMap.put(_Fields.CLEANUP_PENDING, new org.apache.thrift.meta_data.FieldMetaData("cleanupPending", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
-    tmpMap.put(_Fields.SCHEMA, new org.apache.thrift.meta_data.FieldMetaData("schema", org.apache.thrift.TFieldRequirementType.REQUIRED,
+    tmpMap.put(_Fields.DEFINITION_DIGEST, new org.apache.thrift.meta_data.FieldMetaData("definitionDigest", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
+    tmpMap.put(_Fields.DEFINITION_BYTES, new org.apache.thrift.meta_data.FieldMetaData("definitionBytes", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+    tmpMap.put(_Fields.ROSTER_GENERATION, new org.apache.thrift.meta_data.FieldMetaData("rosterGeneration", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
+    tmpMap.put(_Fields.DOMAIN_COUNT, new org.apache.thrift.meta_data.FieldMetaData("domainCount", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I32)));
+    tmpMap.put(_Fields.CAPTURE_DIGEST, new org.apache.thrift.meta_data.FieldMetaData("captureDigest", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
+    tmpMap.put(_Fields.CAPTURE_BYTES, new org.apache.thrift.meta_data.FieldMetaData("captureBytes", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(ExportStatus.class, metaDataMap);
   }
@@ -172,7 +211,12 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     int acknowledgedCount,
     long fileBytes,
     boolean cleanupPending,
-    java.nio.ByteBuffer schema)
+    java.nio.ByteBuffer definitionDigest,
+    long definitionBytes,
+    long rosterGeneration,
+    int domainCount,
+    java.nio.ByteBuffer captureDigest,
+    long captureBytes)
   {
     this();
     this.jobId = org.apache.thrift.TBaseHelper.copyBinary(jobId);
@@ -188,7 +232,16 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     setFileBytesIsSet(true);
     this.cleanupPending = cleanupPending;
     setCleanupPendingIsSet(true);
-    this.schema = org.apache.thrift.TBaseHelper.copyBinary(schema);
+    this.definitionDigest = org.apache.thrift.TBaseHelper.copyBinary(definitionDigest);
+    this.definitionBytes = definitionBytes;
+    setDefinitionBytesIsSet(true);
+    this.rosterGeneration = rosterGeneration;
+    setRosterGenerationIsSet(true);
+    this.domainCount = domainCount;
+    setDomainCountIsSet(true);
+    this.captureDigest = org.apache.thrift.TBaseHelper.copyBinary(captureDigest);
+    this.captureBytes = captureBytes;
+    setCaptureBytesIsSet(true);
   }
 
   /**
@@ -211,9 +264,16 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     this.acknowledgedCount = other.acknowledgedCount;
     this.fileBytes = other.fileBytes;
     this.cleanupPending = other.cleanupPending;
-    if (other.isSetSchema()) {
-      this.schema = org.apache.thrift.TBaseHelper.copyBinary(other.schema);
+    if (other.isSetDefinitionDigest()) {
+      this.definitionDigest = org.apache.thrift.TBaseHelper.copyBinary(other.definitionDigest);
     }
+    this.definitionBytes = other.definitionBytes;
+    this.rosterGeneration = other.rosterGeneration;
+    this.domainCount = other.domainCount;
+    if (other.isSetCaptureDigest()) {
+      this.captureDigest = org.apache.thrift.TBaseHelper.copyBinary(other.captureDigest);
+    }
+    this.captureBytes = other.captureBytes;
   }
 
   @Override
@@ -236,7 +296,16 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     this.fileBytes = 0;
     setCleanupPendingIsSet(false);
     this.cleanupPending = false;
-    this.schema = null;
+    this.definitionDigest = null;
+    setDefinitionBytesIsSet(false);
+    this.definitionBytes = 0;
+    setRosterGenerationIsSet(false);
+    this.rosterGeneration = 0;
+    setDomainCountIsSet(false);
+    this.domainCount = 0;
+    this.captureDigest = null;
+    setCaptureBytesIsSet(false);
+    this.captureBytes = 0;
   }
 
   public byte[] getJobId() {
@@ -462,38 +531,164 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __CLEANUPPENDING_ISSET_ID, value);
   }
 
-  public byte[] getSchema() {
-    setSchema(org.apache.thrift.TBaseHelper.rightSize(schema));
-    return schema == null ? null : schema.array();
+  public byte[] getDefinitionDigest() {
+    setDefinitionDigest(org.apache.thrift.TBaseHelper.rightSize(definitionDigest));
+    return definitionDigest == null ? null : definitionDigest.array();
   }
 
-  public java.nio.ByteBuffer bufferForSchema() {
-    return org.apache.thrift.TBaseHelper.copyBinary(schema);
+  public java.nio.ByteBuffer bufferForDefinitionDigest() {
+    return org.apache.thrift.TBaseHelper.copyBinary(definitionDigest);
   }
 
-  public ExportStatus setSchema(byte[] schema) {
-    this.schema = schema == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(schema.clone());
+  public ExportStatus setDefinitionDigest(byte[] definitionDigest) {
+    this.definitionDigest = definitionDigest == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(definitionDigest.clone());
     return this;
   }
 
-  public ExportStatus setSchema(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer schema) {
-    this.schema = org.apache.thrift.TBaseHelper.copyBinary(schema);
+  public ExportStatus setDefinitionDigest(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer definitionDigest) {
+    this.definitionDigest = org.apache.thrift.TBaseHelper.copyBinary(definitionDigest);
     return this;
   }
 
-  public void unsetSchema() {
-    this.schema = null;
+  public void unsetDefinitionDigest() {
+    this.definitionDigest = null;
   }
 
-  /** Returns true if field schema is set (has been assigned a value) and false otherwise */
-  public boolean isSetSchema() {
-    return this.schema != null;
+  /** Returns true if field definitionDigest is set (has been assigned a value) and false otherwise */
+  public boolean isSetDefinitionDigest() {
+    return this.definitionDigest != null;
   }
 
-  public void setSchemaIsSet(boolean value) {
+  public void setDefinitionDigestIsSet(boolean value) {
     if (!value) {
-      this.schema = null;
+      this.definitionDigest = null;
     }
+  }
+
+  public long getDefinitionBytes() {
+    return this.definitionBytes;
+  }
+
+  public ExportStatus setDefinitionBytes(long definitionBytes) {
+    this.definitionBytes = definitionBytes;
+    setDefinitionBytesIsSet(true);
+    return this;
+  }
+
+  public void unsetDefinitionBytes() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __DEFINITIONBYTES_ISSET_ID);
+  }
+
+  /** Returns true if field definitionBytes is set (has been assigned a value) and false otherwise */
+  public boolean isSetDefinitionBytes() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __DEFINITIONBYTES_ISSET_ID);
+  }
+
+  public void setDefinitionBytesIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __DEFINITIONBYTES_ISSET_ID, value);
+  }
+
+  public long getRosterGeneration() {
+    return this.rosterGeneration;
+  }
+
+  public ExportStatus setRosterGeneration(long rosterGeneration) {
+    this.rosterGeneration = rosterGeneration;
+    setRosterGenerationIsSet(true);
+    return this;
+  }
+
+  public void unsetRosterGeneration() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __ROSTERGENERATION_ISSET_ID);
+  }
+
+  /** Returns true if field rosterGeneration is set (has been assigned a value) and false otherwise */
+  public boolean isSetRosterGeneration() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __ROSTERGENERATION_ISSET_ID);
+  }
+
+  public void setRosterGenerationIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __ROSTERGENERATION_ISSET_ID, value);
+  }
+
+  public int getDomainCount() {
+    return this.domainCount;
+  }
+
+  public ExportStatus setDomainCount(int domainCount) {
+    this.domainCount = domainCount;
+    setDomainCountIsSet(true);
+    return this;
+  }
+
+  public void unsetDomainCount() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __DOMAINCOUNT_ISSET_ID);
+  }
+
+  /** Returns true if field domainCount is set (has been assigned a value) and false otherwise */
+  public boolean isSetDomainCount() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __DOMAINCOUNT_ISSET_ID);
+  }
+
+  public void setDomainCountIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __DOMAINCOUNT_ISSET_ID, value);
+  }
+
+  public byte[] getCaptureDigest() {
+    setCaptureDigest(org.apache.thrift.TBaseHelper.rightSize(captureDigest));
+    return captureDigest == null ? null : captureDigest.array();
+  }
+
+  public java.nio.ByteBuffer bufferForCaptureDigest() {
+    return org.apache.thrift.TBaseHelper.copyBinary(captureDigest);
+  }
+
+  public ExportStatus setCaptureDigest(byte[] captureDigest) {
+    this.captureDigest = captureDigest == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(captureDigest.clone());
+    return this;
+  }
+
+  public ExportStatus setCaptureDigest(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer captureDigest) {
+    this.captureDigest = org.apache.thrift.TBaseHelper.copyBinary(captureDigest);
+    return this;
+  }
+
+  public void unsetCaptureDigest() {
+    this.captureDigest = null;
+  }
+
+  /** Returns true if field captureDigest is set (has been assigned a value) and false otherwise */
+  public boolean isSetCaptureDigest() {
+    return this.captureDigest != null;
+  }
+
+  public void setCaptureDigestIsSet(boolean value) {
+    if (!value) {
+      this.captureDigest = null;
+    }
+  }
+
+  public long getCaptureBytes() {
+    return this.captureBytes;
+  }
+
+  public ExportStatus setCaptureBytes(long captureBytes) {
+    this.captureBytes = captureBytes;
+    setCaptureBytesIsSet(true);
+    return this;
+  }
+
+  public void unsetCaptureBytes() {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.clearBit(__isset_bitfield, __CAPTUREBYTES_ISSET_ID);
+  }
+
+  /** Returns true if field captureBytes is set (has been assigned a value) and false otherwise */
+  public boolean isSetCaptureBytes() {
+    return org.apache.thrift.EncodingUtils.testBit(__isset_bitfield, __CAPTUREBYTES_ISSET_ID);
+  }
+
+  public void setCaptureBytesIsSet(boolean value) {
+    __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __CAPTUREBYTES_ISSET_ID, value);
   }
 
   @Override
@@ -567,15 +762,59 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       }
       break;
 
-    case SCHEMA:
+    case DEFINITION_DIGEST:
       if (value == null) {
-        unsetSchema();
+        unsetDefinitionDigest();
       } else {
         if (value instanceof byte[]) {
-          setSchema((byte[])value);
+          setDefinitionDigest((byte[])value);
         } else {
-          setSchema((java.nio.ByteBuffer)value);
+          setDefinitionDigest((java.nio.ByteBuffer)value);
         }
+      }
+      break;
+
+    case DEFINITION_BYTES:
+      if (value == null) {
+        unsetDefinitionBytes();
+      } else {
+        setDefinitionBytes((java.lang.Long)value);
+      }
+      break;
+
+    case ROSTER_GENERATION:
+      if (value == null) {
+        unsetRosterGeneration();
+      } else {
+        setRosterGeneration((java.lang.Long)value);
+      }
+      break;
+
+    case DOMAIN_COUNT:
+      if (value == null) {
+        unsetDomainCount();
+      } else {
+        setDomainCount((java.lang.Integer)value);
+      }
+      break;
+
+    case CAPTURE_DIGEST:
+      if (value == null) {
+        unsetCaptureDigest();
+      } else {
+        if (value instanceof byte[]) {
+          setCaptureDigest((byte[])value);
+        } else {
+          setCaptureDigest((java.nio.ByteBuffer)value);
+        }
+      }
+      break;
+
+    case CAPTURE_BYTES:
+      if (value == null) {
+        unsetCaptureBytes();
+      } else {
+        setCaptureBytes((java.lang.Long)value);
       }
       break;
 
@@ -610,8 +849,23 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     case CLEANUP_PENDING:
       return isCleanupPending();
 
-    case SCHEMA:
-      return getSchema();
+    case DEFINITION_DIGEST:
+      return getDefinitionDigest();
+
+    case DEFINITION_BYTES:
+      return getDefinitionBytes();
+
+    case ROSTER_GENERATION:
+      return getRosterGeneration();
+
+    case DOMAIN_COUNT:
+      return getDomainCount();
+
+    case CAPTURE_DIGEST:
+      return getCaptureDigest();
+
+    case CAPTURE_BYTES:
+      return getCaptureBytes();
 
     }
     throw new java.lang.IllegalStateException();
@@ -641,8 +895,18 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       return isSetFileBytes();
     case CLEANUP_PENDING:
       return isSetCleanupPending();
-    case SCHEMA:
-      return isSetSchema();
+    case DEFINITION_DIGEST:
+      return isSetDefinitionDigest();
+    case DEFINITION_BYTES:
+      return isSetDefinitionBytes();
+    case ROSTER_GENERATION:
+      return isSetRosterGeneration();
+    case DOMAIN_COUNT:
+      return isSetDomainCount();
+    case CAPTURE_DIGEST:
+      return isSetCaptureDigest();
+    case CAPTURE_BYTES:
+      return isSetCaptureBytes();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -732,12 +996,57 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
         return false;
     }
 
-    boolean this_present_schema = true && this.isSetSchema();
-    boolean that_present_schema = true && that.isSetSchema();
-    if (this_present_schema || that_present_schema) {
-      if (!(this_present_schema && that_present_schema))
+    boolean this_present_definitionDigest = true && this.isSetDefinitionDigest();
+    boolean that_present_definitionDigest = true && that.isSetDefinitionDigest();
+    if (this_present_definitionDigest || that_present_definitionDigest) {
+      if (!(this_present_definitionDigest && that_present_definitionDigest))
         return false;
-      if (!this.schema.equals(that.schema))
+      if (!this.definitionDigest.equals(that.definitionDigest))
+        return false;
+    }
+
+    boolean this_present_definitionBytes = true;
+    boolean that_present_definitionBytes = true;
+    if (this_present_definitionBytes || that_present_definitionBytes) {
+      if (!(this_present_definitionBytes && that_present_definitionBytes))
+        return false;
+      if (this.definitionBytes != that.definitionBytes)
+        return false;
+    }
+
+    boolean this_present_rosterGeneration = true;
+    boolean that_present_rosterGeneration = true;
+    if (this_present_rosterGeneration || that_present_rosterGeneration) {
+      if (!(this_present_rosterGeneration && that_present_rosterGeneration))
+        return false;
+      if (this.rosterGeneration != that.rosterGeneration)
+        return false;
+    }
+
+    boolean this_present_domainCount = true;
+    boolean that_present_domainCount = true;
+    if (this_present_domainCount || that_present_domainCount) {
+      if (!(this_present_domainCount && that_present_domainCount))
+        return false;
+      if (this.domainCount != that.domainCount)
+        return false;
+    }
+
+    boolean this_present_captureDigest = true && this.isSetCaptureDigest();
+    boolean that_present_captureDigest = true && that.isSetCaptureDigest();
+    if (this_present_captureDigest || that_present_captureDigest) {
+      if (!(this_present_captureDigest && that_present_captureDigest))
+        return false;
+      if (!this.captureDigest.equals(that.captureDigest))
+        return false;
+    }
+
+    boolean this_present_captureBytes = true;
+    boolean that_present_captureBytes = true;
+    if (this_present_captureBytes || that_present_captureBytes) {
+      if (!(this_present_captureBytes && that_present_captureBytes))
+        return false;
+      if (this.captureBytes != that.captureBytes)
         return false;
     }
 
@@ -770,9 +1079,21 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
 
     hashCode = hashCode * 8191 + ((cleanupPending) ? 131071 : 524287);
 
-    hashCode = hashCode * 8191 + ((isSetSchema()) ? 131071 : 524287);
-    if (isSetSchema())
-      hashCode = hashCode * 8191 + schema.hashCode();
+    hashCode = hashCode * 8191 + ((isSetDefinitionDigest()) ? 131071 : 524287);
+    if (isSetDefinitionDigest())
+      hashCode = hashCode * 8191 + definitionDigest.hashCode();
+
+    hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(definitionBytes);
+
+    hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(rosterGeneration);
+
+    hashCode = hashCode * 8191 + domainCount;
+
+    hashCode = hashCode * 8191 + ((isSetCaptureDigest()) ? 131071 : 524287);
+    if (isSetCaptureDigest())
+      hashCode = hashCode * 8191 + captureDigest.hashCode();
+
+    hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(captureBytes);
 
     return hashCode;
   }
@@ -865,12 +1186,62 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
         return lastComparison;
       }
     }
-    lastComparison = java.lang.Boolean.compare(isSetSchema(), other.isSetSchema());
+    lastComparison = java.lang.Boolean.compare(isSetDefinitionDigest(), other.isSetDefinitionDigest());
     if (lastComparison != 0) {
       return lastComparison;
     }
-    if (isSetSchema()) {
-      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.schema, other.schema);
+    if (isSetDefinitionDigest()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.definitionDigest, other.definitionDigest);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetDefinitionBytes(), other.isSetDefinitionBytes());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetDefinitionBytes()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.definitionBytes, other.definitionBytes);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetRosterGeneration(), other.isSetRosterGeneration());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetRosterGeneration()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.rosterGeneration, other.rosterGeneration);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetDomainCount(), other.isSetDomainCount());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetDomainCount()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.domainCount, other.domainCount);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetCaptureDigest(), other.isSetCaptureDigest());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetCaptureDigest()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.captureDigest, other.captureDigest);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
+    lastComparison = java.lang.Boolean.compare(isSetCaptureBytes(), other.isSetCaptureBytes());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetCaptureBytes()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.captureBytes, other.captureBytes);
       if (lastComparison != 0) {
         return lastComparison;
       }
@@ -943,12 +1314,36 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     sb.append(this.cleanupPending);
     first = false;
     if (!first) sb.append(", ");
-    sb.append("schema:");
-    if (this.schema == null) {
+    sb.append("definitionDigest:");
+    if (this.definitionDigest == null) {
       sb.append("null");
     } else {
-      org.apache.thrift.TBaseHelper.toString(this.schema, sb);
+      org.apache.thrift.TBaseHelper.toString(this.definitionDigest, sb);
     }
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("definitionBytes:");
+    sb.append(this.definitionBytes);
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("rosterGeneration:");
+    sb.append(this.rosterGeneration);
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("domainCount:");
+    sb.append(this.domainCount);
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("captureDigest:");
+    if (this.captureDigest == null) {
+      sb.append("null");
+    } else {
+      org.apache.thrift.TBaseHelper.toString(this.captureDigest, sb);
+    }
+    first = false;
+    if (!first) sb.append(", ");
+    sb.append("captureBytes:");
+    sb.append(this.captureBytes);
     first = false;
     sb.append(")");
     return sb.toString();
@@ -970,9 +1365,16 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     // alas, we cannot check 'acknowledgedCount' because it's a primitive and you chose the non-beans generator.
     // alas, we cannot check 'fileBytes' because it's a primitive and you chose the non-beans generator.
     // alas, we cannot check 'cleanupPending' because it's a primitive and you chose the non-beans generator.
-    if (schema == null) {
-      throw new org.apache.thrift.protocol.TProtocolException("Required field 'schema' was not present! Struct: " + toString());
+    if (definitionDigest == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'definitionDigest' was not present! Struct: " + toString());
     }
+    // alas, we cannot check 'definitionBytes' because it's a primitive and you chose the non-beans generator.
+    // alas, we cannot check 'rosterGeneration' because it's a primitive and you chose the non-beans generator.
+    // alas, we cannot check 'domainCount' because it's a primitive and you chose the non-beans generator.
+    if (captureDigest == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'captureDigest' was not present! Struct: " + toString());
+    }
+    // alas, we cannot check 'captureBytes' because it's a primitive and you chose the non-beans generator.
     // check for sub-struct validity
   }
 
@@ -1088,10 +1490,50 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
-          case 9: // SCHEMA
+          case 9: // DEFINITION_DIGEST
             if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
-              struct.schema = iprot.readBinary();
-              struct.setSchemaIsSet(true);
+              struct.definitionDigest = iprot.readBinary();
+              struct.setDefinitionDigestIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 10: // DEFINITION_BYTES
+            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+              struct.definitionBytes = iprot.readI64();
+              struct.setDefinitionBytesIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 11: // ROSTER_GENERATION
+            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+              struct.rosterGeneration = iprot.readI64();
+              struct.setRosterGenerationIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 12: // DOMAIN_COUNT
+            if (schemeField.type == org.apache.thrift.protocol.TType.I32) {
+              struct.domainCount = iprot.readI32();
+              struct.setDomainCountIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 13: // CAPTURE_DIGEST
+            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+              struct.captureDigest = iprot.readBinary();
+              struct.setCaptureDigestIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
+          case 14: // CAPTURE_BYTES
+            if (schemeField.type == org.apache.thrift.protocol.TType.I64) {
+              struct.captureBytes = iprot.readI64();
+              struct.setCaptureBytesIsSet(true);
             } else {
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
@@ -1118,6 +1560,18 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       }
       if (!struct.isSetCleanupPending()) {
         throw new org.apache.thrift.protocol.TProtocolException("Required field 'cleanupPending' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetDefinitionBytes()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'definitionBytes' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetRosterGeneration()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'rosterGeneration' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetDomainCount()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'domainCount' was not found in serialized data! Struct: " + toString());
+      }
+      if (!struct.isSetCaptureBytes()) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'captureBytes' was not found in serialized data! Struct: " + toString());
       }
       struct.validate();
     }
@@ -1164,11 +1618,28 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       oprot.writeFieldBegin(CLEANUP_PENDING_FIELD_DESC);
       oprot.writeBool(struct.cleanupPending);
       oprot.writeFieldEnd();
-      if (struct.schema != null) {
-        oprot.writeFieldBegin(SCHEMA_FIELD_DESC);
-        oprot.writeBinary(struct.schema);
+      if (struct.definitionDigest != null) {
+        oprot.writeFieldBegin(DEFINITION_DIGEST_FIELD_DESC);
+        oprot.writeBinary(struct.definitionDigest);
         oprot.writeFieldEnd();
       }
+      oprot.writeFieldBegin(DEFINITION_BYTES_FIELD_DESC);
+      oprot.writeI64(struct.definitionBytes);
+      oprot.writeFieldEnd();
+      oprot.writeFieldBegin(ROSTER_GENERATION_FIELD_DESC);
+      oprot.writeI64(struct.rosterGeneration);
+      oprot.writeFieldEnd();
+      oprot.writeFieldBegin(DOMAIN_COUNT_FIELD_DESC);
+      oprot.writeI32(struct.domainCount);
+      oprot.writeFieldEnd();
+      if (struct.captureDigest != null) {
+        oprot.writeFieldBegin(CAPTURE_DIGEST_FIELD_DESC);
+        oprot.writeBinary(struct.captureDigest);
+        oprot.writeFieldEnd();
+      }
+      oprot.writeFieldBegin(CAPTURE_BYTES_FIELD_DESC);
+      oprot.writeI64(struct.captureBytes);
+      oprot.writeFieldEnd();
       oprot.writeFieldStop();
       oprot.writeStructEnd();
     }
@@ -1201,7 +1672,12 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       oprot.writeI32(struct.acknowledgedCount);
       oprot.writeI64(struct.fileBytes);
       oprot.writeBool(struct.cleanupPending);
-      oprot.writeBinary(struct.schema);
+      oprot.writeBinary(struct.definitionDigest);
+      oprot.writeI64(struct.definitionBytes);
+      oprot.writeI64(struct.rosterGeneration);
+      oprot.writeI32(struct.domainCount);
+      oprot.writeBinary(struct.captureDigest);
+      oprot.writeI64(struct.captureBytes);
     }
 
     @Override
@@ -1232,8 +1708,18 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       struct.setFileBytesIsSet(true);
       struct.cleanupPending = iprot.readBool();
       struct.setCleanupPendingIsSet(true);
-      struct.schema = iprot.readBinary();
-      struct.setSchemaIsSet(true);
+      struct.definitionDigest = iprot.readBinary();
+      struct.setDefinitionDigestIsSet(true);
+      struct.definitionBytes = iprot.readI64();
+      struct.setDefinitionBytesIsSet(true);
+      struct.rosterGeneration = iprot.readI64();
+      struct.setRosterGenerationIsSet(true);
+      struct.domainCount = iprot.readI32();
+      struct.setDomainCountIsSet(true);
+      struct.captureDigest = iprot.readBinary();
+      struct.setCaptureDigestIsSet(true);
+      struct.captureBytes = iprot.readI64();
+      struct.setCaptureBytesIsSet(true);
     }
   }
 

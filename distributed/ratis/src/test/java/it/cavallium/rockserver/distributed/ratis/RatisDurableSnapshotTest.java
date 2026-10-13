@@ -253,10 +253,16 @@ class RatisDurableSnapshotTest {
             var fence=helper.helper.fence(f.home,f.data,22,helper.helper.scope(f.data,1,4)); var initial=SnapshotFenceStatus.begin(fence);
             var old=f.data.f.propose(f.data.f.put(3)); assertNull(old.getException());
             var entered=new java.util.concurrent.CountDownLatch(1); var release=new java.util.concurrent.CountDownLatch(1); var done=new java.util.concurrent.CountDownLatch(1);
+            var cancelDrain=new java.util.concurrent.CompletableFuture<Void>();
             var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return f.data.wire.participant(route,bytes); }
+                public java.util.concurrent.CompletableFuture<byte[]> participantAsync(RangeDescriptor route,byte[] bytes)throws IOException{return f.data.wire.participantAsync(route,bytes);}
+                public java.util.concurrent.CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException {
+                    if(ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL){entered.countDown();return cancelDrain.thenCompose(ignored->{try{return f.data.wire.transactionAsync(route,bytes,fresh);}catch(IOException failure){return java.util.concurrent.CompletableFuture.failedFuture(failure);}});}
+                    return f.data.wire.transactionAsync(route,bytes,fresh);
+                }
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
                     if (ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL) {
                         entered.countDown(); try { if (!release.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); } catch (InterruptedException failure) { throw new IOException(failure); }
@@ -271,7 +277,7 @@ class RatisDurableSnapshotTest {
                 try {
                     assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertTrue(view.cancel(false)); assertThrows(IOException.class,journal::close); assertThrows(IOException.class,driver::close);
                     assertThrows(IOException.class,() -> RatisDurableSnapshot.reopen(path,f.home.homes,client));
-                } finally { release.countDown(); }
+                } finally { release.countDown(); cancelDrain.complete(null); }
                 assertTrue(done.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertEquals(0,f.data.f.machine.proposalGateStats().gates());
                 f.data.f.machine.cancelTransaction(old); journal.close();
                 try (var reopened=RatisDurableSnapshot.reopen(path,f.home.homes,client)) { assertTrue(reopened.snapshot().participant(f.data.f.groupId).installFrozen()); assertNull(reopened.snapshot().participant(f.data.f.groupId).installReceipt()); }

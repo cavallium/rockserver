@@ -11,209 +11,53 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Public export facade. Supplied clients, scheduler and allocation source remain caller-owned. */
+/** Aggregate database export facade. Parent captures precede every selected-column child writer. */
 public final class RatisExportBackend implements ExportAsyncAPI,AutoCloseable {
-    public record Limits(int requests,int requestBytes,int activeJobs,int queuedWork) {
-        public Limits { if (requests<1 || requests>1024 || requestBytes<65536 || requestBytes>64*1024*1024 || activeJobs<1 || activeJobs>RatisExportClient.MAX_JOBS || queuedWork<1 || queuedWork>32) throw new IllegalArgumentException("Invalid export backend limits"); }
-        public static Limits defaults() { return new Limits(128,16*1024*1024,8,16); }
+    public record Limits(int requests,int requestBytes,int activeJobs,int queuedWork){public Limits{if(requests<1||requests>1024||requestBytes<65536||requestBytes>64*1024*1024||activeJobs<1||activeJobs>RatisExportClient.MAX_JOBS||queuedWork<1||queuedWork>32)throw new IllegalArgumentException("Invalid aggregate export backend limits");}public static Limits defaults(){return new Limits(128,64*1024*1024,8,16);}}
+    private final Path root;private final RWScheduler scheduler;private final RatisAggregateExportDriver.Dependencies dependencies;private final Limits limits;private final FileChannel channel;private final FileLock lock;
+    private final Map<UUID,RatisAggregateExportJournal> parents=new LinkedHashMap<>();private final Map<UUID,UUID> nonces=new HashMap<>();private final Map<UUID,RatisAggregateExportDriver> drivers=new LinkedHashMap<>();private final Set<UUID> controls=new HashSet<>();
+    private int active;private boolean creating,closed,closing,stopping,fenced;
+    public RatisExportBackend(Path root,RWScheduler scheduler,RatisAggregateExportDriver.Dependencies dependencies,Limits limits)throws IOException{
+        this.root=root.toAbsolutePath().normalize();this.scheduler=Objects.requireNonNull(scheduler);this.dependencies=Objects.requireNonNull(dependencies);this.limits=Objects.requireNonNull(limits);Files.createDirectories(this.root);if(!Files.isDirectory(this.root,LinkOption.NOFOLLOW_LINKS))throw new IOException("Aggregate export root is not an owned directory");SessionJournalFiles.force(this.root.getParent());channel=FileChannel.open(this.root.resolve("root.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);FileLock acquired=null;
+        try{acquired=channel.tryLock();if(acquired==null)throw new IOException("Aggregate export root already owned");lock=acquired;long retained=0;int count=0;try(var entries=Files.newDirectoryStream(this.root)){for(var entry:entries){if(entry.getFileName().toString().equals("root.lock"))continue;if(++count>limits.requests() || !Files.isDirectory(entry,LinkOption.NOFOLLOW_LINKS))throw new IOException("Aggregate export root capacity/ownership differs");UUID id;try{id=UUID.fromString(entry.getFileName().toString());}catch(IllegalArgumentException invalid){throw new IOException("Foreign aggregate export directory",invalid);}if(!id.toString().equals(entry.getFileName().toString()))throw new IOException("Noncanonical aggregate export path");Path parent=entry.resolve("parent");if(!Files.isRegularFile(parent,LinkOption.NOFOLLOW_LINKS))throw new IOException("Original aggregate parent journal absent");retained=Math.addExact(retained,Files.size(parent));if(retained>limits.requestBytes())throw new IOException("Retained aggregate parent metadata capacity exhausted");var journal=RatisAggregateExportJournal.reopen(parent);if(!id.equals(journal.input().jobId()) || nonces.putIfAbsent(journal.input().requestId(),id)!=null){journal.close();throw new IOException("Repeated/changed aggregate identity");}parents.put(id,journal);if(!journal.readyPublished()&&journal.phase()!=ExportJobs.Phase.CANCELLED&&journal.phase()!=ExportJobs.Phase.SNAPSHOT_LOST&&journal.phase()!=ExportJobs.Phase.RELEASED){retained=Math.addExact(retained,RatisAggregateExportDriver.metadataPromise(journal.input())-Files.size(parent));if(retained>limits.requestBytes())throw new IOException("Retained aggregate parent metadata promises exhausted");}}}}
+        catch(Throwable failed){for(var parent:parents.values())try{parent.close();}catch(IOException cleanup){failed.addSuppressed(cleanup);}if(acquired!=null)acquired.close();channel.close();throw failed;}
     }
-    private final Path root;
-    private final DistributedSchema schema;
-    private final RatisSnapshotClient source;
-    private final RWScheduler scheduler;
-    private final RatisExportClient exports;
-    private final RatisRocksDBAdapter.AllocationSource allocations;
-    private final Limits limits;
-    private final FileChannel ownership;
-    private final FileLock lock;
-    private final RatisExportRequests requests;
-    private final Map<UUID,RatisExportClient.Job> jobs=new HashMap<>();
-    private final Map<UUID,Opening> opening=new HashMap<>();
-    private final Set<UUID> verified=new HashSet<>();
-    private final Map<UUID,Control<?>> controls=new HashMap<>();
-    private static final class Control<T> {
-        final Object key; final CompletableFuture<T> result=new CompletableFuture<>(); int observers;
-        Control(Object key) { this.key=key; }
-        synchronized CompletableFuture<T> view() {
-            if (!result.isDone() && observers>=RatisExportClient.MAX_WAITERS) return CompletableFuture.failedFuture(new RejectedExecutionException("Export control observer capacity exhausted"));
-            if (!result.isDone()) observers++; return result.copy();
-        }
+    private final class Deadline{final long deadline;Deadline(RequestContext context){deadline=scheduler.resolveMonotonicDeadline(Objects.requireNonNull(context));}RequestContext remaining(){if(deadline==Long.MAX_VALUE)return RequestContext.batch();long nanos=scheduler.remainingMonotonicDeadlineNanos(deadline);if(nanos<=0)throw new CompletionException(new TimeoutException("Aggregate export request deadline expired"));return new RequestContext(WorkloadProfile.BATCH,nanos);}}
+    @FunctionalInterface private interface Work<T>{T run(Deadline deadline)throws Exception;}
+    @FunctionalInterface private interface AsyncWork<T>{CompletableFuture<T> run(Deadline deadline)throws Exception;}
+    private <T>CompletableFuture<T> submit(RequestContext context,long bytes,UUID protectedJob,Work<T> work){return submitAsync(context,bytes,protectedJob,deadline->{try{return CompletableFuture.completedFuture(work.run(deadline));}catch(Throwable failed){return CompletableFuture.failedFuture(failed);}});}
+    private <T>CompletableFuture<T> submitAsync(RequestContext context,long bytes,UUID protectedJob,AsyncWork<T> work){
+        var result=new CompletableFuture<T>();final Deadline deadline;try{deadline=new Deadline(context);synchronized(this){if(closed||closing||stopping||fenced)throw new IOException("Aggregate backend closed/fenced");if(protectedJob==null){if(active>=limits.queuedWork())throw new RejectedExecutionException("Aggregate bulk queue exhausted");}else if(!parents.containsKey(protectedJob)||!controls.add(protectedJob))throw new IOException("Aggregate protected job active/unknown");active++;}}catch(Exception failed){return CompletableFuture.failedFuture(failed);}
+        class Task implements Runnable,RWScheduler.RejectionAwareTask{final AtomicInteger phase=new AtomicInteger();public void run(){if(!phase.compareAndSet(0,1))return;CompletableFuture<T> actual;try{deadline.remaining();actual=Objects.requireNonNull(work.run(deadline));}catch(Throwable failed){actual=CompletableFuture.failedFuture(failed);}actual.whenComplete((value,failure)->{Throwable problem=failure;if(problem==null)try{deadline.remaining();}catch(Throwable expired){problem=expired;}finish();if(problem==null)result.complete(value);else result.completeExceptionally(problem);});}public void reject(RuntimeException failed){if(phase.compareAndSet(0,1)){finish();result.completeExceptionally(failed);}}void finish(){phase.set(2);synchronized(RatisExportBackend.this){active--;if(protectedJob!=null)controls.remove(protectedJob);}}}
+        var task=new Task();try{(protectedJob==null?scheduler.executor(WorkloadProfile.BATCH,OperationFamily.MUTATION,deadline.deadline):scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,deadline.deadline)).execute(task,bytes);}catch(RuntimeException rejected){task.reject(rejected);}return result.copy();
     }
-    private int active;
-    private boolean closed,closing;
-    private record Opening(ExportJobs.Create request,CompletableFuture<RatisExportClient.Job> result) {}
+    private synchronized RatisAggregateExportJournal parent(UUID job)throws IOException{var parent=parents.get(Objects.requireNonNull(job));if(parent==null)throw new IOException("Unknown original aggregate export");return parent;}
+    private synchronized RatisAggregateExportDriver driver(UUID job)throws IOException{var driver=drivers.get(job);if(driver==null){if(drivers.size()>=limits.activeJobs())throw new IOException("Aggregate export active job quota exhausted");driver=new RatisAggregateExportDriver(parent(job),dependencies);drivers.put(job,driver);}return driver;}
+    private static List<DatabaseExportDefinition.Domain> selected(RatisAggregateExportDriver.Vector vector,ExportJobs.Create request){var wanted=new HashSet<>(request.columns());var found=new HashSet<Long>();var domains=new ArrayList<DatabaseExportDefinition.Domain>();for(var domain:vector.domains()){var selected=new ArrayList<Long>();for(var column:domain.schema().columns())if(wanted.contains(column.apiId())){if(!found.add(column.apiId()))throw new IllegalArgumentException("Ambiguous aggregate export column");selected.add(column.apiId());}domains.add(new DatabaseExportDefinition.Domain(domain.directory(),domain.schema(),selected));}if(!found.equals(wanted))throw new IllegalArgumentException("Unknown aggregate export selected column");return domains;}
+    private RatisAggregateExportJournal create(ExportJobs.Create request)throws IOException{ synchronized(this){var job=nonces.get(request.requestId());if(job!=null){var parent=parents.get(job);if(!parent.input().selectedColumns().equals(request.columns().stream().sorted(Long::compareUnsigned).toList())||!parent.input().limits().equals(request.limits()))throw new IllegalArgumentException("Aggregate export nonce input changed");return parent;}if(creating||parents.size()>=limits.requests())throw new IOException("Aggregate export creation/capacity busy");creating=true;}
+        RatisAggregateExportJournal created=null;boolean mutated=false;try{var vector=dependencies.authority().read();var input=new DatabaseExportDefinition(UUID.randomUUID(),request.requestId(),vector.roster(),selected(vector,request),request.limits());long bytes=RatisAggregateExportDriver.preflight(input).parentJournalBytes();synchronized(this){long retained=0;for(var parent:parents.values())retained=Math.addExact(retained,parent.readyPublished()||parent.phase()==ExportJobs.Phase.CANCELLED||parent.phase()==ExportJobs.Phase.SNAPSHOT_LOST||parent.phase()==ExportJobs.Phase.RELEASED?Files.size(parent.path()):RatisAggregateExportDriver.metadataPromise(parent.input()));if(bytes>limits.requestBytes()-retained)throw new IOException("Aggregate frozen input byte budget exhausted before allocation");}Path directory=root.resolve(input.jobId().toString());mutated=true;Files.createDirectory(directory);SessionJournalFiles.force(root);created=RatisAggregateExportJournal.create(directory.resolve("parent"),input);synchronized(this){parents.put(input.jobId(),created);nonces.put(input.requestId(),input.jobId());}return created;}catch(IOException|RuntimeException failed){if(created==null&&mutated){synchronized(this){fenced=true;}}throw failed;}finally{synchronized(this){creating=false;}}}
+    private ExportJobs.Status status(UUID job)throws IOException{var parent=parent(job);var input=parent.input();int chunks=0,acknowledged=0;long files=0;var driver=driver(job);for(var summary:driver.summaries().values()){chunks=Math.addExact(chunks,summary.chunks());acknowledged=Math.addExact(acknowledged,summary.acknowledged());files=Math.addExact(files,summary.fileBytes());}var capture=parent.captures();int participants=input.domains().stream().filter(domain->!domain.directory().columns().isEmpty()).mapToInt(domain->domain.directory().ranges().size()).sum();boolean cleanup=parent.phase()!=ExportJobs.Phase.READY&&parent.phase()!=ExportJobs.Phase.RELEASED&&driver.cleanupPending();return new ExportJobs.Status(job,parent.phase(),input.selectedColumns(),participants,chunks,acknowledged,files,cleanup,input.digest(),input.encodedBytes(),input.roster().generation(),input.domains().size(),capture==null?new byte[0]:capture.digest(),capture==null?0:capture.encodedBytes());}
+    @Override public CompletableFuture<ExportJobs.Status> createExport(ExportJobs.Create request,RequestContext context){return submit(context,4L*DatabaseExportDefinition.MAX_BYTES,null,deadline->{var parent=create(Objects.requireNonNull(request));driver(parent.input().jobId());return status(parent.input().jobId());});}
+    @Override public CompletableFuture<ExportJobs.Status> recoverExport(UUID job,RequestContext context){return exportStatus(job,context);}
+    @Override public CompletableFuture<ExportJobs.Status> exportStatus(UUID job,RequestContext context){return submit(context,65536,null,deadline->status(job));}
+    @Override public CompletableFuture<ExportJobs.Status> stepExport(UUID job,RequestContext context){try{return submitAsync(context,65536L+3L*RatisAggregateExportDriver.metadataPromise(parent(job).input())+4L*ExportJobs.MAX_MANIFEST_BYTES,null,deadline->driver(job).stepAsync(deadline.remaining()).thenApply(phase->{try{return status(job);}catch(IOException failed){throw new CompletionException(failed);}}));}catch(Exception failed){return CompletableFuture.failedFuture(failed);}}
+    @Override public CompletableFuture<ExportJobs.WitnessPage> exportWitness(ExportJobs.WitnessRequest request,RequestContext context){return submit(context,65536L+3L*request.maximumBytes(),null,deadline->{var parent=parent(request.jobId());byte[] digest,bytes;long total;if(request.kind()==ExportJobs.WitnessKind.DEFINITION){var definition=parent.input();digest=definition.digest();total=definition.encodedBytes();bytes=definition.page(request.offset(),request.maximumBytes());}else{var capture=parent.captures();if(capture==null)throw new IOException("Aggregate capture witness not yet forced");digest=capture.digest();total=capture.encodedBytes();bytes=capture.page(request.offset(),request.maximumBytes());}if(!Arrays.equals(digest,request.expectedDigest()))throw new IllegalArgumentException("Aggregate witness digest changed");return new ExportJobs.WitnessPage(request.jobId(),request.kind(),digest,total,request.offset(),bytes,request.offset()+bytes.length<total);});}
+    private List<RatisAggregateExportJournal.Slot> selectedSlots(UUID job)throws IOException{return parent(job).slots().stream().filter(slot->!parents.get(job).input().domain(slot.domainId()).selectedColumns().isEmpty()).toList();}
+    private void requireReady(UUID job)throws IOException{if(parent(job).phase()!=ExportJobs.Phase.READY)throw new IOException("Aggregate delivery requires READY parent");}
+    private static ExportJobs.ChunkId publicId(UUID parent,SnapshotFence fence,RatisExportJournal.Chunk chunk){var participant=fence.participant(chunk.group());return new ExportJobs.ChunkId(parent,chunk.group(),participant.rangeId(),chunk.rangeEpoch(),chunk.cut().term(),chunk.cut().index(),chunk.ordinal(),chunk.sha256());}
+    private ExportJobs.Chunk exposed(UUID parent,RatisAggregateExportJournal.Slot slot,RatisExportJournal.Chunk chunk)throws IOException{var schema=parent(parent).input().domain(slot.domainId()).schema();return new ExportJobs.Chunk(publicId(parent,slot.fence(),chunk),schema.column(chunk.column()).apiId(),chunk.lowerInclusive(),chunk.upperExclusive(),chunk.rows(),chunk.payloadBytes(),chunk.fileBytes(),chunk.hasMore());}
+    @Override public CompletableFuture<ExportJobs.ManifestPage> exportManifest(ExportJobs.ManifestRequest request,RequestContext context){return submitAsync(context,65536L+4L*request.maximumBytes(),null,deadline->{requireReady(request.jobId());var owner=driver(request.jobId());var summaries=owner.summaries();int total=0;for(var summary:summaries.values())total=Math.addExact(total,summary.chunks());if(request.offset()>total)throw new IllegalArgumentException("Manifest offset exceeds original vector");return manifestNext(request,deadline,owner,selectedSlots(request.jobId()),summaries,0,0,request.offset(),0,total,new ArrayList<>());});}
+    private CompletableFuture<ExportJobs.ManifestPage> manifestNext(ExportJobs.ManifestRequest request,Deadline deadline,RatisAggregateExportDriver owner,List<RatisAggregateExportJournal.Slot> slots,Map<UUID,RatisExportJournal.Summary> summaries,int index,int base,int offset,int bytes,int total,List<ExportJobs.Chunk> chunks){
+        while(index<slots.size()){var slot=slots.get(index);int count=summaries.get(slot.childJob()).chunks();if(offset>=base+count){base+=count;index++;continue;}if(request.maximumBytes()-bytes<ExportJobs.MIN_PAGE_BYTES||chunks.size()==request.maximumItems())break;int local=offset-base,remainingItems=request.maximumItems()-chunks.size(),remainingBytes=request.maximumBytes()-bytes,nextIndex=index+1,nextBase=base+count,oldOffset=offset,oldBytes=bytes;return owner.withDeliveryAsync(slot,deadline.remaining(),child->child.manifest(local,remainingItems,remainingBytes,deadline.remaining())).thenCompose(page->{int nextOffset=oldOffset,nextBytes=oldBytes;try{for(var chunk:page.chunks()){var value=exposed(request.jobId(),slot,chunk);if(value.estimatedBytes()>request.maximumBytes()-nextBytes)throw new IOException("Manifest exceeds page budget");chunks.add(value);nextBytes+=value.estimatedBytes();nextOffset++;}if(chunks.size()==request.maximumItems()||page.hasMore())return CompletableFuture.completedFuture(new ExportJobs.ManifestPage(chunks,nextOffset,nextOffset<total));return manifestNext(request,deadline,owner,slots,summaries,nextIndex,nextBase,nextOffset,nextBytes,total,chunks);}catch(Throwable failed){return CompletableFuture.failedFuture(failed);}});}
+        return CompletableFuture.completedFuture(new ExportJobs.ManifestPage(chunks,offset,offset<total));
+    }
+    private RatisAggregateExportJournal.Slot qualifiedSlot(ExportJobs.ChunkId id)throws IOException{requireReady(id.jobId());return selectedSlots(id.jobId()).stream().filter(slot->slot.fence().participants().stream().anyMatch(participant->participant.groupId().equals(id.groupId()))).findFirst().orElseThrow(()->new IllegalArgumentException("Unknown aggregate chunk group"));}
+    private static RatisExportJournal.Chunk qualified(ExportJobs.ChunkId id,RatisExportClient.Job child)throws IOException{var chunk=child.chunk(id.groupId(),id.ordinal());if(!publicId(id.jobId(),child.summary().definition().fence(),chunk).equals(id))throw new IllegalArgumentException("Aggregate chunk identity changed");return chunk;}
+    @Override public CompletableFuture<ExportJobs.FilePage> readExport(ExportJobs.ReadRequest request,RequestContext context){return submitAsync(context,65536L+3L*request.maximumBytes(),null,deadline->{var slot=qualifiedSlot(request.id());return driver(request.id().jobId()).withDeliveryAsync(slot,deadline.remaining(),child->child.read(qualified(request.id(),child),request.offset(),request.maximumBytes(),deadline.remaining()).thenApply(page->new ExportJobs.FilePage(request.id(),page.offset(),page.bytes(),page.hasMore())));});}
+    @Override public CompletableFuture<Void> acknowledgeExport(ExportJobs.ChunkId id,RequestContext context){return submitAsync(context,65536,id.jobId(),deadline->{var slot=qualifiedSlot(id);return driver(id.jobId()).withDeliveryAsync(slot,deadline.remaining(),child->child.acknowledge(qualified(id,child),deadline.remaining()));});}
+    private CompletableFuture<Void> settleChildren(UUID job,Deadline deadline,boolean cancel)throws IOException{CompletableFuture<Void> chain=CompletableFuture.completedFuture(null);var owner=driver(job);for(var slot:selectedSlots(job))chain=chain.thenCompose(ignored->owner.withDeliveryAsync(slot,deadline.remaining(),child->{var action=cancel?child.cancel(deadline.remaining()):CompletableFuture.<Void>completedFuture(null);return action.thenCompose(value->child.release(deadline.remaining())).thenCompose(value->child.reclaim(deadline.remaining()));}));return chain;}
+    @Override public CompletableFuture<Void> cancelExport(UUID job,RequestContext context){return submitAsync(context,65536,job,deadline->{var parent=parent(job);if(parent.readyPublished()&&(parent.phase()==ExportJobs.Phase.READY||parent.phase()==ExportJobs.Phase.CANCELLED)){parent.terminal(ExportJobs.Phase.CANCELLED);return settleChildren(job,deadline,true);}return driver(job).drainAsync(deadline.remaining());});}
+    @Override public CompletableFuture<Void> releaseExport(UUID job,RequestContext context){return submitAsync(context,65536,job,deadline->{var parent=parent(job);if(parent.phase()==ExportJobs.Phase.RELEASED)return CompletableFuture.completedFuture(null);CompletableFuture<Void> settled;if(parent.phase()==ExportJobs.Phase.READY)settled=settleChildren(job,deadline,false);else if(parent.readyPublished())settled=settleChildren(job,deadline,true);else settled=driver(job).drainAsync(deadline.remaining());return settled.thenApply(ignored->{try{parent.terminal(ExportJobs.Phase.RELEASED);return null;}catch(IOException failed){throw new CompletionException(failed);}});});}
+    @Override public synchronized void close()throws IOException{if(closed)return;if(active!=0||creating)throw new IOException("Aggregate actual work remains owned");stopping=true;closing=true;try{for(var iterator=parents.entrySet().iterator();iterator.hasNext();){var entry=iterator.next();var actual=drivers.get(entry.getKey());var phase=entry.getValue().phase();if(actual==null&&(phase==ExportJobs.Phase.READY||phase==ExportJobs.Phase.RELEASED)){entry.getValue().close();iterator.remove();continue;}if(actual==null)actual=driver(entry.getKey());actual.drain(RequestContext.batch());actual.close();drivers.remove(entry.getKey(),actual);iterator.remove();}lock.close();channel.close();closed=true;}finally{closing=false;}}
 
-    /** Root preparation and exclusive ownership happen here, never on a public async API call. */
-    public RatisExportBackend(Path root,DistributedSchema schema,RatisSnapshotClient source,RWScheduler scheduler,RatisExportClient exports,RatisRocksDBAdapter.AllocationSource allocations,Limits limits) throws IOException {
-        this.root=root.toAbsolutePath().normalize(); this.schema=Objects.requireNonNull(schema); this.source=source; this.scheduler=Objects.requireNonNull(scheduler); this.exports=Objects.requireNonNull(exports); this.allocations=allocations; this.limits=Objects.requireNonNull(limits);
-        if (source!=null && source.captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY) throw new IllegalArgumentException("Export requires a read-only snapshot source");
-        Files.createDirectories(this.root); if (!Files.isDirectory(this.root,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Export root is not a directory"); SessionJournalFiles.force(this.root.getParent());
-        boolean existingOwner=Files.exists(this.root.resolve("root.lock"),LinkOption.NOFOLLOW_LINKS);
-        ownership=FileChannel.open(this.root.resolve("root.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);
-        FileLock acquired=null;
-        try {
-            try { acquired=ownership.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Export root already owned",owned); }
-            if (acquired==null) throw new IOException("Export root already owned"); lock=acquired;
-            if (existingOwner && !Files.exists(this.root.resolve("requests"),LinkOption.NOFOLLOW_LINKS)) throw new IOException("Original export nonce catalog is missing");
-            requests=new RatisExportRequests(this.root,limits.requests(),limits.requestBytes());
-            for (var entry:requests.entries()) validate(entry);
-        } catch (IOException | RuntimeException | Error failure) { if (acquired!=null) acquired.release(); ownership.close(); throw failure; }
-    }
-    private List<UUID> columns(ExportJobs.Create request,DistributedSchema frozen) { return request.columns().stream().map(id -> frozen.column(id).columnId()).sorted((a,b) -> { int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits()); return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits()); }).toList(); }
-    private void validate(RatisExportRequests.Entry entry) throws IOException {
-        var frozen=entry.savedSchema();if(!frozen.clusterId().equals(schema.clusterId()) || !frozen.databaseId().equals(schema.databaseId()) || !frozen.domainId().equals(schema.domainId()))throw new IOException("Export root namespace changed");var ids=columns(entry.request(),frozen);
-        if (entry.fence()!=null) {
-            if (entry.snapshot().startsWith(root)) throw new IOException("Export source allocation must be disjoint from backend control root");
-            if (!entry.fence().clusterId().equals(frozen.clusterId()) || !entry.fence().databaseId().equals(frozen.databaseId()) || !entry.fence().domainId().equals(frozen.domainId()) || !Arrays.equals(entry.fence().schemaDigest(),frozen.digest())) throw new IOException("Saved export fence differs from qualified schema");
-            var definition=entry.definition(ids); var scope=RatisSnapshotPlan.scope(definition.fence());
-            if (scope.spans().size()!=ids.size() || scope.spans().stream().anyMatch(span -> span.isPoint() || span.lowerInclusive()!=null || span.upperExclusive()!=null || !ids.contains(span.columnId()))) throw new IOException("Saved export is not the selected full-column scope");
-        }
-    }
-    private void requireCaptureSource(RatisExportRequests.Entry entry)throws IOException{if(source==null || !Arrays.equals(entry.savedSchema().digest(),schema.digest()) || !Arrays.equals(entry.source(),source.identityDigest()))throw new IOException("Original frozen export source unavailable; capture cannot use current schema");}
-    private final class Deadline {
-        final long bound;
-        Deadline(RequestContext context) { bound=scheduler.resolveMonotonicDeadline(Objects.requireNonNull(context)); }
-        RequestContext remaining() {
-            if (bound==Long.MAX_VALUE) return RequestContext.batch();
-            long nanos=scheduler.remainingMonotonicDeadlineNanos(bound);
-            if (nanos<=0) throw new CompletionException(new TimeoutException("Export request deadline expired"));
-            return new RequestContext(WorkloadProfile.BATCH,nanos);
-        }
-    }
-    @FunctionalInterface private interface DeadlineWork<T> { CompletableFuture<T> run(Deadline deadline) throws Exception; }
-    @FunctionalInterface private interface Work<T> { CompletableFuture<T> run() throws Exception; }
-    /** Retain admission through the actual SDK future, independent of cancellation of any observer. */
-    private <T> CompletableFuture<T> submit(RequestContext context,DeadlineWork<T> work) {
-        var result=new CompletableFuture<T>(); final Deadline deadline;
-        try { deadline=new Deadline(context); synchronized (this) { if (closed || closing) throw new IOException("Export backend closed"); if (active>=limits.queuedWork()) throw new RejectedExecutionException("Export backend queued work exhausted"); active++; } }
-        catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
-        var phase=new AtomicInteger();
-        class Task implements Runnable,RWScheduler.RejectionAwareTask {
-            public void run() {
-                if (!phase.compareAndSet(0,1)) return;
-                CompletableFuture<T> actual;
-                try { deadline.remaining(); actual=Objects.requireNonNull(work.run(deadline)); } catch (Throwable failure) { actual=CompletableFuture.failedFuture(failure); }
-                actual.whenComplete((value,failure) -> { synchronized (RatisExportBackend.this) { active--; } phase.set(2); if (failure==null) try { deadline.remaining(); } catch (Throwable expired) { failure=expired; } if (failure==null) result.complete(value); else result.completeExceptionally(failure); });
-            }
-            public void reject(RuntimeException failure) { if (phase.compareAndSet(0,2)) { synchronized (RatisExportBackend.this) { active--; } result.completeExceptionally(failure); } }
-        }
-        var task=new Task(); try { scheduler.executor(WorkloadProfile.BATCH,OperationFamily.MUTATION,deadline.bound).execute(task,65536); } catch (RuntimeException failure) { task.reject(failure); }
-        return result.copy();
-    }
-    private static final long STATUS_BYTES=256L+4L*(DistributedSchemaCodec.MAX_BYTES+8L*ExportJobs.MAX_COLUMNS+128);
-    private <T> CompletableFuture<T> io(Work<T> work) { return io(false,work); }
-    private <T> CompletableFuture<T> io(long retainedBytes,Work<T> work){return io(false,retainedBytes,work);}
-    private <T> CompletableFuture<T> io(boolean control,Work<T> work) {return io(control,65536,work);}
-    private <T> CompletableFuture<T> io(boolean control,long retainedBytes,Work<T> work) {
-        var result=new CompletableFuture<T>();
-        class Segment implements Runnable,RWScheduler.RejectionAwareTask {
-            final AtomicInteger phase=new AtomicInteger();
-            public void run() { if (!phase.compareAndSet(0,1)) return; try { work.run().whenComplete((value,failure) -> { phase.set(2); if (failure==null) result.complete(value); else result.completeExceptionally(failure); }); } catch (Throwable failure) { phase.set(2); result.completeExceptionally(failure); } }
-            public void reject(RuntimeException failure) { if (phase.compareAndSet(0,2)) result.completeExceptionally(failure); }
-        }
-        var task=new Segment(); try { (control ? scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,RequestContext.NO_TIMEOUT) : scheduler.executor(RequestContext.batch(),OperationFamily.MUTATION)).execute(task,retainedBytes); } catch (RuntimeException failure) { task.reject(failure); } return result;
-    }
-    private synchronized CompletableFuture<RatisExportClient.Job> open(RatisExportRequests.Entry saved,Deadline deadline) throws IOException {
-        validate(saved); var current=jobs.get(saved.job()); if (current!=null) return current.completion().thenCompose(snapshot -> io(() -> {
-            if (!same(saved.definition(columns(saved.request(),saved.savedSchema())),snapshot.definition())) throw new IOException("Original export definition changed");
-            synchronized (RatisExportBackend.this) { requests.initialized(saved); verified.add(saved.job()); }
-            return CompletableFuture.completedFuture(current);
-        }));
-        var pending=opening.get(saved.job()); if (pending!=null) return pending.result();
-        if (jobs.size()+opening.size()>=limits.activeJobs()) throw new IOException("Export backend job capacity exhausted");
-        var actual=new CompletableFuture<RatisExportClient.Job>(); opening.put(saved.job(),new Opening(saved.request(),actual));
-        CompletableFuture<RatisExportRequests.Entry> bound;
-        try {
-            if (saved.fence()!=null) bound=CompletableFuture.completedFuture(saved);
-            else {
-                requireCaptureSource(saved);if(allocations==null)throw new IOException("Original export allocation source unavailable");
-                var ids=columns(saved.request(),saved.savedSchema()); var scope=new TransactionScope(ids.stream().map(id -> TransactionScope.Span.range(id,null,null)).toList());
-                bound=allocations.allocate(deadline.remaining()).thenCompose(allocation -> io(() -> {
-                    var plan=source.plan(allocation.identity().snapshot(),scope);
-                    var definition=saved.bind(plan.fence(),allocation.snapshot()); validate(definition); definition.definition(ids);
-                    synchronized (RatisExportBackend.this) { var entry=requests.bind(saved,plan.fence(),allocation.snapshot()); return CompletableFuture.completedFuture(entry); }
-                }));
-            }
-        } catch (Throwable failure) { bound=CompletableFuture.failedFuture(failure); }
-        bound.thenCompose(entry -> io(() -> {
-            validate(entry); deadline.remaining(); Path directory=root.resolve(entry.job().toString()); Files.createDirectories(directory); if (!Files.isDirectory(directory,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Invalid export job directory");
-            SessionJournalFiles.force(root);
-            Path journal=directory.resolve("export.log"); var definition=entry.definition(columns(entry.request(),entry.savedSchema()));
-            if (entry.initialized() && !Files.exists(journal,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Original initialized export journal is missing");
-            boolean retained=Files.exists(journal,LinkOption.NOFOLLOW_LINKS);if(!retained)requireCaptureSource(entry);var job=retained ? exports.reopen(journal,deadline.remaining()) : exports.create(journal,definition,deadline.remaining());
-            synchronized (RatisExportBackend.this) { jobs.put(entry.job(),job); }
-            return job.completion().thenCompose(snapshot -> io(() -> {
-                if (!same(definition,snapshot.definition())) throw new IOException("Original export definition changed");
-                synchronized (RatisExportBackend.this) { requests.initialized(entry); verified.add(entry.job()); }
-                return CompletableFuture.completedFuture(job);
-            }));
-        })).whenComplete((job,failure) -> { synchronized (RatisExportBackend.this) { opening.remove(saved.job()); } if (failure==null) actual.complete(job); else actual.completeExceptionally(failure); });
-        return actual;
-    }
-    private static boolean same(RatisExportJournal.Definition a,RatisExportJournal.Definition b) { return a.jobId().equals(b.jobId()) && a.fence().equals(b.fence()) && a.columns().equals(b.columns()) && a.sourceJournal().equals(b.sourceJournal()) && Arrays.equals(a.sourceIdentity(),b.sourceIdentity()) && a.limits().equals(b.limits()) && a.snapshotTtl().equals(b.snapshotTtl()); }
-    private synchronized CompletableFuture<RatisExportClient.Job> job(UUID id,Deadline deadline) throws IOException { return open(requests.job(Objects.requireNonNull(id)),deadline); }
-    private synchronized ExportJobs.Status status(RatisExportClient.Job job) throws IOException {
-        var s=job.summary(); var entry=requests.job(s.definition().jobId());
-        return new ExportJobs.Status(entry.job(),ExportJobs.Phase.valueOf(s.phase().name()),entry.request().columns(),s.definition().groups().size(),s.chunks(),s.acknowledged(),s.fileBytes(),s.cleanupPending(),entry.schema());
-    }
-    @Override public CompletableFuture<ExportJobs.Status> createExport(ExportJobs.Create request,RequestContext context) {
-        return submit(context,deadline -> {
-            Objects.requireNonNull(request); RatisExportRequests.Entry entry;
-            synchronized (this) { entry=requests.nonce(request.requestId()); if (entry!=null && !entry.request().equals(request)) throw new IllegalArgumentException("Export nonce payload changed"); if (entry==null) { if (source==null || allocations==null) throw new IOException("Export source unavailable"); columns(request,schema);entry=requests.pending(request,DistributedSchemaCodec.encode(schema),source.identityDigest()); } }
-            return open(entry,deadline).thenCompose(job -> io(STATUS_BYTES,() -> CompletableFuture.completedFuture(status(job))));
-        });
-    }
-    @Override public CompletableFuture<ExportJobs.Status> recoverExport(UUID id,RequestContext context) { return exportStatus(id,context); }
-    @Override public CompletableFuture<ExportJobs.Status> exportStatus(UUID id,RequestContext context) { return submit(context,deadline -> job(id,deadline).thenCompose(job -> io(STATUS_BYTES,() -> CompletableFuture.completedFuture(status(job))))); }
-    @Override public CompletableFuture<ExportJobs.Status> stepExport(UUID id,RequestContext context) { return submit(context,deadline -> job(id,deadline).thenCompose(job -> job.step(deadline.remaining()).thenCompose(ignored -> io(STATUS_BYTES,() -> CompletableFuture.completedFuture(status(job)))))); }
-    private ExportJobs.ChunkId id(RatisExportJournal.Definition definition,RatisExportJournal.Chunk chunk) {
-        var participant=definition.fence().participant(chunk.group());
-        return new ExportJobs.ChunkId(chunk.jobId(),chunk.group(),participant.rangeId(),chunk.rangeEpoch(),chunk.cut().term(),chunk.cut().index(),chunk.ordinal(),chunk.sha256());
-    }
-    private ExportJobs.Chunk exposed(RatisExportJournal.Definition definition,RatisExportJournal.Chunk chunk,DistributedSchema frozen) { return new ExportJobs.Chunk(id(definition,chunk),frozen.column(chunk.column()).apiId(),chunk.lowerInclusive(),chunk.upperExclusive(),chunk.rows(),chunk.payloadBytes(),chunk.fileBytes(),chunk.hasMore()); }
-    private RatisExportJournal.Chunk qualified(RatisExportClient.Job job,ExportJobs.ChunkId wanted) throws IOException {
-        var chunk=job.chunk(wanted.groupId(),wanted.ordinal());
-        if (!id(job.summary().definition(),chunk).equals(wanted)) throw new IllegalArgumentException("Unknown original export chunk identity");
-        return chunk;
-    }
-    @FunctionalInterface private interface JobWork<T> { CompletableFuture<T> run(RatisExportClient.Job job,Deadline deadline) throws Exception; }
-    /** One reserved 64KiB control slot per already-qualified owned job, independent of bulk admission. */
-    private <T> CompletableFuture<T> protectedJob(UUID id,Object key,RequestContext context,JobWork<T> work) {
-        final RatisExportClient.Job known; final Control<T> task; final Deadline deadline;
-        try {
-            Objects.requireNonNull(context); Objects.requireNonNull(id);
-            synchronized (this) {
-                if (closed || closing) throw new IOException("Export backend closed");
-                known=verified.contains(id) ? jobs.get(id) : null;
-                if (known==null) return submit(context,coldDeadline -> job(id,coldDeadline).thenCompose(job -> { try { return work.run(job,coldDeadline); } catch (Exception failure) { return CompletableFuture.failedFuture(failure); } }));
-                deadline=new Deadline(context);
-                var previous=controls.get(id);
-                if (previous!=null) {
-                    if (!previous.key.equals(key)) throw new IOException("Export protected operation already active");
-                    @SuppressWarnings("unchecked") var same=(Control<T>)previous; return same.view();
-                }
-                if (controls.size()>=limits.activeJobs()) throw new RejectedExecutionException("Export protected capacity exhausted");
-                task=new Control<>(key); controls.put(id,task);
-            }
-        } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
-        io(true,() -> { deadline.remaining(); return work.run(known,deadline); }).whenComplete((value,failure) -> {
-            synchronized (this) { controls.remove(id,task); }
-            if (failure==null) try { deadline.remaining(); } catch (Throwable expired) { failure=expired; }
-            if (failure==null) task.result.complete(value); else task.result.completeExceptionally(failure);
-        });
-        return task.view();
-    }
-    @Override public CompletableFuture<ExportJobs.ManifestPage> exportManifest(ExportJobs.ManifestRequest request,RequestContext context) {
-        return submit(context,deadline -> job(request.jobId(),deadline).thenCompose(job -> job.manifest(request.offset(),request.maximumItems(),request.maximumBytes(),deadline.remaining()).thenCompose(page -> io(() -> { var definition=job.summary().definition();var frozen=requests.job(definition.jobId()).savedSchema(); return CompletableFuture.completedFuture(new ExportJobs.ManifestPage(page.chunks().stream().map(chunk -> exposed(definition,chunk,frozen)).toList(),page.next(),page.hasMore())); }))));
-    }
-    @Override public CompletableFuture<ExportJobs.FilePage> readExport(ExportJobs.ReadRequest request,RequestContext context) { return submit(context,deadline -> job(request.id().jobId(),deadline).thenCompose(job -> io(() -> job.read(qualified(job,request.id()),request.offset(),request.maximumBytes(),deadline.remaining())).thenApply(page -> new ExportJobs.FilePage(request.id(),page.offset(),page.bytes(),page.hasMore())))); }
-    @Override public CompletableFuture<Void> acknowledgeExport(ExportJobs.ChunkId id,RequestContext context) { return protectedJob(id.jobId(),id,context,(job,deadline) -> job.acknowledge(qualified(job,id),deadline.remaining())); }
-    private CompletableFuture<Void> retire(UUID id,RatisExportClient.Job job) { return io(true,() -> { synchronized (this) { job.close(); jobs.remove(id,job); verified.remove(id); } return CompletableFuture.completedFuture(null); }); }
-    @Override public CompletableFuture<Void> releaseExport(UUID id,RequestContext context) { return protectedJob(id,"release",context,(job,deadline) -> job.release(deadline.remaining()).thenCompose(ignored -> job.reclaim(deadline.remaining())).thenCompose(ignored -> retire(id,job))); }
-    @Override public CompletableFuture<Void> cancelExport(UUID id,RequestContext context) { return protectedJob(id,"cancel",context,(job,deadline) -> job.cancel(deadline.remaining()).thenCompose(ignored -> retire(id,job))); }
-    @Override public synchronized void close() throws IOException {
-        if (closed) return; if (active!=0 || !opening.isEmpty() || !controls.isEmpty()) throw new IOException("Export actual work active; ownership retained"); closing=true;
-        try { for (var iterator=jobs.values().iterator();iterator.hasNext();) { iterator.next().close(); iterator.remove(); } lock.release(); ownership.close(); closed=true; }
-        finally { closing=false; }
-    }
 }

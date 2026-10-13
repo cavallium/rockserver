@@ -47,18 +47,14 @@ class RatisSnapshotCoordinatorTest {
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return node(route.groupId()).wire.command(route,command); }
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return node(route.groupId()).wire.participant(route,bytes); }
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return node(route.groupId()).wire.transaction(route,bytes,fresh); }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] bytes) throws IOException {
+                public CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID col,byte[] key)throws IOException{return node(route.groupId()).wire.readAsync(route,col,key);}
+                public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{return node(route.groupId()).wire.commandAsync(route,command);}
+                public CompletableFuture<byte[]> participantAsync(RangeDescriptor route,byte[] bytes)throws IOException{return node(route.groupId()).wire.participantAsync(route,bytes);}
+                public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{return node(route.groupId()).wire.transactionAsync(route,bytes,fresh);}
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] bytes) throws IOException {
                     var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-                    if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
-                        var state=home.homes.read(fence.fenceId()); assertTrue(state.allReady());
-                        if (!state.terminal()) assertFalse(left.f.store.snapshotGate(fence.fenceId()).released()!=null || right.f.store.snapshotGate(fence.fenceId()).released()!=null);
-                        captures.incrementAndGet();
-                    }
-                    assertEquals(route.replicas().getFirst(),owner);
-                    try {
-                        byte[] reply=node(route.groupId()).f.machine.queryStale(Message.valueOf(ByteString.copyFrom(bytes)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-                        if (loseCapture && packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE) { loseCapture=false; throw new IOException("Lost published multi-group capture reply"); } return reply;
-                    } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
+                    if(packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE){var state=home.homes.read(fence.fenceId());assertTrue(state.allReady());if(!state.terminal())assertFalse(left.f.store.snapshotGate(fence.fenceId()).released()!=null || right.f.store.snapshotGate(fence.fenceId()).released()!=null);captures.incrementAndGet();}
+                    if(owner!=null)assertEquals(route.replicas().getFirst(),owner);var machine=node(route.groupId()).f.machine;var message=Message.valueOf(ByteString.copyFrom(bytes));return (owner==null?machine.queryLinearizable(message):machine.queryStale(message,0)).thenApply(reply->{if(loseCapture&&packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE){loseCapture=false;throw new java.util.concurrent.CompletionException(new IOException("Lost published multi-group capture reply"));}return reply.getContent().toByteArray();});
                 }
             });
             registry=new RatisParticipantRecoveryRegistry(java.nio.file.Files.createDirectory(root.resolve(name+"-recoveries")), transactions.statuses, Map.of(data.directory().domainId(), data), group -> data.directory(), false, Set.of(left.f.groupId,right.f.groupId), RatisParticipantRecoveryRegistry.Limits.defaults());
@@ -176,6 +172,9 @@ class RatisSnapshotCoordinatorTest {
                 var transport=new RatisRoutedClient.Transport() {
                     public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
                     public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
+                    public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException {
+                        return f.node(route.groupId()).wire.transactionAsync(route,bytes,fresh).thenApply(actual->{var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()!=ScopedTransactionRpc.SNAPSHOT_BLOCKERS)return actual;var framed=ScopedTransactionRpc.parse(actual,ScopedTransactionRpc.MAX_REPLY_BYTES);var page=RatisSnapshotBlockers.decode(framed.body());var old=page.records().getFirst();byte[] digest=old.digest();digest[0]^=1;var changed=new RatisSnapshotBlockers(page.binding(),crossedGroup?f.left.f.groupId:page.group(),page.installed(),page.position(),List.of(new RatisSnapshotBlockers.Reference(old.transaction(),crossedGroup?old.digest():digest,old.prepared())),false);return ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_BLOCKERS,changed.encode());});
+                    }
                     public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
                         byte[] actual=f.node(route.groupId()).wire.transaction(route,bytes,fresh); var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                         if (packet.kind()!=ScopedTransactionRpc.SNAPSHOT_BLOCKERS) return actual;

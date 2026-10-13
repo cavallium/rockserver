@@ -7,6 +7,8 @@ import java.nio.channels.*;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /** Caller-driven durable snapshot control. Saved control progress does not guarantee a volatile native pin still exists. */
 public final class RatisDurableSnapshot implements AutoCloseable {
@@ -38,7 +40,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private final Path path;
     private final RatisSnapshotFences homes;
     private final RatisRoutedClient data;
-    private final byte[] identity,homeIdentity;
+    private byte[] identity;private final byte[] homeIdentity;
     private final FileChannel channel;
     private final FileLock lock;
     private final LinkedHashMap<UUID,Entry> entries=new LinkedHashMap<>();
@@ -68,7 +70,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
         requireTtl(requestedTtl,mode);
         var journal=new RatisDurableSnapshot(path,homes,data,true);
-        journal.requestedTtl=requestedTtl; journal.captureMode=mode;
+        journal.requestedTtl=requestedTtl; journal.captureMode=mode;journal.identity=dataBinding(data,mode);
         try {
             journal.initial=Objects.requireNonNull(initial);
             if (initial.phase()!=SnapshotFenceStatus.Phase.INSTALLING || initial.generation()!=0) throw new IllegalArgumentException("Snapshot journal requires initial INSTALLING definition");
@@ -104,8 +106,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure;
         }
     }
+    private static byte[] dataBinding(RatisRoutedClient data,RatisSnapshotCaptureRequest.Mode mode){return mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY?data.snapshotNamespaceDigest():data.sessionIdentityDigest();}
     synchronized void requireClients(RatisSnapshotFences expectedHomes,RatisRoutedClient expectedData) throws IOException {
-        requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,Objects.requireNonNull(expectedData).sessionIdentityDigest())) throw new IllegalArgumentException("Snapshot clients differ from journal binding");
+        requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,dataBinding(Objects.requireNonNull(expectedData),captureMode))) throw new IllegalArgumentException("Snapshot clients differ from journal binding");
     }
     public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof,releaseRequested,requestedTtl,captureMode); }
     public synchronized RatisSnapshotCaptureRequest.Mode mode() throws IOException { requireOpen(); return captureMode; }
@@ -128,6 +131,42 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         idle(); if (observed==null || !observed.terminal()) throw new IllegalStateException("Snapshot consumption requires observed terminal HOME");
         if (observed.consumed() || pending!=null && homeResult==null && !homeSuperseded && next(pending).consumed()) return;
         queueHome(homes.prepare(operation,observed,observed.consume()));
+    }
+    @FunctionalInterface private interface AsyncWork<T>{CompletableFuture<T> run()throws IOException;}
+    @FunctionalInterface private interface CheckedMap<T,R>{R apply(T value)throws IOException;}
+    private static <T,R> CompletableFuture<R> map(CompletableFuture<T> actual,CheckedMap<T,R> mapper){
+        return actual.thenApply(value->{try{return mapper.apply(value);}catch(IOException failure){throw new CompletionException(failure);}});
+    }
+    /** Admission is already held; observer cancellation cannot release the actual journal owner. */
+    private <T> CompletableFuture<T> finishAsync(AsyncWork<T> work){
+        final CompletableFuture<T> actual;
+        try{actual=work.run();}catch(Throwable failure){end();return CompletableFuture.failedFuture(failure);}
+        var result=new CompletableFuture<T>();actual.whenComplete((value,failure)->{end();if(failure==null)result.complete(value);else result.completeExceptionally(failure);});return result.copy();
+    }
+    public CompletableFuture<CommandResult> executeHomeAsync()throws IOException{
+        final RatisRoutedClient.PreparedCommand request;
+        synchronized(this){idle();if(homeResult!=null)return CompletableFuture.completedFuture(homeResult);if(homeSuperseded)throw new IllegalStateException("Snapshot home request semantically superseded; exact result unknown");request=pending;active=true;}
+        return finishAsync(()->homes.executeAsync(request).thenCompose(result->{
+            CompletableFuture<SnapshotHomeFenceProof> retirement=result.status()==CommandResult.Status.SUCCESS?CompletableFuture.completedFuture(null):homes.fenceAsync(homes.identity(initial.fence(),homeRoute));
+            return map(retirement,proof->{synchronized(this){
+                if(proof!=null){mergeHomeRetirement(proof);persist();throw new RatisSnapshotHomeRetiredException(proof);}
+                if(result.valueCount()!=0)throw new IOException("Snapshot home returned unexpected values");
+                if(result.status()==CommandResult.Status.SUCCESS){var successful=next(request);if(observed!=null&&observed.generation()>successful.generation())monotone(successful,observed);else observe(successful);}
+                homeResult=result;persist();return result;
+            }});
+        }));
+    }
+    public CompletableFuture<SnapshotFenceStatus> refreshHomeAsync()throws IOException{
+        synchronized(this){idle();active=true;}
+        return finishAsync(()->homes.readRegistrationAsync(initial.fence().fenceId()).thenCompose(read->{
+            try{requireLineage(homeRoute,read.descriptor());}catch(IllegalArgumentException changed){return CompletableFuture.failedFuture(new IOException("Snapshot home incarnation/bounds changed",changed));}
+            CompletableFuture<SnapshotHomeFenceProof> retirement=read.status()==null||!initial.fence().equals(read.status().fence())?homes.fenceAsync(homes.identity(initial.fence(),homeRoute)):CompletableFuture.completedFuture(null);
+            return map(retirement,proof->{synchronized(this){
+                if(proof!=null){mergeHomeRetirement(proof);persist();throw new RatisSnapshotHomeRetiredException(proof);}
+                if(read.status()==null){if(observed!=null)throw new IOException("Snapshot home disappeared");return null;}
+                if(!read.status().equals(observed)){observe(read.status());persist();}return observed;
+            }});
+        }));
     }
     public CommandResult executeHome() throws IOException {
         RatisRoutedClient.PreparedCommand request;
@@ -182,6 +221,59 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         try { data.cancelSnapshotGate(data.restoreSnapshotGate(RatisSnapshotRecord.install(initial.fence(),group),entry.route)); }
         finally { end(); }
     }
+    private CompletableFuture<SnapshotGateResult> readGateResultAsync(UUID group){
+        return data.snapshotGateAsync(initial.fence(),group).handle((gate,failure)->{
+            if(failure==null&&gate!=null&&gate.fence().equals(initial.fence()))return CompletableFuture.completedFuture(SnapshotGateResult.retained(gate));
+            return map(data.snapshotFenceAsync(initial.fence(),group),proof->{
+                if(proof!=null)return SnapshotGateResult.retired(proof);
+                if(failure!=null){Throwable cause=failure;while(cause instanceof CompletionException&&cause.getCause()!=null)cause=cause.getCause();if(cause instanceof IOException io)throw io;throw new IOException("Snapshot gate lookup failed",cause);}
+                if(gate!=null)throw new IOException("Snapshot gate belongs to another unfenced business");return null;
+            });
+        }).thenCompose(future->future);
+    }
+    public CompletableFuture<RatisSnapshotRecord.Result> executeInstallAsync(UUID group)throws IOException{
+        final Entry entry;
+        synchronized(this){idle();entry=entry(group);if(!entry.installFrozen)throw new IllegalStateException("INSTALL is not frozen");if(entry.retirementProof!=null)return CompletableFuture.completedFuture(entry.installReceipt==null?RatisSnapshotRecord.Result.retired(entry.retirementProof):entry.installReceipt);active=true;}
+        return finishAsync(()->{
+            var receipt=entry.installReceipt==null?data.executeSnapshotGateAsync(data.restoreSnapshotGate(RatisSnapshotRecord.install(initial.fence(),group),entry.route)):CompletableFuture.completedFuture(entry.installReceipt);
+            return map(receipt,value->{synchronized(this){if(value.retired()){mergeRetirement(entry,value.retirement());persist();return value;}if(entry.installReceipt==null){checkInstallReceipt(entry,value,entry.gate);entry.installReceipt=value;persist();}return value;}}).thenCompose(value->{
+                if(value.retired())return CompletableFuture.completedFuture(value);
+                return map(readGateResultAsync(group),nativeResult->{synchronized(this){
+                    if(nativeResult!=null&&nativeResult.retired()){mergeRetirement(entry,nativeResult.retirement());persist();return entry.installReceipt==null?RatisSnapshotRecord.Result.retired(entry.retirementProof):entry.installReceipt;}
+                    var gate=nativeResult==null?null:nativeResult.gate();if(gate==null)throw new IOException("INSTALL receipt has no native proof; retry lookup");mergeGate(entry,gate);persist();return entry.installReceipt;
+                }});
+            });
+        });
+    }
+    public CompletableFuture<Boolean> verifyReadyAsync(UUID group)throws IOException{
+        final Entry entry;synchronized(this){idle();entry=entry(group);active=true;}
+        return finishAsync(()->map(data.snapshotReadinessAsync(initial.fence(),group),ready->{synchronized(this){
+            if(!ready.binding().equals(binding())||!ready.group().equals(group))throw new IOException("Readiness binding changed");
+            if(ready.retired()){mergeRetirement(entry,ready.retirement());persist();return false;}if(!ready.ready())return false;
+            if(entry.installReceipt==null||entry.installReceipt.suppressed()||entry.gate==null||!entry.gate.active()||!entry.installReceipt.position().equals(entry.gate.installed())||!entry.gate.installed().equals(ready.installed()))throw new IOException("Readiness has no matching forced INSTALL receipt/native proof");
+            if(entry.ready!=null&&!entry.ready.equals(ready.installed()))throw new IOException("Ready proof changed");if(entry.ready==null){entry.ready=ready.installed();persist();}return true;
+        }}));
+    }
+    public CompletableFuture<RatisSnapshotRecord.Result> resolveReleaseAsync(UUID group)throws IOException{
+        final Entry entry;synchronized(this){idle();entry=entry(group);if(observed==null||!observed.terminal())throw new IllegalStateException("RELEASE resolution requires terminal HOME");active=true;}
+        return finishAsync(()->map(readGateResultAsync(group),nativeResult->{synchronized(this){
+            var gate=nativeResult==null?null:nativeResult.gate();var retirement=nativeResult==null?null:nativeResult.retirement();
+            if(retirement!=null){mergeRetirement(entry,retirement);persist();return RatisSnapshotRecord.Result.retired(entry.retirementProof);}
+            if(!Objects.equals(gate,entry.gate)){mergeGate(entry,gate);persist();}return RatisSnapshotRecord.release(observed,group).receipt(gate);
+        }}));
+    }
+    public CompletableFuture<RatisSnapshotRecord.Result> executeReleaseAsync(UUID group)throws IOException{
+        final Entry entry;synchronized(this){idle();entry=entry(group);if(!entry.releaseFrozen)throw new IllegalStateException("RELEASE is not frozen");if(entry.retirementProof!=null)return CompletableFuture.completedFuture(entry.releaseReceipt==null?RatisSnapshotRecord.Result.retired(entry.retirementProof):new RatisSnapshotRecord.Result(entry.releaseReceipt));active=true;}
+        return finishAsync(()->{
+            var receipt=entry.releaseReceipt==null?data.executeSnapshotGateAsync(data.restoreSnapshotGate(RatisSnapshotRecord.release(observed,group),entry.route)):CompletableFuture.completedFuture(new RatisSnapshotRecord.Result(entry.releaseReceipt));
+            return map(receipt,result->{synchronized(this){if(result.retired()){mergeRetirement(entry,result.retirement());persist();return result;}
+                if(entry.releaseReceipt==null){var position=result.position();checkReleaseReceipt(entry,position);if(entry.gate!=null&&entry.gate.released()!=null&&!entry.gate.released().equals(position))throw new IOException("RELEASE receipt differs from verified native proof");entry.releaseReceipt=position;persist();}return result;
+            }}).thenCompose(result->{if(result.retired())return CompletableFuture.completedFuture(result);return map(readGateResultAsync(group),nativeResult->{synchronized(this){
+                if(nativeResult!=null&&nativeResult.retired()){mergeRetirement(entry,nativeResult.retirement());persist();return new RatisSnapshotRecord.Result(entry.releaseReceipt);}
+                var gate=nativeResult==null?null:nativeResult.gate();if(gate==null||gate.released()==null)throw new IOException("RELEASE receipt has no native terminal proof; retry lookup");mergeGate(entry,gate);persist();return new RatisSnapshotRecord.Result(entry.releaseReceipt);
+            }});});
+        });
+    }
     public RatisSnapshotRecord.Result executeInstall(UUID group) throws IOException {
         Entry entry;
         synchronized (this) { idle(); entry=entry(group); if (!entry.installFrozen) throw new IllegalStateException("INSTALL is not frozen"); if (entry.retirementProof!=null) return entry.installReceipt==null ? RatisSnapshotRecord.Result.retired(entry.retirementProof) : entry.installReceipt; active=true; }
@@ -234,6 +326,15 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         if (observed==null || observed.terminal() || !observed.allReady() || entry.ready==null || !entry.ready.equals(observed.progress(entry.route.groupId()).ready())) throw new IllegalStateException("Capture requires all home ready proofs and verified local readiness");
         entry.capture=restored; persist();
     }
+    public CompletableFuture<SnapshotFenceStatus.Capture> executeCaptureAsync(UUID group)throws IOException{
+        final Entry entry;synchronized(this){idle();entry=entry(group);if(entry.capture==null)throw new IllegalStateException("Capture is not frozen");if(entry.captureLost||entry.captureReleaseFrozen)throw new RatisSnapshotLostException("Capture was lost or explicitly released");active=true;}
+        return finishAsync(()->map(data.executeCaptureAsync(entry.capture).handle((captured,failure)->{
+            if(failure==null)return captured;
+            Throwable cause=failure;while(cause instanceof CompletionException&&cause.getCause()!=null)cause=cause.getCause();
+            if(cause instanceof RatisSnapshotLostException||cause.getCause() instanceof IllegalArgumentException){synchronized(this){try{entry.captureLost=true;persist();}catch(IOException force){cause.addSuppressed(force);}}throw new CompletionException(new RatisSnapshotLostException("Frozen owner capture lost or changed",cause));}
+            throw new CompletionException(cause);
+        }),captured->{synchronized(this){return acceptCaptured(entry,group,captured);}}));
+    }
     public SnapshotFenceStatus.Capture executeCapture(UUID group) throws IOException {
         Entry entry;
         synchronized (this) { idle(); entry=entry(group); if (entry.capture==null) throw new IllegalStateException("Capture is not frozen"); if (entry.captureLost || entry.captureReleaseFrozen) throw new RatisSnapshotLostException("Capture was lost or explicitly released"); active=true; }
@@ -269,6 +370,28 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     public enum CaptureReleaseProgress { RECOVERED, RELEASED, LOST }
     /** One owner RPC per call: recover an unknown original token after HOME consumption, then explicitly release it. */
+    public CompletableFuture<CaptureReleaseProgress> releaseCaptureAsync(UUID group)throws IOException{
+        final Entry entry;final boolean recover;
+        synchronized(this){requireOpen();if(active)throw new IOException("Snapshot journal RPC already active");entry=entry(group);
+            if(entry.captureReleased)return CompletableFuture.completedFuture(CaptureReleaseProgress.RELEASED);if(entry.captureReleaseLost)return CompletableFuture.completedFuture(CaptureReleaseProgress.LOST);
+            if(observed!=null&&!observed.terminal()&&pending!=null&&homeResult==null&&!homeSuperseded&&next(pending).phase()==SnapshotFenceStatus.Phase.COMPLETE)throw new IllegalStateException("Resolve pending COMPLETE before releasing its capture pin");
+            if(entry.capture==null&&entry.token==null&&(observed==null||observed.progress(group).capture()==null))return CompletableFuture.completedFuture(CaptureReleaseProgress.RELEASED);
+            if(entry.capture==null)throw new IllegalStateException("Capture release requires its frozen original owner target");recover=entry.token==null;
+            if(recover&&!captureRecoveryAllowed())throw new IllegalStateException("Unknown capture token replay requires forced consumed HOME or matching retirement proof");
+            if(!entry.captureReleaseFrozen){entry.captureReleaseFrozen=true;entry.captureLost=true;persist();}active=true;
+        }
+        return finishAsync(()->{
+            CompletableFuture<CaptureReleaseProgress> actual=recover?map(data.executeCaptureAsync(entry.capture),captured->{synchronized(this){
+                var token=captured.token();var request=entry.capture.request();var homeToken=observed==null?null:observed.progress(group).capture();
+                if(!token.ownerIncarnation().equals(request.owner())||!token.snapshotId().equals(request.snapshotId())||entry.ready==null||!atLeast(token.position(),entry.ready)||homeToken!=null&&!homeToken.equals(token))throw new IOException("Recovered capture token changed its original identity/cut");
+                entry.token=token;entry.certifiedHandle=captured.handle();persist();return CaptureReleaseProgress.RECOVERED;
+            }}):map(data.releaseSnapshotAsync(entry.capture.target(),entry.token),ignored->{synchronized(this){entry.captureReleased=true;persist();return CaptureReleaseProgress.RELEASED;}});
+            return actual.handle((progress,failure)->{if(failure==null)return progress;Throwable cause=failure;while(cause instanceof CompletionException&&cause.getCause()!=null)cause=cause.getCause();
+                if(cause instanceof RatisSnapshotLostException){synchronized(this){try{entry.captureReleaseLost=true;entry.captureLost=true;persist();return CaptureReleaseProgress.LOST;}catch(IOException force){throw new CompletionException(force);}}}
+                throw new CompletionException(cause);
+            });
+        });
+    }
     public CaptureReleaseProgress releaseCapture(UUID group) throws IOException {
         Entry entry; boolean recover;
         synchronized (this) {
@@ -527,8 +650,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         try {
             var in=ByteBuffer.wrap(body); if (in.getInt()!=MAGIC) throw new IOException("Invalid snapshot journal format");
             byte[] bound=new byte[32],homeBound=new byte[32]; in.get(bound).get(homeBound);
+            int mode=in.get() & 255; if (mode>1) throw new IOException("Invalid frozen snapshot capture mode"); captureMode=mode==0 ? RatisSnapshotCaptureRequest.Mode.READ_ONLY : RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED;identity=dataBinding(data,captureMode);
             if (!Arrays.equals(bound,identity) || !Arrays.equals(homeBound,homeIdentity)) throw new IOException("Snapshot journal client identity changed");
-            int mode=in.get() & 255; if (mode>1) throw new IOException("Invalid frozen snapshot capture mode"); captureMode=mode==0 ? RatisSnapshotCaptureRequest.Mode.READ_ONLY : RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED;
             initial=SnapshotFenceStatus.begin(SnapshotFence.decode(blob(in,SnapshotFence.MAX_BYTES))); homeRoute=SessionWindowJournal.route(in); lastHome=operation(in); observed=status(in);
             if (observed!=null) monotone(initial,observed);
             var pendingRoute=SessionWindowJournal.route(in); requireLineage(homeRoute,pendingRoute); UUID column=uuid(in); byte[] schema=new byte[32]; in.get(schema); var operation=operation(in); long ack=in.getLong();

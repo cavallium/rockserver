@@ -40,8 +40,9 @@ class RatisDatabaseBackendFactoryTest {
             var domains=nativeDomains.data.stream().map(d->d.plan.domains().getFirst()).toList();var catalogue=nativeDomains.data.getFirst().plan.catalogue();var placements=homes.stream().map(h->h.placement).toList();
             plan=new RatisNodePlan(nativeDomains.node,nativeDomains.incarnation,domains,catalogue,placements,List.of(),Map.of(),5,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(domains),RatisPoolFixtures.groups(catalogue,placements));
         }
-        RatisDatabaseBackendFactory factory(Path path)throws IOException {
-            return new RatisDatabaseBackendFactory(path,plan,nativeDomains.client,routes,scheduler,(name,shape)->nativeDomains.data.stream().filter(d->d.schema.columns().stream().anyMatch(c->c.name().equals(name))).findFirst().orElseThrow(()->new IOException("Undeclared placement")).domain,
+        RatisDatabaseBackendFactory factory(Path path)throws IOException {return factory(path,nativeDomains.client);}
+        RatisDatabaseBackendFactory factory(Path path,org.apache.ratis.client.RaftClient catalogue)throws IOException {
+            return new RatisDatabaseBackendFactory(path,plan,catalogue,routes,scheduler,(name,shape)->nativeDomains.data.stream().filter(d->d.schema.columns().stream().anyMatch(c->c.name().equals(name))).findFirst().orElseThrow(()->new IOException("Undeclared placement")).domain,
                     (name,type,hash,revision)->{throw new IOException("No operator upload in this fixture");},RatisDatabaseBackendFactory.Policy.defaults(),directory->homes.stream().filter(h->h.directory.domainId().equals(directory.domainId())).findFirst().orElseThrow().client(),new RatisSchemaReplicaClient(1));
         }
         final class Home implements AutoCloseable {
@@ -85,10 +86,10 @@ class RatisDatabaseBackendFactoryTest {
                 var connection=factory.open(URI.create("ratis://controlled/backend"));var api=connection.getAsyncApi(RequestContext.batch());assertEquals(2,await(api.getAllColumnDefinitionsAsync()).size());
                 for(int n=0;n<2;n++){long column=71+n;await(api.putAsync(0,column,key(7),value(10+n),RequestType.none()));await(api.putBatchAsync(column,RatisRocksDBBatchesTest.one(new KVBatch.KVBatchRef(List.of(key(8),key(9)),List.of(value(20+n),value(30+n)))),PutBatchMode.WRITE_BATCH));assertArrayEquals(new byte[]{(byte)(20+n)},await(api.getAsync(0,column,key(8),RequestType.<Buf>current())).toByteArray());}
                 long transaction=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertTrue(await(api.closeTransactionAsync(transaction,false)));
-                assertEquals(before+6,fixture.nativeDomains.catalogue.epochs.read().nextEpoch(),"Each domain owns allocation, point and bulk exclusive grants");
-                var grants=fixture.nativeDomains.catalogue.epochs.read().grants();assertEquals(6,grants.size());assertEquals(6,grants.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
-                var transactionHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.TRANSACTION_HOME).findFirst().orElseThrow();assertEquals(6,transactionHome.bindings.size());
-                var snapshotHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.SNAPSHOT_HOME).findFirst().orElseThrow();assertEquals(2,snapshotHome.bindings.size());assertTrue(snapshotHome.bindings.stream().allMatch(b->b.outstandingWindow()==4096));
+                assertEquals(before+4,fixture.nativeDomains.catalogue.epochs.read().nextEpoch(),"Each used domain owns point and bulk grants; an untouched lazy transaction allocates none");
+                var grants=fixture.nativeDomains.catalogue.epochs.read().grants();assertEquals(4,grants.size());assertEquals(4,grants.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
+                var transactionHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.TRANSACTION_HOME).findFirst().orElseThrow();assertEquals(4,transactionHome.bindings.size());
+                var snapshotHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.SNAPSHOT_HOME).findFirst().orElseThrow();assertTrue(snapshotHome.bindings.isEmpty(),"No snapshot grant is issued until a transaction actually captures or stages data");
             }
             assertEquals(2,fixture.transportCloses.get());long issued=fixture.nativeDomains.catalogue.epochs.read().nextEpoch();
             try(var factory=fixture.factory(owned)){
@@ -105,8 +106,9 @@ class RatisDatabaseBackendFactoryTest {
         final DistributedSchema extraSchema;final RangeDirectory extraDirectory;final RatisRoutedClient extra;
         final RatisNodePlan plan;final Map<UUID,RatisRoutedClient> routes;
         final AtomicInteger ownedHomeCloses=new AtomicInteger();
-        TransactionFixture()throws Exception {
-            nativeState=new RatisAtomicClientTest.Fixture(root.resolve("transaction-native"),true);
+        TransactionFixture()throws Exception {this(null);}
+        TransactionFixture(PoolSnapshotAdmission.Limits pins)throws Exception {
+            nativeState=new RatisAtomicClientTest.Fixture(root.resolve("transaction-native"),true,Map.of(),pins);
             var f=nativeState;var replica=f.directory.ranges().getFirst().replicas().getFirst();
             extraSchema=new DistributedSchema(f.outer.cluster,f.outer.database,extraDomain,1,1,List.of(new DistributedSchema.Column(75,extraColumn,"second-domain",f.schema.column(71).schema(),null)));
             var descriptor=new RangeDescriptor(new UUID(910,4),extraGroup,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
@@ -135,7 +137,7 @@ class RatisDatabaseBackendFactoryTest {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{return transport.read(route,column,key);}
                 public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh)throws IOException{return transport.transaction(route,request,fresh);}
                 public byte[] participant(RangeDescriptor route,byte[] record)throws IOException{return transport.participant(route,record);}
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request)throws IOException{return transport.snapshot(route,owner,request);}
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request)throws IOException{return transport.snapshot(route,owner,request);}
                 public RangeStateView stateView(RangeDescriptor route)throws IOException{return transport.stateView(route);}
                 public void close(){ownedHomeCloses.incrementAndGet();}
             }),new RatisSchemaReplicaClient(1));
@@ -155,7 +157,7 @@ class RatisDatabaseBackendFactoryTest {
                 assertNull(await(api.getAsync(0,71,key(2),RequestType.<Buf>current())),"Uncommitted cross-column state remains private");
                 assertTrue(await(api.closeTransactionAsync(firstTransaction,true)));assertArrayEquals(new byte[]{41},await(api.getAsync(0,71,key(2),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{42},await(api.getAsync(0,72,key(200),RequestType.<Buf>current())).toByteArray());
                 for(var store:f.stores.values())assertEquals(0,store.activeSnapshotPins());issued=f.catalogue.epochs.read().nextEpoch();
-                var retainedGrant=f.catalogue.epochs.read().grants().stream().filter(grant->!grant.sessionId().equals(f.session)).toList();assertEquals(6,retainedGrant.size());assertEquals(6,retainedGrant.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
+                var retainedGrant=f.catalogue.epochs.read().grants().stream().filter(grant->!grant.sessionId().equals(f.session)).toList();assertEquals(5,retainedGrant.size(),"Four point/bulk grants plus the one domain that actually stages a transaction");assertEquals(5,retainedGrant.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
             }
             assertEquals(2,fixture.ownedHomeCloses.get());int captures=f.captureRequests.get();
             try(var factory=fixture.factory(owned)){
@@ -164,6 +166,17 @@ class RatisDatabaseBackendFactoryTest {
                 for(var store:f.stores.values())assertEquals(0,store.activeSnapshotPins());
             }
             assertEquals(4,fixture.ownedHomeCloses.get());assertArrayEquals(new byte[]{41},f.get(71,key(2)));assertArrayEquals(new byte[]{55},fixture.extra.read(fixture.extraColumn,new byte[]{7}));
+        }
+    }
+
+    @Test void separateExportRootRemainsOwnedAndReopensWithoutAllocationOrSourceRpc()throws Exception {
+        try(var fixture=new Fixture()) {
+            Path owned=root.resolve("export-backend");long issued=fixture.nativeDomains.catalogue.epochs.read().nextEpoch();var borrowed=fixture.nativeDomains.client;
+            var sourceAbsent=(org.apache.ratis.client.RaftClient)Proxy.newProxyInstance(org.apache.ratis.client.RaftClient.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.RaftClient.class},(proxy,method,args)->{if(method.getName().equals("getGroupId"))return borrowed.getGroupId();throw new AssertionError("Source-free export open attempted catalogue RPC: "+method);});
+            try(var factory=fixture.factory(owned,sourceAbsent)){var exports=factory.exports();assertSame(exports,factory.exports());assertThrows(java.nio.channels.OverlappingFileLockException.class,()->{try(var duplicate=fixture.factory(owned,sourceAbsent)){duplicate.exports();}});assertEquals(issued,fixture.nativeDomains.catalogue.epochs.read().nextEpoch());assertEquals(0,fixture.nativeDomains.catalogue.epochs.read().grants().size());assertFalse(Files.exists(owned.resolve("export-allocations")));factory.drainExports();}
+            assertEquals(4,fixture.transportCloses.get());for(var data:fixture.nativeDomains.data)assertNull(data.routed.read(data.column,new byte[]{7}));
+            try(var factory=fixture.factory(owned,sourceAbsent)){assertNotNull(factory.exports());assertEquals(issued,fixture.nativeDomains.catalogue.epochs.read().nextEpoch());assertEquals(0,fixture.nativeDomains.catalogue.epochs.read().grants().size());assertFalse(Files.exists(owned.resolve("export-allocations")));}
+            assertEquals(6,fixture.transportCloses.get(),"The refused duplicate retires only its own HOME transports");
         }
     }
 

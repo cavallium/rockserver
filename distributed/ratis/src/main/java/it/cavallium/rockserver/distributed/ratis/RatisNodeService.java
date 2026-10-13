@@ -52,9 +52,9 @@ public final class RatisNodeService implements AutoCloseable {
     private boolean starting,closing,closed,closeRequested; private int checks;
     private RatisDatabaseBackendFactory frontendBackend;
     private Server frontend;
-    private boolean frontendOpening,frontendClosed,backendClosed;
+    private boolean frontendOpening,frontendClosed,exportsClosed,backendClosed;
     @FunctionalInterface interface BackendCreator { RatisDatabaseBackendFactory create() throws IOException; }
-    @FunctionalInterface interface ListenerCreator { Server create(RatisRocksDBConnection connection) throws IOException; }
+    @FunctionalInterface interface ListenerCreator { Server create(RatisRocksDBConnection connection,it.cavallium.rockserver.core.common.export.ExportAsyncAPI exports) throws IOException; }
     private RatisNodeService(RatisNodeManifest manifest,Resources resources,RatisNodeRuntime node) {
         this.manifest=manifest; this.resources=resources; this.node=node; var plan=manifest.plan(); var c=plan.catalogue();
         schemas=new RatisSchemaCatalogue(resources.catalogue,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
@@ -127,8 +127,8 @@ public final class RatisNodeService implements AutoCloseable {
             RatisSchemaClient.TrustedOperatorResolver resolver,RatisDatabaseBackendFactory.Policy policy) throws IOException {
         requireListenAddress(listen);
         startFrontend(() -> new RatisDatabaseBackendFactory(backendRoot,manifest.plan(),resources.catalogue,
-                resources.routed,resources.scheduler,placement,resolver,policy),connection -> {
-            var builder=new ServerBuilder();builder.setClient(connection);
+                resources.routed,resources.scheduler,placement,resolver,policy),(connection,exports) -> {
+            var builder=new ServerBuilder();builder.setClient(connection);builder.setExportAPI(exports);
             builder.setHttpAddress(new HostAndPort(listen.getHost(),listen.getPort()));
             builder.setUseThrift(listen.getScheme().equals("thrift"));return builder.build();
         },listen);
@@ -150,7 +150,7 @@ public final class RatisNodeService implements AutoCloseable {
             verifyCatalogue();
             var owner=Objects.requireNonNull(backend.create());synchronized(this){frontendBackend=owner;}
             var connection=owner.open(listen);
-            var server=Objects.requireNonNull(listener.create(connection));synchronized(this){frontend=server;}
+            var server=Objects.requireNonNull(listener.create(connection,owner.exports()));synchronized(this){frontend=server;}
             server.start();
         } finally { synchronized(this){frontendOpening=false;} }
     }
@@ -189,6 +189,7 @@ public final class RatisNodeService implements AutoCloseable {
         }
         try {
             if(frontend!=null && !frontendClosed){frontend.close();frontendClosed=true;}
+            if(frontendBackend!=null && !exportsClosed){frontendBackend.drainExports();exportsClosed=true;}
             if(frontendBackend!=null && !backendClosed){frontendBackend.close();backendClosed=true;}
             node.close(); // On a drain/pin/close failure retain all dependencies and ownership for retry.
             resources.close(); synchronized (this) { closed=true; }

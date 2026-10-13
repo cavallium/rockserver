@@ -11,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Actual native catalogue issuance and HOME/DATA bindings through the current public maintenance facades. */
 class RatisBackendSessionsTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
-    static List<RatisBackendSessions.Target> targets(RatisDatabaseBackupFactoryFixture fixture){var result=new ArrayList<RatisBackendSessions.Target>();for(var home:fixture.homes){for(var range:home.data.directory.ranges())result.add(new RatisBackendSessions.Target(fixture.access.get(home.data.domain).routed(),range.groupId()));result.add(new RatisBackendSessions.Target(home.routed,home.group));}return result;}
+    static List<RatisBackendSessions.Target> targets(RatisDatabaseBackupFactoryFixture fixture){var result=new ArrayList<RatisBackendSessions.Target>();for(var home:fixture.homes){for(var range:home.data.directory.ranges())result.add(new RatisBackendSessions.Target(fixture.access.get(home.data.domain).routed(),range.groupId(),home.data.directory));result.add(new RatisBackendSessions.Target(home.routed,home.group,home.routed.directory()));}return result;}
     @Test void twoDomainsDistinctPointBulkWindowsFreezeIssuanceAndRecoverLostAppliedReply()throws Exception{
         try(var fixture=new RatisDatabaseBackupFactoryFixture(root.resolve("sessions"))){
             var routed=fixture.access.get(fixture.homes.getFirst().data.domain).routed();var limits=RatisSessionClient.Limits.defaults();Path point=root.resolve("point"),bulk=root.resolve("bulk");var epochs=fixture.catalogue.epochs;

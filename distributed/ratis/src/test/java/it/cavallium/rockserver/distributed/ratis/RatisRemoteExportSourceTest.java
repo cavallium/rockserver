@@ -29,7 +29,7 @@ class RatisRemoteExportSourceTest {
         public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
         public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
         String key(RatisExportSourceRpc.JobDefinition d,long ordinal) { return d.jobId()+"-"+d.group()+"-"+ordinal; }
-        public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] frame) throws IOException {
+        public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] frame) throws IOException {
             assertEquals(route.replicas().getFirst(),owner);
             var request=ScopedTransactionRpc.parse(frame,ScopedTransactionRpc.MAX_REQUEST_BYTES); int kind=request.kind();
             try {
@@ -43,18 +43,18 @@ class RatisRemoteExportSourceTest {
                         descriptors.put(key,descriptor); files.put(key,m.file()); builds++;
                     }
                     if (loseBuild) { loseBuild=false; throw new IOException("Lost BUILD reply after durable artifact"); }
-                    return ScopedTransactionRpc.frame(kind,new RatisExportSourceRpc.BuildReply(build,descriptor).encode());
+                    return java.util.concurrent.CompletableFuture.completedFuture(ScopedTransactionRpc.frame(kind,new RatisExportSourceRpc.BuildReply(build,descriptor).encode()));
                 }
                 if (kind==ScopedTransactionRpc.EXPORT_READ) {
                     var read=RatisExportSourceRpc.ReadRequest.decode(request.body()); String key=key(read.definition(),read.ordinal());
                     assertArrayEquals(descriptors.get(key).digest(),read.descriptorDigest()); assertTrue(read.maxBytes()<=1024*1024);
                     var output=ByteBuffer.allocate(read.maxBytes()); try (var input=FileChannel.open(files.get(key),StandardOpenOption.READ)) { input.position(read.offset()); while(output.hasRemaining() && input.read(output)>=0) {} }
                     byte[] bytes=Arrays.copyOf(output.array(),output.position()); if (truncate) { truncate=false; bytes=Arrays.copyOf(bytes,bytes.length-1); }
-                    return ScopedTransactionRpc.frame(kind,new RatisExportSourceRpc.ReadReply(read,bytes).encode());
+                    return java.util.concurrent.CompletableFuture.completedFuture(ScopedTransactionRpc.frame(kind,new RatisExportSourceRpc.ReadReply(read,bytes).encode()));
                 }
                 if (kind==ScopedTransactionRpc.EXPORT_RELEASE) {
                     var release=RatisExportSourceRpc.ReleaseRequest.decode(request.body()); if (failRelease) { failRelease=false; throw new IOException("Controlled RELEASE rejection"); }
-                    releases++; return ScopedTransactionRpc.frame(kind,new RatisExportSourceRpc.ReleaseReply(release).encode());
+                    releases++; return java.util.concurrent.CompletableFuture.completedFuture(ScopedTransactionRpc.frame(kind,new RatisExportSourceRpc.ReleaseReply(release).encode()));
                 }
                 throw new AssertionError("Unexpected owner query "+kind);
             } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
@@ -126,17 +126,10 @@ class RatisRemoteExportSourceTest {
             try (var routed=new RatisRoutedClient(f.directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] frame) throws IOException {
-                    assertEquals(route.replicas().getFirst(),owner); var packet=ScopedTransactionRpc.parse(frame,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-                    try {
-                        if (packet.kind()==ScopedTransactionRpc.EXPORT_RELEASE) {
-                            for (var group:f.groups) assertEquals(0,f.machines.get(group).snapshotPinStats().pins());
-                            releases.add(packet.body());
-                        }
-                        var reply=await(service.submit(route.groupId(),packet.kind(),packet.body()));
-                        if (packet.kind()==ScopedTransactionRpc.EXPORT_RELEASE && loseRelease.compareAndSet(true,false)) throw new IOException("Lost RELEASE reply after durable cleanup");
-                        return ScopedTransactionRpc.frame(packet.kind(),reply);
-                    } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] frame) throws IOException {
+                    assertEquals(route.replicas().getFirst(),owner);var packet=ScopedTransactionRpc.parse(frame,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+                    if(packet.kind()==ScopedTransactionRpc.EXPORT_RELEASE){for(var group:f.groups)assertEquals(0,f.machines.get(group).snapshotPinStats().pins());releases.add(packet.body());}
+                    return service.submit(route.groupId(),packet.kind(),packet.body()).thenApply(reply->{if(packet.kind()==ScopedTransactionRpc.EXPORT_RELEASE&&loseRelease.compareAndSet(true,false))throw new java.util.concurrent.CompletionException(new IOException("Lost RELEASE reply after durable cleanup"));return ScopedTransactionRpc.frame(packet.kind(),reply);});
                 }
             }); var client=new RatisExportClient(source,f.scheduler,new RatisRemoteExportSource(source,routed),RatisExportClient.Limits.defaults()); var job=client.create(path,definition,RequestContext.batch()); var destination=new Destination(destinationPath,true,definition.columns())) {
                 await(job.completion()); await(job.step(RequestContext.batch())); int captures=f.captureRequests.get();
@@ -186,13 +179,8 @@ class RatisRemoteExportSourceTest {
             var loseBuild=new java.util.concurrent.atomic.AtomicBoolean(true); var loseRelease=new java.util.concurrent.atomic.AtomicBoolean(true); var releases=new ArrayList<byte[]>();
             try (var routed=new RatisRoutedClient(f.directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); } public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] frame) throws IOException {
-                    var packet=ScopedTransactionRpc.parse(frame,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-                    try { var reply=await(service.get().submit(route.groupId(),packet.kind(),packet.body()));
-                        if(packet.kind()==ScopedTransactionRpc.EXPORT_BUILD && RatisExportSourceRpc.BuildRequest.decode(packet.body()).intent().column().equals(selected.getLast()) && loseBuild.compareAndSet(true,false)) throw new IOException("Lost boundary BUILD reply");
-                        if(packet.kind()==ScopedTransactionRpc.EXPORT_RELEASE) { releases.add(packet.body()); if(loseRelease.compareAndSet(true,false)) throw new IOException("Lost RELEASE reply"); }
-                        return ScopedTransactionRpc.frame(packet.kind(),reply);
-                    } catch(IOException failure) { throw failure; } catch(Exception failure) { throw new IOException(failure); }
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] frame) throws IOException {
+                    var packet=ScopedTransactionRpc.parse(frame,ScopedTransactionRpc.MAX_REQUEST_BYTES);return service.get().submit(route.groupId(),packet.kind(),packet.body()).thenApply(reply->{if(packet.kind()==ScopedTransactionRpc.EXPORT_BUILD&&RatisExportSourceRpc.BuildRequest.decode(packet.body()).intent().column().equals(selected.getLast())&&loseBuild.compareAndSet(true,false))throw new java.util.concurrent.CompletionException(new IOException("Lost boundary BUILD reply"));if(packet.kind()==ScopedTransactionRpc.EXPORT_RELEASE){releases.add(packet.body());if(loseRelease.compareAndSet(true,false))throw new java.util.concurrent.CompletionException(new IOException("Lost RELEASE reply"));}return ScopedTransactionRpc.frame(packet.kind(),reply);});
                 }
             })) {
                 var lease=snapshots.openFrozen(definition.sourceJournal(),definition.fence(),definition.snapshotTtl(),RequestContext.batch()); await(lease.completion()); int captures=f.captureRequests.get(); var group=f.groups.getFirst();

@@ -135,22 +135,23 @@ class RatisSessionClockServiceTest {
             } finally { release.countDown(); }
         }
     }
-    @Test void threeScopesShareOneBudgetAndAllMustFinishBeforeAnotherClockAdvance() throws Exception {
+    @Test void fourScopesShareOneBudgetAndAllMustFinishBeforeAnotherClockAdvance() throws Exception {
         try (var f=new RatisSessionPropagationTest.Fixture(root)) {
             var wall=new AtomicLong(20);
-            try (var env=new MultiEnv(root,f,wall,List.of(f.catalogue.epochs,f.catalogue.epochs,f.catalogue.epochs))) {
-                for (int i=1;i<=6;i++) {
+            try (var env=new MultiEnv(root,f,wall,List.of(f.catalogue.epochs,f.catalogue.epochs,f.catalogue.epochs,f.catalogue.epochs))) {
+                for (int i=1;i<=8;i++) {
                     var status=env.service.tick().get(5,TimeUnit.SECONDS);
                     assertEquals(i,f.submissions,"One total participant visit per quantum across all scopes");
-                    assertEquals(i==6,status.complete()); assertEquals(3,status.scopes().size());
+                    assertEquals(i==8,status.complete()); assertEquals(4,status.scopes().size());
                     assertSame(status.scopes().getFirst(),status.propagation());
                     for (var scope:status.scopes()) assertEquals(20,scope.target().logicalTimeMillis());
-                    assertEquals(i<4 ? 1 : 2,status.scopes().get((i-1)%3).completed());
+                    assertEquals(i<5 ? 1 : 2,status.scopes().get((i-1)%4).completed());
                     wall.set(30); assertEquals(20,f.catalogue.epochs.read().logicalTimeMillis());
                 }
                 var next=env.service.tick().get(5,TimeUnit.SECONDS); assertEquals(30,next.clock().authority().logicalTimeMillis());
                 for (var scope:next.scopes()) assertEquals(next.clock().authority(),scope.target());
                 assertThrows(UnsupportedOperationException.class,() -> next.scopes().clear());
+                assertThrows(IllegalArgumentException.class,()->new RatisSessionClockService.Snapshot(null,Collections.nCopies(RatisSessionClockService.MAX_SCOPES+1,next.propagation())));
                 assertThrows(IllegalArgumentException.class,() -> new RatisSessionClockService(env.scheduler,env.clock,List.of(),wall::get,1));
                 assertThrows(IllegalArgumentException.class,() -> new RatisSessionClockService(env.scheduler,env.clock,List.of(env.drivers.getFirst(),env.drivers.getFirst()),wall::get,1));
                 assertThrows(IllegalArgumentException.class,() -> new RatisSessionClockService(env.scheduler,env.clock,List.of(env.drivers.getFirst(),env.drivers.get(1),env.drivers.get(2),env.drivers.getFirst()),wall::get,1));

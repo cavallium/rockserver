@@ -53,7 +53,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     }
     RatisSnapshotCaptureRequest.Mode captureMode() { return mode; }
     public byte[] identityDigest() {
-        var bytes=java.nio.ByteBuffer.allocate(97).put(data.sessionIdentityDigest()).put(homes.identityDigest()).put(schema.digest()).put((byte)(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? 0 : 1)).array();
+        var bytes=java.nio.ByteBuffer.allocate(97).put(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY?data.snapshotNamespaceDigest():data.sessionIdentityDigest()).put(homes.identityDigest()).put(schema.digest()).put((byte)(mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY ? 0 : 1)).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); }
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }

@@ -20,10 +20,11 @@ import reactor.core.scheduler.Scheduler;
 
 /** One queued/running background quantum through the database's existing bounded BATCH write lane. */
 public final class RatisSessionClockService {
+    public static final int MAX_SCOPES=it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster.MAX_DOMAINS+2;
     public record Snapshot(RatisCatalogueClock.Tick clock,List<RatisSessionPropagation.Progress> scopes) {
         public Snapshot {
             scopes=List.copyOf(scopes);
-            if (scopes.isEmpty() || scopes.size()>3) throw new IllegalArgumentException("Invalid clock propagation scopes");
+            if (scopes.isEmpty() || scopes.size()>MAX_SCOPES) throw new IllegalArgumentException("Invalid clock propagation scopes");
         }
         public RatisSessionPropagation.Progress propagation() { return scopes.getFirst(); }
         public boolean complete() { return scopes.stream().allMatch(RatisSessionPropagation.Progress::complete); }
@@ -64,7 +65,7 @@ public final class RatisSessionClockService {
         this.scheduler=Objects.requireNonNull(scheduler);
         this.executor=scheduler.executor(RequestContext.batch(),OperationFamily.MUTATION);
         this.clock=Objects.requireNonNull(clock); this.propagations=List.copyOf(propagations); this.timeMillis=Objects.requireNonNull(timeMillis);
-        if (this.propagations.isEmpty() || this.propagations.size()>3
+        if (this.propagations.isEmpty() || this.propagations.size()>MAX_SCOPES
                 || this.propagations.stream().map(RatisSessionPropagation::scopeIdentity).distinct().count()!=this.propagations.size()) {
             throw new IllegalArgumentException("Invalid clock propagation scopes");
         }

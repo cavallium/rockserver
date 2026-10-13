@@ -5,6 +5,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /** Snapshot fence home CAS over one dedicated data-plane column. Participant gate/capture proofs need separate verification. */
 public final class RatisSnapshotFences {
@@ -35,6 +37,11 @@ public final class RatisSnapshotFences {
         if (!identity.columnId().equals(column) || !Arrays.equals(identity.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Snapshot HOME fence context changed");
         return routed.snapshotHomeFence(identity);
     }
+    public CompletableFuture<SnapshotHomeFenceProof> fenceAsync(SnapshotHomeIdentity identity) {
+        requireDatabaseBinding(identity.fence().clusterId(),identity.fence().databaseId());
+        if(!identity.columnId().equals(column)||!Arrays.equals(identity.schemaDigest(),schemaDigest))throw new IllegalArgumentException("Snapshot HOME fence context changed");
+        return routed.snapshotHomeFenceAsync(identity);
+    }
     public void retire(SnapshotHomeRetirement retirement) throws IOException {
         var identity=retirement.identity(); requireDatabaseBinding(identity.fence().clusterId(),identity.fence().databaseId());
         if (!identity.columnId().equals(column) || !Arrays.equals(identity.schemaDigest(),schemaDigest)) throw new IllegalArgumentException("Snapshot HOME retirement context changed");
@@ -56,6 +63,14 @@ public final class RatisSnapshotFences {
             return new RegistrationRead(status,read.descriptor());
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot fence home record",malformed); }
     }
+    public CompletableFuture<RegistrationRead> readRegistrationAsync(UUID fenceId) {
+        return routed.readWithRouteAsync(column,key(fenceId)).thenApply(read->{
+            if(read.value()==null)return new RegistrationRead(null,read.descriptor());
+            try{var status=SnapshotFenceStatus.decode(read.value());requireIdentity(status,cluster,database,read.descriptor().groupId(),read.descriptor().rangeEpoch(),key(fenceId));return new RegistrationRead(status,read.descriptor());}
+            catch(IllegalArgumentException malformed){throw new CompletionException(new IOException("Invalid snapshot fence home record",malformed));}
+        });
+    }
+    public CompletableFuture<CommandResult> executeAsync(RatisRoutedClient.PreparedCommand prepared) {validate(prepared);return routed.executeAsync(prepared);}
     /** Retain this exact request for uncertain retries. A confirmed CAS conflict requires a fresh read and new operation identity. */
     public RatisRoutedClient.PreparedCommand prepare(OperationId operation,SnapshotFenceStatus expected,SnapshotFenceStatus next) {
         Objects.requireNonNull(next); byte[] key=key(next.fence().fenceId());

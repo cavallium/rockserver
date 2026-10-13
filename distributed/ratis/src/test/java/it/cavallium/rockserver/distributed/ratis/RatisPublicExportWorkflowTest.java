@@ -58,34 +58,15 @@ class RatisPublicExportWorkflowTest {
         }
         assertEquals(chunk.fileBytes(),offset);if(chunk.rows()>0)assertTrue(pages>1,"Incompressible native SST must exercise bounded multi-page delivery");return file;
     }
-    @Test void directGrpcNativeCapturePagedDeliveryDurableDestinationBeforeAckAndExactJournalReopen()throws Exception {
-        Path jobs=root.resolve("jobs"),destination=root.resolve("destination");UUID id;int captures;List<ExportJobs.Chunk> chunks;byte[] lostPage;
-        byte[] firstValue=new byte[256*1024],secondValue=new byte[256*1024];new Random(112).nextBytes(firstValue);new Random(113).nextBytes(secondValue);
-        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("source"),true);var snapshots=RatisExportClientTest.snapshots(f);var executor=Executors.newVirtualThreadPerTaskExecutor()){
-            seed(f,71,RatisAtomicClientTest.key(2),Buf.wrap(firstValue),1900);seed(f,71,RatisAtomicClientTest.key(200),Buf.wrap(secondValue),1901);
-            var targets=new ArrayList<RatisBackendSessions.Target>();for(var range:f.directory.ranges())targets.add(new RatisBackendSessions.Target(f.data,range.groupId()));targets.add(new RatisBackendSessions.Target(f.homeClient,f.homeGroup));targets.add(new RatisBackendSessions.Target(f.snapshotClient,f.snapshotGroup));
-            var request=new ExportJobs.Create(new UUID(996,1),List.of(71L),new ExportJobs.Limits(8,16L<<20,32L<<20,1,1L<<20,2L<<20,Duration.ofSeconds(10),Duration.ofSeconds(60)));var create=ExportWire.create(request).toBuilder().setContext(ExportWire.context(RequestContext.batch(),RequestContext.NO_TIMEOUT)).build();
-            try(var allocations=new RatisBackendAllocations(root.resolve("allocations"),f.catalogue.epochs,f.scheduler,3600000,4,targets);var sdk=new RatisExportClient(snapshots,f.scheduler,RatisExportBackendTest.writer(f,executor),RatisExportClient.Limits.defaults());var backend=new RatisExportBackend(jobs,f.schema,snapshots,f.scheduler,sdk,allocations,RatisExportBackend.Limits.defaults())){
-                var service=new ExportGrpcService(backend);assertThrows(IOException.class,()->lose(service.createExport(create)));var created=ExportWire.status(ExportStatus.parseFrom(service.createExport(create).block(WAIT).toByteArray()));id=created.jobId();assertEquals(0,f.captureRequests.get());assertEquals(3,f.catalogue.epochs.read().nextEpoch(),"Export allocation is issued by the native catalogue");
-                var progress=ExportWire.status(service.stepExport(job(id)).block(WAIT),id);assertTrue(f.captureRequests.get()>0);captures=f.captureRequests.get();for(var group:f.groups)assertEquals(1,f.machines.get(group).snapshotPinStats().pins());
-                for(int n=0;n<32 && progress.phase()!=ExportJobs.Phase.READY;n++)progress=ExportWire.status(service.stepExport(job(id)).block(WAIT),id);assertEquals(ExportJobs.Phase.READY,progress.phase());assertEquals(0,progress.acknowledgedCount());assertEquals(captures,f.captureRequests.get());
-                for(var group:f.groups){assertEquals(0,f.machines.get(group).snapshotPinStats().pins());assertEquals(0,f.stores.get(group).activeSnapshotPins());}
-                chunks=manifest(service,id);assertEquals(2,chunks.size());assertTrue(chunks.stream().allMatch(chunk->chunk.rows()==1));
-                var first=chunks.getFirst();lostPage=service.readExport(read(first.id(),0)).block(WAIT).toByteArray();
-                try(var target=new Destination(destination)){target.install(first,receive(service,first));assertEquals(0,status(service,id).acknowledgedCount());}
-            }
-            long issued=f.catalogue.epochs.read().nextEpoch();
-            // Materialized delivery recovery needs no capture source, and native source stores stay live.
-            try(var sdk=new RatisExportClient(null,f.scheduler,null,RatisExportClient.Limits.defaults());var backend=new RatisExportBackend(jobs,f.schema,null,f.scheduler,sdk,null,RatisExportBackend.Limits.defaults());var target=new Destination(destination)){
-                var service=new ExportGrpcService(backend);assertEquals(id,ExportWire.status(service.createExport(create).block(WAIT)).jobId());var recoveredManifest=manifest(service,id);assertEquals(chunks.size(),recoveredManifest.size());for(int n=0;n<chunks.size();n++)assertArrayEquals(ExportWire.chunk(chunks.get(n)).toByteArray(),ExportWire.chunk(recoveredManifest.get(n)).toByteArray());assertEquals(captures,f.captureRequests.get());assertEquals(issued,f.catalogue.epochs.read().nextEpoch());
-                var first=chunks.getFirst();assertArrayEquals(lostPage,service.readExport(read(first.id(),0)).block(WAIT).toByteArray());assertTrue(target.contains(first.id()),"Destination commit survives before the original ACK");assertThrows(IOException.class,()->lose(service.acknowledgeExport(acknowledge(first.id()))));
-            }
-            try(var sdk=new RatisExportClient(null,f.scheduler,null,RatisExportClient.Limits.defaults());var backend=new RatisExportBackend(jobs,f.schema,null,f.scheduler,sdk,null,RatisExportBackend.Limits.defaults());var target=new Destination(destination)){
-                var service=new ExportGrpcService(backend);assertEquals(1,status(service,id).acknowledgedCount());service.acknowledgeExport(acknowledge(chunks.getFirst().id())).block(WAIT);assertEquals(1,status(service,id).acknowledgedCount());
-                for(var chunk:chunks)if(!target.contains(chunk.id())){target.install(chunk,receive(service,chunk));assertTrue(target.contains(chunk.id()));service.acknowledgeExport(acknowledge(chunk.id())).block(WAIT);}
-                assertArrayEquals(firstValue,target.db.get(new byte[]{2}));assertArrayEquals(secondValue,target.db.get(new byte[]{(byte)200}));assertEquals(chunks.size(),status(service,id).acknowledgedCount());service.releaseExport(job(id)).block(WAIT);assertEquals(0,sdk.stats().jobs());assertEquals(ExportJobs.Phase.RELEASED,status(service,id).phase());assertFalse(status(service,id).cleanupPending());assertEquals(captures,f.captureRequests.get());assertEquals(issued,f.catalogue.epochs.read().nextEpoch());
-                for(var group:f.groups){assertEquals(0,f.machines.get(group).snapshotPinStats().pins());assertEquals(0,f.stores.get(group).activeSnapshotPins());}
-            }
+    @Test void crossDomainPublicSelectionReturnsBothSchemasAndOnlyRequestedColumnChunks()throws Exception {
+        var workflow=new RatisDatabaseExportWorkflowTest();workflow.root=root;
+        try(var source=workflow.new Source(root.resolve("aggregate-source"))){
+            var api=source.factory.open(java.net.URI.create("ratis://controlled/aggregate-source")).getAsyncApi(RequestContext.batch());
+            api.putAsync(0,74,RatisAtomicClientTest.member(2,"alpha"),Buf.wrap(new byte[]{7}),RequestType.none()).get(20,TimeUnit.SECONDS);api.putAsync(0,75,RatisAtomicClientTest.key(7),Buf.wrap(new byte[]{9}),RequestType.none()).get(20,TimeUnit.SECONDS);
+            var request=RatisDatabaseExportWorkflowTest.request(new UUID(997,1),List.of(74L,75L));var service=new ExportGrpcService(source.backend);var created=ExportWire.status(service.createExport(ExportWire.create(request)).block(WAIT));var progress=created;
+            for(int n=0;n<128 && progress.phase()!=ExportJobs.Phase.READY;n++)progress=ExportWire.status(service.stepExport(job(created.jobId())).block(WAIT));assertEquals(ExportJobs.Phase.READY,progress.phase());assertEquals(2,progress.domainCount());
+            var definition=it.cavallium.rockserver.core.common.distributed.DatabaseExportDefinition.decode(RatisDatabaseExportWorkflowTest.witness(service,progress,ExportJobs.WitnessKind.DEFINITION));var captures=it.cavallium.rockserver.core.common.distributed.DatabaseExportCaptures.decode(RatisDatabaseExportWorkflowTest.witness(service,progress,ExportJobs.WitnessKind.CAPTURES),definition);assertEquals(1,captures.cohorts().size());assertEquals(3,RatisDatabaseExportWorkflowTest.tokens(captures).size());
+            var chunks=manifest(service,created.jobId());assertEquals(Set.of(74L,75L),chunks.stream().map(ExportJobs.Chunk::columnId).collect(java.util.stream.Collectors.toSet()));for(var chunk:chunks){RatisDatabaseExportWorkflowTest.qualify(definition,captures,chunk);service.acknowledgeExport(acknowledge(chunk.id())).block(WAIT);}service.releaseExport(job(created.jobId())).block(WAIT);assertEquals(ExportJobs.Phase.RELEASED,status(service,created.jobId()).phase());assertEquals(0,source.ordinaryCaptures);assertEquals(0,source.f.catalogue.pool.snapshotAdmissionStats().pins());
         }
     }
 }

@@ -63,6 +63,10 @@ public final class GrpcExportClient implements ExportAsyncAPI {
                 .setOffset(request.offset()).setMaximumItems(request.maximumItems()).setMaximumBytes(request.maximumBytes()).setContext(c).build()),
                 value -> ExportWire.manifest(value, request));
     }
+    @Override public CompletableFuture<ExportJobs.WitnessPage> exportWitness(ExportJobs.WitnessRequest request, RequestContext context) {
+        return invoke(context, (s, c) -> s.exportWitness(ExportWire.witnessRequest(request).toBuilder().setContext(c).build()),
+                value -> ExportWire.witness(value, request));
+    }
     @Override public CompletableFuture<ExportJobs.FilePage> readExport(ExportJobs.ReadRequest request, RequestContext context) {
         return invoke(context, (s, c) -> s.readExport(ExportReadRequest.newBuilder().setId(ExportWire.id(request.id()))
                 .setOffset(request.offset()).setMaximumBytes(request.maximumBytes()).setContext(c).build()), value -> ExportWire.file(value, request));

@@ -16,8 +16,15 @@ pub const MIN_PAGE_BYTES: i32 = 64 * 1024;
 pub const MAX_FILE_PAGE_BYTES: i32 = 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_WITNESS_BYTES: i64 = 64 * 1024 * 1024;
 pub type ExportId = [u8; 16];
-pub use wire::{ExportPhase as Phase, ExportRawScanMode as RawScanMode};
+pub use wire::{
+    ExportPhase as Phase, ExportRawScanMode as RawScanMode, ExportWitnessKind as WitnessKind,
+};
+
+#[path = "aggregate_export.rs"]
+mod aggregate;
+pub use aggregate::*;
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -90,7 +97,12 @@ pub struct ExportStatus {
     pub acknowledged_count: i32,
     pub file_bytes: i64,
     pub cleanup_pending: bool,
-    pub canonical_schema: Vec<u8>,
+    pub definition_digest: [u8; 32],
+    pub definition_bytes: i64,
+    pub roster_generation: i64,
+    pub domain_count: i32,
+    pub capture_digest: Option<[u8; 32]>,
+    pub capture_bytes: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkId {
@@ -527,20 +539,31 @@ impl ExportSchema {
     }
 }
 impl ExportStatus {
-    pub fn decoded_schema(&self) -> Result<ExportSchema> {
-        ExportSchema::decode(&self.canonical_schema)
-    }
     pub fn decode(v: wire::ExportStatus, expected_job: Option<ExportId>) -> Result<Self> {
-        let schema = ExportSchema::decode(&v.schema)?;
-        let selected = columns(v.columns)?;
-        if selected
-            .iter()
-            .any(|api| !schema.columns.iter().any(|column| column.api_id == *api))
+        let phase = Phase::try_from(v.phase).map_err(|_| invalid("unknown export phase"))?;
+        let definition_digest = content_digest(v.definition_digest)?;
+        let capture_digest = if v.capture_digest.is_empty() {
+            None
+        } else {
+            Some(content_digest(v.capture_digest)?)
+        };
+        if !(1..=MAX_WITNESS_BYTES).contains(&v.definition_bytes)
+            || v.roster_generation < 0
+            || !(1..=64).contains(&v.domain_count)
+            || if capture_digest.is_some() {
+                !(1..=MAX_WITNESS_BYTES).contains(&v.capture_bytes)
+            } else {
+                v.capture_bytes != 0
+            }
         {
-            return Err(invalid(
-                "export status selected column is absent from schema witness",
-            ));
+            return Err(invalid("invalid aggregate export witness status"));
         }
+        if capture_digest.is_none()
+            && matches!(phase, Phase::Exporting | Phase::Materialized | Phase::Ready)
+        {
+            return Err(invalid("export phase requires forced capture witness"));
+        }
+        let selected = columns(v.columns)?;
         let job_id = uuid(v.job_id)?;
         if expected_job.is_some_and(|id| id != job_id)
             || v.participant_count < 0
@@ -552,15 +575,134 @@ impl ExportStatus {
         }
         Ok(Self {
             job_id,
-            phase: Phase::try_from(v.phase).map_err(|_| invalid("unknown export phase"))?,
+            phase,
             columns: selected,
             participant_count: v.participant_count,
             chunk_count: v.chunk_count,
             acknowledged_count: v.acknowledged_count,
             file_bytes: v.file_bytes,
             cleanup_pending: v.cleanup_pending,
-            canonical_schema: v.schema,
+            definition_digest,
+            definition_bytes: v.definition_bytes,
+            roster_generation: v.roster_generation,
+            domain_count: v.domain_count,
+            capture_digest,
+            capture_bytes: v.capture_bytes,
         })
+    }
+}
+
+fn content_digest(value: Vec<u8>) -> Result<[u8; 32]> {
+    value
+        .try_into()
+        .map_err(|_| invalid("witness digest must contain 32 bytes"))
+}
+#[derive(Clone, Debug)]
+pub struct WitnessRequest {
+    pub job_id: ExportId,
+    pub kind: WitnessKind,
+    pub expected_digest: [u8; 32],
+    pub offset: i64,
+    pub maximum_bytes: i32,
+}
+impl WitnessRequest {
+    fn validate(&self) -> Result<()> {
+        if self.offset < 0
+            || self.offset > MAX_WITNESS_BYTES
+            || !(MIN_PAGE_BYTES..=MAX_FILE_PAGE_BYTES).contains(&self.maximum_bytes)
+        {
+            return Err(invalid("invalid export witness request"));
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitnessPage {
+    pub job_id: ExportId,
+    pub kind: WitnessKind,
+    pub digest: [u8; 32],
+    pub total_bytes: i64,
+    pub offset: i64,
+    pub data: Vec<u8>,
+    pub has_more: bool,
+}
+impl WitnessPage {
+    pub fn decode(v: wire::ExportWitnessPage, request: &WitnessRequest) -> Result<Self> {
+        request.validate()?;
+        let page = Self {
+            job_id: uuid(v.job_id)?,
+            kind: WitnessKind::try_from(v.kind)
+                .map_err(|_| invalid("unknown export witness kind"))?,
+            digest: content_digest(v.digest)?,
+            total_bytes: v.total_bytes,
+            offset: v.offset,
+            data: v.data,
+            has_more: v.has_more,
+        };
+        page.validate()?;
+        if page.job_id != request.job_id
+            || page.kind != request.kind
+            || page.digest != request.expected_digest
+            || page.offset != request.offset
+            || page.data.len() > request.maximum_bytes as usize
+        {
+            return Err(invalid(
+                "crossed export witness identity/digest/offset/budget",
+            ));
+        }
+        Ok(page)
+    }
+    fn validate(&self) -> Result<()> {
+        let end = self
+            .offset
+            .checked_add(self.data.len() as i64)
+            .ok_or_else(|| invalid("export witness offset overflow"))?;
+        if !(1..=MAX_WITNESS_BYTES).contains(&self.total_bytes)
+            || self.offset < 0
+            || self.offset > self.total_bytes
+            || self.data.len() > MAX_FILE_PAGE_BYTES as usize
+            || end > self.total_bytes
+            || self.has_more != (end < self.total_bytes)
+            || self.has_more && self.data.is_empty()
+        {
+            return Err(invalid("invalid export witness page bounds"));
+        }
+        Ok(())
+    }
+    /// Recompose a complete, contiguous witness and verify its qualified digest before parsing it.
+    pub fn assemble(
+        pages: impl IntoIterator<Item = Self>,
+        job_id: ExportId,
+        kind: WitnessKind,
+        expected_digest: [u8; 32],
+        total_bytes: i64,
+    ) -> Result<Vec<u8>> {
+        if !(1..=MAX_WITNESS_BYTES).contains(&total_bytes) {
+            return Err(invalid("invalid aggregate witness size"));
+        }
+        let mut encoded = Vec::new();
+        let mut complete = false;
+        for page in pages {
+            page.validate()?;
+            if complete
+                || page.job_id != job_id
+                || page.kind != kind
+                || page.digest != expected_digest
+                || page.total_bytes != total_bytes
+                || page.offset != encoded.len() as i64
+            {
+                return Err(invalid("noncontiguous or crossed aggregate witness"));
+            }
+            encoded.extend_from_slice(&page.data);
+            complete = !page.has_more;
+        }
+        if !complete
+            || encoded.len() as i64 != total_bytes
+            || <[u8; 32]>::from(Sha256::digest(&encoded)) != expected_digest
+        {
+            return Err(invalid("incomplete or corrupted aggregate witness digest"));
+        }
+        Ok(encoded)
     }
 }
 
@@ -718,6 +860,22 @@ impl ExportClient {
         };
         FilePage::decode(
             self.call(message, |mut c, r| async move { c.read_export(r).await })
+                .await?,
+            &request,
+        )
+    }
+    pub async fn export_witness(&self, request: WitnessRequest) -> Result<WitnessPage> {
+        request.validate()?;
+        let message = wire::ExportWitnessRequest {
+            job_id: request.job_id.to_vec(),
+            kind: request.kind as i32,
+            expected_digest: request.expected_digest.to_vec(),
+            offset: request.offset,
+            maximum_bytes: request.maximum_bytes,
+            context: Some(self.context.clone()),
+        };
+        WitnessPage::decode(
+            self.call(message, |mut c, r| async move { c.export_witness(r).await })
                 .await?,
             &request,
         )
@@ -965,26 +1123,24 @@ mod tests {
     fn schema_status() -> wire::ExportStatus {
         wire::ExportStatus {
             job_id: [1; 16].to_vec(),
-            phase: Phase::Ready as i32,
+            phase: Phase::Capturing as i32,
             columns: vec![1, 2],
             participant_count: 1,
             chunk_count: 1,
             acknowledged_count: 0,
             file_bytes: 3,
             cleanup_pending: false,
-            schema: schema_bytes(),
+            definition_digest: Sha256::digest(schema_bytes()).to_vec(),
+            definition_bytes: schema_bytes().len() as i64,
+            roster_generation: 0,
+            domain_count: 1,
+            capture_digest: vec![],
+            capture_bytes: 0,
         }
     }
     #[test]
-    fn schema_witness_roundtrips_status_and_exposes_physical_operator_identity() {
-        let wire = schema_status();
-        let status = ExportStatus::decode(
-            wire::ExportStatus::decode(wire.encode_to_vec().as_slice()).unwrap(),
-            Some([1; 16]),
-        )
-        .unwrap();
-        assert_eq!(status.canonical_schema, schema_bytes());
-        let schema = status.decoded_schema().unwrap();
+    fn schema_component_exposes_canonical_physical_operator_identity() {
+        let schema = ExportSchema::decode(&schema_bytes()).unwrap();
         assert_eq!(
             (schema.cluster_id, schema.database_id, schema.domain_id),
             ([3; 16], [4; 16], [5; 16])
@@ -1018,21 +1174,177 @@ mod tests {
         assert_eq!(operator.deterministic_contract, "deterministic");
     }
     #[test]
-    fn schema_witness_is_required_bounded_and_contains_all_selected_api_ids() {
-        for schema in [vec![], vec![0; 75], vec![0; MAX_SCHEMA_BYTES + 1]] {
+    fn aggregate_status_roundtrip_requires_qualified_witness_metadata() {
+        let wire = schema_status();
+        let decoded = ExportStatus::decode(
+            wire::ExportStatus::decode(wire.encode_to_vec().as_slice()).unwrap(),
+            Some([1; 16]),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.definition_digest,
+            <[u8; 32]>::from(Sha256::digest(schema_bytes()))
+        );
+        assert_eq!(decoded.definition_bytes, schema_bytes().len() as i64);
+        assert_eq!(decoded.domain_count, 1);
+        assert!(decoded.capture_digest.is_none());
+        assert_eq!(decoded.capture_bytes, 0);
+        for digest in [vec![], vec![0; 31], vec![0; 33]] {
             let mut status = schema_status();
-            status.schema = schema;
+            status.definition_digest = digest;
             assert!(ExportStatus::decode(status, None).is_err());
         }
+        for bytes in [0, MAX_WITNESS_BYTES + 1] {
+            let mut status = schema_status();
+            status.definition_bytes = bytes;
+            assert!(ExportStatus::decode(status, None).is_err());
+        }
+        for count in [0, 65] {
+            let mut status = schema_status();
+            status.domain_count = count;
+            assert!(ExportStatus::decode(status, None).is_err());
+        }
+        let mut missing_capture = schema_status();
+        missing_capture.phase = Phase::Ready as i32;
+        assert!(ExportStatus::decode(missing_capture, None).is_err());
         let mut status = schema_status();
-        status.columns = vec![3];
+        status.roster_generation = -1;
         assert!(ExportStatus::decode(status, None).is_err());
         let mut status = schema_status();
-        status.schema.pop();
+        status.capture_bytes = 1;
         assert!(ExportStatus::decode(status, None).is_err());
         let mut status = schema_status();
-        status.schema[0] ^= 1;
+        status.capture_digest = vec![0; 32];
         assert!(ExportStatus::decode(status, None).is_err());
+        let mut status = schema_status();
+        status.capture_digest = vec![1; 32];
+        status.capture_bytes = MAX_WITNESS_BYTES;
+        assert!(ExportStatus::decode(status, None).is_ok());
+    }
+    fn witness_request() -> WitnessRequest {
+        WitnessRequest {
+            job_id: [1; 16],
+            kind: WitnessKind::Definition,
+            expected_digest: [2; 32],
+            offset: 0,
+            maximum_bytes: MIN_PAGE_BYTES,
+        }
+    }
+    fn witness_page() -> wire::ExportWitnessPage {
+        wire::ExportWitnessPage {
+            job_id: [1; 16].to_vec(),
+            kind: WitnessKind::Definition as i32,
+            digest: [2; 32].to_vec(),
+            total_bytes: 3,
+            offset: 0,
+            data: vec![1, 2, 3],
+            has_more: false,
+        }
+    }
+    #[test]
+    fn witness_page_checks_exact_job_kind_hash_offset_total_and_budget() {
+        assert_eq!(
+            WitnessPage::decode(witness_page(), &witness_request())
+                .unwrap()
+                .data,
+            vec![1, 2, 3]
+        );
+        let mut page = witness_page();
+        page.job_id = [3; 16].to_vec();
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.kind = WitnessKind::Captures as i32;
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.kind = 99;
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.digest = [3; 32].to_vec();
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.offset = 1;
+        page.data.pop();
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.has_more = true;
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.data.clear();
+        page.has_more = true;
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.total_bytes = MAX_WITNESS_BYTES + 1;
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut page = witness_page();
+        page.data = vec![0; MIN_PAGE_BYTES as usize + 1];
+        page.total_bytes = page.data.len() as i64;
+        assert!(WitnessPage::decode(page, &witness_request()).is_err());
+        let mut request = witness_request();
+        request.maximum_bytes = MIN_PAGE_BYTES - 1;
+        assert!(WitnessPage::decode(witness_page(), &request).is_err());
+    }
+    #[test]
+    fn witness_recomposition_verifies_continuity_and_full_digest_without_ack() {
+        let bytes = schema_bytes();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let pages = vec![
+            WitnessPage {
+                job_id: [1; 16],
+                kind: WitnessKind::Definition,
+                digest,
+                total_bytes: bytes.len() as i64,
+                offset: 0,
+                data: bytes[..100].to_vec(),
+                has_more: true,
+            },
+            WitnessPage {
+                job_id: [1; 16],
+                kind: WitnessKind::Definition,
+                digest,
+                total_bytes: bytes.len() as i64,
+                offset: 100,
+                data: bytes[100..].to_vec(),
+                has_more: false,
+            },
+        ];
+        let recomposed = WitnessPage::assemble(
+            pages.clone(),
+            [1; 16],
+            WitnessKind::Definition,
+            digest,
+            bytes.len() as i64,
+        )
+        .unwrap();
+        assert_eq!(recomposed, bytes);
+        assert!(ExportSchema::decode(&recomposed).is_ok());
+        let mut corrupted = pages.clone();
+        corrupted[1].data[0] ^= 1;
+        assert!(WitnessPage::assemble(
+            corrupted,
+            [1; 16],
+            WitnessKind::Definition,
+            digest,
+            bytes.len() as i64
+        )
+        .is_err());
+        let mut crossed = pages.clone();
+        crossed[1].offset += 1;
+        assert!(WitnessPage::assemble(
+            crossed,
+            [1; 16],
+            WitnessKind::Definition,
+            digest,
+            bytes.len() as i64
+        )
+        .is_err());
+        assert!(WitnessPage::assemble(
+            pages[..1].to_vec(),
+            [1; 16],
+            WitnessKind::Definition,
+            digest,
+            bytes.len() as i64
+        )
+        .is_err());
     }
     #[test]
     fn schema_decoder_rejects_noncanonical_ids_names_utf8_and_carrier_versions() {
@@ -1109,14 +1421,19 @@ mod tests {
     fn status_rejects_wrong_job_unknown_phase_and_invalid_counts() {
         let status = || wire::ExportStatus {
             job_id: [1; 16].to_vec(),
-            phase: Phase::Ready as i32,
+            phase: Phase::Capturing as i32,
             columns: vec![2, 1],
             participant_count: 1,
             chunk_count: 1,
             acknowledged_count: 0,
             file_bytes: 3,
             cleanup_pending: false,
-            schema: schema_bytes(),
+            definition_digest: Sha256::digest(schema_bytes()).to_vec(),
+            definition_bytes: schema_bytes().len() as i64,
+            roster_generation: 0,
+            domain_count: 1,
+            capture_digest: vec![],
+            capture_bytes: 0,
         };
         assert_eq!(
             ExportStatus::decode(status(), Some([1; 16]))

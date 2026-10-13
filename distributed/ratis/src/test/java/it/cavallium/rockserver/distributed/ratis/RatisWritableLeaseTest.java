@@ -31,7 +31,7 @@ class RatisWritableLeaseTest {
             }
             return reply;
         }
-        public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException { return delegate.snapshot(route,owner,request); }
+        public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException { return delegate.snapshot(route,owner,request); }
         public RangeStateView stateView(RangeDescriptor route) throws IOException { return delegate.stateView(route); }
         public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException {
             boolean stage=ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES)==ScopedTransactionRpc.STAGE;

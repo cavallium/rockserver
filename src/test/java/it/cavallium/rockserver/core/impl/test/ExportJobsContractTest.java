@@ -78,6 +78,35 @@ class ExportJobsContractTest {
         assertDoesNotThrow(() -> new ExportJobs.Chunk(id(new byte[32]), 1, null, null, 0, 0, 0, false));
     }
 
+    @Test void witnessSummariesAndPagesOwnTheirBuffersAndBounds() {
+        byte[] definition = new byte[32], capture = new byte[32];
+        var status = new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false,
+                definition, 1, 0, 1, capture, 1);
+        definition[0]=1; capture[0]=1;
+        status.definitionDigest()[0]=2; status.captureDigest()[0]=2;
+        assertArrayEquals(new byte[32], status.definitionDigest()); assertArrayEquals(new byte[32], status.captureDigest());
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false,
+                new byte[31], 1, 0, 1, new byte[0], 0));
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false,
+                new byte[32], 1, 0, 0, new byte[0], 0));
+        var request = new ExportJobs.WitnessRequest(job, ExportJobs.WitnessKind.DEFINITION, definition, 0, ExportJobs.MIN_PAGE_BYTES);
+        var page = new ExportJobs.WitnessPage(job, request.kind(), definition, 3, 0, new byte[]{1,2}, true);
+        var same = new ExportJobs.WitnessPage(job, request.kind(), definition.clone(), 3, 0, new byte[]{1,2}, true);
+        definition[0]=3; request.expectedDigest()[0]=4; page.digest()[0]=5; page.bytes()[0]=6;
+        assertEquals(1, request.expectedDigest()[0]); assertEquals(same, page); assertEquals(same.hashCode(), page.hashCode());
+        assertArrayEquals(new byte[]{1,2}, page.bytes());
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.WitnessRequest(job, request.kind(), new byte[32], -1, ExportJobs.MIN_PAGE_BYTES));
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.WitnessRequest(job, request.kind(), new byte[32], ExportJobs.MAX_WITNESS_BYTES+1L, ExportJobs.MIN_PAGE_BYTES));
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.WitnessRequest(job, request.kind(), new byte[32], 0, ExportJobs.MAX_WITNESS_PAGE_BYTES+1));
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.WitnessPage(job, request.kind(), new byte[32], 3, 0, new byte[0], true));
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.WitnessPage(job, request.kind(), new byte[32], 3, 0, new byte[]{1,2}, false));
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.WitnessPage(job, request.kind(), new byte[32], 3, 2, new byte[]{1,2}, false));
+        assertDoesNotThrow(() -> new ExportJobs.WitnessPage(job, request.kind(), new byte[32], 3, 3, new byte[0], false));
+        var command = new ExportCommand.Witness(request);
+        assertEquals(OperationFamily.RANGE_PAGE, command.operationFamily()); assertEquals(WorkloadProfile.LATENCY, command.defaultProfile());
+        assertTrue(command.estimatedBytes() >= request.maximumBytes()); assertTrue(command.estimatedBytes() <= WorkloadCost.MAX_ESTIMATED_BYTES);
+    }
+
     private ExportJobs.Limits limits(int chunks, long journal, long disk, Duration ttl) {
         return new ExportJobs.Limits(chunks, journal, disk, 65536, 16L * 1024 * 1024,
                 32L * 1024 * 1024, Duration.ofSeconds(30), ttl);
@@ -95,15 +124,16 @@ class ExportJobsContractTest {
         var create = new ExportJobs.Create(job, List.of(1L), ExportJobs.Limits.defaults());
         var manifest = new ExportJobs.ManifestRequest(job, 0, 1, 65536);
         var read = new ExportJobs.ReadRequest(id(new byte[32]), 0, 65536);
+        var witness = new ExportJobs.WitnessRequest(job, ExportJobs.WitnessKind.CAPTURES, new byte[32], 0, 65536);
         var chunkId = id(new byte[32]);
         var commands = List.<ExportCommand<?>>of(new ExportCommand.Create(create), new ExportCommand.Recover(job),
                 new ExportCommand.Step(job), new ExportCommand.Status(job), new ExportCommand.Manifest(manifest),
-                new ExportCommand.Read(read), new ExportCommand.Acknowledge(chunkId),
+                new ExportCommand.Read(read), new ExportCommand.Witness(witness), new ExportCommand.Acknowledge(chunkId),
                 new ExportCommand.Release(job), new ExportCommand.Cancel(job));
         for (var command : commands) assertSame(future, command.handleAsync(api, context));
         assertEquals(List.of("createExport", "recoverExport", "stepExport", "exportStatus", "exportManifest",
-                "readExport", "acknowledgeExport", "releaseExport", "cancelExport"), calls);
-        var expected = List.of(create, job, job, job, manifest, read, chunkId, job, job);
+                "readExport", "exportWitness", "acknowledgeExport", "releaseExport", "cancelExport"), calls);
+        var expected = List.of(create, job, job, job, manifest, read, witness, chunkId, job, job);
         for (int i = 0; i < expected.size(); i++) assertSame(expected.get(i), arguments.get(i));
         assertFalse(future.isDone());
     }

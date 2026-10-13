@@ -94,6 +94,9 @@ public final class ThriftExportClient implements ExportAsyncAPI {
     @Override public CompletableFuture<ExportJobs.Status> stepExport(UUID id,RequestContext c) { return invoke(c,(s,w)->s.stepExport(ThriftExportWire.uuid(id),w),v->ThriftExportWire.status(v,id)); }
     @Override public CompletableFuture<ExportJobs.Status> exportStatus(UUID id,RequestContext c) { return invoke(c,(s,w)->s.exportStatus(ThriftExportWire.uuid(id),w),v->ThriftExportWire.status(v,id)); }
     @Override public CompletableFuture<ExportJobs.ManifestPage> exportManifest(ExportJobs.ManifestRequest r,RequestContext c) { return invoke(c,(s,w)->s.exportManifest(ThriftExportWire.manifestRequest(requirePage(r,r.maximumBytes())),w),v->ThriftExportWire.manifest(v,r)); }
+    @Override public CompletableFuture<ExportJobs.WitnessPage> exportWitness(ExportJobs.WitnessRequest r,RequestContext c) {
+        return invoke(c,(s,w)->s.exportWitness(ThriftExportWire.witnessRequest(requirePage(r,r.maximumBytes())),w),v->ThriftExportWire.witness(v,r));
+    }
     @Override public CompletableFuture<ExportJobs.FilePage> readExport(ExportJobs.ReadRequest r,RequestContext c) { return invoke(c,(s,w)->s.readExport(ThriftExportWire.readRequest(requirePage(r,r.maximumBytes())),w),v->ThriftExportWire.file(v,r)); }
     @Override public CompletableFuture<Void> acknowledgeExport(ExportJobs.ChunkId id,RequestContext c) { return invoke(c,(s,w)->{s.acknowledgeExport(ThriftExportWire.id(id),w);return null;},v->null); }
     @Override public CompletableFuture<Void> releaseExport(UUID id,RequestContext c) { return invoke(c,(s,w)->{s.releaseExport(ThriftExportWire.uuid(id),w);return null;},v->null); }

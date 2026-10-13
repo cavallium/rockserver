@@ -184,10 +184,8 @@ class RatisSnapshotJournalReclamationTest {
             public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
             public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return f.data.wire.participant(route,record); }
             public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException { return f.data.wire.transaction(route,request,fresh); }
-            public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
-                if (lost.get()) throw new RatisSnapshotLostException("Controlled original owner is gone");
-                try { return f.data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
-                catch (Exception failure) { throw new IOException(failure); }
+            public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
+                if(lost.get())throw new RatisSnapshotLostException("Controlled original owner is gone");var message=Message.valueOf(ByteString.copyFrom(request));return (owner==null?f.data.f.machine.queryLinearizable(message):f.data.f.machine.queryStale(message,0)).thenApply(reply->reply.getContent().toByteArray());
             }
         }); var journal=RatisDurableSnapshot.create(path,f.home.homes,data,f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
             complete(journal,f); retire(journal,f); lost.set(true); journal.releaseCapture(f.data.f.groupId);
@@ -203,11 +201,9 @@ class RatisSnapshotJournalReclamationTest {
             public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
             public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return f.data.wire.participant(route,record); }
             public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException { return f.data.wire.transaction(route,request,fresh); }
-            public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
-                try {
-                    if (block.get() && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.SNAPSHOT_RELEASE) { entered.countDown(); if (!resume.await(5,TimeUnit.SECONDS)) throw new IOException("Release barrier timed out"); }
-                    return f.data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-                } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
+            public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
+                if(block.get()&&ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES)==ScopedTransactionRpc.SNAPSHOT_RELEASE){entered.countDown();try{if(!resume.await(5,TimeUnit.SECONDS))throw new IOException("Release barrier timed out");}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new IOException(failure);}}
+                var message=Message.valueOf(ByteString.copyFrom(request));return (owner==null?f.data.f.machine.queryLinearizable(message):f.data.f.machine.queryStale(message,0)).thenApply(reply->reply.getContent().toByteArray());
             }
         }); var journal=RatisDurableSnapshot.create(path,f.home.homes,data,f.initial,f.home.homes.prepare(helper.control(0),null,f.initial),f.data.directory.ranges())) {
             complete(journal,f); block.set(true);
