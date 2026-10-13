@@ -68,7 +68,8 @@ final class RatisDatabaseBackupRealCohortFixture implements AutoCloseable {
         }
         public void close()throws Exception{denyDrain=false;exports.stop().get(20,TimeUnit.SECONDS);service.close();for(var registry:registries.values())registry.close();snapshots.close();routed.close();homeRouted.close();scheduler.disposeGracefully().block(Duration.ofSeconds(10));}
     }
-    RatisDatabaseBackupRealCohortFixture(Path root,int first,int second)throws Exception{base=new RatisDatabaseBackupDriverFixture(root,first,second);for(int i=0;i<base.pools.size();i++)endpoints.add(new Endpoint(base.pools.get(i),i));cohorts=new RatisSnapshotCohortClient(groups,frozen::get);}
+    RatisDatabaseBackupRealCohortFixture(Path root,int first,int second)throws Exception{this(root,first,second,false);}
+    RatisDatabaseBackupRealCohortFixture(Path root,int first,int second,boolean sharedPool)throws Exception{base=new RatisDatabaseBackupDriverFixture(root,first,second,sharedPool);for(int i=0;i<base.pools.size();i++)endpoints.add(new Endpoint(base.pools.get(i),i));cohorts=new RatisSnapshotCohortClient(groups,frozen::get);}
     RatisDatabaseBackupDriver driver(RatisDatabaseBackupJournal journal,RatisDatabaseBackupArchive archive)throws IOException{return new RatisDatabaseBackupDriver(journal,archive,()->new RatisDatabaseBackupDriver.Vector(base.definition.roster(),base.definition.domains()),cohorts,operator->{throw new IOException("No operator");},bindings);}
     @Override public void close()throws Exception{for(var endpoint:endpoints)endpoint.close();base.close();}
 }

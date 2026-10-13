@@ -25,20 +25,22 @@ final class RatisDatabaseBackupDriverFixture implements AutoCloseable,RatisDatab
     final AtomicInteger reports=new AtomicInteger(),physical=new AtomicInteger();final AtomicBoolean vectorForced=new AtomicBoolean();boolean lostReply,changeVector;
     final CountDownLatch exportEntered=new CountDownLatch(1),exportExit=new CountDownLatch(1);volatile boolean blockExport;final ExecutorService executor=Executors.newSingleThreadExecutor();
     final class Pool {
-        final UUID domain=UUID.randomUUID(),column=UUID.randomUUID(),poolId=UUID.randomUUID(),processId=UUID.randomUUID();
-        final ReplicaDescriptor owner=new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"owner"+pools.size(),"localhost:"+(20000+pools.size()),ReplicaDescriptor.Role.VOTER);
+        final UUID domain=UUID.randomUUID(),column=UUID.randomUUID(),poolId,processId;
+        final ReplicaDescriptor owner;
         final DistributedStoragePool nativePool;final DistributedSchema schema;final RangeDirectory directory;final SnapshotFence fence;SnapshotFenceStatus home;
         final Map<UUID,UUID> registryOwners=new HashMap<>();final Map<UUID,ReplicatedRangeStore> stores=new HashMap<>();final Map<UUID,RatisRoutedClient.PreparedSnapshotCapture> prepared=new HashMap<>();
         final Map<UUID,SnapshotFenceStatus.Capture> tokens=new HashMap<>(),accepted=new HashMap<>();final Map<UUID,ReplicatedRangeStore.ScopedSnapshot> scoped=new HashMap<>();final Set<UUID> released=new HashSet<>();
         final RatisDurableSnapshot durable=mock(RatisDurableSnapshot.class);final RatisSnapshotCoordinator coordinator=mock(RatisSnapshotCoordinator.class);
         final RatisRoutedClient routed;final Path sourcePath;DistributedStoragePool.SnapshotCohort cohort;boolean started,releaseRequested;int gateChecks;
-        Pool(int ordinal,int count)throws Exception{
-            nativePool=DistributedStoragePool.open(root.resolve("native-"+ordinal),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
-            nativePool.configureSnapshotAdmission(new PoolSnapshotAdmission.Limits(1,1L<<30,Duration.ofMinutes(5),0));
+        Pool(int ordinal,int count,Pool shared)throws Exception{
+            poolId=shared==null?UUID.randomUUID():shared.poolId;processId=shared==null?UUID.randomUUID():shared.processId;
+            owner=shared==null?new ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"owner"+pools.size(),"localhost:"+(20000+pools.size()),ReplicaDescriptor.Role.VOTER):shared.owner;
+            nativePool=shared==null?DistributedStoragePool.open(root.resolve("native-"+ordinal),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass())):shared.nativePool;
+            if(shared==null)nativePool.configureSnapshotAdmission(new PoolSnapshotAdmission.Limits(1,1L<<30,Duration.ofMinutes(5),0));
             schema=new DistributedSchema(cluster,database,domain,0,0,List.of(new DistributedSchema.Column(ordinal+1,column,"data"+ordinal,ColumnSchema.of(IntArrayList.of(2),new ObjectArrayList<>(),true),null)));
             var ranges=new ArrayList<RangeDescriptor>();UUID session=UUID.randomUUID();
             for(int i=0;i<count;i++){
-                UUID group=UUID.randomUUID();byte[] lo=i==0?null:key(i),hi=i==count-1?null:key(i+1);var store=nativePool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(domain,Set.of(column),lo,hi),schema.digest(),Map.of(column,"shared"),Set.of());
+                UUID group=UUID.randomUUID();byte[] lo=i==0?null:key(i),hi=i==count-1?null:key(i+1);var store=nativePool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(domain,Set.of(column),lo,hi),schema.digest(),Map.of(column,shared==null?"shared":"shared-"+ordinal),Set.of());
                 store.enableLogicalSchema(schema);store.initializeConfiguration(new byte[]{1});store.enableScopedHistory(RangeMutationHistory.Limits.defaults());store.applyNoop(new ApplyPosition(1,0));store.apply(new ApplyPosition(1,1),new DistributedCommand(group,1,schema.digest(),new OperationId(session,1,i),List.of(new Mutation(Mutation.Kind.PUT,column,key(i),new byte[]{(byte)i}))));stores.put(group,store);registryOwners.put(group,UUID.randomUUID());
                 ranges.add(new RangeDescriptor(group,group,1,0,lo,hi,RangeDescriptor.TopologyState.ACTIVE,List.of(owner)));
             }
@@ -68,8 +70,9 @@ final class RatisDatabaseBackupDriverFixture implements AutoCloseable,RatisDatab
         }
         void save()throws IOException{var fields=new HashMap<String,byte[]>();fields.put("home",home.encode());prepared.forEach((id,p)->fields.put("capture/"+id,p.bytes()));accepted.forEach((id,t)->fields.put("token/"+id,java.nio.ByteBuffer.allocate(48).putLong(t.ownerIncarnation().getMostSignificantBits()).putLong(t.ownerIncarnation().getLeastSignificantBits()).putLong(t.snapshotId().getMostSignificantBits()).putLong(t.snapshotId().getLeastSignificantBits()).putLong(t.position().term()).putLong(t.position().index()).array()));RatisSchemaClientJournal.write(sourcePath,fields);}
     }
-    RatisDatabaseBackupDriverFixture(Path root,int first,int second)throws Exception{
-        this.root=root;Files.createDirectories(root);pools.add(new Pool(0,first));pools.add(new Pool(1,second));
+    RatisDatabaseBackupDriverFixture(Path root,int first,int second)throws Exception{this(root,first,second,false);}
+    RatisDatabaseBackupDriverFixture(Path root,int first,int second,boolean sharedPool)throws Exception{
+        this.root=root;Files.createDirectories(root);pools.add(new Pool(0,first,null));pools.add(new Pool(1,second,sharedPool?pools.getFirst():null));
         var domains=pools.stream().map(p->new DatabaseBackupDefinition.Domain(p.directory,p.schema,List.of(p.fence))).toList();int ranges=first+second;
         definition=new DatabaseBackupDefinition(UUID.randomUUID(),new DatabaseDomainRoster(cluster,database,0,domains.stream().map(d->d.directory().domainId()).toList()),domains,new DatabaseBackupDefinition.Limits(ranges,ranges,4*ranges,64L*1024*1024,16*1024*1024));
     }
@@ -94,5 +97,5 @@ final class RatisDatabaseBackupDriverFixture implements AutoCloseable,RatisDatab
     }
     @Override public void requireLive(RatisDatabaseBackupJournal.CohortRequest request,Map<UUID,SnapshotFenceStatus.Capture> tokens)throws IOException{var p=pool(request);if(p.cohort==null)throw new RatisSnapshotLostException("Original cohort disappeared");try{for(var m:request.members()){p.scoped.get(m.groupId()).requireLive();assertEquals(p.tokens.get(m.groupId()),tokens.get(m.groupId()));}}catch(IllegalStateException failure){throw new RatisSnapshotLostException("Original cohort expired");}}
     @Override public void cancelAndDrain(RatisDatabaseBackupJournal.CohortRequest request)throws IOException{var p=pool(request);p.scoped.values().forEach(ReplicatedRangeStore.ScopedSnapshot::close);p.scoped.clear();if(p.cohort!=null){p.cohort.close();p.cohort=null;}}
-    @Override public void close()throws Exception{exportExit.countDown();executor.shutdown();assertTrue(executor.awaitTermination(10,TimeUnit.SECONDS));for(var p:pools){p.scoped.values().forEach(ReplicatedRangeStore.ScopedSnapshot::close);if(p.cohort!=null)p.cohort.close();p.routed.close();p.nativePool.close();}}
+    @Override public void close()throws Exception{exportExit.countDown();executor.shutdown();assertTrue(executor.awaitTermination(10,TimeUnit.SECONDS));var nativeOwners=Collections.newSetFromMap(new IdentityHashMap<DistributedStoragePool,Boolean>());for(var p:pools){p.scoped.values().forEach(ReplicatedRangeStore.ScopedSnapshot::close);if(p.cohort!=null)p.cohort.close();p.routed.close();nativeOwners.add(p.nativePool);}for(var pool:nativeOwners)pool.close();}
 }

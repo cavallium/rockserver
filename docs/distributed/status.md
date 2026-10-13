@@ -40,6 +40,13 @@ This section and the remaining gates at the end describe the current branch.
   HOME/DATA bindings, whole-cohort capture/export, completion, resource drain and
   same-root reopening. Gone-owner cleanup relies on the exclusive established
   node root and exact previous process identity.
+  A reusable capture-only coordinator now borrows the same forced journal and
+  retains the original native pins after releasing HOME gates. Four new native
+  cases cover two domains across one or two actual pools, one shared physical
+  snapshot, complete-vector force before HOME reports, original reads after writes
+  resume, exact retry, explicit pin loss and later backup phase preservation.
+  The affected backup driver/cohort regressions also pass. Public aggregate export
+  composition still needs to consume this coordinator.
 - Fifteen native range-delete cases passed fixed bounds, shard clipping, collision
   members, repeated use, unknown live/cold replies, original terminal outcomes,
   complete same-format sidecar recovery and cancellation during result delivery.

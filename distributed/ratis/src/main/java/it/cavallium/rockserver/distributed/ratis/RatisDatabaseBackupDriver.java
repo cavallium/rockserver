@@ -6,7 +6,6 @@ import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeSstExport;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.security.*;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
@@ -41,19 +40,19 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
         public Binding {Objects.requireNonNull(journal);Objects.requireNonNull(coordinator);Objects.requireNonNull(routed);Objects.requireNonNull(exportPath);Objects.requireNonNull(exportDefinition);Objects.requireNonNull(chunks);exportPath=exportPath.toAbsolutePath().normalize();}
     }
     public record Progress(RatisDatabaseBackupJournal.Phase phase,int copiedChunks,boolean complete,boolean cleanupPending) {}
-    private final RatisDatabaseBackupJournal journal;private final RatisDatabaseBackupArchive archive;private final Authority authority;
+    private final RatisDatabaseBackupJournal journal;private final RatisDatabaseBackupArchive archive;private final RatisDatabaseCaptureCoordinator captures;
     private final CohortTransport transport;private final Operators operators;private final Map<UUID,Binding> bindings;
     private boolean active,closed,cohortsDrained;private volatile boolean cancelRequested;
     public RatisDatabaseBackupDriver(RatisDatabaseBackupJournal journal,RatisDatabaseBackupArchive archive,Authority authority,
             CohortTransport transport,Operators operators,Map<UUID,Binding> bindings)throws IOException {
-        this.journal=Objects.requireNonNull(journal);this.archive=Objects.requireNonNull(archive);this.authority=Objects.requireNonNull(authority);this.transport=Objects.requireNonNull(transport);this.operators=Objects.requireNonNull(operators);this.bindings=Map.copyOf(bindings);
+        this.journal=Objects.requireNonNull(journal);this.archive=Objects.requireNonNull(archive);Objects.requireNonNull(authority);this.transport=Objects.requireNonNull(transport);this.operators=Objects.requireNonNull(operators);this.bindings=Map.copyOf(bindings);
         var expected=new HashSet<UUID>();for(var d:journal.definition().domains())for(var fence:d.fences()){
             expected.add(fence.fenceId());var b=this.bindings.get(fence.fenceId());if(b==null || !fence.equals(b.journal().snapshot().initial().fence()) || !fence.equals(b.exportDefinition().fence())
                     || b.journal().snapshot().captureMode()!=RatisSnapshotCaptureRequest.Mode.READ_ONLY || !journal.policy().retention().equals(b.journal().snapshot().requestedTtl()) || !journal.policy().retention().equals(b.exportDefinition().snapshotTtl())
                     || !new HashSet<>(b.exportDefinition().columns()).equals(d.directory().columns()))throw new IOException("Backup subjournal/export binding differs from original definition");
         }
         if(!expected.equals(this.bindings.keySet()))throw new IOException("Backup subjournal coverage differs");
-        if(journal.snapshot().phase()==RatisDatabaseBackupJournal.Phase.GATES){fresh();transport.requireSupported(journal.definition(),journal.policy());}
+        var captureBindings=new HashMap<UUID,RatisDatabaseCaptureCoordinator.CaptureBinding>();this.bindings.forEach((id,binding)->captureBindings.put(id,new RatisDatabaseCaptureCoordinator.CaptureBinding(binding.journal(),binding.coordinator(),binding.routed())));captures=new RatisDatabaseCaptureCoordinator(journal,authority,transport,captureBindings);
     }
     /** Bounded global capture dispatch; at most one HOME state change or materialization chunk per step. */
     public Progress step(RequestContext context)throws IOException {
@@ -63,10 +62,7 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
             if(cancelRequested && saved.phase()!=RatisDatabaseBackupJournal.Phase.COMPLETE){abandonOwned(RatisDatabaseBackupJournal.Phase.CANCELLED);return progress();}
             if(saved.phase()!=RatisDatabaseBackupJournal.Phase.GATES && saved.phase()!=RatisDatabaseBackupJournal.Phase.MATERIALIZING && saved.phase()!=RatisDatabaseBackupJournal.Phase.COMPLETE && saved.phase()!=RatisDatabaseBackupJournal.Phase.CANCELLED && saved.phase()!=RatisDatabaseBackupJournal.Phase.LOST)checkDeadline(saved);
             switch(saved.phase()) {
-                case GATES -> gates();
-                case REQUESTS -> capture();
-                case CAPTURED -> report();
-                case REPORTED -> releaseGates();
+                case GATES,REQUESTS,CAPTURED,REPORTED -> captures.step(context);
                 case RELEASED -> journal.phase(RatisDatabaseBackupJournal.Phase.MATERIALIZING);
                 case MATERIALIZING -> materialize(context);
                 case COMPLETE -> {qualifyComplete();cleanupSources(context);}
@@ -82,64 +78,7 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
         if(started<=0 || now<started || now-started>journal.policy().maximumMaterialization().toMillis())throw new RatisSnapshotLostException("Backup exceeded original dispatch deadline; reopen never renews retention");
     }
     private Progress progress()throws IOException{var s=journal.snapshot();boolean pending=s.phase()==RatisDatabaseBackupJournal.Phase.COMPLETE?cleanupPending():(s.phase()==RatisDatabaseBackupJournal.Phase.CANCELLED || s.phase()==RatisDatabaseBackupJournal.Phase.LOST) && abandonmentPending();return new Progress(s.phase(),s.chunks().size(),s.phase()==RatisDatabaseBackupJournal.Phase.COMPLETE && !pending,pending);}
-    private void fresh()throws IOException{var current=authority.read();journal.definition().requireVector(current.roster(),current.domains());}
     private List<Binding> ordered(){return bindings.entrySet().stream().sorted(Map.Entry.comparingByKey(RangeDirectoryCodec.UUID_ORDER)).map(Map.Entry::getValue).toList();}
-    private void gates()throws IOException{
-        for(var b:ordered()){
-            var step=b.coordinator().step(RatisSnapshotCoordinator.StopAt.GATES_READY);
-            if(step.action()!=RatisSnapshotCoordinator.Action.GATES_READY){if(step.action()==RatisSnapshotCoordinator.Action.ABORTED || step.complete())throw new RatisSnapshotLostException("Backup gate acquisition lost");return;}
-
-        }
-        fresh();var prepared=new HashMap<UUID,RatisRoutedClient.PreparedSnapshotCapture>();
-        for(var b:ordered())for(var p:b.journal().snapshot().participants()){
-            if(p.captureLost() || p.captureReleased() || p.captureReleaseLost())throw new RatisSnapshotLostException("Original backup capture unavailable");
-            var request=p.capture();if(request==null){var target=b.routed().snapshotTarget(b.exportDefinition().fence(),p.route().groupId());request=b.routed().prepareSnapshotCapture(target,UUID.randomUUID(),journal.policy().retention());b.journal().freezeCapture(request);}
-            prepared.put(p.route().groupId(),request);
-        }
-        var requests=transport.qualify(journal.definition(),Map.copyOf(prepared),journal.policy());verifyRequests(requests,prepared);journal.freezeRequests(requests);
-    }
-    private Map<UUID,RatisRoutedClient.PreparedSnapshotCapture> frozen()throws IOException{
-        var map=new HashMap<UUID,RatisRoutedClient.PreparedSnapshotCapture>();for(var b:ordered())for(var p:b.journal().snapshot().participants()){
-            if(p.capture()==null || p.captureLost() || p.captureReleased() || p.captureReleaseLost())throw new RatisSnapshotLostException("Frozen backup request lost; recapture prohibited");map.put(p.route().groupId(),p.capture());}
-        verifyRequests(journal.snapshot().requests(),map);return Map.copyOf(map);
-    }
-    private static void verifyRequests(List<RatisDatabaseBackupJournal.CohortRequest> requests,Map<UUID,RatisRoutedClient.PreparedSnapshotCapture> prepared)throws IOException{
-        var groups=new HashSet<UUID>();for(var c:requests)for(var m:c.members()){
-            var p=prepared.get(m.groupId());if(p==null || !groups.add(m.groupId()) || !m.fenceId().equals(p.request().fence().fenceId()) || !m.snapshotId().equals(p.request().snapshotId())
-                    || !m.owner().equals(p.request().owner()) || !m.replica().equals(p.target().replica().replicaId()) || m.ttlMillis()!=p.request().ttl().toMillis() || !MessageDigest.isEqual(m.preparedDigest(),sha(p.bytes())))throw new IOException("Cohort changed exact frozen request/owner");
-        }if(!groups.equals(prepared.keySet()))throw new IOException("Cohort does not cover all frozen requests");
-    }
-    private void capture()throws IOException{
-        var prepared=frozen();var results=new HashMap<UUID,RatisSnapshotCaptureRequest.Result>();
-        // Each exact backend retry recovers its single original physical cut, including lost replies.
-        for(var request:journal.snapshot().requests()){
-            var members=new HashMap<UUID,RatisRoutedClient.PreparedSnapshotCapture>();request.members().forEach(m->members.put(m.groupId(),prepared.get(m.groupId())));
-            var captured=transport.capture(request,Map.copyOf(members));var expected=request.members().stream().map(RatisDatabaseBackupJournal.Member::groupId).collect(java.util.stream.Collectors.toSet());
-            if(!captured.keySet().equals(expected))throw new IOException("Cohort result coverage changed");for(var entry:captured.entrySet()){
-                var original=prepared.get(entry.getKey()).request();var result=entry.getValue();if(result.handle()!=null || !result.token().ownerIncarnation().equals(original.owner()) || !result.token().snapshotId().equals(original.snapshotId()))throw new IOException("Cohort result changed original read-only request");results.put(entry.getKey(),result);
-            }
-        }
-        var tokens=new HashMap<UUID,SnapshotFenceStatus.Capture>();results.forEach((id,result)->tokens.put(id,result.token()));for(var request:journal.snapshot().requests())transport.requireLive(request,Map.copyOf(tokens));
-        fresh();var statuses=new ArrayList<SnapshotFenceStatus>();for(var b:ordered()){
-            var home=b.journal().snapshot().observedHome();if(home==null || home.terminal() || !home.allReady())throw new IOException("HOME changed before global vector force");
-            for(var p:home.progress())home=home.capture(p.groupId(),tokens.get(p.groupId()));statuses.add(home);
-        }
-        // The only authority to start reporting: one forced COMPLETE token/cohort vector, still INSTALLING HOME images.
-        journal.captured(statuses);
-    }
-    private void report()throws IOException{
-        var saved=journal.snapshot();var prepared=frozen();var tokens=new HashMap<UUID,SnapshotFenceStatus.Capture>();saved.captured().forEach(s->s.progress().forEach(p->tokens.put(p.groupId(),p.capture())));
-        for(var request:saved.requests())transport.requireLive(request,Map.copyOf(tokens));
-        for(var status:saved.captured()){
-            var b=bindings.get(status.fence().fenceId());for(var p:status.progress())b.journal().acceptExternalCapture(p.groupId(),prepared.get(p.groupId()),new RatisSnapshotCaptureRequest.Result(p.capture(),null));
-            var step=b.coordinator().reportExternalCaptures(status);if(step.participant()!=null)return;
-        }
-        journal.phase(RatisDatabaseBackupJournal.Phase.REPORTED);
-    }
-    private void releaseGates()throws IOException{
-        for(var b:ordered()){var step=b.coordinator().step(RatisSnapshotCoordinator.StopAt.RELEASED);if(!step.complete())return;}
-        journal.phase(RatisDatabaseBackupJournal.Phase.RELEASED);
-    }
     private void materialize(RequestContext context)throws IOException{
         // Cold continuation can verify independently copied full coverage without touching volatile source pins.
         try{var manifest=journal.manifest();completeArchive(manifest);journal.phase(RatisDatabaseBackupJournal.Phase.COMPLETE);return;}catch(IllegalArgumentException incomplete){}
@@ -234,6 +173,5 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
     /** Cancellation is intent only while actual work runs; the borrowed backend owns actual drain. */
     public synchronized void cancel(){cancelRequested=true;}
     @Override public synchronized void close()throws IOException{if(active)throw new IOException("Backup actual work still active; ownership retained");closed=true;}
-    private static byte[] sha(byte[] bytes){try{return MessageDigest.getInstance("SHA-256").digest(bytes);}catch(NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}
     private static <T>T await(CompletableFuture<T> future)throws IOException{boolean interrupted=false;try{while(true){try{return future.get();}catch(InterruptedException retry){interrupted=true;}catch(ExecutionException failed){var cause=failed.getCause();if(cause instanceof IOException io)throw io;throw new IOException("Actual export action failed",cause);}catch(CancellationException canceled){throw new IOException("Actual export action canceled",canceled);}}}finally{if(interrupted)Thread.currentThread().interrupt();}}
 }

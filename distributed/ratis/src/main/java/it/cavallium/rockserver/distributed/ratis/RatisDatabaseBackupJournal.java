@@ -7,7 +7,7 @@ import java.nio.file.*;
 import java.util.*;
 
 /** One forced global vector before any HOME capture report; unknown force fences this live owner. */
-public final class RatisDatabaseBackupJournal implements AutoCloseable {
+public final class RatisDatabaseBackupJournal implements AutoCloseable,RatisDatabaseCaptureCoordinator.Log {
     public static final int MAX_BYTES=DatabaseBackupDefinition.MAX_BYTES+32;
     public enum Phase { GATES, REQUESTS, CAPTURED, REPORTED, RELEASED, MATERIALIZING, COMPLETE, LOST, CANCELLED }
     public record Member(UUID fenceId,UUID groupId,UUID snapshotId,UUID owner,UUID replica,long ttlMillis,byte[] preparedDigest) {
