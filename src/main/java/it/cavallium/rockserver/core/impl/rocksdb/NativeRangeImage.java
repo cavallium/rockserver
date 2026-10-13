@@ -158,7 +158,7 @@ public final class NativeRangeImage {
                 if(originBytes!=null && !originWritten[0]) append.accept(Section.STATE,null,originKey,originBytes);
                 pin.visitReceipts((key, value) -> append.accept(Section.RECEIPTS, null, key, value));
                 tracker.finish();
-                try { pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
+                try { pin.validateCatalogueHistoryImage(); pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
                 pin.validateSnapshotHomeImage(); }
                 catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("HOME image user/promise/recovery proof differs",invalid); }
                 output.writeByte(0);
@@ -183,6 +183,21 @@ public final class NativeRangeImage {
     /** Fully validates the image without exposing rows. */
     public static Manifest inspect(Path image, Limits limits) throws IOException {
         return visit(image, limits, (section, column, key, value) -> {});
+    }
+
+    /** Role-qualified history inventory; authority/classification is installed by trusted catalogue bootstrap. */
+    public static Manifest inspectCatalogueHistory(Path image,Limits limits,UUID historyColumn,java.util.function.Predicate<byte[]> historyKeys) throws IOException {
+        Objects.requireNonNull(historyColumn);Objects.requireNonNull(historyKeys);long[] counts=new long[4];int[] directories={0};byte[][] stored={null};
+        var manifest=visit(image,limits,(section,column,key,value)-> {
+            if(section==Section.USER && column.equals(historyColumn) && key.length==16){if(++directories[0]>it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster.MAX_DOMAINS || value.length>it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IOException("Catalogue directory image reservation bound exceeded");var directory=it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec.decode(value);byte[] domain=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();if(!Arrays.equals(key,domain))throw new IOException("Catalogue directory image key/domain differs");}
+            if(section==Section.USER && column.equals(historyColumn) && historyKeys.test(key)){counts[0]=Math.addExact(counts[0],key.length+(long)value.length);counts[1]++;}
+            if(section==Section.STATE && key.length>16 && key[16]==0x78){if(key.length!=17 || stored[0]!=null)throw new IOException("Invalid catalogue history state key");stored[0]=value;counts[0]+=key.length+(long)value.length;counts[1]++;}
+            if(section==Section.STATE && key.length>16 && key[16]==0x79){if(key.length!=49)throw new IOException("Invalid catalogue history credit key");var credit=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.Credit.decode(value);if(!Arrays.equals(Arrays.copyOfRange(key,17,49),credit.definition()))throw new IOException("Catalogue credit identity changed");counts[0]=Math.addExact(counts[0],key.length+(long)value.length);counts[1]++;counts[2]=Math.addExact(counts[2],credit.bytes());counts[3]=Math.addExact(counts[3],credit.rows());}
+            if(counts[0]>it.cavallium.rockserver.core.common.distributed.CatalogueHistory.MAX_BYTES-counts[2] || counts[1]>it.cavallium.rockserver.core.common.distributed.CatalogueHistory.MAX_ROWS-counts[3])throw new IOException("Catalogue history image capacity exceeded");
+        });
+        if(stored[0]==null){if(counts[1]!=0)throw new IOException("Catalogue history inventory lacks state");return manifest;}
+        try {var actual=new it.cavallium.rockserver.core.common.distributed.CatalogueHistory.State(counts[0],counts[1],counts[2],counts[3]);if(!actual.equals(it.cavallium.rockserver.core.common.distributed.CatalogueHistory.State.decode(stored[0])))throw new IOException("Catalogue history image accounting differs from inventory");}
+        catch(IllegalArgumentException failure){throw new IOException("Invalid catalogue history image accounting",failure);}return manifest;
     }
 
     /** Qualified TX HOME reverse proof, including an image with no credit rows. Does not activate native admission. */
@@ -238,6 +253,8 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && (key[16]==0x69 || key[16]==0x6b) && (key.length!=17 || valueLength!=48))throw new IOException("Invalid learner image receipt length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x6a && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerImagePermission.MAX_BYTES))throw new IOException("Later image permission exceeds canonical bound");
                 if(section==Section.STATE && key.length>16 && (key[16]==0x40 || key[16]==0x41) && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.MAX_BYTES+(key[16]==0x41 ? 24 : 0)))throw new IOException("Import birth/intent exceeds native metadata bound");
+                if(section==Section.STATE && key.length>16 && key[16]==0x78 && (key.length!=17 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.STATE_BYTES))throw new IOException("Invalid catalogue history state length");
+                if(section==Section.STATE && key.length>16 && key[16]==0x79 && (key.length!=49 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.CREDIT_BYTES))throw new IOException("Invalid catalogue history credit length");
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);

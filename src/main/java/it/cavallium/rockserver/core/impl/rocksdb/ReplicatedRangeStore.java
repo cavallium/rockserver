@@ -1,6 +1,9 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.common.distributed.BucketMergeOperand;
+import it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster;
+import it.cavallium.rockserver.core.common.distributed.CatalogueHistory;
+import it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
@@ -581,6 +584,70 @@ public final class ReplicatedRangeStore {
         } finally { applyLane.unlock(); leaveNative(); }
     }
 
+    private volatile HomeStatusWriteObserver catalogueHistoryWriteObserver=()->{};
+    public void catalogueHistoryWriteObserver(HomeStatusWriteObserver observer){catalogueHistoryWriteObserver=Objects.requireNonNull(observer);}
+    private int catalogueDirectorySlots=-1;
+    private volatile UUID catalogueHistoryColumn;
+    private java.util.function.Predicate<byte[]> catalogueHistoryKeys;
+    private java.util.function.Function<DistributedCommand,CatalogueHistory.Directive> catalogueHistoryPolicy;
+    private CatalogueHistory.State catalogueHistoryCache;
+    public void configureCatalogueHistory(UUID column,java.util.function.Predicate<byte[]> keys,java.util.function.Function<DistributedCommand,CatalogueHistory.Directive> policy) throws RocksDBException {
+        Objects.requireNonNull(column);Objects.requireNonNull(keys);Objects.requireNonNull(policy);enterNative();applyLane.lock();try {
+            if(!catalogueScopeCompaction || homeRecoveryContext!=null || snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column)) || catalogueHistoryColumn!=null && !catalogueHistoryColumn.equals(column))throw new IllegalArgumentException("Catalogue history role/column changed");
+            catalogueHistoryColumn=column;catalogueHistoryKeys=keys;catalogueHistoryPolicy=policy;catalogueHistoryCache=null;catalogueDirectorySlots=-1;catalogueHistoryCache=verifyCatalogueHistory(null);
+        }finally {applyLane.unlock();leaveNative();}
+    }
+    private byte[] catalogueHistoryKey(byte[] suffix){return ByteBuffer.allocate(16+suffix.length).put(markerKey).put(suffix).array();}
+    public CatalogueHistory.State catalogueHistoryCapacity() throws RocksDBException {
+        enterNative();applyLane.lock();try {if(catalogueHistoryColumn==null)throw new IllegalStateException("Catalogue history is not configured");if(catalogueHistoryCache==null)catalogueHistoryCache=verifyCatalogueHistory(null);return catalogueHistoryCache;}finally {applyLane.unlock();leaveNative();}
+    }
+    private CatalogueHistory.State verifyCatalogueHistory(Snapshot snapshot) throws RocksDBException {
+        long actualBytes=0,actualRows=0,promisedBytes=0,promisedRows=0;int directorySlots=0;byte[] stored;
+        try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false)) {
+            stored=db.get(state,options,catalogueHistoryKey(CatalogueHistory.stateKey()));
+            if(stored!=null){actualBytes=17L+stored.length;actualRows=1;}
+            var sizing=new byte[0];try(var rows=db.newIterator(columns.get(catalogueHistoryColumn),options)) {
+                if(interval.lowerInclusive()==null)rows.seekToFirst();else rows.seek(interval.lowerInclusive());
+                for(;rows.isValid() && contains(rows.key());rows.next()){byte[] key=rows.key();if(key.length==16){if(++directorySlots>DatabaseDomainRoster.MAX_DOMAINS || rows.value(sizing)>RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IllegalStateException("Catalogue directory reservation bound exceeded");requireCatalogueDirectory(key,rows.value());}if(!catalogueHistoryKeys.test(key))continue;actualBytes=Math.addExact(actualBytes,key.length+(long)rows.value(sizing));actualRows++;if(actualBytes>CatalogueHistory.MAX_BYTES || actualRows>CatalogueHistory.MAX_ROWS)throw new IllegalStateException("Catalogue history native inventory exceeds capacity");}rows.status();
+            }
+            byte[] prefix=catalogueHistoryKey(new byte[]{0x79});try(var rows=db.newIterator(state,options)) {
+                rows.seek(prefix);for(;rows.isValid() && rows.key().length>=prefix.length && Arrays.equals(rows.key(),0,prefix.length,prefix,0,prefix.length);rows.next()){if(rows.key(sizing)!=49 || rows.value(sizing)!=CatalogueHistory.CREDIT_BYTES)throw new IllegalStateException("Invalid catalogue history credit shape");var credit=CatalogueHistory.Credit.decode(rows.value());if(!Arrays.equals(Arrays.copyOfRange(rows.key(),17,49),credit.definition()))throw new IllegalStateException("Catalogue history credit identity changed");actualBytes=Math.addExact(actualBytes,49L+CatalogueHistory.CREDIT_BYTES);actualRows++;promisedBytes=Math.addExact(promisedBytes,credit.bytes());promisedRows=Math.addExact(promisedRows,credit.rows());}rows.status();
+            }
+        }
+        if(snapshot==null)catalogueDirectorySlots=directorySlots;
+        if(stored==null){if(actualRows!=0)throw new IllegalStateException("Catalogue history inventory lacks accounting");return new CatalogueHistory.State(17L+CatalogueHistory.STATE_BYTES,1,0,0);}
+        var actual=new CatalogueHistory.State(actualBytes,actualRows,promisedBytes,promisedRows);if(!actual.equals(CatalogueHistory.State.decode(stored)))throw new IllegalStateException("Catalogue history accounting differs from actual inventory");return actual;
+    }
+    private static void requireCatalogueDirectory(byte[] key,byte[] value){if(value.length>RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IllegalArgumentException("Catalogue directory value exceeds pre-reserved slot");var directory=RangeDirectoryCodec.decode(value);if(!Arrays.equals(key,uuidBytes(directory.domainId())))throw new IllegalArgumentException("Catalogue directory key/domain differs");}
+    private record CatalogueChange(CatalogueHistory.Directive directive,CatalogueHistory.Update update,int directoryDelta) {}
+    private CatalogueChange catalogueHistoryChange(DistributedCommand command,List<Mutation> effects) throws RocksDBException {
+        if(catalogueHistoryColumn==null || effects.isEmpty())return null;
+        var directive=Objects.requireNonNull(catalogueHistoryPolicy.apply(command));
+        for(var effect:effects)if(effect.columnId().equals(catalogueHistoryColumn) && effect.kind()!=Mutation.Kind.PUT && effect.kind()!=Mutation.Kind.DELETE)throw new IllegalArgumentException("Catalogue accounting requires bounded point mutations");
+        var delta=new CatalogueHistory.Delta(0,0);var touched=new java.util.HashSet<String>();int directoryDelta=0;
+        for(var effect:effects)if(effect.columnId().equals(catalogueHistoryColumn) && effect.key().length==16){if(!touched.add(java.util.HexFormat.of().formatHex(effect.key())))throw new IllegalArgumentException("Duplicate catalogue directory mutation key");byte[] previous=db.get(columns.get(catalogueHistoryColumn),effect.key());if(effect.kind()==Mutation.Kind.PUT){requireCatalogueDirectory(effect.key(),effect.value());if(previous==null)directoryDelta++;}else if(effect.kind()==Mutation.Kind.DELETE && previous!=null)directoryDelta--;else if(effect.kind()!=Mutation.Kind.DELETE)throw new IllegalArgumentException("Catalogue directory requires point mutation");}
+        for(var effect:effects)if(effect.columnId().equals(catalogueHistoryColumn) && catalogueHistoryKeys.test(effect.key())) {
+            if(effect.kind()!=Mutation.Kind.PUT && effect.kind()!=Mutation.Kind.DELETE)throw new IllegalArgumentException("Catalogue history requires bounded point mutations");
+            if(!touched.add(java.util.HexFormat.of().formatHex(effect.key())))throw new IllegalArgumentException("Duplicate catalogue history mutation key");
+            delta=delta.plus(CatalogueHistory.Delta.replacement(effect.key(),db.get(columns.get(catalogueHistoryColumn),effect.key()),effect.kind()==Mutation.Kind.DELETE ? null : effect.value()));
+        }
+        if(directoryDelta==0 && delta.bytes()==0 && delta.rows()==0 && directive.action()==CatalogueHistory.Action.UNRESERVED)return null;
+        if(catalogueHistoryCache==null)catalogueHistoryCache=verifyCatalogueHistory(null);
+        if(catalogueDirectorySlots+directoryDelta>DatabaseDomainRoster.MAX_DOMAINS)return new CatalogueChange(directive,null,0);
+        var definition=directive.definition();byte[] value=definition==null ? null : db.get(state,catalogueHistoryKey(CatalogueHistory.creditKey(definition)));var credit=value==null ? null : CatalogueHistory.Credit.decode(value);
+        try {
+            var updated=CatalogueHistory.apply(catalogueHistoryCache,credit,directive,delta);
+            // The current common model charges suffixes; native STATE keys also carry group UUID16.
+            long prefix=directive.action()==CatalogueHistory.Action.BEGIN ? 16 : directive.action()==CatalogueHistory.Action.TERMINAL ? -16 : 0;
+            var qualified=new CatalogueHistory.State(Math.addExact(updated.state().actualBytes(),prefix),updated.state().actualRows(),updated.state().promisedBytes(),updated.state().promisedRows());
+            return new CatalogueChange(directive,new CatalogueHistory.Update(qualified,updated.credit()),directoryDelta);
+        }
+        catch(IllegalArgumentException full){if(directive.action()==CatalogueHistory.Action.BEGIN || directive.action()==CatalogueHistory.Action.UNRESERVED)return new CatalogueChange(directive,null,0);throw full;}
+    }
+    private void writeCatalogueHistory(WriteBatch batch,CatalogueChange change) throws RocksDBException {
+        if(change==null)return;batch.put(state,catalogueHistoryKey(CatalogueHistory.stateKey()),change.update().state().encode());
+        if(change.directive().definition()!=null){byte[] key=catalogueHistoryKey(CatalogueHistory.creditKey(change.directive().definition()));if(change.update().credit()==null)batch.delete(state,key);else batch.put(state,key,change.update().credit().encode());}
+    }
     private volatile boolean catalogueScopeCompaction;
     private RangeMutationHistory scopedHistory;
     private RangeMutationHistory.Limits scopedLimits;
@@ -1442,6 +1509,7 @@ public final class ReplicatedRangeStore {
         for (var pin:scopedPins.values()) scopedReleases.add(pin.snapshot); scopedPins.clear();
     }
     private void resetScopedUnderLane() {
+        catalogueHistoryCache=null;catalogueDirectorySlots=-1;
         homeStatusCapacityKnown=false;
         if (scopedHistory==null) return;
         scopedGeneration=new Object(); scopedHistory.reset();
@@ -3339,6 +3407,8 @@ public final class ReplicatedRangeStore {
                 }
                 installUserEffects = evaluated.result().status() == CommandResult.Status.SUCCESS;
             }
+            var catalogueChange=saved==null && installUserEffects ? catalogueHistoryChange(command,effects) : null;
+            if(catalogueChange!=null && catalogueChange.update()==null){stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode();installUserEffects=false;catalogueChange=null;}
             var homeStatusChange=saved==null && installUserEffects ? homeStatusDelta(effects) : null;
             if(!homeStatusFits(homeStatusChange)){stableResult=new CommandResult(CommandResult.Status.CONFLICT,List.of()).encode();installUserEffects=false;homeStatusChange=null;}
             var creditChange=homeCreditChange(command,position,saved==null && installUserEffects);
@@ -3349,6 +3419,7 @@ public final class ReplicatedRangeStore {
                     WriteOptions options = new WriteOptions().setDisableWAL(false).setSync(false)) {
                 if(cdc!=null) publishCdc=cdc.initialize(batch);
                 if (saved == null) {
+                    if(installUserEffects)writeCatalogueHistory(batch,catalogueChange);
                     if (installUserEffects) for (var mutation : effects) {
                         var cf = columns.get(mutation.columnId());
                         if (cf == null) throw new IllegalArgumentException("Unknown logical column");
@@ -3390,6 +3461,7 @@ public final class ReplicatedRangeStore {
                 db.write(options, batch);
             }
             publishCdc.run();publishSourceGc.run();
+            if(catalogueChange!=null){catalogueHistoryWriteObserver.afterWrite();catalogueHistoryCache=catalogueChange.update().state();catalogueDirectorySlots+=catalogueChange.directoryDelta();}
             if(homeStatusChange!=null)homeStatusWriteObserver.afterWrite();
             publishHomeCredit(creditChange); publishHomeStatus(homeStatusChange); publishScoped(position,writes,false); applied = position;
             return saved == null ? stableResult : original;
@@ -3760,6 +3832,7 @@ public final class ReplicatedRangeStore {
                 var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visit(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); });
                 if(!activeTopologyFreeze.equals(incoming[0])) throw new IOException("Snapshot cannot discard/change native topology FREEZE");
             }
+            if(catalogueHistoryColumn!=null)NativeRangeImage.inspectCatalogueHistory(image,limits,catalogueHistoryColumn,catalogueHistoryKeys);
             if(cdc!=null) cdc.validateImage(image,limits,expected.position());
             if(importBirth!=null) {
                 byte[][] incoming=new byte[3][];
@@ -4488,6 +4561,7 @@ public final class ReplicatedRangeStore {
                 validateHomeUserCredits(credits,context,snapshot);
             } finally { releaseUse(); }
         }
+        void validateCatalogueHistoryImage() throws RocksDBException {if(catalogueHistoryColumn==null)return;acquireUse();try {verifyCatalogueHistory(snapshot);}finally {releaseUse();}}
         void validateSnapshotHomeImage() throws RocksDBException { acquireUse(); try { validateSnapshotHomeUsers(snapshot,snapshotHomeContext); } finally { releaseUse(); } }
         public SnapshotHomeFenceProof snapshotHomeFence(SnapshotHomeIdentity identity) throws RocksDBException {
             acquireUse(); try (var options=new ReadOptions().setSnapshot(snapshot)) { return readSnapshotHomeFence(identity,options,position); } finally { releaseUse(); }
