@@ -15,7 +15,7 @@ class RatisDatabaseRestorePlannerTest {
         assertArrayEquals(RangeDirectoryCodec.encode(d.imports().getFirst().targetDirectory()),RangeDirectoryCodec.encode(d.imports().getLast().sourceDirectory()));
         assertEquals(2,d.finalDirectory().generation());assertTrue(d.finalDirectory().ranges().stream().allMatch(r->r.topologyState()==RangeDescriptor.TopologyState.ACTIVE));
         var old=f.directory.ranges().stream().map(RangeDescriptor::groupId).collect(java.util.stream.Collectors.toSet());assertTrue(d.finalDirectory().ranges().stream().noneMatch(r->old.contains(r.groupId())));
-        assertNotEquals(d.imports().getFirst().importId(),d.imports().getLast().importId());assertEquals(new OperationId(session,1,1),d.imports().getLast().operation());
+        assertNotEquals(d.imports().getFirst().importId(),d.imports().getLast().importId());assertEquals(new OperationId(session,1,2),d.imports().getLast().operation());
     }
     @Test void definitionAndCompleteRequireExactRosterCutsAndFullCoverage() {
         var f=new RatisDatabaseBackupFixture(1,1024);assertArrayEquals(f.definition.encode(),DatabaseBackupDefinition.decode(f.definition.encode()).encode());
