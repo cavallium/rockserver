@@ -38,6 +38,7 @@ class StartupSettingsTest {
         assertFalse(resolved.admission().enabled()); assertTrue(resolved.admission().storageGroups().isEmpty());
         assertNull(resolved.admission().storageFor(directory));
         assertFalse(resolved.caches().get("default").enabled());
+        assertEquals(0, resolved.snapshotAuxiliaryBytes());
         assertNull(resolved.caches().get("default").directory());
         assertFalse(config.global().useClockCache());
         assertEquals(65L << 20, resolved.caches().get("default").data().lookupBufferBytes());
@@ -109,8 +110,12 @@ class StartupSettingsTest {
                 "database.global.startup-io.storage-groups: []",
                 "database.global.startup-io.storage-groups: [{id: hdd}, {id: hdd}]",
                 "database.global.startup-io.storage-groups: [{id: hdd, maximum-opens: 0}]",
+                "database.global.startup-io.storage-groups: [{id: hdd, maximum-opens: 1025}]",
                 "database.global.startup-io.storage-groups: [{id: hdd, progress-interval: PT0S}]",
                 "database.global.startup-io.storage-groups: [{id: hdd, progress-interval: PT0.000001S}]",
+                "database.global.startup-io.storage-groups: [{id: hdd, progress-interval: PT61S, stale-after: PT61S}]",
+                "database.global.startup-io.storage-groups: [{id: hdd, progress-interval: PT0.001S, stale-after: PT0.049S}]",
+                "database.global.startup-io.storage-groups: [{id: hdd, stale-after: PT61S}]",
                 "database.global.startup-io.storage-groups: [{id: hdd, progress-interval: PT3S, stale-after: PT2S}]",
                 "database.global.startup-io.storage-groups: [{id: hdd, paths: [data]}, {id: ssd, paths: [\"data/../data\"]}]",
                 "database.global.startup-io.storage-groups: [{id: hdd, workload-groups: [default, default]}]",
@@ -123,7 +128,7 @@ class StartupSettingsTest {
         assertThrows(IllegalArgumentException.class, () -> resolve(ENABLED_SNAPSHOT
                 + "database.global.block-cache-metadata-size: 0B"));
         for (String invalid : new String[] {
-                "disk-budget: 0B", "snapshot-budget: 2GiB", "snapshot-budget: 127B",
+                "disk-budget: 0B", "snapshot-budget: 2GiB", "snapshot-budget: 127B", "snapshot-budget: 1KiB",
                 "collector-entries: 65", "collector-entries: 2097152", "index-ram: 1B",
                 "maximum-block: 0B", "maximum-block: 17MiB", "lookup-buffer: 64MiB",
                 "minimum-free-disk: -1B", "snapshot-deadline: PT0S", "snapshot-deadline: PT2H",
@@ -141,6 +146,19 @@ class StartupSettingsTest {
                 database.global.block-caches: [{name: "source/name", size: 64MiB, metadata-size: 16MiB}]
                 """);
         assertTrue(settings.caches().get("source/name").enabled());
+    }
+
+    @Test void knownSnapshotMemoryQuotasAreAccountedAndCombinedOverflowIsRejected() throws Exception {
+        var settings = resolve(ENABLED_SNAPSHOT);
+        var cache = settings.caches().get("default");
+        long expected = 0;
+        for (var policy : java.util.List.of(cache.data(), cache.metadata())) {
+            expected += policy.collectorEntries() * 32 + policy.indexRamBytes()
+                    + policy.maximumBlockBytes() + policy.lookupBufferBytes();
+        }
+        assertEquals(expected, settings.snapshotAuxiliaryBytes());
+        assertThrows(IllegalArgumentException.class, () -> resolve(ENABLED_SNAPSHOT
+                + "database.global.hot-cache-snapshot.data.index-ram: 9223372036854775807B"));
     }
 
     @Test void zeroCeilingsAndExplicitCapturePeriodAreValidAndCapacityOverflowIsRejected() throws Exception {

@@ -132,6 +132,10 @@ public final class NativeStartupBridge {
 
     static long createCache(CacheConfig config) {
         String compatibility = cacheCompatibilityId();
+        try { Files.createDirectories(config.directory()); }
+        catch (IOException failure) {
+            throw new IllegalStateException("Cannot create snapshot parent directory " + config.directory(), failure);
+        }
         try (var arena = Arena.ofConfined()) {
             var error = arena.allocate(4096);
             long handle = (long) call(CacheApi.CREATE, encodeCacheConfig(arena, config, compatibility), error, error.byteSize());

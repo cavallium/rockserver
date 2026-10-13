@@ -59,7 +59,7 @@ final class StartupIoController implements AutoCloseable {
                     long now = System.nanoTime();
                     for (var entry : samples.entrySet()) {
                         decisions.put(entry.getKey(), policies.computeIfAbsent(entry.getKey(), _ -> new StartupIoPolicy())
-                                .sample(entry.getValue(), now, entry.getKey().equals(":shared")));
+                                .sample(entry.getValue(), now));
                     }
                     for (var entry : budgets.entrySet()) {
                         Set<String> groups = storageWorkloads.get(entry.getKey());

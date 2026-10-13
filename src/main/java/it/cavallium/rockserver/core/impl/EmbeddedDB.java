@@ -330,7 +330,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ColumnFamilyHandle handle,
 			@Nullable ColumnInstance registeredColumn,
 			long effectiveSoftPendingCompactionBytesLimit, int effectiveLevel0SlowdownWritesTrigger,
-			int effectiveMaxWriteBufferNumber, int effectiveMinWriteBufferNumberToMerge) {
+			int effectiveMaxWriteBufferNumber, int effectiveMinWriteBufferNumberToMerge, String workloadGroup) {
 	}
 
 	private static long storagePressurePendingCompactionBytesOverride() {
@@ -714,10 +714,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				maxBackgroundJobs = bgJobs >= 0 ? bgJobs : Runtime.getRuntime().availableProcessors();
 			}
 			memoryUpperBoundConfig = new RocksDBStatistics.MemoryUpperBoundConfig(
-					maxBackgroundJobs, compactionReadaheadBytes, writableFileMaxBufferBytes);
+					maxBackgroundJobs, compactionReadaheadBytes, writableFileMaxBufferBytes,
+					startupResources == null ? 0 : startupResources.settings().snapshotAuxiliaryBytes());
 		} catch (GestaltException e) {
 			memoryUpperBoundConfig = new RocksDBStatistics.MemoryUpperBoundConfig(
-					Runtime.getRuntime().availableProcessors(), 0, 0);
+					Runtime.getRuntime().availableProcessors(), 0, 0,
+					startupResources == null ? 0 : startupResources.settings().snapshotAuxiliaryBytes());
 		}
 		var configuredWalDirectory = dbOptions.walDir();
 		var walDirectory = configuredWalDirectory == null || configuredWalDirectory.isBlank()
@@ -1136,7 +1138,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				handle,
 				null,
 				options.softPendingCompactionBytesLimit(), options.level0SlowdownWritesTrigger(),
-				options.maxWriteBufferNumber(), options.minWriteBufferNumberToMerge());
+				options.maxWriteBufferNumber(), options.minWriteBufferNumberToMerge(),
+				columnWorkloadGroups.getOrDefault(name, fallbackWorkloadGroup));
 	}
 
 	private void upsertStoragePressureColumn(StoragePressureColumn replacement) {
@@ -1202,7 +1205,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				pressureColumn.handle(),
 				column,
 				pressureColumn.effectiveSoftPendingCompactionBytesLimit(), pressureColumn.effectiveLevel0SlowdownWritesTrigger(),
-				pressureColumn.effectiveMaxWriteBufferNumber(), pressureColumn.effectiveMinWriteBufferNumberToMerge()));
+				pressureColumn.effectiveMaxWriteBufferNumber(), pressureColumn.effectiveMinWriteBufferNumberToMerge(), workload));
 
 		logger.info("Registered column: " + column);
 		return id;
@@ -3292,18 +3295,21 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 	private Map<String, StartupIoPolicy.InputSample> sampleStartupIo(long epoch) {
 		ops.beginOp();
+		long sampledNanos = System.nanoTime();
 		try {
 			var nativeDb = db.get();
-			boolean urgent = nativeDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY) != 0
+			boolean databaseUrgent = nativeDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY) != 0
 					|| nativeDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
-			boolean complete = true;
+			var urgentGroups = new HashSet<String>();
+			var incompleteGroups = new HashSet<String>();
 			for (var column : storagePressureColumns) {
+				String workload = column.workloadGroup();
 				var registered = column.registeredColumn();
-				if (registered != null && !tryBeginColumnUse(registered)) { complete = false; continue; }
+				if (registered != null && !tryBeginColumnUse(registered)) { incompleteGroups.add(workload); continue; }
 				try {
 					long debt = nativeDb.getLongProperty(column.handle(), ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
 					long limit = column.effectiveSoftPendingCompactionBytesLimit();
-					urgent |= limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
+					boolean urgent = limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
 					long l0 = Long.parseUnsignedLong(nativeDb.getProperty(column.handle(), "rocksdb.num-files-at-level0"));
 					int trigger = column.effectiveLevel0SlowdownWritesTrigger();
 					urgent |= trigger >= 0 && Long.compareUnsigned(l0, trigger) >= 0;
@@ -3312,6 +3318,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						long immutable = nativeDb.getLongProperty(column.handle(), RocksDBLongProperty.NUM_IMMUTABLE_MEM_TABLE.getName());
 						urgent |= Long.compareUnsigned(immutable, Math.max(1L, (long) buffers - 1)) >= 0;
 					}
+					if (urgent) urgentGroups.add(workload);
 				} finally { if (registered != null) registered.endUse(); }
 			}
 			var samples = new HashMap<String, StartupIoPolicy.InputSample>();
@@ -3321,19 +3328,19 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				String group = entry.getKey();
 				var reads = entry.getValue().snapshot(epoch);
 				if (group.equals(":shared")) {
-					samples.put(group, new StartupIoPolicy.InputSample(epoch, System.nanoTime(), true, complete,
-							1, 0, 0, 0, 0, urgent, reads));
+					samples.put(group, new StartupIoPolicy.InputSample(epoch, sampledNanos, true, true,
+							1, 0, 0, 0, 0, databaseUrgent, reads));
 					continue;
 				}
 				var groupScheduler = workloadGroups.getOrDefault(group, scheduler);
 				groupScheduler.copyPoolTelemetry(RWScheduler.Pool.READ, telemetry);
 				groupScheduler.copyPoolTelemetry(RWScheduler.Pool.WRITE, writes);
-				samples.put(group, new StartupIoPolicy.InputSample(epoch, System.nanoTime(), true, complete,
+				samples.put(group, new StartupIoPolicy.InputSample(epoch, sampledNanos, true, !incompleteGroups.contains(group),
 						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT], writes[RWScheduler.POOL_TELEMETRY_WORKER_COUNT])),
 						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS], writes[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS])),
 						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS], writes[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS])),
 						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS], writes[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS]),
-						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES], writes[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]), urgent, reads));
+						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES], writes[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]), databaseUrgent || urgentGroups.contains(group), reads));
 			}
 			return samples;
 		} catch (org.rocksdb.RocksDBException failure) {
@@ -3537,7 +3544,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						long pendingCompactionBytes = rocksDb.getLongProperty(
 								pressureColumn.handle(),
 								ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
-						var groupSignal = workloadGroupPressure.get(columnWorkloadNames.getOrDefault(pressureColumn.id(), "default"));
+						var groupSignal = workloadGroupPressure.get(pressureColumn.workloadGroup());
 						if (groupSignal != null) groupSignal.observeColumn(pressureColumn.id(), pendingCompactionBytes,
 								pressureColumn.effectiveSoftPendingCompactionBytesLimit());
 						storagePressureSignal.observeColumn(pressureColumn.id(),
