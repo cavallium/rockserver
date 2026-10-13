@@ -28,7 +28,9 @@ enum ExportPhase { CAPTURING = 0; EXPORTING = 1; MATERIALIZED = 2; READY = 3; SN
 message ExportStatus {
   bytes job_id = 1; ExportPhase phase = 2; repeated int64 columns = 3;
   int32 participant_count = 4; int32 chunk_count = 5; int32 acknowledged_count = 6;
-  int64 file_bytes = 7; bool cleanup_pending = 8; bytes schema = 9;
+  int64 file_bytes = 7; bool cleanup_pending = 8; bytes definition_digest = 9;
+  int64 definition_bytes = 10; int64 roster_generation = 11; int32 domain_count = 12;
+  bytes capture_digest = 13; int64 capture_bytes = 14;
 }
 message ExportChunkId {
   bytes job_id = 1; bytes group_id = 2; bytes range_lineage = 3;
@@ -50,6 +52,16 @@ message ExportReadRequest {
   it.cavallium.rockserver.core.common.api.proto.RequestContext context = 4;
 }
 message ExportFilePage { ExportChunkId id = 1; int64 offset = 2; bytes data = 3; bool has_more = 4; }
+enum ExportWitnessKind { DEFINITION = 0; CAPTURES = 1; }
+message ExportWitnessRequest {
+  bytes job_id = 1; ExportWitnessKind kind = 2; bytes expected_digest = 3;
+  int64 offset = 4; int32 maximum_bytes = 5;
+  it.cavallium.rockserver.core.common.api.proto.RequestContext context = 6;
+}
+message ExportWitnessPage {
+  bytes job_id = 1; ExportWitnessKind kind = 2; bytes digest = 3;
+  int64 total_bytes = 4; int64 offset = 5; bytes data = 6; bool has_more = 7;
+}
 message ExportAcknowledgeRequest {
   ExportChunkId id = 1;
   it.cavallium.rockserver.core.common.api.proto.RequestContext context = 2;
@@ -66,6 +78,7 @@ service RocksDBExportService {
   rpc StepExport(ExportJobRequest) returns (.it.cavallium.rockserver.core.common.api.export.proto.ExportStatus);
   rpc ExportStatus(ExportJobRequest) returns (.it.cavallium.rockserver.core.common.api.export.proto.ExportStatus);
   rpc ExportManifest(ExportManifestRequest) returns (ExportManifestPage);
+  rpc ExportWitness(ExportWitnessRequest) returns (ExportWitnessPage);
   rpc ReadExport(ExportReadRequest) returns (ExportFilePage);
   rpc AcknowledgeExport(ExportAcknowledgeRequest) returns (google.protobuf.Empty);
   rpc ReleaseExport(ExportJobRequest) returns (google.protobuf.Empty);

@@ -50,7 +50,7 @@ class RatisLogicalSnapshotPagesTest {
                 public byte[] read(RangeDescriptor route,UUID col,byte[] key) { throw new AssertionError("No live read fallback"); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError("No mutation fallback"); }
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) { throw new AssertionError("No owner discovery, OPEN or recapture"); }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor replica,byte[] bytes) throws IOException {
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor replica,byte[] bytes) throws IOException {
                     assertEquals(directory.ranges().stream().filter(r -> r.groupId().equals(route.groupId())).findFirst().orElseThrow(),route); assertEquals(route.replicas().getFirst(),replica);
                     if (route.groupId().equals(unavailable)) throw new RatisSnapshotLostException("Original owner capture is unavailable");
                     var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES); var input=ByteBuffer.wrap(packet.body());
@@ -72,7 +72,7 @@ class RatisLogicalSnapshotPagesTest {
                         boolean more=selected.size()<eligible.size(); if (selected.isEmpty() && more) throw new IOException("Physical row exceeds owner page budget");
                         if (badOrder) Collections.reverse(selected); fetchedRows+=selected.size(); payload=ScopedTransactionRpc.pageBytes(new PhysicalRangePage(selected,more));
                     }
-                    return ScopedTransactionRpc.frame(packet.kind(),ScopedTransactionRpc.snapshotReply(binding,token,payload));
+                    return java.util.concurrent.CompletableFuture.completedFuture(ScopedTransactionRpc.frame(packet.kind(),ScopedTransactionRpc.snapshotReply(binding,token,payload)));
                 }
             });
             var frozen=new ArrayList<RatisLogicalSnapshotPages.Owner>();

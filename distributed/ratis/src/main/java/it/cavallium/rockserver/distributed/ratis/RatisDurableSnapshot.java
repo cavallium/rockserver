@@ -38,7 +38,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     private final Path path;
     private final RatisSnapshotFences homes;
     private final RatisRoutedClient data;
-    private final byte[] identity,homeIdentity;
+    private byte[] identity;private final byte[] homeIdentity;
     private final FileChannel channel;
     private final FileLock lock;
     private final LinkedHashMap<UUID,Entry> entries=new LinkedHashMap<>();
@@ -68,7 +68,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
         requireTtl(requestedTtl,mode);
         var journal=new RatisDurableSnapshot(path,homes,data,true);
-        journal.requestedTtl=requestedTtl; journal.captureMode=mode;
+        journal.requestedTtl=requestedTtl; journal.captureMode=mode;journal.identity=dataBinding(data,mode);
         try {
             journal.initial=Objects.requireNonNull(initial);
             if (initial.phase()!=SnapshotFenceStatus.Phase.INSTALLING || initial.generation()!=0) throw new IllegalArgumentException("Snapshot journal requires initial INSTALLING definition");
@@ -104,8 +104,9 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure;
         }
     }
+    private static byte[] dataBinding(RatisRoutedClient data,RatisSnapshotCaptureRequest.Mode mode){return mode==RatisSnapshotCaptureRequest.Mode.READ_ONLY?data.snapshotNamespaceDigest():data.sessionIdentityDigest();}
     synchronized void requireClients(RatisSnapshotFences expectedHomes,RatisRoutedClient expectedData) throws IOException {
-        requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,Objects.requireNonNull(expectedData).sessionIdentityDigest())) throw new IllegalArgumentException("Snapshot clients differ from journal binding");
+        requireOpen(); if (!Arrays.equals(homeIdentity,Objects.requireNonNull(expectedHomes).identityDigest()) || !Arrays.equals(identity,dataBinding(Objects.requireNonNull(expectedData),captureMode))) throw new IllegalArgumentException("Snapshot clients differ from journal binding");
     }
     public synchronized Snapshot snapshot() throws IOException { requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof,releaseRequested,requestedTtl,captureMode); }
     public synchronized RatisSnapshotCaptureRequest.Mode mode() throws IOException { requireOpen(); return captureMode; }
@@ -527,8 +528,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         try {
             var in=ByteBuffer.wrap(body); if (in.getInt()!=MAGIC) throw new IOException("Invalid snapshot journal format");
             byte[] bound=new byte[32],homeBound=new byte[32]; in.get(bound).get(homeBound);
+            int mode=in.get() & 255; if (mode>1) throw new IOException("Invalid frozen snapshot capture mode"); captureMode=mode==0 ? RatisSnapshotCaptureRequest.Mode.READ_ONLY : RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED;identity=dataBinding(data,captureMode);
             if (!Arrays.equals(bound,identity) || !Arrays.equals(homeBound,homeIdentity)) throw new IOException("Snapshot journal client identity changed");
-            int mode=in.get() & 255; if (mode>1) throw new IOException("Invalid frozen snapshot capture mode"); captureMode=mode==0 ? RatisSnapshotCaptureRequest.Mode.READ_ONLY : RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED;
             initial=SnapshotFenceStatus.begin(SnapshotFence.decode(blob(in,SnapshotFence.MAX_BYTES))); homeRoute=SessionWindowJournal.route(in); lastHome=operation(in); observed=status(in);
             if (observed!=null) monotone(initial,observed);
             var pendingRoute=SessionWindowJournal.route(in); requireLineage(homeRoute,pendingRoute); UUID column=uuid(in); byte[] schema=new byte[32]; in.get(schema); var operation=operation(in); long ack=in.getLong();

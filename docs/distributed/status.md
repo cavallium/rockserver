@@ -1165,16 +1165,32 @@ cannot export/install USER images; their adapter snapshots are disabled until th
 appropriate recovery/retirement workflow exists. No server sockets or quorum were exercised.
 Relocation currently admits preparation/abort while its source stays writable.
 
+The node frontend now attaches the aggregate export API. A parent freezes the
+complete database roster, selected columns and schemas, forces all native cohort
+capture tokens before HOME reports, and publishes bounded paged definition and
+capture witnesses. Children share the original native capture graph and settle
+remote writers before releasing it. Capture and cohort cleanup compose actual
+futures under scheduler pressure; routed client leases and bounded retirement
+remain owned through actual completion. Controlled validation covers 73 distinct
+Ratis cases and 27 public gRPC/Thrift/core cases. The runtime cleanup case restarts
+the exclusive node root and advances current directories before retrying original
+cleanup, with no recapture or new grants. It retains factory/client bindings across
+restart; fresh factory reconstruction and independent-node acceptance remain open.
+Evidence: `/tmp/rockserver-aggregate-gone-and-pool-final-gate.log`,
+`/tmp/rockserver-aggregate-async-consumer-regression.log` with repaired backup/capture
+cases in `/tmp/rockserver-aggregate-backup-typed-validation-gate.log`, and
+`/tmp/rockserver-aggregate-public-protocol-final-gate.log`.
+
 ## Remaining architecture gates
 
 - Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold
   artifact quotas against the architecture. Controlled restore quota/unknown-force,
   durable ownership claims and custom proof accounting checks are recorded above;
   they do not prove the full resource envelope.
-- Compose the production frontend export backend: the current node launcher
-  creates the database connection but does not attach the public export route.
-  Establish adoption by the intended external consumers. Controlled snapshot/CDC
-  resynchronization and public frozen-schema export migration are recorded above.
+- Verify fresh factory reconstruction of pending aggregate exports and adoption
+  by the intended external consumers. The frontend route and controlled aggregate
+  export/cleanup workflows are implemented; independent endpoint acceptance remains
+  open. Controlled snapshot/CDC resynchronization is recorded above.
 - Complete shared committed-apply dispatch before callback materialization,
   learner pressure/rate controls and running Raft-log/WAL runway policy. Qualify opaque native allocation bounds
   for eager maintenance inventory where Java accounting alone is insufficient.

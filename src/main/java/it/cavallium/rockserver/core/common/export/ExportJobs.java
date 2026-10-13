@@ -1,7 +1,6 @@
 package it.cavallium.rockserver.core.common.export;
 
-import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
-import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
+import it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
@@ -18,6 +17,8 @@ public final class ExportJobs {
     public static final int MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
     public static final int MIN_PAGE_BYTES = 64 * 1024;
     public static final int MAX_FILE_PAGE_BYTES = 1024 * 1024;
+    public static final int MAX_WITNESS_BYTES = 64 * 1024 * 1024;
+    public static final int MAX_WITNESS_PAGE_BYTES = 1024 * 1024;
     /** Fixed manifest metadata bytes, excluding the two physical bounds. */
     public static final int CHUNK_METADATA_BYTES = 153;
     private ExportJobs() {}
@@ -62,34 +63,92 @@ public final class ExportJobs {
     public enum Phase { CAPTURING, EXPORTING, MATERIALIZED, READY, SNAPSHOT_LOST, CANCELLED, RELEASED }
 
     public record Status(UUID jobId, Phase phase, List<Long> columns, int participantCount,
-                         int chunkCount, int acknowledgedCount, long fileBytes, boolean cleanupPending, byte[] schemaBytes) {
+                         int chunkCount, int acknowledgedCount, long fileBytes, boolean cleanupPending,
+                         byte[] definitionDigest, long definitionBytes, long rosterGeneration, int domainCount,
+                         byte[] captureDigest, long captureBytes) {
         public Status {
             Objects.requireNonNull(jobId, "jobId");
             Objects.requireNonNull(phase, "phase");
             columns = selectedColumns(columns);
+            Objects.requireNonNull(definitionDigest, "definitionDigest");
+            Objects.requireNonNull(captureDigest, "captureDigest");
             if (participantCount < 0 || chunkCount < 0 || chunkCount > MAX_CHUNKS
-                    || acknowledgedCount < 0 || acknowledgedCount > chunkCount || fileBytes < 0) {
+                    || acknowledgedCount < 0 || acknowledgedCount > chunkCount || fileBytes < 0
+                    || definitionDigest.length != 32 || definitionBytes < 1 || definitionBytes > MAX_WITNESS_BYTES
+                    || rosterGeneration < 0 || domainCount < 1 || domainCount > DatabaseDomainRoster.MAX_DOMAINS
+                    || !(captureDigest.length == 0 && captureBytes == 0
+                         || captureDigest.length == 32 && captureBytes > 0 && captureBytes <= MAX_WITNESS_BYTES)) {
                 throw new IllegalArgumentException("Invalid export status");
             }
-            Objects.requireNonNull(schemaBytes, "schemaBytes");
-            if (schemaBytes.length == 0 || schemaBytes.length > DistributedSchemaCodec.MAX_BYTES)
-                throw new IllegalArgumentException("Invalid export schema size");
-            schemaBytes = schemaBytes.clone();
-            var schema = DistributedSchemaCodec.decode(schemaBytes);
-            for (long column : columns) schema.column(column);
+            if (captureDigest.length == 0 && (phase == Phase.EXPORTING || phase == Phase.MATERIALIZED || phase == Phase.READY))
+                throw new IllegalArgumentException("Export phase requires its forced capture witness");
+            definitionDigest = definitionDigest.clone();
+            captureDigest = captureDigest.clone();
         }
-        @Override public byte[] schemaBytes() { return schemaBytes.clone(); }
-        public DistributedSchema decodedSchema() { return DistributedSchemaCodec.decode(schemaBytes); }
+        @Override public byte[] definitionDigest() { return definitionDigest.clone(); }
+        @Override public byte[] captureDigest() { return captureDigest.clone(); }
         @Override public boolean equals(Object other) {
             return other instanceof Status status && jobId.equals(status.jobId) && phase == status.phase
                     && columns.equals(status.columns) && participantCount == status.participantCount
                     && chunkCount == status.chunkCount && acknowledgedCount == status.acknowledgedCount
                     && fileBytes == status.fileBytes && cleanupPending == status.cleanupPending
-                    && Arrays.equals(schemaBytes, status.schemaBytes);
+                    && definitionBytes == status.definitionBytes && rosterGeneration == status.rosterGeneration
+                    && domainCount == status.domainCount && captureBytes == status.captureBytes
+                    && Arrays.equals(definitionDigest, status.definitionDigest) && Arrays.equals(captureDigest, status.captureDigest);
         }
         @Override public int hashCode() {
-            return 31 * Objects.hash(jobId, phase, columns, participantCount, chunkCount, acknowledgedCount, fileBytes, cleanupPending)
-                    + Arrays.hashCode(schemaBytes);
+            return 31 * (31 * Objects.hash(jobId, phase, columns, participantCount, chunkCount, acknowledgedCount,
+                    fileBytes, cleanupPending, definitionBytes, rosterGeneration, domainCount, captureBytes)
+                    + Arrays.hashCode(definitionDigest)) + Arrays.hashCode(captureDigest);
+        }
+    }
+
+    public enum WitnessKind { DEFINITION, CAPTURES }
+
+    public record WitnessRequest(UUID jobId, WitnessKind kind, byte[] expectedDigest, long offset, int maximumBytes) {
+        public WitnessRequest {
+            Objects.requireNonNull(jobId, "jobId");
+            Objects.requireNonNull(kind, "kind");
+            Objects.requireNonNull(expectedDigest, "expectedDigest");
+            if (expectedDigest.length != 32 || offset < 0 || offset > MAX_WITNESS_BYTES
+                    || maximumBytes < MIN_PAGE_BYTES || maximumBytes > MAX_WITNESS_PAGE_BYTES)
+                throw new IllegalArgumentException("Invalid export witness request");
+            expectedDigest = expectedDigest.clone();
+        }
+        @Override public byte[] expectedDigest() { return expectedDigest.clone(); }
+        @Override public boolean equals(Object other) {
+            return other instanceof WitnessRequest request && jobId.equals(request.jobId) && kind == request.kind
+                    && offset == request.offset && maximumBytes == request.maximumBytes
+                    && Arrays.equals(expectedDigest, request.expectedDigest);
+        }
+        @Override public int hashCode() {
+            return 31 * Objects.hash(jobId, kind, offset, maximumBytes) + Arrays.hashCode(expectedDigest);
+        }
+    }
+
+    public record WitnessPage(UUID jobId, WitnessKind kind, byte[] digest, long totalBytes, long offset, byte[] bytes, boolean hasMore) {
+        public WitnessPage {
+            Objects.requireNonNull(jobId, "jobId");
+            Objects.requireNonNull(kind, "kind");
+            Objects.requireNonNull(digest, "digest");
+            Objects.requireNonNull(bytes, "bytes");
+            if (digest.length != 32 || totalBytes < 1 || totalBytes > MAX_WITNESS_BYTES
+                    || offset < 0 || offset > totalBytes || bytes.length > MAX_WITNESS_PAGE_BYTES
+                    || bytes.length > totalBytes - offset || hasMore != (offset + bytes.length < totalBytes)
+                    || hasMore && bytes.length == 0)
+                throw new IllegalArgumentException("Invalid export witness page");
+            digest = digest.clone();
+            bytes = bytes.clone();
+        }
+        @Override public byte[] digest() { return digest.clone(); }
+        @Override public byte[] bytes() { return bytes.clone(); }
+        @Override public boolean equals(Object other) {
+            return other instanceof WitnessPage page && jobId.equals(page.jobId) && kind == page.kind
+                    && totalBytes == page.totalBytes && offset == page.offset && hasMore == page.hasMore
+                    && Arrays.equals(digest, page.digest) && Arrays.equals(bytes, page.bytes);
+        }
+        @Override public int hashCode() {
+            return 31 * (31 * Objects.hash(jobId, kind, totalBytes, offset, hasMore) + Arrays.hashCode(digest)) + Arrays.hashCode(bytes);
         }
     }
 

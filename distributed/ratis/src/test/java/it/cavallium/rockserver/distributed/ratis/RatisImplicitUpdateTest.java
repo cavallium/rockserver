@@ -82,7 +82,7 @@ class RatisImplicitUpdateTest {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return base.read(route,column,key); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return base.command(route,command); }
                 public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return base.participant(route,record); }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException { return base.snapshot(route,owner,request); }
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException { return base.snapshot(route,owner,request); }
                 public RangeStateView stateView(RangeDescriptor route) throws IOException { return base.stateView(route); }
                 public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException {
                     if (ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES)==ScopedTransactionRpc.STAGE) stages.incrementAndGet();

@@ -32,7 +32,8 @@ public final class ExportThriftService implements RocksDBExports.Iface {
             long start=System.nanoTime();
             var request=command.get();
             if(request instanceof ExportCommand.Manifest manifest && manifest.request().maximumBytes()>getExportCapabilities().maximumManifestBytes
-                    || request instanceof ExportCommand.Read read && read.request().maximumBytes()>getExportCapabilities().maximumFilePageBytes)
+                    || request instanceof ExportCommand.Read read && read.request().maximumBytes()>getExportCapabilities().maximumFilePageBytes
+                    || request instanceof ExportCommand.Witness witness && witness.request().maximumBytes()>responseLimit)
                 throw new IllegalArgumentException("Export request exceeds configured response budget");
             long admitted=context.hasTimeout()?context.timeoutNanos()-(System.nanoTime()-start):RequestContext.NO_TIMEOUT;
             if(admitted<=0) throw new java.util.concurrent.TimeoutException();
@@ -74,6 +75,9 @@ public final class ExportThriftService implements RocksDBExports.Iface {
     @Override public ExportStatus stepExport(ByteBuffer id,it.cavallium.rockserver.core.common.api.RequestContext c) throws org.apache.thrift.TException { return invoke(c,()->new ExportCommand.Step(ThriftExportWire.uuid(id)),v->ThriftExportWire.status(v,ThriftExportWire.uuid(id))); }
     @Override public ExportStatus exportStatus(ByteBuffer id,it.cavallium.rockserver.core.common.api.RequestContext c) throws org.apache.thrift.TException { return invoke(c,()->new ExportCommand.Status(ThriftExportWire.uuid(id)),v->ThriftExportWire.status(v,ThriftExportWire.uuid(id))); }
     @Override public ExportManifestPage exportManifest(ExportManifestRequest r,it.cavallium.rockserver.core.common.api.RequestContext c) throws org.apache.thrift.TException { return invoke(c,()->new ExportCommand.Manifest(ThriftExportWire.manifestRequest(r)),v->ThriftExportWire.manifest(v,ThriftExportWire.manifestRequest(r))); }
+    @Override public ExportWitnessPage exportWitness(ExportWitnessRequest r,it.cavallium.rockserver.core.common.api.RequestContext c) throws org.apache.thrift.TException {
+        return invoke(c,()->new ExportCommand.Witness(ThriftExportWire.witnessRequest(r)),v->ThriftExportWire.witness(v,ThriftExportWire.witnessRequest(r)));
+    }
     @Override public ExportFilePage readExport(ExportReadRequest r,it.cavallium.rockserver.core.common.api.RequestContext c) throws org.apache.thrift.TException { return invoke(c,()->new ExportCommand.Read(ThriftExportWire.readRequest(r)),v->ThriftExportWire.file(v,ThriftExportWire.readRequest(r))); }
     @Override public void acknowledgeExport(ExportChunkId id,it.cavallium.rockserver.core.common.api.RequestContext c) throws org.apache.thrift.TException { invoke(c,()->new ExportCommand.Acknowledge(ThriftExportWire.id(id)),v->null); }
     @Override public void releaseExport(ByteBuffer id,it.cavallium.rockserver.core.common.api.RequestContext c) throws org.apache.thrift.TException { invoke(c,()->new ExportCommand.Release(ThriftExportWire.uuid(id)),v->null); }

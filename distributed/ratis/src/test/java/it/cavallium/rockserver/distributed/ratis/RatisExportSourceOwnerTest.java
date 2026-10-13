@@ -54,15 +54,8 @@ class RatisExportSourceOwnerTest {
             try (var data=new RatisRoutedClient(f.data.directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor r,UUID c,byte[] k) { throw new AssertionError("No fresh reads"); }
                 public CommandResult command(RangeDescriptor r,DistributedCommand c) { throw new AssertionError("No mutations"); }
-                public byte[] snapshot(RangeDescriptor r,ReplicaDescriptor replica,byte[] bytes) throws IOException {
-                    assertEquals(route,r); assertEquals(peer,replica);
-                    try {
-                        byte[] reply=machine.queryStale(Message.valueOf(ByteString.copyFrom(bytes)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-                        if (ScopedTransactionRpc.kind(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES)==ScopedTransactionRpc.EXPORT_BUILD && loseReply.getAndSet(false))
-                            throw new IOException("Lost completed BUILD reply");
-                        return reply;
-                    } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
-                    catch (ExecutionException | TimeoutException failure) { throw new IOException(failure); }
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor r,ReplicaDescriptor replica,byte[] bytes) throws IOException {
+                    assertEquals(route,r);if(replica!=null)assertEquals(peer,replica);var message=Message.valueOf(ByteString.copyFrom(bytes));return (replica==null?machine.queryLinearizable(message):machine.queryStale(message,0)).thenApply(reply->{if(ScopedTransactionRpc.kind(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES)==ScopedTransactionRpc.EXPORT_BUILD&&loseReply.getAndSet(false))throw new java.util.concurrent.CompletionException(new IOException("Lost completed BUILD reply"));return reply.getContent().toByteArray();});
                 }
             })) {
                 var target=data.restoreSnapshotTarget(f.fence,route,peer,token.ownerIncarnation());

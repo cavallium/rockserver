@@ -26,13 +26,13 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
     /** No capture factory is permitted on retry: started requests must return original tokens or explicit loss. */
     public interface CohortTransport {
         /** Validate the complete declared work against actual registry/pool pin counts, bytes and retention before gating. */
-        void requireSupported(DatabaseBackupDefinition definition,Policy policy)throws IOException;
+        CompletableFuture<Void> requireSupported(DatabaseBackupDefinition definition,Policy policy)throws IOException;
         /** Fresh process/pool/configuration qualification, after every subfence is READY. */
-        List<RatisDatabaseBackupJournal.CohortRequest> qualify(DatabaseBackupDefinition definition,Map<UUID,RatisRoutedClient.PreparedSnapshotCapture> frozen,Policy policy)throws IOException;
-        Map<UUID,RatisSnapshotCaptureRequest.Result> capture(RatisDatabaseBackupJournal.CohortRequest request,Map<UUID,RatisRoutedClient.PreparedSnapshotCapture> frozen)throws IOException;
-        void requireLive(RatisDatabaseBackupJournal.CohortRequest request,Map<UUID,SnapshotFenceStatus.Capture> original)throws IOException;
+        CompletableFuture<List<RatisDatabaseBackupJournal.CohortRequest>> qualify(DatabaseBackupDefinition definition,Map<UUID,RatisRoutedClient.PreparedSnapshotCapture> frozen,Policy policy)throws IOException;
+        CompletableFuture<Map<UUID,RatisSnapshotCaptureRequest.Result>> capture(RatisDatabaseBackupJournal.CohortRequest request,Map<UUID,RatisRoutedClient.PreparedSnapshotCapture> frozen)throws IOException;
+        CompletableFuture<Void> requireLive(RatisDatabaseBackupJournal.CohortRequest request,Map<UUID,SnapshotFenceStatus.Capture> original)throws IOException;
         /** Must wait for actual capture/export actions to return before closing adopted native pins. */
-        void cancelAndDrain(RatisDatabaseBackupJournal.CohortRequest request)throws IOException;
+        CompletableFuture<Void> cancelAndDrain(RatisDatabaseBackupJournal.CohortRequest request)throws IOException;
     }
     @FunctionalInterface public interface Operators {Path source(DistributedSchema.Operator operator)throws IOException;}
     public record Binding(RatisDurableSnapshot journal,RatisSnapshotCoordinator coordinator,RatisRoutedClient routed,
@@ -152,7 +152,7 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
                 await(b.chunks().release(RatisExportJournal.sourceDefinition(export.snapshot(),group),context));export.sourceReleased(group);return;
             }
         }
-        if(!cohortsDrained){for(var request:journal.snapshot().requests())transport.cancelAndDrain(request);cohortsDrained=true;}
+        if(!cohortsDrained){for(var request:journal.snapshot().requests())await(transport.cancelAndDrain(request));cohortsDrained=true;}
         for(var b:ordered()){
             for(var p:b.journal().snapshot().participants())if(p.captureToken()!=null && !p.captureReleased() && !p.captureReleaseLost()){b.journal().releaseCapture(p.route().groupId());return;}
             if(Files.exists(b.exportPath(),LinkOption.NOFOLLOW_LINKS))try(var export=RatisExportJournal.reopen(b.exportPath())){settleExport(export,b);}
@@ -167,7 +167,7 @@ public final class RatisDatabaseBackupDriver implements AutoCloseable {
     }
     private UUID asset(String key){return UUID.nameUUIDFromBytes((journal.definition().backupId()+"/"+key).getBytes(StandardCharsets.UTF_8));}
     private void abandonOwned(RatisDatabaseBackupJournal.Phase terminal)throws IOException{
-        journal.phase(terminal);if(!cohortsDrained){for(var request:journal.snapshot().requests())transport.cancelAndDrain(request);cohortsDrained=true;}
+        journal.phase(terminal);if(!cohortsDrained){for(var request:journal.snapshot().requests())await(transport.cancelAndDrain(request));cohortsDrained=true;}
         for(var b:ordered()){b.journal().requestRelease();b.coordinator().step(RatisSnapshotCoordinator.StopAt.RELEASED);for(var p:b.journal().snapshot().participants())if(p.captureToken()!=null && !p.captureReleased() && !p.captureReleaseLost())b.journal().releaseCapture(p.route().groupId());}
     }
     /** Cancellation is intent only while actual work runs; the borrowed backend owns actual drain. */

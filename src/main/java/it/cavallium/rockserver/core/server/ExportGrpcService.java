@@ -94,6 +94,10 @@ public final class ExportGrpcService extends ReactorRocksDBExportServiceGrpc.Roc
         return invoke(request.getContext(), () -> new ExportCommand.Manifest(ExportWire.manifestRequest(request)),
                 value -> ExportWire.manifest(value, ExportWire.manifestRequest(request)));
     }
+    @Override public Mono<ExportWitnessPage> exportWitness(ExportWitnessRequest request) {
+        return invoke(request.getContext(), () -> new ExportCommand.Witness(ExportWire.witnessRequest(request)),
+                value -> ExportWire.witness(value, ExportWire.witnessRequest(request)));
+    }
     @Override public Mono<ExportFilePage> readExport(ExportReadRequest request) {
         return invoke(request.getContext(), () -> new ExportCommand.Read(ExportWire.readRequest(request)),
                 value -> ExportWire.file(value, ExportWire.readRequest(request)));

@@ -65,14 +65,20 @@ public final class ExportWire {
         return ExportStatus.newBuilder().setJobId(uuid(v.jobId())).setPhase(ExportPhase.valueOf(v.phase().name()))
                 .addAllColumns(v.columns()).setParticipantCount(v.participantCount()).setChunkCount(v.chunkCount())
                 .setAcknowledgedCount(v.acknowledgedCount()).setFileBytes(v.fileBytes()).setCleanupPending(v.cleanupPending())
-                .setSchema(ByteString.copyFrom(v.schemaBytes())).build();
+                .setDefinitionDigest(ByteString.copyFrom(v.definitionDigest())).setDefinitionBytes(v.definitionBytes())
+                .setRosterGeneration(v.rosterGeneration()).setDomainCount(v.domainCount())
+                .setCaptureDigest(ByteString.copyFrom(v.captureDigest())).setCaptureBytes(v.captureBytes()).build();
     }
     public static ExportJobs.Status status(ExportStatus v) {
         columns(v.getColumnsCount());
-        if (v.getSchema().isEmpty() || v.getSchema().size() > it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec.MAX_BYTES)
-            throw new IllegalArgumentException("Invalid export schema size");
+        if (v.getDefinitionDigest().size() != 32
+                || !(v.getCaptureDigest().isEmpty() && v.getCaptureBytes() == 0
+                     || v.getCaptureDigest().size() == 32 && v.getCaptureBytes() > 0 && v.getCaptureBytes() <= ExportJobs.MAX_WITNESS_BYTES))
+            throw new IllegalArgumentException("Invalid export witness digest summary");
         return new ExportJobs.Status(uuid(v.getJobId()), ExportJobs.Phase.valueOf(v.getPhase().name()), v.getColumnsList(),
-                v.getParticipantCount(), v.getChunkCount(), v.getAcknowledgedCount(), v.getFileBytes(), v.getCleanupPending(), v.getSchema().toByteArray());
+                v.getParticipantCount(), v.getChunkCount(), v.getAcknowledgedCount(), v.getFileBytes(), v.getCleanupPending(),
+                v.getDefinitionDigest().toByteArray(), v.getDefinitionBytes(), v.getRosterGeneration(), v.getDomainCount(),
+                v.getCaptureDigest().toByteArray(), v.getCaptureBytes());
     }
     public static ExportStatus status(ExportJobs.Status value, UUID expectedJob) {
         if (!value.jobId().equals(expectedJob)) throw new IllegalArgumentException("Wrong status job identity");
@@ -82,6 +88,37 @@ public final class ExportWire {
         var result = status(value);
         if (!result.jobId().equals(expectedJob)) throw new IllegalArgumentException("Wrong status job identity");
         return result;
+    }
+    public static ExportWitnessRequest witnessRequest(ExportJobs.WitnessRequest v) {
+        return ExportWitnessRequest.newBuilder().setJobId(uuid(v.jobId())).setKind(ExportWitnessKind.valueOf(v.kind().name()))
+                .setExpectedDigest(ByteString.copyFrom(v.expectedDigest())).setOffset(v.offset()).setMaximumBytes(v.maximumBytes()).build();
+    }
+    public static ExportJobs.WitnessRequest witnessRequest(ExportWitnessRequest v) {
+        if (v.getExpectedDigest().size() != 32) throw new IllegalArgumentException("Invalid witness digest");
+        return new ExportJobs.WitnessRequest(uuid(v.getJobId()), ExportJobs.WitnessKind.valueOf(v.getKind().name()),
+                v.getExpectedDigest().toByteArray(), v.getOffset(), v.getMaximumBytes());
+    }
+    public static ExportWitnessPage witness(ExportJobs.WitnessPage v, ExportJobs.WitnessRequest request) {
+        var bytes = v.bytes();
+        validateWitness(v.jobId(), v.kind(), v.digest(), v.offset(), bytes.length, request);
+        return ExportWitnessPage.newBuilder().setJobId(uuid(v.jobId())).setKind(ExportWitnessKind.valueOf(v.kind().name()))
+                .setDigest(ByteString.copyFrom(v.digest())).setTotalBytes(v.totalBytes()).setOffset(v.offset())
+                .setData(ByteString.copyFrom(bytes)).setHasMore(v.hasMore()).build();
+    }
+    public static ExportJobs.WitnessPage witness(ExportWitnessPage v, ExportJobs.WitnessRequest request) {
+        if (v.getDigest().size() != 32 || v.getData().size() > request.maximumBytes())
+            throw new IllegalArgumentException("Invalid witness response size");
+        var job = uuid(v.getJobId());
+        var kind = ExportJobs.WitnessKind.valueOf(v.getKind().name());
+        var digest = v.getDigest().toByteArray();
+        validateWitness(job, kind, digest, v.getOffset(), v.getData().size(), request);
+        return new ExportJobs.WitnessPage(job, kind, digest, v.getTotalBytes(), v.getOffset(), v.getData().toByteArray(), v.getHasMore());
+    }
+    private static void validateWitness(UUID job, ExportJobs.WitnessKind kind, byte[] digest, long offset, int bytes,
+                                        ExportJobs.WitnessRequest request) {
+        if (!job.equals(request.jobId()) || kind != request.kind() || !java.util.Arrays.equals(digest, request.expectedDigest())
+                || offset != request.offset() || bytes > request.maximumBytes())
+            throw new IllegalArgumentException("Invalid witness response identity or bounds");
     }
     public static ExportJobs.ManifestRequest manifestRequest(ExportManifestRequest v) {
         return new ExportJobs.ManifestRequest(uuid(v.getJobId()), v.getOffset(), v.getMaximumItems(), v.getMaximumBytes());

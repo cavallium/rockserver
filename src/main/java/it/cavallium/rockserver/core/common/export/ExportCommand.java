@@ -17,7 +17,7 @@ public sealed interface ExportCommand<R> {
             case Create _, Recover _ -> OperationFamily.MUTATION;
             case Step _ -> OperationFamily.FULL_SCAN_AGGREGATE;
             case Status _ -> OperationFamily.METADATA;
-            case Manifest _, Read _ -> OperationFamily.RANGE_PAGE;
+            case Manifest _, Read _, Witness _ -> OperationFamily.RANGE_PAGE;
             case Acknowledge _, Release _, Cancel _ -> OperationFamily.CONTROL;
         };
     }
@@ -26,6 +26,7 @@ public sealed interface ExportCommand<R> {
         return switch (this) {
             case Create create -> Math.min(WorkloadCost.MAX_ESTIMATED_BYTES, 128L + 8L * create.request.columns().size());
             case Manifest manifest -> Math.min(WorkloadCost.MAX_ESTIMATED_BYTES, 32L + manifest.request.maximumBytes());
+            case Witness witness -> Math.min(WorkloadCost.MAX_ESTIMATED_BYTES, 128L + witness.request.maximumBytes());
             case Read read -> Math.min(WorkloadCost.MAX_ESTIMATED_BYTES, 128L + read.request.maximumBytes());
             case Recover _, Step _ -> WorkloadCost.MAX_ESTIMATED_BYTES;
             case Status _, Release _, Cancel _ -> 16L;
@@ -38,7 +39,7 @@ public sealed interface ExportCommand<R> {
         return switch (this) {
             case Create _, Recover _, Step _ -> WorkloadProfile.BATCH;
             case Acknowledge _, Release _, Cancel _ -> WorkloadProfile.CONTROL;
-            case Status _, Manifest _, Read _ -> WorkloadProfile.LATENCY;
+            case Status _, Manifest _, Read _, Witness _ -> WorkloadProfile.LATENCY;
         };
     }
 
@@ -75,6 +76,12 @@ public sealed interface ExportCommand<R> {
         public Manifest { Objects.requireNonNull(request, "request"); }
         @Override public CompletableFuture<ExportJobs.ManifestPage> handleAsync(ExportAsyncAPI api, RequestContext context) {
             return api.exportManifest(request, context);
+        }
+    }
+    record Witness(ExportJobs.WitnessRequest request) implements ExportCommand<ExportJobs.WitnessPage> {
+        public Witness { Objects.requireNonNull(request, "request"); }
+        @Override public CompletableFuture<ExportJobs.WitnessPage> handleAsync(ExportAsyncAPI api, RequestContext context) {
+            return api.exportWitness(request, context);
         }
     }
     record Read(ExportJobs.ReadRequest request) implements ExportCommand<ExportJobs.FilePage> {

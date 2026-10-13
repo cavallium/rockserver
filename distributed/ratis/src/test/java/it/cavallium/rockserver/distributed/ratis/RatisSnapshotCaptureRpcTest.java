@@ -39,12 +39,9 @@ class RatisSnapshotCaptureRpcTest {
                 public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return data.wire.participant(route,record); }
                 public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException { assertTrue(fresh); owners.incrementAndGet(); byte[] reply=data.wire.transaction(route,request,true);
                     if (loseGateProof && ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind()==ScopedTransactionRpc.SNAPSHOT_GATE_STATE) { loseGateProof=false; throw new IOException("Lost native gate proof reply"); } return reply; }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
-                    assertEquals(data.directory.ranges().getFirst(),route); assertEquals(route.replicas().getFirst(),owner);
-                    try {
-                        byte[] response=data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-                        if (lose) { lose=false; throw new IOException("Lost capture reply after pin publication"); } return response;
-                    } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
+                    assertEquals(data.directory.ranges().getFirst(),route);if(owner==null)owners.incrementAndGet();if(owner!=null)assertEquals(route.replicas().getFirst(),owner);var message=Message.valueOf(ByteString.copyFrom(request));
+                    return (owner==null ? data.f.machine.queryLinearizable(message) : data.f.machine.queryStale(message,0)).thenApply(reply->{if(lose&&owner!=null){lose=false;throw new java.util.concurrent.CompletionException(new IOException("Lost capture reply after pin publication"));}return reply.getContent().toByteArray();});
                 }
             });
         }

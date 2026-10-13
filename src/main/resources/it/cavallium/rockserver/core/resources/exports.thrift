@@ -16,7 +16,18 @@ struct ExportChunkId {
 struct ExportStatus {
  1: required binary jobId, 2: required ExportPhase phase, 3: required list<i64> columns,
  4: required i32 participantCount, 5: required i32 chunkCount, 6: required i32 acknowledgedCount,
- 7: required i64 fileBytes, 8: required bool cleanupPending, 9: required binary schema
+ 7: required i64 fileBytes, 8: required bool cleanupPending,
+ 9: required binary definitionDigest, 10: required i64 definitionBytes, 11: required i64 rosterGeneration,
+ 12: required i32 domainCount, 13: required binary captureDigest, 14: required i64 captureBytes
+}
+enum ExportWitnessKind { DEFINITION = 0, CAPTURES = 1 }
+struct ExportWitnessRequest {
+ 1: required binary jobId, 2: required ExportWitnessKind kind, 3: required binary expectedDigest,
+ 4: required i64 offset, 5: required i32 maximumBytes
+}
+struct ExportWitnessPage {
+ 1: required binary jobId, 2: required ExportWitnessKind kind, 3: required binary digest,
+ 4: required i64 totalBytes, 5: required i64 offset, 6: required binary data, 7: required bool hasMore
 }
 struct ExportChunk {
  1: required ExportChunkId id, 2: required i64 columnId, 3: optional binary lowerInclusive,
@@ -39,6 +50,7 @@ service RocksDBExports {
  ExportStatus stepExport(1: required binary jobId, 2: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
  ExportStatus exportStatus(1: required binary jobId, 2: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
  ExportManifestPage exportManifest(1: required ExportManifestRequest request, 2: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
+ ExportWitnessPage exportWitness(1: required ExportWitnessRequest request, 2: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
  ExportFilePage readExport(1: required ExportReadRequest request, 2: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
  void acknowledgeExport(1: required ExportChunkId id, 2: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),
  void releaseExport(1: required binary jobId, 2: required rocksdb.RequestContext context) throws (1: rocksdb.RocksDBThriftException e),

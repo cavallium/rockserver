@@ -175,17 +175,13 @@ class RatisAtomicClientTest {
                         return (fresh ? machine.queryLinearizable(message) : machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray();
                     } catch (Exception failure) { throw new IOException("Controlled transaction failed",failure); }
                 }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
-                    rpcs.incrementAndGet(); int kind=ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
+                    rpcs.incrementAndGet(); int kind=ScopedTransactionRpc.kind(request,Math.max(ScopedTransactionRpc.MAX_REQUEST_BYTES,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES));
                     if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) { captureRequests.incrementAndGet(); if (beforeSnapshotCapture!=null) beforeSnapshotCapture.run(); }
                     if (kind==ScopedTransactionRpc.SNAPSHOT_RELEASE && beforeSnapshotRelease!=null) beforeSnapshotRelease.run();
                     if ((kind==ScopedTransactionRpc.SNAPSHOT_GET || kind==ScopedTransactionRpc.SNAPSHOT_PAGE) && beforeSnapshotRead!=null) beforeSnapshotRead.run();
-                    assertEquals(route.replicas().getFirst(),owner);
-                    try {
-                        byte[] reply=machines.get(route.groupId()).queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-                        if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE && route.groupId().equals(loseCaptureGroup)) { loseCaptureGroup=null; throw new IOException("Lost native capture reply"); }
-                        return reply;
-                    } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Controlled owner query failed",failure); }
+                    if(owner!=null)assertEquals(route.replicas().getFirst(),owner);var machine=machines.get(route.groupId());var message=Message.valueOf(ByteString.copyFrom(request));
+                    return (owner==null ? machine.queryLinearizable(message) : machine.queryStale(message,0)).thenApply(reply->{if(kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE && route.groupId().equals(loseCaptureGroup)){loseCaptureGroup=null;throw new java.util.concurrent.CompletionException(new IOException("Lost native capture reply"));}return reply.getContent().toByteArray();});
                 }
                 public RangeStateView stateView(RangeDescriptor route) throws IOException { return RangeStateView.decode(ScopedTransactionRpc.parse(transaction(route,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true),ScopedTransactionRpc.MAX_REPLY_BYTES).body()); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException {

@@ -38,10 +38,8 @@ class RatisSnapshotOwnerTransportTest {
                     assertTrue(fresh); assertEquals(ScopedTransactionRpc.SNAPSHOT_OWNER,ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES)); discoveries.incrementAndGet();
                     return f.data.wire.transaction(r,request,true);
                 }
-                public byte[] snapshot(RangeDescriptor r,ReplicaDescriptor peer,byte[] request) throws IOException {
-                    assertEquals(route,r); assertEquals(owner,peer); reads.incrementAndGet();
-                    try { return f.data.f.machine.queryStale(Message.valueOf(ByteString.copyFrom(request)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
-                    catch (Exception failure) { throw new IOException(failure); }
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor r,ReplicaDescriptor peer,byte[] request) throws IOException {
+                    assertEquals(route,r);if(peer==null)discoveries.incrementAndGet();else{assertEquals(owner,peer);reads.incrementAndGet();}var message=Message.valueOf(ByteString.copyFrom(request));return (peer==null ? f.data.f.machine.queryLinearizable(message) : f.data.f.machine.queryStale(message,0)).thenApply(reply->reply.getContent().toByteArray());
                 }
             };
             try (var client=new RatisRoutedClient(directory,transport)) {
@@ -102,13 +100,13 @@ class RatisSnapshotOwnerTransportTest {
         var token=new SnapshotFenceStatus.Capture(UUID.randomUUID(),UUID.randomUUID(),new ApplyPosition(1,1)); var binding=new ScopedTransactionRpc.SnapshotBinding(UUID.randomUUID(),new byte[32]); var body=ByteBuffer.allocate(96); ScopedTransactionRpc.snapshotBinding(body,binding); ScopedTransactionRpc.snapshotToken(body,token);
         byte[] request=ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_RELEASE,body.array()); byte[] response=ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_RELEASE,ScopedTransactionRpc.snapshotReply(binding,token,new byte[0]));
         var responsePeer=new AtomicReference<>(RaftPeerId.valueOf(peer.peerId())); var calls=new AtomicInteger();
-        var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args) -> {
+        var io=(org.apache.ratis.client.api.AsyncApi)Proxy.newProxyInstance(org.apache.ratis.client.api.AsyncApi.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.api.AsyncApi.class},(proxy,method,args) -> {
             assertEquals("sendStaleRead",method.getName()); assertEquals(0L,args[1]); assertEquals(RaftPeerId.valueOf(peer.peerId()),args[2]); calls.incrementAndGet();
-            return RaftClientReply.newBuilder().setClientId(ClientId.randomId()).setServerId(responsePeer.get()).setGroupId(RaftGroupId.valueOf(route.groupId())).setCallId(1).setSuccess().setMessage(Message.valueOf(ByteString.copyFrom(response))).build();
+            return java.util.concurrent.CompletableFuture.completedFuture(RaftClientReply.newBuilder().setClientId(ClientId.randomId()).setServerId(responsePeer.get()).setGroupId(RaftGroupId.valueOf(route.groupId())).setCallId(1).setSuccess().setMessage(Message.valueOf(ByteString.copyFrom(response))).build());
         });
-        var client=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args) -> { assertEquals("io",method.getName()); return io; });
-        assertArrayEquals(response,RatisRoutedClient.snapshotOnOwner(client,route,peer,request)); assertEquals(1,calls.get());
-        responsePeer.set(RaftPeerId.valueOf("replacement")); assertThrows(IOException.class,() -> RatisRoutedClient.snapshotOnOwner(client,route,peer,request)); assertEquals(2,calls.get());
+        var client=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args) -> { assertEquals("async",method.getName()); return io; });
+        assertArrayEquals(response,RatisRoutedClient.awaitSnapshot(RatisRoutedClient.snapshotOnOwner(client,route,peer,request))); assertEquals(1,calls.get());
+        responsePeer.set(RaftPeerId.valueOf("replacement")); assertThrows(IOException.class,() -> RatisRoutedClient.awaitSnapshot(RatisRoutedClient.snapshotOnOwner(client,route,peer,request))); assertEquals(2,calls.get());
         assertThrows(IllegalArgumentException.class,() -> RatisRoutedClient.snapshotOnOwner(client,route,peer,ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_OWNER,new byte[0]))); assertEquals(2,calls.get());
     }
     @Test void snapshotReplyBindsFullTokenAndLossStatusHasNoHiddenPayload() {

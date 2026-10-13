@@ -1,7 +1,6 @@
 package it.cavallium.rockserver.core.common.export;
 
 import it.cavallium.rockserver.core.common.api.*;
-import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.UUID;
@@ -23,13 +22,56 @@ public final class ThriftExportWire {
     }
     public static ExportChunkId id(ExportJobs.ChunkId v) { return new ExportChunkId(uuid(v.jobId()),uuid(v.groupId()),uuid(v.rangeLineage()),v.rangeEpoch(),v.snapshotTerm(),v.snapshotIndex(),v.ordinal(),ByteBuffer.wrap(v.contentHash())); }
     public static ExportJobs.ChunkId id(ExportChunkId v) { return new ExportJobs.ChunkId(uuid(v.jobId),uuid(v.groupId),uuid(v.rangeLineage),v.rangeEpoch,v.snapshotTerm,v.snapshotIndex,v.ordinal,bytes(v.contentHash,32)); }
-    public static ExportStatus status(ExportJobs.Status v) { return new ExportStatus(uuid(v.jobId()),ExportPhase.valueOf(v.phase().name()),v.columns(),v.participantCount(),v.chunkCount(),v.acknowledgedCount(),v.fileBytes(),v.cleanupPending(),ByteBuffer.wrap(v.schemaBytes())); }
+    public static ExportStatus status(ExportJobs.Status v) {
+        return new ExportStatus(uuid(v.jobId()),ExportPhase.valueOf(v.phase().name()),v.columns(),v.participantCount(),v.chunkCount(),
+                v.acknowledgedCount(),v.fileBytes(),v.cleanupPending(),ByteBuffer.wrap(v.definitionDigest()),v.definitionBytes(),
+                v.rosterGeneration(),v.domainCount(),ByteBuffer.wrap(v.captureDigest()),v.captureBytes());
+    }
     public static ExportJobs.Status status(ExportStatus v) {
-        if(v.columns==null || v.columns.size()>ExportJobs.MAX_COLUMNS) throw new IllegalArgumentException("Oversized columns");
-        if(v.schema==null || !v.schema.hasRemaining() || v.schema.remaining()>DistributedSchemaCodec.MAX_BYTES)
-            throw new IllegalArgumentException("Missing or oversized frozen export schema");
-        return new ExportJobs.Status(uuid(v.jobId),ExportJobs.Phase.valueOf(v.phase.name()),v.columns,v.participantCount,v.chunkCount,v.acknowledgedCount,v.fileBytes,v.cleanupPending,
-                bytes(v.schema,DistributedSchemaCodec.MAX_BYTES));
+        if(v.columns==null || v.columns.isEmpty() || v.columns.size()>ExportJobs.MAX_COLUMNS) throw new IllegalArgumentException("Invalid columns");
+        if(v.phase==null || !v.isSetDefinitionBytes() || !v.isSetRosterGeneration() || !v.isSetDomainCount() || !v.isSetCaptureBytes())
+            throw new IllegalArgumentException("Missing export witness metadata");
+        hash(v.definitionDigest);
+        if(v.captureDigest==null || v.captureDigest.remaining()!=0 && v.captureDigest.remaining()!=32)
+            throw new IllegalArgumentException("Invalid capture digest");
+        if(v.definitionBytes<1 || v.definitionBytes>ExportJobs.MAX_WITNESS_BYTES || v.captureBytes<0 || v.captureBytes>ExportJobs.MAX_WITNESS_BYTES
+                || v.rosterGeneration<0 || v.domainCount<1 || v.domainCount>it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster.MAX_DOMAINS
+                || (v.captureDigest.remaining()==0)!=(v.captureBytes==0)) throw new IllegalArgumentException("Invalid witness metadata bounds");
+        return new ExportJobs.Status(uuid(v.jobId),ExportJobs.Phase.valueOf(v.phase.name()),v.columns,v.participantCount,v.chunkCount,
+                v.acknowledgedCount,v.fileBytes,v.cleanupPending,bytes(v.definitionDigest,32),v.definitionBytes,v.rosterGeneration,
+                v.domainCount,bytes(v.captureDigest,32),v.captureBytes);
+    }
+    private static void hash(ByteBuffer digest) {
+        if(digest==null || digest.remaining()!=32) throw new IllegalArgumentException("Digest must contain 32 bytes");
+    }
+    public static ExportWitnessRequest witnessRequest(ExportJobs.WitnessRequest v) {
+        return new ExportWitnessRequest(uuid(v.jobId()),ExportWitnessKind.valueOf(v.kind().name()),ByteBuffer.wrap(v.expectedDigest()),v.offset(),v.maximumBytes());
+    }
+    public static ExportJobs.WitnessRequest witnessRequest(ExportWitnessRequest v) {
+        if(v.kind==null || !v.isSetOffset() || !v.isSetMaximumBytes() || v.offset<0 || v.offset>ExportJobs.MAX_WITNESS_BYTES
+                || v.maximumBytes<ExportJobs.MIN_PAGE_BYTES || v.maximumBytes>ExportJobs.MAX_WITNESS_PAGE_BYTES)
+            throw new IllegalArgumentException("Invalid witness request bounds");
+        hash(v.expectedDigest);
+        return new ExportJobs.WitnessRequest(uuid(v.jobId),ExportJobs.WitnessKind.valueOf(v.kind.name()),bytes(v.expectedDigest,32),v.offset,v.maximumBytes);
+    }
+    private static void validateWitness(UUID job,ExportJobs.WitnessKind kind,ByteBuffer digest,long total,long offset,int length,boolean more,ExportJobs.WitnessRequest request) {
+        hash(digest);
+        if(!job.equals(request.jobId()) || kind!=request.kind() || !digest.equals(ByteBuffer.wrap(request.expectedDigest()))
+                || total<1 || total>ExportJobs.MAX_WITNESS_BYTES || offset!=request.offset() || offset<0 || offset>total
+                || length<0 || length>request.maximumBytes() || length>total-offset
+                || more!=(offset+length<total) || more && length==0)
+            throw new IllegalArgumentException("Invalid witness identity, digest or progress bounds");
+    }
+    public static ExportWitnessPage witness(ExportJobs.WitnessPage v,ExportJobs.WitnessRequest request) {
+        var data=v.bytes();
+        validateWitness(v.jobId(),v.kind(),ByteBuffer.wrap(v.digest()),v.totalBytes(),v.offset(),data.length,v.hasMore(),request);
+        return new ExportWitnessPage(uuid(v.jobId()),ExportWitnessKind.valueOf(v.kind().name()),ByteBuffer.wrap(v.digest()),v.totalBytes(),v.offset(),ByteBuffer.wrap(data),v.hasMore());
+    }
+    public static ExportJobs.WitnessPage witness(ExportWitnessPage v,ExportJobs.WitnessRequest request) {
+        if(v.data==null || v.kind==null || !v.isSetTotalBytes() || !v.isSetOffset() || !v.isSetHasMore()) throw new IllegalArgumentException("Missing witness fields");
+        var job=uuid(v.jobId); var kind=ExportJobs.WitnessKind.valueOf(v.kind.name());
+        validateWitness(job,kind,v.digest,v.totalBytes,v.offset,v.data.remaining(),v.hasMore,request);
+        return new ExportJobs.WitnessPage(job,kind,bytes(v.digest,32),v.totalBytes,v.offset,bytes(v.data,request.maximumBytes()),v.hasMore);
     }
     public static ExportJobs.Status status(ExportStatus v,UUID expected) { var r=status(v); if(!r.jobId().equals(expected)) throw new IllegalArgumentException("Wrong status identity"); return r; }
     public static ExportStatus status(ExportJobs.Status v,UUID expected) { if(!v.jobId().equals(expected)) throw new IllegalArgumentException("Wrong status identity"); return status(v); }

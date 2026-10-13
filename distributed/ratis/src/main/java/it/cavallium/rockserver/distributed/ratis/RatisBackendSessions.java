@@ -7,7 +7,7 @@ import java.util.*;
 
 /** One immutable issued grant and its exclusive consumers. Unknown outcomes reopen exact issuer/binding/window state. */
 final class RatisBackendSessions {
-    record Target(RatisRoutedClient routed,UUID group){}
+    record Target(RatisRoutedClient routed,UUID group,RangeDirectory directory){Target{Objects.requireNonNull(routed);Objects.requireNonNull(group);Objects.requireNonNull(directory);if(directory.ranges().stream().noneMatch(range->range.groupId().equals(group)&&range.topologyState()==RangeDescriptor.TopologyState.ACTIVE))throw new IllegalArgumentException("Binding target absent from exact frozen directory");}}
     private RatisBackendSessions(){}
     static RatisGrantIssuer.Issued issue(Path root,RatisSessionEpochs epochs,long lifetime)throws IOException{
         Files.createDirectories(root);Path file=root.resolve("issuer.bin");
@@ -24,7 +24,7 @@ final class RatisBackendSessions {
             byte[] expected=java.nio.ByteBuffer.allocate(96).putInt(0x424e4447).putLong(grant.epoch()).putLong(grant.sessionId().getMostSignificantBits()).putLong(grant.sessionId().getLeastSignificantBits()).putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis()).putInt(window).putLong(target.group().getMostSignificantBits()).putLong(target.group().getLeastSignificantBits()).put(target.routed().sessionIdentityDigest()).array();
             if(Files.exists(identity,LinkOption.NOFOLLOW_LINKS)){if(!Arrays.equals(expected,SessionJournalFiles.read(identity,128)))throw new IOException("Retained binding grant/window/context identity changed");}
             else {if(Files.exists(path,LinkOption.NOFOLLOW_LINKS) || Files.exists(path.resolveSibling(path.getFileName()+".lock"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Used binding identity is missing");SessionJournalFiles.write(identity,expected,128);}
-            try(var maintenance=new RatisSessionMaintenance(path,epochs,target.routed(),target.group())){
+            try(var maintenance=RatisSessionMaintenance.frozenBinding(path,epochs,target.routed(),target.group(),target.directory())){
             if(maintenance.pendingCommand()!=null){var pending=maintenance.pendingCommand().sessionControl();if(pending==null || !issued.grant().equals(pending.grant()) || pending.outstandingWindow()!=window)throw new IOException("Retained session binding differs from exact grant/window");}
             else if(maintenance.propagated()!=null){continue;}else maintenance.prepareBinding(issued.grant(),window);
             var result=maintenance.execute();if(result.status()!=CommandResult.Status.SUCCESS)throw new IOException("Native session binding rejected: "+result.status());

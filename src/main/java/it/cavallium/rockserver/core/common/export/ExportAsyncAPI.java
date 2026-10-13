@@ -11,6 +11,7 @@ public interface ExportAsyncAPI {
     CompletableFuture<ExportJobs.Status> stepExport(UUID jobId, RequestContext context);
     CompletableFuture<ExportJobs.Status> exportStatus(UUID jobId, RequestContext context);
     CompletableFuture<ExportJobs.ManifestPage> exportManifest(ExportJobs.ManifestRequest request, RequestContext context);
+    CompletableFuture<ExportJobs.WitnessPage> exportWitness(ExportJobs.WitnessRequest request, RequestContext context);
     CompletableFuture<ExportJobs.FilePage> readExport(ExportJobs.ReadRequest request, RequestContext context);
     CompletableFuture<Void> acknowledgeExport(ExportJobs.ChunkId id, RequestContext context);
     CompletableFuture<Void> releaseExport(UUID jobId, RequestContext context);

@@ -15,7 +15,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
     private final RatisSessionEpochs epochs;
     private final RatisRoutedClient routed;
     record ClockRoute(RangeDirectory directory,RangeDescriptor descriptor,boolean metadataOnly){ClockRoute{Objects.requireNonNull(directory);Objects.requireNonNull(descriptor);if(directory.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Clock route is outside frozen directory");}}
-    private final ClockRoute clockRoute;
+    private final ClockRoute clockRoute;private RangeDirectory bindingDirectory;
     private final UUID group;
     private final long rangeEpoch;
     private final Path journal;
@@ -63,6 +63,9 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             throw failure;
         }
     }
+    static RatisSessionMaintenance frozenBinding(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,RangeDirectory directory)throws IOException{
+        if(!Arrays.equals(RangeDirectoryCodec.encode(directory),RangeDirectoryCodec.encode(routed.directory())))throw new IOException("Fresh grant target changed before maintenance admission");var descriptor=directory.ranges().stream().filter(range->range.groupId().equals(group)&&range.topologyState()==RangeDescriptor.TopologyState.ACTIVE).findFirst().orElseThrow(()->new IOException("Fresh grant target absent from frozen directory"));var owner=new RatisSessionMaintenance(journal,epochs,routed,group,new ClockRoute(directory,descriptor,false));owner.bindingDirectory=directory;return owner;
+    }
     public synchronized DistributedCommand pendingCommand() { return state.pending()==null ? null : state.pending().command(); }
     public synchronized SessionAuthority propagated() { return state.propagated(); }
     public long rangeEpoch() { return rangeEpoch; }
@@ -90,7 +93,9 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             if (acknowledged==Long.MAX_VALUE) throw new IOException("Maintenance sequence space exhausted");
             var control=grant==null ? RangeSessionControl.advance(ledger) : RangeSessionControl.bind(ledger,grant,window);
             var command=DistributedCommand.sessionControl(group,rangeEpoch,directory.schemaDigest(),new OperationId(before.session(),epoch,sequence),control,acknowledged);
+            if(bindingDirectory!=null&&!Arrays.equals(RangeDirectoryCodec.encode(bindingDirectory),RangeDirectoryCodec.encode(routed.directory())))throw new IOException("Fresh grant target changed before binding preparation");
             var prepared=clockRoute!=null && grant==null ? routed.prepareMetadataSessionControl(command,directory,descriptor) : routed.prepareSessionControl(command);
+            if(bindingDirectory!=null&&!Arrays.equals(RangeDirectoryCodec.encode(bindingDirectory),RangeDirectoryCodec.encode(prepared.sourceDirectory())))throw new IOException("Fresh grant command changed frozen target before dispatch");
             var next=new State(before.session(),epoch,sequence,acknowledged,before.propagated(),prepared);
             synchronized (this) { persist(next); state=next; }
             return command;

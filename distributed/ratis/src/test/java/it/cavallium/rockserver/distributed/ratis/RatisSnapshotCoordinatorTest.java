@@ -47,18 +47,10 @@ class RatisSnapshotCoordinatorTest {
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return node(route.groupId()).wire.command(route,command); }
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return node(route.groupId()).wire.participant(route,bytes); }
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return node(route.groupId()).wire.transaction(route,bytes,fresh); }
-                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] bytes) throws IOException {
+                public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] bytes) throws IOException {
                     var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-                    if (packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE) {
-                        var state=home.homes.read(fence.fenceId()); assertTrue(state.allReady());
-                        if (!state.terminal()) assertFalse(left.f.store.snapshotGate(fence.fenceId()).released()!=null || right.f.store.snapshotGate(fence.fenceId()).released()!=null);
-                        captures.incrementAndGet();
-                    }
-                    assertEquals(route.replicas().getFirst(),owner);
-                    try {
-                        byte[] reply=node(route.groupId()).f.machine.queryStale(Message.valueOf(ByteString.copyFrom(bytes)),0).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-                        if (loseCapture && packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE) { loseCapture=false; throw new IOException("Lost published multi-group capture reply"); } return reply;
-                    } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
+                    if(packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE){var state=home.homes.read(fence.fenceId());assertTrue(state.allReady());if(!state.terminal())assertFalse(left.f.store.snapshotGate(fence.fenceId()).released()!=null || right.f.store.snapshotGate(fence.fenceId()).released()!=null);captures.incrementAndGet();}
+                    if(owner!=null)assertEquals(route.replicas().getFirst(),owner);var machine=node(route.groupId()).f.machine;var message=Message.valueOf(ByteString.copyFrom(bytes));return (owner==null?machine.queryLinearizable(message):machine.queryStale(message,0)).thenApply(reply->{if(loseCapture&&packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE){loseCapture=false;throw new java.util.concurrent.CompletionException(new IOException("Lost published multi-group capture reply"));}return reply.getContent().toByteArray();});
                 }
             });
             registry=new RatisParticipantRecoveryRegistry(java.nio.file.Files.createDirectory(root.resolve(name+"-recoveries")), transactions.statuses, Map.of(data.directory().domainId(), data), group -> data.directory(), false, Set.of(left.f.groupId,right.f.groupId), RatisParticipantRecoveryRegistry.Limits.defaults());
