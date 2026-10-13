@@ -983,7 +983,8 @@ class RatisNodeRuntimeTest {
             var group=actualGroups.get(id);if(group==null)throw new IllegalArgumentException("No actual division for "+id);
             var configuration=(RaftConfiguration)Proxy.newProxyInstance(RaftConfiguration.class.getClassLoader(),new Class<?>[]{RaftConfiguration.class},(proxy,method,args) -> {
                 if(method.getName().equals("getLogEntryIndex")){var nativeField=RatisRangeStateMachine.class.getDeclaredField("store");nativeField.setAccessible(true);var store=(ReplicatedRangeStore)nativeField.get(machines.get(id));var saved=store.configuration();return saved==null ? -1L : saved.index();}
-                var role=(RaftPeerRole)args[0]; var peers=group.getPeers().stream().filter(peer -> peer.getStartupRole()==role).toList();
+                // Installed RaftConfiguration default no-arg accessors select FOLLOWER (voters).
+                var role=args==null || args.length==0 ? RaftPeerRole.FOLLOWER : (RaftPeerRole)args[0]; var peers=group.getPeers().stream().filter(peer -> peer.getStartupRole()==role).toList();
                 if (method.getName().equals("getPreviousPeers")) return joint ? peers : List.of();
                 if (method.getName().equals("getCurrentPeers")) return peers.stream().map(peer -> wrongEndpoint ? RaftPeer.newBuilder().setId(peer.getId()).setAddress("127.0.0.1:9999").setStartupRole(peer.getStartupRole()).build() : peer).toList();
                 throw new AssertionError(method);

@@ -65,6 +65,22 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
 
   InstallSnapshotRequests(RaftServer.Division server, RaftPeerId followerId,
       String requestId, SnapshotInfo snapshot, int snapshotChunkMaxSize) {
+    this(server, followerId, requestId, snapshot, snapshotChunkMaxSize, null);
+  }
+
+  static InstallSnapshotRequests source(RaftServer.Division server, RaftPeerId receiver,
+      String requestId, SnapshotInfo snapshot, int chunkBytes) {
+    if (snapshot.getFiles().size() != 1 || snapshot.getTerm() < 1 || snapshot.getIndex() < 0) {
+      throw new IllegalArgumentException("Source transfer requires one committed image");
+    }
+    final Path wirePath = new File(RaftStorageDirectory.STATE_MACHINE_DIR_NAME,
+        org.apache.ratis.statemachine.impl.SimpleStateMachineStorage.getSnapshotFileName(
+            snapshot.getTerm(), snapshot.getIndex())).toPath();
+    return new InstallSnapshotRequests(server, receiver, requestId, snapshot, chunkBytes, ignored -> wirePath);
+  }
+
+  private InstallSnapshotRequests(RaftServer.Division server, RaftPeerId followerId,
+      String requestId, SnapshotInfo snapshot, int snapshotChunkMaxSize, Function<FileInfo, Path> sourcePath) {
     this.server = server;
     this.followerId = followerId;
     this.requestId = requestId;
@@ -74,6 +90,8 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
     this.totalSize = files.stream().mapToLong(FileInfo::getFileSize).reduce(Long::sum).orElseThrow(
             () -> new IllegalStateException("Failed to compute total size for snapshot " + snapshot));
     this.numFiles = files.size();
+
+    if (sourcePath != null) { this.getRelativePath = sourcePath; return; }
 
     final File snapshotDir = server.getStateMachine().getStateMachineStorage().getSnapshotDir();
     final Function<Path, Path> relativize;

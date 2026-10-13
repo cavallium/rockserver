@@ -70,10 +70,16 @@ This section and the remaining gates at the end describe the current branch.
   group/domain placement. Two actual native databases passed writes, service cold
   reopening and shared pin admission. Node/pool graph ceilings, schema upload/work
   quotas and cohort action/retention leases passed their focused fixtures. Source
-  image disk capacity is conservatively partitioned across declared pools. Cold
-  source-artifact review found that the durable disk check currently follows native
-  image capture; pre-capture reservations and original-cut recovery are being
-  repaired and are not yet accepted. Schema disk accounting covers upload staging.
+  image disk capacity is conservatively partitioned across declared pools. Source
+  capture now reserves durable inventory before acquiring its pin and forces the
+  original cut/bounds/schema/configuration before image writing. Five actual Runtime
+  cold-quota cases pass exact replay, owner-qualified transfer/release and failed
+  deletion/force accounting. Both source-owned image copies are reclaimed before
+  quota refund; normal Raft snapshot files remain unchanged. Two fork producer
+  cases pass canonical transfer paths for images outside Raft storage. An incomplete
+  unpublished capture whose original cut is unavailable still needs safe terminal
+  authority and a distinct successor attempt; it currently remains charged and
+  cannot silently substitute a later cut. Schema disk accounting covers upload staging.
   Four actual two-pool cases now pass cold retained quotas, canceled work ownership,
   unknown cleanup and independent pool limits. The immutable native operator cache
   has a separate persisted node ceiling: every declared pool reserves its bounded

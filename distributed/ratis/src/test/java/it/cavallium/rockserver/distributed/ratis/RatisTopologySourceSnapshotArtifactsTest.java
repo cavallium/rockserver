@@ -28,10 +28,10 @@ class RatisTopologySourceSnapshotArtifactsTest {
             var info=managed(lease,original);Path durable;
             try(var helper=open(owned)){var saved=helper.retain(lease.prepared(),info);durable=saved.image();assertTrue(Files.isRegularFile(durable));assertSame(lease.prepared(),saved.prepared());}
             Files.delete(info.getFiles().getFirst().getPath());
-            try(var helper=open(owned)){var saved=helper.lookup(lease.prepared().request(),restored);assertEquals(lease.prepared().image().position().index(),saved.snapshot().getIndex());assertArrayEquals(lease.prepared().image().sha256(),saved.prepared().image().sha256());
-                Path standard=saved.snapshot().getFiles().getFirst().getPath();assertEquals(SimpleStateMachineStorage.getSnapshotFileName(saved.snapshot().getTerm(),saved.snapshot().getIndex()),standard.getFileName().toString());MD5FileUtil.verifySavedMD5(standard.toFile(),saved.snapshot().getFiles().getFirst().getFileDigest());
+            try(var helper=open(owned)){var saved=helper.lookup(lease.prepared().request());assertEquals(lease.prepared().image().position().index(),saved.snapshot().getIndex());assertArrayEquals(lease.prepared().image().sha256(),saved.prepared().image().sha256());
+                Path standard=saved.snapshot().getFiles().getFirst().getPath();assertEquals(SimpleStateMachineStorage.getSnapshotFileName(saved.snapshot().getTerm(),saved.snapshot().getIndex()),standard.getFileName().toString());assertEquals(MD5FileUtil.computeMd5ForFile(standard.toFile()),saved.snapshot().getFiles().getFirst().getFileDigest());assertTrue(standard.startsWith(owned));
                 assertArrayEquals(lease.prepared().image().sha256(),NativeRangeImage.inspect(standard,limits).sha256());assertTrue(Files.exists(durable));
-                assertNull(helper.lookup(fixture.request(51),restored));
+                assertNull(helper.lookup(fixture.request(51)));
             }
         }
     }
@@ -41,18 +41,18 @@ class RatisTopologySourceSnapshotArtifactsTest {
             var info=managed(lease,sourceDir);UUID id=lease.prepared().request().transferId();var deletes=new AtomicInteger();
             SessionJournalFiles.Removal fail=path->{assertTrue(Files.exists(owned.resolve(id+".released")));if(deletes.incrementAndGet()==2)throw new IOException("controlled partial cleanup");Files.delete(path);};
             try(var helper=new RatisTopologySourceSnapshotArtifacts(owned,limits,64*1024*1024,128*1024*1024,4,fail)){helper.retain(lease.prepared(),info);assertThrows(IOException.class,()->helper.released(lease.prepared().request()));assertTrue(Files.exists(owned.resolve(id+".prepared")));}
-            try(var helper=open(owned)){helper.released(lease.prepared().request());helper.released(lease.prepared().request());assertFalse(Files.exists(owned.resolve(id+".image")));assertFalse(Files.exists(owned.resolve(id+".prepared")));assertTrue(Files.exists(info.getFiles().getFirst().getPath()));assertThrows(IOException.class,()->helper.lookup(lease.prepared().request(),sourceDir));assertThrows(IOException.class,()->helper.retain(lease.prepared(),info));}
+            try(var helper=open(owned)){helper.released(lease.prepared().request());helper.released(lease.prepared().request());assertFalse(Files.exists(owned.resolve(id+".image")));assertFalse(Files.exists(owned.resolve(id+".prepared")));assertTrue(Files.exists(info.getFiles().getFirst().getPath()));assertThrows(IOException.class,()->helper.lookup(lease.prepared().request()));assertThrows(IOException.class,()->helper.retain(lease.prepared(),info));}
         }
     }
     @Test void originalMetadataSymlinksAndForeignDataCannotBeOverwritten()throws Exception {
         Path owned=artifacts(),managedDir=root.resolve("managed");
         try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50));var helper=open(owned)){
             var info=managed(lease,managedDir);var saved=helper.retain(lease.prepared(),info);var request=lease.prepared().request();
-            var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver(),request.purpose());assertThrows(IOException.class,()->helper.lookup(changed,managedDir));
+            var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver(),request.purpose());assertThrows(IOException.class,()->helper.lookup(changed));
             var old=lease.prepared();var foreignMetadata=new RatisTopologySourceSnapshotRpc.Prepared(request,old.image(),old.schema(),old.sourceOwner(),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(old.sourceCfg().term(),old.sourceCfg().index(),new byte[]{1}),old.schemaRows());
             assertThrows(IOException.class,()->helper.retain(foreignMetadata,info));
-            byte[] bytes=Files.readAllBytes(saved.image());Files.delete(saved.image());Files.write(saved.image(),new byte[]{1});assertThrows(IOException.class,()->helper.lookup(request,managedDir));assertThrows(IOException.class,()->helper.released(request));Files.delete(saved.image());Files.write(saved.image(),bytes);
-            Path foreign=root.resolve("foreign");Files.write(foreign,bytes);Files.delete(saved.image());Files.createSymbolicLink(saved.image(),foreign);assertThrows(IOException.class,()->helper.lookup(request,managedDir));assertThrows(IOException.class,()->helper.released(request));assertTrue(Files.exists(foreign));
+            byte[] bytes=Files.readAllBytes(saved.image());Files.delete(saved.image());Files.write(saved.image(),new byte[]{1});assertThrows(IOException.class,()->helper.lookup(request));assertThrows(IOException.class,()->helper.released(request));Files.delete(saved.image());Files.write(saved.image(),bytes);
+            Path foreign=root.resolve("foreign");Files.write(foreign,bytes);Files.delete(saved.image());Files.createSymbolicLink(saved.image(),foreign);assertThrows(IOException.class,()->helper.lookup(request));assertThrows(IOException.class,()->helper.released(request));assertTrue(Files.exists(foreign));
         }
     }
     @Test void imageAndMetadataQuotaFailBeforeAnyDurableMutation()throws Exception {
@@ -68,8 +68,8 @@ class RatisTopologySourceSnapshotArtifactsTest {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50))){var info=managed(lease,managedDir);var request=lease.prepared().request();Path durable;
             try(var helper=open(owned)){durable=helper.retain(lease.prepared(),info).image();}
             byte[] bytes=Files.readAllBytes(durable);Files.delete(durable);Path pending=durable.resolveSibling(durable.getFileName()+".pending");Files.write(pending,Arrays.copyOf(bytes,64));
-            try(var helper=open(owned)){var repaired=helper.lookup(request,managedDir);assertArrayEquals(lease.prepared().image().sha256(),NativeRangeImage.inspect(repaired.image(),limits).sha256());}
-            Files.delete(durable);Files.write(pending,new byte[]{99});try(var helper=open(owned)){assertThrows(IOException.class,()->helper.lookup(request,managedDir));assertArrayEquals(new byte[]{99},Files.readAllBytes(pending));}
+            try(var helper=open(owned)){var repaired=helper.lookup(request);assertArrayEquals(lease.prepared().image().sha256(),NativeRangeImage.inspect(repaired.image(),limits).sha256());}
+            Files.delete(durable);Files.write(pending,new byte[]{99});try(var helper=open(owned)){assertThrows(IOException.class,()->helper.lookup(request));assertArrayEquals(new byte[]{99},Files.readAllBytes(pending));}
         }
     }
     @Test void completeForcedMetadataSidecarRecoversWithoutAChangedCapture()throws Exception {
@@ -77,7 +77,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50))){var info=managed(lease,managedDir);var request=lease.prepared().request();
             try(var helper=open(owned)){helper.retain(lease.prepared(),info);}
             Path metadata=owned.resolve(request.transferId()+".prepared");Path pending=metadata.resolveSibling(metadata.getFileName()+".pending");Files.move(metadata,pending);
-            try(var helper=open(owned)){var saved=helper.lookup(request,managedDir);assertArrayEquals(lease.prepared().image().sha256(),saved.prepared().image().sha256());assertTrue(Files.exists(metadata));assertFalse(Files.exists(pending));}
+            try(var helper=open(owned)){var saved=helper.lookup(request);assertArrayEquals(lease.prepared().image().sha256(),saved.prepared().image().sha256());assertTrue(Files.exists(metadata));assertFalse(Files.exists(pending));}
         }
     }
 
@@ -98,7 +98,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                 };
                 try(var service=new RatisTopologySourceSnapshotService(host,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){service.prepare(request);service.close();assertEquals(1,fixture.pinCloses.get());assertEquals(0,fixture.durableReleases.get());}
             }
-            try(var helper=open(owned)){assertNotNull(helper.lookup(request,fixture.image.getParent()));assertFalse(Files.exists(owned.resolve(request.transferId()+".released")));}
+            try(var helper=open(owned)){assertNotNull(helper.lookup(request));assertFalse(Files.exists(owned.resolve(request.transferId()+".released")));}
         }
     }
 

@@ -70,7 +70,9 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             }else host.requireOwner(entry.lease);
             synchronized(this){requireOpen();}
             return entry.lease.prepared();
-        }catch(Exception problem){failure=io("Source snapshot preparation failed; original owner retained",problem);throw failure;}
+        }catch(Exception problem){
+            if(problem instanceof RatisTopologySourceSnapshotArtifacts.AdmissionRejected){synchronized(this){if(entry.lease==null && entries.remove(request.transferId(),entry)){imageBytes-=entry.imageCharge;metadataBytes-=entry.metadataCharge;}}}
+            failure=io("Source snapshot preparation failed; original owner retained",problem);throw failure;}
         finally{finish(entry,failure);}
     }
     public Prepared transfer(Request request)throws IOException {
@@ -78,7 +80,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         try {
             if(entry.installed)return entry.lease.prepared();
             host.requireOwner(entry.lease);boolean received=false;
-            try(var chunks=RockserverSnapshotRequests.open(entry.lease.source(),RaftPeerId.valueOf(request.receiver().peerId()),request.transferId().toString(),entry.lease.snapshot(),CHUNK_BYTES)){
+            try(var chunks=RockserverSnapshotRequests.openSource(entry.lease.source(),RaftPeerId.valueOf(request.receiver().peerId()),request.transferId().toString(),entry.lease.snapshot(),CHUNK_BYTES)){
                 while(chunks.hasNext()){
                     synchronized(this){requireOpen();}
                     host.requireOwner(entry.lease);var chunk=chunks.next();var reply=host.send(chunk);requireReply(chunk,reply);
