@@ -64,12 +64,15 @@ public final class ExportWire {
     public static ExportStatus status(ExportJobs.Status v) {
         return ExportStatus.newBuilder().setJobId(uuid(v.jobId())).setPhase(ExportPhase.valueOf(v.phase().name()))
                 .addAllColumns(v.columns()).setParticipantCount(v.participantCount()).setChunkCount(v.chunkCount())
-                .setAcknowledgedCount(v.acknowledgedCount()).setFileBytes(v.fileBytes()).setCleanupPending(v.cleanupPending()).build();
+                .setAcknowledgedCount(v.acknowledgedCount()).setFileBytes(v.fileBytes()).setCleanupPending(v.cleanupPending())
+                .setSchema(ByteString.copyFrom(v.schemaBytes())).build();
     }
     public static ExportJobs.Status status(ExportStatus v) {
         columns(v.getColumnsCount());
+        if (v.getSchema().isEmpty() || v.getSchema().size() > it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec.MAX_BYTES)
+            throw new IllegalArgumentException("Invalid export schema size");
         return new ExportJobs.Status(uuid(v.getJobId()), ExportJobs.Phase.valueOf(v.getPhase().name()), v.getColumnsList(),
-                v.getParticipantCount(), v.getChunkCount(), v.getAcknowledgedCount(), v.getFileBytes(), v.getCleanupPending());
+                v.getParticipantCount(), v.getChunkCount(), v.getAcknowledgedCount(), v.getFileBytes(), v.getCleanupPending(), v.getSchema().toByteArray());
     }
     public static ExportStatus status(ExportJobs.Status value, UUID expectedJob) {
         if (!value.jobId().equals(expectedJob)) throw new IllegalArgumentException("Wrong status job identity");

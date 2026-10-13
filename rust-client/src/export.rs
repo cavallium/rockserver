@@ -1,6 +1,7 @@
 //! Bounded immutable export jobs. IDs are network-order UUID bytes; metadata contains no paths.
 use crate::{export_proto as wire, RequestContext, Result};
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, future::Future, time::Duration};
 use tonic::service::{interceptor::InterceptedService, Interceptor};
 use tonic::{transport::Channel, Request, Status};
@@ -13,6 +14,7 @@ pub const MAX_MANIFEST_BYTES: i32 = 4 * 1024 * 1024;
 pub const MIN_PAGE_BYTES: i32 = 64 * 1024;
 pub const MAX_FILE_PAGE_BYTES: i32 = 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
 pub type ExportId = [u8; 16];
 pub use wire::{ExportPhase as Phase, ExportRawScanMode as RawScanMode};
 
@@ -87,6 +89,7 @@ pub struct ExportStatus {
     pub acknowledged_count: i32,
     pub file_bytes: i64,
     pub cleanup_pending: bool,
+    pub canonical_schema: Vec<u8>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkId {
@@ -307,8 +310,236 @@ fn columns(mut v: Vec<i64>) -> Result<Vec<i64>> {
     }
     Ok(v)
 }
+/// Decoded current distributed schema witness; its digest is computed from the canonical bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportSchema {
+    pub cluster_id: ExportId,
+    pub database_id: ExportId,
+    pub domain_id: ExportId,
+    pub schema_epoch: i64,
+    pub routing_prefix_bytes: i32,
+    pub columns: Vec<ExportSchemaColumn>,
+    pub digest: [u8; 32],
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportSchemaColumn {
+    pub column_id: ExportId,
+    pub api_id: i64,
+    pub name: String,
+    pub physical_key_widths: Vec<i32>,
+    pub variable_tail_hashes: Vec<SchemaHash>,
+    pub has_value: bool,
+    pub operator: Option<ExportSchemaOperator>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaHash {
+    XxHash32,
+    XxHash8,
+    AllSame8,
+    FixedInteger32,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportSchemaOperator {
+    pub name: String,
+    pub version: i64,
+    pub class_name: String,
+    pub artifact_sha256: [u8; 32],
+    pub value_codec_version: i32,
+    pub operand_codec_version: i32,
+    pub deterministic_contract: String,
+    pub deterministic_contract_version: i32,
+}
+struct SchemaReader<'a>(&'a [u8]);
+impl<'a> SchemaReader<'a> {
+    fn take(&mut self, size: usize) -> Result<&'a [u8]> {
+        if self.0.len() < size {
+            return Err(invalid("truncated export schema"));
+        }
+        let (head, tail) = self.0.split_at(size);
+        self.0 = tail;
+        Ok(head)
+    }
+    fn i32(&mut self) -> Result<i32> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn i64(&mut self) -> Result<i64> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn uuid(&mut self) -> Result<ExportId> {
+        Ok(self.take(16)?.try_into().unwrap())
+    }
+    fn flag(&mut self) -> Result<bool> {
+        match self.take(1)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(invalid("invalid export schema flag")),
+        }
+    }
+    fn text(&mut self) -> Result<String> {
+        let length = self.i32()?;
+        if !(1..=4096).contains(&length) {
+            return Err(invalid("invalid export schema text length"));
+        }
+        std::str::from_utf8(self.take(length as usize)?)
+            .map(str::to_owned)
+            .map_err(|_| invalid("invalid export schema UTF-8"))
+    }
+}
+impl ExportSchema {
+    pub fn decode(encoded: &[u8]) -> Result<Self> {
+        if !(76..=MAX_SCHEMA_BYTES).contains(&encoded.len()) {
+            return Err(invalid("invalid export schema size"));
+        }
+        let mut r = SchemaReader(encoded);
+        if r.i32()? != 0x44534348 || r.i32()? != 1 || r.i32()? != 1 {
+            return Err(invalid("unsupported export schema or physical key codec"));
+        }
+        let cluster_id = r.uuid()?;
+        let database_id = r.uuid()?;
+        let domain_id = r.uuid()?;
+        let schema_epoch = r.i64()?;
+        let routing_prefix_bytes = r.i32()?;
+        let count = r.i32()?;
+        if schema_epoch < 0
+            || !(0..=1024 * 1024).contains(&routing_prefix_bytes)
+            || !(0..=256).contains(&count)
+            || count as usize * 39 > r.0.len()
+        {
+            return Err(invalid("invalid export schema header bounds"));
+        }
+        let mut columns = Vec::with_capacity(count as usize);
+        let mut previous = None;
+        let mut ids = HashSet::new();
+        let mut names = HashSet::new();
+        let mut prefix = None;
+        for _ in 0..count {
+            let column_id = r.uuid()?;
+            let api_id = r.i64()?;
+            if api_id <= 0 || !ids.insert(api_id) || previous.is_some_and(|id| id >= column_id) {
+                return Err(invalid("noncanonical export schema UUID or API ID"));
+            }
+            previous = Some(column_id);
+            let name = r.text()?;
+            if !names.insert(name.clone()) {
+                return Err(invalid("duplicate export schema column name"));
+            }
+            let components = r.i32()?;
+            if !(0..=256).contains(&components) || components as usize * 4 + 6 > r.0.len() {
+                return Err(invalid("invalid export schema key component count"));
+            }
+            let mut physical_key_widths = Vec::with_capacity(components as usize);
+            let mut bytes = 0i64;
+            for _ in 0..components {
+                let width = r.i32()?;
+                bytes += width as i64;
+                if width <= 0 || bytes > MAX_SCHEMA_BYTES as i64 {
+                    return Err(invalid("invalid export schema key width/budget"));
+                }
+                physical_key_widths.push(width);
+            }
+            let tails = r.i32()?;
+            if tails < 0 || tails > components || tails as usize + 2 > r.0.len() {
+                return Err(invalid("invalid export schema variable tail count"));
+            }
+            let mut variable_tail_hashes = Vec::with_capacity(tails as usize);
+            for k in 0..tails {
+                let (hash, width) = match r.take(1)?[0] {
+                    1 => (SchemaHash::XxHash32, 4),
+                    2 => (SchemaHash::XxHash8, 1),
+                    3 => (SchemaHash::AllSame8, 1),
+                    4 => (SchemaHash::FixedInteger32, 4),
+                    _ => return Err(invalid("unknown export schema hash codec")),
+                };
+                if physical_key_widths[(components - tails + k) as usize] != width {
+                    return Err(invalid("export schema hash width differs from codec"));
+                }
+                variable_tail_hashes.push(hash);
+            }
+            let has_value = r.flag()?;
+            let operator = if r.flag()? {
+                let name = r.text()?;
+                let version = r.i64()?;
+                let class_name = r.text()?;
+                let artifact_sha256 = r.take(32)?.try_into().unwrap();
+                let value_codec_version = r.i32()?;
+                let operand_codec_version = r.i32()?;
+                let deterministic_contract = r.text()?;
+                let deterministic_contract_version = r.i32()?;
+                if version < 0
+                    || value_codec_version < 1
+                    || operand_codec_version < 1
+                    || deterministic_contract_version < 1
+                {
+                    return Err(invalid("invalid export schema operator identity"));
+                }
+                Some(ExportSchemaOperator {
+                    name,
+                    version,
+                    class_name,
+                    artifact_sha256,
+                    value_codec_version,
+                    operand_codec_version,
+                    deterministic_contract,
+                    deterministic_contract_version,
+                })
+            } else {
+                None
+            };
+            let mut widths = Vec::new();
+            let mut bytes = 0i64;
+            for width in &physical_key_widths[..(components - tails) as usize] {
+                if bytes >= routing_prefix_bytes as i64 {
+                    break;
+                }
+                widths.push(*width);
+                bytes += *width as i64;
+            }
+            if bytes != routing_prefix_bytes as i64 || prefix.as_ref().is_some_and(|p| p != &widths)
+            {
+                return Err(invalid(
+                    "export schema routing prefix differs from fixed component boundaries",
+                ));
+            }
+            prefix = Some(widths);
+            columns.push(ExportSchemaColumn {
+                column_id,
+                api_id,
+                name,
+                physical_key_widths,
+                variable_tail_hashes,
+                has_value,
+                operator,
+            });
+        }
+        if !r.0.is_empty() {
+            return Err(invalid("trailing export schema bytes"));
+        }
+        Ok(Self {
+            cluster_id,
+            database_id,
+            domain_id,
+            schema_epoch,
+            routing_prefix_bytes,
+            columns,
+            digest: Sha256::digest(encoded).into(),
+        })
+    }
+}
 impl ExportStatus {
+    pub fn decoded_schema(&self) -> Result<ExportSchema> {
+        ExportSchema::decode(&self.canonical_schema)
+    }
     pub fn decode(v: wire::ExportStatus, expected_job: Option<ExportId>) -> Result<Self> {
+        let schema = ExportSchema::decode(&v.schema)?;
+        let selected = columns(v.columns)?;
+        if selected
+            .iter()
+            .any(|api| !schema.columns.iter().any(|column| column.api_id == *api))
+        {
+            return Err(invalid(
+                "export status selected column is absent from schema witness",
+            ));
+        }
         let job_id = uuid(v.job_id)?;
         if expected_job.is_some_and(|id| id != job_id)
             || v.participant_count < 0
@@ -321,12 +552,13 @@ impl ExportStatus {
         Ok(Self {
             job_id,
             phase: Phase::try_from(v.phase).map_err(|_| invalid("unknown export phase"))?,
-            columns: columns(v.columns)?,
+            columns: selected,
             participant_count: v.participant_count,
             chunk_count: v.chunk_count,
             acknowledged_count: v.acknowledged_count,
             file_bytes: v.file_bytes,
             cleanup_pending: v.cleanup_pending,
+            canonical_schema: v.schema,
         })
     }
 }
@@ -688,6 +920,185 @@ mod tests {
         };
         assert!(FilePage::decode(v, &request).is_err());
     }
+    fn schema_bytes() -> Vec<u8> {
+        fn text(encoded: &mut Vec<u8>, value: &str) {
+            encoded.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            encoded.extend_from_slice(value.as_bytes());
+        }
+        let mut encoded = Vec::new();
+        for header in [0x44534348i32, 1, 1] {
+            encoded.extend_from_slice(&header.to_be_bytes());
+        }
+        for uuid in [[3; 16], [4; 16], [5; 16]] {
+            encoded.extend_from_slice(&uuid);
+        }
+        encoded.extend_from_slice(&6i64.to_be_bytes());
+        encoded.extend_from_slice(&4i32.to_be_bytes());
+        encoded.extend_from_slice(&2i32.to_be_bytes());
+        for (api, name, operator) in [(1i64, "a", false), (2i64, "b", true)] {
+            encoded.extend_from_slice(&[api as u8; 16]);
+            encoded.extend_from_slice(&api.to_be_bytes());
+            text(&mut encoded, name);
+            for field in [2i32, 4, 4, 1] {
+                encoded.extend_from_slice(&field.to_be_bytes());
+            }
+            encoded.extend_from_slice(&[1, 1, operator as u8]);
+            if operator {
+                text(&mut encoded, "merge");
+                encoded.extend_from_slice(&7i64.to_be_bytes());
+                text(&mut encoded, "example.Merge");
+                encoded.extend_from_slice(&[8; 32]);
+                encoded.extend_from_slice(&1i32.to_be_bytes());
+                encoded.extend_from_slice(&2i32.to_be_bytes());
+                text(&mut encoded, "deterministic");
+                encoded.extend_from_slice(&3i32.to_be_bytes());
+            }
+        }
+        encoded
+    }
+    fn schema_status() -> wire::ExportStatus {
+        wire::ExportStatus {
+            job_id: [1; 16].to_vec(),
+            phase: Phase::Ready as i32,
+            columns: vec![1, 2],
+            participant_count: 1,
+            chunk_count: 1,
+            acknowledged_count: 0,
+            file_bytes: 3,
+            cleanup_pending: false,
+            schema: schema_bytes(),
+        }
+    }
+    #[test]
+    fn schema_witness_roundtrips_status_and_exposes_physical_operator_identity() {
+        let wire = schema_status();
+        let status = ExportStatus::decode(
+            wire::ExportStatus::decode(wire.encode_to_vec().as_slice()).unwrap(),
+            Some([1; 16]),
+        )
+        .unwrap();
+        assert_eq!(status.canonical_schema, schema_bytes());
+        let schema = status.decoded_schema().unwrap();
+        assert_eq!(
+            (schema.cluster_id, schema.database_id, schema.domain_id),
+            ([3; 16], [4; 16], [5; 16])
+        );
+        assert_eq!(schema.schema_epoch, 6);
+        assert_eq!(schema.routing_prefix_bytes, 4);
+        assert_eq!(
+            schema.digest,
+            <[u8; 32]>::from(Sha256::digest(schema_bytes()))
+        );
+        assert_eq!(schema.columns[0].api_id, 1);
+        assert_eq!(schema.columns[0].physical_key_widths, vec![4, 4]);
+        assert_eq!(
+            schema.columns[0].variable_tail_hashes,
+            vec![SchemaHash::XxHash32]
+        );
+        assert!(schema.columns[0].operator.is_none());
+        let operator = schema.columns[1].operator.as_ref().unwrap();
+        assert_eq!(operator.name, "merge");
+        assert_eq!(operator.version, 7);
+        assert_eq!(operator.class_name, "example.Merge");
+        assert_eq!(operator.artifact_sha256, [8; 32]);
+        assert_eq!(
+            (
+                operator.value_codec_version,
+                operator.operand_codec_version,
+                operator.deterministic_contract_version
+            ),
+            (1, 2, 3)
+        );
+        assert_eq!(operator.deterministic_contract, "deterministic");
+    }
+    #[test]
+    fn schema_witness_is_required_bounded_and_contains_all_selected_api_ids() {
+        for schema in [vec![], vec![0; 75], vec![0; MAX_SCHEMA_BYTES + 1]] {
+            let mut status = schema_status();
+            status.schema = schema;
+            assert!(ExportStatus::decode(status, None).is_err());
+        }
+        let mut status = schema_status();
+        status.columns = vec![3];
+        assert!(ExportStatus::decode(status, None).is_err());
+        let mut status = schema_status();
+        status.schema.pop();
+        assert!(ExportStatus::decode(status, None).is_err());
+        let mut status = schema_status();
+        status.schema[0] ^= 1;
+        assert!(ExportStatus::decode(status, None).is_err());
+    }
+    #[test]
+    fn schema_decoder_rejects_noncanonical_ids_names_utf8_and_carrier_versions() {
+        let bytes = schema_bytes();
+        assert_eq!(bytes.len(), 267);
+        for offset in [4, 8] {
+            let mut v = bytes.clone();
+            v[offset..offset + 4].copy_from_slice(&2i32.to_be_bytes());
+            assert!(ExportSchema::decode(&v).is_err());
+        }
+        let mut v = bytes.clone();
+        v[92..100].copy_from_slice(&0i64.to_be_bytes());
+        assert!(ExportSchema::decode(&v).is_err());
+        let mut v = bytes.clone();
+        v[140..148].copy_from_slice(&1i64.to_be_bytes());
+        assert!(ExportSchema::decode(&v).is_err());
+        let mut v = bytes.clone();
+        v[124..140].copy_from_slice(&[1; 16]);
+        assert!(ExportSchema::decode(&v).is_err());
+        let mut v = bytes.clone();
+        v[76..92].copy_from_slice(&[0x80; 16]);
+        assert!(ExportSchema::decode(&v).is_err());
+        let mut v = bytes.clone();
+        v[124..140].copy_from_slice(&[0x80; 16]);
+        assert!(ExportSchema::decode(&v).is_ok());
+        let mut v = bytes.clone();
+        v[152] = b'a';
+        assert!(ExportSchema::decode(&v).is_err());
+        let mut v = bytes.clone();
+        v[104] = 0xff;
+        assert!(ExportSchema::decode(&v).is_err());
+        let mut v = bytes.clone();
+        v[100..104].copy_from_slice(&4097i32.to_be_bytes());
+        assert!(ExportSchema::decode(&v).is_err());
+        let mut v = bytes;
+        v.push(0);
+        assert!(ExportSchema::decode(&v).is_err());
+    }
+    #[test]
+    fn schema_decoder_enforces_shape_prefix_hash_flags_and_operator_versions() {
+        let bytes = schema_bytes();
+        let mut v = bytes.clone();
+        v[60..68].copy_from_slice(&(-1i64).to_be_bytes());
+        assert!(ExportSchema::decode(&v).is_err());
+        for (offset, value) in [
+            (72, 257i32),
+            (105, 257),
+            (109, 0),
+            (109, MAX_SCHEMA_BYTES as i32),
+            (117, 3),
+            (68, 3),
+            (238, 0),
+            (242, 0),
+            (263, 0),
+        ] {
+            let mut v = bytes.clone();
+            v[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+            assert!(ExportSchema::decode(&v).is_err());
+        }
+        for (offset, value) in [(121, 0u8), (121, 2), (122, 2), (123, 2)] {
+            let mut v = bytes.clone();
+            v[offset] = value;
+            assert!(ExportSchema::decode(&v).is_err());
+        }
+        let mut v = bytes.clone();
+        v[181..189].copy_from_slice(&(-1i64).to_be_bytes());
+        assert!(ExportSchema::decode(&v).is_err());
+        // Equal byte prefix length is insufficient: every column must use the same fixed component boundaries.
+        let mut v = bytes;
+        v[157..161].copy_from_slice(&2i32.to_be_bytes());
+        assert!(ExportSchema::decode(&v).is_err());
+    }
     #[test]
     fn status_rejects_wrong_job_unknown_phase_and_invalid_counts() {
         let status = || wire::ExportStatus {
@@ -699,6 +1110,7 @@ mod tests {
             acknowledged_count: 0,
             file_bytes: 3,
             cleanup_pending: false,
+            schema: schema_bytes(),
         };
         assert_eq!(
             ExportStatus::decode(status(), Some([1; 16]))

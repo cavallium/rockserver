@@ -4,6 +4,9 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import io.grpc.Status;
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.ColumnSchema;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
 import it.cavallium.rockserver.core.common.api.export.proto.*;
 import it.cavallium.rockserver.core.common.export.*;
 import it.cavallium.rockserver.core.server.ExportGrpcService;
@@ -18,7 +21,35 @@ import static org.mockito.Mockito.*;
 class ExportGrpcContractTest {
     private final UUID job = new UUID(0, 1);
     private ExportJobs.ChunkId id() { return new ExportJobs.ChunkId(job, new UUID(0, 2), new UUID(0, 3), 1, 1, 2, 0, new byte[32]); }
-    private ExportJobs.Status status() { return new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(-1L), 1, 0, 0, 0, false); }
+    private ExportJobs.Status status() { return new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false, schemaBytes()); }
+    private byte[] schemaBytes() {
+        var column = new DistributedSchema.Column(1, new UUID(0, 10), "entries",
+                ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntList.of(8), it.unimi.dsi.fastutil.objects.ObjectList.of(), true), null);
+        return DistributedSchemaCodec.encode(new DistributedSchema(new UUID(0, 11), new UUID(0, 12),
+                new UUID(0, 13), 1, 8, List.of(column)));
+    }
+    @Test void statusCarriesMandatoryCanonicalFrozenSchema() throws Exception {
+        var bytes = schemaBytes();
+        var status = new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false, bytes);
+        bytes[0] ^= 1;
+        var wire = ExportStatus.parseFrom(ExportWire.status(status).toByteArray());
+        var decoded = ExportWire.status(wire);
+        assertEquals(status, decoded);
+        assertArrayEquals(schemaBytes(), decoded.schemaBytes());
+        assertArrayEquals(DistributedSchemaCodec.decode(schemaBytes()).digest(), decoded.decodedSchema().digest());
+        var exposed = decoded.schemaBytes(); exposed[0] ^= 1;
+        assertArrayEquals(schemaBytes(), decoded.schemaBytes());
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().clearSchema().build()));
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().clearColumns().addColumns(2L).build()));
+        assertThrows(IllegalArgumentException.class, () -> new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(-1L), 1, 0, 0, 0, false, schemaBytes()));
+        var tampered = schemaBytes(); tampered[0] ^= 1;
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setSchema(ByteString.copyFrom(tampered)).build()));
+        var trailing = java.util.Arrays.copyOf(schemaBytes(), schemaBytes().length + 1);
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setSchema(ByteString.copyFrom(trailing)).build()));
+        var oversized = ByteString.copyFrom(new byte[DistributedSchemaCodec.MAX_BYTES + 1]);
+        assertThrows(IllegalArgumentException.class, () -> ExportWire.status(wire.toBuilder().setSchema(oversized).build()));
+        assertThrows(NullPointerException.class, () -> new ExportJobs.Status(job, ExportJobs.Phase.READY, List.of(1L), 1, 0, 0, 0, false, null));
+    }
     @Test void pathFreeRoundTripPreservesSignedIdsAndBoundPresence() throws Exception {
         var create = new ExportJobs.Create(job, List.of(Long.MIN_VALUE, -1L, Long.MAX_VALUE), ExportJobs.Limits.defaults());
         assertEquals(create, ExportWire.create(ExportCreateRequest.parseFrom(ExportWire.create(create).toByteArray())));

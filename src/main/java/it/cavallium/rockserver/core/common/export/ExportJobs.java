@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.core.common.export;
 
+import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
@@ -59,7 +61,7 @@ public final class ExportJobs {
     public enum Phase { CAPTURING, EXPORTING, MATERIALIZED, READY, SNAPSHOT_LOST, CANCELLED, RELEASED }
 
     public record Status(UUID jobId, Phase phase, List<Long> columns, int participantCount,
-                         int chunkCount, int acknowledgedCount, long fileBytes, boolean cleanupPending) {
+                         int chunkCount, int acknowledgedCount, long fileBytes, boolean cleanupPending, byte[] schemaBytes) {
         public Status {
             Objects.requireNonNull(jobId, "jobId");
             Objects.requireNonNull(phase, "phase");
@@ -68,6 +70,25 @@ public final class ExportJobs {
                     || acknowledgedCount < 0 || acknowledgedCount > chunkCount || fileBytes < 0) {
                 throw new IllegalArgumentException("Invalid export status");
             }
+            Objects.requireNonNull(schemaBytes, "schemaBytes");
+            if (schemaBytes.length == 0 || schemaBytes.length > DistributedSchemaCodec.MAX_BYTES)
+                throw new IllegalArgumentException("Invalid export schema size");
+            schemaBytes = schemaBytes.clone();
+            var schema = DistributedSchemaCodec.decode(schemaBytes);
+            for (long column : columns) schema.column(column);
+        }
+        @Override public byte[] schemaBytes() { return schemaBytes.clone(); }
+        public DistributedSchema decodedSchema() { return DistributedSchemaCodec.decode(schemaBytes); }
+        @Override public boolean equals(Object other) {
+            return other instanceof Status status && jobId.equals(status.jobId) && phase == status.phase
+                    && columns.equals(status.columns) && participantCount == status.participantCount
+                    && chunkCount == status.chunkCount && acknowledgedCount == status.acknowledgedCount
+                    && fileBytes == status.fileBytes && cleanupPending == status.cleanupPending
+                    && Arrays.equals(schemaBytes, status.schemaBytes);
+        }
+        @Override public int hashCode() {
+            return 31 * Objects.hash(jobId, phase, columns, participantCount, chunkCount, acknowledgedCount, fileBytes, cleanupPending)
+                    + Arrays.hashCode(schemaBytes);
         }
     }
 

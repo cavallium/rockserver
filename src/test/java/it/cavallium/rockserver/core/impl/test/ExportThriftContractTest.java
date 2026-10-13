@@ -5,6 +5,8 @@ import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.ThriftTransportLimits;
 import it.cavallium.rockserver.core.common.api.*;
 import it.cavallium.rockserver.core.common.export.*;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
 import it.cavallium.rockserver.core.server.ExportThriftService;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
@@ -19,7 +21,12 @@ class ExportThriftContractTest {
     private static final UUID JOB=UUID.randomUUID();
     private static final ExportJobs.ChunkId ID=new ExportJobs.ChunkId(JOB,UUID.randomUUID(),UUID.randomUUID(),1,1,1,0,new byte[32]);
     private static final ExportJobs.Chunk CHUNK=new ExportJobs.Chunk(ID,1,null,null,1,1,3,false);
-    private static final ExportJobs.Status STATUS=new ExportJobs.Status(JOB,ExportJobs.Phase.READY,List.of(1L),1,1,0,3,false);
+    private static final DistributedSchema SCHEMA=new DistributedSchema(new UUID(0,1),new UUID(0,2),new UUID(0,3),2,4,
+            List.of(new DistributedSchema.Column(1,new UUID(0,4),"column",it.cavallium.rockserver.core.common.ColumnSchema.of(
+                    it.unimi.dsi.fastutil.ints.IntArrayList.of(4),
+                    it.unimi.dsi.fastutil.objects.ObjectArrayList.of(it.cavallium.rockserver.core.common.ColumnHashType.XXHASH8),true,"sum",2L,"example.Sum"),
+                    new DistributedSchema.Operator("sum",2,"example.Sum",new byte[32],3,4,"pure-sum",1))));
+    private static final ExportJobs.Status STATUS=new ExportJobs.Status(JOB,ExportJobs.Phase.READY,List.of(1L),1,1,0,3,false,DistributedSchemaCodec.encode(SCHEMA));
     private static ExportAsyncAPI backend(java.lang.reflect.InvocationHandler handler) {
         return (ExportAsyncAPI)Proxy.newProxyInstance(ExportAsyncAPI.class.getClassLoader(),new Class<?>[]{ExportAsyncAPI.class},handler);
     }
@@ -58,6 +65,27 @@ class ExportThriftContractTest {
         var decodedPage=new ExportManifestPage();
         new org.apache.thrift.TDeserializer().deserialize(decodedPage,new org.apache.thrift.TSerializer().serialize(page));
         assertEquals(ID,ThriftExportWire.manifest(decodedPage,manifest).chunks().getFirst().id());
+    }
+    @Test void frozenSchemaIsRequiredCanonicalBoundedAndPreservedThroughSerialization() throws Exception {
+        var wire=ThriftExportWire.status(STATUS);
+        var decoded=new ExportStatus();
+        new org.apache.thrift.TDeserializer().deserialize(decoded,new org.apache.thrift.TSerializer().serialize(wire));
+        var status=ThriftExportWire.status(decoded,JOB);
+        assertArrayEquals(DistributedSchemaCodec.encode(SCHEMA),status.schemaBytes());
+        assertArrayEquals(SCHEMA.digest(),status.decodedSchema().digest());
+        assertEquals(SCHEMA.column(1),status.decodedSchema().column(1));
+        var missing=ThriftExportWire.status(STATUS); missing.unsetSchema();
+        assertThrows(org.apache.thrift.protocol.TProtocolException.class,missing::validate);
+        assertThrows(IllegalArgumentException.class,()->ThriftExportWire.status(missing));
+        var empty=ThriftExportWire.status(STATUS).setSchema(ByteBuffer.allocate(0));
+        assertThrows(IllegalArgumentException.class,()->ThriftExportWire.status(empty));
+        var oversized=ThriftExportWire.status(STATUS).setSchema(ByteBuffer.allocate(DistributedSchemaCodec.MAX_BYTES+1));
+        assertThrows(IllegalArgumentException.class,()->ThriftExportWire.status(oversized));
+        var invalid=STATUS.schemaBytes(); invalid[0]^=1;
+        var corrupt=ThriftExportWire.status(STATUS).setSchema(invalid);
+        assertThrows(IllegalArgumentException.class,()->ThriftExportWire.status(corrupt));
+        var trailing=ThriftExportWire.status(STATUS).setSchema(java.util.Arrays.copyOf(STATUS.schemaBytes(),STATUS.schemaBytes().length+1));
+        assertThrows(IllegalArgumentException.class,()->ThriftExportWire.status(trailing));
     }
     @Test void multiplexedProcessorRoundTripInMemory() throws Exception {
         var service=new ExportThriftService(backend((p,m,a)->CompletableFuture.completedFuture(STATUS)),ThriftTransportLimits.DEFAULT_MAX_FRAME_SIZE);

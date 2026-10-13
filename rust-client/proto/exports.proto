@@ -28,7 +28,7 @@ enum ExportPhase { CAPTURING = 0; EXPORTING = 1; MATERIALIZED = 2; READY = 3; SN
 message ExportStatus {
   bytes job_id = 1; ExportPhase phase = 2; repeated int64 columns = 3;
   int32 participant_count = 4; int32 chunk_count = 5; int32 acknowledged_count = 6;
-  int64 file_bytes = 7; bool cleanup_pending = 8;
+  int64 file_bytes = 7; bool cleanup_pending = 8; bytes schema = 9;
 }
 message ExportChunkId {
   bytes job_id = 1; bytes group_id = 2; bytes range_lineage = 3;

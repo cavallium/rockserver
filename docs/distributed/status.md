@@ -124,7 +124,13 @@ This section and the remaining gates at the end describe the current branch.
   atomically before ACK, preserve an existing collision member and reject a competing
   fence update without data/checkpoint/ACK. Connection-journal reopening skips the
   committed chunk and retries a lost ACK exactly; native stores remain live. This
-  does not establish general public schema witnessing or external Yotsuba adoption.
+  now obtains the canonical frozen schema solely from public job status. The nonce
+  ledger forces that schema before allocation/capture and binds it to the original
+  snapshot fence; READY delivery survives reopening under a newer backend schema
+  that removed the exported API column. Java, Thrift and Rust reject missing,
+  noncanonical, oversized or selection-mismatched witnesses. The clean focused gate
+  passed 23 core and 10 Ratis cases, with 10 Rust export cases passing separately.
+  This does not establish external Yotsuba adoption.
 - Replica-local maintenance passed actual flush/SST preview/execution/property
   checks, stale target rejection, cancellation with retained JNI ownership and
   node-owned shutdown. It requires explicit policy and process/pool/CF identities.
@@ -1146,11 +1152,14 @@ Relocation currently admits preparation/abort while its source stays writable.
   artifact quotas against the architecture. Controlled restore quota/unknown-force,
   durable ownership claims and custom proof accounting checks are recorded above;
   they do not prove the full resource envelope.
-- Complete general public schema witnessing for logical export migration and
-  establish adoption by the intended external consumers. Controlled snapshot/CDC
-  resynchronization and schema-bound export migration are recorded above.
-- Qualify opaque native allocation bounds for maintenance inventory and other
-  retained native work where Java accounting alone is insufficient.
+- Compose the production frontend export backend: the current node launcher
+  creates the database connection but does not attach the public export route.
+  Establish adoption by the intended external consumers. Controlled snapshot/CDC
+  resynchronization and public frozen-schema export migration are recorded above.
+- Complete shared committed-apply dispatch before callback materialization,
+  aggregate native cache/WBM preflight across pools, learner pressure/rate controls
+  and running Raft-log/WAL runway policy. Qualify opaque native allocation bounds
+  for eager maintenance inventory where Java accounting alone is insufficient.
 - Verify all documented topology, schema, import, retirement and repair workflows
   together under the final source/configuration, then reconcile contracts and status.
 - Independent quorum/restart/fault and representative performance/resource gates

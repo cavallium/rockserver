@@ -29,6 +29,18 @@ class RatisExportBackendTest {
             public CompletableFuture<Void> release(RatisExportSourceRpc.JobDefinition definition,RequestContext context) { return CompletableFuture.completedFuture(null); }
         };
     }
+    @Test void oversizedFrozenSchemaRejectsBeforeLedgerMutation() throws Exception {
+        try (var f=new RatisAtomicClientTest.Fixture(root.resolve("source"),true);var source=RatisExportClientTest.snapshots(f)) {
+            var columns=new ArrayList<DistributedSchema.Column>();var shape=f.schema.columns().getFirst().schema();
+            for(int i=0;i<24;i++)columns.add(new DistributedSchema.Column(71L+i,new UUID(291,i+1),"column-"+i+"x".repeat(4000),shape,null));
+            var schema=new DistributedSchema(f.schema.clusterId(),f.schema.databaseId(),f.schema.domainId(),f.schema.schemaEpoch(),f.schema.routingPrefixBytes(),columns);
+            byte[] encoded=DistributedSchemaCodec.encode(schema);assertTrue(encoded.length>65536);
+            Path owned=Files.createDirectory(root.resolve("small-ledger"));var ledger=new RatisExportRequests(owned,128,65536);byte[] original=Files.readAllBytes(owned.resolve("requests"));
+            assertThrows(IOException.class,()->ledger.pending(request(),encoded,source.identityDigest()));
+            assertNull(ledger.nonce(request().requestId()));assertArrayEquals(original,Files.readAllBytes(owned.resolve("requests")));assertFalse(Files.exists(owned.resolve("requests.pending")));
+            assertTrue(new RatisExportRequests(owned,128,65536).entries().isEmpty());assertEquals(0,f.captureRequests.get());
+        }
+    }
     @Test void allColumnsTwoGroupsLostCreateReplyColdDeliveryAndExplicitDurableAck() throws Exception {
         Path backendRoot=root.resolve("jobs"); UUID jobId; int captures;
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("source"),true); var source=RatisExportClientTest.snapshots(f); var executor=Executors.newVirtualThreadPerTaskExecutor()) {
@@ -84,11 +96,11 @@ class RatisExportBackendTest {
     }
     @Test void durablePendingAndBoundBeforeCaptureSurviveRestartWithoutChangingJobIdentity() throws Exception {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("source"),true); var source=RatisExportClientTest.snapshots(f)) {
-            Path pendingRoot=Files.createDirectory(root.resolve("pending")); var ledger=new RatisExportRequests(pendingRoot,128,16*1024*1024); var pending=ledger.pending(request(),f.schema.digest(),source.identityDigest()); var allocations=new Allocations(f);
+            Path pendingRoot=Files.createDirectory(root.resolve("pending")); var ledger=new RatisExportRequests(pendingRoot,128,16*1024*1024); var pending=ledger.pending(request(),DistributedSchemaCodec.encode(f.schema),source.identityDigest()); var allocations=new Allocations(f);
             try (var sdk=new RatisExportClient(source,f.scheduler,null,RatisExportClient.Limits.defaults()); var backend=new RatisExportBackend(pendingRoot,f.schema,source,f.scheduler,sdk,allocations,RatisExportBackend.Limits.defaults())) {
                 assertEquals(pending.job(),await(backend.createExport(request(),RequestContext.batch())).jobId()); assertEquals(1,allocations.count.get()); assertEquals(0,f.captureRequests.get());
             }
-            Path boundRoot=Files.createDirectory(root.resolve("bound")); var second=new RatisExportRequests(boundRoot,128,16*1024*1024); var original=second.pending(request(),f.schema.digest(),source.identityDigest()); var allocation=allocations.issued.getFirst();
+            Path boundRoot=Files.createDirectory(root.resolve("bound")); var second=new RatisExportRequests(boundRoot,128,16*1024*1024); var original=second.pending(request(),DistributedSchemaCodec.encode(f.schema),source.identityDigest()); var allocation=allocations.issued.getFirst();
             var scope=new TransactionScope(f.schema.columns().stream().map(column -> TransactionScope.Span.range(column.columnId(),null,null)).toList()); second.bind(original,source.plan(allocation.identity().snapshot(),scope).fence(),allocation.snapshot());
             try (var sdk=new RatisExportClient(source,f.scheduler,null,RatisExportClient.Limits.defaults()); var backend=new RatisExportBackend(boundRoot,f.schema,source,f.scheduler,sdk,context -> { throw new AssertionError("Bound nonce cannot allocate again"); },RatisExportBackend.Limits.defaults())) {
                 assertEquals(original.job(),await(backend.createExport(request(),RequestContext.batch())).jobId()); assertEquals(0,f.captureRequests.get());
@@ -164,7 +176,7 @@ class RatisExportBackendTest {
         try (var f=new RatisAtomicClientTest.Fixture(root.resolve("source"),true); var source=RatisExportClientTest.snapshots(f)) {
             Path directory=Files.createDirectory(root.resolve("job")); var allocations=new Allocations(f); var allocation=await(allocations.allocate(RequestContext.batch()));
             var scope=new TransactionScope(f.schema.columns().stream().map(column -> TransactionScope.Span.range(column.columnId(),null,null)).toList());
-            var ledger=new RatisExportRequests(directory,128,16*1024*1024); var pending=ledger.pending(request(),f.schema.digest(),source.identityDigest()); var bound=ledger.bind(pending,source.plan(allocation.identity().snapshot(),scope).fence(),allocation.snapshot()); var definition=bound.definition(f.schema.columns().stream().map(DistributedSchema.Column::columnId).toList());
+            var ledger=new RatisExportRequests(directory,128,16*1024*1024); var pending=ledger.pending(request(),DistributedSchemaCodec.encode(f.schema),source.identityDigest()); var bound=ledger.bind(pending,source.plan(allocation.identity().snapshot(),scope).fence(),allocation.snapshot()); var definition=bound.definition(f.schema.columns().stream().map(DistributedSchema.Column::columnId).toList());
             var lease=source.openFrozen(allocation.snapshot(),definition.fence(),definition.snapshotTtl(),RequestContext.batch());
             try {
                 await(lease.completion());

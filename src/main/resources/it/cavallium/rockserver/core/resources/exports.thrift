@@ -16,7 +16,7 @@ struct ExportChunkId {
 struct ExportStatus {
  1: required binary jobId, 2: required ExportPhase phase, 3: required list<i64> columns,
  4: required i32 participantCount, 5: required i32 chunkCount, 6: required i32 acknowledgedCount,
- 7: required i64 fileBytes, 8: required bool cleanupPending
+ 7: required i64 fileBytes, 8: required bool cleanupPending, 9: required binary schema
 }
 struct ExportChunk {
  1: required ExportChunkId id, 2: required i64 columnId, 3: optional binary lowerInclusive,

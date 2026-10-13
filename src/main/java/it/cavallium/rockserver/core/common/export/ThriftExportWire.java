@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.common.export;
 
 import it.cavallium.rockserver.core.common.api.*;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.UUID;
@@ -22,10 +23,13 @@ public final class ThriftExportWire {
     }
     public static ExportChunkId id(ExportJobs.ChunkId v) { return new ExportChunkId(uuid(v.jobId()),uuid(v.groupId()),uuid(v.rangeLineage()),v.rangeEpoch(),v.snapshotTerm(),v.snapshotIndex(),v.ordinal(),ByteBuffer.wrap(v.contentHash())); }
     public static ExportJobs.ChunkId id(ExportChunkId v) { return new ExportJobs.ChunkId(uuid(v.jobId),uuid(v.groupId),uuid(v.rangeLineage),v.rangeEpoch,v.snapshotTerm,v.snapshotIndex,v.ordinal,bytes(v.contentHash,32)); }
-    public static ExportStatus status(ExportJobs.Status v) { return new ExportStatus(uuid(v.jobId()),ExportPhase.valueOf(v.phase().name()),v.columns(),v.participantCount(),v.chunkCount(),v.acknowledgedCount(),v.fileBytes(),v.cleanupPending()); }
+    public static ExportStatus status(ExportJobs.Status v) { return new ExportStatus(uuid(v.jobId()),ExportPhase.valueOf(v.phase().name()),v.columns(),v.participantCount(),v.chunkCount(),v.acknowledgedCount(),v.fileBytes(),v.cleanupPending(),ByteBuffer.wrap(v.schemaBytes())); }
     public static ExportJobs.Status status(ExportStatus v) {
         if(v.columns==null || v.columns.size()>ExportJobs.MAX_COLUMNS) throw new IllegalArgumentException("Oversized columns");
-        return new ExportJobs.Status(uuid(v.jobId),ExportJobs.Phase.valueOf(v.phase.name()),v.columns,v.participantCount,v.chunkCount,v.acknowledgedCount,v.fileBytes,v.cleanupPending);
+        if(v.schema==null || !v.schema.hasRemaining() || v.schema.remaining()>DistributedSchemaCodec.MAX_BYTES)
+            throw new IllegalArgumentException("Missing or oversized frozen export schema");
+        return new ExportJobs.Status(uuid(v.jobId),ExportJobs.Phase.valueOf(v.phase.name()),v.columns,v.participantCount,v.chunkCount,v.acknowledgedCount,v.fileBytes,v.cleanupPending,
+                bytes(v.schema,DistributedSchemaCodec.MAX_BYTES));
     }
     public static ExportJobs.Status status(ExportStatus v,UUID expected) { var r=status(v); if(!r.jobId().equals(expected)) throw new IllegalArgumentException("Wrong status identity"); return r; }
     public static ExportStatus status(ExportJobs.Status v,UUID expected) { if(!v.jobId().equals(expected)) throw new IllegalArgumentException("Wrong status identity"); return status(v); }

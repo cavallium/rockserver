@@ -18,6 +18,7 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
   private static final org.apache.thrift.protocol.TField ACKNOWLEDGED_COUNT_FIELD_DESC = new org.apache.thrift.protocol.TField("acknowledgedCount", org.apache.thrift.protocol.TType.I32, (short)6);
   private static final org.apache.thrift.protocol.TField FILE_BYTES_FIELD_DESC = new org.apache.thrift.protocol.TField("fileBytes", org.apache.thrift.protocol.TType.I64, (short)7);
   private static final org.apache.thrift.protocol.TField CLEANUP_PENDING_FIELD_DESC = new org.apache.thrift.protocol.TField("cleanupPending", org.apache.thrift.protocol.TType.BOOL, (short)8);
+  private static final org.apache.thrift.protocol.TField SCHEMA_FIELD_DESC = new org.apache.thrift.protocol.TField("schema", org.apache.thrift.protocol.TType.STRING, (short)9);
 
   private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new ExportStatusStandardSchemeFactory();
   private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new ExportStatusTupleSchemeFactory();
@@ -34,6 +35,7 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
   public int acknowledgedCount; // required
   public long fileBytes; // required
   public boolean cleanupPending; // required
+  public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer schema; // required
 
   /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
   public enum _Fields implements org.apache.thrift.TFieldIdEnum {
@@ -48,7 +50,8 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     CHUNK_COUNT((short)5, "chunkCount"),
     ACKNOWLEDGED_COUNT((short)6, "acknowledgedCount"),
     FILE_BYTES((short)7, "fileBytes"),
-    CLEANUP_PENDING((short)8, "cleanupPending");
+    CLEANUP_PENDING((short)8, "cleanupPending"),
+    SCHEMA((short)9, "schema");
 
     private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
 
@@ -80,6 +83,8 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
           return FILE_BYTES;
         case 8: // CLEANUP_PENDING
           return CLEANUP_PENDING;
+        case 9: // SCHEMA
+          return SCHEMA;
         default:
           return null;
       }
@@ -149,6 +154,8 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.I64)));
     tmpMap.put(_Fields.CLEANUP_PENDING, new org.apache.thrift.meta_data.FieldMetaData("cleanupPending", org.apache.thrift.TFieldRequirementType.REQUIRED,
         new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.BOOL)));
+    tmpMap.put(_Fields.SCHEMA, new org.apache.thrift.meta_data.FieldMetaData("schema", org.apache.thrift.TFieldRequirementType.REQUIRED,
+        new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING        , true)));
     metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
     org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(ExportStatus.class, metaDataMap);
   }
@@ -164,7 +171,8 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     int chunkCount,
     int acknowledgedCount,
     long fileBytes,
-    boolean cleanupPending)
+    boolean cleanupPending,
+    java.nio.ByteBuffer schema)
   {
     this();
     this.jobId = org.apache.thrift.TBaseHelper.copyBinary(jobId);
@@ -180,6 +188,7 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     setFileBytesIsSet(true);
     this.cleanupPending = cleanupPending;
     setCleanupPendingIsSet(true);
+    this.schema = org.apache.thrift.TBaseHelper.copyBinary(schema);
   }
 
   /**
@@ -202,6 +211,9 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     this.acknowledgedCount = other.acknowledgedCount;
     this.fileBytes = other.fileBytes;
     this.cleanupPending = other.cleanupPending;
+    if (other.isSetSchema()) {
+      this.schema = org.apache.thrift.TBaseHelper.copyBinary(other.schema);
+    }
   }
 
   @Override
@@ -224,6 +236,7 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     this.fileBytes = 0;
     setCleanupPendingIsSet(false);
     this.cleanupPending = false;
+    this.schema = null;
   }
 
   public byte[] getJobId() {
@@ -449,6 +462,40 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     __isset_bitfield = org.apache.thrift.EncodingUtils.setBit(__isset_bitfield, __CLEANUPPENDING_ISSET_ID, value);
   }
 
+  public byte[] getSchema() {
+    setSchema(org.apache.thrift.TBaseHelper.rightSize(schema));
+    return schema == null ? null : schema.array();
+  }
+
+  public java.nio.ByteBuffer bufferForSchema() {
+    return org.apache.thrift.TBaseHelper.copyBinary(schema);
+  }
+
+  public ExportStatus setSchema(byte[] schema) {
+    this.schema = schema == null ? (java.nio.ByteBuffer)null   : java.nio.ByteBuffer.wrap(schema.clone());
+    return this;
+  }
+
+  public ExportStatus setSchema(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer schema) {
+    this.schema = org.apache.thrift.TBaseHelper.copyBinary(schema);
+    return this;
+  }
+
+  public void unsetSchema() {
+    this.schema = null;
+  }
+
+  /** Returns true if field schema is set (has been assigned a value) and false otherwise */
+  public boolean isSetSchema() {
+    return this.schema != null;
+  }
+
+  public void setSchemaIsSet(boolean value) {
+    if (!value) {
+      this.schema = null;
+    }
+  }
+
   @Override
   public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
     switch (field) {
@@ -520,6 +567,18 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       }
       break;
 
+    case SCHEMA:
+      if (value == null) {
+        unsetSchema();
+      } else {
+        if (value instanceof byte[]) {
+          setSchema((byte[])value);
+        } else {
+          setSchema((java.nio.ByteBuffer)value);
+        }
+      }
+      break;
+
     }
   }
 
@@ -551,6 +610,9 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     case CLEANUP_PENDING:
       return isCleanupPending();
 
+    case SCHEMA:
+      return getSchema();
+
     }
     throw new java.lang.IllegalStateException();
   }
@@ -579,6 +641,8 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       return isSetFileBytes();
     case CLEANUP_PENDING:
       return isSetCleanupPending();
+    case SCHEMA:
+      return isSetSchema();
     }
     throw new java.lang.IllegalStateException();
   }
@@ -668,6 +732,15 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
         return false;
     }
 
+    boolean this_present_schema = true && this.isSetSchema();
+    boolean that_present_schema = true && that.isSetSchema();
+    if (this_present_schema || that_present_schema) {
+      if (!(this_present_schema && that_present_schema))
+        return false;
+      if (!this.schema.equals(that.schema))
+        return false;
+    }
+
     return true;
   }
 
@@ -696,6 +769,10 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     hashCode = hashCode * 8191 + org.apache.thrift.TBaseHelper.hashCode(fileBytes);
 
     hashCode = hashCode * 8191 + ((cleanupPending) ? 131071 : 524287);
+
+    hashCode = hashCode * 8191 + ((isSetSchema()) ? 131071 : 524287);
+    if (isSetSchema())
+      hashCode = hashCode * 8191 + schema.hashCode();
 
     return hashCode;
   }
@@ -788,6 +865,16 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
         return lastComparison;
       }
     }
+    lastComparison = java.lang.Boolean.compare(isSetSchema(), other.isSetSchema());
+    if (lastComparison != 0) {
+      return lastComparison;
+    }
+    if (isSetSchema()) {
+      lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.schema, other.schema);
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+    }
     return 0;
   }
 
@@ -855,6 +942,14 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     sb.append("cleanupPending:");
     sb.append(this.cleanupPending);
     first = false;
+    if (!first) sb.append(", ");
+    sb.append("schema:");
+    if (this.schema == null) {
+      sb.append("null");
+    } else {
+      org.apache.thrift.TBaseHelper.toString(this.schema, sb);
+    }
+    first = false;
     sb.append(")");
     return sb.toString();
   }
@@ -875,6 +970,9 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
     // alas, we cannot check 'acknowledgedCount' because it's a primitive and you chose the non-beans generator.
     // alas, we cannot check 'fileBytes' because it's a primitive and you chose the non-beans generator.
     // alas, we cannot check 'cleanupPending' because it's a primitive and you chose the non-beans generator.
+    if (schema == null) {
+      throw new org.apache.thrift.protocol.TProtocolException("Required field 'schema' was not present! Struct: " + toString());
+    }
     // check for sub-struct validity
   }
 
@@ -990,6 +1088,14 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
               org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
             }
             break;
+          case 9: // SCHEMA
+            if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+              struct.schema = iprot.readBinary();
+              struct.setSchemaIsSet(true);
+            } else {
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+            }
+            break;
           default:
             org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
         }
@@ -1058,6 +1164,11 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       oprot.writeFieldBegin(CLEANUP_PENDING_FIELD_DESC);
       oprot.writeBool(struct.cleanupPending);
       oprot.writeFieldEnd();
+      if (struct.schema != null) {
+        oprot.writeFieldBegin(SCHEMA_FIELD_DESC);
+        oprot.writeBinary(struct.schema);
+        oprot.writeFieldEnd();
+      }
       oprot.writeFieldStop();
       oprot.writeStructEnd();
     }
@@ -1090,6 +1201,7 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       oprot.writeI32(struct.acknowledgedCount);
       oprot.writeI64(struct.fileBytes);
       oprot.writeBool(struct.cleanupPending);
+      oprot.writeBinary(struct.schema);
     }
 
     @Override
@@ -1120,6 +1232,8 @@ public class ExportStatus implements org.apache.thrift.TBase<ExportStatus, Expor
       struct.setFileBytesIsSet(true);
       struct.cleanupPending = iprot.readBool();
       struct.setCleanupPendingIsSet(true);
+      struct.schema = iprot.readBinary();
+      struct.setSchemaIsSet(true);
     }
   }
 
