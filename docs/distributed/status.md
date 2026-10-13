@@ -11,9 +11,45 @@ The full target remains [architecture.md](architecture.md), with the identified
 consumer behavior in [consumer-contracts.md](consumer-contracts.md). This checkpoint
 does not establish complete distributed API parity or production acceptance.
 
-## Implemented paths
+## Current acceptance (2026-10-13)
 
-- A few shared native storage pools host multiple range replicas. Per-group ordered
+Earlier checkpoints below retain the limitations known at their validation time.
+This section and the remaining gates at the end describe the current branch.
+
+- The aggregate common connection routes the complete database domain roster,
+  retains schema generations and uses durable point/bulk grants and rotating
+  transaction allocations. The actual native two-domain factory workflow passed
+  point/bulk writes, owned close and exact cold reopen. Launcher ownership tests
+  passed with controlled listeners; real gRPC/Thrift listeners were not started.
+- The fresh-cluster restore controller passed actual native import, catalogue
+  activation, logical qualification and restoration without the original source
+  directories, including sparse interleaved API IDs and an empty column across
+  two domains. Operator assets, larger batched restores and cold target reopen
+  still need composed acceptance.
+- The owned backup factory passed actual native catalogue grant issuance and
+  HOME/DATA bindings, whole-cohort capture/export, completion, resource drain and
+  same-root reopening. Gone-owner cleanup relies on the exclusive established
+  node root and exact previous process identity.
+- Fifteen native range-delete cases passed fixed bounds, shard clipping, collision
+  members, repeated use, unknown live/cold replies, original terminal outcomes,
+  complete same-format sidecar recovery and cancellation during result delivery.
+  Final source review confirmed the reported recovery/delivery blockers are repaired.
+- Native pool pressure now feeds shared background admission. Fresh native
+  sampling, stale/failing signal handling, actual sampler drain and node lifecycle
+  checks passed. This does not establish a complete node/pool resource envelope.
+- Replica-local maintenance passed actual flush/SST preview/execution/property
+  checks, stale target rejection, cancellation with retained JNI ownership and
+  node-owned shutdown. It requires explicit policy and process/pool/CF identities.
+  Common distributed SST commands remain unsupported. Java response limits do
+  not establish a bound on RocksDB's eager inventory allocation.
+
+All evidence above uses controlled native/Ratis interface fixtures. No sockets,
+independent quorum, production deployment or representative hardware/density
+acceptance is claimed.
+
+## Implementation checkpoints
+
+- The current node runtime uses one native storage pool for multiple range replicas. Per-group ordered
   apply installs effects, receipt/accounting metadata and completed A in one
   WAL-enabled `sync=false` batch. Ratis's durable log remains recovery authority;
   C, A and portable snapshot D are distinct watermarks.
@@ -944,7 +980,7 @@ process/pool/member identities, all-gates-before-capture, one physical pool cut,
 global-vector force before HOME reports, finite original deadlines and actual
 cleanup settlement. Controlled service/client and driver fixtures passed in the
 focused integration selection, including 65 groups across two native pools.
-The owned public backup factory and its complete runtime integration remain pending.
+The owned public backup factory was subsequently implemented and validated as described in the current acceptance section.
 The affected consumer adapters passed their selections in
 `/tmp/rockserver-multi-domain-consumer-adaptation-gate.log`; topology fixtures
 were then corrected to declare their actual four-group scope. The final 28-case
@@ -1012,19 +1048,22 @@ cannot export/install USER images; their adapter snapshots are disabled until th
 appropriate recovery/retirement workflow exists. No server sockets or quorum were exercised.
 Relocation currently admits preparation/abort while its source stays writable.
 
-- Complete public RocksDB API and transport frontend transaction/range/cursor parity,
-  including consistent cross-group/unbounded pages, typed pin-loss errors and retained
-  cooperative streams. The current logical page adapter is one-group and transaction-bound.
-- Protected status-group node/pool activation, daemon journal discovery/admission
-  and public commit orchestration/frontend wiring, and consistent
-  multi-group scoped snapshot fences. PREPARE and the home kernel alone do not
-  establish these.
-- Topology controllers, lineage-aware routing/receipts, relocation, split/merge,
-  placement authority and real operator-artifact activation.
-- Complete bounded bulk/import, CDC, export/backup/restore and operational repair
-  workflows; global node/pool/tenant resource envelopes.
-- Representative performance/resource acceptance, independent quorum/restart/fault
-  evidence and integration with the user's chosen final checkout.
+## Remaining architecture gates
+
+- Complete composed operator/batched/cold restore acceptance and public backend
+  capture/transaction/export workflows.
+- Declare and implement explicit pool/SLO placement. Reserve configured durable
+  replica ceilings before opening/voting, reconstruct retained claims on recovery,
+  and share volatile proposal/staging/retained-buffer budgets across node/pool scopes.
+- Complete and validate replica-local maintenance integration without presenting
+  physical SST identities as cluster-wide files.
+- Compose snapshot plus CDC tail gap recovery and export-based consumer migration;
+  establish adoption by the intended external consumers.
+- Verify all documented topology, schema, import, retirement and repair workflows
+  together under the final source/configuration, then reconcile contracts and status.
+- Independent quorum/restart/fault and representative performance/resource gates
+  remain outside the currently authorized controlled-fixture validation. Final
+  integration with the user's chosen checkout has not occurred.
 
 Standalone remains supported. This branch has not been pushed, published, merged
 or deployed.
