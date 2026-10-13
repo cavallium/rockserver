@@ -12,7 +12,7 @@ public final class RatisTopologySourceSnapshotRpc {
     public static final int PREPARE=105,TRANSFER=106,RELEASE=107,MAX_BOUND_BYTES=8192,MAX_OWNER_BYTES=441;
     public static final int MAX_REQUEST_BYTES=ScopedTransactionRpc.HEADER_BYTES+41+TopologyChange.MAX_HEADER_BYTES+MAX_OWNER_BYTES;
     public static final int MAX_MANIFEST_BYTES=156+2*MAX_BOUND_BYTES+32*RangeDirectoryCodec.MAX_COLUMNS+NativeTopologyImageOrigin.MAX_BYTES;
-    public static final int MAX_REPLY_BYTES=ScopedTransactionRpc.HEADER_BYTES+MAX_REQUEST_BYTES+MAX_MANIFEST_BYTES+DistributedSchemaCodec.MAX_BYTES+65536+MAX_OWNER_BYTES+NativeTopologyLearnerSchema.MAX_BYTES+NativeTopologyLearnerSchema.MAX_ROWS*82+64;
+    public static final int MAX_REPLY_BYTES=ScopedTransactionRpc.HEADER_BYTES+MAX_REQUEST_BYTES+MAX_MANIFEST_BYTES+DistributedSchemaCodec.MAX_BYTES+65536+MAX_OWNER_BYTES+NativeTopologyLearnerSchema.MAX_BYTES+NativeTopologyLearnerSchema.MAX_ROWS*82+65;
     private RatisTopologySourceSnapshotRpc() {}
     public static boolean kind(int kind){return kind==PREPARE || kind==TRANSFER || kind==RELEASE;}
     public enum Purpose { BOOTSTRAP,RECOVERY }
@@ -48,21 +48,32 @@ public final class RatisTopologySourceSnapshotRpc {
         }
         @Override public Map<String,byte[]> schemaRows(){return NativeTopologyLearnerSchema.copy(schemaRows);}
     }
+    public record Abandoned(Request original,UUID successorId,ApplyPosition cut,ReplicaDescriptor sourceOwner,byte[] configurationDigest) {
+        public Abandoned {Objects.requireNonNull(original);Objects.requireNonNull(successorId);Objects.requireNonNull(cut);Objects.requireNonNull(sourceOwner);if(successorId.equals(original.transferId()) || cut.term()<1 || configurationDigest.length!=32 || !original.header().parents().getFirst().owner(sourceOwner.replicaId()).equals(TopologyChange.Owner.of(sourceOwner)))throw new IllegalArgumentException("Invalid abandoned source receipt");configurationDigest=configurationDigest.clone();}
+        @Override public byte[] configurationDigest(){return configurationDigest.clone();}
+        public Request successorRequest(){return new Request(successorId,original.header(),original.catalogue(),original.receiver(),original.purpose());}
+    }
+    public static final class AbandonedException extends IOException {
+        private final Abandoned receipt;public AbandonedException(Abandoned receipt){super("Source transfer was durably abandoned; retry its acknowledged successor");this.receipt=Objects.requireNonNull(receipt);}public Abandoned receipt(){return receipt;}
+    }
+    public static byte[] reply(int kind,Abandoned abandoned){if(kind!=PREPARE && kind!=TRANSFER)throw new IllegalArgumentException("Expected source publication reply");return ScopedTransactionRpc.frame(kind,bytes(out->{out.writeByte(2);blob(out,body(abandoned.original()));uuid(out,abandoned.successorId());out.writeLong(abandoned.cut().term());out.writeLong(abandoned.cut().index());blob(out,owner(abandoned.sourceOwner()));out.write(abandoned.configurationDigest());},MAX_REPLY_BYTES));}
     public static byte[] request(int kind,Request request){if(!kind(kind))throw new IllegalArgumentException("Unknown source snapshot action");return ScopedTransactionRpc.frame(kind,body(request));}
     public static Request request(byte[] bytes){var packet=ScopedTransactionRpc.parse(bytes,MAX_REQUEST_BYTES);if(!kind(packet.kind()))throw new IllegalArgumentException("Unknown source snapshot action");var request=readRequest(ByteBuffer.wrap(packet.body()));if(!Arrays.equals(body(request),packet.body()))throw new IllegalArgumentException("Noncanonical transfer request");return request;}
-    public static byte[] reply(int kind,Prepared prepared){if(kind!=PREPARE && kind!=TRANSFER)throw new IllegalArgumentException("Expected image reply");return ScopedTransactionRpc.frame(kind,preparedBody(prepared));}
-    public static Prepared reply(byte[] bytes,int kind,Request expected){
+    public static byte[] reply(int kind,Prepared prepared){if(kind!=PREPARE && kind!=TRANSFER)throw new IllegalArgumentException("Expected image reply");byte[] body=preparedBody(prepared);return ScopedTransactionRpc.frame(kind,ByteBuffer.allocate(1+body.length).put((byte)1).put(body).array());}
+    public static Prepared reply(byte[] bytes,int kind,Request expected)throws AbandonedException{
         var packet=ScopedTransactionRpc.parse(bytes,MAX_REPLY_BYTES);if(packet.kind()!=kind || kind!=PREPARE && kind!=TRANSFER)throw new IllegalArgumentException("Wrong source image reply kind");
-        var in=ByteBuffer.wrap(packet.body());var request=readRequest(ByteBuffer.wrap(blob(in,MAX_REQUEST_BYTES)));requireRequest(expected,request);
+        var in=ByteBuffer.wrap(packet.body());if(!in.hasRemaining())throw new IllegalArgumentException("Missing source publication kind");int publication=in.get()&255;
+        if(publication==2){var original=readRequest(ByteBuffer.wrap(blob(in,MAX_REQUEST_BYTES)));requireRequest(expected,original);UUID successor=uuid(in);var cut=new ApplyPosition(in.getLong(),in.getLong());var source=owner(blob(in,MAX_OWNER_BYTES));byte[] cfg=new byte[32];in.get(cfg);if(in.hasRemaining())throw new IllegalArgumentException("Trailing abandoned source reply");var receipt=new Abandoned(original,successor,cut,source,cfg);if(!Arrays.equals(bytes,reply(kind,receipt)))throw new IllegalArgumentException("Noncanonical abandoned source reply");throw new AbandonedException(receipt);}
+        if(publication!=1)throw new IllegalArgumentException("Unknown source publication kind");var request=readRequest(ByteBuffer.wrap(blob(in,MAX_REQUEST_BYTES)));requireRequest(expected,request);
         var image=manifest(blob(in,MAX_MANIFEST_BYTES));var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES));var source=owner(blob(in,MAX_OWNER_BYTES));
         if(in.remaining()<20)throw new IllegalArgumentException("Truncated source configuration");var configuration=new ReplicatedRangeStore.Configuration(in.getLong(),in.getLong(),blob(in,65536));
         if(in.remaining()<4)throw new IllegalArgumentException("Truncated schema row count");int count=in.getInt();if(count<0 || count>NativeTopologyLearnerSchema.MAX_ROWS)throw new IllegalArgumentException("Schema row count exceeds bound");
         var rows=new TreeMap<String,byte[]>();long total=0;
         for(int n=0;n<count;n++){byte[] key=blob(in,74);if(in.remaining()<4)throw new IllegalArgumentException("Truncated schema row");int size=in.getInt();if(size<0 || size>in.remaining() || (total+=key.length+size)>NativeTopologyLearnerSchema.MAX_BYTES)throw new IllegalArgumentException("Schema row payload exceeds bound");byte[] value=new byte[size];in.get(value);if(rows.put(HexFormat.of().formatHex(key),value)!=null)throw new IllegalArgumentException("Duplicate schema row");}
-        if(in.hasRemaining())throw new IllegalArgumentException("Trailing source snapshot reply");var result=new Prepared(request,image,schema,source,configuration,rows);if(!Arrays.equals(preparedBody(result),packet.body()))throw new IllegalArgumentException("Noncanonical source snapshot reply");return result;
+        if(in.hasRemaining())throw new IllegalArgumentException("Trailing source snapshot reply");var result=new Prepared(request,image,schema,source,configuration,rows);if(!Arrays.equals(reply(kind,result),bytes))throw new IllegalArgumentException("Noncanonical source snapshot reply");return result;
     }
     public static void requireRequest(Request expected,Request actual){if(!Arrays.equals(body(expected),body(actual)))throw new IllegalArgumentException("Source transfer identity/input changed");}
-    static int preparedBytes(Prepared prepared){return preparedBody(prepared).length+ScopedTransactionRpc.HEADER_BYTES;}
+    static int preparedBytes(Prepared prepared){return preparedBody(prepared).length+1+ScopedTransactionRpc.HEADER_BYTES;}
     private static byte[] body(Request request){return bytes(out->{out.writeByte(request.purpose().ordinal());uuid(out,request.transferId());uuid(out,request.catalogue());blob(out,request.header().encode());blob(out,owner(request.receiver()));},MAX_REQUEST_BYTES);}
     private static Request readRequest(ByteBuffer in){if(in.remaining()<41)throw new IllegalArgumentException("Truncated source transfer request");int purpose=in.get()&255;if(purpose>=Purpose.values().length)throw new IllegalArgumentException("Unknown source transfer purpose");UUID transfer=uuid(in),catalogue=uuid(in);var result=new Request(transfer,TopologyChange.Header.decode(blob(in,TopologyChange.MAX_HEADER_BYTES)),catalogue,owner(blob(in,MAX_OWNER_BYTES)),Purpose.values()[purpose]);if(in.hasRemaining())throw new IllegalArgumentException("Trailing transfer request");return result;}
     private static byte[] preparedBody(Prepared prepared){return bytes(out->{blob(out,body(prepared.request()));blob(out,manifest(prepared.image()));blob(out,DistributedSchemaCodec.encode(prepared.schema()));blob(out,owner(prepared.sourceOwner()));out.writeLong(prepared.sourceCfg().term());out.writeLong(prepared.sourceCfg().index());blob(out,prepared.sourceCfg().data());var rows=prepared.schemaRows();out.writeInt(rows.size());for(var row:rows.entrySet()){blob(out,HexFormat.of().parseHex(row.getKey()));blob(out,row.getValue());}},MAX_REPLY_BYTES);}

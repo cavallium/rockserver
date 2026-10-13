@@ -86,6 +86,8 @@ class RatisTopologySourceSnapshotArtifactsTest {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"))){var request=fixture.request(50);
             try(var helper=open(owned)){
                 var host=new RatisTopologySourceSnapshotService.Host(){
+                    public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
+                    public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
                     public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request input)throws Exception{
                         var held=fixture.capture(input);boolean adopted=false;
                         try{var saved=helper.retain(held.prepared(),managed(held,fixture.image.getParent()));var result=new RatisTopologySourceSnapshotService.Lease(saved.prepared(),held.source(),saved.snapshot(),held.retained());adopted=true;return result;}finally{if(!adopted)held.close();}
@@ -107,6 +109,8 @@ class RatisTopologySourceSnapshotArtifactsTest {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"))){var request=fixture.request(50);
             try(var helper=open(owned)){
                 var host=new RatisTopologySourceSnapshotService.Host(){
+                    public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
+                    public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
                     public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request input)throws Exception{
                         var held=fixture.capture(input);boolean adopted=false;
                         try{var saved=helper.retain(held.prepared(),managed(held,fixture.image.getParent()));var result=new RatisTopologySourceSnapshotService.Lease(saved.prepared(),held.source(),saved.snapshot(),held.retained());adopted=true;return result;}finally{if(!adopted)held.close();}
@@ -121,6 +125,8 @@ class RatisTopologySourceSnapshotArtifactsTest {
             }
             try(var helper=open(owned)){
                 var replayOnly=new RatisTopologySourceSnapshotService.Host(){
+                    public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
+                    public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
                     public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request){throw new AssertionError("Cold release cannot recapture");}
                     public void requireOwner(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot acquire owner permission");}
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot create a new installation proof");}

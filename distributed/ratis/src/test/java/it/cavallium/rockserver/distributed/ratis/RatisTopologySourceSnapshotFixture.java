@@ -61,6 +61,8 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
         var machine=mock(StateMachine.class);var storage=mock(StateMachineStorage.class);when(storage.getSnapshotDir()).thenReturn(image.getParent().toFile());when(machine.getStateMachineStorage()).thenReturn(storage);when(division.getStateMachine()).thenReturn(machine);
     }
     RatisTopologySourceSnapshotRpc.Request request(int n){return new RatisTopologySourceSnapshotRpc.Request(id(n),definition.header(),id(40),receiver,RatisTopologySourceSnapshotRpc.Purpose.BOOTSTRAP);}
+    public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request){return null;}
+    public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws IOException{throw new IOException("Fixture has no source publication abandonment authority");}
     @Override public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request)throws Exception {
         captures.incrementAndGet();var pin=store.capture();boolean adopted=false;
         try {

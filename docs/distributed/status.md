@@ -76,10 +76,14 @@ This section and the remaining gates at the end describe the current branch.
   cold-quota cases pass exact replay, owner-qualified transfer/release and failed
   deletion/force accounting. Both source-owned image copies are reclaimed before
   quota refund; normal Raft snapshot files remain unchanged. Two fork producer
-  cases pass canonical transfer paths for images outside Raft storage. An incomplete
-  unpublished capture whose original cut is unavailable still needs safe terminal
-  authority and a distinct successor attempt; it currently remains charged and
-  cannot silently substitute a later cut. Schema disk accounting covers upload staging.
+  cases pass canonical transfer paths for images outside Raft storage. Forced source
+  publication now distinguishes CAPTURING, READY and ABANDONED. An unpublished lost
+  cut can be terminalized after actual drain and forced cleanup; its stable successor
+  uses a distinct request ID. READY cannot be abandoned after a lost reply or missing
+  file. Actual native controller/source recovery passes A-to-B registration, transfer,
+  release and journal retry; native registration, recovery permission and the journal
+  retain the chosen request. Terminal replay remains available at full image quota
+  under bounded metadata ownership. Schema disk accounting covers upload staging.
   Four actual two-pool cases now pass cold retained quotas, canceled work ownership,
   unknown cleanup and independent pool limits. The immutable native operator cache
   has a separate persisted node ceiling: every declared pool reserves its bounded

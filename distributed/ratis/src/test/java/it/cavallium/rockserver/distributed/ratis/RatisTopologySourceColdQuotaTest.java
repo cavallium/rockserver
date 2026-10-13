@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
+import java.nio.ByteBuffer;
+
 import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
@@ -161,20 +163,38 @@ class RatisTopologySourceColdQuotaTest {
             }
         }
     }
-    @Test void incompleteForcedCaptureCannotSubstituteLaterNativeCutOrRefundColdDiskPromise()throws Exception {
+    @Test void incompleteForcedCaptureAcknowledgesOriginalAbandonmentAndOnlySuccessorMayPublishLaterCut()throws Exception {
         try(var f=new Fixture()) {
-            var intent=new AtomicReference<Path>();byte[] originalIntent;long charge;ApplyPosition originalCut;
+            var intent=new AtomicReference<Path>();long charge;ApplyPosition originalCut;byte[] originalConfiguration,abandonedReply,successorReply;
+            RatisTopologySourceSnapshotRpc.Request successor;
             try(var owner=f.open(false)) {
-                owner.machine.notifyTermIndexUpdated(1,owner.store.applied().index()+1);originalCut=owner.store.applied();var managed=files(owner.machine.sourceSnapshotDirectory());
+                owner.machine.notifyTermIndexUpdated(1,owner.store.applied().index()+1);originalCut=owner.store.applied();var configuration=owner.store.configuration();originalConfiguration=ByteBuffer.allocate(16+configuration.data().length).putLong(configuration.term()).putLong(configuration.index()).put(configuration.data()).array();var managed=files(owner.machine.sourceSnapshotDirectory());
                 owner.artifacts.captureForceObserver(path->{intent.set(path);throw new IOException("Controlled failure after original-cut force before image write");});
                 assertThrows(java.util.concurrent.ExecutionException.class,()->owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));assertEquals(0,owner.store.activeSnapshotPins());assertEquals(managed,files(owner.machine.sourceSnapshotDirectory()));assertTrue(f.imageFiles().isEmpty());
-                originalIntent=Files.readAllBytes(intent.get());charge=owner.artifacts.reservedImageBytes();assertTrue(charge>0);owner.machine.notifyTermIndexUpdated(1,originalCut.index()+1);
+                assertTrue(Files.isRegularFile(intent.get()));charge=owner.artifacts.reservedImageBytes();assertTrue(charge>0);owner.machine.notifyTermIndexUpdated(1,originalCut.index()+1);
             }
             try(var owner=f.open(true)) {
                 assertTrue(owner.store.applied().index()>originalCut.index());assertEquals(charge,owner.artifacts.reservedImageBytes());var managed=files(owner.machine.sourceSnapshotDirectory());
-                assertThrows(java.util.concurrent.ExecutionException.class,()->owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));assertEquals(managed,files(owner.machine.sourceSnapshotDirectory()));assertEquals(0,owner.store.activeSnapshotPins());assertTrue(f.imageFiles().isEmpty());
-                assertArrayEquals(originalIntent,Files.readAllBytes(intent.get()));assertEquals(charge,owner.artifacts.reservedImageBytes());
-                assertThrows(java.util.concurrent.ExecutionException.class,()->owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.fresh));assertEquals(charge,owner.artifacts.reservedImageBytes());
+                abandonedReply=owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request);
+                var abandoned=assertThrows(RatisTopologySourceSnapshotRpc.AbandonedException.class,()->RatisTopologySourceSnapshotRpc.reply(abandonedReply,RatisTopologySourceSnapshotRpc.PREPARE,f.request)).receipt();
+                assertEquals(originalCut,abandoned.cut());assertArrayEquals(OperatorUpload.sha256(originalConfiguration),abandoned.configurationDigest());
+                assertEquals(f.parent.replicas().stream().filter(replica->replica.nodeId().equals(f.env.plan.nodeId()) && replica.nodeIncarnation().equals(f.env.plan.nodeIncarnation())).findFirst().orElseThrow(),abandoned.sourceOwner());
+                assertArrayEquals(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,f.request),RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,abandoned.original()));
+                successor=abandoned.successorRequest();assertNotEquals(f.request.transferId(),successor.transferId());
+                assertEquals(managed,files(owner.machine.sourceSnapshotDirectory()));assertEquals(0,owner.store.activeSnapshotPins());assertTrue(f.imageFiles().isEmpty());
+                assertFalse(Files.exists(intent.get()),"Original capture intent is reclaimed only after forced abandonment cleanup");assertEquals(0,owner.artifacts.reservedImageBytes());
+                assertArrayEquals(abandonedReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request),"A repeats its terminal receipt, never a later READY image");
+                successorReply=owner.action(RatisTopologySourceSnapshotRpc.PREPARE,successor);
+                var ready=RatisTopologySourceSnapshotRpc.reply(successorReply,RatisTopologySourceSnapshotRpc.PREPARE,successor);
+                assertEquals(successor.transferId(),ready.request().transferId());assertTrue(ready.image().position().index()>originalCut.index());assertEquals(2,f.imageFiles().size());assertEquals(1,owner.store.activeSnapshotPins());assertTrue(owner.artifacts.reservedImageBytes()>0);
+                assertArrayEquals(abandonedReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));assertEquals(2,f.imageFiles().size());
+                assertTrue(f.imageFiles().stream().noneMatch(path->path.toString().contains(f.request.transferId().toString())),"Neither old A image may be substituted by B");
+            }
+            try(var owner=f.open(true)) {
+                owner.machine.notifyTermIndexUpdated(1,owner.store.applied().index()+1);
+                assertArrayEquals(abandonedReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));
+                assertArrayEquals(successorReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,successor),"B retains its own fixed READY cut across a later cold prefix");
+                assertEquals(2,f.imageFiles().size());assertEquals(1,owner.store.activeSnapshotPins());
             }
         }
     }

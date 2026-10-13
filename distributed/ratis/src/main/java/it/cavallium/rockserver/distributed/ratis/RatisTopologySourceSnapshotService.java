@@ -16,6 +16,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public static final long MAX_METADATA_BYTES=128L*1024*1024;
     // CRC reader copies, expected sidecar bytes and bounded sidecar comparison during cleanup.
     private static final long RELEASE_LOOKUP_BYTES=4L*MAX_REPLY_BYTES;
+    private static final long PUBLICATION_LOOKUP_BYTES=4L*(MAX_REQUEST_BYTES+MAX_OWNER_BYTES+177);
     public record Limits(int maximumLeases,long maximumImageBytes,long maximumReservedImageBytes,long maximumMetadataBytes) {
         public Limits {if(maximumLeases<1 || maximumLeases>MAX_LEASES || maximumImageBytes<1 || maximumReservedImageBytes<maximumImageBytes || maximumMetadataBytes<3L*MAX_REPLY_BYTES || maximumMetadataBytes>MAX_METADATA_BYTES)throw new IllegalArgumentException("Invalid source snapshot limits");}
         public static Limits defaults(long maximumImageBytes){return new Limits(MAX_LEASES,maximumImageBytes,Math.multiplyExact(MAX_LEASES,maximumImageBytes),MAX_METADATA_BYTES);}
@@ -31,6 +32,8 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     }
     public interface Host {
         Lease capture(Request request)throws Exception;
+        Abandoned abandoned(Request request)throws Exception;
+        Abandoned abandon(Request request)throws Exception;
         void requireOwner(Lease lease)throws Exception;
         void requireReceiverInstalled(Lease lease)throws Exception;
         void released(Lease lease)throws Exception;
@@ -53,14 +56,16 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             requireOpen();requireNotReleased(request);if(releaseLookups.contains(request.transferId()))throw new IOException("Durable release lookup still owns this transfer");entry=entries.get(request.transferId());
             if(entry!=null){requireSame(entry,request);if(entry.unusable)throw new IOException("Failed source preparation requires cleanup drainage");if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;active++;capture=entry.lease==null;}
             else {
-                long charge=3L*MAX_REPLY_BYTES;
-                if(entries.size()>=limits.maximumLeases() || released.size()>=MAX_RELEASED || limits.maximumImageBytes()>limits.maximumReservedImageBytes()-imageBytes || charge>limits.maximumMetadataBytes()-metadataBytes)throw new IOException("Source snapshot admission exhausted");
-                entry=new Entry(request,limits.maximumImageBytes(),charge);entries.put(request.transferId(),entry);imageBytes+=entry.imageCharge;metadataBytes+=charge;active++;capture=true;
+                long charge=PUBLICATION_LOOKUP_BYTES;
+                if(active>=MAX_LEASES || entries.size()>=limits.maximumLeases()+MAX_LEASES || released.size()>=MAX_RELEASED || charge>limits.maximumMetadataBytes()-metadataBytes)throw new IOException("Source publication lookup admission exhausted");
+                entry=new Entry(request,0,charge);entries.put(request.transferId(),entry);metadataBytes+=charge;active++;capture=true;
             }
         }
         IOException failure=null;
         try {
             if(capture){
+                var terminal=host.abandoned(request);if(terminal!=null)throw new AbandonedException(terminal);
+                synchronized(this){if(entry.imageCharge==0){long charge=3L*MAX_REPLY_BYTES;long captures=entries.values().stream().filter(value->value.imageCharge!=0).count();if(captures>=limits.maximumLeases() || limits.maximumImageBytes()>limits.maximumReservedImageBytes()-imageBytes || charge-entry.metadataCharge>limits.maximumMetadataBytes()-metadataBytes)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Source snapshot admission exhausted");requireOpen();entry.imageCharge=limits.maximumImageBytes();imageBytes+=entry.imageCharge;metadataBytes+=charge-entry.metadataCharge;entry.metadataCharge=charge;}}
                 Lease candidate=null;
                 try {candidate=Objects.requireNonNull(host.capture(request));requireRequest(request,candidate.prepared().request());
                     if(candidate.prepared().image().bytes()>limits.maximumImageBytes())throw new IOException("Captured source image exceeds reserved quota");
@@ -71,11 +76,13 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             synchronized(this){requireOpen();}
             return entry.lease.prepared();
         }catch(Exception problem){
-            if(problem instanceof RatisTopologySourceSnapshotArtifacts.AdmissionRejected){synchronized(this){if(entry.lease==null && entries.remove(request.transferId(),entry)){imageBytes-=entry.imageCharge;metadataBytes-=entry.metadataCharge;}}}
-            failure=io("Source snapshot preparation failed; original owner retained",problem);throw failure;}
+            if(problem instanceof RatisTopologySourceSnapshotArtifacts.OriginalCutUnavailable){try{problem=new AbandonedException(host.abandon(request));}catch(Exception qualification){problem.addSuppressed(qualification);}}
+            if(problem instanceof AbandonedException || problem instanceof RatisTopologySourceSnapshotArtifacts.AdmissionRejected){synchronized(this){if(entry.lease==null && entries.remove(request.transferId(),entry)){imageBytes-=entry.imageCharge;metadataBytes-=entry.metadataCharge;}}}
+            failure=problem instanceof AbandonedException terminal?terminal:io("Source snapshot preparation failed; original owner retained",problem);throw failure;}
         finally{finish(entry,failure);}
     }
     public Prepared transfer(Request request)throws IOException {
+        lookupTerminal(request);
         Entry entry=begin(request);IOException failure=null;
         try {
             if(entry.installed)return entry.lease.prepared();
@@ -99,6 +106,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public void release(Request request)throws IOException {
         Entry entry;
         synchronized(this){
+            if(releaseLookups.contains(request.transferId()))throw new IOException("Source publication lookup still owns this transfer");
             byte[] prior=released.get(request.transferId());if(prior!=null){requireReleased(request,prior);return;}
             entry=entries.get(request.transferId());
             if(entry!=null){requireSame(entry,request);if(entry.busy || !entry.installed)throw new IOException("Source snapshot has no settled receiver installation");entry.busy=true;active++;}
@@ -112,8 +120,13 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         }catch(Exception failure){throw io("Durable source release retry failed",failure);}
         finally{synchronized(this){releaseLookups.remove(request.transferId());active--;metadataBytes-=RELEASE_LOOKUP_BYTES;notifyAll();}}
     }
+    private void lookupTerminal(Request request)throws IOException {
+        synchronized(this){requireOpen();requireNotReleased(request);var entry=entries.get(request.transferId());if(entry!=null){requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");}if(active>=MAX_LEASES || PUBLICATION_LOOKUP_BYTES>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Source publication lookup capacity/ownership unavailable");active++;metadataBytes+=PUBLICATION_LOOKUP_BYTES;}
+        try{var terminal=host.abandoned(request);if(terminal!=null)throw new AbandonedException(terminal);}catch(Exception failure){throw io("Source publication lookup failed",failure);}
+        finally{synchronized(this){releaseLookups.remove(request.transferId());active--;metadataBytes-=PUBLICATION_LOOKUP_BYTES;notifyAll();}}
+    }
     private Entry begin(Request request)throws IOException {
-        synchronized(this){requireOpen();requireNotReleased(request);var entry=entries.get(request.transferId());if(entry==null || entry.lease==null || entry.unusable)throw new IOException("Prepare the exact source image first");requireSame(entry,request);if(entry.unusable)throw new IOException("Failed source preparation requires cleanup drainage");if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;active++;return entry;}
+        synchronized(this){requireOpen();requireNotReleased(request);if(releaseLookups.contains(request.transferId()))throw new IOException("Source publication lookup still owns this transfer");var entry=entries.get(request.transferId());if(entry==null || entry.lease==null || entry.unusable)throw new IOException("Prepare the exact source image first");requireSame(entry,request);if(entry.unusable)throw new IOException("Failed source preparation requires cleanup drainage");if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;active++;return entry;}
     }
     private void finish(Entry entry,IOException failure)throws IOException {
         boolean close;
