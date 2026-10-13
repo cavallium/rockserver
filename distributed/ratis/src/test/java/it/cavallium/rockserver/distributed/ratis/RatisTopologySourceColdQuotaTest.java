@@ -43,7 +43,7 @@ class RatisTopologySourceColdQuotaTest {
             fresh=new RatisTopologySourceSnapshotRpc.Request(new UUID(160,6),definition.header(),request.catalogue(),receiver,request.purpose());
             var defaults=env.settings();var resources=defaults.resources();
             // Each declared pool receives exactly one worst-case pair of managed+artifact images.
-            var constrained=new RatisNodeRuntime.ResourceLimits(resources.node(),resources.pool(),Math.multiplyExact(2L*defaults.images().maxImageBytes(),env.plan.pools().size()),resources.maximumDurableMetadataBytes(),resources.maximumOperatorCacheBytes());
+            var constrained=new RatisNodeRuntime.ResourceLimits(resources.node(),resources.pool(),Math.multiplyExact(2L*defaults.images().maxImageBytes(),env.plan.pools().size()),resources.maximumDurableMetadataBytes(),resources.maximumOperatorCacheBytes(),resources.maximumNativeCacheBytes());
             settings=new RatisNodeRuntime.Settings(defaults.images(),defaults.retention(),defaults.clockPeriod(),defaults.propagationVisits(),defaults.maxPropagationRanges(),defaults.shutdownTimeout(),defaults.exports(),constrained);
         }
         Owned open(boolean recover)throws Exception {

@@ -21,7 +21,7 @@ class RatisNodeManifestTest {
         var original=manifest(false);var base=original.settings();
         var node=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,64),new RatisNodeResourceBudget.Lane(64L*1024*1024,32));
         var pool=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(32L*1024*1024,16),new RatisNodeResourceBudget.Lane(16L*1024*1024,8));
-        var limits=new RatisNodeRuntime.ResourceLimits(node,pool,1L<<30,1L<<40,16L<<30);
+        var limits=new RatisNodeRuntime.ResourceLimits(node,pool,1L<<30,1L<<40,16L<<30,13L<<30);
         var settings=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports(),limits);
         var value=new RatisNodeManifest(original.schemas().values(),original.plan(),settings,original.readThreads(),original.writeThreads());
         var cold=RatisNodeManifest.decode(RatisNodeManifest.encode(value));assertEquals(limits,cold.settings().resources());
@@ -191,7 +191,7 @@ class RatisNodeManifestTest {
         byte[] reversed=valid.clone(); System.arraycopy(valid,bindings,reversed,second,16); System.arraycopy(valid,second,reversed,bindings,16);
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(reversed));
         byte[] groupBudget=valid.clone(); ByteBuffer.wrap(groupBudget).putInt(tail+64,1); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(groupBudget));
-        int settingsStart=valid.length-272;
+        int settingsStart=valid.length-280;
         for (int offset:new int[] {settingsStart+72,settingsStart+76}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
         byte[] duration=valid.clone(); ByteBuffer.wrap(duration).putLong(settingsStart+48,0); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(duration));
         for (int lane=0;lane<4;lane++) {

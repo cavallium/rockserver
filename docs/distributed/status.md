@@ -101,6 +101,13 @@ This section and the remaining gates at the end describe the current branch.
   activation, CREATE and cold-reopen case preserves both columns and the original
   import receipt. These ceilings cover canonical metadata/promises,
   not SST/WAL amplification or filesystem capacity.
+- Native cache/WBM declarations now share one pure resolver with the loader.
+  The current manifest persists a separate 16 GiB default node ceiling. Checked
+  preflight sums every declared pool before runtime ownership, HOME clients or
+  native opening; aliases within a pool count once, while independent pools count
+  separately. Exact-ceiling native writes/cold recovery and under-limit rejection
+  pass. Eighteen cache/configuration cases and 53 standalone regressions pass.
+  This is a conservative declared-capacity sum, not measured native memory usage.
 - Proof tasks now charge the shared protected node/pool graph before cloning, with
   one charge per physical coalesced task until actual drain. Twelve executor cases
   pass. Ordinary point/page construction reserves before decoding; exact configured
@@ -1157,8 +1164,7 @@ Relocation currently admits preparation/abort while its source stays writable.
   Establish adoption by the intended external consumers. Controlled snapshot/CDC
   resynchronization and public frozen-schema export migration are recorded above.
 - Complete shared committed-apply dispatch before callback materialization,
-  aggregate native cache/WBM preflight across pools, learner pressure/rate controls
-  and running Raft-log/WAL runway policy. Qualify opaque native allocation bounds
+  learner pressure/rate controls and running Raft-log/WAL runway policy. Qualify opaque native allocation bounds
   for eager maintenance inventory where Java accounting alone is insufficient.
 - Verify all documented topology, schema, import, retirement and repair workflows
   together under the final source/configuration, then reconcile contracts and status.

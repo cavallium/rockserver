@@ -712,6 +712,7 @@ public class RocksDBLoader {
         RocksDBObjects refs,
         Logger logger) {
         try {
+            var nativeCacheCapacity=path==null ? null : NativeCacheCapacity.resolve(databaseOptions.global());
             // the Options class contains a set of configurable DB options
             // that determines the behaviour of the database.
             var options = newCompatibleDBOptions();
@@ -800,10 +801,6 @@ public class RocksDBLoader {
                 options.setUseFsync(false);
             }
 
-            long writeBufferManagerSize = Optional.ofNullable(databaseOptions.global().writeBufferManager())
-                    .map(DataSize::longValue)
-                    .orElse(0L);
-
             Cache blockCache;
             Map<String, Cache> blockCaches = new LinkedHashMap<>();
             Map<String, Long> blockCacheCapacities = new LinkedHashMap<>();
@@ -832,7 +829,7 @@ public class RocksDBLoader {
             ;
             long blockCacheSize;
             if (path != null) {
-                blockCacheSize = writeBufferManagerSize + Optional.ofNullable(databaseOptions.global().blockCache()).map(DataSize::longValue).orElse( 512 * SizeUnit.MB);
+                blockCacheSize = nativeCacheCapacity.defaultCacheBytes();
                 double highPriorityPoolRatio = resolveBlockCacheHighPriorityRatio(databaseOptions.global());
                 blockCache = newBlockCache(databaseOptions.global(), blockCacheSize, highPriorityPoolRatio,
                         "default", logger);
@@ -840,41 +837,10 @@ public class RocksDBLoader {
                 blockCaches.put("default", blockCache);
                 blockCacheCapacities.put("default", blockCacheSize);
 
-                for (BlockCacheConfig cacheConfig : Objects.requireNonNullElse(
-                        databaseOptions.global().blockCaches(), new BlockCacheConfig[0])) {
-                    String cacheName = cacheConfig.name();
-                    if (cacheName == null || cacheName.isBlank()) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "database.global.block-caches contains a blank name");
-                    }
-                    if ("default".equals(cacheName)) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "database.global.block-caches name 'default' is reserved");
-                    }
-                    DataSize configuredSize = cacheConfig.size();
-                    if (configuredSize == null) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "Named block cache '" + cacheName + "' size is required");
-                    }
-                    long cacheSize = configuredSize.longValue();
-                    if (cacheSize <= 0L) {
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "Named block cache '" + cacheName + "' size must be greater than zero");
-                    }
-                    Cache namedCache = newBlockCache(databaseOptions.global(), cacheSize,
-                            highPriorityPoolRatio, cacheName, logger);
-                    if (blockCaches.putIfAbsent(cacheName, namedCache) != null) {
-                        namedCache.close();
-                        throw it.cavallium.rockserver.core.common.RocksDBException.of(
-                                RocksDBErrorType.CONFIG_ERROR,
-                                "Duplicate named block cache: " + cacheName);
-                    }
-                    refs.add(namedCache);
-                    blockCacheCapacities.put(cacheName, cacheSize);
+                for (var declaration:nativeCacheCapacity.blockCaches().entrySet()) {
+                    if(declaration.getKey().equals("default"))continue;
+                    Cache namedCache=newBlockCache(databaseOptions.global(),declaration.getValue(),highPriorityPoolRatio,declaration.getKey(),logger);
+                    refs.add(namedCache);blockCaches.put(declaration.getKey(),namedCache);blockCacheCapacities.put(declaration.getKey(),declaration.getValue());
                 }
             } else {
                 blockCacheSize = 0;
@@ -919,9 +885,7 @@ public class RocksDBLoader {
                 // If writeBufferManagerSize is not explicitly configured, default to 50% of block cache size.
                 // Without a WriteBufferManager, memtable memory is unbounded and not tracked by the block cache,
                 // which can cause real RAM usage to grow far beyond the configured block cache size.
-                long effectiveWbmSize = writeBufferManagerSize > 0L
-                        ? writeBufferManagerSize
-                        : blockCacheSize / 2;
+                long effectiveWbmSize = nativeCacheCapacity.writeBufferManagerBytes();
                 if (effectiveWbmSize > 0) {
                     var writeBufferManager = new WriteBufferManager(effectiveWbmSize, blockCache, false) {
                       {
