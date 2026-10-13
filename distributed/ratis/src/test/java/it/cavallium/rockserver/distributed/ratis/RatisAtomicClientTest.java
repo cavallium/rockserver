@@ -175,6 +175,29 @@ class RatisAtomicClientTest {
                         return (fresh ? machine.queryLinearizable(message) : machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray();
                     } catch (Exception failure) { throw new IOException("Controlled transaction failed",failure); }
                 }
+                public CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key)throws IOException {
+                    if(route.groupId().equals(homeGroup) && beforeHomeRead!=null)beforeHomeRead.run();
+                    return transactionAsync(route,ScopedTransactionRpc.pointRequest(column,key),true).thenApply(reply->ScopedTransactionRpc.pointValue(reply,2*1024*1024));
+                }
+                public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] request,boolean fresh)throws IOException {
+                    rpcs.incrementAndGet();int kind=ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+                    if(kind==ScopedTransactionRpc.OPEN)opens.incrementAndGet();if(kind==ScopedTransactionRpc.CLOSE)captureCloses.incrementAndGet();
+                    if(kind==ScopedTransactionRpc.PARTICIPANT_AUTHORIZE && beforeAuthorize!=null)beforeAuthorize.run();
+                    var input=Message.valueOf(ByteString.copyFrom(request));var target=machines.get(route.groupId());
+                    return (fresh?target.queryLinearizable(input):target.query(input)).thenApply(reply->reply.getContent().toByteArray());
+                }
+                public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException {
+                    if(route.groupId().equals(homeGroup) && beforeHomeCommand!=null && command.mutations().size()==1 && command.predicates().size()==1 && command.predicates().getFirst().expectedValue()==null){var initial=TransactionStatus.decode(command.mutations().getFirst().value());if(initial.origin()==null && initial.phase()==TransactionStatus.Phase.PREPARING && initial.generation()==0)beforeHomeCommand.run();}
+                    if(route.groupId().equals(homeGroup) && command.mutations().size()==1) {var next=TransactionStatus.decode(command.mutations().getFirst().value());if(next.origin()!=null && next.phase()==TransactionStatus.Phase.PREPARING && next.generation()==1)promotionSubmissions.incrementAndGet();}
+                    return appendAsync(route,DistributedCommandCodec.encode(command)).thenApply(bytes->{
+                        var result=CommandResult.decode(bytes);
+                        if(losePromotion && route.groupId().equals(homeGroup) && TransactionStatus.decode(command.mutations().getFirst().value()).origin()!=null && TransactionStatus.decode(command.mutations().getFirst().value()).generation()==1){losePromotion=false;throw new CompletionException(new IOException("Lost applied promotion reply"));}
+                        return result;
+                    });
+                }
+                public CompletableFuture<byte[]> participantAsync(RangeDescriptor route,byte[] bytes)throws IOException {
+                    return appendAsync(route,bytes).thenApply(reply->{if(route.groupId().equals(losePrepareGroup) && RatisParticipantRecord.isParticipant(bytes) && !RatisParticipantRecord.isFinalization(bytes)){losePrepareGroup=null;throw new CompletionException(new IOException("Lost applied PREPARE reply"));}return reply;});
+                }
                 public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request) throws IOException {
                     rpcs.incrementAndGet(); int kind=ScopedTransactionRpc.kind(request,Math.max(ScopedTransactionRpc.MAX_REQUEST_BYTES,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES));
                     if (kind==ScopedTransactionRpc.SNAPSHOT_CAPTURE) { captureRequests.incrementAndGet(); if (beforeSnapshotCapture!=null) beforeSnapshotCapture.run(); }
@@ -200,15 +223,22 @@ class RatisAtomicClientTest {
                 }
             };
         }
-        synchronized byte[] append(RangeDescriptor route,byte[] bytes) throws IOException {
-            try {
-                var group=raftGroups.get(route.groupId()); var machine=machines.get(route.groupId());
-                var context=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(group.getPeers().iterator().next().getId()).setGroupId(group.getGroupId())
-                        .setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(Message.valueOf(ByteString.copyFrom(bytes))).build());
-                if (context.getException()!=null) throw new IOException("Controlled admission rejected",context.getException());
-                machine.preAppendTransaction(context); context.initLogEntry(1,stores.get(route.groupId()).applied().index()+1); submissions.incrementAndGet();
-                return machine.applyTransaction(context).get(5,TimeUnit.SECONDS).getContent().toByteArray();
-            } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
+        private CompletableFuture<Void> appendTail=CompletableFuture.completedFuture(null);
+        CompletableFuture<byte[]> appendAsync(RangeDescriptor route,byte[] bytes) {
+            byte[] copy=bytes.clone();var result=new CompletableFuture<byte[]>();final CompletableFuture<Void> prior;
+            synchronized(this){prior=appendTail;appendTail=result.handle((value,failure)->null);}
+            prior.whenComplete((ignored,previousFailure)->{
+                try {
+                    var group=raftGroups.get(route.groupId());var machine=machines.get(route.groupId());
+                    var context=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(group.getPeers().iterator().next().getId()).setGroupId(group.getGroupId()).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(Message.valueOf(ByteString.copyFrom(copy))).build());
+                    if(context.getException()!=null)throw new IOException("Controlled admission rejected",context.getException());
+                    machine.preAppendTransaction(context);context.initLogEntry(1,stores.get(route.groupId()).applied().index()+1);submissions.incrementAndGet();
+                    machine.applyTransaction(context).whenComplete((reply,failure)->{if(failure==null)result.complete(reply.getContent().toByteArray());else result.completeExceptionally(failure);});
+                }catch(Throwable failure){result.completeExceptionally(failure);}
+            });return result;
+        }
+        byte[] append(RangeDescriptor route,byte[] bytes)throws IOException {
+            try{return appendAsync(route,bytes).get(5,TimeUnit.SECONDS);}catch(ExecutionException failure){if(failure.getCause() instanceof IOException io)throw io;throw new IOException(failure.getCause());}catch(Exception failure){throw new IOException(failure);}
         }
         byte[] get(long column,Keys keys) throws IOException {
             var binding=schema.column(column); var encoded=schema.encodeLogicalKey(binding.columnId(),keys); byte[] raw=data.read(binding.columnId(),encoded.physicalKey());

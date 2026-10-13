@@ -76,6 +76,10 @@ class RatisAggregateExportColdCleanupTest {
         RatisRoutedClient.Transport transport(){return new RatisRoutedClient.Transport(){
             public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{return ScopedTransactionRpc.pointValue(transaction(route,ScopedTransactionRpc.pointRequest(column,key),true),2<<20);}
             public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh)throws IOException{try{var target=machine(route.groupId());return (fresh?target.queryLinearizable(message(request)):target.query(message(request))).get(20,TimeUnit.SECONDS).getContent().toByteArray();}catch(Exception failed){throw new IOException("Controlled Runtime query failed",failed);}}
+            public CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key)throws IOException{return transactionAsync(route,ScopedTransactionRpc.pointRequest(column,key),true).thenApply(reply->ScopedTransactionRpc.pointValue(reply,2<<20));}
+            public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] request,boolean fresh)throws IOException{var target=machine(route.groupId());return (fresh?target.queryLinearizable(message(request)):target.query(message(request))).thenApply(reply->reply.getContent().toByteArray());}
+            public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{return appendAsync(route,DistributedCommandCodec.encode(command)).thenApply(CommandResult::decode);}
+            public CompletableFuture<byte[]> participantAsync(RangeDescriptor route,byte[] bytes)throws IOException{return appendAsync(route,bytes);}
             public CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request)throws IOException{
                 int kind=ScopedTransactionRpc.kind(request,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);
                 if(kind==RatisSnapshotCohortRpc.CAPTURE)cohortCaptures.incrementAndGet();
@@ -88,13 +92,21 @@ class RatisAggregateExportColdCleanupTest {
             public byte[] participant(RangeDescriptor route,byte[] bytes)throws IOException{return append(route,bytes);}
             public void close(){}
         };}
-        synchronized byte[] append(RangeDescriptor route,byte[] bytes)throws IOException {
-            try {
-                var target=machine(route.groupId());var context=target.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(route.groupId())).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(message(bytes)).build());
-                if(context.getException()!=null)throw new IOException("Controlled Runtime admission rejected",context.getException());
-                target.preAppendTransaction(context);context.initLogEntry(1,store(route.groupId()).applied().index()+1);return target.applyTransaction(context).get(20,TimeUnit.SECONDS).getContent().toByteArray();
-            }catch(IOException failed){throw failed;}catch(Exception failed){throw new IOException(failed);}
+        private CompletableFuture<Void> appendTail=CompletableFuture.completedFuture(null);
+        CompletableFuture<byte[]> appendAsync(RangeDescriptor route,byte[] bytes) {
+            byte[] copy=bytes.clone();var result=new CompletableFuture<byte[]>();final CompletableFuture<Void> prior;
+            synchronized(this){prior=appendTail;appendTail=result.handle((value,failure)->null);}
+            prior.thenCompose(ignored->{try{return field(node,"poolPressure",RatisPoolPressureService.class).refresh();}catch(Exception failure){return CompletableFuture.failedFuture(failure);}}).whenComplete((ignored,pressureFailure)->{
+                if(pressureFailure!=null){result.completeExceptionally(pressureFailure);return;}
+                try {
+                    var target=machine(route.groupId());var context=target.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(route.groupId())).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(message(copy)).build());
+                    if(context.getException()!=null)throw new IOException("Controlled Runtime admission rejected",context.getException());
+                    target.preAppendTransaction(context);context.initLogEntry(1,store(route.groupId()).applied().index()+1);
+                    target.applyTransaction(context).whenComplete((reply,failure)->{if(failure==null)result.complete(reply.getContent().toByteArray());else result.completeExceptionally(failure);});
+                }catch(Throwable failure){result.completeExceptionally(failure);}
+            });return result;
         }
+        byte[] append(RangeDescriptor route,byte[] bytes)throws IOException {try{return appendAsync(route,bytes).get(20,TimeUnit.SECONDS);}catch(Exception failure){throw new IOException(failure);}}
         RatisAggregateExportJournal parent()throws Exception{var parents=field(backend,"parents",Map.class);assertEquals(1,parents.size());return (RatisAggregateExportJournal)parents.values().iterator().next();}
         DistributedStoragePool pool()throws Exception {var pools=field(node,"pools",Map.class);return field(pools.get(RatisPoolFixtures.ID),"pool",DistributedStoragePool.class);}
         long issued()throws Exception{return f.catalogue.epochs.read().nextEpoch();}

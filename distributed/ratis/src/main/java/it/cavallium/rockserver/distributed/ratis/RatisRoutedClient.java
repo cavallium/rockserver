@@ -39,6 +39,10 @@ public final class RatisRoutedClient implements AutoCloseable {
         default CompletableFuture<byte[]> snapshot(RangeDescriptor descriptor,ReplicaDescriptor owner,byte[] request) throws IOException { return CompletableFuture.failedFuture(new IOException("Owner-specific snapshots unsupported by this transport")); }
         default RangeStateView stateView(RangeDescriptor descriptor) throws IOException { throw new IOException("Range-state reads unsupported by this transport"); }
         default byte[] transaction(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException { throw new IOException("Scoped transactions unsupported by this transport"); }
+        default CompletableFuture<byte[]> readAsync(RangeDescriptor descriptor,UUID column,byte[] key) throws IOException { return CompletableFuture.failedFuture(new IOException("Asynchronous point reads unsupported by this transport")); }
+        default CompletableFuture<CommandResult> commandAsync(RangeDescriptor descriptor,DistributedCommand command) throws IOException { return CompletableFuture.failedFuture(new IOException("Asynchronous commands unsupported by this transport")); }
+        default CompletableFuture<byte[]> transactionAsync(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) throws IOException { return CompletableFuture.failedFuture(new IOException("Asynchronous scoped transactions unsupported by this transport")); }
+        default CompletableFuture<byte[]> participantAsync(RangeDescriptor descriptor,byte[] record) throws IOException { return CompletableFuture.failedFuture(new IOException("Asynchronous participant commands unsupported by this transport")); }
         @Override default void close() throws IOException {}
     }
 
@@ -225,6 +229,18 @@ public final class RatisRoutedClient implements AutoCloseable {
         public UUID incarnation() { return incarnation; }
         public RatisSnapshotCohortRpc.Capabilities cohort(){return cohort;}
     }
+    public CompletableFuture<RatisSnapshotReadiness> snapshotReadinessAsync(SnapshotFence fence,UUID group) {
+
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+        requireSnapshotRoute(observed,descriptor,fence,group);
+        return snapshotAsync(()->transactionReplyAsync(descriptor,ScopedTransactionRpc.SNAPSHOT_READY,fence.encode(),true).thenApply(reply->{
+        try {
+            var proof=RatisSnapshotReadiness.decode(reply);
+            if (!proof.group().equals(group) || !proof.binding().equals(ScopedTransactionRpc.SnapshotBinding.of(fence)) || proof.retired() && !proof.retirement().fence().equals(fence)) throw new IllegalArgumentException("Snapshot readiness binding changed"); return proof;
+        } catch (IllegalArgumentException malformed) { throw new CompletionException(new IOException("Invalid snapshot readiness reply",malformed)); }
+
+        }));
+    }
     public RatisSnapshotReadiness snapshotReadiness(SnapshotFence fence,UUID group) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group);
@@ -270,6 +286,16 @@ public final class RatisRoutedClient implements AutoCloseable {
         ScopedTransactionRpc.putBlob(body,lower); ScopedTransactionRpc.putBlob(body,upper); body.put((byte)(reverse ? 1 : 0)); ScopedTransactionRpc.putBlob(body,resume); body.putInt(items).putInt(bytes);
         try { return ScopedTransactionRpc.decodePage(snapshotQuery(target,token,ScopedTransactionRpc.SNAPSHOT_PAGE,body.array())); }
         catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot page reply",malformed); }
+    }
+    public CompletableFuture<Void> releaseSnapshotAsync(SnapshotTarget target,SnapshotFenceStatus.Capture token)throws IOException{
+        Objects.requireNonNull(target);Objects.requireNonNull(token);requireIdentity(target.source);
+        if(!target.incarnation.equals(token.ownerIncarnation()))throw new RatisSnapshotLostException("Token belongs to another owner incarnation");
+        var body=ByteBuffer.allocate(48+ScopedTransactionRpc.SNAPSHOT_TOKEN_BYTES);ScopedTransactionRpc.snapshotBinding(body,target.binding);ScopedTransactionRpc.snapshotToken(body,token);
+        var request=ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_RELEASE,body.array());
+        return snapshotAsync(()->transport.snapshot(target.descriptor,target.replica,request).thenApply(bytes->{try{
+            var reply=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);if(reply.kind()!=ScopedTransactionRpc.SNAPSHOT_RELEASE)throw new IOException("Snapshot reply opcode changed");
+            if(ScopedTransactionRpc.snapshotPayload(reply.body(),target.binding,token).length!=0)throw new IOException("Invalid snapshot release reply");return null;
+        }catch(IOException|IllegalArgumentException failure){throw new CompletionException(failure);}}));
     }
     public void releaseSnapshot(SnapshotTarget target,SnapshotFenceStatus.Capture token) throws IOException {
         var body=ByteBuffer.allocate(48+ScopedTransactionRpc.SNAPSHOT_TOKEN_BYTES); ScopedTransactionRpc.snapshotBinding(body,target.binding); ScopedTransactionRpc.snapshotToken(body,token);
@@ -347,6 +373,13 @@ public final class RatisRoutedClient implements AutoCloseable {
         var participant=operation.request.fence().participant(operation.target.descriptor.groupId());
         return new ScopedTransaction(operation.target.descriptor,certified.handle(),participant.scope(),participant.schemaDigest());
     }
+    CompletableFuture<RatisSnapshotCaptureRequest.Result> executeCaptureAsync(PreparedSnapshotCapture operation){
+        Objects.requireNonNull(operation);requireIdentity(operation.target.source);
+        return snapshotAsync(()->transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes).thenApply(bytes->{try{
+            var response=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);if(response.kind()!=ScopedTransactionRpc.SNAPSHOT_CAPTURE)throw new IllegalArgumentException("Capture reply opcode changed");return operation.request.resultBinding(response.body());
+        }catch(IllegalArgumentException malformed){throw new CompletionException(new IOException("Invalid capture reply",malformed));}
+        catch(IOException failure){throw new CompletionException(failure);}}));
+    }
     private RatisSnapshotCaptureRequest.Result executeCapture(PreparedSnapshotCapture operation) throws IOException {
         Objects.requireNonNull(operation); requireIdentity(operation.target.source);
         try{return awaitSnapshot(snapshotAsync(()->transport.snapshot(operation.target.descriptor,operation.target.replica,operation.bytes).thenApply(bytes->{var response=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);if(response.kind()!=ScopedTransactionRpc.SNAPSHOT_CAPTURE)throw new IllegalArgumentException("Capture reply opcode changed");try{return operation.request.resultBinding(response.body());}catch(IOException lost){throw new CompletionException(lost);}})));}catch(IllegalArgumentException invalid){throw new IOException("Invalid capture reply",invalid);}
@@ -392,6 +425,27 @@ public final class RatisRoutedClient implements AutoCloseable {
             return new SnapshotGatePreparation(state!=0,receipt);
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot gate authority reply",malformed); }
     }
+    public CompletableFuture<RatisSnapshotRecord.Result> executeSnapshotGateAsync(PreparedSnapshotOperation operation) {
+        Objects.requireNonNull(operation);requireIdentity(operation.source);
+        return snapshotAsync(()->transactionReplyAsync(operation.descriptor,ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE,operation.bytes,true).thenApply(reply->{
+        try {
+            var input=ByteBuffer.wrap(reply);
+            byte[] digest=ScopedTransactionRpc.blob(input,32,false);
+            if (input.remaining()<5) throw new IllegalArgumentException("Truncated snapshot preparation reply");
+            int state=input.get()&255; byte[] bytes=ScopedTransactionRpc.blob(input,RatisSnapshotRecord.Result.MAX_BYTES,true);
+            if (!Arrays.equals(digest,operation.request.digest()) || input.hasRemaining() || state>2 || (state==2)!=(bytes!=null)) throw new IllegalArgumentException("Snapshot authority changed its frozen request");
+            var receipt=bytes==null ? null : RatisSnapshotRecord.Result.decode(bytes); if (receipt!=null) requireSnapshotResult(operation,receipt);
+            return new SnapshotGatePreparation(state!=0,receipt);
+        } catch (IllegalArgumentException malformed) { throw new CompletionException(new IOException("Invalid snapshot gate authority reply",malformed)); }
+        }).thenCompose(preparation->{
+            if(!preparation.drained())return CompletableFuture.failedFuture(new RatisSnapshotWaitingException());
+            if(preparation.receipt()!=null)return CompletableFuture.completedFuture(preparation.receipt());
+            try{return transport.participantAsync(operation.descriptor,operation.bytes).thenApply(bytes->{
+                try{var result=RatisSnapshotRecord.Result.decode(bytes);requireSnapshotResult(operation,result);return result;}
+                catch(IllegalArgumentException invalid){throw new CompletionException(new IOException("Invalid snapshot gate applied reply",invalid));}
+            });}catch(IOException failure){return CompletableFuture.failedFuture(failure);}
+        }));
+    }
     public RatisSnapshotRecord.Result executeSnapshotGate(PreparedSnapshotOperation operation) throws IOException {
         Objects.requireNonNull(operation); requireIdentity(operation.source); beginCall();
         try {
@@ -422,6 +476,21 @@ public final class RatisRoutedClient implements AutoCloseable {
         } finally { endCall(); }
     }
     /** One bounded server-side recovery quantum; false or an empty blocker page never proves READY. */
+    public CompletableFuture<Boolean> helpSnapshotFenceAsync(SnapshotFence fence,UUID group) {
+
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot helper route absent"));
+        requireSnapshotRoute(observed,descriptor,fence,group);
+        var binding=ScopedTransactionRpc.SnapshotBinding.of(fence); var body=ByteBuffer.allocate(48); ScopedTransactionRpc.snapshotBinding(body,binding);
+        return snapshotAsync(()->transactionReplyAsync(descriptor,ScopedTransactionRpc.SNAPSHOT_HELP,body.array(),true).thenApply(reply->{
+        try {
+            var input=ByteBuffer.wrap(reply);
+            var actual=ScopedTransactionRpc.snapshotBinding(input); var actualGroup=ScopedTransactionRpc.uuid(input);
+            if (!binding.equals(actual) || !group.equals(actualGroup) || input.remaining()!=1) throw new IllegalArgumentException("Snapshot helper reply binding changed");
+            int helped=input.get()&255; if (helped>1) throw new IllegalArgumentException("Invalid snapshot helper progress"); return helped==1;
+        } catch (IllegalArgumentException malformed) { throw new CompletionException(new IOException("Invalid snapshot helper reply",malformed)); }
+
+        }));
+    }
     public boolean helpSnapshotFence(SnapshotFence fence,UUID group) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot helper route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group);
@@ -434,6 +503,21 @@ public final class RatisRoutedClient implements AutoCloseable {
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot helper reply",malformed); }
     }
     /** Fresh retained gate/terminal state remains queryable independently of control grants. */
+    public CompletableFuture<SnapshotGate> snapshotGateAsync(SnapshotFence fence,UUID group) {
+
+        var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
+        requireSnapshotRoute(observed,descriptor,fence,group); var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,fence.fenceId());
+        return snapshotAsync(()->transactionReplyAsync(descriptor,ScopedTransactionRpc.SNAPSHOT_GATE_STATE,body.array(),true).thenApply(reply->{
+        try {
+            var input=ByteBuffer.wrap(reply);
+            byte[] bytes=ScopedTransactionRpc.blob(input,SnapshotGate.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing snapshot gate state");
+            if (bytes==null) return null; var record=SnapshotGate.decode(bytes);
+            if (!record.participantGroup().equals(group) || !record.fence().equals(fence)) throw new IllegalArgumentException("Snapshot gate reply binding changed");
+            return record;
+        } catch (IllegalArgumentException malformed) { throw new CompletionException(new IOException("Invalid snapshot gate state reply",malformed)); }
+
+        }));
+    }
     public SnapshotGate snapshotGate(SnapshotFence fence,UUID group) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
         requireSnapshotRoute(observed,descriptor,fence,group); var body=ByteBuffer.allocate(16); ScopedTransactionRpc.uuid(body,fence.fenceId());
@@ -645,6 +729,20 @@ public final class RatisRoutedClient implements AutoCloseable {
             return outcome;
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid participant outcome reply",invalid); }
     }
+    public CompletableFuture<SnapshotFenceProof> snapshotFenceAsync(SnapshotFence fence,UUID group) {
+
+        var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,fence,group);
+        return snapshotAsync(()->transactionReplyAsync(route,ScopedTransactionRpc.SNAPSHOT_FENCE,fence.encode(),true).thenApply(reply->{
+        try {
+            var input=ByteBuffer.wrap(reply);
+            byte[] binding=new byte[48]; if (input.remaining()<52) throw new IllegalArgumentException("Truncated snapshot fence reply"); input.get(binding);
+            if (!ScopedTransactionRpc.snapshotBinding(ByteBuffer.wrap(binding)).equals(ScopedTransactionRpc.SnapshotBinding.of(fence))) throw new IllegalArgumentException("Snapshot fence binding changed");
+            byte[] bytes=ScopedTransactionRpc.blob(input,SnapshotFenceProof.MAX_BYTES,true); if (input.hasRemaining()) throw new IllegalArgumentException("Trailing snapshot fence reply");
+            if (bytes==null) return null; var proof=SnapshotFenceProof.decode(bytes); if (!proof.fence().equals(fence) || !proof.participantGroup().equals(group)) throw new IllegalArgumentException("Snapshot fence identity changed"); return new SnapshotFenceProof(fence,group,proof.minimumEpoch(),proof.position());
+        } catch (IllegalArgumentException malformed) { throw new CompletionException(new IOException("Invalid snapshot fence reply",malformed)); }
+
+        }));
+    }
     public SnapshotFenceProof snapshotFence(SnapshotFence fence,UUID group) throws IOException {
         var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent")); requireSnapshotRoute(observed,route,fence,group); beginCall();
         try {
@@ -673,6 +771,19 @@ public final class RatisRoutedClient implements AutoCloseable {
         var observed=current(); var route=observed.ranges().stream().filter(r -> r.groupId().equals(identity.groupId())).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot HOME route absent"));
         if (route.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || route.rangeEpoch()!=identity.rangeEpoch() || !observed.columns().equals(java.util.Set.of(identity.columnId()))
                 || !observed.clusterId().equals(identity.fence().clusterId()) || !observed.databaseId().equals(identity.fence().databaseId()) || !Arrays.equals(observed.schemaDigest(),identity.schemaDigest())) throw new IllegalArgumentException("Snapshot HOME route differs from frozen identity"); return route;
+    }
+    public CompletableFuture<SnapshotHomeFenceProof> snapshotHomeFenceAsync(SnapshotHomeIdentity identity) {
+
+        Objects.requireNonNull(identity); var route=snapshotHomeRoute(identity);
+        return snapshotAsync(()->transactionReplyAsync(route,ScopedTransactionRpc.SNAPSHOT_HOME_FENCE,identity.encode(),true).thenApply(reply->{
+        try {
+            var input=ByteBuffer.wrap(reply);
+            if (input.remaining()<36) throw new IllegalArgumentException("Truncated snapshot HOME proof"); byte[] digest=new byte[32]; input.get(digest); byte[] bytes=ScopedTransactionRpc.blob(input,SnapshotHomeFenceProof.MAX_BYTES,true);
+            if (!Arrays.equals(digest,identity.digest()) || input.hasRemaining()) throw new IllegalArgumentException("Snapshot HOME proof binding changed"); if (bytes==null) return null;
+            var proof=SnapshotHomeFenceProof.decode(bytes); if (!proof.identity().equals(identity)) throw new IllegalArgumentException("Snapshot HOME proof identity changed"); return new SnapshotHomeFenceProof(identity,proof.minimumEpoch(),proof.position());
+        } catch (IllegalArgumentException malformed) { throw new CompletionException(new IOException("Invalid snapshot HOME proof reply",malformed)); }
+
+        }));
     }
     public SnapshotHomeFenceProof snapshotHomeFence(SnapshotHomeIdentity identity) throws IOException {
         Objects.requireNonNull(identity); var route=snapshotHomeRoute(identity); beginCall();
@@ -803,15 +914,21 @@ public final class RatisRoutedClient implements AutoCloseable {
         private void record(RangeDescriptor route,byte[] bytes,boolean release)throws IOException{route(route);var record=RatisSnapshotRecord.decode(bytes);if(!fence.equals(record.fence()) || !route.groupId().equals(record.participantGroup()) || release&&!record.isRelease())throw denied();}
         public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{throw denied();}
         public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{throw denied();}
+        public CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key)throws IOException{throw denied();}
+        public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{throw denied();}
         public byte[] participant(RangeDescriptor route,byte[] bytes)throws IOException{record(route,bytes,true);return transport.participant(route,bytes);}
+        public CompletableFuture<byte[]> participantAsync(RangeDescriptor route,byte[] bytes)throws IOException{record(route,bytes,true);return transport.participantAsync(route,bytes);}
         public RangeStateView stateView(RangeDescriptor route)throws IOException{route(route);return transport.stateView(route);}
-        public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{route(route);var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);switch(packet.kind()){
+        private void transactionRequest(RangeDescriptor route,byte[] bytes)throws IOException{route(route);var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);switch(packet.kind()){
             case ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE -> record(route,packet.body(),true);
             case ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL -> record(route,packet.body(),false);
             case ScopedTransactionRpc.SNAPSHOT_GATE_STATE -> {if(!Arrays.equals(packet.body(),ByteBuffer.allocate(16).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array()))throw denied();}
             case ScopedTransactionRpc.SNAPSHOT_FENCE,ScopedTransactionRpc.SNAPSHOT_READY -> {if(!Arrays.equals(packet.body(),fence.encode()))throw denied();}
             default -> throw denied();
-        }return transport.transaction(route,bytes,fresh);}
+        }}
+
+        public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{transactionRequest(route,bytes);return transport.transaction(route,bytes,fresh);}
+        public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{transactionRequest(route,bytes);return transport.transactionAsync(route,bytes,fresh);}
         public CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] bytes)throws IOException{route(route);var packet=ScopedTransactionRpc.parse(bytes,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);switch(packet.kind()){
             case ScopedTransactionRpc.SNAPSHOT_CAPTURE -> {PreparedSnapshotCapture original;synchronized(this){original=captures.get(route.groupId());}if(original==null || !original.target.replica.equals(owner) || !Arrays.equals(original.bytes,bytes))throw denied();}
             case ScopedTransactionRpc.SNAPSHOT_RELEASE -> {var input=ByteBuffer.wrap(packet.body());if(!ScopedTransactionRpc.snapshotBinding(input).equals(ScopedTransactionRpc.SnapshotBinding.of(fence)))throw denied();var token=ScopedTransactionRpc.snapshotToken(input);PreparedSnapshotCapture original;synchronized(this){original=captures.get(route.groupId());}if(original==null || !original.target.replica.equals(owner) || !original.request.snapshotId().equals(token.snapshotId()) || !original.request.owner().equals(token.ownerIncarnation()))throw denied();}
@@ -954,6 +1071,16 @@ public final class RatisRoutedClient implements AutoCloseable {
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid scoped transaction reply",malformed); }
     }
 
+    private CompletableFuture<byte[]> transactionReplyAsync(RangeDescriptor descriptor,int kind,byte[] body,boolean freshBarrier) throws IOException {
+        byte[] request=ScopedTransactionRpc.frame(kind,body);
+        if(request.length>ScopedTransactionRpc.MAX_REQUEST_BYTES)throw new IllegalArgumentException("Transaction request exceeds byte budget");
+        return transport.transactionAsync(descriptor,request,freshBarrier).thenApply(bytes->{
+            try{var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REPLY_BYTES);
+                if(packet.kind()!=kind)throw new IOException("Transaction reply opcode differs from request");return packet.body();
+            }catch(IOException|IllegalArgumentException failure){throw new CompletionException(new IOException("Invalid scoped transaction reply",failure));}
+        });
+    }
+
     public synchronized RangeDirectory directory() { return directory; }
     /** Select only a current or ACTIVATE-qualified historical schema, never a caller-selected route. */
     public synchronized RangeDirectory directory(DistributedSchema schema) {
@@ -1009,6 +1136,16 @@ public final class RatisRoutedClient implements AutoCloseable {
             if (value != null && value.length > DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IOException("Point value exceeds budget");
             return new RoutedRead(descriptor,value==null ? null : value.clone());
         } finally { endCall(); }
+    }
+
+    CompletableFuture<RoutedRead> readWithRouteAsync(UUID columnId,byte[] physicalKey) {
+        Objects.requireNonNull(physicalKey,"physicalKey");
+        if(physicalKey.length>DistributedCommandCodec.MAX_ENCODED_BYTES-16)throw new IllegalArgumentException("Point read key exceeds budget");
+        var descriptor=current().route(columnId,physicalKey);
+        return snapshotAsync(()->transport.readAsync(descriptor,columnId,physicalKey.clone()).thenApply(value->{
+            if(value!=null&&value.length>DistributedCommandCodec.MAX_ENCODED_BYTES)throw new CompletionException(new IOException("Point value exceeds budget"));
+            return new RoutedRead(descriptor,value==null?null:value.clone());
+        }));
     }
 
     /** Linearizable metadata read through the same pooled Ratis transport; scope is verified against the captured directory. */
@@ -1326,6 +1463,50 @@ public final class RatisRoutedClient implements AutoCloseable {
         } finally { endCall(); }
     }
 
+    public CompletableFuture<CommandResult> executeAsync(PreparedCommand prepared) {
+        Objects.requireNonNull(prepared,"prepared");var observed=current();var descriptor=prepared.descriptor;
+        boolean moved=observed.ranges().stream().noneMatch(range->range.rangeId().equals(descriptor.rangeId())
+                &&range.groupId().equals(descriptor.groupId())&&range.rangeEpoch()==descriptor.rangeEpoch());
+        if(moved)requireNamespace(prepared.source);else requireIdentity(prepared.source);
+        return snapshotAsync(()->{
+            if(moved)return readOriginalOutcomeAsync(prepared).thenCompose(reply->resolvedOriginalOutcomeAsync(prepared,reply));
+            return transport.commandAsync(descriptor,prepared.command).handle((result,failure)->{
+                if(failure==null)return result==null?CompletableFuture.<CommandResult>failedFuture(new IOException("Missing command result")):CompletableFuture.completedFuture(result);
+                Throwable cause=unwrap(failure);
+                if(!(cause instanceof IOException unresolved)||cause instanceof java.io.InterruptedIOException)return CompletableFuture.<CommandResult>failedFuture(cause);
+                return readOriginalOutcomeAsync(prepared).thenCompose(reply->resolvedOriginalOutcomeAsync(prepared,reply)).handle((resolved,lookupFailure)->{
+                    if(lookupFailure==null)return resolved;
+                    Throwable lookup=unwrap(lookupFailure);
+                    if(lookup instanceof OriginalOperationAbsent){lookup.addSuppressed(unresolved);throw new CompletionException(lookup);}
+                    unresolved.addSuppressed(lookup);throw new CompletionException(unresolved);
+                });
+            }).thenCompose(future->future);
+        });
+    }
+    private CompletableFuture<RatisTopologyOperationOutcomeRpc.Reply> readOriginalOutcomeAsync(PreparedCommand prepared) {
+        try {
+        var source=prepared.source;var descriptor=prepared.descriptor;
+        var lineage=new DistributedCdcCheckpoint.Lineage(descriptor.rangeId(),descriptor.groupId(),descriptor.rangeEpoch());
+        var request=new RatisTopologyOperationOutcomeRpc.Request(source.clusterId(),source.databaseId(),source.domainId(),lineage,prepared.command.operationId(),prepared.command.receiptDigest());
+        return transport.transactionAsync(descriptor,RatisTopologyOperationOutcomeRpc.request(request),true).thenApply(bytes->{
+            try{return RatisTopologyOperationOutcomeRpc.decodeReply(bytes,request);}catch(IllegalArgumentException malformed){throw new CompletionException(new IOException("Invalid original operation outcome",malformed));}
+        });
+        } catch(IOException failure) {return CompletableFuture.failedFuture(failure);}
+    }
+    private CompletableFuture<CommandResult> resolvedOriginalOutcomeAsync(PreparedCommand prepared,RatisTopologyOperationOutcomeRpc.Reply reply) {
+        try{return switch(reply.outcome()){
+            case FOUND -> CompletableFuture.completedFuture(CommandResult.decode(reply.result()));
+            case EXPIRED -> CompletableFuture.completedFuture(new CommandResult(CommandResult.Status.SESSION_EXPIRED,List.of()));
+            case ABSENT -> {
+                if(!RatisOperationRerouteAdmissionRpc.acknowledgementOnly(prepared.command))yield CompletableFuture.failedFuture(new OriginalOperationAbsent(prepared,reply));
+                yield transport.commandAsync(prepared.descriptor,prepared.command).thenApply(result->{
+                    if(result==null||result.valueCount()!=0)throw new CompletionException(new IOException("Invalid original-parent acknowledgement result"));return result;
+                });
+            }
+        };}catch(IOException|RuntimeException failure){return CompletableFuture.failedFuture(failure);}
+    }
+    private static Throwable unwrap(Throwable failure){while(failure instanceof CompletionException&&failure.getCause()!=null)failure=failure.getCause();return failure;}
+
     private synchronized RangeDirectory current() { requireOpen(); return directory; }
     private void requireOpen() { if (closing) throw new IllegalStateException("Routed client is closing"); }
     private void requireIdentity(RangeDirectory other) {
@@ -1392,8 +1573,38 @@ public final class RatisRoutedClient implements AutoCloseable {
         CompletableFuture<RaftClientReply> actual;try{var message=Message.valueOf(ByteString.copyFrom(request));actual=owner==null ? client.async().sendReadOnly(message) : kind==RatisSnapshotCohortRpc.OWNER ? client.async().sendReadOnly(message) : client.async().sendStaleRead(message,0,RaftPeerId.valueOf(owner.peerId()));}catch(StatusRuntimeException failure){throw new IOException("Raft gRPC transport failed",failure);}
         return actual.thenApply(reply->{try{if(reply!=null&&(!reply.getRaftGroupId().equals(RaftGroupId.valueOf(descriptor.groupId())) || owner!=null&&!reply.getServerId().equals(RaftPeerId.valueOf(owner.peerId()))))throw new IOException("Snapshot reply came from another peer/group");return RaftTransport.content(reply,cohort?RatisSnapshotCohortRpc.MAX_REPLY_BYTES:ScopedTransactionRpc.MAX_REPLY_BYTES);}catch(IOException failure){throw new CompletionException(failure);}});
     }
-    /** Only definite NotLeader READ failures discover another frozen voter; all mutation/unknown failures stay no-retry. */
-    static org.apache.ratis.retry.RetryPolicy snapshotRetryPolicy(RangeDescriptor descriptor){var voters=descriptor.replicas().stream().filter(replica->replica.role()==ReplicaDescriptor.Role.VOTER).map(ReplicaDescriptor::peerId).collect(java.util.stream.Collectors.toSet());return event->{if(!(event instanceof org.apache.ratis.client.retry.ClientRetryEvent client) || !client.getRequest().getType().is(org.apache.ratis.proto.RaftProtos.RaftClientRequestProto.TypeCase.READ) || event.getAttemptCount()>=5 || !(event.getCause() instanceof org.apache.ratis.protocol.exceptions.NotLeaderException notLeader) || notLeader.getSuggestedLeader()==null || !voters.contains(notLeader.getSuggestedLeader().getId().toString()))return org.apache.ratis.retry.RetryPolicy.NO_RETRY_ACTION;return org.apache.ratis.retry.RetryPolicy.RETRY_WITHOUT_SLEEP_ACTION;};}
+    /** Only READ and Ratis' exact zero-index window handshake discover voters; mutations never retry. */
+    static org.apache.ratis.retry.RetryPolicy snapshotRetryPolicy(RangeDescriptor descriptor){
+        var voters=descriptor.replicas().stream().filter(replica->replica.role()==ReplicaDescriptor.Role.VOTER)
+                .map(ReplicaDescriptor::peerId).collect(java.util.stream.Collectors.toSet());
+        return event->{
+            if(!(event instanceof org.apache.ratis.client.retry.ClientRetryEvent client)||event.getAttemptCount()>=5
+                    ||!(event.getCause() instanceof org.apache.ratis.protocol.exceptions.NotLeaderException notLeader)
+                    ||notLeader.getSuggestedLeader()==null||!voters.contains(notLeader.getSuggestedLeader().getId().toString()))
+                return org.apache.ratis.retry.RetryPolicy.NO_RETRY_ACTION;
+            var type=client.getRequest().getType();
+            boolean read=type.is(org.apache.ratis.proto.RaftProtos.RaftClientRequestProto.TypeCase.READ);
+            // OrderedAsync initializes a new window with its no-effect DUMMY WATCH(0).
+            // Retrying an arbitrary WATCH, or an already-appended WRITE on step-down, is forbidden.
+            boolean handshake=type.is(org.apache.ratis.proto.RaftProtos.RaftClientRequestProto.TypeCase.WATCH)
+                    &&type.getWatch().getIndex()==0
+                    &&type.getWatch().getReplication()==org.apache.ratis.proto.RaftProtos.ReplicationLevel.MAJORITY
+                    &&client.getRequest().getMessage()!=null
+                    &&client.getRequest().getMessage().getContent().equals(ByteString.copyFromUtf8("DUMMY"));
+            if(!read&&!handshake)return org.apache.ratis.retry.RetryPolicy.NO_RETRY_ACTION;
+            return org.apache.ratis.retry.RetryPolicy.RETRY_WITHOUT_SLEEP_ACTION;
+        };
+    }
+    /** Discover the leader asynchronously before dispatch, without retrying a possibly appended WRITE. */
+    static CompletableFuture<RaftClientReply> metadataWriteAfterLeaderBarrier(RaftClient client,RangeDescriptor descriptor,Message message){
+        var barrier=Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0])));
+        return client.async().sendReadOnly(barrier).thenCompose(reply->{
+            try{if(reply==null||!reply.getRaftGroupId().equals(RaftGroupId.valueOf(descriptor.groupId())))throw new IOException("Metadata barrier came from another group");
+                RaftTransport.content(reply,ScopedTransactionRpc.MAX_REPLY_BYTES);
+                return client.async().send(message);
+            }catch(IOException failure){return CompletableFuture.failedFuture(failure);}
+        });
+    }
     @FunctionalInterface private interface SnapshotAsync<T>{CompletableFuture<T> run()throws IOException;}
     private <T> CompletableFuture<T> snapshotAsync(SnapshotAsync<T> work) {
         try{beginCall();}catch(Exception failure){return CompletableFuture.failedFuture(failure);}final CompletableFuture<T> actual;
@@ -1440,6 +1651,42 @@ public final class RatisRoutedClient implements AutoCloseable {
         }
         @Override public byte[] participant(RangeDescriptor descriptor,byte[] record) throws IOException {
             return rpc(() -> { try (var lease=clients.acquire(descriptor)) { return content(lease.client().io().send(Message.valueOf(ByteString.copyFrom(record))),RatisSourceOutcomeRecord.isRecord(record)?37+NativeSourceOutcomeCredit.MAX_BYTES:CommandResult.MAX_BYTES); } });
+        }
+
+        @FunctionalInterface private interface AsyncCall { CompletableFuture<RaftClientReply> send(RaftClient client); }
+        private CompletableFuture<byte[]> callAsync(RangeDescriptor descriptor,int maximum,AsyncCall call) {
+            var flow=clients.acquireSnapshotAsync(descriptor,null).thenCompose(lease->{
+                final CompletableFuture<RaftClientReply> actual;
+                try{actual=Objects.requireNonNull(call.send(lease.client()));}
+                catch(Throwable failure){lease.invalidate();lease.close();return CompletableFuture.failedFuture(failure);}
+                var result=new CompletableFuture<byte[]>();
+                actual.whenComplete((reply,failure)->{
+                    try{if(failure!=null)throw new CompletionException(failure);
+                        if(reply!=null&&!reply.getRaftGroupId().equals(RaftGroupId.valueOf(descriptor.groupId())))throw new IOException("Reply came from another group");
+                        byte[] value=content(reply,maximum);lease.close();result.complete(value);
+                    }catch(Throwable invalid){lease.invalidate();lease.close();result.completeExceptionally(invalid);}
+                });return result;
+            });return flow.copy();
+        }
+        @Override public CompletableFuture<byte[]> readAsync(RangeDescriptor descriptor,UUID column,byte[] key) {
+            return transactionAsync(descriptor,ScopedTransactionRpc.pointRequest(column,key),true).thenApply(bytes->{
+                try{return ScopedTransactionRpc.pointValue(bytes,DistributedCommandCodec.MAX_ENCODED_BYTES);}
+                catch(IllegalArgumentException invalid){throw new CompletionException(new IOException("Invalid point reply",invalid));}
+            });
+        }
+        @Override public CompletableFuture<CommandResult> commandAsync(RangeDescriptor descriptor,DistributedCommand command) {
+            var message=Message.valueOf(ByteString.copyFrom(DistributedCommandCodec.encode(command)));
+            return callAsync(descriptor,CommandResult.MAX_BYTES,client->metadataWriteAfterLeaderBarrier(client,descriptor,message)).thenApply(bytes->{
+                try{return CommandResult.decode(bytes);}catch(IllegalArgumentException invalid){throw new CompletionException(new IOException("Invalid command reply",invalid));}
+            });
+        }
+        @Override public CompletableFuture<byte[]> transactionAsync(RangeDescriptor descriptor,byte[] request,boolean freshBarrier) {
+            var message=Message.valueOf(ByteString.copyFrom(request));
+            return callAsync(descriptor,ScopedTransactionRpc.MAX_REPLY_BYTES,client->freshBarrier?client.async().sendReadOnly(message):client.async().sendReadOnlyNonLinearizable(message));
+        }
+        @Override public CompletableFuture<byte[]> participantAsync(RangeDescriptor descriptor,byte[] record) {
+            var message=Message.valueOf(ByteString.copyFrom(record));
+            return callAsync(descriptor,RatisSourceOutcomeRecord.isRecord(record)?37+NativeSourceOutcomeCredit.MAX_BYTES:CommandResult.MAX_BYTES,client->metadataWriteAfterLeaderBarrier(client,descriptor,message));
         }
 
         private static RaftClient connected(RangeDescriptor descriptor) throws IOException {

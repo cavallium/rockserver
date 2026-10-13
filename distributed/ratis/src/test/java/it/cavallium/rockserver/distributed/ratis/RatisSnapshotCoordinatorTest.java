@@ -47,6 +47,10 @@ class RatisSnapshotCoordinatorTest {
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return node(route.groupId()).wire.command(route,command); }
                 public byte[] participant(RangeDescriptor route,byte[] bytes) throws IOException { return node(route.groupId()).wire.participant(route,bytes); }
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return node(route.groupId()).wire.transaction(route,bytes,fresh); }
+                public CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID col,byte[] key)throws IOException{return node(route.groupId()).wire.readAsync(route,col,key);}
+                public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{return node(route.groupId()).wire.commandAsync(route,command);}
+                public CompletableFuture<byte[]> participantAsync(RangeDescriptor route,byte[] bytes)throws IOException{return node(route.groupId()).wire.participantAsync(route,bytes);}
+                public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{return node(route.groupId()).wire.transactionAsync(route,bytes,fresh);}
                 public java.util.concurrent.CompletableFuture<byte[]> snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] bytes) throws IOException {
                     var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                     if(packet.kind()==ScopedTransactionRpc.SNAPSHOT_CAPTURE){var state=home.homes.read(fence.fenceId());assertTrue(state.allReady());if(!state.terminal())assertFalse(left.f.store.snapshotGate(fence.fenceId()).released()!=null || right.f.store.snapshotGate(fence.fenceId()).released()!=null);captures.incrementAndGet();}
@@ -168,6 +172,9 @@ class RatisSnapshotCoordinatorTest {
                 var transport=new RatisRoutedClient.Transport() {
                     public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
                     public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError(); }
+                    public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException {
+                        return f.node(route.groupId()).wire.transactionAsync(route,bytes,fresh).thenApply(actual->{var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()!=ScopedTransactionRpc.SNAPSHOT_BLOCKERS)return actual;var framed=ScopedTransactionRpc.parse(actual,ScopedTransactionRpc.MAX_REPLY_BYTES);var page=RatisSnapshotBlockers.decode(framed.body());var old=page.records().getFirst();byte[] digest=old.digest();digest[0]^=1;var changed=new RatisSnapshotBlockers(page.binding(),crossedGroup?f.left.f.groupId:page.group(),page.installed(),page.position(),List.of(new RatisSnapshotBlockers.Reference(old.transaction(),crossedGroup?old.digest():digest,old.prepared())),false);return ScopedTransactionRpc.frame(ScopedTransactionRpc.SNAPSHOT_BLOCKERS,changed.encode());});
+                    }
                     public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException {
                         byte[] actual=f.node(route.groupId()).wire.transaction(route,bytes,fresh); var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
                         if (packet.kind()!=ScopedTransactionRpc.SNAPSHOT_BLOCKERS) return actual;

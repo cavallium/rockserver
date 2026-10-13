@@ -85,6 +85,22 @@ class RatisParticipantPrepareTest {
                 if (lose) { lose=false; throw new IOException("Lost applied participant reply"); } return result;
             } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
         }
+        private java.util.concurrent.CompletableFuture<Void> appendTail=java.util.concurrent.CompletableFuture.completedFuture(null);
+        java.util.concurrent.CompletableFuture<byte[]> appendAsync(byte[] bytes) {
+            byte[] copy=bytes.clone();var result=new java.util.concurrent.CompletableFuture<byte[]>();final java.util.concurrent.CompletableFuture<Void> prior;
+            synchronized(this){prior=appendTail;appendTail=result.handle((value,failure)->null);}
+            prior.whenComplete((ignored,previousFailure)->{try{var context=propose(copy);if(context.getException()!=null)throw new IOException("Admission rejected",context.getException());f.machine.preAppendTransaction(context);context.initLogEntry(f.leadership.get().term(),++index);f.machine.applyTransaction(context).whenComplete((reply,failure)->{if(failure!=null){result.completeExceptionally(failure);return;}try{if(lose){lose=false;throw new IOException("Lost applied participant reply");}result.complete(reply.getContent().toByteArray());}catch(Throwable failed){result.completeExceptionally(failed);}});}catch(Throwable failed){result.completeExceptionally(failed);}});return result;
+        }
+        public java.util.concurrent.CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{return appendAsync(DistributedCommandCodec.encode(command)).thenApply(CommandResult::decode);}
+        public java.util.concurrent.CompletableFuture<byte[]> participantAsync(RangeDescriptor route,byte[] record)throws IOException{return appendAsync(record);}
+        public java.util.concurrent.CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] request,boolean fresh)throws IOException {
+            int kind=ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES).kind();if(beforeFence!=null && (kind==ScopedTransactionRpc.PARTICIPANT_FENCE || kind==ScopedTransactionRpc.SNAPSHOT_FENCE))beforeFence.run();if(beforeFinalization!=null && kind==ScopedTransactionRpc.FINALIZATION_PREPARE)beforeFinalization.run();
+            var input=Message.valueOf(ByteString.copyFrom(request));return (fresh?f.machine.queryLinearizable(input):f.machine.query(input)).thenApply(reply->reply.getContent().toByteArray());
+        }
+        public java.util.concurrent.CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key)throws IOException {
+            if(readFailure!=null)return java.util.concurrent.CompletableFuture.failedFuture(readFailure);
+            return transactionAsync(route,ScopedTransactionRpc.pointRequest(column,key),true).thenApply(reply->{var value=ScopedTransactionRpc.pointValue(reply,2*1024*1024);if(afterRead!=null)afterRead.run();return value;});
+        }
         public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return CommandResult.decode(append(DistributedCommandCodec.encode(command))); }
         public byte[] participant(RangeDescriptor route,byte[] record) throws IOException { return append(record); }
         public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh) throws IOException {

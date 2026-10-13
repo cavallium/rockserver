@@ -26,21 +26,47 @@ class RatisTransactionRpcTest {
         return new RangeDirectory(new UUID(0,1),new UUID(0,2),new UUID(0,3),1,new byte[32],0,Set.of(f.column),0,List.of(range));
     }
     final class Controlled implements RatisRoutedClient.Transport {
-        final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Path journal; byte[] openRequest; int fresh,owned;
+        final RatisRetentionAdmissionTest.Fixture f; long index; boolean lose; Path journal; byte[] openRequest; int fresh,owned; final java.util.List<Integer> freshMetadataKinds=new java.util.ArrayList<>();
         Controlled(RatisRetentionAdmissionTest.Fixture f) { this.f=f; }
+        void requireForcedCommand(DistributedCommand command)throws IOException {
+            if(journal==null)return;var body=SessionJournalFiles.read(journal,SessionWindowJournal.MAX_BYTES);var input=ByteBuffer.wrap(body);input.position(117);int entries=input.getInt(),directories=input.getInt();
+            for(int i=0;i<directories;i++){int size=input.getInt();input.position(input.position()+size);}
+            boolean found=false;byte[] expected=DistributedCommandCodec.encode(command);
+            for(int i=0;i<entries;i++){int size=input.getInt();byte[] encoded=new byte[size];input.get(encoded);found|=Arrays.equals(expected,encoded);input.position(input.position()+48);int result=input.getInt();if(result>=0)input.position(input.position()+result);input.get();input.get();}
+            assertFalse(input.hasRemaining());assertTrue(found,"Exact pending command must be forced in the current session-window layout before dispatch");
+        }
+        void observeQuery(byte[] request,boolean barrier) {
+            if(!barrier){owned++;return;}int kind=ScopedTransactionRpc.kind(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+            if(kind==ScopedTransactionRpc.OPEN){fresh++;openRequest=request.clone();}else freshMetadataKinds.add(kind);
+        }
         public byte[] read(RangeDescriptor route,UUID column,byte[] key) { throw new AssertionError(); }
         public byte[] transaction(RangeDescriptor route,byte[] request,boolean barrier) throws IOException {
             assertEquals(f.groupId,route.groupId());
-            if (barrier) { fresh++; openRequest=request.clone(); } else owned++;
+            observeQuery(request,barrier);
             try { var message=Message.valueOf(ByteString.copyFrom(request)); return (barrier ? f.machine.queryLinearizable(message) : f.machine.query(message)).get(5,TimeUnit.SECONDS).getContent().toByteArray(); }
             catch (Exception failure) { throw new IOException("Controlled query failed",failure); }
         }
+        public java.util.concurrent.CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] request,boolean barrier)throws IOException {
+            assertEquals(f.groupId,route.groupId());observeQuery(request,barrier);
+            var input=Message.valueOf(ByteString.copyFrom(request));return (barrier?f.machine.queryLinearizable(input):f.machine.query(input)).thenApply(reply->reply.getContent().toByteArray());
+        }
+        public java.util.concurrent.CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key)throws IOException{return transactionAsync(route,ScopedTransactionRpc.pointRequest(column,key),true).thenApply(reply->ScopedTransactionRpc.pointValue(reply,SnapshotFenceStatus.MAX_BYTES));}
+        private java.util.concurrent.CompletableFuture<Void> commandTail=java.util.concurrent.CompletableFuture.completedFuture(null);
+        public java.util.concurrent.CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException {
+            var result=new java.util.concurrent.CompletableFuture<CommandResult>();final java.util.concurrent.CompletableFuture<Void> prior;
+            synchronized(this){prior=commandTail;commandTail=result.handle((value,failure)->null);}
+            prior.whenComplete((ignored,previousFailure)->{
+                try {
+                    requireForcedCommand(command);
+                    var transaction=f.propose(command);if(transaction.getException()!=null)throw new IOException("Admission failed",transaction.getException());
+                    f.machine.preAppendTransaction(transaction);transaction.initLogEntry(1,++index);
+                    f.machine.applyTransaction(transaction).whenComplete((reply,failure)->{if(failure!=null){result.completeExceptionally(failure);return;}try{var decoded=CommandResult.decode(reply.getContent().toByteArray());if(lose){lose=false;throw new IOException("Lost applied reply");}result.complete(decoded);}catch(Throwable failed){result.completeExceptionally(failed);}});
+                }catch(Throwable failed){result.completeExceptionally(failed);}
+            });return result;
+        }
         public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException {
             try {
-                if (journal!=null) {
-                    byte[] body=SessionJournalFiles.read(journal,SessionWindowJournal.MAX_BYTES); int length=ByteBuffer.wrap(body).getInt(121);
-                    assertArrayEquals(DistributedCommandCodec.encode(command),Arrays.copyOfRange(body,125,125+length));
-                }
+                requireForcedCommand(command);
                 var transaction=f.propose(command); if (transaction.getException()!=null) throw new IOException("Admission failed",transaction.getException());
                 f.machine.preAppendTransaction(transaction); transaction.initLogEntry(1,++index);
                 var result=CommandResult.decode(f.machine.applyTransaction(transaction).get(5,TimeUnit.SECONDS).getContent().toByteArray());
@@ -69,7 +95,7 @@ class RatisTransactionRpcTest {
                     var pending=client.pending().getFirst(); assertArrayEquals(frozen,DistributedCommandCodec.encode(pending.command()));
                     assertNull(client.execute(pending).value(0)); client.acknowledge(pending); assertEquals(0,client.acknowledgedThrough());
                 }
-                assertEquals(1,transport.fresh); assertTrue(transport.owned>=4); f.assertReleased();
+                assertEquals(1,transport.fresh); assertEquals(java.util.List.of(RatisTopologyOperationOutcomeRpc.KIND),transport.freshMetadataKinds,"Lost WRITE reply performs one separate fresh outcome lookup, never another OPEN"); assertTrue(transport.owned>=4); f.assertReleased();
                 try (var pin=f.store.capture()) { assertArrayEquals(new byte[]{7},pin.get(f.column,new byte[]{0})); }
             }
         }

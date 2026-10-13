@@ -1238,6 +1238,21 @@ properties remain unchanged. This establishes the tested ownership/admission pat
 not hard filesystem containment: WAL preallocation and unbounded flush/merge output
 still require native pre-I/O enforcement and bounded recovery work.
 
+Snapshot/export metadata now composes actual asynchronous Ratis operations through
+HOME reads/CAS, gate install, readiness, report, capture and release. Each pooled
+client lease remains owned through its actual reply; durable intent/known-result
+forcing and cleanup retain their original identities beyond observer cancellation.
+A same-client STATE barrier discovers a frozen voter before the single WRITE.
+Only READ and Ratis's exact no-effect WATCH handshake have bounded discovery retries;
+a WRITE failure remains an unknown outcome. Malformed capture replies persist loss,
+and frozen cleanup views forward only original guarded release operations.
+
+The combined native regression gate passes 104 cases, including held metadata under
+scheduler pressure, cold leader discovery, post-barrier WRITE loss without retry,
+capture-loss/ABORT replay, borrowed cleanup ownership, backup/export and fresh-factory
+recovery. Evidence: `/tmp/rockserver-async-metadata-combined-acceptance-gate.log`.
+No network listener, independent quorum or external-consumer acceptance is established.
+
 ## Remaining architecture gates
 
 - Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold

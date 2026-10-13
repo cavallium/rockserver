@@ -7,6 +7,7 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import org.slf4j.LoggerFactory;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -41,6 +42,9 @@ final class RatisDatabaseBackupFactoryFixture implements AutoCloseable,RatisData
             routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport(){
                 public byte[] read(RangeDescriptor route,UUID requested,byte[] key)throws IOException{try{assertEquals(column,requested);return value(key);}catch(Exception failure){throw new IOException(failure);}}
                 public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{try{if(command.sessionControl()!=null)catalogue.epochs.sessionControlAdmission(directory,group).accept(command);else RatisSnapshotFences.validator(real.base.cluster,real.base.database,group,1,new byte[32],column).accept(command);var applied=CommandResult.decode(store.apply(next(store),command));if(command.sessionControl()!=null && loseHomeBinding){loseHomeBinding=false;throw new IOException("Lost native HOME binding reply");}return applied;}catch(Exception failure){throw new IOException(failure);}}
+                public CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID requested,byte[] key)throws IOException{try{assertEquals(column,requested);return CompletableFuture.completedFuture(value(key));}catch(Exception failure){return CompletableFuture.failedFuture(failure);}}
+                public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{try{if(command.sessionControl()!=null)catalogue.epochs.sessionControlAdmission(directory,group).accept(command);else RatisSnapshotFences.validator(real.base.cluster,real.base.database,group,1,new byte[32],column).accept(command);var applied=CommandResult.decode(store.apply(next(store),command));if(command.sessionControl()!=null && loseHomeBinding){loseHomeBinding=false;throw new IOException("Lost native HOME binding reply");}return CompletableFuture.completedFuture(applied);}catch(Exception failure){return CompletableFuture.failedFuture(failure);}}
+                public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{assertTrue(fresh);var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()!=ScopedTransactionRpc.SNAPSHOT_HOME_FENCE)throw new AssertionError("Unexpected HOME query");var identity=SnapshotHomeIdentity.decode(packet.body());return CompletableFuture.completedFuture(ScopedTransactionRpc.frame(packet.kind(),ByteBuffer.allocate(36).put(identity.digest()).putInt(-1).array()));}
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{assertTrue(fresh);var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()!=ScopedTransactionRpc.SNAPSHOT_HOME_FENCE)throw new AssertionError("Unexpected HOME query");var identity=SnapshotHomeIdentity.decode(packet.body());return ScopedTransactionRpc.frame(packet.kind(),ByteBuffer.allocate(36).put(identity.digest()).putInt(-1).array());}
             });fences=new RatisSnapshotFences(routed,column);
             long offset=1000L*index;var identity=new RatisSnapshotClient.Identity(UUID.randomUUID(),new OperationId(grant.sessionId(),grant.epoch(),offset),new OperationId(grant.sessionId(),grant.epoch(),offset+1));

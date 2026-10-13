@@ -30,6 +30,9 @@ class RatisSnapshotFencesTest {
         return new RatisRoutedClient.Transport() {
             public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return ScopedTransactionRpc.pointValue(wire.transaction(route,ScopedTransactionRpc.pointRequest(column,key),true),SnapshotFenceStatus.MAX_BYTES); }
             public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { return wire.command(route,command); }
+            public java.util.concurrent.CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key)throws IOException{return wire.transactionAsync(route,ScopedTransactionRpc.pointRequest(column,key),true).thenApply(reply->ScopedTransactionRpc.pointValue(reply,SnapshotFenceStatus.MAX_BYTES));}
+            public java.util.concurrent.CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{return wire.commandAsync(route,command);}
+
         };
     }
     @Test void lostExactRepliesStaleCasAndOrderedCaptureDecisionRemainDurable() throws Exception {
@@ -90,6 +93,7 @@ class RatisSnapshotFencesTest {
             var initial=initial(directory); var value=new AtomicReference<>(initial.encode()); var client=new AtomicReference<RatisRoutedClient>();
             var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { client.get().refresh(refreshed); return value.get(); }
+                public java.util.concurrent.CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key){client.get().refresh(refreshed);return java.util.concurrent.CompletableFuture.completedFuture(value.get());}
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError("Read-only fixture"); }
             };
             try (var routed=new RatisRoutedClient(directory,transport)) {
@@ -110,6 +114,8 @@ class RatisSnapshotFencesTest {
             var oversized=SnapshotFenceStatus.begin(new SnapshotFence(base.clusterId(),base.databaseId(),base.domainId(),base.fenceId(),base.homeGroup(),1,base.operation(),2,3,base.schemaDigest(),List.of(participant)));
             var calls=new AtomicInteger(); var transport=new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) { return null; }
+                public java.util.concurrent.CompletableFuture<byte[]> readAsync(RangeDescriptor route,UUID column,byte[] key){return java.util.concurrent.CompletableFuture.completedFuture(null);}
+                public java.util.concurrent.CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command){calls.incrementAndGet();throw new AssertionError("Must reject before RPC");}
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { calls.incrementAndGet(); throw new AssertionError("Must reject before RPC"); }
             };
             try (var routed=new RatisRoutedClient(directory,transport)) {
