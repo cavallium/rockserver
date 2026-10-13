@@ -123,6 +123,15 @@ This section and the remaining gates at the end describe the current branch.
   Six native cases include canceled lookups, unknown append, strict term exclusion
   and exact saved INSTALL replay while older native cleanup is blocked. The combined
   publication/proof gate passes 123 Ratis cases plus 13 unique core learner cases.
+- Committed apply now uses a dedicated bounded dispatcher before Ratis log reads
+  and callback materialization. Queued groups retain only scalar descriptors;
+  independent read/ordinary/protected credits survive actual native return and
+  cleanup. The current manifest persists this policy (node 3.75 GiB across lanes,
+  pool 1.875 GiB). Snapshot/stop waits pump continuations, pause/reload fences the
+  complete handoff by generation, and group ceilings reject before native birth.
+  Ninety-three distinct fork/native/runtime/schema/topology cases pass across the
+  focused gates. Opaque resident Ratis segment cache and follower intake accounting
+  remain outside these temporary-work credits.
 - Snapshot/CDC gap resynchronization passed a two-range native workflow using the
   original snapshot capture vector, atomic destination effects/checkpoints, lost
   replies and MERGE deduplication. A retention gap invalidates incomplete staging.
@@ -1175,8 +1184,8 @@ Relocation currently admits preparation/abort while its source stays writable.
   creates the database connection but does not attach the public export route.
   Establish adoption by the intended external consumers. Controlled snapshot/CDC
   resynchronization and public frozen-schema export migration are recorded above.
-- Complete shared committed-apply dispatch before callback materialization,
-  learner pressure/rate controls and running Raft-log/WAL runway policy. Qualify opaque native allocation bounds
+- Complete shared follower intake and resident Raft-log cache bounds, learner
+  pressure/rate controls and running Raft-log/WAL runway policy. Qualify opaque native allocation bounds
   for eager maintenance inventory where Java accounting alone is insufficient.
 - Verify all documented topology, schema, import, retirement and repair workflows
   together under the final source/configuration, then reconcile contracts and status.

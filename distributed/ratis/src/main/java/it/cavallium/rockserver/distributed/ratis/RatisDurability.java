@@ -13,6 +13,7 @@ public final class RatisDurability {
         var properties = new RaftProperties();
         RaftServerConfigKeys.setStorageDir(properties, List.of(logDirectory.toFile()));
         RaftServerConfigKeys.Log.setUseMemory(properties, false);
+        RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf(RatisRangeStateMachine.COMMITTED_SEGMENT_BYTES));
         RaftServerConfigKeys.Log.setUnsafeFlushEnabled(properties, false);
         RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, false);
         RaftServerConfigKeys.Log.StateMachineData.setSync(properties, true);

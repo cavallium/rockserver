@@ -90,7 +90,7 @@ import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Initial synchronous apply adapter; the pool owner drains Ratis before closing native handles. */
-public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.impl.LinearizableQueryStateMachine {
+public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.impl.LinearizableQueryStateMachine, org.apache.ratis.server.impl.CommittedApplyStateMachine {
     private RatisReferencedFiles referencedFiles;
     private static final org.apache.ratis.statemachine.StateMachine.DataApi NO_REFERENCED_DATA=new org.apache.ratis.statemachine.StateMachine.DataApi() {
         @Override public CompletableFuture<?> write(org.apache.ratis.proto.RaftProtos.LogEntryProto entry) {
@@ -1747,6 +1747,38 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private ProposalFootprints.CandidateLease exclusiveMetadataCandidate;
     private final Object gate = new Object();
     private final RaftGroup initialGroup;
+    private RatisCommittedApplyDispatcher.Group committedGroup;
+    private long committedMaximumEntryBytes;
+    public static final long COMMITTED_SEGMENT_BYTES=8L*1024*1024;
+    public static long committedReadWeight(long maximumEntryBytes){return Math.addExact(256,Math.multiplyExact(4,Math.addExact(Math.multiplyExact(2,maximumEntryBytes),COMMITTED_SEGMENT_BYTES)));}
+    public static long committedExecutionWeight(long wireBytes){return Math.addExact(256,Math.multiplyExact(4,Math.addExact(Math.multiplyExact(2,wireBytes),COMMITTED_SEGMENT_BYTES+2L*1024*1024+RatisRangeImportRecord.MAX_MANIFEST_BYTES+NativeSchemaInstallation.MAX_BYTES)));}
+    /** Production binding is fixed before any group initialization or committed materialization. */
+    public void committedApply(RatisCommittedApplyDispatcher dispatcher,UUID pool,long maximumEntryBytes){
+        if(getLifeCycleState()!=LifeCycle.State.NEW || committedGroup!=null || maximumEntryBytes<RatisSourceOutcomeRecord.MAX_BYTES)throw new IllegalStateException("Invalid committed apply binding");
+        committedMaximumEntryBytes=maximumEntryBytes;
+        committedGroup=dispatcher.register(store.ownership().owner().groupId(),pool,committedReadWeight(maximumEntryBytes),committedExecutionWeight(maximumEntryBytes),COMMITTED_SEGMENT_BYTES,this::describeCommitted);
+    }
+    @Override public org.apache.ratis.server.impl.CommittedApplyStateMachine.Admission committedApplyAdmission(){
+        if(committedGroup==null)throw new IllegalStateException("Production committed apply admission is not configured");return committedGroup;
+    }
+    private org.apache.ratis.server.impl.CommittedApplyStateMachine.Descriptor describeCommitted(org.apache.ratis.proto.RaftProtos.LogEntryProto entry){
+        long size=entry.getSerializedSize();
+        var lane=org.apache.ratis.server.impl.CommittedApplyStateMachine.Lane.PROTECTED;
+        if(entry.hasStateMachineLogEntry()){
+            var data=entry.getStateMachineLogEntry();
+            if(data.hasStateMachineEntry())size=Math.max(size,data.getStateMachineEntry().getLogEntryProtoSerializedSize());
+            if(size>committedMaximumEntryBytes)throw new IllegalStateException("Committed entry exceeds declared producer limit");
+            byte[] encoded=data.getLogData().toByteArray();
+            if(RatisSchemaInstallRecord.isInstall(encoded) || RatisReferencedFile.Request.isRequest(encoded) || RatisRangeImportRecord.isImport(encoded) || RatisTopologyFreezeRecord.isFreeze(encoded) || RatisParticipantRecord.isParticipant(encoded) && !RatisParticipantRecord.isFinalization(encoded) && !RatisParticipantRecord.isNegative(encoded) && !RatisParticipantRecord.isRetirement(encoded) || RatisSourceOutcomeRecord.isRecord(encoded) && encoded.length>=8 && ByteBuffer.wrap(encoded).getInt(4)==RatisSourceOutcomeRecord.Kind.CREDIT.ordinal())lane=org.apache.ratis.server.impl.CommittedApplyStateMachine.Lane.ORDINARY;
+            else{
+                try {var command=DistributedCommandCodec.decode(encoded);if((command.kind()==DistributedCommand.Kind.DATA && !(command.mutations().isEmpty() && command.predicates().isEmpty()) || command.kind()==DistributedCommand.Kind.COMMIT_ACCEPTED) && !snapshotHomeProgressInput(ByteBuffer.wrap(encoded)))lane=org.apache.ratis.server.impl.CommittedApplyStateMachine.Lane.ORDINARY;}
+                catch(IllegalArgumentException customRecord){/* Current custom completion records use the independent protected lane. */}
+            }
+        }
+        if(size>committedMaximumEntryBytes)throw new IllegalStateException("Committed entry exceeds declared producer limit");
+        try {return new org.apache.ratis.server.impl.CommittedApplyStateMachine.Descriptor(entry.getTerm(),entry.getIndex(),entry.getLogEntryBodyCase().getNumber(),lane,Math.max(committedReadWeight(committedMaximumEntryBytes),committedExecutionWeight(size)),java.security.MessageDigest.getInstance("SHA-256").digest(entry.toByteArray()),0);}
+        catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
+    }
     private final NativeRangeImage.Limits limits;
     private final SimpleStateMachineStorage snapshots = new SimpleStateMachineStorage();
     private volatile SingleFileSnapshotInfo durableSnapshot;
@@ -1764,7 +1796,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         byte[] coveredResult;
         RetainedProof retainedOwner;volatile boolean cleanupSettled,nativeCleaning;
         NativeApply(long index,Deferred deferred) {
-            this.index=index; this.deferred=deferred;
+            this.index=index; this.deferred=deferred; deferred.nativeOwner=true;
             byte[] bytes=deferred.encoded(); boolean importing=RatisRangeImportRecord.isImport(bytes),referencing=RatisReferencedFile.Request.isRequest(bytes),freezing=RatisTopologyFreezeRecord.isFreeze(bytes);
             topologyRecord=freezing ? RatisTopologyFreezeRecord.decode(bytes) : null;
             record=importing || referencing || freezing ? null : RatisSchemaInstallRecord.decode(bytes);
@@ -1783,7 +1815,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         void releaseRetainedIfDrained(){
             synchronized(admissions){
-                if(running || !cleanupSettled || retainedOwner==null)return;
+                if(running || !cleanupSettled)return;
+                deferred.releaseCommitted();
+                if(retainedOwner==null)return;
                 var owner=retainedOwner;retainedOwner=null;owner.nativeOwners--;
                 if(owner instanceof TopologyHold h && h.released)releaseTopologyHold(h);
                 else if(owner instanceof SchemaHold h && h.released)releaseSchemaHold(h);
@@ -1807,7 +1841,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private Path snapshotTmp;
     private Path recoveryDir;
     private record ConfigurationEntry(long term, byte[] bytes) {}
-    private record Deferred(long term, byte[] encoded, CompletableFuture<Message> future) {}
+    private static final class Deferred {
+        private final long term;private final byte[] encoded;private final CompletableFuture<Message> future;
+        private final org.apache.ratis.server.impl.CommittedApplyStateMachine.ApplyPermit committed;boolean nativeOwner;
+        Deferred(long term,byte[] encoded,CompletableFuture<Message> future,org.apache.ratis.server.impl.CommittedApplyStateMachine.ApplyPermit committed){this.term=term;this.encoded=encoded;this.future=future;this.committed=committed;}
+        long term(){return term;}byte[] encoded(){return encoded;}CompletableFuture<Message> future(){return future;}
+        void releaseCommitted(){if(committed!=null)committed.close();}
+    }
 
     public RatisRangeStateMachine(ReplicatedRangeStore store, RaftGroup initialGroup, NativeRangeImage.Limits limits) {
         this(store, initialGroup, limits, command -> {});
@@ -2066,7 +2106,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 getLifeCycle().transition(LifeCycle.State.PAUSING);
                 store.fence();
                 getLifeCycle().transition(LifeCycle.State.PAUSED);
+                if(committedGroup!=null && nativeApply!=null){nativeApply.suspended=true;nativeApply.stageReady=false;}
             }
+            if(committedGroup!=null)committedGroup.wakeup();
             capturedSnapshots.invalidate();
             awaitNativeReaders(java.time.Duration.ofSeconds(10));
             preserveInstallationImages();
@@ -2079,6 +2121,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     /** Must run before RaftServer.close(), whose updater waits for outstanding apply futures. */
     public void beginShutdown() {
+        if(committedGroup!=null)committedGroup.stop();
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
         try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
         try { capturedSnapshots.close(); } catch (Exception failure) { storageFailure=failure; }
@@ -2267,6 +2310,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     synchronized(admissions) {
                         if(importApplyHold!=null && Arrays.equals(importApplyHold.bytes,pending.encoded()))releaseImportApply(importApplyHold);
                     }
+                    if(!pending.nativeOwner)pending.releaseCommitted();
                     completions.add(new Completion(pending.future(), Message.valueOf(ByteString.copyFrom(result))));
                     coveredOperations.add(recovered.operation());
                 }
@@ -2304,6 +2348,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if(nativeApply!=null && nativeApply.topologyRecord!=null)nativeApply.topologyReplacing=false;
                 getLifeCycle().transition(LifeCycle.State.RUNNING);
+                if(committedGroup!=null)committedGroup.resume();
             } catch (Exception problem) { failure = failRecovery(problem); }
         }
         if (failure != null) {
@@ -2331,7 +2376,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             abandoned = java.util.List.copyOf(deferred.values());
             deferred.clear(); deferredBytes = 0;
         }
-        for (var pending : abandoned) pending.future().completeExceptionally(failure);
+        for (var pending : abandoned) {if(!pending.nativeOwner)pending.releaseCommitted();pending.future().completeExceptionally(failure);}
     }
 
     private void advance(long term, long index) {
@@ -2985,11 +3030,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     @Override public CompletableFuture<Message> applyTransaction(TransactionContext transaction) {
         Deferred completion = null;
+        var logEntry=transaction.getLogEntry();
+        org.apache.ratis.server.impl.CommittedApplyStateMachine.ApplyPermit committed=null;
+        boolean committedDeferred=false;
         Message result = null;
         Throwable failure = null;
         NativeApply schedule=null; CompletableFuture<Message> waiting=null; AppliedRecord appliedRecord=null;
         synchronized (gate) {
             try {
+                committed=committedGroup==null ? null : committedGroup.claim(logEntry.getTerm(),logEntry.getIndex(),getLifeCycleState()==LifeCycle.State.RUNNING);
                 if (storageFailure != null) requireHealthy();
                 var entry = transaction.getLogEntry();
                 if (pendingNoops.containsKey(entry.getIndex()) || configurations.containsKey(entry.getIndex())) {
@@ -3003,10 +3052,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 if (getLifeCycleState() != LifeCycle.State.RUNNING || nativeApply!=null || asyncNativeRecord(encoded)) {
                     if (pending == null) {
-                        if (deferred.size() >= 1024 || deferredBytes + encoded.length > 16L * 1024 * 1024) throw new IllegalStateException("Deferred apply budget exhausted");
-                        pending = new Deferred(entry.getTerm(), encoded, new CompletableFuture<>());
+                        if (committed==null && (deferred.size() >= 1024 || deferredBytes + encoded.length > 16L * 1024 * 1024)) throw new IllegalStateException("Deferred apply budget exhausted");
+                        pending = new Deferred(entry.getTerm(), encoded, new CompletableFuture<>(),committed);
                         deferred.put(entry.getIndex(), pending); deferredBytes += encoded.length;
                     }
+                    committedDeferred=true;
+                    if(committed!=null && pending.committed!=committed)committed.close();
                     waiting=pending.future().whenComplete((message, problem) -> releaseAdmission(transaction));
                     if (nativeApply==null && getLifeCycleState()==LifeCycle.State.RUNNING && deferred.firstKey()==entry.getIndex()) {
                         nativeApply=new NativeApply(entry.getIndex(),pending); schedule=nativeApply;
@@ -3026,12 +3077,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 }
                 }
             } catch (Throwable problem) {
-                storageFailure = problem;
+                if(!(problem instanceof org.apache.ratis.server.impl.CommittedApplyStateMachine.Retry) && !(problem instanceof org.apache.ratis.server.impl.CommittedApplyStateMachine.Stopped))storageFailure = problem;
                 failure = problem;
             }
         }
         if (waiting!=null && failure==null) { if (schedule!=null) scheduleNativeApply(schedule,false); return waiting; }
+        if(committed!=null && !committedDeferred)committed.close();
         releaseAdmission(transaction);
+        if(failure instanceof org.apache.ratis.server.impl.CommittedApplyStateMachine.Retry || failure instanceof org.apache.ratis.server.impl.CommittedApplyStateMachine.Stopped)return CompletableFuture.failedFuture(failure);
         if (failure != null) {
             failDeferred(failure);
             return CompletableFuture.failedFuture(failure);
@@ -3057,7 +3110,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private void scheduleNativeApply(NativeApply work,boolean ready) { scheduleNativeApply(work,ready,-1); }
     private void scheduleNativeApply(NativeApply work,boolean ready,long expectedTopologyGeneration) {
-        var executor=proofQueries;
+        ProofQueryExecutor executor=committedGroup==null ? proofQueries : (group,input,weight,coalesce,action)->committedGroup.executeNative(()->action.run(input));
         if (executor==null) { failNativeApply(work,new IOException("Bounded schema apply dispatcher is not configured"),expectedTopologyGeneration); return; }
         byte[] input=ByteBuffer.allocate(17+work.deferred.encoded().length).putLong(work.deferred.term()).putLong(work.index).put((byte)(ready ? 1 : 0)).put(work.deferred.encoded()).array();
         var topologyContinuation=new CompletableFuture<Void>();var topologyWaiting=new java.util.concurrent.atomic.AtomicBoolean();
@@ -3120,7 +3173,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var fence=store.lookupSchemaFence(work.record.header());
                 if (fence==null || !fence.position().equals(work.record.expectedFencePosition())) throw new IllegalArgumentException("Committed installation original fence changed");
                 if (!work.captureGate.ready()) {
-                    work.captureGate.readyFuture().whenComplete((unused,failure) -> { if (failure!=null) failNativeApply(work,failure); else scheduleNativeApply(work,true); });
+                    topologyWaiting.set(true);work.captureGate.readyFuture().whenComplete((unused,failure) -> { if (failure!=null) topologyContinuation.completeExceptionally(failure); else topologyContinuation.complete(null); });
                     return Message.EMPTY;
                 }
             }
@@ -3176,7 +3229,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var applied=applyRecord(new ApplyPosition(pending.term(),data),pending.encoded());
                 if (applied.activation()!=null || applied.topologyActivation()!=null) activations.add(applied);
                 synchronized (admissions) { var admission=admissions.get(applied.operation()); if (admission!=null) settleAdmission(admission); }
-                advance(pending.term(),data); deferred.remove(data); deferredBytes-=pending.encoded().length;
+                advance(pending.term(),data); deferred.remove(data); deferredBytes-=pending.encoded().length; pending.releaseCommitted();
                 completions.add(new Completion(pending.future(),Message.valueOf(ByteString.copyFrom(applied.result()))));
             }
         }
