@@ -12,6 +12,9 @@ import java.util.*;
 /** Native PUT-table qualification and immutable local original-file ownership. */
 public final class NativeRangeSstImport {
     public static final int MAX_ROW_BYTES=3*1024*1024;
+    public static final int MAX_TABLE_METADATA_BYTES=1024*1024;
+    public static final int MAX_TABLE_PROPERTY_ENTRIES=4096;
+    public static final int MAX_TABLE_PROPERTY_STRING_BYTES=64*1024;
     public enum Stage { ORIGINALS_FORCED, INTENT_FORCED, INTERVAL_RESET, BATCH_INGESTED, COLUMN_INGESTED, DATA_DURABLE, RECEIPT_FORCED }
     @FunctionalInterface public interface Observer { void at(Stage stage) throws IOException; }
     /** Trusted catalogue publication authority, supplied only after the matching global import is published. */
@@ -63,9 +66,11 @@ public final class NativeRangeSstImport {
     static void qualify(Path path,NativeSstImportManifest.File file,NativeSstImportManifest manifest,UUID column,DistributedSchema schema,Options options) throws IOException,RocksDBException {
         verifyBytes(path,file);
         try(var reader=new SstFileReader(options); var reads=new ReadOptions().setFillCache(false)) {
-            reader.open(path.toString()); reader.verifyChecksum(); var properties=reader.getTableProperties();
-            if(properties.getNumDeletions()!=0 || properties.getNumMergeOperands()!=0 || properties.getNumRangeDeletions()!=0 || properties.getNumEntries()!=file.entries())throw new IOException("Import requires exact materialized PUT-only SST");
-            if(!"leveldb.BytewiseComparator".equals(properties.getComparatorName()))throw new IOException("Import comparator differs");
+            var properties=reader.openBounded(path.toString(),MAX_TABLE_METADATA_BYTES,
+                    MAX_TABLE_PROPERTY_ENTRIES,MAX_TABLE_PROPERTY_STRING_BYTES);
+            reader.verifyChecksum();
+            if(properties.numDeletions!=0 || properties.numMergeOperands!=0 || properties.numRangeDeletions!=0 || properties.numEntries!=file.entries())throw new IOException("Import requires exact materialized PUT-only SST");
+            if(!"leveldb.BytewiseComparator".equals(properties.comparatorName))throw new IOException("Import comparator differs");
             long count=0; byte[] previous=null,first=null;var sizing=ByteBuffer.allocate(0);
             try(var iterator=reader.newIterator(reads)) {
                 for(iterator.seekToFirst();iterator.isValid();iterator.next()) {
