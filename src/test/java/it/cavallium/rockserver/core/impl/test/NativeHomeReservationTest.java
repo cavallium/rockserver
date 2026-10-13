@@ -25,6 +25,23 @@ class NativeHomeReservationTest {
     DistributedCommand cas(TransactionStatus before,TransactionStatus next,int step) { return helper.cas(new OperationId(next.origin().firstControl().sessionId(),next.origin().firstControl().epoch(),next.origin().firstControl().sequence()+step),before,next); }
     HomeRecovery abort(TransactionStatus before,long sequence) { return new HomeRecovery(HomeRecovery.Action.ABORT,helper.cas(new OperationId(helper.recoverySession,0,sequence),before,before.decide(TransactionStatus.Phase.ABORT)),null); }
     TransactionStatus row(NativeHomeRecoveryTest.Fixture f,TransactionStatus status)throws Exception { return TransactionStatus.decode(f.store.readCurrentPoint(helper.column,helper.key(status))); }
+    @Test void ordinaryHomeCannotRegisterExpiredBusinessUnderFreshControlGrant() throws Exception {
+        try(var f=helper.new Fixture(root)) {
+            configure(f);f.store.enableSessionControls();var initial=helper.initial(0);
+            var ledger=SessionEpochLedger.initial(initial.clusterId(),initial.databaseId(),0)
+                    .issue(helper.admin,1000).issue(initial.operation().sessionId(),100).issue(helper.user,1000);
+            var grant=ledger.grants().get(1);var control=ledger.grants().getLast();
+            var business=TransactionStatus.begin(initial.clusterId(),initial.databaseId(),initial.domainId(),initial.transactionId(),
+                    new OperationId(grant.sessionId(),grant.epoch(),0),initial.schemaEpoch(),initial.schemaDigest(),initial.planDigest(),initial.participants());
+            helper.apply(f,1,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,control.epoch(),0),RangeSessionControl.bind(ledger,grant,32),-1));
+            helper.apply(f,2,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,control.epoch(),1),RangeSessionControl.bind(ledger,control,32),0));
+            helper.apply(f,3,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,control.epoch(),2),RangeSessionControl.advance(ledger.advanceTime(200)),1));
+            var command=helper.cas(new OperationId(control.sessionId(),control.epoch(),0),null,business);
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,helper.apply(f,4,command).status());
+            assertNull(f.store.readCurrentPoint(helper.column,helper.key(business)));
+            assertEquals(0,f.store.homeRecoveryCapacity().reservedCount());
+        }
+    }
     @Test void registrationReservesWholeFutureStatusAndPromotionCannotDonateItsCreditToStaleAbort()throws Exception {
         try(var f=helper.new Fixture(root)) {
             configure(f);var reserved=reserve(0,2);var registration=cas(null,reserved,0);var estimate=f.store.estimateHomeRegistration(registration);assertEquals(4,estimate.additionalCount());assertTrue(estimate.additionalBytes()>=4L*ReplicatedRangeStore.HomeRecoveryCredit.TRANSITION_BYTES+33+128+2L*TransactionStatus.MAX_BYTES);assertEquals(CommandResult.Status.SUCCESS,helper.apply(f,1,registration).status());var capacity=f.store.homeRecoveryCapacity();assertEquals(4,capacity.reservedCount());assertEquals(CommandResult.Status.SUCCESS,helper.apply(f,2,registration).status());assertEquals(capacity.reservedBytes(),f.store.homeRecoveryCapacity().reservedBytes());

@@ -1772,7 +1772,7 @@ public final class ReplicatedRangeStore {
             var initial=SnapshotFenceStatus.decode(mutation.value());
             requireSnapshotHomeUser(context,mutation.key(),initial);
             if (initial.phase()!=SnapshotFenceStatus.Phase.INSTALLING || initial.generation()!=0) throw new IllegalArgumentException("Snapshot HOME registration is not initial");
-            return initial.fence().operation().epoch()<minimumSessionEpoch(null);
+            return homeIdentityExpired(initial.fence().operation(),false);
         }
         var initial=TransactionStatus.decode(mutation.value());
         var expected=command.predicates().getFirst().expectedValue();
@@ -1782,7 +1782,7 @@ public final class ReplicatedRangeStore {
             if(!before.reserved() || initial.phase()!=TransactionStatus.Phase.PREPARING)return false;
             initial.requireSuccessorOf(before);
         }
-        if(initial.operation().epoch()<minimumSessionEpoch(null))return true;
+        if(homeIdentityExpired(initial.operation(),false))return true;
         if(initial.origin()!=null) {
             var authority=sessionAuthority();
             if(authority!=null) {

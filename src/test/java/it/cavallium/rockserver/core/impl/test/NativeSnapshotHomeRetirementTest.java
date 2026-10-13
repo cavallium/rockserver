@@ -32,6 +32,23 @@ class NativeSnapshotHomeRetirementTest {
     void configure(NativeHomeRecoveryTest.Fixture f) { f.store.configureSnapshotHome(cluster,database,helper.column); }
     void floor(NativeHomeRecoveryTest.Fixture f,int index) throws Exception { helper.apply(f,index,DistributedCommand.advanceSessionEpochFloor(helper.group,1,new byte[32],new OperationId(helper.admin,2,index),2)); }
 
+    @Test void snapshotHomeCannotRegisterIndividuallyExpiredBusinessUnderFreshControlGrant() throws Exception {
+        try(var f=helper.new Fixture(root)) {
+            configure(f);f.store.enableSessionControls();var business=fence(2);
+            var ledger=SessionEpochLedger.initial(cluster,database,0)
+                    .issue(helper.admin,1000).issue(business.operation().sessionId(),100).issue(helper.user,1000);
+            var grant=ledger.grants().get(1);var control=ledger.grants().getLast();
+            helper.apply(f,1,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,control.epoch(),0),RangeSessionControl.bind(ledger,grant,32),-1));
+            helper.apply(f,2,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,control.epoch(),1),RangeSessionControl.bind(ledger,control,32),0));
+            helper.apply(f,3,DistributedCommand.sessionControl(helper.group,1,new byte[32],new OperationId(helper.admin,control.epoch(),2),RangeSessionControl.advance(ledger.advanceTime(200)),1));
+            var initial=SnapshotFenceStatus.begin(business);
+            var command=new DistributedCommand(helper.group,1,new byte[32],new OperationId(control.sessionId(),control.epoch(),0),
+                    List.of(new Mutation(Mutation.Kind.PUT,helper.column,key(business),initial.encode())),List.of(new KeyPredicate(helper.column,key(business),null)));
+            assertEquals(CommandResult.Status.SESSION_EXPIRED,helper.apply(f,4,command).status());
+            assertNull(f.store.readCurrentPoint(helper.column,key(business)));
+        }
+    }
+
     @Test void completeAndAbortCollectWithoutRewritingHistoricalReceiptsAndSurvivePinsReopenAndImage() throws Exception {
         for (boolean complete:new boolean[]{false,true}) {
             var source=root.resolve("source-"+complete); var image=root.resolve("image-"+complete); var fence=fence(1); var initial=SnapshotFenceStatus.begin(fence); var consumed=consumed(fence,complete); var retirement=retirement(consumed); var original=cas(0,null,initial);
