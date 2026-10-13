@@ -247,6 +247,7 @@ public final class NativeRangeImage {
                         try {
                             if (key.length!=16 || value.length>it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.MAX_BYTES) throw new IllegalArgumentException("Invalid snapshot HOME row size");
                             var fence=it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.decode(value).fence();
+                            tracker.chargeHomeStatus(ReplicatedRangeStore.homeSnapshotStatusBytes(fence));
                             var id=ByteBuffer.wrap(key);
                             if (!column.equals(snapshotHome.column()) || !new UUID(id.getLong(),id.getLong()).equals(fence.fenceId()) || !fence.clusterId().equals(snapshotHome.cluster()) || !fence.databaseId().equals(snapshotHome.database()) || !fence.homeGroup().equals(header.owner().groupId()) || fence.homeEpoch()!=header.owner().epoch()) throw new IllegalArgumentException("Snapshot HOME image USER identity differs");
                         } catch (IllegalArgumentException failure) { throw new IOException("Invalid snapshot HOME image USER",failure); }
@@ -428,6 +429,9 @@ public final class NativeRangeImage {
         private int importFileReceipts;
         private long importFileReceiptCount;
         private boolean acceptSchema(byte[] digest) { referencedSchemas.add(digest.clone()); return true; }
+        private int homeStatusRows;
+        private long homeStatusBytes;
+        void chargeHomeStatus(long bytes) throws IOException {homeStatusBytes=Math.addExact(homeStatusBytes,bytes);if(++homeStatusRows>ReplicatedRangeStore.MAX_HOME_STATUS_ROWS || homeStatusBytes>ReplicatedRangeStore.MAX_HOME_STATUS_BYTES)throw new IOException("HOME USER image status reservation capacity exceeded");}
         private int homeCreditCount;
         private final Map<UUID,ReplicatedRangeStore.HomeRecoveryCredit> homeCredits=new HashMap<>();
         private final Map<OperationId,HomeRecoveryReceipt> homeRecoveries=new HashMap<>();
@@ -782,6 +786,7 @@ public final class NativeRangeImage {
             byte[] expected=ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
             if (!status.clusterId().equals(context.cluster()) || !status.databaseId().equals(context.database()) || !Arrays.equals(key,expected)) throw new IOException("Qualified HOME image user identity differs");
             if(status.reserved() && (status.origin()==null || status.consumed() || !status.participants().isEmpty()))throw new IOException("Invalid reserved HOME image row");
+            chargeHomeStatus(ReplicatedRangeStore.HOME_TRANSACTION_STATUS_BYTES);
             var credit=homeCredits.get(id);
             if (ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)>0 && (credit==null || !credit.current().equals(status)) || ReplicatedRangeStore.HomeRecoveryCredit.remaining(status)==0 && credit!=null) throw new IOException("Unfinished HOME image user row lacks exact promise");
             if (credit!=null) matched.add(id);
