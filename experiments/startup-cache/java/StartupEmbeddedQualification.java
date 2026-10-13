@@ -68,13 +68,16 @@ public final class StartupEmbeddedQualification {
         var c = resources.snapshotCaches();
         return c.isEmpty() ? Map.of() : stats(c.getFirst(), c.getLast());
     }
-    private static int captureIdle(RocksDBLoader.StartupResources resources) throws Exception {
+    private static void awaitCapturePermission(RocksDBLoader.StartupResources resources) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         // Observe actual controller feedback; never force a healthy sample or override native pressure.
         while (resources.snapshotCaches().stream().anyMatch(c -> !c.stats().contains("\"feedback\":0"))) {
             if (System.nanoTime() >= deadline) throw new IllegalStateException("Controller did not permit idle capture: " + cacheStats(resources));
             Thread.sleep(25);
         }
+    }
+    private static int captureIdle(RocksDBLoader.StartupResources resources) throws Exception {
+        awaitCapturePermission(resources);
         var c = resources.snapshotCaches();
         return captureBoth(c.getFirst(), c.getLast());
     }
@@ -170,6 +173,8 @@ public final class StartupEmbeddedQualification {
                 output.put("fixture_l0_files", files.stream().filter(f -> f.level() == 0).count());
                 if (files.isEmpty() || files.stream().anyMatch(f -> f.level() == 0))
                     throw new IllegalStateException("Fixture must contain compacted non-L0 SSTs");
+                // Native sampling rejects observations under pressure: wait before the existing single prime pass.
+                awaitCapturePermission(resources);
                 for (int i = 0; i < Math.min(count, 4096); i++) verifyValue(api.get(0, column, keys(key(i)), RequestType.current()), i);
                 int status = captureIdle(resources);
                 if (status != 0) throw new IllegalStateException("Seed durable capture failed: " + status);
