@@ -7,6 +7,8 @@ from pathlib import Path
 import platform
 import shutil
 import statistics
+import signal
+import time
 import subprocess
 import tempfile
 
@@ -25,6 +27,8 @@ def main():
     parser.add_argument("--classpath", required=True, help="Built production classes and candidate JNI/runtime dependencies")
     parser.add_argument("--output", required=True, type=Path, help="New retained evidence directory")
     parser.add_argument("--disk", action="append", required=True, type=Path, help="Task-owned mkdtemp parent, repeat for HDD/SSD")
+    parser.add_argument("--cache-disk", action="append", required=True, type=Path, help="Separate faster cache mkdtemp parent; one per --disk, in matching order")
+    parser.add_argument("--capture-period-ms", type=int, default=300000, help="Production default300000;30000 explicitly accelerates active-capture qualification")
     parser.add_argument("--dataset-mib", type=int, default=512)
     parser.add_argument("--operations", type=int, default=1024, help="Fixed operations per reader; two readers, every fourth operation is eight-key MultiGet")
     parser.add_argument("--pairs", type=int, default=3)
@@ -39,6 +43,10 @@ def main():
     for sampling in (args.data_sample_every, args.metadata_sample_every):
         if sampling < 1 or sampling > 65536 or sampling & (sampling - 1):
             parser.error("Sampling must be a power of two in 1..65536")
+    if len(args.cache_disk) != len(args.disk):
+        parser.error("Provide exactly one matching --cache-disk for each --disk")
+    if not 100 <= args.capture_period_ms <= 86400000:
+        parser.error("Capture period must be100..86400000ms")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     source = Path(__file__).parent / "java" / "StartupProductionQualification.java"
@@ -76,7 +84,10 @@ def main():
                                           "admission_mechanism_gate": "Every candidate pair requires foreground overlap and completed FindTable calls",
                                           "resident_hotset_gate": "Hot point-read p99 protected at same1.20ratio; every returned value verified despite concurrent read-driven cache turnover",
                                           "note": "Thresholds classify this component workload only; spread crossing thresholds is inconclusive. Histograms report eight buckets per power of two, upper bounds."},
-                "retained_fixture_roots": []}
+                "capture_period_ms": args.capture_period_ms,
+                "capture_period_scope": "production default" if args.capture_period_ms == 300000 else "explicit accelerated qualification override; not production default",
+                "writer": "Target maximum128writes/sec, cyclic128deterministic keys, continues until fixed reader workload ends",
+                "retained_fixture_roots": [], "retained_cache_roots": []}
     write_json(out / "manifest.json", manifest)
     command = ["javac", "--release", "25", "-Xlint:all,-restricted", "-Werror", "-cp", args.classpath,
                "-d", str(classes), str(source)]
@@ -93,16 +104,41 @@ def main():
     environment = {k: v for k, v in os.environ.items() if not k.startswith(("RSHC_TEST_", "ROCKSDB_TEST_"))}
 
     def java(label, db, cache, mode):
-        command = ["/usr/bin/time", "-v", "-o", str(out / (label + ".resources.txt")),
-                   "java", "-Xms32m", "-Xmx256m", "--enable-native-access=ALL-UNNAMED",
+        command = ["java", "-Xms32m", "-Xmx256m", "--enable-native-access=ALL-UNNAMED",
                    "-cp", str(classes) + os.pathsep + args.classpath,
                    "it.cavallium.rockserver.core.impl.rocksdb.StartupProductionQualification",
-                   str(db), str(cache), mode, str(args.dataset_mib), str(args.operations), str(not args.buffered_reads).lower(), str(args.data_sample_every), str(args.metadata_sample_every)]
+                   str(db), str(cache), mode, str(args.dataset_mib), str(args.operations), str(not args.buffered_reads).lower(), str(args.data_sample_every), str(args.metadata_sample_every), str(args.capture_period_ms)]
         write_json(out / (label + ".command.json"), command)
         with (out / (label + ".stdout")).open("w") as stdout, (out / (label + ".stderr")).open("w") as stderr:
-            completed = subprocess.run(command, stdout=stdout, stderr=stderr, timeout=args.timeout, env=environment)
-        (out / (label + ".exit")).write_text(str(completed.returncode) + "\n")
-        if completed.returncode:
+            started = time.monotonic()
+            process = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=environment, start_new_session=True)
+            io_counters = {}
+            timed_out = False
+            while True:
+                pid, status, usage = os.wait4(process.pid, os.WNOHANG)
+                if pid:
+                    process.returncode = os.waitstatus_to_exitcode(status)
+                    break
+                try:
+                    for line in Path(f"/proc/{process.pid}/io").read_text().splitlines():
+                        key, value = line.split(":", 1)
+                        io_counters[key] = max(io_counters.get(key, 0), int(value))
+                except FileNotFoundError:
+                    pass
+                if time.monotonic() - started > args.timeout and not timed_out:
+                    timed_out = True
+                    os.killpg(process.pid, signal.SIGKILL)
+                time.sleep(.05)
+        write_json(out / (label + ".resources.json"), {
+            "wall_seconds": time.monotonic() - started, "user_cpu_seconds": usage.ru_utime,
+            "system_cpu_seconds": usage.ru_stime, "peak_rss_kib": usage.ru_maxrss,
+            "io_input_operations": usage.ru_inblock, "io_output_operations": usage.ru_oublock,
+            "voluntary_context_switches": usage.ru_nvcsw, "involuntary_context_switches": usage.ru_nivcsw,
+            "sampled_process_io_cumulative_max": io_counters,
+            "scope": "Whole child JVM including library loading/open/capture/close; procIO samples may miss final increments",
+            "timeout": timed_out})
+        (out / (label + ".exit")).write_text(str(process.returncode) + "\n")
+        if process.returncode:
             raise RuntimeError(f"{label} failed: retained diagnostics at {out}")
         reports = [json.loads(line) for line in (out / (label + ".stdout")).read_text().splitlines() if line.startswith("{")]
         if len(reports) != 1 or reports[0].get("data_mismatches") != 0:
@@ -156,12 +192,13 @@ def main():
             mechanism_exercised = all(
                 (mode not in ("cache", "both") or
                  (report.get("actual_secondary_hits", 0) > 0 and report.get("durable_final_capture")
+                  and report["foreground_elapsed_ns"] >= 2 * args.capture_period_ms * 1_000_000
                   and all(report.get("periodic_published_snapshots_during_foreground", {}).get(role, 0) > 0
                           for role in ("data", "metadata"))))
                 and (mode not in ("admission", "both") or
                      (report["opening_overlap"]["operations"] > 0 and
                       report.get("admission_before_close", {}).get("completed_find_table", 0) > 0))
-                for report in candidate)
+                for report in candidate) and all(report.get("writes_during_read_tasks", 0) >= 128 for report in candidate)
             if not mechanism_exercised:
                 performance = "INCONCLUSIVE_MECHANISM_NOT_EXERCISED"
             comparisons.append({"disk": disk_index, "mechanism_exercised": mechanism_exercised, "mode": mode, "mechanism_evidence": mechanisms, "paired_throughput_ratios": gains,
@@ -182,7 +219,17 @@ def run_disks(java, args, out, manifest, runs):
         manifest["retained_fixture_roots"].append(str(root))
         write_json(out / "manifest.json", manifest)
         (out / f"disk-{disk_index}.txt").write_text(subprocess.run(["findmnt", "-T", str(root)], capture_output=True, text=True, check=True).stdout)
-        seed_db, seed_cache = root / "seed-db", root / "seed-cache"
+        cache_disk = args.cache_disk[disk_index].resolve(strict=True)
+        if cache_disk == disk:
+            raise RuntimeError("Use a separate faster cache parent than DB parent")
+        if shutil.disk_usage(cache_disk).free < 1024**3:
+            raise RuntimeError("Cache disk free-space reserve insufficient")
+        cache_root = Path(tempfile.mkdtemp(prefix="rockserver-startup-cache-qualification-", dir=cache_disk))
+        (cache_root / ".task-owned").write_text("startup-production-qualification-cache-v1\n")
+        manifest["retained_cache_roots"].append(str(cache_root))
+        write_json(out / "manifest.json", manifest)
+        (out / f"cache-disk-{disk_index}.txt").write_text(subprocess.run(["findmnt", "-T", str(cache_root)], capture_output=True, text=True, check=True).stdout)
+        seed_db, seed_cache = root / "seed-db", cache_root / "seed-cache"
         java(f"disk-{disk_index}-seed", seed_db, seed_cache, "seed")
         fixture = []
         for file in sorted(seed_db.iterdir()):
@@ -195,7 +242,7 @@ def run_disks(java, args, out, manifest, runs):
                 label = f"disk-{disk_index}-pair-{pair}-{mode}"
                 run_root = root / label
                 run_root.mkdir()
-                db, cache = run_root / "db", run_root / "cache"
+                db, cache = run_root / "db", cache_root / label
                 shutil.copytree(seed_db, db)
                 if mode in ("cache", "both"):
                     shutil.copytree(seed_cache, cache)
@@ -211,6 +258,9 @@ def run_disks(java, args, out, manifest, runs):
                     if previous.parent != root or not (root / ".task-owned").is_file():
                         raise RuntimeError("Task fixture ownership lost")
                     shutil.rmtree(previous)
+                    previous_cache = cache_root / f"disk-{disk_index}-pair-{pair-1}-{mode}"
+                    if previous_cache.exists() and (cache_root / ".task-owned").is_file():
+                        shutil.rmtree(previous_cache)
 
 
 if __name__ == "__main__":

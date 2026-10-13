@@ -6,6 +6,8 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.rocksdb.*;
 import it.cavallium.rockserver.core.impl.StartupIoPolicy;
 import it.cavallium.rockserver.core.impl.StartupReadCompletions;
@@ -95,11 +97,11 @@ public final class StartupProductionQualification {
             return new StartupIoPolicy.InputSample(epoch, now, true, true, 3, active, queued, accepted, terminal, false, reads);
         }
     }
-    static SnapshotCache snapshotCache(Path path, boolean seed, boolean metadata, int sampling) {
+    static SnapshotCache snapshotCache(Path path, boolean seed, boolean metadata, int sampling, long periodMs) {
         return new SnapshotCache(new NativeStartupBridge.CacheConfig(1, -1, (metadata ? 4 : 28) * MIB,
                 0, (metadata ? 12 : 36) * MIB, (metadata ? 4 : 12) * MIB,
                 metadata ? 2048 : 8192, (metadata ? 2 : 4) * MIB, 256 * 1024,
-                64 * MIB, 2 * MIB, 5000, seed ? 0 : 500, 8 * MIB, 8 * MIB,
+                64 * MIB, 2 * MIB, 5000, seed ? 0 : periodMs, 8 * MIB, 8 * MIB,
                 sampling, 2, .5, path, metadata ? "metadata" : "data"));
     }
     static Map<String, String> stats(SnapshotCache data, SnapshotCache metadata) {
@@ -109,8 +111,17 @@ public final class StartupProductionQualification {
         int dataStatus = capture(data).status(), metadataStatus = capture(metadata).status();
         return Math.max(dataStatus, metadataStatus);
     }
+    static void flushToLevelOne(RocksDB db, FlushOptions flush) throws RocksDBException {
+        db.flush(flush);
+        var inputs = db.getLiveFilesMetaData().stream().filter(f -> f.level() == 0)
+                .map(LiveFileMetaData::fileName).toList();
+        if (!inputs.isEmpty()) try (var compact = new CompactionOptions().setOutputFileSizeLimit(16 * MIB)
+                .setCompression(CompressionType.NO_COMPRESSION); var job = new CompactionJobInfo()) {
+            db.compactFiles(compact, inputs, 1, 0, job);
+        }
+    }
     public static void main(String[] args) throws Exception {
-        if (args.length != 8) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB readOperations directReads dataSampleEvery metadataSampleEvery");
+        if (args.length != 9) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB readOperations directReads dataSampleEvery metadataSampleEvery capturePeriodMs");
         Path dbPath = Path.of(args[0]), cachePath = Path.of(args[1]);
         String mode = args[2];
         if (!Set.of("seed", "none", "cache", "admission", "both", "verify").contains(mode)) throw new IllegalArgumentException(mode);
@@ -120,6 +131,8 @@ public final class StartupProductionQualification {
         int mib = Integer.parseInt(args[3]), operations = Integer.parseInt(args[4]);
         boolean direct = Boolean.parseBoolean(args[5]);
         int dataSampling = Integer.parseInt(args[6]), metadataSampling = Integer.parseInt(args[7]);
+        long capturePeriodMs = Long.parseLong(args[8]);
+        if (capturePeriodMs < 100 || capturePeriodMs > 86400000) throw new IllegalArgumentException("Capture period bound");
         if (mib < 1 || mib > 1024 || operations < 1 || operations > 1_000_000) throw new IllegalArgumentException("Unbounded fixture");
         int keys = Math.toIntExact(mib * MIB / VALUE_BYTES);
         if (seed && Files.exists(dbPath)) throw new IllegalArgumentException("Seed needs new database path");
@@ -130,6 +143,8 @@ public final class StartupProductionQualification {
         output.put("primary_cache_capacity_bytes", CAPACITY);
         output.put("cache_geometry", "AutoHyperClockCache data28MiB/metadata4MiB, estimatedEntryCharge0/shards-1; matched baseline/candidate");
         output.put("data_sample_every", dataSampling); output.put("metadata_sample_every", metadataSampling);
+        output.put("capture_period_ms", capturePeriodMs);
+        output.put("capture_period_override", capturePeriodMs != 300000);
         output.put("feedback_policy_window_ns", 1_000_000_000L);
         output.put("snapshot_budget_bytes", 16 * MIB); output.put("disk_budget_bytes", 48 * MIB);
         var hotPoint = new Histogram(); var coldPoint = new Histogram();
@@ -137,13 +152,13 @@ public final class StartupProductionQualification {
         var overlap = new Histogram(); var steady = new Histogram();
         var samples = Collections.synchronizedList(new ArrayList<Map<String, Object>>());
         var running = new AtomicBoolean(true);
-        SnapshotCache snapshot = cacheEnabled ? snapshotCache(cachePath, seed, false, dataSampling) : null;
-        SnapshotCache metadataSnapshot = cacheEnabled ? snapshotCache(cachePath, seed, true, metadataSampling) : null;
+        SnapshotCache snapshot = cacheEnabled ? snapshotCache(cachePath, seed, false, dataSampling, capturePeriodMs) : null;
+        SnapshotCache metadataSnapshot = cacheEnabled ? snapshotCache(cachePath, seed, true, metadataSampling, capturePeriodMs) : null;
         try (Cache cache = snapshot != null ? snapshot : new HyperClockCache(28 * MIB, 0, -1, false);
              Cache metadataCache = metadataSnapshot != null ? metadataSnapshot : new HyperClockCache(4 * MIB, 0, -1, false);
              Options options = new Options().setCreateIfMissing(seed).setErrorIfExists(seed)
                      .setCompressionType(CompressionType.NO_COMPRESSION).setDisableAutoCompactions(true)
-                     .setWriteBufferSize(8 * MIB).setMaxOpenFiles(-1).setMaxFileOpeningThreads(4)
+                     .setWriteBufferSize((seed ? 16 : 8) * MIB).setMaxOpenFiles(-1).setMaxFileOpeningThreads(4)
                      .setOpenFilesAsync(!seed && !checking).setSkipStatsUpdateOnDbOpen(!seed)
                      .setUseDirectReads(direct).setTableFormatConfig(new BlockBasedTableConfig().setBlockCache(cache).setMetadataBlockCache(metadataCache)
                              .setCacheIndexAndFilterBlocks(true));
@@ -161,9 +176,11 @@ public final class StartupProductionQualification {
                         if (seed) {
                             for (int i = 0; i < keys; i++) {
                                 db.put(writeOptions, key(i), value(i));
-                                if ((i + 1) % 2048 == 0) db.flush(flush);
+                                if ((i + 1) % 2048 == 0) flushToLevelOne(db, flush);
                             }
-                            db.flush(flush);
+                            flushToLevelOne(db, flush);
+                            output.put("fixture_live_sst_files", db.getLiveFilesMetaData().size());
+                            output.put("fixture_l0_files", db.getLiveFilesMetaData().stream().filter(f -> f.level() == 0).count());
                             for (int i = 0; i < Math.min(keys, 4096); i++) verify(db.get(key(i)), i);
                             int status = captureBoth(snapshot, metadataSnapshot);
                             output.put("capture_status", status);
@@ -181,6 +198,9 @@ public final class StartupProductionQualification {
                             var completions = new StartupReadCompletions();
                             var policy = new StartupIoPolicy();
                             var openingSampled = new AtomicBoolean();
+                            var readersRemaining = new AtomicInteger(2);
+                            var completedWrites = new AtomicLong();
+                            var writesDuringReads = new AtomicLong();
                             Future<?> monitor = pool.submit(() -> {
                                 try {
                                     long lastEpoch = -1;
@@ -188,6 +208,8 @@ public final class StartupProductionQualification {
                                         long now = System.nanoTime();
                                         var sample = new LinkedHashMap<String, Object>();
                                         sample.put("elapsed_ns", now - started);
+                                        sample.put("completed_writes", completedWrites.get());
+                                        sample.put("writes_during_read_tasks", writesDuringReads.get());
                                         long epoch = 1 + (now - started) / 1_000_000_000L;
                                         if (epoch != lastEpoch) {
                                             var reads = completions.snapshot(epoch);
@@ -256,14 +278,17 @@ public final class StartupProductionQualification {
                                             }
                                         }
                                     } catch (Exception failure) { throw new CompletionException(failure); }
-                                    finally { foreground.finish(); }
+                                    finally { readersRemaining.decrementAndGet(); foreground.finish(); }
                                 }));
                             }
                             foreground.accept();
                             tasks.add(pool.submit(() -> {
                                 foreground.start();
                                 try {
-                                    for (int i = 0; i < WRITES; i++) {
+                                    for (int sequence = 0; sequence < WRITES || readersRemaining.get() > 0; sequence++) {
+                                        int i = sequence % WRITES;
+                                        long cycleStarted = System.nanoTime();
+                                        boolean readersActive = readersRemaining.get() > 0;
                                         byte[] nativeKey = writeKey(i), nativeValue = value(~i);
                                         long before = System.nanoTime(); db.put(writeOptions, nativeKey, nativeValue);
                                         writes.record(System.nanoTime() - before);
@@ -272,6 +297,10 @@ public final class StartupProductionQualification {
                                         try { actual = db.get(nativeKey); failed = false; }
                                         finally { completions.recordPoint(System.nanoTime() - before, failed); }
                                         verify(actual, ~i);
+                                        completedWrites.incrementAndGet();
+                                        if (readersActive) writesDuringReads.incrementAndGet();
+                                        long pause = 1_000_000_000L / 128 - (System.nanoTime() - cycleStarted);
+                                        if (pause > 0) TimeUnit.NANOSECONDS.sleep(pause);
                                     }
                                 } catch (Exception failure) { throw new CompletionException(failure); }
                                 finally { foreground.finish(); }
@@ -285,6 +314,9 @@ public final class StartupProductionQualification {
                                 monitor.get();
                             }
                             output.put("foreground_elapsed_ns", foregroundEnded - started);
+                            output.put("completed_writes", completedWrites.get());
+                            output.put("writes_during_read_tasks", writesDuringReads.get());
+                            output.put("writer_target_max_ops_per_second", 128);
                             output.put("point", point.report()); output.put("hot_point", hotPoint.report()); output.put("cold_point", coldPoint.report()); output.put("multi_get", multi.report()); output.put("writes", writes.report());
                             output.put("opening_overlap", overlap.report()); output.put("steady_or_unclassified", steady.report());
                             output.put("overlap_classification", budget == null ? "unclassified: admission disabled" : "approximate: latest100ms admission sample");
