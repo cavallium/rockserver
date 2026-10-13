@@ -174,7 +174,7 @@ public final class StartupEmbeddedQualification {
         long period = Long.parseLong(args[8]);
         int workloadSeconds = Integer.parseInt(args[9]);
         if (workloadSeconds < 10 || workloadSeconds > 3600) throw new IllegalArgumentException("Workload timeout bound");
-        if (mib < 1 || mib > 1024 || operations < 1 || operations > 1_000_000 || period < 100 || period > 86400000)
+        if (mib < 1 || mib > 8192 || operations < 1 || operations > 1_000_000 || period < 100 || period > 86400000)
             throw new IllegalArgumentException("Unbounded workload");
         int count = Math.toIntExact(mib * MIB / VALUE_BYTES);
         int seedHotKeys = Integer.parseInt(args[10]), seedPasses = Integer.parseInt(args[11]);

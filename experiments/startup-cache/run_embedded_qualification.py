@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import tempfile
@@ -26,6 +27,38 @@ def save(path, value):
 def tree_manifest(root):
     return [{"name": str(p.relative_to(root)), "bytes": p.stat().st_size, "sha256": sha256(p)}
             for p in sorted(root.rglob("*")) if p.is_file()]
+
+
+def closed_fixture_bytes(root):
+    if not root.is_dir() or root.is_symlink():
+        raise RuntimeError(f"Unsupported task fixture directory: {root}")
+    logical = allocated = regular_files = sst_files = 0
+    for file in root.rglob("*"):
+        info = file.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"Unsupported nonregular task fixture entry: {file}")
+        logical += info.st_size
+        allocated += info.st_blocks * 512
+        regular_files += 1
+        sst_files += file.suffix == ".sst"
+    return {"logical_regular_file_bytes": logical, "allocated_regular_file_bytes": allocated,
+            "regular_file_count": regular_files, "sst_file_count_on_disk": sst_files,
+            "allocation_scope": "Sum of per-file st_blocks*512, without inode/extent deduplication; not device consumption"}
+
+
+def require_data_clone_space(destination, owner, accounting, remaining_bytes):
+    if destination.parent != owner or (owner / ".task-owned").read_text() != "startup-embedded-qualification-v1\n":
+        raise RuntimeError("Data clone guard lost task-owned path identity")
+    clone_bytes = max(accounting["logical_regular_file_bytes"], accounting["allocated_regular_file_bytes"])
+    free = shutil.disk_usage(owner).free
+    required = clone_bytes + remaining_bytes
+    if free < required:
+        raise RuntimeError(f"Insufficient data clone space: {free} available, {required} required")
+    return {"destination": str(destination), "available_bytes_before_copy": free,
+            "conservative_clone_bytes": clone_bytes, "declared_remaining_data_and_headroom_bytes": remaining_bytes,
+            "required_available_bytes": required}
 
 
 def classpath_resource(entries, resource):
@@ -75,7 +108,7 @@ def main():
     read_ceiling_bytes = a.read_ceiling_mib * 1024**2
     if len(a.disk) != len(a.cache_disk):
         p.error("Supply a separate matching cache parent for every DB parent")
-    if not (1 <= a.dataset_mib <= 1024 and 1 <= a.operations <= 1000000 and 1 <= a.pairs <= 10
+    if not (1 <= a.dataset_mib <= 8192 and 1 <= a.operations <= 1000000 and 1 <= a.pairs <= 10
             and 10 <= a.timeout <= 3600 and 100 <= a.capture_period_ms <= 86400000):
         p.error("Workload or timeout exceeds supported bounds")
     for sample in (a.data_sample_every, a.metadata_sample_every):
@@ -117,6 +150,10 @@ def main():
                 "read_ceiling": {"mib_per_second": a.read_ceiling_mib, "bytes_per_second": read_ceiling_bytes,
                     "roles": ["data", "metadata"], "scope": "unlimited, matching production default" if read_ceiling_bytes == 0 else "explicit standalone benchmark profile"},
                 "startup_window_scope": "Separate public request-start window after EmbeddedConnection open returns; service latency includes queue/native/future wait; full-workload thresholds unchanged",
+                "data_disk_reservation": {"initial_required_bytes": 5 * a.dataset_mib * 1024**2 + 1024**3,
+                    "remaining_data_and_headroom_bytes": a.dataset_mib * 1024**2 + 1024**3,
+                    "clone_scope": "Measured closed-seed regular logical/allocated bytes; max used conservatively before data copies, never treated as deduplicated device consumption"},
+                "fd_resource_scope": "At most one parent /proc/<pid>/fd sample per second; observed peak can miss short peaks; unavailable/exited samples are not zero",
                 "ownership": "New task-owned roots. Sequential exited child JVMs; immutable seed backups restore the same canonical DB/cache paths before every trial. No namespace rebasing.",
                 "feedback": "Actual production loader/controller, native-call completion cohorts and scheduler pools. Observer reads counters every100ms; never publishes feedback.",
                 "bulk_semantics": "Public async eight-key ExistsMulti presence checks; async Get verifies values. One in-flight future per caller lane. Not raw value-returning MultiGet.",
@@ -163,6 +200,9 @@ def main():
         started = time.monotonic()
         timed_out = False
         process_io = {}
+        peak_fds = None
+        fd_samples = fd_unavailable = 0
+        last_fd_sample = started
         with (out / (label + ".stdout")).open("w") as stdout, (out / (label + ".stderr")).open("w") as stderr:
             process = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
             while True:
@@ -176,7 +216,20 @@ def main():
                         process_io[key] = max(process_io.get(key, 0), int(value))
                 except FileNotFoundError:
                     pass
-                if time.monotonic() - started > a.timeout and not timed_out:
+                now = time.monotonic()
+                if now - last_fd_sample >= 1:
+                    last_fd_sample = now
+                    try:
+                        observed_fds = sum(1 for _ in Path(f"/proc/{process.pid}/fd").iterdir())
+                    except OSError:
+                        fd_unavailable += 1
+                    else:
+                        if observed_fds == 0:  # A just-exited process can expose an empty FD directory.
+                            fd_unavailable += 1
+                        else:
+                            fd_samples += 1
+                            peak_fds = observed_fds if peak_fds is None else max(peak_fds, observed_fds)
+                if now - started > a.timeout and not timed_out:
                     timed_out = True
                     os.killpg(process.pid, signal.SIGKILL)
                 time.sleep(.05)
@@ -184,6 +237,8 @@ def main():
             "user_cpu_seconds": usage.ru_utime, "system_cpu_seconds": usage.ru_stime, "peak_rss_kib": usage.ru_maxrss,
             "io_input_operations": usage.ru_inblock, "io_output_operations": usage.ru_oublock,
             "sampled_process_io_cumulative_max": process_io, "timeout": timed_out,
+            "peak_observed_fd_count": peak_fds, "fd_sample_count": fd_samples, "fd_unavailable_sample_count": fd_unavailable,
+            "fd_scope": "Once/second observed process FD entries; can miss brief peaks; missing/exited samples are unavailable, not zero",
             "scope": "Whole child including loading/open/capture/close; final procIO increments may be missed"})
         (out / (label + ".exit")).write_text(str(process.returncode) + "\n")
         if process.returncode or timed_out:
@@ -237,7 +292,7 @@ def main():
     try:
         for disk_index, (disk, cache_disk) in enumerate(zip(a.disk, a.cache_disk)):
             disk, cache_disk = disk.resolve(strict=True), cache_disk.resolve(strict=True)
-            if disk == cache_disk or shutil.disk_usage(disk).free < 3 * a.dataset_mib * 1024**2 + 1024**3 or shutil.disk_usage(cache_disk).free < 1024**3:
+            if disk == cache_disk or shutil.disk_usage(disk).free < 5 * a.dataset_mib * 1024**2 + 1024**3 or shutil.disk_usage(cache_disk).free < 1024**3:
                 raise RuntimeError("Separate cache parent and reserved fixture/free-space bounds required")
             root = Path(tempfile.mkdtemp(prefix="rockserver-embedded-qualification-", dir=disk))
             cache_root = Path(tempfile.mkdtemp(prefix="rockserver-embedded-cache-qualification-", dir=cache_disk))
@@ -251,7 +306,15 @@ def main():
             seed = java(f"disk-{disk_index}-seed", db, cache, "seed")
             if not seed.get("fixture_live_sst_files"):
                 raise RuntimeError("Seed fixture has no SST files")
+            seed_bytes = closed_fixture_bytes(db)
+            save(out / f"disk-{disk_index}-closed-seed-storage.json", {
+                "data": seed_bytes, "cache": closed_fixture_bytes(cache),
+                "live_entry_cf_sst_count_before_close": seed["fixture_live_sst_files"],
+                "scope": "Regular files after seed JVM exit, before copying; on-disk SST count can include other CFs/obsolete files"})
             backup_db, backup_cache = root / "immutable-seed-db", cache_root / "immutable-seed-cache"
+            remaining_bytes = a.dataset_mib * 1024**2 + 1024**3
+            save(out / f"disk-{disk_index}-seed-backup-space.json",
+                 require_data_clone_space(backup_db, root, seed_bytes, remaining_bytes))
             shutil.copytree(db, backup_db)
             shutil.copytree(cache, backup_cache)
             seed_db_manifest, seed_cache_manifest = tree_manifest(backup_db), tree_manifest(backup_cache)
@@ -267,6 +330,10 @@ def main():
                         if target.exists():
                             shutil.rmtree(target)
                         if target == db or mode in ("cache", "both"):
+                            if target == db:
+                                # Actual free space is checked after removing the previous owned target, before copying.
+                                save(out / f"disk-{disk_index}-pair-{pair}-{mode}.restore-space.json",
+                                     require_data_clone_space(target, root, seed_bytes, remaining_bytes))
                             shutil.copytree(backup, target)
                             if tree_manifest(target) != expected:
                                 raise RuntimeError("Restored same-path fixture differs from immutable seed")
