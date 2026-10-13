@@ -796,7 +796,8 @@ public final class ReplicatedRangeStore {
         try {
             var current = ownership.get(owner);
             if (current.state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
-            else if (current.state() != RangeOwnership.State.FENCED && current.state()!=RangeOwnership.State.RETIRED) throw new IllegalStateException("Range cannot be fenced");
+            else if (current.state() != RangeOwnership.State.FENCED && current.state()!=RangeOwnership.State.RETIRED && current.state()!=RangeOwnership.State.INSTALLING) throw new IllegalStateException("Range cannot be fenced");
+            // INSTALLING already denies USER work; shutdown must preserve its recovery ownership.
             invalidateScopedUnderLane(RangeMutationHistory.Status.INVALIDATED);
         } finally { applyLane.unlock(); drainScopedReleases(); }
     }
