@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed.ratis;
 
+import it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation;
 import it.cavallium.rockserver.core.common.distributed.RangeImportAdmission;
 
 import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
@@ -177,20 +178,52 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private final HashMap<OperationId,ImportPublicationHold> importPublicationHolds=new HashMap<>();
     private long importPublicationBytes;
-    private static final class ImportPublicationHold {
+    private static class RetainedProof {
+        final RatisNodeResourceBudget.Lease retainedGraph;
+        final java.util.List<RatisNodeResourceBudget.Lease> inputGraphs=new java.util.ArrayList<>();
+        int nativeOwners;
+        RetainedProof(RatisNodeResourceBudget.Lease graph){retainedGraph=graph;}
+        void closeGraph(){if(retainedGraph!=null)retainedGraph.close();inputGraphs.forEach(RatisNodeResourceBudget.Lease::close);inputGraphs.clear();}
+    }
+    private record SavedAppendStamp(RetainedProof owner,Object record,byte[] digest,long term,long generation,long configurationStamp) {}
+    private final java.util.IdentityHashMap<TransactionContext,SavedAppendStamp> savedAppendStamps=new java.util.IdentityHashMap<>();
+    private byte[] appendInputDigest(TransactionContext transaction) {
+        java.security.MessageDigest digest;
+        try{digest=java.security.MessageDigest.getInstance("SHA-256");}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
+        digest.update(transaction.getClientRequest().getMessage().getContent().asReadOnlyByteBuffer());return digest.digest();
+    }
+    /** Exact native originals replay without borrowing a new fresh-admission capability. */
+    private void savedAppend(TransactionContext transaction,RetainedProof owner,Object record,Leadership current,long generation) throws IOException {
+        var cut=store.applied();
+        if(!current.ready() || cut==null || cut.term()!=current.term() || generation!=admissionGeneration.get() || schemaConfigurationPending)
+            throw new IOException("Saved append lost completed current-term owner");
+        savedAppendStamps.put(transaction,new SavedAppendStamp(owner,record,appendInputDigest(transaction),current.term(),generation,schemaConfigurationStamp));
+    }
+    private RatisNodeResourceBudget.Lease retainedProof(long wireBound,ProposalFootprints.GateLease scope)throws IOException {
+        try{return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,256L+4L*wireBound,1);}
+        catch(IOException failure){if(scope!=null)proposalFootprints.release(scope);throw failure;}
+    }
+    private long schemaRetainedBound(Object record) {
+        if(record instanceof DistributedCommand)return DistributedCommandCodec.MAX_ENCODED_BYTES;
+        if(record instanceof RatisSchemaInstallRecord)return (long)RatisSchemaInstallRecord.MAX_BYTES+NativeSchemaInstallation.MAX_BYTES;
+        if(record instanceof RatisSchemaActivateRpc.Request)return (long)RatisSchemaActivateRpc.MAX_REQUEST_BYTES+RatisSchemaActivateRecord.MAX_BYTES;
+        if(record instanceof RatisSchemaActivateRecord)return RatisSchemaActivateRecord.MAX_BYTES;
+        return RatisSchemaFenceRecord.MAX_BYTES;
+    }
+    private static final class ImportPublicationHold extends RetainedProof {
         final DistributedCommand command;final byte[] digest;final long term,generation,configurationStamp;
         final ProposalFootprints.GateLease lease;ApplyPosition cut;
-        boolean reading=true,qualified,submitted,invalidated,released;
-        ImportPublicationHold(DistributedCommand command,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease){this.command=command;this.digest=command.payloadDigest();this.term=term;this.generation=generation;this.configurationStamp=configurationStamp;this.lease=lease;}
+        boolean reading=true,qualified,submitted,invalidated,released;int owners;
+        ImportPublicationHold(DistributedCommand command,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease,RatisNodeResourceBudget.Lease graph){super(graph);this.command=command;this.digest=command.payloadDigest();this.term=term;this.generation=generation;this.configurationStamp=configurationStamp;this.lease=lease;}
     }
     record ImportPublicationStats(int holds,long bytes,int reading) {}
     ImportPublicationStats importPublicationStats(){synchronized(admissions){return new ImportPublicationStats(importPublicationHolds.size(),importPublicationBytes,(int)importPublicationHolds.values().stream().filter(h->h.reading).count());}}
     private void releaseImportPublication(ImportPublicationHold hold){
         hold.released=true;
         // An invalidated lookup still owns its gate and metadata until its actual finally exits.
-        if(hold.reading)return;
+        if(hold.reading || hold.owners!=0 || hold.nativeOwners!=0)return;
         proposalFootprints.release(hold.lease);
-        if(importPublicationHolds.remove(hold.command.operationId(),hold))importPublicationBytes-=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;
+        if(importPublicationHolds.remove(hold.command.operationId(),hold)){importPublicationBytes-=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;hold.closeGraph();}
     }
     private static boolean preparedCutMatches(ImportPublicationHold hold,ApplyPosition current) {
         if(hold.cut==null || current==null)return false;
@@ -232,7 +265,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(importPublicationHolds.size()>=2 || RatisProofQueryService.IMPORT_PUBLICATION_BYTES>2*RatisProofQueryService.IMPORT_PUBLICATION_BYTES-importPublicationBytes)throw new IOException("Import publication metadata budget exhausted");
             var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(store.commandAccessScope(command)),owner.term(),generation);
             if(lease==null)throw new IOException("Import publication overlaps a reserved proposal");
-            hold=new ImportPublicationHold(command,owner.term(),generation,schemaConfigurationStamp,lease);importPublicationHolds.put(command.operationId(),hold);importPublicationBytes+=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;
+            hold=new ImportPublicationHold(command,owner.term(),generation,schemaConfigurationStamp,lease,retainedProof(DistributedCommandCodec.MAX_ENCODED_BYTES,lease));importPublicationHolds.put(command.operationId(),hold);importPublicationBytes+=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;
         }
         boolean qualified=false;
         try{
@@ -264,14 +297,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         RatisRangeImportRpc.requireFile(rangeImportApply.definition().manifest(request.groupId()),request);
     }
     private ImportApplyHold importApplyHold;
-    private static final class ImportApplyHold {
+    private static final class ImportApplyHold extends RetainedProof {
         final Object record; final byte[] bytes; final long term,generation,configurationStamp; final ApplyPosition cut;
         boolean reading=true,qualified,submitted,invalidated,released,maybeAppended; int owners;
-        ImportApplyHold(Object record,Leadership leader,long generation,long stamp,ApplyPosition cut) {
-            this.record=record; bytes=importProposalBytes(record); term=leader.term(); this.generation=generation; configurationStamp=stamp; this.cut=cut;
+        ImportApplyHold(Object record,Leadership leader,long generation,long stamp,ApplyPosition cut,RatisNodeResourceBudget.Lease graph) {
+            super(graph);this.record=record; bytes=importProposalBytes(record); term=leader.term(); this.generation=generation; configurationStamp=stamp; this.cut=cut;
         }
     }
-    private void releaseImportApply(ImportApplyHold hold) { hold.released=true; if(!hold.reading && importApplyHold==hold)importApplyHold=null; }
+    private void releaseImportApply(ImportApplyHold hold) { hold.released=true; if(!hold.reading && hold.owners==0 && hold.nativeOwners==0 && importApplyHold==hold){importApplyHold=null;hold.closeGraph();} }
     private ApplyPosition requireImportOwner(Leadership leader) throws IOException {
         requireHealthy(); requireDataRole(); var cut=store.applied();
         if(rangeImportApply==null || getLifeCycleState()!=LifeCycle.State.RUNNING || !leader.ready() || cut==null || cut.term()!=leader.term()
@@ -300,13 +333,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         return configuration;
     }
+    private byte[] recoveredImportInput(Object record) throws Exception {
+        return record instanceof RatisReferencedFile.Request file ? referenceProof(file) : rangeImportApply.recoveredResult((RatisRangeImportRecord)record);
+    }
     private void prepareImportApply(Object record,long generation) throws Exception {
         requireImportProposal(record); var leader=leadership(); var cut=requireImportOwner(leader); final ImportApplyHold hold;
         synchronized(admissions) {
             if(generation!=admissionGeneration.get())throw new IOException("Native import read-barrier owner changed");
             reconcileOlderProposalTerms(leader.term());
             if(importApplyHold!=null) { requireImportApply(importApplyHold,record,leader,generation); return; }
-            hold=new ImportApplyHold(record,leader,generation,schemaConfigurationStamp,cut); importApplyHold=hold;
+            hold=new ImportApplyHold(record,leader,generation,schemaConfigurationStamp,cut,retainedProof(Math.max(RatisRangeImportRecord.MAX_BYTES,RatisReferencedFile.Request.BYTES),null)); importApplyHold=hold;
         }
         boolean qualified=false;
         try {
@@ -319,8 +355,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         } finally { synchronized(admissions) { hold.reading=false; if(!qualified || hold.invalidated || hold.released)releaseImportApply(hold); } }
     }
     private TransactionContext startImportApply(TransactionContext transaction,Object record,long generation,Leadership leader) throws Exception {
+        synchronized(admissions){if(importApplyHold!=null && importApplyHold.reading)throw new IOException("Native import preparation is still reading");}
+        var saved=recoveredImportInput(record);var cut=requireImportOwner(leader);
         synchronized(admissions) {
-            requireImportApply(importApplyHold,record,leader,generation); var hold=importApplyHold;
+            if(saved!=null && importApplyHold==null){
+                var retained=new ImportApplyHold(record,leader,generation,schemaConfigurationStamp,cut,retainedProof(Math.max(RatisRangeImportRecord.MAX_BYTES,RatisReferencedFile.Request.BYTES),null));
+                retained.reading=false;retained.qualified=true;importApplyHold=retained;
+            }
+            var hold=importApplyHold;
+            if(saved==null)requireImportApply(hold,record,leader,generation);
+            else {if(hold==null || hold.reading || !Arrays.equals(hold.bytes,importProposalBytes(record)))throw new IOException("Saved import input differs from retained owner");if(hold.owners>=16)throw new IOException("Native import proposal waiter bound exhausted");savedAppend(transaction,hold,record,leader,generation);}
             if(hold.owners>=16)throw new IOException("Native import proposal waiter bound exhausted");
             hold.submitted=true; hold.owners++; transaction.setStateMachineContext(hold); return transaction;
         }
@@ -379,23 +423,23 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private TopologyHold topologyHold;private int topologySlots;private long topologyBytes;
     private CompletableFuture<Void> topologyApplyCleanup=CompletableFuture.completedFuture(null);
-    private static final class TopologyHold {
+    private static final class TopologyHold extends RetainedProof {
         final RatisTopologyFreezeRecord record;final byte[] bytes;final long term,generation,stamp;final ProposalFootprints.GateLease lease;
         ReplicatedRangeStore.TopologyFreezeGate nativeGate;
         boolean reading=true,qualified,nativeReady,submitted,maybeAppended,invalidated,released,cleaning;int owners;
         final CompletableFuture<Void> cleanup=new CompletableFuture<>();
-        TopologyHold(RatisTopologyFreezeRecord record,Leadership owner,long generation,long stamp,ProposalFootprints.GateLease lease){this.record=record;bytes=record.encode();term=owner.term();this.generation=generation;this.stamp=stamp;this.lease=lease;}
+        TopologyHold(RatisTopologyFreezeRecord record,Leadership owner,long generation,long stamp,ProposalFootprints.GateLease lease,RatisNodeResourceBudget.Lease graph){super(graph);this.record=record;bytes=record.encode();term=owner.term();this.generation=generation;this.stamp=stamp;this.lease=lease;}
     }
     record TopologyFreezeStats(int holds,long bytes,int reading) {}
     TopologyFreezeStats topologyFreezeStats(){synchronized(admissions){return new TopologyFreezeStats(topologySlots,topologyBytes,topologyHold!=null && topologyHold.reading ? 1 : 0);}}
     CompletableFuture<Void> topologyCleanup(){synchronized(admissions){return CompletableFuture.allOf(topologyApplyCleanup,topologyActivationHold==null ? CompletableFuture.completedFuture(null) : topologyActivationHold.cleanup,topologyHold==null ? CompletableFuture.completedFuture(null) : topologyHold.cleanup).copy();}}
-    private void finishTopologyHold(TopologyHold hold){if(topologyHold==hold){topologyHold=null;topologySlots--;topologyBytes-=hold.bytes.length;}}
+    private void finishTopologyHold(TopologyHold hold){if(topologyHold==hold && !hold.reading && hold.owners==0 && hold.nativeOwners==0){topologyHold=null;topologySlots--;topologyBytes-=hold.bytes.length;hold.closeGraph();}}
     private void releaseTopologyHold(TopologyHold hold){
-        hold.released=true;if(hold.reading || hold.cleaning)return;
+        hold.released=true;if(hold.reading || hold.owners!=0 || hold.nativeOwners!=0 || hold.cleaning)return;
         if(hold.lease!=null)proposalFootprints.release(hold.lease);
         var capture=hold.nativeGate;if(capture==null){finishTopologyHold(hold);hold.cleanup.complete(null);return;}
         hold.cleaning=true;hold.nativeGate=null;
-        topologyStorage.submitTopologyCleanup(capture).whenComplete((unused,failure)->{synchronized(admissions){if(failure==null)finishTopologyHold(hold);else storageFailure=failure;}if(failure==null)hold.cleanup.complete(null);else hold.cleanup.completeExceptionally(failure);});
+        topologyStorage.submitTopologyCleanup(capture).whenComplete((unused,failure)->{synchronized(admissions){if(failure==null){hold.cleaning=false;finishTopologyHold(hold);}else storageFailure=failure;}if(failure==null)hold.cleanup.complete(null);else hold.cleanup.completeExceptionally(failure);});
     }
     private void requireTopologyRecord(RatisTopologyFreezeRecord record)throws IOException{
         requireDataRole();if(schemaConfigurationPending)throw new IOException("Topology FREEZE waits for queued configuration apply");if(topologyAuthority==null || topologyDescriptor==null || topologyLocalReplica==null || topologyStorage==null || !record.groupId().equals(store.ownership().owner().groupId()))throw new IOException("Topology FREEZE owner is not configured");
@@ -425,7 +469,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             else {
             if(sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Protected topology proposal budget exhausted");
             var spans=record.definition().sourceDirectory().columns().stream().map(column->TransactionScope.Span.range(column,null,null)).toList();var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),owner.term(),generation);
-            if(lease==null)throw new IOException("Topology FREEZE scope already reserved");hold=new TopologyHold(record,owner,generation,schemaConfigurationStamp,lease);topologyHold=hold;topologySlots++;topologyBytes+=hold.bytes.length;}
+            if(lease==null)throw new IOException("Topology FREEZE scope already reserved");hold=new TopologyHold(record,owner,generation,schemaConfigurationStamp,lease,retainedProof(RatisTopologyFreezeRecord.MAX_BYTES,lease));topologyHold=hold;topologySlots++;topologyBytes+=hold.bytes.length;}
         }
         boolean qualified=false;
         try{
@@ -453,8 +497,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private TransactionContext startTopologyFreeze(TransactionContext transaction,RatisTopologyFreezeRecord record,long generation,Leadership owner)throws Exception{
         requireTopologyRecord(record);var saved=store.lookupTopologyFreeze(record.header(),record.admissionDigest());
         synchronized(admissions){reconcileOlderProposalTerms(owner.term());
-            if(saved!=null && topologyHold==null){if(sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Protected topology retry budget exhausted");topologyHold=new TopologyHold(record,owner,generation,schemaConfigurationStamp,null);topologyHold.reading=false;topologyHold.qualified=topologyHold.nativeReady=true;topologySlots++;topologyBytes+=topologyHold.bytes.length;}
-            var hold=topologyHold;requireTopologyOwner(hold,record,owner,generation,true);hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}
+            if(saved!=null && topologyHold==null){if(sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Protected topology retry budget exhausted");topologyHold=new TopologyHold(record,owner,generation,schemaConfigurationStamp,null,retainedProof(RatisTopologyFreezeRecord.MAX_BYTES,null));topologyHold.reading=false;topologyHold.qualified=topologyHold.nativeReady=true;topologySlots++;topologyBytes+=topologyHold.bytes.length;}
+            var hold=topologyHold;if(saved==null)requireTopologyOwner(hold,record,owner,generation,true);else {if(hold==null || hold.reading || !hold.record.equals(record))throw new IOException("Saved topology input differs from retained owner");savedAppend(transaction,hold,record,owner,generation);}hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}
     }
     private byte[] topologyRecovered(RatisTopologyFreezeRecord record){var freeze=store.lookupTopologyFreeze(record.header(),record.admissionDigest());if(freeze==null)return null;freeze.requireCut(store.applied());synchronized(admissions){if(topologyHold!=null && topologyHold.record.equals(record))releaseTopologyHold(topologyHold);}return freeze.encode();}
     @FunctionalInterface interface TopologySeedInstaller { NativeTopologySeed install(RatisTopologySeedRpc.Request request)throws IOException; }
@@ -467,18 +511,18 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         requireDataRole(); if(getLifeCycleState()!=LifeCycle.State.NEW || topologyActivationObserver!=null)throw new IllegalStateException("Topology activation observer is fixed before initialization"); topologyActivationObserver=java.util.Objects.requireNonNull(observer);
     }
     Throwable topologyActivationObserverFailure() { return topologyActivationObserverFailure; }
-    private static final class ActivationHold {
+    private static final class ActivationHold extends RetainedProof {
         final RatisTopologyActivationRecord record; final long term,generation,stamp; final ApplyPosition cut; final ProposalFootprints.GateLease lease;
         final CompletableFuture<Void> cleanup=new CompletableFuture<>();
         boolean reading=true,qualified,submitted,maybeAppended,invalidated,released; int owners;
-        ActivationHold(RatisTopologyActivationRecord record,Leadership leader,long generation,long stamp,ApplyPosition cut,ProposalFootprints.GateLease lease) { this.record=record; term=leader.term();this.generation=generation;this.stamp=stamp;this.cut=cut;this.lease=lease; }
+        ActivationHold(RatisTopologyActivationRecord record,Leadership leader,long generation,long stamp,ApplyPosition cut,ProposalFootprints.GateLease lease,RatisNodeResourceBudget.Lease graph) { super(graph);this.record=record; term=leader.term();this.generation=generation;this.stamp=stamp;this.cut=cut;this.lease=lease; }
     }
     record TopologyActivationStats(int holds,long bytes,int reading) {}
     TopologyActivationStats topologyActivationStats() { synchronized(admissions) { var h=topologyActivationHold; return new TopologyActivationStats(h==null?0:1,h==null?0:h.record.encode().length,h!=null && h.reading?1:0); } }
     private void releaseTopologyActivation(ActivationHold hold) {
-        hold.released=true; if(hold.reading || hold.owners!=0)return;
+        hold.released=true; if(hold.reading || hold.owners!=0 || hold.nativeOwners!=0)return;
         if(hold.lease!=null)proposalFootprints.release(hold.lease);
-        if(topologyActivationHold==hold) { topologyActivationHold=null;topologySlots--;topologyBytes-=hold.record.encode().length; }
+        if(topologyActivationHold==hold) { topologyActivationHold=null;topologySlots--;topologyBytes-=hold.record.encode().length;hold.closeGraph(); }
         hold.cleanup.complete(null);
     }
     private NativeTopologyActivation savedTopologyActivation(RatisTopologyActivationRecord record) {
@@ -512,7 +556,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             }
             if(sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Protected activation proposal budget exhausted");
             var spans=record.definition().targetDirectory().columns().stream().map(c->TransactionScope.Span.range(c,null,null)).toList();var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),leader.term(),generation);if(lease==null)throw new IOException("Topology activation scope already reserved");
-            hold=new ActivationHold(record,leader,generation,schemaConfigurationStamp,cut,lease);topologyActivationHold=hold;topologySlots++;topologyBytes+=record.encode().length;
+            hold=new ActivationHold(record,leader,generation,schemaConfigurationStamp,cut,lease,retainedProof(RatisTopologyActivationRecord.MAX_BYTES,lease));topologyActivationHold=hold;topologySlots++;topologyBytes+=record.encode().length;
         }
         boolean qualified=false;
         try {
@@ -530,8 +574,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private TransactionContext startTopologyActivation(TransactionContext transaction,RatisTopologyActivationRecord record,long generation,Leadership leader)throws Exception {
         requireTopologyActivationRecord(record);var saved=savedTopologyActivation(record);
         synchronized(admissions) { reconcileOlderProposalTerms(leader.term());
-            if(saved!=null && topologyActivationHold==null) { if(sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Topology activation retry budget exhausted");var hold=new ActivationHold(record,leader,generation,schemaConfigurationStamp,store.applied(),null);hold.reading=false;hold.qualified=true;topologyActivationHold=hold;topologySlots++;topologyBytes+=record.encode().length; }
-            var hold=topologyActivationHold;requireTopologyActivationOwner(hold,record,leader,generation);hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;
+            if(saved!=null && topologyActivationHold==null) { if(sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16)throw new IOException("Topology activation retry budget exhausted");var hold=new ActivationHold(record,leader,generation,schemaConfigurationStamp,store.applied(),null,retainedProof(RatisTopologyActivationRecord.MAX_BYTES,null));hold.reading=false;hold.qualified=true;topologyActivationHold=hold;topologySlots++;topologyBytes+=record.encode().length; }
+            var hold=topologyActivationHold;if(saved==null)requireTopologyActivationOwner(hold,record,leader,generation);else {if(hold==null || hold.reading || !hold.record.equals(record))throw new IOException("Saved activation input differs from retained owner");savedAppend(transaction,hold,record,leader,generation);}hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;
         }
     }
     private byte[] topologyActivationRecovered(RatisTopologyActivationRecord record) {
@@ -631,7 +675,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private volatile boolean currentDataVoter=true;
     private void updateDataVoter(byte[] configuration)throws IOException{if(role!=RatisNodePlan.Role.DATA || topologyLocalReplica==null)return;var cfg=RaftConfigurationProto.parseFrom(configuration);String peer=topologyLocalReplica.peerId();currentDataVoter=java.util.stream.Stream.concat(cfg.getPeersList().stream(),cfg.getOldPeersList().stream()).anyMatch(p->p.getId().toStringUtf8().equals(peer));}
     private void requireUserReplica()throws IOException{if(role==RatisNodePlan.Role.DATA && !currentDataVoter)throw new IOException("Local replica is no longer a current voting USER owner");}
-    private static final class SchemaHold {
+    private static final class SchemaHold extends RetainedProof {
         final Object record;
         ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
         DistributedStoragePool.SchemaInstallPlan installPlan;
@@ -642,8 +686,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         boolean reading=true,qualified,submitted,maybeAppended,invalidated,released,nativeReady,cleaning;
         final CompletableFuture<Void> cleanup=new CompletableFuture<>();
         int owners;
-        SchemaHold(Object record,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease) {
-            this.record=record; this.term=term; this.generation=generation; this.configurationStamp=configurationStamp; this.lease=lease;
+        SchemaHold(Object record,long term,long generation,long configurationStamp,ProposalFootprints.GateLease lease,RatisNodeResourceBudget.Lease graph) {
+            super(graph);this.record=record; this.term=term; this.generation=generation; this.configurationStamp=configurationStamp; this.lease=lease;
         }
     }
     void schemaReplicas(RatisSchemaReplicaService service,it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor replica) {
@@ -710,16 +754,29 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     interface RelocationObserver {void persist(RatisTopologyRelocationRecord record,ApplyPosition position)throws IOException;boolean saved(RatisTopologyRelocationRecord record)throws IOException;}
     private RelocationObserver relocationObserver;
     void relocationObserver(RelocationObserver observer){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || relocationObserver!=null)throw new IllegalStateException("Relocation journal owner fixed before initialization");relocationObserver=java.util.Objects.requireNonNull(observer);}
-    private static final class RelocationHold {final RatisTopologyRelocationRecord record;final long term,generation,stamp;boolean reading=true,qualified,submitted,invalidated,maybeAppended,released;int owners;RelocationHold(RatisTopologyRelocationRecord record,long term,long generation,long stamp){this.record=record;this.term=term;this.generation=generation;this.stamp=stamp;}}
+    private static final class RelocationHold extends RetainedProof {final RatisTopologyRelocationRecord record;final long term,generation,stamp;boolean reading=true,qualified,submitted,invalidated,maybeAppended,released;int owners;RelocationHold(RatisTopologyRelocationRecord record,long term,long generation,long stamp,RatisNodeResourceBudget.Lease graph){super(graph);this.record=record;this.term=term;this.generation=generation;this.stamp=stamp;}}
     private RelocationHold relocationHold;
-    private void releaseRelocation(RelocationHold hold){hold.invalidated=true;if(hold.reading || hold.owners>0 || hold.released)return;hold.released=true;if(relocationHold==hold){relocationHold=null;topologySlots--;topologyBytes-=hold.record.encode().length;}}
+    private void releaseRelocation(RelocationHold hold){hold.invalidated=true;if(hold.reading || hold.owners>0 || hold.nativeOwners!=0)return;hold.released=true;if(relocationHold==hold){relocationHold=null;topologySlots--;topologyBytes-=hold.record.encode().length;hold.closeGraph();}}
     private void requireRelocationHold(RelocationHold hold,Leadership leader)throws IOException{if(hold==null || relocationHold!=hold || hold.released || hold.invalidated || hold.reading || !hold.qualified || hold.term!=leader.term() || !leader.ready() || hold.generation!=admissionGeneration.get() || hold.stamp!=schemaConfigurationStamp || schemaConfigurationPending || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Relocation record lacks exact current prepared owner");}
     private void prepareRelocation(RatisTopologyRelocationRecord record)throws Exception{
         requireDataRole();requireHealthy();if(relocationObserver==null || relocationAuthority==null)throw new IOException("Relocation durable owner is not configured");var leader=leadership();if(!leader.ready())throw new IOException("Relocation leader unavailable");final RelocationHold hold;
-        synchronized(admissions){if(relocationHold!=null){if(!relocationHold.record.equals(record))throw new IOException("Another relocation proposal owns the group");requireRelocationHold(relocationHold,leader);return;}if(topologySlots>=16 || topologyBytes+record.encode().length>16L*1024*1024 || schemaConfigurationPending)throw new IOException("Relocation metadata budget/configuration unavailable");hold=new RelocationHold(record,leader.term(),admissionGeneration.get(),schemaConfigurationStamp);relocationHold=hold;topologySlots++;topologyBytes+=record.encode().length;}
+        synchronized(admissions){if(relocationHold!=null){if(!relocationHold.record.equals(record))throw new IOException("Another relocation proposal owns the group");requireRelocationHold(relocationHold,leader);return;}if(topologySlots>=16 || topologyBytes+record.encode().length>16L*1024*1024 || schemaConfigurationPending)throw new IOException("Relocation metadata budget/configuration unavailable");hold=new RelocationHold(record,leader.term(),admissionGeneration.get(),schemaConfigurationStamp,retainedProof(RatisTopologyRelocationRecord.MAX_BYTES,null));relocationHold=hold;topologySlots++;topologyBytes+=record.encode().length;}
         boolean qualified=false;try{if(relocationObserver.saved(record)){synchronized(admissions){hold.reading=false;hold.qualified=true;requireRelocationHold(hold,leadership());qualified=true;}return;}var purpose=record.action()==RatisTopologyRelocationRecord.Action.AUTHORIZE?RatisTopologyJoinAuthority.Purpose.SOURCE_CONFIGURATION:RatisTopologyJoinAuthority.Purpose.PUBLICATION;var request=RatisTopologyJoinAuthority.Request.of(record.definition().header(),topologyLocalReplica.replicaId(),purpose);var view=relocationAuthority.read(request);view.require(request);if(!view.catalogue().equals(record.catalogue()) || !java.util.Arrays.equals(view.definition().encode(),record.definition().encode()) || !RatisRelocationOwnerRpc.covers(view.cut(),record.catalogueCut()))throw new IOException("Relocation catalogue witness differs");var cfg=store.configuration();var cut=store.applied();byte[] expected=record.action()==RatisTopologyRelocationRecord.Action.AUTHORIZE?record.sourceConfiguration():record.targetConfiguration();if(cfg==null || cut==null || cut.term()!=leader.term() || !java.util.Arrays.equals(cfg.data(),expected))throw new IOException("Relocation native configuration changed");requireActualMembership(getServer().getNow(null).getDivision(getGroupId()).getRaftConf(),record.action()==RatisTopologyRelocationRecord.Action.AUTHORIZE?record.definition().parents().getFirst():record.definition().targets().getFirst());if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && !java.util.Arrays.equals(view.state().relocation().configurationDigest(),OperatorUpload.sha256(expected)))throw new IOException("Publication committed another configuration");synchronized(admissions){hold.reading=false;hold.qualified=true;requireRelocationHold(hold,leadership());qualified=true;}}finally{synchronized(admissions){hold.reading=false;if(!qualified)releaseRelocation(hold);}}
     }
-    private TransactionContext startRelocation(TransactionContext transaction,RatisTopologyRelocationRecord record)throws IOException{synchronized(admissions){var hold=relocationHold;requireRelocationHold(hold,leadership());if(!hold.record.equals(record))throw new IOException("Relocation frozen record changed");hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}}
+    private TransactionContext startRelocation(TransactionContext transaction,RatisTopologyRelocationRecord record)throws IOException{
+        boolean saved=relocationObserver!=null && relocationObserver.saved(record);var current=leadership();
+        synchronized(admissions){
+            if(saved && relocationHold==null){
+                if(topologySlots>=16 || topologyBytes+record.encode().length>16L*1024*1024)throw new IOException("Saved relocation input budget exhausted");
+                var retained=new RelocationHold(record,current.term(),admissionGeneration.get(),schemaConfigurationStamp,retainedProof(RatisTopologyRelocationRecord.MAX_BYTES,null));
+                retained.reading=false;retained.qualified=true;relocationHold=retained;topologySlots++;topologyBytes+=record.encode().length;
+            }
+            var hold=relocationHold;
+            if(!saved)requireRelocationHold(hold,current);
+            else {if(hold==null || hold.reading || !hold.record.equals(record))throw new IOException("Saved relocation input differs from retained owner");savedAppend(transaction,hold,record,current,admissionGeneration.get());}
+            if(!hold.record.equals(record))throw new IOException("Relocation frozen record changed");hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;
+        }
+    }
     private ProofQueryExecutor importPreflightQueries;
     void importPreflightQueries(ProofQueryExecutor executor){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || importPreflightQueries!=null)throw new IllegalStateException("Import preflight lane fixed before initialization");importPreflightQueries=java.util.Objects.requireNonNull(executor);}
     private int qualifiedImportManifestBytes(Object record){var definition=rangeImportApply.definition();if(record instanceof RatisRangeImportRecord proposal)proposal.requireDefinition(definition);else if(!(record instanceof RatisReferencedFile.Request))throw new IllegalArgumentException("Unknown import preparation subject");var manifest=definition.manifest(store.ownership().owner().groupId());RatisRangeImportRecord.requirePolicy(manifest);return manifest.limits().maximumEncodedBytes();}
@@ -882,7 +939,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
             var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(store.commandAccessScope(command)),owner.term(),generation);
             if (lease==null) throw new IOException("Conflicting catalogue gate owns FENCING");
-            hold=new SchemaHold(command,owner.term(),generation,schemaConfigurationStamp,lease); schemaHold=hold; schemaSlots++;
+            hold=new SchemaHold(command,owner.term(),generation,schemaConfigurationStamp,lease,retainedProof(schemaRetainedBound(command),lease)); schemaHold=hold; schemaSlots++;
         }
         boolean qualified=false;
         try {
@@ -927,17 +984,17 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     // A pending authority lookup keeps its bounded input charged until the lookup exits.
     private void releaseSchemaHold(SchemaHold hold) {
         hold.released=true; if (hold.lease!=null) proposalFootprints.release(hold.lease);
-        if (hold.reading || hold.cleaning) return;
+        if (hold.reading || hold.owners!=0 || hold.nativeOwners!=0 || hold.cleaning) return;
         var plan=hold.installPlan; var capture=hold.captureGate;
         if (plan==null && capture==null) {
-            if (schemaHold==hold) { schemaHold=null; schemaSlots--; }
+            if (schemaHold==hold) { schemaHold=null; schemaSlots--;hold.closeGraph(); }
             hold.cleanup.complete(null); return;
         }
         hold.cleaning=true; hold.installPlan=null; hold.captureGate=null;
         // Enqueue only: pool-owned actual cleanup never acquires native mutation while Raft monitors are held.
         schemaStorage.submitSchemaCleanup(plan,capture).whenComplete((unused,failure) -> {
             synchronized (admissions) {
-                if (failure==null) { if (schemaHold==hold) { schemaHold=null; schemaSlots--; } }
+                if (failure==null) { hold.cleaning=false;if (schemaHold==hold && !hold.reading && hold.owners==0 && hold.nativeOwners==0) { schemaHold=null; schemaSlots--;hold.closeGraph(); } }
                 else storageFailure=failure;
             }
             if (failure==null) hold.cleanup.complete(null); else hold.cleanup.completeExceptionally(failure);
@@ -998,7 +1055,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var spans=interval.columns().stream().map(c -> TransactionScope.Span.range(c,null,null)).toList();
             var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),owner.term(),generation);
             if (lease==null) throw new IOException("Conflicting DATA gate owns schema admission");
-            hold=new SchemaHold(record,owner.term(),generation,schemaConfigurationStamp,lease); schemaHold=hold; schemaSlots++;
+            hold=new SchemaHold(record,owner.term(),generation,schemaConfigurationStamp,lease,retainedProof(schemaRetainedBound(record),lease)); schemaHold=hold; schemaSlots++;
         }
         boolean qualified=false;
         try {
@@ -1028,11 +1085,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 // A native retry needs no new source capture or volatile gate, but still owns a bounded input slot.
                 if (schemaHold==null) {
                     if (sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
-                    schemaHold=new SchemaHold(record,leader.term(),generation,schemaConfigurationStamp,null); schemaHold.reading=false; schemaHold.qualified=true; schemaSlots++;
+                    schemaHold=new SchemaHold(record,leader.term(),generation,schemaConfigurationStamp,null,retainedProof(schemaRetainedBound(record),null)); schemaHold.reading=false; schemaHold.qualified=true; schemaSlots++;
                 }
                 var hold=schemaHold;
-                if (!hold.record.equals(record) || hold.invalidated || hold.released || hold.term!=leader.term() || hold.generation!=generation || hold.configurationStamp!=schemaConfigurationStamp) throw new IOException("Schema retry lost admission ownership");
-                hold.submitted=true; hold.owners++; transaction.setStateMachineContext(hold);
+                if (!hold.record.equals(record) || hold.reading) throw new IOException("Schema retry lost exact retained input");
+                savedAppend(transaction,hold,record,leader,generation);hold.submitted=true; hold.owners++; transaction.setStateMachineContext(hold);
             } else {
                 var hold=schemaHold;
                 if (hold==null || !hold.record.equals(record) || hold.reading || !hold.qualified || hold.invalidated || hold.released
@@ -1105,7 +1162,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var spans=store.ownership().interval().columns().stream().map(c -> TransactionScope.Span.range(c,null,null)).toList();
             var lease=proposalFootprints.reserveGate(proposalFootprints.prepare(spans),owner.term(),generation);
             if (lease==null) throw new IOException("Conflicting DATA gate owns schema admission");
-            var hold=new SchemaHold(record,owner.term(),generation,schemaConfigurationStamp,lease); schemaHold=hold; schemaSlots++; return hold;
+            var hold=new SchemaHold(record,owner.term(),generation,schemaConfigurationStamp,lease,retainedProof(schemaRetainedBound(record),lease)); schemaHold=hold; schemaSlots++; return hold;
         }
     }
     private void requireSchemaLifecycleOwner(SchemaHold hold) throws IOException {
@@ -1179,10 +1236,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (schemaConfigurationPending) throw new IOException("Schema append waits for queued configuration apply");
             if (saved!=null && schemaHold==null) {
                 if (sourceHolds.size()+schemaSlots+topologySlots+protectedAdmissions+protectedFinalizationSlots+snapshotSlots+protectedNegativeSlots+homeRecoverySlots+retirementSlots+homeRetirementSlots+snapshotRetirementSlots+snapshotHomeRetirementSlots>=16) throw new IOException("Protected schema proposal budget exhausted");
-                schemaHold=new SchemaHold(record,leader.term(),generation,schemaConfigurationStamp,null); schemaHold.reading=false; schemaHold.qualified=true; schemaSlots++;
+                schemaHold=new SchemaHold(record,leader.term(),generation,schemaConfigurationStamp,null,retainedProof(schemaRetainedBound(record),null)); schemaHold.reading=false; schemaHold.qualified=true; schemaSlots++;
             }
             var hold=schemaHold;
-            if (hold==null || !(hold.record.equals(record) || hold.activation!=null && hold.activation.equals(record)) || hold.reading || !hold.qualified || hold.invalidated || hold.released
+            if(saved!=null){
+                if(hold==null || !(hold.record.equals(record) || hold.activation!=null && hold.activation.equals(record)) || hold.reading)throw new IOException("Saved schema input differs from retained owner");
+                savedAppend(transaction,hold,record,leader,generation);
+            }else if (hold==null || !(hold.record.equals(record) || hold.activation!=null && hold.activation.equals(record)) || hold.reading || !hold.qualified || hold.invalidated || hold.released
                     || hold.term!=leader.term() || hold.generation!=generation || hold.configurationStamp!=schemaConfigurationStamp || generation!=admissionGeneration.get()
                     || hold.lease!=null && !proposalFootprints.drained(hold.lease) || hold.captureGate!=null && !hold.nativeReady) throw new IOException("Schema operation lacks drained current-owner preparation");
             hold.submitted=true; hold.owners++; transaction.setStateMachineContext(hold); return transaction;
@@ -1326,14 +1386,14 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     void sourceOutcomeAdmission(SourceOutcomeAdmission admission){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || sourceOutcomeAdmission!=null)throw new IllegalStateException("Source outcome proof is fixed before initialization");sourceOutcomeAdmission=java.util.Objects.requireNonNull(admission);}
     private record SourceKey(OperationId operation,RatisSourceOutcomeRecord.Kind kind){}
     private final Map<SourceKey,SourceHold> sourceHolds=new HashMap<>();
-    private static final class SourceHold {
+    private static final class SourceHold extends RetainedProof {
         final SourceKey key;final NativeSourceOutcomeCredit.Request request;final long term,generation,stamp;final ApplyPosition cut;final long count,bytes,inputBytes,metadataBytes;
         SessionNamespace namespaceReservation; RatisSourceOutcomeRecord record;boolean reading=true,qualified,submitted,invalidated,released,maybeAppended;int owners;
-        SourceHold(SourceKey key,NativeSourceOutcomeCredit.Request request,CdcMetadataOwner owner,long count,long bytes,long metadataBytes){this.key=key;this.request=request;this.term=owner.term();this.generation=owner.generation();this.stamp=owner.stamp();this.cut=owner.cut();this.count=count;this.bytes=bytes;this.metadataBytes=metadataBytes;this.inputBytes=16L+request.encode().length+(key.kind()==RatisSourceOutcomeRecord.Kind.PUBLISH?request.maximumResultBytes():0);}
+        SourceHold(SourceKey key,NativeSourceOutcomeCredit.Request request,CdcMetadataOwner owner,long count,long bytes,long metadataBytes,RatisNodeResourceBudget.Lease graph){super(graph);this.key=key;this.request=request;this.term=owner.term();this.generation=owner.generation();this.stamp=owner.stamp();this.cut=owner.cut();this.count=count;this.bytes=bytes;this.metadataBytes=metadataBytes;this.inputBytes=16L+request.encode().length+(key.kind()==RatisSourceOutcomeRecord.Kind.PUBLISH?request.maximumResultBytes():0);}
     }
     record SourceOutcomeStats(int holds,int reading,long count,long bytes){}
     SourceOutcomeStats sourceOutcomeStats(){synchronized(admissions){return new SourceOutcomeStats(sourceHolds.size(),(int)sourceHolds.values().stream().filter(h->h.reading).count(),sourceHolds.values().stream().mapToLong(h->h.count).sum(),sourceHolds.values().stream().mapToLong(h->h.bytes).sum());}}
-    private void releaseSourceHold(SourceHold hold){hold.released=true;if(hold.reading || hold.owners>0)return;if(sourceHolds.remove(hold.key,hold)){releaseSourceNamespace(hold);reservedReceiptCount-=hold.count;reservedReceiptBytes-=hold.bytes;}}
+    private void releaseSourceHold(SourceHold hold){hold.released=true;if(hold.reading || hold.owners>0 || hold.nativeOwners!=0)return;if(sourceHolds.remove(hold.key,hold)){hold.closeGraph();releaseSourceNamespace(hold);reservedReceiptCount-=hold.count;reservedReceiptBytes-=hold.bytes;}}
     private void releaseSourceNamespace(SourceHold hold) {
         if (hold.namespaceReservation!=null) { releaseSessionNamespace(hold.namespaceReservation); hold.namespaceReservation=null; }
     }
@@ -1365,8 +1425,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(!retentionFits(estimate.usage().retainedCount(),reservedReceiptCount,count,retentionLimits.dataCount()+(proposal.kind()==RatisSourceOutcomeRecord.Kind.CREDIT?0:retentionLimits.maintenanceCount())) || !retentionFits(estimate.usage().retainedBytes(),reservedReceiptBytes,bytes,retentionLimits.dataBytes()+(proposal.kind()==RatisSourceOutcomeRecord.Kind.CREDIT?0:retentionLimits.maintenanceBytes())))throw new IOException("Source promises overlap pending ordinary receipt capacity");
             if(proposal.kind()==RatisSourceOutcomeRecord.Kind.CREDIT && !retentionFits(estimate.metadataUsageBytes(),sourceHolds.values().stream().mapToLong(h->h.metadataBytes).sum(),estimate.metadataBytes(),NativeSourceOutcomeCredit.MAX_METADATA_BYTES))throw new IOException("Source metadata promises exceed durable/volatile budget");
             var namespace=reserveSessionNamespace(proposal.request().original(),namespaceEstimate);
-            try { hold=new SourceHold(key,proposal.request(),owner,count,bytes,proposal.kind()==RatisSourceOutcomeRecord.Kind.CREDIT?estimate.metadataBytes():0); }
-            catch (RuntimeException | Error failure) { if(namespace!=null)releaseSessionNamespace(namespace); throw failure; }
+            try { hold=new SourceHold(key,proposal.request(),owner,count,bytes,proposal.kind()==RatisSourceOutcomeRecord.Kind.CREDIT?estimate.metadataBytes():0,retainedProof(RatisSourceOutcomeRecord.MAX_BYTES,null)); }
+            catch (IOException | RuntimeException | Error failure) { if(namespace!=null)releaseSessionNamespace(namespace); throw failure; }
             hold.namespaceReservation=namespace;sourceHolds.put(key,hold);reservedReceiptCount+=count;reservedReceiptBytes+=bytes;
         }
         boolean qualified=false;
@@ -1376,7 +1436,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void cancelSourceOutcome(RatisSourceOutcomeRpc.Proposal proposal){synchronized(admissions){var hold=sourceHolds.get(new SourceKey(proposal.request().original().operationId(),proposal.kind()));if(hold!=null && hold.request.equals(proposal.request()) && !hold.submitted){hold.invalidated=true;releaseSourceHold(hold);}}}
     private TransactionContext startSourceOutcome(TransactionContext transaction,RatisSourceOutcomeRecord record)throws Exception{
         var owner=checkCdcMetadataOwner();if(!owner.sealed())throw new IOException("Source record requires sealed native owner");var saved=savedSourceRecord(record);var key=new SourceKey(record.request().original().operationId(),record.kind());
-        synchronized(admissions){reconcileOlderProposalTerms(owner.term());if(nonSourceIdentityBusy(key.operation()))throw new IOException("Source record original identity already owns another proposal");var hold=sourceHolds.get(key);if(saved!=null && hold==null){if(sourceHolds.size()>=NativeSourceOutcomeCredit.MAX_CREDITS || sourceHolds.values().stream().mapToLong(h->h.inputBytes).sum()+record.encode().length>NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IOException("Saved source retry slots/input exhausted");hold=new SourceHold(key,record.request(),owner,0,0,0);hold.record=record;hold.reading=false;hold.qualified=true;sourceHolds.put(key,hold);}if(hold==null || hold.reading || !hold.qualified || !record.equals(hold.record))throw new IOException("Source record has no exact prepared proof");requireSourceOwner(hold,leadership());hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}
+        synchronized(admissions){reconcileOlderProposalTerms(owner.term());if(nonSourceIdentityBusy(key.operation()))throw new IOException("Source record original identity already owns another proposal");var hold=sourceHolds.get(key);if(saved!=null && hold==null){if(sourceHolds.size()>=NativeSourceOutcomeCredit.MAX_CREDITS || sourceHolds.values().stream().mapToLong(h->h.inputBytes).sum()+record.encode().length>NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IOException("Saved source retry slots/input exhausted");hold=new SourceHold(key,record.request(),owner,0,0,0,retainedProof(RatisSourceOutcomeRecord.MAX_BYTES,null));hold.record=record;hold.reading=false;hold.qualified=true;sourceHolds.put(key,hold);}if(hold==null || hold.reading || !hold.qualified || !record.equals(hold.record))throw new IOException("Source record has no exact prepared proof");if(saved==null)requireSourceOwner(hold,leadership());else savedAppend(transaction,hold,record,leadership(),admissionGeneration.get());hold.submitted=true;hold.owners++;transaction.setStateMachineContext(hold);return transaction;}
     }
     private byte[] applySourceOutcome(ApplyPosition position,RatisSourceOutcomeRecord record)throws Exception{
         byte[] result;if(record.kind()==RatisSourceOutcomeRecord.Kind.CREDIT){var credit=store.applySourceOutcomeCredit(position,record.request());var estimate=store.estimateSourceOutcomeCredit(record.request());result=RatisSourceOutcomeRpc.applied(record,estimate.fenced()?NativeSourceOutcomePublication.Outcome.FENCED:NativeSourceOutcomePublication.Outcome.RETAINED,credit==null?null:credit.encode());}else{var published=store.publishSourceOutcome(position,record.request(),record.result());result=RatisSourceOutcomeRpc.applied(record,published.outcome(),published.publication()==null?null:published.publication().encode());}synchronized(admissions){var hold=sourceHolds.get(new SourceKey(record.request().original().operationId(),record.kind()));if(hold!=null && record.equals(hold.record)){releaseSourceNamespace(hold);releaseSourceHold(hold);}}return result;
@@ -1697,8 +1757,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         ReplicatedRangeStore.TopologyFreezeGate topologyGate;DistributedStoragePool topologyPool;
         long topologyGeneration;boolean topologyReplacing;CompletableFuture<Void> topologyActions=CompletableFuture.completedFuture(null);
         ReplicatedRangeStore.SchemaInstallCaptureGate captureGate;
-        DistributedStoragePool.SchemaInstallPlan plan; boolean running,suspended,stageReady,cancelled;
+        DistributedStoragePool.SchemaInstallPlan plan; volatile boolean running; boolean suspended,stageReady,cancelled;
         byte[] coveredResult;
+        RetainedProof retainedOwner;volatile boolean cleanupSettled,nativeCleaning;
         NativeApply(long index,Deferred deferred) {
             this.index=index; this.deferred=deferred;
             byte[] bytes=deferred.encoded(); boolean importing=RatisRangeImportRecord.isImport(bytes),referencing=RatisReferencedFile.Request.isRequest(bytes),freezing=RatisTopologyFreezeRecord.isFreeze(bytes);
@@ -1707,7 +1768,36 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             importRecord=importing ? RatisRangeImportRecord.decode(bytes) : null;
             referenceRequest=referencing ? RatisReferencedFile.Request.decode(bytes) : null;
         }
-        void close() { if(topologyGate!=null){var capture=topologyGate;topologyGate=null;var cleanup=topologyPool.submitTopologyCleanup(capture).toCompletableFuture();synchronized(admissions){topologyApplyCleanup=CompletableFuture.allOf(topologyApplyCleanup,cleanup);}}if (plan!=null) plan.close(); if (captureGate!=null) captureGate.close(); }
+        void ownRetainedProof() {
+            synchronized(admissions){
+                if(retainedOwner!=null)return;
+                RetainedProof found=null;
+                if(topologyRecord!=null && topologyHold!=null && topologyHold.record.equals(topologyRecord))found=topologyHold;
+                else if(record!=null && schemaHold!=null && schemaHold.record.equals(record))found=schemaHold;
+                else if(importApplyHold!=null && Arrays.equals(importApplyHold.bytes,deferred.encoded()))found=importApplyHold;
+                if(found!=null){retainedOwner=found;found.nativeOwners++;}
+            }
+        }
+        void releaseRetainedIfDrained(){
+            synchronized(admissions){
+                if(running || !cleanupSettled || retainedOwner==null)return;
+                var owner=retainedOwner;retainedOwner=null;owner.nativeOwners--;
+                if(owner instanceof TopologyHold h && h.released)releaseTopologyHold(h);
+                else if(owner instanceof SchemaHold h && h.released)releaseSchemaHold(h);
+                else if(owner instanceof ImportApplyHold h && h.released)releaseImportApply(h);
+            }
+        }
+        void close() {
+            if(nativeCleaning)return;
+            if(topologyGate!=null){
+                nativeCleaning=true;var capture=topologyGate;topologyGate=null;
+                var cleanup=topologyPool.submitTopologyCleanup(capture).toCompletableFuture();
+                synchronized(admissions){topologyApplyCleanup=CompletableFuture.allOf(topologyApplyCleanup,cleanup);}
+                cleanup.whenComplete((unused,failure)->{if(failure==null){cleanupSettled=true;releaseRetainedIfDrained();}});
+                return;
+            }
+            if(plan!=null)plan.close();if(captureGate!=null)captureGate.close();cleanupSettled=true;releaseRetainedIfDrained();
+        }
     }
     private final Object durabilityGate = new Object();
     private Path raftRoot;
@@ -2283,6 +2373,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             boolean maintenance=semantic==2 || semantic==3 || semantic==1 && java.nio.ByteBuffer.wrap(prefix).getInt(101)==0 && java.nio.ByteBuffer.wrap(prefix).getInt(105)==0;
             kind=maintenance || snapshotHomeProgressInput(content.asReadOnlyByteBuffer()) ? RatisNodeResourceBudget.Kind.PROTECTED : RatisNodeResourceBudget.Kind.ORDINARY;
         }
+        if(kind==null && (RatisRangeImportRecord.isImport(prefix) || RatisReferencedFile.Request.isRequest(prefix) || RatisTopologyFreezeRecord.isFreeze(prefix)
+                || RatisTopologyActivationRecord.isActivation(prefix) || prefix.length>=4 && ByteBuffer.wrap(prefix).getInt()==RatisTopologyRelocationRecord.MAGIC
+                || RatisSchemaFenceRecord.isFence(prefix) || RatisSchemaInstallRecord.isInstall(prefix) || RatisSchemaActivateRecord.isActivate(prefix) || RatisSourceOutcomeRecord.isRecord(prefix)))kind=RatisNodeResourceBudget.Kind.PROTECTED;
         var lease=kind==null ? null : reserveNodeResources(kind,256L+4L*content.size(),1);
         boolean retained=false;
         try {
@@ -2290,6 +2383,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if (lease!=null && transaction.getStateMachineContext() instanceof Admission admission) {
                 synchronized(admissions) { admission.resourceLeases.add(lease); }
                 retained=true;
+            } else if(lease!=null && transaction.getStateMachineContext() instanceof RetainedProof hold) {
+                synchronized(admissions){hold.inputGraphs.add(lease);}retained=true;
             }
             return transaction;
         } finally { if (!retained && lease!=null) lease.close(); }
@@ -2425,11 +2520,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                             admission = new Admission(command.operationId(), digest, encoded.length, leadership.term(), generation,
                                     estimate.additionalCount(),estimate.additionalBytes(),maintenance,protectedControl,lease,accepted==null ? null : accepted.reservation.lease,reject ? rejectionData : null);
                             admission.namespaceReservation=namespace;
-                            admission.importPublicationHold=importOwner;if(importOwner!=null)importOwner.submitted=true;
+                            admission.importPublicationHold=importOwner;if(importOwner!=null){importOwner.submitted=true;importOwner.owners++;}
                             admission.sessionBinding=command.sessionControl()!=null && command.sessionControl().binding();
                             if(metadataOwner!=null) { admission.topologyMetadataControl=command; admission.topologyMetadataOwner=metadataOwner; }
                             admission.fencingHold=fencingOwner;
-                            if (fencingOwner!=null) fencingOwner.submitted=true;
+                            if (fencingOwner!=null) { fencingOwner.submitted=true;fencingOwner.owners++; }
                             if (homeCredit!=null) { admission.homeCreditCount=homeCredit.additionalCount(); admission.homeCreditBytes=homeCredit.additionalBytes(); }
                             admissions.put(admission.id, admission);
                         } catch (RuntimeException | Error failure) {
@@ -2706,8 +2801,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     && role==RatisNodePlan.Role.DATA && store.metadataTopologyControl(input.topologyMetadataControl);
             Leadership current = leadership();
             var nativePosition = store.applied();
+            var replayDigest=transaction.getStateMachineContext() instanceof RetainedProof ? appendInputDigest(transaction) : null;
             synchronized (admissions) {
                 requireHealthy();
+                var saved=savedAppendStamps.get(transaction);
+                if(saved!=null){
+                    if(transaction.getStateMachineContext()!=saved.owner() || !Arrays.equals(saved.digest(),replayDigest) || !current.ready() || nativePosition==null || nativePosition.term()!=current.term()
+                            || saved.term()!=current.term() || saved.generation()!=admissionGeneration.get() || saved.configurationStamp()!=schemaConfigurationStamp || schemaConfigurationPending || getLifeCycleState()!=LifeCycle.State.RUNNING)
+                        throw new IOException("Saved exact append lost current context owner");
+                    return super.preAppendTransaction(transaction);
+                }
                 if(transaction.getStateMachineContext() instanceof RelocationHold hold){requireRelocationHold(hold,current);if(hold.owners<=0)throw new IOException("Relocation owner released");return super.preAppendTransaction(transaction);}
                 if(transaction.getStateMachineContext() instanceof SourceHold hold){requireSourceOwner(hold,current);if(hold.owners<=0 || !hold.qualified || hold.reading)throw new IOException("Source record owner released");return super.preAppendTransaction(transaction);}
                 if(transaction.getStateMachineContext() instanceof ActivationHold hold){requireTopologyActivationOwner(hold,hold.record,current,admissionGeneration.get());if(hold.owners<=0)throw new IOException("Topology activation proposal owner released");return super.preAppendTransaction(transaction);}
@@ -2965,6 +3068,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 work.running=true; work.suspended=false;
             }
             try {
+            work.ownRetainedProof();
             if(work.topologyRecord!=null){
                 var record=work.topologyRecord;var saved=store.lookupTopologyFreeze(record.header(),record.admissionDigest());
                 if(saved!=null){store.applyTopologyFreeze(new ApplyPosition(work.deferred.term(),work.index),record.definition(),record.admissionDigest());return finishNativeApply(work,saved.encode());}
@@ -3020,7 +3124,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             // No Ratis gate or admission monitor owns JNI schema mutation or waits for retained pins.
             var installed=schemaStorage.installSchema(store,new ApplyPosition(work.deferred.term(),work.index),work.plan);
             return finishNativeApply(work,installed.proof().encode());
-            } finally { boolean close; synchronized (gate) { work.running=false; close=work.cancelled || work.coveredResult!=null; } if (close) work.close(); }
+            } finally { boolean close; synchronized (gate) { work.running=false; close=work.cancelled || work.coveredResult!=null; } if (close) work.close(); work.releaseRetainedIfDrained(); }
         }).whenComplete((ignored,failure) -> {
             topologyAction.complete(null);
             synchronized(gate){if(work.topologyRecord!=null && (work.topologyReplacing || topologyGeneration!=work.topologyGeneration))return;}
@@ -3102,17 +3206,18 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     private void releaseAdmission(TransactionContext transaction) {
         synchronized (admissions) {
-            if(transaction.getStateMachineContext() instanceof RelocationHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.invalidated || !hold.maybeAppended && hold.owners==0)releaseRelocation(hold);}
+            savedAppendStamps.remove(transaction);
+            if(transaction.getStateMachineContext() instanceof RelocationHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released || hold.invalidated || !hold.maybeAppended && hold.owners==0)releaseRelocation(hold);}
             if(transaction.getStateMachineContext() instanceof SourceHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released)releaseSourceHold(hold);else if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseSourceHold(hold);}}
             if(transaction.getStateMachineContext() instanceof ActivationHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released)releaseTopologyActivation(hold);else if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseTopologyActivation(hold);}}
-            if(transaction.getStateMachineContext() instanceof TopologyHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseTopologyHold(hold);}}
+            if(transaction.getStateMachineContext() instanceof TopologyHold hold){transaction.setStateMachineContext(null);hold.owners--;if(transaction.getLogEntry()!=null)hold.maybeAppended=true;if(hold.released || !hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseTopologyHold(hold);}}
             if (transaction.getStateMachineContext() instanceof ImportApplyHold hold) {
                 transaction.setStateMachineContext(null); hold.owners--; if(transaction.getLogEntry()!=null)hold.maybeAppended=true;
-                if(!hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseImportApply(hold);}
+                if(hold.released || !hold.maybeAppended && hold.owners==0){hold.submitted=false;releaseImportApply(hold);}
             }
             if (transaction.getStateMachineContext() instanceof SchemaHold hold) {
                 transaction.setStateMachineContext(null); hold.owners--; if (transaction.getLogEntry()!=null) hold.maybeAppended=true;
-                if (!hold.maybeAppended && hold.owners==0) { hold.submitted=false; releaseSchemaHold(hold); }
+                if (hold.released || !hold.maybeAppended && hold.owners==0) { hold.submitted=false; releaseSchemaHold(hold); }
             }
             if (transaction.getStateMachineContext() instanceof Admission admission) {
                 transaction.setStateMachineContext(null);
@@ -3125,6 +3230,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void finishAdmission(Admission admission) {
         if (!admissions.remove(admission.id,admission)) return;
         releaseRetention(admission); releaseFootprint(admission);
+        if(admission.importPublicationHold!=null){admission.importPublicationHold.owners--;releaseImportPublication(admission.importPublicationHold);}
+        if(admission.fencingHold!=null){admission.fencingHold.owners--;releaseSchemaHold(admission.fencingHold);}
         admission.resourceLeases.forEach(RatisNodeResourceBudget.Lease::close); admission.resourceLeases.clear();
         admittedBytes-=admission.bytes;
         if (admission.homeRecovery!=null) homeRecoveryInputBytes-=admission.bytes;
@@ -4480,7 +4587,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 // Native rows, immutable row copies, serialization and response framing overlap.
                 responseBytes=8L*bytes;
             }
-            default -> { return null; }
+            default -> { return reserveNodeResources(RatisNodeResourceBudget.Kind.PROTECTED,256L+4L*request.remaining(),1); }
         }
         var lane=RatisNodeResourceBudget.Kind.ORDINARY;
         // Exact configured HOME status reads are required by protected completion protocols.
