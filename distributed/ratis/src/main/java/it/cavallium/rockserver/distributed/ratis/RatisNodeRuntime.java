@@ -118,6 +118,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final Map<RatisNodePlan.Role,RatisRoutedClient> homeClients=new EnumMap<>(RatisNodePlan.Role.class);
     private RatisTransactionExpiryService transactionExpiry;
     private RatisPoolPressureService poolPressure;
+    private RatisNodeMaintenance localMaintenance;
+    private RatisNodeMaintenance.Policy localMaintenancePolicy;
     private RecoverySettings recoverySettings;
     private RatisParticipantRecoveryRegistry participantRecoveries;
     private RatisTransactionRecoveryService participantRecoveryService;
@@ -804,6 +806,18 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisNodeReadiness.Recovery recoveryStamp(RatisParticipantRecoveryRegistry.RecoveryStatus status) {
         return new RatisNodeReadiness.Recovery(status.scanned(),status.unresolvedDecisions(),status.activeWorkers(),participantRecoveryFailure());
     }
+    /** Trusted embedding API. Policy is fixed for this node owner; the returned controller is borrowed. */
+    public synchronized RatisNodeMaintenance localMaintenance(RatisNodeMaintenance.Policy policy) throws IOException {
+        if(!started || closeRequested || closing || closed)throw new IOException("Local maintenance node is unavailable");
+        Objects.requireNonNull(policy);
+        if(localMaintenance==null){localMaintenance=new RatisNodeMaintenance(plan.nodeId(),plan.nodeIncarnation(),List.of(pool),scheduler,policy);localMaintenancePolicy=policy;}
+        else if(!localMaintenancePolicy.equals(policy))throw new IOException("Local maintenance policy is already fixed");
+        return localMaintenance;
+    }
+    public synchronized RatisNodeMaintenance.Target localMaintenanceTarget(UUID column) throws IOException {
+        if(!started || closeRequested || closing || closed || localMaintenance==null)throw new IOException("Local maintenance is not configured or available");
+        return localMaintenance.target(pool,column);
+    }
     public RatisSessionClockService.Snapshot maintenanceStatus() { return service==null ? null : service.latest(); }
     public Throwable maintenanceFailure() { return service==null ? null : service.lastFailure(); }
     public Throwable retirementFailure() { if (retirementCoordinator!=null && retirementCoordinator.lastFailure()!=null) return retirementCoordinator.lastFailure(); return retirementService==null ? null : retirementService.lastFailure(); }
@@ -839,6 +853,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (installing || starting || closing) throw new IOException("Node lifecycle operation is active"); closeRequested=true; closing=true;
         }
         try {
+            if(localMaintenance!=null) {
+                try{localMaintenance.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Local maintenance drain interrupted",interrupted);}
+                catch(ExecutionException | TimeoutException failure){throw new IOException("Local maintenance work did not drain",failure);}
+            }
             if(topologyImageQueries!=null){try{topologyImageQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Topology image drain interrupted",interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException("Topology image owners did not drain",failure);}}
             if(sourceSnapshots!=null)sourceSnapshots.close();if(sourceArtifacts!=null)sourceArtifacts.close();
             if(importPreflightQueries!=null){try{importPreflightQueries.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Import preflight drain interrupted",interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException("Import preflight owners did not drain",failure);}}

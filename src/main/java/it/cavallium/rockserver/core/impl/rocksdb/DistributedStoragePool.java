@@ -1561,6 +1561,52 @@ public final class DistributedStoragePool implements AutoCloseable {
         }
     }
 
+    private final UUID maintenanceSession=UUID.randomUUID();
+    public UUID maintenanceSession() { return maintenanceSession; }
+    private volatile java.util.function.Consumer<UUID> localMaintenanceObserver=column -> {};
+    /** Native lifetime remains held while this diagnostic boundary executes. */
+    public void localMaintenanceObserver(java.util.function.Consumer<UUID> observer) { localMaintenanceObserver=Objects.requireNonNull(observer); }
+    @FunctionalInterface private interface MaintenanceAction<T> { T run(org.rocksdb.RocksDB db,ColumnFamilyHandle column,List<String> paths) throws RocksDBException,IOException; }
+    private <T>T localMaintenance(UUID session,UUID column,MaintenanceAction<T> action) throws RocksDBException,IOException {
+        Objects.requireNonNull(session);Objects.requireNonNull(column);
+        ColumnFamilyHandle handle;String name;List<String> paths;
+        nativeMutation.acquireUninterruptibly();
+        try {
+            synchronized(admission){if(closing || closed)throw new IOException("Pool is closing");}
+            if(!maintenanceSession.equals(session))throw new IllegalArgumentException("Stale physical maintenance session");
+            var binding=bindings.get(column);if(binding==null || deferredDrops.contains(column))throw new IllegalArgumentException("Unknown or retired physical column");
+            name=binding.name();handle=handles.get(name);if(handle==null)throw new IllegalArgumentException("Physical column is absent");
+            paths=maintenancePaths(name);handleLifetime.readLock().lock();
+        } finally {nativeMutation.release();}
+        try {localMaintenanceObserver.accept(column);return action.run(loaded.db().get(),handle,paths);}
+        finally {handleLifetime.readLock().unlock();}
+    }
+    public void flushLocal(UUID session,UUID column) throws RocksDBException,IOException {
+        localMaintenance(session,column,(db,handle,paths)->{try(var options=new org.rocksdb.FlushOptions().setWaitForFlush(true)){db.flush(options,handle);}return null;});
+    }
+    public void compactLocal(UUID session,UUID column) throws RocksDBException,IOException {
+        localMaintenance(session,column,(db,handle,paths)->{db.compactRange(handle);return null;});
+    }
+    private List<String> maintenancePaths(String name) throws IOException {
+        try {
+            var selected=globalConfig.fallbackColumnOptions();
+            for(var configured:globalConfig.columnOptions())if(configured.name().equals(name)){selected=configured;break;}
+            return RocksDBLoader.getVolumeConfigs(loaded.definitiveDbPath(),selected).stream().map(path->path.path().toAbsolutePath().normalize().toString()).toList();
+        } catch(GestaltException failure){throw new IOException("Physical column volume configuration unavailable",failure);}
+    }
+    public it.cavallium.rockserver.core.common.SstMaintenance.Metadata sstMetadataLocal(UUID session,UUID column,int level,int maxFiles,long maxBytes) throws RocksDBException,IOException {
+        return localMaintenance(session,column,(db,handle,paths)->{var metadata=it.cavallium.rockserver.core.impl.SelectiveCompaction.boundedMetadata(db,handle,paths,session+"-"+handle.getID(),handle.getID(),level,maxFiles,maxBytes);return metadata;});
+    }
+    public it.cavallium.rockserver.core.common.SstMaintenance.Result compactFilesLocal(UUID session,UUID column,it.cavallium.rockserver.core.common.SstMaintenance.Request request,int maxFiles,long maxBytes) throws RocksDBException,IOException {
+        return localMaintenance(session,column,(db,handle,paths)->{var metadata=it.cavallium.rockserver.core.impl.SelectiveCompaction.boundedMetadata(db,handle,paths,session+"-"+handle.getID(),handle.getID(),request.level(),maxFiles,maxBytes);return it.cavallium.rockserver.core.impl.SelectiveCompaction.compact(db,handle,metadata,request);});
+    }
+    private static long checkedMaintenanceProperty(long value) throws IOException {if(value<0)throw new IOException("Unsigned physical table property exceeds signed range");return value;}
+    public record LocalTableProperties(long files,long entries,long deletions,long mergeOperands,long dataBytes,long indexBytes,long filterBytes) {}
+    public LocalTableProperties tablePropertiesLocal(UUID session,UUID column,int maxFiles) throws RocksDBException,IOException {
+        if(maxFiles<1 || maxFiles>it.cavallium.rockserver.core.common.SstMaintenance.MAX_INPUT_FILES)throw new IllegalArgumentException("Invalid table inventory limit");
+        return localMaintenance(session,column,(db,handle,paths)->{var tables=db.getPropertiesOfAllTables(handle);if(tables.size()>maxFiles)throw new IOException("Physical table inventory exceeds maintenance limit");long entries=0,deletions=0,merges=0,data=0,index=0,filter=0;for(var table:tables.values()){entries=Math.addExact(entries,checkedMaintenanceProperty(table.getNumEntries()));deletions=Math.addExact(deletions,checkedMaintenanceProperty(table.getNumDeletions()));merges=Math.addExact(merges,checkedMaintenanceProperty(table.getNumMergeOperands()));data=Math.addExact(data,checkedMaintenanceProperty(table.getDataSize()));index=Math.addExact(index,checkedMaintenanceProperty(table.getIndexSize()));filter=Math.addExact(filter,checkedMaintenanceProperty(table.getFilterSize()));}return new LocalTableProperties(tables.size(),entries,deletions,merges,data,index,filter);});
+    }
+
     /** Export a caller-owned cut with this pool's exact column options; no schema lock spans file I/O. */
     public NativeRangeSstExport.Manifest exportSst(Path destination, ReplicatedRangeStore.ScopedSnapshot snapshot,
             UUID column, byte[] lowerInclusive, byte[] upperExclusive, NativeRangeSstExport.Limits limits)

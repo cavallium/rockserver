@@ -14,18 +14,34 @@ import org.rocksdb.RocksDB;
 public final class SelectiveCompaction {
     private SelectiveCompaction() {}
 
-    static SstMaintenance.Metadata metadata(RocksDB db, ColumnFamilyHandle column,
+    public static SstMaintenance.Metadata metadata(RocksDB db, ColumnFamilyHandle column,
             List<String> configuredPaths, String session, long columnId, int level)
             throws org.rocksdb.RocksDBException {
+        return boundedMetadata(db,column,configuredPaths,session,columnId,level,SstMaintenance.MAX_INPUT_FILES,SstMaintenance.MAX_METADATA_RESPONSE_BYTES);
+    }
+
+    /** The native metadata call eagerly owns its inventory; bounds precede Java response copies. */
+    public static SstMaintenance.Metadata boundedMetadata(RocksDB db,ColumnFamilyHandle column,
+            List<String> configuredPaths,String session,long columnId,int level,int maxFiles,long maxBytes)
+            throws org.rocksdb.RocksDBException {
+        if(maxFiles<1 || maxFiles>SstMaintenance.MAX_INPUT_FILES || maxBytes<1 || maxBytes>SstMaintenance.MAX_METADATA_RESPONSE_BYTES)throw SstMaintenance.invalid("Invalid physical metadata limits");
+        if(level < -1)throw SstMaintenance.invalid("Invalid level");
+        if(level>=0){var observed=db.getProperty(column,"rocksdb.num-files-at-level"+level);if(observed!=null){long count=Long.parseLong(observed);if(count<0 || count>maxFiles)throw SstMaintenance.invalid("Physical SST inventory exceeds response limit");}}
         var meta = db.getColumnFamilyMetaData(column);
         if (level < -1 || level >= meta.levels().size()) throw SstMaintenance.invalid("Invalid level");
         var paths = configuredPaths;
         if (paths.isEmpty()) paths = List.of(Path.of(db.getName()).toAbsolutePath().normalize().toString());
+        long bytes=128L+2L*(session.length()+meta.name().length);
+        for(var path:paths)bytes=Math.addExact(bytes,2L*path.length());
+        if(bytes>maxBytes)throw SstMaintenance.invalid("Physical metadata exceeds response limit");
         var files = new ArrayList<SstMaintenance.File>();
         var hex = HexFormat.of();
         for (var l : meta.levels()) {
             if (level != -1 && l.level() != level) continue;
             for (var f : l.files()) {
+                if(files.size()>=maxFiles)throw SstMaintenance.invalid("Physical SST inventory exceeds response limit");
+                bytes=Math.addExact(bytes,96L+2L*f.fileName().length()+4L*(f.smallestKey().length+f.largestKey().length));
+                if(bytes>maxBytes)throw SstMaintenance.invalid("Physical metadata exceeds response limit");
                 int pathId = paths.indexOf(Path.of(f.path()).toAbsolutePath().normalize().toString());
                 if (pathId < 0) throw SstMaintenance.invalid("SST path is absent from configured CF paths");
                 files.add(new SstMaintenance.File(basename(f.fileName()), l.level(), pathId, f.size(),
@@ -64,7 +80,7 @@ public final class SelectiveCompaction {
         return selected;
     }
 
-    static SstMaintenance.Result compact(RocksDB db, ColumnFamilyHandle column,
+    public static SstMaintenance.Result compact(RocksDB db, ColumnFamilyHandle column,
             SstMaintenance.Metadata meta, SstMaintenance.Request request) throws org.rocksdb.RocksDBException {
         var selected = validate(meta, request);
         long inputBytes = selected.stream().mapToLong(SstMaintenance.File::sizeBytes).sum();

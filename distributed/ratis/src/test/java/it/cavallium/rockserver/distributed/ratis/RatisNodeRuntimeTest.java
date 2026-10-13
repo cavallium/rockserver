@@ -39,6 +39,21 @@ class RatisNodeRuntimeTest {
         }
         return bytes.toByteArray();
     }
+    @Test void trustedLocalMaintenanceIsNodeOwnedAndStoppedBeforeNativeClose() throws Exception {
+        try(var env=new Env(root)) {
+            var fake=new FakeServer();var policy=new RatisNodeMaintenance.Policy(false,false,2,32,1024*1024);
+            try(var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake)) {
+                assertThrows(IOException.class,()->node.localMaintenance(policy));node.start();env.timer.fire();RatisTransactionRecoveryServiceTest.idle(env.scheduler);
+                var maintenance=node.localMaintenance(policy);var target=node.localMaintenanceTarget(env.outer.data);
+                assertSame(maintenance,node.localMaintenance(policy));
+                assertThrows(IOException.class,()->node.localMaintenance(new RatisNodeMaintenance.Policy(true,false,2,32,1024*1024)));
+                assertNotNull(maintenance.metadata(target,-1).get(5,java.util.concurrent.TimeUnit.SECONDS));
+                assertThrows(IllegalStateException.class,()->maintenance.flush(target));
+                node.close();assertThrows(IllegalStateException.class,()->maintenance.metadata(target,-1));
+                assertThrows(IOException.class,()->node.localMaintenanceTarget(env.outer.data));
+            }
+        }
+    }
     @Test void exclusiveRecoveredRootAttestsOnlyPreviousProcessCohortsGone()throws Exception{
         try(var env=new Env(root)){
             UUID process,pool;var first=new FakeServer();

@@ -133,6 +133,12 @@ public final class RatisNodeService implements AutoCloseable {
         try { return node.readiness(); }
         finally { synchronized (this) { checks--; } }
     }
+    public synchronized RatisNodeMaintenance localMaintenance(RatisNodeMaintenance.Policy policy) throws IOException {
+        requireOpen();return node.localMaintenance(policy);
+    }
+    public synchronized RatisNodeMaintenance.Target localMaintenanceTarget(UUID column) throws IOException {
+        requireOpen();return node.localMaintenanceTarget(column);
+    }
     private void requireOpen() throws IOException { if (closed || closeRequested || closing) throw new IOException("Node service is closing/closed"); }
     @Override public void close() throws IOException {
         synchronized (this) {
