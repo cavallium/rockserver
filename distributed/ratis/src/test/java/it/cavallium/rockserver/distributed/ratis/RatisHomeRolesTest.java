@@ -29,7 +29,7 @@ class RatisHomeRolesTest {
                 var directory=new RangeDirectory(env.outer.cluster,env.outer.database,new UUID(93,id),id,digest,0,Set.of(column),0,List.of(route));
                 homes.add(new RatisNodePlan.Home(role,directory,column,"home-"+id));
             }
-            return new RatisNodePlan(env.plan.nodeId(), env.plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(env.plan.domains().getFirst().directory(), env.plan.columns(), env.plan.merges())), env.plan.catalogue(), homes, List.of(), Map.of(), env.plan.localGroups().size()+2);
+            return new RatisNodePlan(env.plan.nodeId(), env.plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(env.plan.domains().getFirst().directory(), env.plan.columns(), env.plan.merges())), env.plan.catalogue(), homes, List.of(), Map.of(), env.plan.localGroups().size()+2,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(env.plan.domains().getFirst().directory(), env.plan.columns(), env.plan.merges()))),RatisPoolFixtures.groups(env.plan.catalogue(),homes));
     }
     final class Fixture implements AutoCloseable {
         final RatisNodeRuntimeTest.Env env;

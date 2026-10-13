@@ -72,6 +72,10 @@ class RatisAtomicClientTest {
             this(root,snapshotHome,schemaOverrides,null);
         }
         Fixture(Path root,boolean snapshotHome,Map<Long,ColumnSchema> schemaOverrides,it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits pins) throws Exception {
+            this(root,snapshotHome,schemaOverrides,pins,(route,machine)->{});
+        }
+        Fixture(Path root,boolean snapshotHome,Map<Long,ColumnSchema> schemaOverrides,it.cavallium.rockserver.core.impl.rocksdb.PoolSnapshotAdmission.Limits pins,
+                java.util.function.BiConsumer<RangeDescriptor,RatisRangeStateMachine> configureData) throws Exception {
             this.root=root; Files.createDirectories(root); catalogue=outer.new Fixture(root.resolve("catalogue"),pins);
             snapshotHelp=snapshotHome ? new RatisSnapshotHelpService(scheduler) : null;
             try {
@@ -123,6 +127,7 @@ class RatisAtomicClientTest {
                 var server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> switch (method.getName()) {
                     case "getId" -> peer.getId(); case "toString" -> "atomic-controlled-identity"; default -> throw new AssertionError(method);
                 });
+                if(source==directory)configureData.accept(descriptor,machine);
                 machines.put(descriptor.groupId(),machine); machine.initialize(server,group.getGroupId(),storage); machine.notifyTermIndexUpdated(1,0);
                 var binding=catalogue.epochs.prepareSessionBinding(source,descriptor.groupId(),new OperationId(admin,1,source==directory ? groups.indexOf(descriptor.groupId()) : source==homeDirectory ? 2 : 3),grant,snapshotHome ? 2048 : 1024,-1);
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(append(descriptor,DistributedCommandCodec.encode(binding))).status());

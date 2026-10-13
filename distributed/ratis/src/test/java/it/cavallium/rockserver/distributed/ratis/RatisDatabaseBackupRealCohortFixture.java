@@ -21,13 +21,13 @@ final class RatisDatabaseBackupRealCohortFixture implements AutoCloseable {
     interface Control {byte[] transaction(UUID group,int kind,byte[] body)throws Exception;byte[] participant(UUID group,byte[] body)throws Exception;CommandResult session(UUID group,DistributedCommand command)throws Exception;}
     volatile Control control;
     final class Endpoint implements RatisSnapshotCohortService.Host,AutoCloseable {
-        final RatisDatabaseBackupDriverFixture.Pool state;final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,128,1,"real-backup-cohort");
+        final RatisDatabaseBackupDriverFixture.Pool state;final RatisNodeResourceBudget graph;final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,128,1,"real-backup-cohort");
         final Map<UUID,RatisSnapshotPins> registries=new HashMap<>();RatisSnapshotCohortService service;final RatisExportSourceService exports;final Set<String> gone=new HashSet<>();UUID currentProcess;
         final RatisRoutedClient routed,homeRouted;final RatisSnapshotClient snapshots;
         Endpoint(RatisDatabaseBackupDriverFixture.Pool state,int index)throws Exception{
-            this.state=state;currentProcess=state.processId;
+            this.state=state;currentProcess=state.processId;graph=new RatisNodeResourceBudget(RatisNodeRuntime.ResourceLimits.defaults().node(),Map.of(state.poolId,RatisNodeRuntime.ResourceLimits.defaults().pool()));
             for(var group:state.stores.keySet())registries.put(group,new RatisSnapshotPins(state.registryOwners.get(group),group,new RatisSnapshotPins.Limits(16,16L*1024*1024,base.policy.retention()),System::nanoTime,(homes,fence)->{throw new AssertionError("Ordinary capture factory must never run");}));
-            service=new RatisSnapshotCohortService(this,scheduler,RatisSnapshotCohortService.Limits.defaults(),System::nanoTime);
+            service=new RatisSnapshotCohortService(this,scheduler,RatisSnapshotCohortService.Limits.defaults(),System::nanoTime,graph);
             var budgets=RatisExportSourceRegistry.Budgets.defaults();exports=new RatisExportSourceService(base.root.resolve("remote-"+index),budgets,new RatisExportSourceService.IoLimits(0,64L*1024*1024,1024*1024),new RatisExportSourceRegistry.NativeBuilder(){
                 public NativeRangeSstExport.Chunk build(RatisExportSourceRpc.JobDefinition definition,RatisExportJournal.ChunkIntent intent,Path artifact,RatisExportSourceRegistry.Completion complete)throws Exception{
                     return registries.get(definition.group()).export(definition.capture(),pin->{var result=state.nativePool.exportSstChunk(artifact,pin,intent.column(),intent.scopeStart(),definition.scope(intent.column()).upperExclusive(),intent.limits());complete.persist(result);return result;});
@@ -64,7 +64,7 @@ final class RatisDatabaseBackupRealCohortFixture implements AutoCloseable {
         }
         public boolean originalGone(RatisSnapshotCohortRpc.Reference original){return !original.processIncarnation().equals(currentProcess) && gone.contains(HexFormat.of().formatHex(RatisSnapshotCohortRpc.reference(original))) && state.nativePool.snapshotAdmissionStats().pins()==0;}
         void restartAfterDrain(RatisDatabaseBackupJournal.CohortRequest original)throws Exception{
-            service.close();assertEquals(0,state.nativePool.snapshotAdmissionStats().pins());gone.add(HexFormat.of().formatHex(RatisSnapshotCohortRpc.reference(RatisSnapshotCohortRpc.reference(original))));currentProcess=UUID.randomUUID();service=new RatisSnapshotCohortService(this,scheduler,RatisSnapshotCohortService.Limits.defaults(),System::nanoTime);
+            service.close();assertEquals(0,state.nativePool.snapshotAdmissionStats().pins());assertEquals(0,graph.stats().protectedLane().bytes());gone.add(HexFormat.of().formatHex(RatisSnapshotCohortRpc.reference(RatisSnapshotCohortRpc.reference(original))));currentProcess=UUID.randomUUID();service=new RatisSnapshotCohortService(this,scheduler,RatisSnapshotCohortService.Limits.defaults(),System::nanoTime,graph);
         }
         public void close()throws Exception{denyDrain=false;exports.stop().get(20,TimeUnit.SECONDS);service.close();for(var registry:registries.values())registry.close();snapshots.close();routed.close();homeRouted.close();scheduler.disposeGracefully().block(Duration.ofSeconds(10));}
     }

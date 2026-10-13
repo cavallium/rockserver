@@ -42,8 +42,8 @@ class RatisNodeServiceTest {
             var policy=new Policy(); var fake=new RatisNodeRuntimeTest.FakeServer();
             try (var service=RatisNodeService.recover(configured,env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create,policy)) {
                 var nodeField=RatisNodeService.class.getDeclaredField("node"); nodeField.setAccessible(true); var node=nodeField.get(service);
-                var replicaField=RatisNodeRuntime.class.getDeclaredField("schemaReplicas"); replicaField.setAccessible(true); var replicas=replicaField.get(node); assertNotNull(replicas);
-                var limitsField=RatisSchemaReplicaService.class.getDeclaredField("limits"); limitsField.setAccessible(true); assertEquals(limits,limitsField.get(replicas));
+                var replicas=RatisPoolFixtures.schemaService((RatisNodeRuntime)node); assertNotNull(replicas);
+                var limitsField=RatisSchemaReplicaService.class.getDeclaredField("limits"); limitsField.setAccessible(true); assertEquals(RatisPoolFixtures.pools().getFirst().replicas(),limitsField.get(replicas));var admissionField=RatisSchemaReplicaService.class.getDeclaredField("admission");admissionField.setAccessible(true);var nodeAdmission=admissionField.get(replicas);var nodeLimitsField=RatisSchemaReplicaAdmission.class.getDeclaredField("limits");nodeLimitsField.setAccessible(true);assertEquals(limits,nodeLimitsField.get(nodeAdmission));
                 var policyField=RatisSchemaReplicaService.class.getDeclaredField("policy"); policyField.setAccessible(true); assertSame(policy,policyField.get(replicas));
                 service.start();
             }

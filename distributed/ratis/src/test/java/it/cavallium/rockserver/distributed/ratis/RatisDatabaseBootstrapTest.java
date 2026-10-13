@@ -18,7 +18,7 @@ class RatisDatabaseBootstrapTest {
     RatisNodePlan plan(RatisSessionPropagationTest.Fixture f) {
         var node=f.directory.ranges().getFirst().replicas().getFirst();
         var catalogue=new ReplicaDescriptor(node.nodeId(),node.nodeIncarnation(),new UUID(8,8),node.peerId(),node.address(),ReplicaDescriptor.Role.VOTER);
-        return new RatisNodePlan(node.nodeId(), node.nodeIncarnation(), List.of(new RatisNodePlan.Domain(f.directory, Map.of(f.outer.data,"data"), Set.of())), new RatisNodePlan.Catalogue(f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.outer.sessions,List.of(catalogue)), List.of(), List.of(), Map.of(), 2);
+        return new RatisNodePlan(node.nodeId(), node.nodeIncarnation(), List.of(new RatisNodePlan.Domain(f.directory, Map.of(f.outer.data,"data"), Set.of())), new RatisNodePlan.Catalogue(f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.outer.sessions,List.of(catalogue)), List.of(), List.of(), Map.of(), 2,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(f.directory, Map.of(f.outer.data,"data"), Set.of()))),RatisPoolFixtures.groups(new RatisNodePlan.Catalogue(f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.outer.sessions,List.of(catalogue)),List.of()));
     }
     RatisDatabaseBootstrap bootstrap(Path path,RatisSessionPropagationTest.Fixture f,RatisNodePlan plan) throws IOException {
         return new RatisDatabaseBootstrap(path,List.of(new RatisDatabaseBootstrap.Domain(plan,f.routed,null,null)),f.catalogue.client,null,null,10,() -> 20L,2);

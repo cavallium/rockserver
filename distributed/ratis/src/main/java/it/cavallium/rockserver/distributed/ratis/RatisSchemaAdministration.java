@@ -12,7 +12,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 /** Replicated administrative intent and publication CAS. Native fencing and installation remain separate duties. */
 public final class RatisSchemaAdministration {
     public static final int MAX_HEAD_BYTES=SchemaChange.MAX_STATUS_BYTES+12;
-    private static final byte DEFINITION=0x43,HEAD=0x41,OUTCOME=0x4f,ADMISSION=0x4d;
+    private static final byte DEFINITION=0x43,HEAD=0x41,OUTCOME=0x4f,ADMISSION=0x4d,CANDIDATE=0x4e;
     @FunctionalInterface public interface ImmutableReader { byte[] read(byte[] key); }
     private final RaftClient client;
     private final UUID cluster,database,group,column;
@@ -111,8 +111,8 @@ public final class RatisSchemaAdministration {
         manifest.requireDefinition(definition);
         if (prepared.status().phase()!=SchemaChange.Phase.PREPARED || !sameHeader(prepared.status().header(),definition.header())) throw new IllegalArgumentException("Admissions require original PREPARED head");
         byte[] key=admissionKey(manifest.digest());
-        return checked(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,manifest.encode())),
-                List.of(new KeyPredicate(column,headKey(definition.header().domainId()),prepared.encode()),new KeyPredicate(column,key,null)));
+        return checked(operation,List.of(new Mutation(Mutation.Kind.PUT,column,key,manifest.encode()),new Mutation(Mutation.Kind.PUT,column,admissionCandidateKey(definition.digest()),manifest.digest())),
+                List.of(new KeyPredicate(column,headKey(definition.header().domainId()),prepared.encode()),new KeyPredicate(column,key,null),new KeyPredicate(column,admissionCandidateKey(definition.digest()),null)));
     }
     public DistributedCommand prepareFencing(OperationId operation,Head prepared,SchemaChange.Definition definition,SchemaAdmissionManifest manifest) {
         manifest.requireDefinition(definition);
@@ -199,11 +199,14 @@ public final class RatisSchemaAdministration {
                 requireDefinition(SchemaChange.Definition.decode(first.value()),cluster,database,key); return;
             }
             if (key.length==33 && key[0]==ADMISSION) {
-                if (command.mutations().size()!=1 || command.predicates().size()!=2 || !Arrays.equals(key,command.predicates().get(1).key()) || command.predicates().get(1).expectedValue()!=null) throw new IllegalArgumentException("Admissions require immutable absent-content CAS");
+                if (command.mutations().size()!=2 || command.predicates().size()!=3 || !Arrays.equals(key,command.predicates().get(1).key()) || command.predicates().get(1).expectedValue()!=null) throw new IllegalArgumentException("Admissions require immutable absent-content CAS");
                 var header=manifestHeader(first.value()); requireHeader(header,cluster,database,header.domainId());
                 var prepared=Head.decode(command.predicates().getFirst().expectedValue());
                 if (prepared.status().phase()!=SchemaChange.Phase.PREPARED || !sameHeader(prepared.status().header(),header) || !Arrays.equals(command.predicates().getFirst().key(),headKey(header.domainId()))
                         || !Arrays.equals(key,admissionKey(OperatorUpload.sha256(first.value())))) throw new IllegalArgumentException("Admission publication differs from original PREPARED intent");
+                var candidate=command.mutations().get(1);
+                if (!Arrays.equals(candidate.key(),admissionCandidateKey(header.definitionDigest())) || !Arrays.equals(candidate.value(),OperatorUpload.sha256(first.value()))) throw new IllegalArgumentException("Schema admission candidate commitment differs");
+                if (!Arrays.equals(command.predicates().get(2).key(),admissionCandidateKey(header.definitionDigest())) || command.predicates().get(2).expectedValue()!=null) throw new IllegalArgumentException("Schema admission candidate is not fresh");
                 if (!structural) {
                     var definition=committedDefinition(reader,header,cluster,database);
                     SchemaAdmissionManifest.decode(first.value(),definition);
@@ -229,6 +232,22 @@ public final class RatisSchemaAdministration {
             }
         };
     }
+    /** Called by the configured native accounting policy after deterministic catalogue validation. */
+    public static CatalogueHistory.Directive historyDirective(DistributedCommand command,ImmutableReader reader) {
+        byte[] key=command.mutations().getFirst().key();
+        if(key[0]==DEFINITION) return CatalogueHistory.Directive.unreserved();
+        if(key[0]==ADMISSION) return CatalogueHistory.Directive.spend(manifestHeader(command.mutations().getFirst().value()).definitionDigest());
+        var next=Head.decode(command.mutations().getFirst().value()); byte[] id=next.status().header().definitionDigest();
+        var old=command.predicates().getFirst().expectedValue();
+        if(next.status().phase()==SchemaChange.Phase.PREPARED && (old==null || !sameHeader(Head.decode(old).status().header(),next.status().header()))) {
+            var header=next.status().header(); var definition=committedDefinition(reader,header,header.clusterId(),header.databaseId());
+            long visits=3L*header.participants().size()+8;
+            long bytes=SchemaAdmissionManifest.MAX_BYTES+33L+65L+Math.multiplyExact(visits,MAX_HEAD_BYTES)+17L+MAX_HEAD_BYTES+RangeDirectoryCodec.encodedSize(definition.targetDirectory());
+            return CatalogueHistory.Directive.begin(id,bytes,3);
+        }
+        return next.terminal() ? CatalogueHistory.Directive.terminal(id) : CatalogueHistory.Directive.spend(id);
+    }
+    public static byte[] admissionCandidateKey(byte[] definition) { if(definition.length!=32) throw new IllegalArgumentException("Invalid definition digest"); return ByteBuffer.allocate(33).put(CANDIDATE).put(definition).array(); }
     private static SchemaChange.Header manifestHeader(byte[] bytes) {
         if (bytes==null || bytes.length<8 || bytes.length>SchemaAdmissionManifest.MAX_BYTES) throw new IllegalArgumentException("Invalid admission manifest budget");
         var in=ByteBuffer.wrap(bytes); in.getInt(); int length=in.getInt();

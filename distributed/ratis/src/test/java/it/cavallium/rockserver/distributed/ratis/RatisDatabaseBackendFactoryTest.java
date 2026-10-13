@@ -37,7 +37,8 @@ class RatisDatabaseBackendFactoryTest {
             try(var bootstrap=nativeDomains.bootstrap(Files.createDirectory(root.resolve("bootstrap")),null,2)){nativeDomains.ready(bootstrap);}
             homes.add(new Home(RatisNodePlan.Role.SNAPSHOT_HOME,1));homes.add(new Home(RatisNodePlan.Role.TRANSACTION_HOME,2));
             for(var data:nativeDomains.data)routes.put(data.domain,data.routed);
-            plan=new RatisNodePlan(nativeDomains.node,nativeDomains.incarnation,nativeDomains.data.stream().map(d->d.plan.domains().getFirst()).toList(),nativeDomains.data.getFirst().plan.catalogue(),homes.stream().map(h->h.placement).toList(),List.of(),Map.of(),5);
+            var domains=nativeDomains.data.stream().map(d->d.plan.domains().getFirst()).toList();var catalogue=nativeDomains.data.getFirst().plan.catalogue();var placements=homes.stream().map(h->h.placement).toList();
+            plan=new RatisNodePlan(nativeDomains.node,nativeDomains.incarnation,domains,catalogue,placements,List.of(),Map.of(),5,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(domains),RatisPoolFixtures.groups(catalogue,placements));
         }
         RatisDatabaseBackendFactory factory(Path path)throws IOException {
             return new RatisDatabaseBackendFactory(path,plan,nativeDomains.client,routes,scheduler,(name,shape)->nativeDomains.data.stream().filter(d->d.schema.columns().stream().anyMatch(c->c.name().equals(name))).findFirst().orElseThrow(()->new IOException("Undeclared placement")).domain,
@@ -119,9 +120,10 @@ class RatisDatabaseBackendFactoryTest {
             extra=new RatisRoutedClient(extraDirectory,f.transport());routes=Map.of(f.schema.domainId(),f.data,extraDomain,extra);
             var bindings=new LinkedHashMap<UUID,String>();for(var column:f.schema.columns())bindings.put(column.columnId(),column.name());
             var catalogue=new RatisNodePlan.Catalogue(f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.outer.sessions,List.of(replica));
-            plan=new RatisNodePlan(replica.nodeId(),replica.nodeIncarnation(),List.of(new RatisNodePlan.Domain(f.directory,bindings,Set.of()),new RatisNodePlan.Domain(extraDirectory,Map.of(extraColumn,"second-domain"),Set.of())),catalogue,List.of(new RatisNodePlan.Home(RatisNodePlan.Role.SNAPSHOT_HOME,f.snapshotDirectory,f.snapshotColumn,"snapshot-home"),new RatisNodePlan.Home(RatisNodePlan.Role.TRANSACTION_HOME,f.homeDirectory,f.homeColumn,"atomic-home")),List.of(),Map.of(),6);
-            var domains=List.of(new RatisDatabaseBootstrap.Domain(plan,f.data,f.schema,null),new RatisDatabaseBootstrap.Domain(plan,extra,extraSchema,RatisColumnAllocation.counterValue(74)));
-            try(var bootstrap=new RatisDatabaseBootstrap(Files.createDirectory(root.resolve("transaction-bootstrap")),domains,f.catalogue.client,f.catalogue.epochs.read(),null,10,()->10L,3)){
+            var domains=List.of(new RatisNodePlan.Domain(f.directory,bindings,Set.of()),new RatisNodePlan.Domain(extraDirectory,Map.of(extraColumn,"second-domain"),Set.of()));var homes=List.of(new RatisNodePlan.Home(RatisNodePlan.Role.SNAPSHOT_HOME,f.snapshotDirectory,f.snapshotColumn,"snapshot-home"),new RatisNodePlan.Home(RatisNodePlan.Role.TRANSACTION_HOME,f.homeDirectory,f.homeColumn,"atomic-home"));
+            plan=new RatisNodePlan(replica.nodeId(),replica.nodeIncarnation(),domains,catalogue,homes,List.of(),Map.of(),6,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(domains),RatisPoolFixtures.groups(catalogue,homes));
+            var bootstrapDomains=List.of(new RatisDatabaseBootstrap.Domain(plan,f.data,f.schema,null),new RatisDatabaseBootstrap.Domain(plan,extra,extraSchema,RatisColumnAllocation.counterValue(74)));
+            try(var bootstrap=new RatisDatabaseBootstrap(Files.createDirectory(root.resolve("transaction-bootstrap")),bootstrapDomains,f.catalogue.client,f.catalogue.epochs.read(),null,10,()->10L,3)){
                 for(int n=0;n<40 && bootstrap.progress().phase()!=RatisDatabaseBootstrap.Phase.READY;n++)bootstrap.step(3);assertEquals(RatisDatabaseBootstrap.Phase.READY,bootstrap.progress().phase());
             }
         }

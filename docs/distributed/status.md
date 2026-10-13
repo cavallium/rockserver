@@ -55,6 +55,21 @@ This section and the remaining gates at the end describe the current branch.
   a saved no-effects conflict, protected completion at full capacity, cold/image
   reconstruction and exact retry after an unknown native write. This bounds HOME
   status metadata; other catalogue and per-role durable ceilings remain open.
+- Session epoch advancement now physically deletes obsolete receipt and ACK
+  namespaces through the current epoch-first keys. Native reproduction confirmed
+  the former leak; the repaired session/source/image/reclamation workflows passed.
+  Shared native pin admission also passed cross-pool growth, count, age and actual
+  release checks. The auxiliary namespace/source-promise saturation matrix and
+  node runtime integration remain separate pending gates.
+- Explicit physical pools now carry stable IDs, frozen native configuration and
+  group/domain placement. Two actual native databases passed writes, service cold
+  reopening and shared pin admission. Node/pool graph ceilings, schema upload/work
+  quotas and cohort action/retention leases passed their focused fixtures. Source
+  image disk capacity is conservatively partitioned across declared pools.
+- Snapshot/CDC gap resynchronization passed a two-range native workflow using the
+  original snapshot capture vector, atomic destination effects/checkpoints, lost
+  replies and MERGE deduplication. A retention gap invalidates incomplete staging.
+  This does not establish adoption by an external consumer.
 - Replica-local maintenance passed actual flush/SST preview/execution/property
   checks, stale target rejection, cancellation with retained JNI ownership and
   node-owned shutdown. It requires explicit policy and process/pool/CF identities.
@@ -1070,9 +1085,10 @@ Relocation currently admits preparation/abort while its source stays writable.
 
 - Complete restore quota/unknown-force acceptance, plus public backend
   capture/transaction/export workflows.
-- Declare and implement explicit pool/SLO placement. Reserve configured durable
-  replica ceilings before opening/voting, reconstruct retained claims on recovery,
-  and share volatile proposal/staging/retained-buffer budgets across node/pool scopes.
+- Complete the two-pool dynamic/import/schema/backup matrix and cold artifact
+  quotas. Reserve configured durable replica ceilings before opening/voting and
+  reconstruct retained claims on recovery. Finish shared accounting for remaining
+  custom proof/retained-buffer paths.
 - Complete and validate replica-local maintenance integration without presenting
   physical SST identities as cluster-wide files.
 - Compose snapshot plus CDC tail gap recovery and export-based consumer migration;

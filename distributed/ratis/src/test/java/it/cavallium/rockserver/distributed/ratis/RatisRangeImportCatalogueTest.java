@@ -33,7 +33,18 @@ class RatisRangeImportCatalogueTest {
     }
     final class Fixture implements AutoCloseable {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest();
-        final RatisSessionEpochsTest.Fixture nativeCatalogue=outer.new Fixture(root);
+        final NativeCatalogue nativeCatalogue=new NativeCatalogue();
+        final class NativeCatalogue implements AutoCloseable {
+            final it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool pool;
+            final it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore store;
+            final java.util.concurrent.atomic.AtomicLong next;
+            NativeCatalogue() throws Exception {
+                pool=it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool.open(root.resolve("import-catalogue"),it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass()));
+                store=pool.openRange(new it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.Owner(outer.catalogue,1),new it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.Interval(outer.catalogue,Set.of(outer.directoryColumn,outer.sessions),null,null),new byte[32],Map.of(outer.directoryColumn,"directories",outer.sessions,"session_epochs"),Set.of());
+                next=new java.util.concurrent.atomic.AtomicLong(store.applied()==null ? 0 : store.applied().index()+1);
+            }
+            public void close() throws Exception { pool.close(); }
+        }
         final RatisRangeImportCatalogue.ImmutableReader immutable=key -> { try { return nativeCatalogue.store.readCurrentPoint(outer.directoryColumn,key); } catch(Exception failure) { throw new IllegalStateException(failure); } };
         final java.util.function.Consumer<DistributedCommand> pure=RatisCatalogue.validator(outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,command -> { throw new IllegalArgumentException("No operators in import fixture"); },immutable::read);
         final AtomicInteger ownerReads=new AtomicInteger(); final List<byte[]> publications=new ArrayList<>();
@@ -58,11 +69,22 @@ class RatisRangeImportCatalogueTest {
                     result=nativeCatalogue.store.apply(new ApplyPosition(1,nativeCatalogue.next.getAndIncrement()),command);
                     if(loseReply && RatisRangeImportCatalogue.isPublication(command)) { loseReply=false; throw new IOException("Lost original publication reply"); }
                 } else if(method.getName().equals("sendReadOnly")) {
-                    var packet=ScopedTransactionRpc.parse(((Message)args[0]).getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES); assertEquals(ScopedTransactionRpc.POINT,packet.kind()); var in=ByteBuffer.wrap(packet.body()); assertEquals(outer.directoryColumn,ScopedTransactionRpc.uuid(in)); byte[] key=ScopedTransactionRpc.blob(in,65536,false); assertFalse(in.hasRemaining()); byte[] value=immutable.read(key); var out=ByteBuffer.allocate(4+(value==null ? 0 : value.length)).putInt(value==null ? -1 : value.length); if(value!=null) out.put(value); result=ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,out.array());
+                    byte[] encoded=((Message)args[0]).getContent().toByteArray();
+                    int kind=ScopedTransactionRpc.kind(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES);
+                    if(ScopedTransactionRpc.schemaFencing(kind)) {
+                        var command=RatisSchemaFencingRpc.request(encoded); pure.accept(command);
+                        result=RatisSchemaFencingRpc.preparedReply(kind,command);
+                    } else {
+                        var packet=ScopedTransactionRpc.parse(encoded,ScopedTransactionRpc.MAX_REQUEST_BYTES); assertEquals(ScopedTransactionRpc.POINT,packet.kind()); var in=ByteBuffer.wrap(packet.body()); assertEquals(outer.directoryColumn,ScopedTransactionRpc.uuid(in)); byte[] key=ScopedTransactionRpc.blob(in,65536,false); assertFalse(in.hasRemaining()); byte[] value=immutable.read(key); var out=ByteBuffer.allocate(4+(value==null ? 0 : value.length)).putInt(value==null ? -1 : value.length); if(value!=null) out.put(value); result=ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,out.array());
+                    }
                 } else throw new AssertionError(method);
                 return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf("catalogue-fixture")).setGroupId(RaftGroupId.valueOf(outer.catalogue)).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(result))).build();
             });
             client=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args) -> switch(method.getName()) { case "getGroupId" -> RaftGroupId.valueOf(outer.catalogue); case "io" -> io; default -> throw new AssertionError(method); }); catalogue=new RatisRangeImportCatalogue(client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
+        }
+        void enableHistory() throws Exception {
+            nativeCatalogue.store.enableCatalogueScopeCompaction();
+            nativeCatalogue.store.configureCatalogueHistory(outer.directoryColumn,outer.sessions,RatisSchemaCatalogue::isHistoryKey,RatisSchemaCatalogue.historyPolicy(outer.directoryColumn,pure,immutable::read));
         }
         OperationId operation(long index) { return new OperationId(id(99),1,index); }
         void seed(RangeDirectory directory) throws Exception { var key=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array(); var command=new DistributedCommand(outer.catalogue,1,new byte[32],operation(0),List.of(new Mutation(Mutation.Kind.PUT,outer.directoryColumn,key,RangeDirectoryCodec.encode(directory))),List.of(new KeyPredicate(outer.directoryColumn,key,null))); assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(nativeCatalogue.store.apply(new ApplyPosition(1,nativeCatalogue.next.getAndIncrement()),command)).status()); }
@@ -129,6 +151,29 @@ class RatisRangeImportCatalogueTest {
             assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(completion).status(),"Original operation returns its retained completion result");
             assertEquals(CommandResult.Status.SUCCESS,ordinary.execute(ordinary.prepareAfterAdministration(f.operation(60),active,later,null,completed)).status());
             var missing=new ArrayList<>(raced.predicates()); missing.removeLast(); var bypass=new DistributedCommand(raced.groupId(),raced.rangeEpoch(),raced.schemaDigest(),f.operation(35),raced.mutations(),missing); assertThrows(IllegalArgumentException.class,() -> f.pure.accept(bypass));
+        }
+    }
+    @Test void admissionCandidateIsFrozenByOriginalHeadAndCannotStageUnrelatedOrphans() throws Exception {
+        try(var f=new Fixture()) {
+            var definition=definition(f.outer.cluster,f.outer.database,f.operation(20)); var installed=admission(definition,5);
+            f.seed(definition.sourceDirectory()); f.enableHistory(); f.stage(definition,installed);
+            var alternative=admission(definition,6);
+            var rejected=f.catalogue.prepareAdmissionChunk(f.operation(61),definition,alternative,0);
+            var capacity=f.nativeCatalogue.store.catalogueHistoryCapacity();
+            assertEquals(CommandResult.Status.CONFLICT,f.catalogue.execute(rejected).status(),"A different admission cannot consume the already frozen candidate");
+            assertEquals(capacity,f.nativeCatalogue.store.catalogueHistoryCapacity());
+            assertNull(f.immutable.read(RatisRangeImportCatalogue.admissionChunkKey(alternative.digest(),0)));
+            var unbound=new DistributedCommand(rejected.groupId(),rejected.rangeEpoch(),rejected.schemaDigest(),f.operation(62),List.of(rejected.mutations().getFirst()),List.of(rejected.predicates().getFirst()));
+            assertThrows(IllegalArgumentException.class,() -> f.pure.accept(unbound));
+            var foreignDefinition=definition(f.outer.cluster,f.outer.database,f.operation(21)); var foreign=admission(foreignDefinition,6);
+            assertThrows(IllegalArgumentException.class,() -> f.catalogue.prepareAdmissionChunk(f.operation(63),definition,foreign,0));
+            var mutations=new ArrayList<>(rejected.mutations()); byte[] foreignKey=RatisRangeImportCatalogue.admissionChunkKey(foreign.digest(),0);
+            mutations.set(0,new Mutation(Mutation.Kind.PUT,f.outer.directoryColumn,foreignKey,foreign.encode()));
+            mutations.set(1,new Mutation(Mutation.Kind.PUT,f.outer.directoryColumn,mutations.get(1).key(),RatisRangeImportCatalogue.admissionArtifact(foreign).encode()));
+            var predicates=new ArrayList<>(rejected.predicates()); predicates.set(0,new KeyPredicate(f.outer.directoryColumn,foreignKey,null));
+            var forged=new DistributedCommand(rejected.groupId(),rejected.rangeEpoch(),rejected.schemaDigest(),f.operation(64),mutations,predicates);
+            assertThrows(IllegalArgumentException.class,() -> f.pure.accept(forged),"Full artifact body must belong to exact guarded BEGIN");
+            assertArrayEquals(installed.encode(),f.catalogue.readAdmission(definition,installed.digest()).encode());
         }
     }
     private static void nativeReplay(Fixture f,DistributedCommand publication) throws Exception { assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.nativeCatalogue.store.apply(new ApplyPosition(1,f.nativeCatalogue.next.getAndIncrement()),publication)).status()); }

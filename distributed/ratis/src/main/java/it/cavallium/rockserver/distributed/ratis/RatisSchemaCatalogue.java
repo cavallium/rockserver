@@ -132,6 +132,32 @@ public final class RatisSchemaCatalogue {
             if (reservationIndex!=command.predicates().size()) throw new IllegalArgumentException("Extra reservation predicates");
         };
     }
+    /** Audited history subtotal. Current directories, operator, topology and CDC budgets remain independent. */
+    public static boolean isHistoryKey(byte[] key) {
+        if(key==null || key.length==0 || key.length==16) return false;
+        return switch(key[0]&255) {
+            case 0x53,0x43,0x4d,0x4e,0x4f,0x31,0x33,0x37 -> key.length==33;
+            case 0x41,0x34,0x35,0x55,0x62 -> key.length==17;
+            case 0x30,0x32,0x36 -> key.length==37;
+            case 0x38 -> key.length==34;
+            case 0x49 -> key.length==9;
+            case 0x61 -> key.length==1;
+            default -> false;
+        };
+    }
+    /** Native apply policy: validate first, then derive credit solely from committed immutable authority. */
+    public static java.util.function.Function<DistributedCommand,CatalogueHistory.Directive> historyPolicy(UUID column,Consumer<DistributedCommand> composedValidator,RatisSchemaAdministration.ImmutableReader reader) {
+        Objects.requireNonNull(column); Objects.requireNonNull(composedValidator); Objects.requireNonNull(reader);
+        return command -> {
+            composedValidator.accept(command);
+            // Atomic genesis includes the session ledger. The original composed rule qualifies every column;
+            // native accounting independently selects only actual history-column effects.
+            if(command.mutations().isEmpty()) return CatalogueHistory.Directive.unreserved();
+            if(RatisSchemaAdministration.isCommand(command)) return RatisSchemaAdministration.historyDirective(command,reader);
+            if(RatisRangeImportCatalogue.isCommand(command)) return RatisRangeImportCatalogue.historyDirective(command);
+            return CatalogueHistory.Directive.unreserved();
+        };
+    }
     private static void requirePut(Mutation mutation,KeyPredicate predicate,UUID column,byte[] key) {
         if (mutation.kind()!=Mutation.Kind.PUT || mutation.returnMode()!=Mutation.ReturnMode.NONE || mutation.bucket() || predicate.bucket()
                 || !mutation.columnId().equals(column) || !predicate.columnId().equals(column)

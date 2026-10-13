@@ -23,7 +23,7 @@ class RatisSchemaClientWorkflowTest {
         final ReplicaDescriptor replica; final DistributedStoragePool pool; final ReplicatedRangeStore store; final Path path; final RatisSchemaArtifactRegistry artifacts;
         final Map<UUID,String> names=new HashMap<>();
         Peer(Path path,ReplicaDescriptor replica,RangeDescriptor range,DistributedSchema schema) throws Exception {
-            this.replica=replica; this.path=path; artifacts=new RatisSchemaArtifactRegistry(path.resolveSibling(path.getFileName()+"-staging"),new RatisSchemaReplicaService.Limits(16,64L*1024*1024,192L*1024*1024,16,16,0)); pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
+            this.replica=replica; this.path=path; artifacts=new RatisSchemaArtifactRegistry(path.resolveSibling(path.getFileName()+"-staging"),new RatisSchemaReplicaService.Limits(16,64L*1024*1024,192L*1024*1024,16,16,0),RatisPoolFixtures.schemaAdmission(new RatisSchemaReplicaService.Limits(16,64L*1024*1024,192L*1024*1024,16,16,0)),RatisPoolFixtures.ID); pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
             for(var column:schema.columns()) names.put(column.columnId(),"data");
             store=pool.openRange(new RangeOwnership.Owner(range.groupId(),range.rangeEpoch()),new RangeOwnership.Interval(schema.domainId(),schema.columnIds(),range.lowerInclusive(),range.upperExclusive()),schema.digest(),names,Set.of()); store.enableLogicalSchema(schema); store.applyNoop(new ApplyPosition(1,0));
         }

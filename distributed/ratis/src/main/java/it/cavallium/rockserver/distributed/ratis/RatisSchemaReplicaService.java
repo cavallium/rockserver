@@ -37,14 +37,15 @@ public final class RatisSchemaReplicaService {
     private final Map<UUID,Local> locals=new HashMap<>();
     private final Map<Key,Work> work=new LinkedHashMap<>();
     private long heapBytes;
+    private final RatisSchemaReplicaAdmission admission;private final UUID poolId;
     private int parsing;
     private boolean stopping,closing;
     private CompletableFuture<Void> stopped=new CompletableFuture<>();
     private int stopObservers;
-    public RatisSchemaReplicaService(Path poolPath,Path stagingRoot,DistributedStoragePool pool,RWScheduler scheduler,OperatorPolicy policy,Limits limits) throws IOException {
+    public RatisSchemaReplicaService(Path poolPath,Path stagingRoot,DistributedStoragePool pool,RWScheduler scheduler,OperatorPolicy policy,Limits limits,RatisSchemaReplicaAdmission admission,UUID poolId) throws IOException {
         this.poolPath=poolPath.toAbsolutePath().normalize(); this.pool=Objects.requireNonNull(pool); this.scheduler=Objects.requireNonNull(scheduler);
-        this.policy=Objects.requireNonNull(policy); this.limits=Objects.requireNonNull(limits);
-        registry=new RatisSchemaArtifactRegistry(stagingRoot,limits);
+        this.policy=Objects.requireNonNull(policy); this.limits=Objects.requireNonNull(limits);this.admission=Objects.requireNonNull(admission);this.poolId=Objects.requireNonNull(poolId);
+        registry=new RatisSchemaArtifactRegistry(stagingRoot,limits,admission,poolId);
         batch=scheduler.executor(RequestContext.batch(),OperationFamily.MUTATION);
         control=scheduler.executor(WorkloadProfile.CONTROL,OperationFamily.CONTROL,RequestContext.NO_TIMEOUT);
     }
@@ -57,10 +58,10 @@ public final class RatisSchemaReplicaService {
         locals.put(group,new Local(before.store(),replica,before.authority(),before.validator()));
     }
     public CompletableFuture<byte[]> submit(UUID addressedGroup,byte[] encoded) {
-        boolean parsingReserved=false; long parsingCharge=0;
+        boolean parsingReserved=false; long parsingCharge=0;RatisSchemaReplicaAdmission.Heap parsingHeap=null;
         try {
             if (encoded==null || encoded.length>MAX_BYTES) throw new IOException("Invalid schema replica frame size");
-            parsingCharge=3L*encoded.length+2L*MAX_TARGET_BYTES+1024L;
+            parsingCharge=3L*encoded.length+2L*MAX_TARGET_BYTES+1024L;parsingHeap=admission.heap(poolId,parsingCharge,1);
             synchronized (this) {
                 if (stopping || work.size()+parsing>=limits.maximumTasks() || parsingCharge>limits.maximumHeapBytes()-heapBytes) throw new IOException("Schema replica parsing capacity unavailable");
                 parsing++; heapBytes+=parsingCharge; parsingReserved=true;
@@ -68,6 +69,7 @@ public final class RatisSchemaReplicaService {
             var request=RatisSchemaReplicaRpc.request(encoded); Local local;
             synchronized (this) { local=locals.get(addressedGroup); }
             if (local==null || !request.target().binding().groupId().equals(addressedGroup) || !request.target().replica().equals(local.replica())) throw new IOException("Schema request addressed another frozen replica");
+            if(request.kind()==ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN){long finishCharge=parsingCharge+3L*request.upload().artifactLength()+96L*1024*1024+MAX_TARGET_BYTES+1024L;if(finishCharge>limits.maximumHeapBytes())throw new IOException("Declared schema heap cannot finish this upload");try(var finish=admission.heap(poolId,finishCharge,0)) { /* Admit the eventual loader before retaining an upload. */ }}
             String owner=HexFormat.of().formatHex(OperatorUpload.sha256(request.target().encode()));
             var key=new Key(request.kind(),HexFormat.of().formatHex(request.digest()));
             long observer=MAX_TARGET_BYTES+1024L;
@@ -81,29 +83,29 @@ public final class RatisSchemaReplicaService {
                 if (definition.kind()==SchemaChange.Kind.CREATE_COLUMN && definition.targetSchema().column(definition.header().changedColumnId()).operator()!=null) charge+=96L*1024*1024;
             }
             if (request.kind()==ScopedTransactionRpc.SCHEMA_ARTIFACT_CHUNK) charge+=request.upload().chunks().get(request.chunkIndex()).length();
-            final Work selected;
+            final Work selected;final RatisSchemaReplicaAdmission.Heap observerHeap;
             synchronized (this) {
                 if (stopping) throw new IOException("Schema replica service is stopping");
                 var existing=work.get(key);
                 if (existing!=null && existing.observers>=limits.maximumObservers()) throw new IOException("Schema observer capacity exhausted");
                 long reservation=observer+(existing==null ? charge : 0);
                 if (reservation>limits.maximumHeapBytes()-heapBytes+parsingCharge || existing==null && work.size()+parsing>limits.maximumTasks()) throw new IOException("Schema actual work capacity exhausted");
-                if (existing==null) { selected=new Work(key,owner,request,local,charge); work.put(key,selected); } else selected=existing;
+                if(existing==null){parsingHeap.resize(charge,1);observerHeap=admission.heap(poolId,observer,0);selected=new Work(key,owner,request,local,charge,parsingHeap);parsingHeap=null;work.put(key,selected);}else{parsingHeap.resize(observer,0);observerHeap=parsingHeap;parsingHeap=null;selected=existing;}
                 selected.observers++; heapBytes+=reservation-parsingCharge; parsing--; parsingReserved=false;
             }
             var view=new CompletableFuture<byte[]>();
             selected.actual.whenComplete((reply,failure) -> {
                 try { if (failure==null) { if (!view.isDone()) view.complete(reply.clone()); } else view.completeExceptionally(failure); }
-                finally { synchronized (RatisSchemaReplicaService.this) { selected.observers--; heapBytes-=observer; } }
+                finally { synchronized (RatisSchemaReplicaService.this) { selected.observers--; heapBytes-=observer; }observerHeap.close(); }
             });
             dispatch(); return view;
         } catch (Throwable failure) { return CompletableFuture.failedFuture(failure); }
-        finally { if (parsingReserved) { synchronized (this) { parsing--; heapBytes-=parsingCharge; } closeIfStopped(); } }
+        finally {if(parsingHeap!=null)parsingHeap.close(); if (parsingReserved) { synchronized (this) { parsing--; heapBytes-=parsingCharge; } closeIfStopped(); } }
     }
     private final class Work implements Runnable,RWScheduler.RejectionAwareTask {
         final Key key; final String owner; final Request request; final Local local; final long charge;
-        final CompletableFuture<byte[]> actual=new CompletableFuture<>(); int observers; boolean scheduled,started,finished; Throwable rejection;
-        Work(Key key,String owner,Request request,Local local,long charge) { this.key=key; this.owner=owner; this.request=request; this.local=local; this.charge=charge; }
+        final RatisSchemaReplicaAdmission.Heap heap;final CompletableFuture<byte[]> actual=new CompletableFuture<>(); int observers; boolean scheduled,started,finished; Throwable rejection;
+        Work(Key key,String owner,Request request,Local local,long charge,RatisSchemaReplicaAdmission.Heap heap) {this.heap=heap; this.key=key; this.owner=owner; this.request=request; this.local=local; this.charge=charge; }
         RWScheduler.WorkloadExecutor executor() { return request.kind()==ScopedTransactionRpc.SCHEMA_CAPACITY_RELEASE ? control : batch; }
         @Override public void run() {
             synchronized (RatisSchemaReplicaService.this) { if (finished) return; started=true; }
@@ -202,7 +204,7 @@ public final class RatisSchemaReplicaService {
     }
     private void finish(Work task,byte[] reply,Throwable failure) {
         synchronized (this) { if (task.finished) return; task.finished=true; work.remove(task.key); heapBytes-=task.charge; if (task.rejection!=null) failure=task.rejection; }
-        if (failure==null) task.actual.complete(reply); else task.actual.completeExceptionally(failure);
+        task.heap.close();if (failure==null) task.actual.complete(reply); else task.actual.completeExceptionally(failure);
         dispatch(); closeIfStopped();
     }
     public CompletableFuture<Void> stop() {

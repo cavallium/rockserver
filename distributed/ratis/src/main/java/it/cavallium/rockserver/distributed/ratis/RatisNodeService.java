@@ -108,9 +108,10 @@ public final class RatisNodeService implements AutoCloseable {
         }
     }
     private static void preflight(Path root,RatisNodePlan plan) throws IOException {
-        if (!Files.isRegularFile(root.resolve("node.identity")) || !Files.isRegularFile(root.resolve("native/CURRENT"))) {
+        if (!Files.isRegularFile(root.resolve("node.identity"))) {
             throw new IOException("Recovery launcher requires established node identity/native state");
         }
+        for(var spec:plan.pools().values())if(!Files.isRegularFile(spec.nativePath(root).resolve("CURRENT")))throw new IOException("Recovery requires established native pool: "+spec.id());
         for (var group:plan.localGroups()) if (!Files.isRegularFile(root.resolve("raft").resolve(group.getGroupId().getUuid().toString()).resolve("current/raft-meta"))) {
             throw new IOException("Recovery launcher requires established Raft state");
         }
@@ -177,8 +178,8 @@ public final class RatisNodeService implements AutoCloseable {
     public synchronized RatisNodeMaintenance localMaintenance(RatisNodeMaintenance.Policy policy) throws IOException {
         requireOpen();return node.localMaintenance(policy);
     }
-    public synchronized RatisNodeMaintenance.Target localMaintenanceTarget(UUID column) throws IOException {
-        requireOpen();return node.localMaintenanceTarget(column);
+    public synchronized RatisNodeMaintenance.Target localMaintenanceTarget(UUID poolId,UUID column) throws IOException {
+        requireOpen();return node.localMaintenanceTarget(poolId,column);
     }
     private void requireOpen() throws IOException { if (closed || closeRequested || closing) throw new IOException("Node service is closing/closed"); }
     @Override public void close() throws IOException {

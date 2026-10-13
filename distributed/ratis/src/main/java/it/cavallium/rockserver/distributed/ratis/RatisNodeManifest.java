@@ -15,7 +15,7 @@ import java.util.*;
 public final class RatisNodeManifest {
     /** Includes the file checksum; encoded bodies leave room for its 32 bytes. */
     public static final int MAX_BYTES=RatisNodePlan.MAX_METADATA_BYTES;
-    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=248;
+    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=256;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
@@ -44,6 +44,7 @@ public final class RatisNodeManifest {
             case DATA -> plan.groupDirectory(group.getGroupId().getUuid()).columns().size(); case CATALOGUE -> 2; case TRANSACTION_HOME, SNAPSHOT_HOME -> 1;
         }).max().orElseThrow();
         if (settings.images().maxColumns()<requiredColumns) throw new IllegalArgumentException("Manifest snapshot column budget is below local group scope");
+        for(var group:plan.localGroups()){var spec=plan.pools().get(plan.poolId(group.getGroupId().getUuid()));int count=plan.role(group.getGroupId().getUuid())==RatisNodePlan.Role.CATALOGUE?2:plan.groupDirectory(group.getGroupId().getUuid()).columns().size();if(spec.images().maxColumns()<count)throw new IllegalArgumentException("Assigned pool snapshot column budget below group scope");}
         for (String name:plan.columns().values()) text(name);
         for (var home:plan.homes()) text(home.physicalName());
         nanos(settings.clockPeriod()); nanos(settings.shutdownTimeout());
@@ -63,8 +64,10 @@ public final class RatisNodeManifest {
         return Set.copyOf(columns);
     }
 
+    private static long placementBytes(RatisNodePlan plan){long size=12L+32L*(plan.domainPools().size()+plan.groupPools().size());for(var spec:plan.pools().values())size+=4L+spec.encode().length;return size;}
+    private static Map<UUID,UUID> placements(ByteBuffer in,int maximum){require(in,4);int count=in.getInt();if(count<0 || count>maximum || count*32L>in.remaining())throw new IllegalArgumentException("Invalid pool placement count");var values=new LinkedHashMap<UUID,UUID>();UUID previous=null;for(int n=0;n<count;n++){var id=uuid(in);if(previous!=null && UUID_ORDER.compare(previous,id)>=0)throw new IllegalArgumentException("Noncanonical pool placements");previous=id;values.put(id,uuid(in));}return values;}
     private static long encodedSize(RatisNodeManifest manifest) {
-        long size=4L+4+8L*manifest.plan.domains().size()+4+RangeDirectoryCodec.encode(synthetic(manifest.plan)).length+72+12+SETTINGS_BYTES;
+        long size=placementBytes(manifest.plan)+4L+4+8L*manifest.plan.domains().size()+4+RangeDirectoryCodec.encode(synthetic(manifest.plan)).length+72+12+SETTINGS_BYTES;
         for(var domain:manifest.plan.domains()) size+=DistributedSchemaCodec.encode(manifest.schema(domain.domainId())).length+RangeDirectoryCodec.encode(domain.directory()).length;
         for(var home:manifest.plan.homes()) size+=25L+RangeDirectoryCodec.encode(home.directory()).length+text(home.physicalName()).length;
         for(var name:manifest.plan.columns().values()) size+=20L+text(name).length;
@@ -78,13 +81,14 @@ public final class RatisNodeManifest {
         for(var domain:manifest.plan.domains()) { byte[] schema=DistributedSchemaCodec.encode(manifest.schema(domain.domainId())),directory=RangeDirectoryCodec.encode(domain.directory()); schemaBytes.add(schema); directoryBytes.add(directory); domainBytes+=schema.length+directory.length; }
         if(domainBytes>RatisNodePlan.MAX_DOMAIN_BYTES) throw new IllegalArgumentException("Manifest DATA metadata exceeds aggregate bound");
         byte[] catalogue=RangeDirectoryCodec.encode(synthetic(manifest.plan));
-        long size=4L+4+8L*schemaBytes.size()+domainBytes+4+catalogue.length+72+12+SETTINGS_BYTES;
+        long size=placementBytes(manifest.plan)+4L+4+8L*schemaBytes.size()+domainBytes+4+catalogue.length+72+12+SETTINGS_BYTES;
         for (var home:manifest.plan.homes()) size+=25L+RangeDirectoryCodec.encode(home.directory()).length+text(home.physicalName()).length;
         for (var name:manifest.plan.columns().values()) size+=20L+text(name).length;
         for(var definition:manifest.plan.imports()) size+=4L+definition.encode().length;
         for(var entry:manifest.plan.streamAddresses().entrySet())size+=8L+text(entry.getKey()).length+text(entry.getValue()).length;
         if (size>MAX_BYTES-32) throw new IllegalArgumentException("Node manifest exceeds byte budget");
         var output=ByteBuffer.allocate((int)size).putInt(MAGIC);
+        output.putInt(manifest.plan.pools().size());for(var spec:manifest.plan.pools().values())blob(output,spec.encode());for(var placement:List.of(manifest.plan.domainPools(),manifest.plan.groupPools())){output.putInt(placement.size());for(var id:placement.keySet().stream().sorted(UUID_ORDER).toList()){uuid(output,id);uuid(output,placement.get(id));}}
         output.putInt(schemaBytes.size()); for(int i=0;i<schemaBytes.size();i++){blob(output,schemaBytes.get(i));blob(output,directoryBytes.get(i));} blob(output,catalogue);
         var c=manifest.plan.catalogue(); uuid(output,c.directoryColumn()); uuid(output,c.sessionsColumn());
         uuid(output,manifest.plan.nodeId()); uuid(output,manifest.plan.nodeIncarnation());
@@ -113,13 +117,14 @@ public final class RatisNodeManifest {
         for(var limits:List.of(settings.resources().node(),settings.resources().pool())) {
             for(var lane:List.of(limits.ordinary(),limits.protectedLane()))output.putLong(lane.bytes()).putInt(lane.owners());
         }
-        return output.array();
+        output.putLong(settings.resources().maximumSourceImageDiskBytes());return output.array();
     }
     public static RatisNodeManifest decode(byte[] bytes) {
         Objects.requireNonNull(bytes);
         if (bytes.length<172 || bytes.length>MAX_BYTES-32) throw new IllegalArgumentException("Invalid node manifest size");
         var input=ByteBuffer.wrap(bytes);
         if (input.getInt()!=MAGIC) throw new IllegalArgumentException("Unsupported node manifest header");
+        require(input,4);int poolCount=input.getInt();if(poolCount<1 || poolCount>RatisNodeResourceBudget.MAX_POOLS)throw new IllegalArgumentException("Invalid physical pool count");var pools=new ArrayList<RatisNativePoolSpec>();long poolBytes=0;UUID previousPool=null;for(int n=0;n<poolCount;n++){var encoded=blob(input,RatisNativePoolSpec.MAX_BYTES);if((poolBytes+=encoded.length)>4L*1024*1024)throw new IllegalArgumentException("Pool declarations exceed aggregate limit");var spec=RatisNativePoolSpec.decode(encoded);if(previousPool!=null && UUID_ORDER.compare(previousPool,spec.id())>=0)throw new IllegalArgumentException("Noncanonical pool order");previousPool=spec.id();pools.add(spec);}var domainPools=placements(input,RatisNodePlan.MAX_DOMAINS);var groupPools=placements(input,RatisNodePlan.MAX_LOCAL_GROUPS);
         require(input,4); int domainCount=input.getInt();
         if(domainCount<1 || domainCount>RatisNodePlan.MAX_DOMAINS || domainCount*8L>input.remaining()) throw new IllegalArgumentException("Invalid manifest DATA domain count");
         var schemas=new ArrayList<DistributedSchema>(domainCount); var directories=new ArrayList<RangeDirectory>(domainCount); UUID previousDomain=null; long domainBytes=0;
@@ -179,11 +184,11 @@ public final class RatisNodeManifest {
         var replicaLimits=new RatisSchemaReplicaService.Limits(input.getInt(),input.getLong(),input.getLong(),input.getInt(),input.getInt(),input.getLong());
         var nodeLimits=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()),new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()));
         var poolLimits=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()),new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()));
-        if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
-        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io),new RatisNodeRuntime.ResourceLimits(nodeLimits,poolLimits));
+        long sourceImageDisk=input.getLong();if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
+        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io),new RatisNodeRuntime.ResourceLimits(nodeLimits,poolLimits,sourceImageDisk));
         var recovered=catalogue(catalogue,directories.getFirst(),directoryColumn,sessionsColumn); var domains=new ArrayList<RatisNodePlan.Domain>();
         for(int i=0;i<directories.size();i++) { var directory=directories.get(i); var bindings=new HashMap<UUID,String>(); for(var column:directory.columns()) { var name=columns.get(column); if(name==null) throw new IllegalArgumentException("Manifest DATA physical binding missing"); bindings.put(column,name); } domains.add(new RatisNodePlan.Domain(directory,bindings,mergeColumns(schemas.get(i)))); }
-        var plan=new RatisNodePlan(node,incarnation,domains,recovered,homes,imports,streamAddresses,groups);
+        var plan=new RatisNodePlan(node,incarnation,domains,recovered,homes,imports,streamAddresses,groups,pools,domainPools,groupPools);
         if(!plan.columns().equals(columns)) throw new IllegalArgumentException("Manifest has unrelated physical column bindings");
         var manifest=new RatisNodeManifest(schemas,plan,settings,reads,writes,replicaLimits);
         if (!Arrays.equals(bytes,encode(manifest))) throw new IllegalArgumentException("Noncanonical node manifest encoding");

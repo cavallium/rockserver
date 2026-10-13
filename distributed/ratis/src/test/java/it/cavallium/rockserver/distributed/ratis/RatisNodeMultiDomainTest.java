@@ -31,7 +31,7 @@ class RatisNodeMultiDomainTest {
             var owners=source.ranges().getFirst().replicas().stream().map(r->new ReplicaDescriptor(r.nodeId(),r.nodeIncarnation(),UUID.randomUUID(),r.peerId(),r.address(),r.role())).toList();
             var range=new RangeDescriptor(new UUID(980,3),new UUID(980,4),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,owners);
             secondDirectory=new RangeDirectory(first.clusterId(),first.databaseId(),domain,1,second.digest(),1,Set.of(column),0,List.of(range));
-            plan=new RatisNodePlan(env.plan.nodeId(),env.plan.nodeIncarnation(),List.of(env.plan.domain(first.domainId()),new RatisNodePlan.Domain(secondDirectory,Map.of(column,"second"),Set.of())),env.plan.catalogue(),List.of(),List.of(),Map.of(),8);
+            plan=new RatisNodePlan(env.plan.nodeId(),env.plan.nodeIncarnation(),List.of(env.plan.domain(first.domainId()),new RatisNodePlan.Domain(secondDirectory,Map.of(column,"second"),Set.of())),env.plan.catalogue(),List.of(),List.of(),Map.of(),8,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(env.plan.domain(first.domainId()),new RatisNodePlan.Domain(secondDirectory,Map.of(column,"second"),Set.of()))),RatisPoolFixtures.groups(env.plan.catalogue(),List.of()));
             secondClient=new RatisRoutedClient(secondDirectory,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor r,UUID c,byte[] k){throw new AssertionError("Unexpected read");}public CommandResult command(RangeDescriptor r,DistributedCommand c){throw new AssertionError("Timer has not fired");}});
             clients=Map.of(first.domainId(),env.routed,domain,secondClient);schemas=List.of(second,first);
         }
@@ -81,7 +81,7 @@ class RatisNodeMultiDomainTest {
     @Test void incompleteRoutesOrSchemasRejectBeforeNativeOrServerExposure()throws Exception {
         try(var f=new Fixture()){
             var fake=new RatisNodeRuntimeTest.FakeServer();assertThrows(IllegalArgumentException.class,()->RatisNodeRuntime.open(f.plan,f.env.nodeRoot,ConfigParser.parseDefault(),f.env.catalogue.epochs,Map.of(f.first.domainId(),f.env.routed),f.env.scheduler,f.env.timer,()->20L,f.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,f.schemas));
-            assertThrows(IllegalArgumentException.class,()->RatisNodeRuntime.open(f.plan,f.env.nodeRoot,ConfigParser.parseDefault(),f.env.catalogue.epochs,f.clients,f.env.scheduler,f.env.timer,()->20L,f.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,List.of(f.first)));assertFalse(fake.created);assertFalse(Files.exists(f.env.nodeRoot.resolve("native/CURRENT")));assertFalse(Files.exists(f.env.nodeRoot.resolve("node.identity")));
+            assertThrows(IllegalArgumentException.class,()->RatisNodeRuntime.open(f.plan,f.env.nodeRoot,ConfigParser.parseDefault(),f.env.catalogue.epochs,f.clients,f.env.scheduler,f.env.timer,()->20L,f.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,List.of(f.first)));assertFalse(fake.created);assertFalse(Files.exists(RatisPoolFixtures.pools().getFirst().nativePath(f.env.nodeRoot).resolve("CURRENT")));assertFalse(Files.exists(f.env.nodeRoot.resolve("node.identity")));
         }
     }
 }

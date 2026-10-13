@@ -12,7 +12,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 /** Import metadata, separate from schema administration. Pure replay validation never invokes owner RPCs. */
 public final class RatisRangeImportCatalogue {
     public static final int MAX_CONTROL_BYTES=64*1024,CHUNK_BYTES=48*1024,MAX_HEAD_BYTES=261;
-    private static final byte DEFINITION_CHUNK=0x30,DEFINITION_REF=0x31,ADMISSION_CHUNK=0x32,ADMISSION_REF=0x33,HEAD=0x34,IMPORT_RECORD=0x35,ACTIVATION_CHUNK=0x36,ACTIVATION_REF=0x37;
+    private static final byte DEFINITION_CHUNK=0x30,DEFINITION_REF=0x31,ADMISSION_CHUNK=0x32,ADMISSION_REF=0x33,HEAD=0x34,IMPORT_RECORD=0x35,ACTIVATION_CHUNK=0x36,ACTIVATION_REF=0x37,CANDIDATE=0x38;
     public enum Phase { PREPARED,PUBLISHED,COMPLETE }
     @FunctionalInterface public interface ImmutableReader { byte[] read(byte[] key); }
     /** Runtime-configured, fresh and owner-addressed; caller-provided evidence is never an implementation. */
@@ -57,11 +57,23 @@ public final class RatisRangeImportCatalogue {
     public static Artifact admissionArtifact(RangeImportAdmission admission) { return artifact(admission.encode()); }
     private static Artifact artifact(byte[] value) { return new Artifact(RangeImportAdmission.sha256(value),value.length,(value.length+CHUNK_BYTES-1)/CHUNK_BYTES); }
     public DistributedCommand prepareDefinitionChunk(OperationId operation,RangeImportDefinition definition,int index) { requireDefinitionIdentity(definition,cluster,database); return prepareChunk(operation,DEFINITION_CHUNK,definition.encode(),index); }
-    public DistributedCommand prepareAdmissionChunk(OperationId operation,RangeImportDefinition definition,RangeImportAdmission admission,int index) { requireDefinitionIdentity(definition,cluster,database); admission.requireDefinition(definition); return prepareChunk(operation,ADMISSION_CHUNK,admission.encode(),index); }
+    public DistributedCommand prepareAdmissionChunk(OperationId operation,RangeImportDefinition definition,RangeImportAdmission admission,int index) { requireDefinitionIdentity(definition,cluster,database); admission.requireDefinition(definition); return prepareBoundChunk(operation,ADMISSION_CHUNK,definition,Head.prepared(definition),admission.encode(),index); }
     private DistributedCommand prepareChunk(OperationId operation,byte kind,byte[] bytes,int index) { var ref=artifact(bytes); if(index<0 || index>=ref.chunks()) throw new IllegalArgumentException("Import artifact chunk outside commitment"); byte[] key=chunkKey(kind,ref.digest(),index),part=Arrays.copyOfRange(bytes,index*CHUNK_BYTES,Math.min(bytes.length,(index+1)*CHUNK_BYTES)); return checked(operation,List.of(put(key,part)),List.of(predicate(key,null))); }
     public DistributedCommand prepareDefinitionCommit(OperationId operation,RangeImportDefinition definition) { requireDefinitionIdentity(definition,cluster,database); return prepareCommit(operation,DEFINITION_REF,definitionArtifact(definition)); }
-    public DistributedCommand prepareAdmissionCommit(OperationId operation,RangeImportDefinition definition,RangeImportAdmission admission) { requireDefinitionIdentity(definition,cluster,database); admission.requireDefinition(definition); return prepareCommit(operation,ADMISSION_REF,admissionArtifact(admission)); }
+    public DistributedCommand prepareAdmissionCommit(OperationId operation,RangeImportDefinition definition,RangeImportAdmission admission) { requireDefinitionIdentity(definition,cluster,database); admission.requireDefinition(definition); return prepareBoundCommit(operation,ADMISSION_REF,definition,Head.prepared(definition),admissionArtifact(admission)); }
     private DistributedCommand prepareCommit(OperationId operation,byte kind,Artifact artifact) { byte[] key=refKey(kind,artifact.digest()); return checked(operation,List.of(put(key,artifact.encode())),List.of(predicate(key,null))); }
+    private DistributedCommand prepareBoundChunk(OperationId operation,byte kind,RangeImportDefinition definition,Head head,byte[] bytes,int index) {
+        var ref=artifact(bytes); if(index<0 || index>=ref.chunks()) throw new IllegalArgumentException("Import artifact chunk outside commitment");
+        byte[] key=chunkKey(kind,ref.digest(),index),candidate=candidateKey(kind,definition.digest());
+        var mutations=new ArrayList<Mutation>(); mutations.add(put(key,Arrays.copyOfRange(bytes,index*CHUNK_BYTES,Math.min(bytes.length,(index+1)*CHUNK_BYTES))));
+        if(index==0) mutations.add(put(candidate,ref.encode()));
+        return checked(operation,mutations,List.of(predicate(key,null),predicate(headKey(head.domainId()),head.encode()),predicate(definitionKey(definition.digest()),definitionArtifact(definition).encode()),predicate(candidate,index==0 ? null : ref.encode())));
+    }
+    private DistributedCommand prepareBoundCommit(OperationId operation,byte kind,RangeImportDefinition definition,Head head,Artifact ref) {
+        byte chunkKind=kind==ADMISSION_REF ? ADMISSION_CHUNK : ACTIVATION_CHUNK;
+        byte[] key=refKey(kind,ref.digest());
+        return checked(operation,List.of(put(key,ref.encode())),List.of(predicate(key,null),predicate(headKey(head.domainId()),head.encode()),predicate(definitionKey(definition.digest()),definitionArtifact(definition).encode()),predicate(candidateKey(chunkKind,definition.digest()),ref.encode())));
+    }
     public DistributedCommand prepareBegin(OperationId operation,RangeImportDefinition definition,Head previous,RatisSchemaAdministration.Head schemaHead) {
         return prepareBegin(operation,definition,previous,schemaHead,null);
     }
@@ -79,10 +91,10 @@ public final class RatisRangeImportCatalogue {
         return checked(definition.operation(),List.of(put(head,next.encode()),put(record,next.encode()),put(directoryKey(next.domainId()),RangeDirectoryCodec.encode(definition.targetDirectory()))),List.of(predicate(head,prepared.encode()),predicate(record,prepared.encode()),predicate(directoryKey(next.domainId()),RangeDirectoryCodec.encode(definition.sourceDirectory())),predicate(RatisSchemaAdministration.headKey(next.domainId()),schemaHead==null ? null : schemaHead.encode()),predicate(definitionKey(definition.digest()),definitionArtifact(definition).encode()),predicate(admissionKey(artifact.digest()),artifact.encode())));
     }
     public DistributedCommand prepareActivationChunk(OperationId operation,RangeImportDefinition definition,RangeImportAdmission installed,Head published,RangeImportActivationAdmission activated,int index) {
-        requireActivation(definition,installed,published,activated); return prepareChunk(operation,ACTIVATION_CHUNK,activated.encode(),index);
+        requireActivation(definition,installed,published,activated); return prepareBoundChunk(operation,ACTIVATION_CHUNK,definition,published,activated.encode(),index);
     }
     public DistributedCommand prepareActivationCommit(OperationId operation,RangeImportDefinition definition,RangeImportAdmission installed,Head published,RangeImportActivationAdmission activated) {
-        requireActivation(definition,installed,published,activated); return prepareCommit(operation,ACTIVATION_REF,activationArtifact(activated));
+        requireActivation(definition,installed,published,activated); return prepareBoundCommit(operation,ACTIVATION_REF,definition,published,activationArtifact(activated));
     }
     public DistributedCommand prepareCompletion(OperationId operation,RangeImportDefinition definition,RangeImportAdmission installed,Head published,RangeImportActivationAdmission activated,RatisSchemaAdministration.Head schemaHead) {
         requireActivation(definition,installed,published,activated); if(operation.equals(definition.operation())) throw new IllegalArgumentException("Completion requires its own original operation"); var next=published.complete(activated.digest());
@@ -132,19 +144,60 @@ public final class RatisRangeImportCatalogue {
             int bytes=DistributedCommandCodec.encodedSize(command); if(bytes>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Import command exceeds DATA/MUTATION envelope");
             var first=command.mutations().getFirst(); byte[] key=first.key(); if(key.length<1) throw new IllegalArgumentException("Missing import key");
             if(key[0]==DEFINITION_CHUNK || key[0]==ADMISSION_CHUNK || key[0]==ACTIVATION_CHUNK) {
-                if(bytes>MAX_CONTROL_BYTES || key.length!=37 || command.mutations().size()!=1 || command.predicates().size()!=1 || !Arrays.equals(key,command.predicates().getFirst().key()) || command.predicates().getFirst().expectedValue()!=null || first.value().length<1 || first.value().length>CHUNK_BYTES) throw new IllegalArgumentException("Invalid immutable import chunk");
-                int index=ByteBuffer.wrap(key,33,4).getInt(),maximum=key[0]==DEFINITION_CHUNK ? RangeImportDefinition.MAX_BYTES : key[0]==ADMISSION_CHUNK ? RangeImportAdmission.MAX_BYTES : RangeImportActivationAdmission.MAX_BYTES; if(index<0 || index>=(maximum+CHUNK_BYTES-1)/CHUNK_BYTES) throw new IllegalArgumentException("Import chunk index exceeds bound"); return;
+                if(bytes>MAX_CONTROL_BYTES || key.length!=37 || (!boundArtifact(key[0]) && (command.mutations().size()!=1 || command.predicates().size()!=1)) || !Arrays.equals(key,command.predicates().getFirst().key()) || command.predicates().getFirst().expectedValue()!=null || first.value().length<1 || first.value().length>CHUNK_BYTES) throw new IllegalArgumentException("Invalid immutable import chunk");
+                int index=ByteBuffer.wrap(key,33,4).getInt(),maximum=key[0]==DEFINITION_CHUNK ? RangeImportDefinition.MAX_BYTES : key[0]==ADMISSION_CHUNK ? RangeImportAdmission.MAX_BYTES : RangeImportActivationAdmission.MAX_BYTES; if(index<0 || index>=(maximum+CHUNK_BYTES-1)/CHUNK_BYTES) throw new IllegalArgumentException("Import chunk index exceeds bound");
+                if(boundArtifact(key[0])) {
+                    var ref=requireBoundArtifact(command,key[0],reader,structural,index==0);
+                    if(index==0) requireBoundBody(command,key[0],first.value());
+                    if(index>=ref.chunks() || first.value().length!=Math.min(CHUNK_BYTES,ref.bytes()-index*CHUNK_BYTES) || !Arrays.equals(Arrays.copyOfRange(key,1,33),ref.digest())) throw new IllegalArgumentException("Chunk differs from frozen artifact candidate");
+                }
+                return;
             }
             if(key[0]==DEFINITION_REF || key[0]==ADMISSION_REF || key[0]==ACTIVATION_REF) {
-                if(bytes>MAX_CONTROL_BYTES || key.length!=33 || command.mutations().size()!=1 || command.predicates().size()!=1 || !Arrays.equals(key,command.predicates().getFirst().key()) || command.predicates().getFirst().expectedValue()!=null) throw new IllegalArgumentException("Invalid immutable import commitment");
-                var ref=Artifact.decode(first.value()); if(!Arrays.equals(key,refKey(key[0],ref.digest())) || key[0]==ADMISSION_REF && ref.bytes()>RangeImportAdmission.MAX_BYTES || key[0]==ACTIVATION_REF && ref.bytes()>RangeImportActivationAdmission.MAX_BYTES) throw new IllegalArgumentException("Import artifact reference differs");
-                if(!structural) { byte[] body=assemble(reader,key[0],ref); if(key[0]==DEFINITION_REF) requireDefinitionIdentity(RangeImportDefinition.decode(body),cluster,database); else if(key[0]==ADMISSION_REF) { var definition=definition(reader,RangeImportAdmission.definitionDigest(body),cluster,database); RangeImportAdmission.decode(body,definition); } else { var definition=definition(reader,RangeImportActivationAdmission.definitionDigest(body),cluster,database); var installed=admission(reader,definition,RangeImportActivationAdmission.installationDigest(body)); var publication=Head.prepared(definition).publish(installed.digest()); RangeImportActivationAdmission.decode(body,definition,installed,group,RangeImportAdmission.sha256(publication.encode())); } }
+                if(bytes>MAX_CONTROL_BYTES || key.length!=33 || (!boundArtifact(key[0]) && (command.mutations().size()!=1 || command.predicates().size()!=1)) || !Arrays.equals(key,command.predicates().getFirst().key()) || command.predicates().getFirst().expectedValue()!=null) throw new IllegalArgumentException("Invalid immutable import commitment");
+                var ref=Artifact.decode(first.value()); if(boundArtifact(key[0]) && !Arrays.equals(ref.encode(),requireBoundArtifact(command,key[0],reader,structural,false).encode())) throw new IllegalArgumentException("Commit differs from original candidate"); if(!Arrays.equals(key,refKey(key[0],ref.digest())) || key[0]==ADMISSION_REF && ref.bytes()>RangeImportAdmission.MAX_BYTES || key[0]==ACTIVATION_REF && ref.bytes()>RangeImportActivationAdmission.MAX_BYTES) throw new IllegalArgumentException("Import artifact reference differs");
+                if(!structural) { byte[] body=assemble(reader,key[0],ref); if(boundArtifact(key[0])) requireBoundBody(command,key[0],body); if(key[0]==DEFINITION_REF) requireDefinitionIdentity(RangeImportDefinition.decode(body),cluster,database); else if(key[0]==ADMISSION_REF) { var definition=definition(reader,RangeImportAdmission.definitionDigest(body),cluster,database); RangeImportAdmission.decode(body,definition); } else { var definition=definition(reader,RangeImportActivationAdmission.definitionDigest(body),cluster,database); var installed=admission(reader,definition,RangeImportActivationAdmission.installationDigest(body)); var publication=Head.prepared(definition).publish(installed.digest()); RangeImportActivationAdmission.decode(body,definition,installed,group,RangeImportAdmission.sha256(publication.encode())); } }
                 return;
             }
             if(key[0]!=HEAD || key.length!=17) throw new IllegalArgumentException("Import records require atomic domain head update");
             var next=Head.decode(first.value()); if(!next.clusterId().equals(cluster) || !next.databaseId().equals(database) || !Arrays.equals(key,headKey(next.domainId()))) throw new IllegalArgumentException("Foreign import head");
             if(next.phase()==Phase.PREPARED) validateBegin(command,next,reader,structural); else if(next.phase()==Phase.PUBLISHED) validatePublication(command,next,reader,structural); else validateCompletion(command,next,reader,structural,group);
         };
+    }
+    /** Trusted directive for native atomic history accounting after this command has passed the pure validator. */
+    public static CatalogueHistory.Directive historyDirective(DistributedCommand command) {
+        byte kind=command.mutations().getFirst().key()[0];
+        if(kind==DEFINITION_CHUNK || kind==DEFINITION_REF) return CatalogueHistory.Directive.unreserved();
+        if(boundArtifact(kind)) return CatalogueHistory.Directive.spend(Head.decode(command.predicates().get(1).expectedValue()).definitionDigest());
+        var head=Head.decode(command.mutations().getFirst().value());
+        if(head.phase()==Phase.PREPARED) {
+            long chunks=(RangeImportAdmission.MAX_BYTES+CHUNK_BYTES-1L)/CHUNK_BYTES+(RangeImportActivationAdmission.MAX_BYTES+CHUNK_BYTES-1L)/CHUNK_BYTES;
+            long bytes=RangeImportAdmission.MAX_BYTES+(long)RangeImportActivationAdmission.MAX_BYTES+37L*chunks+2L*(33+40)+2L*(34+40)+4L*MAX_HEAD_BYTES;
+            return CatalogueHistory.Directive.begin(head.definitionDigest(),bytes,chunks+4);
+        }
+        return head.phase()==Phase.COMPLETE ? CatalogueHistory.Directive.terminal(head.definitionDigest()) : CatalogueHistory.Directive.spend(head.definitionDigest());
+    }
+    private static boolean boundArtifact(byte kind) { return kind==ADMISSION_CHUNK || kind==ADMISSION_REF || kind==ACTIVATION_CHUNK || kind==ACTIVATION_REF; }
+    private static void requireBoundBody(DistributedCommand command,byte kind,byte[] body) {
+        var head=Head.decode(command.predicates().get(1).expectedValue()); boolean installing=kind==ADMISSION_CHUNK || kind==ADMISSION_REF;
+        byte[] definition=installing ? RangeImportAdmission.definitionDigest(body) : RangeImportActivationAdmission.definitionDigest(body);
+        if(!Arrays.equals(definition,head.definitionDigest())) throw new IllegalArgumentException("Artifact body belongs to a different BEGIN credit");
+        if(!installing && (!Arrays.equals(RangeImportActivationAdmission.installationDigest(body),head.admissionDigest()) || !Arrays.equals(Arrays.copyOfRange(body,68,100),RangeImportAdmission.sha256(head.encode())))) throw new IllegalArgumentException("Activation artifact differs from original publication");
+    }
+    private static Artifact requireBoundArtifact(DistributedCommand command,byte kind,ImmutableReader reader,boolean structural,boolean firstChunk) {
+        if(command.predicates().size()!=4 || command.mutations().size()!=(firstChunk ? 2 : 1)) throw new IllegalArgumentException("Artifact requires original active head, definition and candidate guards");
+        var head=Head.decode(command.predicates().get(1).expectedValue()); boolean installing=kind==ADMISSION_CHUNK || kind==ADMISSION_REF;
+        if(head.phase()!=(installing ? Phase.PREPARED : Phase.PUBLISHED)) throw new IllegalArgumentException("Artifact does not belong to active import phase");
+        requirePredicate(command,1,headKey(head.domainId()),head.encode(),true);
+        requireArtifactPredicate(command.predicates().get(2),DEFINITION_REF,head.definitionDigest());
+        byte chunkKind=installing ? ADMISSION_CHUNK : ACTIVATION_CHUNK;
+        byte[] key=candidateKey(chunkKind,head.definitionDigest());
+        var ref=Artifact.decode(firstChunk ? command.mutations().get(1).value() : command.predicates().get(3).expectedValue());
+        requirePredicate(command,3,key,firstChunk ? null : ref.encode(),true);
+        if(firstChunk) requireMutation(command,1,key,ref.encode());
+        if(ref.bytes()>(installing ? RangeImportAdmission.MAX_BYTES : RangeImportActivationAdmission.MAX_BYTES)) throw new IllegalArgumentException("Candidate exceeds reserved artifact bounds");
+        if(!structural) { var definition=definition(reader,head.definitionDigest(),head.clusterId(),head.databaseId()); head.requireDefinition(definition); requireRef(command.predicates().get(2),definitionArtifact(definition)); }
+        return ref;
     }
     private static void validateBegin(DistributedCommand command,Head next,ImmutableReader reader,boolean structural) {
         if(command.mutations().size()!=2 || command.predicates().size()!=6) throw new IllegalArgumentException("Prepared import requires exact identity/directory/schema/artifact guards");
@@ -196,6 +249,10 @@ public final class RatisRangeImportCatalogue {
     public static byte[] admissionKey(byte[] digest) { return refKey(ADMISSION_REF,digest); }
     public static byte[] definitionChunkKey(byte[] digest,int index) { return chunkKey(DEFINITION_CHUNK,digest,index); }
     public static byte[] admissionChunkKey(byte[] digest,int index) { return chunkKey(ADMISSION_CHUNK,digest,index); }
+    public static byte[] candidateKey(byte kind,byte[] definitionDigest) {
+        if(kind!=ADMISSION_CHUNK && kind!=ACTIVATION_CHUNK || definitionDigest.length!=32) throw new IllegalArgumentException("Invalid import artifact candidate kind");
+        return ByteBuffer.allocate(34).put(CANDIDATE).put(kind).put(definitionDigest).array();
+    }
     public static byte[] headKey(UUID domain) { return uuidKey(HEAD,domain); }
     public static byte[] importKey(UUID importId) { return uuidKey(IMPORT_RECORD,importId); }
     private static byte[] refKey(byte tag,byte[] digest) { if(digest.length!=32) throw new IllegalArgumentException("Invalid import artifact digest"); return ByteBuffer.allocate(33).put(tag).put(digest).array(); }

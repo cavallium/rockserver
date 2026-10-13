@@ -68,10 +68,12 @@ class RatisSchemaReplicaServiceTest {
         RatisRangeStateMachine machine;
         volatile Runnable beforeAuthority=() -> {};
         volatile RatisSchemaReplicaService.OperatorPolicy policy;
-        final Path poolPath,stagePath;
+        final Path poolPath,stagePath;final boolean runtimeDefaults;final long poolBudget;
         Fixture(Path path,boolean onListener) throws Exception { this(path,onListener,artifact()); }
-        Fixture(Path path,boolean onListener,byte[] sharedJar) throws Exception {
-            local=onListener ? listener : voter; jar=sharedJar;
+        Fixture(Path path,boolean onListener,byte[] sharedJar) throws Exception {this(path,onListener,sharedJar,false);}
+        Fixture(Path path,boolean onListener,byte[] sharedJar,boolean runtimeDefaults) throws Exception {this(path,onListener,sharedJar,runtimeDefaults,RatisNodeRuntime.ResourceLimits.defaults().pool().protectedLane().bytes());}
+        Fixture(Path path,boolean onListener,byte[] sharedJar,boolean runtimeDefaults,long poolBudget) throws Exception {
+            this.poolBudget=poolBudget;this.runtimeDefaults=runtimeDefaults;local=onListener ? listener : voter; jar=sharedJar;
             operator=new DistributedSchema.Operator("append",1,AppendOperator.class.getName(),OperatorUpload.sha256(jar),1,1,"append-contract",1);
             var shape=ColumnSchema.of(IntArrayList.of(1),ObjectArrayList.of(),true);
             var targetSchema=new DistributedSchema(id(1),id(2),id(3),1,0,List.of(new DistributedSchema.Column(1,column,"added",new ColumnSchema(shape.keys(),shape.variableTailKeys(),true,operator.name(),operator.version(),operator.className()),operator)));
@@ -91,7 +93,8 @@ class RatisSchemaReplicaServiceTest {
         }
         volatile byte[] admissions;
         void start() throws Exception {
-            service=new RatisSchemaReplicaService(poolPath,stagePath,pool,scheduler,operator -> policy.admit(operator),new RatisSchemaReplicaService.Limits(4,64L*1024*1024,192L*1024*1024,8,8,0));
+            var limits=new RatisSchemaReplicaService.Limits(4,64L*1024*1024,192L*1024*1024,8,8,0);var defaults=RatisNodeRuntime.ResourceLimits.defaults();var admission=runtimeDefaults?new RatisSchemaReplicaAdmission(limits,new RatisNodeResourceBudget(defaults.node(),Map.of(RatisPoolFixtures.ID,new RatisNodeResourceBudget.Limits(defaults.pool().ordinary(),new RatisNodeResourceBudget.Lane(poolBudget,defaults.pool().protectedLane().owners()))))):RatisPoolFixtures.schemaAdmission(limits);
+            service=new RatisSchemaReplicaService(poolPath,stagePath,pool,scheduler,operator -> policy.admit(operator),limits,admission,RatisPoolFixtures.ID);
             machine=new RatisRangeStateMachine(store,raftGroup,new NativeRangeImage.Limits(4*1024*1024,32*1024*1024,2),command -> {},command -> {},() -> new RatisRangeStateMachine.Leadership(1,false));
             machine.schemaStorage(pool); machine.proofQueries(queries);
             machine.schemaAuthority((header,digest) -> { beforeAuthority.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3),header,digest,false),id(20),new ApplyPosition(1,10),directory,new RatisSchemaAdministration.Head(status.get(),1),digest==null ? null : admissions); },directory);
@@ -104,6 +107,12 @@ class RatisSchemaReplicaServiceTest {
         void restart() throws Exception { service.stop().get(10,TimeUnit.SECONDS); machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); start(); }
         void upload() throws Exception { call(request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN)); for (int i=0;i<upload.chunks().size();i++) call(chunk(i)); assertTrue(call(request(ScopedTransactionRpc.SCHEMA_ARTIFACT_FINISH)).artifactReady()); }
         @Override public void close() throws Exception { service.stop().get(10,TimeUnit.SECONDS); machine.close(); machine.awaitNativeReaders(java.time.Duration.ofSeconds(5)); queries.stop().get(10,TimeUnit.SECONDS); storage.close(); scheduler.dispose(); pool.close(); }
+    }
+    @Test void uploadBeginCannotStrandArtifactBelowRequiredFinishBudget()throws Exception {
+        try(var f=new Fixture(root.resolve("insufficient-finish"),false,artifact(),true,64L<<20)){assertThrows(ExecutionException.class,()->f.call(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN)));try(var paths=Files.list(f.stagePath)){assertTrue(paths.noneMatch(Files::isDirectory));}}
+    }
+    @Test void runtimeDefaultBudgetsCanFinishAdmittedOperatorAndPrepareMergeColumn()throws Exception {
+        try(var f=new Fixture(root.resolve("runtime-defaults"),false,artifact(),true)){f.upload();var reserved=f.call(f.request(ScopedTransactionRpc.SCHEMA_CAPACITY_RESERVE));assertNotNull(reserved.capacity());assertEquals(CapacityState.ACTIVE,reserved.capacityState());}
     }
     @Test void listenerUploadForcedProgressReopenReserveAndAuthoritativeAbortCleanup() throws Exception {
         try (var f=new Fixture(root,true)) {
@@ -228,14 +237,14 @@ class RatisSchemaReplicaServiceTest {
             try (var registry=new RatisSchemaArtifactRegistry(staging,limits,path -> {
                 if (Files.isDirectory(path) && Files.exists(path.resolve("chunk-0"))) { forcedOwners.incrementAndGet(); if (fail.get()) throw new IOException("unknown directory force"); }
                 try (var channel=java.nio.channels.FileChannel.open(path,StandardOpenOption.READ)) { channel.force(true); }
-            })) {
+            },RatisPoolFixtures.schemaAdmission(limits),RatisPoolFixtures.ID)) {
                 var begin=f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN); registry.begin(begin); fail.set(true);
                 assertThrows(IOException.class,() -> registry.chunk(f.chunk(0))); assertThrows(IOException.class,() -> registry.progress(begin));
                 fail.set(false); assertTrue(registry.progress(begin).chunks().get(0)); assertTrue(forcedOwners.get()>=3);
                 registry.release(f.target);
                 Files.createDirectory(staging.resolve(RatisSchemaArtifactRegistry.key(begin))); // Crash after the final marker unlink, before owner-directory unlink.
             }
-            try (var registry=new RatisSchemaArtifactRegistry(staging,limits)) {
+            try (var registry=new RatisSchemaArtifactRegistry(staging,limits,RatisPoolFixtures.schemaAdmission(limits),RatisPoolFixtures.ID)) {
                 assertFalse(Files.exists(staging.resolve(RatisSchemaArtifactRegistry.key(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN)))));
                 registry.begin(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN)); assertFalse(registry.progress(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE)).ready());
             }
@@ -244,7 +253,7 @@ class RatisSchemaReplicaServiceTest {
     @Test void finishAndReserveAccountForExpandedClassLoaderHeapBeforePolicyOrNativeIo() throws Exception {
         try (var f=new Fixture(root.resolve("fixture"),false)) {
             var policies=new AtomicInteger();
-            var limited=new RatisSchemaReplicaService(f.poolPath,root.resolve("limited"),f.pool,f.scheduler,operator -> { policies.incrementAndGet(); return f.policy.admit(operator); },new RatisSchemaReplicaService.Limits(1,64L*1024*1024,64L*1024*1024,2,2,0));
+            var limited=new RatisSchemaReplicaService(f.poolPath,root.resolve("limited"),f.pool,f.scheduler,operator -> { policies.incrementAndGet(); return f.policy.admit(operator); },new RatisSchemaReplicaService.Limits(1,64L*1024*1024,64L*1024*1024,2,2,0),RatisPoolFixtures.schemaAdmission(new RatisSchemaReplicaService.Limits(1,64L*1024*1024,64L*1024*1024,2,2,0)),RatisPoolFixtures.ID);
             try {
                 limited.register(f.group,f.store,f.local,header -> { throw new AssertionError("Rejected FINISH must not fetch authority"); },(target,currentSource) -> 0);
                 for (int kind:List.of(ScopedTransactionRpc.SCHEMA_ARTIFACT_FINISH,ScopedTransactionRpc.SCHEMA_CAPACITY_RESERVE)) {
@@ -264,7 +273,7 @@ class RatisSchemaReplicaServiceTest {
             try {
                 assertTrue(entered.await(5,TimeUnit.SECONDS)); observer.cancel(false);
                 var stopping=f.service.stop(); assertFalse(stopping.isDone()); stopping.cancel(false);
-                assertThrows(IOException.class,() -> new RatisSchemaReplicaService(f.poolPath,f.stagePath,f.pool,f.scheduler,f.policy,RatisSchemaReplicaService.Limits.defaults()));
+                assertThrows(IOException.class,() -> new RatisSchemaReplicaService(f.poolPath,f.stagePath,f.pool,f.scheduler,f.policy,RatisSchemaReplicaService.Limits.defaults(),RatisPoolFixtures.schemaAdmission(RatisSchemaReplicaService.Limits.defaults()),RatisPoolFixtures.ID));
             } finally { release.countDown(); }
             f.service.stop().get(10,TimeUnit.SECONDS); f.beforeAuthority=() -> {}; f.machine.close(); f.start();
             assertFalse(f.call(f.request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE)).artifactReady());

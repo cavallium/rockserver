@@ -21,7 +21,7 @@ class RatisNodeManifestTest {
         var original=manifest(false);var base=original.settings();
         var node=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,64),new RatisNodeResourceBudget.Lane(64L*1024*1024,32));
         var pool=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(32L*1024*1024,16),new RatisNodeResourceBudget.Lane(16L*1024*1024,8));
-        var limits=new RatisNodeRuntime.ResourceLimits(node,pool);
+        var limits=new RatisNodeRuntime.ResourceLimits(node,pool,1L<<30);
         var settings=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports(),limits);
         var value=new RatisNodeManifest(original.schemas().values(),original.plan(),settings,original.readThreads(),original.writeThreads());
         var cold=RatisNodeManifest.decode(RatisNodeManifest.encode(value));assertEquals(limits,cold.settings().resources());
@@ -29,7 +29,7 @@ class RatisNodeManifestTest {
     }
     @Test void explicitStreamEndpointSurvivesManifestAndConfiguresFiniteProviderWithoutStartingIt() throws Exception {
         var original=manifest(false); var base=original.plan(); var addresses=Map.of("local","127.0.0.1:9101");
-        var plan=new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges())),base.catalogue(),base.homes(),base.imports(),addresses,base.localGroups().size());
+        var plan=new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges())),base.catalogue(),base.homes(),base.imports(),addresses,base.localGroups().size(),RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges()))),RatisPoolFixtures.groups(base.catalogue(),base.homes()));
         var encoded=RatisNodeManifest.encode(new RatisNodeManifest(List.of(original.schema(DOMAIN)),plan,original.settings(),original.readThreads(),original.writeThreads()));
         var reopened=RatisNodeManifest.decode(encoded).plan(); assertEquals(addresses,reopened.streamAddresses()); assertArrayEquals(plan.identityDigest(),reopened.identityDigest());
         assertFalse(Arrays.equals(base.identityDigest(),plan.identityDigest()));
@@ -40,8 +40,8 @@ class RatisNodeManifestTest {
         assertEquals(2,org.apache.ratis.netty.NettyConfigKeys.DataStream.Server.workerGroupSize(properties));
         assertFalse(org.apache.ratis.server.RaftServerConfigKeys.DataStream.asyncRequestThreadPoolCached(properties)); assertEquals(2,org.apache.ratis.server.RaftServerConfigKeys.DataStream.asyncWriteThreadPoolSize(properties));
         assertEquals(1,org.apache.ratis.netty.NettyConfigKeys.DataStream.Client.workerGroupSize(properties));
-        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges())),base.catalogue(),base.homes(),base.imports(),Map.of("other","127.0.0.1:9101"),base.localGroups().size()));
-        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges())),base.catalogue(),base.homes(),base.imports(),Map.of("local",base.address()),base.localGroups().size()));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges())),base.catalogue(),base.homes(),base.imports(),Map.of("other","127.0.0.1:9101"),base.localGroups().size(),RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges()))),RatisPoolFixtures.groups(base.catalogue(),base.homes())));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges())),base.catalogue(),base.homes(),base.imports(),Map.of("local",base.address()),base.localGroups().size(),RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges()))),RatisPoolFixtures.groups(base.catalogue(),base.homes())));
         var disabled=new org.apache.ratis.conf.RaftProperties(); RatisStreamingTransport.server(base,disabled);
         assertEquals(org.apache.ratis.datastream.SupportedDataStreamType.DISABLED,org.apache.ratis.RaftConfigKeys.DataStream.type(disabled,ignored->{}));
     }
@@ -61,7 +61,7 @@ class RatisNodeManifestTest {
         var cat=new ReplicaDescriptor(NODE,INCARNATION,new UUID(1,2),"local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
         var range=new RangeDescriptor(new UUID(1,3),new UUID(1,4),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(data));
         var directory=new RangeDirectory(CLUSTER,DATABASE,DOMAIN,1,schema.digest(),5,schema.columnIds(),0,List.of(range));
-        return new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,bindings,merges)),new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(cat)),List.of(),List.of(),Map.of(),20);
+        return new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,bindings,merges)),new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(cat)),List.of(),List.of(),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(directory,bindings,merges))),RatisPoolFixtures.groups(new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(cat)),List.of()));
     }
     private static RatisNodeRuntime.Settings settings() {
         return new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,8L*1024*1024,2),
@@ -78,15 +78,15 @@ class RatisNodeManifestTest {
         UUID job=UUID.randomUUID(); var columns=original.plan().columns().entrySet().stream().map(entry -> new NativeSstImportManifest.Column(entry.getKey(),entry.getValue(),false,List.of())).toList();
         var nativeManifest=new NativeSstImportManifest(job,range.groupId(),range.rangeEpoch(),fenced.domainId(),fenced.schemaDigest(),null,null,columns,RatisRangeImportRecord.DISTRIBUTED_LIMITS);
         var definition=new RangeImportDefinition(job,new OperationId(UUID.randomUUID(),1,0),fenced,List.of(nativeManifest));
-        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(fenced,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(),Map.of(),20));
-        var configured=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(fenced,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(definition),Map.of(),20);
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(fenced,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(fenced,original.plan().columns(),Set.of()))),RatisPoolFixtures.groups(original.plan().catalogue(),List.of())));
+        var configured=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(fenced,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(definition),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(fenced,original.plan().columns(),Set.of()))),RatisPoolFixtures.groups(original.plan().catalogue(),List.of()));
         assertThrows(IOException.class,()->RatisStreamingTransport.server(configured,new org.apache.ratis.conf.RaftProperties()));
         var value=new RatisNodeManifest(List.of(original.schema(DOMAIN)),configured,settings(),3,5); byte[] encoded=RatisNodeManifest.encode(value);
         var reopened=RatisNodeManifest.decode(encoded); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
         assertArrayEquals(definition.encode(),reopened.plan().importDefinition(range.groupId()).encode());
         assertArrayEquals(configured.identityDigest(),reopened.plan().identityDigest());
         assertEquals(RangeDescriptor.TopologyState.FENCED,reopened.plan().directory(DOMAIN).ranges().getFirst().topologyState());
-        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(active,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(definition),Map.of(),20));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(active,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(definition),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(active,original.plan().columns(),Set.of()))),RatisPoolFixtures.groups(original.plan().catalogue(),List.of())));
     }
     @Test void configuredPoolAndExportResourcesSurviveCanonicalManifestRoundTrip() {
         var original=manifest(false); var base=original.settings();
@@ -129,7 +129,7 @@ class RatisNodeManifestTest {
 
     @Test void canonicalRoundTripRetainsSchemaPlanSettingsAndImmutableBindings() {
         var original=manifest(false); byte[] encoded=RatisNodeManifest.encode(original); var copy=RatisNodeManifest.decode(encoded);
-        assertEquals(1,ByteBuffer.wrap(encoded).getInt(4)); assertEquals(DistributedSchemaCodec.encode(original.schema(DOMAIN)).length,ByteBuffer.wrap(encoded).getInt(8));
+        var prefix=ByteBuffer.wrap(encoded); skipPlacement(prefix); assertEquals(1,prefix.getInt()); assertEquals(DistributedSchemaCodec.encode(original.schema(DOMAIN)).length,prefix.getInt());
         assertArrayEquals(encoded,RatisNodeManifest.encode(copy)); assertArrayEquals(original.schema(DOMAIN).digest(),copy.schema(DOMAIN).digest());
         assertArrayEquals(original.plan().identityDigest(),copy.plan().identityDigest()); assertEquals(original.plan().directory(DOMAIN).generation(),copy.plan().directory(DOMAIN).generation());
         assertEquals(original.settings(),copy.settings()); assertEquals(3,copy.readThreads()); assertEquals(5,copy.writeThreads());
@@ -191,7 +191,7 @@ class RatisNodeManifestTest {
         byte[] reversed=valid.clone(); System.arraycopy(valid,bindings,reversed,second,16); System.arraycopy(valid,second,reversed,bindings,16);
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(reversed));
         byte[] groupBudget=valid.clone(); ByteBuffer.wrap(groupBudget).putInt(tail+64,1); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(groupBudget));
-        int settingsStart=valid.length-248;
+        int settingsStart=valid.length-256;
         for (int offset:new int[] {settingsStart+72,settingsStart+76}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
         byte[] duration=valid.clone(); ByteBuffer.wrap(duration).putLong(settingsStart+48,0); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(duration));
         for (int lane=0;lane<4;lane++) {
@@ -208,7 +208,7 @@ class RatisNodeManifestTest {
     }
 
     @Test void syntheticCatalogueMustRemainExactlyTheDeclaredMetadataRange() {
-        byte[] valid=RatisNodeManifest.encode(manifest(false)); var input=ByteBuffer.wrap(valid); input.position(8);
+        byte[] valid=RatisNodeManifest.encode(manifest(false)); var input=ByteBuffer.wrap(valid); skipPlacement(input); input.getInt();
         for (int i=0;i<2;i++) { int length=input.getInt(); input.position(input.position()+length); }
         int size=input.getInt(), offset=input.position(); byte[] encoded=new byte[size]; input.get(encoded);
         var catalogue=RangeDirectoryCodec.decode(encoded); var range=catalogue.ranges().getFirst();
@@ -240,7 +240,7 @@ class RatisNodeManifestTest {
     }
     private static RatisNodeManifest withHomes(List<RatisNodePlan.Home> homes) {
         var original=manifest(false); var base=original.plan();
-        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),Set.of())),base.catalogue(),homes,List.of(),Map.of(),20);
+        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),Set.of())),base.catalogue(),homes,List.of(),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),Set.of()))),RatisPoolFixtures.groups(base.catalogue(),homes));
         return new RatisNodeManifest(List.of(original.schema(DOMAIN)),plan,settings(),3,5);
     }
     @Test void currentManifestRoundTripsCanonicalDedicatedHomeRolesAndFullDefinitions() {
@@ -272,7 +272,7 @@ class RatisNodeManifestTest {
         var old=base.directory(DOMAIN).ranges().getFirst(); var range=new RangeDescriptor(old.rangeId(),old.groupId(),old.rangeEpoch(),old.configurationVersion(),null,null,old.topologyState(),List.of(remote));
         var data=new RangeDirectory(CLUSTER,DATABASE,DOMAIN,1,original.schema(DOMAIN).digest(),5,original.schema(DOMAIN).columnIds(),0,List.of(range));
         var catalogue=new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(remote));
-        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(data,base.columns(),Set.of())),catalogue,List.of(home(RatisNodePlan.Role.TRANSACTION_HOME,1)),List.of(),Map.of(),1);
+        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(data,base.columns(),Set.of())),catalogue,List.of(home(RatisNodePlan.Role.TRANSACTION_HOME,1)),List.of(),Map.of(),1,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(data,base.columns(),Set.of()))),RatisPoolFixtures.groups(catalogue,List.of(home(RatisNodePlan.Role.TRANSACTION_HOME,1))));
         var one=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,1),settings().retention(),settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults());
         var manifest=new RatisNodeManifest(List.of(original.schema(DOMAIN)),plan,one,3,5); assertEquals(1,manifest.plan().localGroups().size());
         assertEquals(RatisNodePlan.Role.TRANSACTION_HOME,plan.role(plan.localGroups().getFirst().getGroupId().getUuid()));
@@ -283,19 +283,20 @@ class RatisNodeManifestTest {
         for (int i=0;i<columns;i++) { input.position(input.position()+16); int size=input.getInt(); input.position(input.position()+size); }
         return input.position();
     }
+    private static void skipPlacement(ByteBuffer input){input.position(4);int pools=input.getInt();for(int n=0;n<pools;n++){int length=input.getInt();input.position(input.position()+length);}for(int n=0;n<2;n++){int count=input.getInt();input.position(input.position()+32*count);}}
     private static void skipBlobs(ByteBuffer input) {
-        input.position(4); int domains=input.getInt(); for(int i=0;i<domains*2+1;i++) { int size=input.getInt(); input.position(input.position()+size); }
+        skipPlacement(input); int domains=input.getInt(); for(int i=0;i<domains*2+1;i++) { int size=input.getInt(); input.position(input.position()+size); }
     }    @Test void twoDomainCurrentCodecAndColdFileReadPreserveSchemasBindingsAndDeclaredCapacity() throws Exception {
         var first=manifest(false); UUID domain=new UUID(0,500),column=new UUID(0,501),group=new UUID(0,502); var shape=ColumnSchema.of(IntArrayList.of(4),ObjectArrayList.of(),true); var second=new DistributedSchema(CLUSTER,DATABASE,domain,1,0,List.of(new DistributedSchema.Column(99,column,"gamma",shape,null)));
         var original=first.plan().directory(DOMAIN).ranges().getFirst(); var range=new RangeDescriptor(group,group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,original.replicas()); var directory=new RangeDirectory(CLUSTER,DATABASE,domain,1,second.digest(),0,Set.of(column),0,List.of(range)); var extra=new RatisNodePlan.Domain(directory,Map.of(column,"physical-gamma"),Set.of());
-        var domains=new ArrayList<>(first.plan().domains()); domains.add(extra); Collections.reverse(domains); var plan=new RatisNodePlan(NODE,INCARNATION,domains,first.plan().catalogue(),List.of(),List.of(),Map.of(),20); var manifest=new RatisNodeManifest(List.of(second,first.schema(DOMAIN)),plan,settings(),3,5);
+        var domains=new ArrayList<>(first.plan().domains()); domains.add(extra); Collections.reverse(domains); var plan=new RatisNodePlan(NODE,INCARNATION,domains,first.plan().catalogue(),List.of(),List.of(),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(domains),RatisPoolFixtures.groups(first.plan().catalogue(),List.of())); var manifest=new RatisNodeManifest(List.of(second,first.schema(DOMAIN)),plan,settings(),3,5);
         var bytes=RatisNodeManifest.encode(manifest); var decoded=RatisNodeManifest.decode(bytes); assertArrayEquals(bytes,RatisNodeManifest.encode(decoded)); assertEquals(2,decoded.schemas().size()); assertEquals(20,decoded.plan().maxLocalGroups()); assertEquals(3,decoded.plan().localGroups().size()); assertArrayEquals(second.digest(),decoded.schemaForGroup(group).digest()); assertEquals(Set.of(A,B,column),decoded.plan().columns().keySet());
         Path path=root.resolve("multi.manifest"); manifest.write(path); var cold=RatisNodeManifest.read(path); assertArrayEquals(bytes,RatisNodeManifest.encode(cold)); assertArrayEquals(plan.identityDigest(),cold.plan().identityDigest()); assertThrows(UnsupportedOperationException.class,()->cold.schemas().clear());
         assertThrows(IllegalArgumentException.class,()->new RatisNodeManifest(List.of(second),plan,settings(),3,5)); assertThrows(IllegalArgumentException.class,()->new RatisNodeManifest(List.of(second,second),plan,settings(),3,5));
-        var collision=new DistributedSchema(CLUSTER,DATABASE,domain,1,0,List.of(new DistributedSchema.Column(first.schema(DOMAIN).columns().getFirst().apiId(),column,"gamma",shape,null))); var collisionDirectory=new RangeDirectory(CLUSTER,DATABASE,domain,1,collision.digest(),0,Set.of(column),0,List.of(range)); var collisionPlan=new RatisNodePlan(NODE,INCARNATION,List.of(first.plan().domains().getFirst(),new RatisNodePlan.Domain(collisionDirectory,extra.columns(),Set.of())),plan.catalogue(),List.of(),List.of(),Map.of(),20); assertThrows(IllegalArgumentException.class,()->new RatisNodeManifest(List.of(first.schema(DOMAIN),collision),collisionPlan,settings(),3,5));
+        var collision=new DistributedSchema(CLUSTER,DATABASE,domain,1,0,List.of(new DistributedSchema.Column(first.schema(DOMAIN).columns().getFirst().apiId(),column,"gamma",shape,null))); var collisionDirectory=new RangeDirectory(CLUSTER,DATABASE,domain,1,collision.digest(),0,Set.of(column),0,List.of(range)); var collisionPlan=new RatisNodePlan(NODE,INCARNATION,List.of(first.plan().domains().getFirst(),new RatisNodePlan.Domain(collisionDirectory,extra.columns(),Set.of())),plan.catalogue(),List.of(),List.of(),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(first.plan().domains().getFirst(),new RatisNodePlan.Domain(collisionDirectory,extra.columns(),Set.of()))),RatisPoolFixtures.groups(plan.catalogue(),List.of())); assertThrows(IllegalArgumentException.class,()->new RatisNodeManifest(List.of(first.schema(DOMAIN),collision),collisionPlan,settings(),3,5));
         var fencedRange=new RangeDescriptor(group,group,1,0,null,null,RangeDescriptor.TopologyState.FENCED,range.replicas()); var fencedDirectory=new RangeDirectory(CLUSTER,DATABASE,domain,1,second.digest(),0,Set.of(column),0,List.of(fencedRange)); UUID job=new UUID(0,600);
         var nativeManifest=new NativeSstImportManifest(job,group,1,domain,second.digest(),null,null,List.of(new NativeSstImportManifest.Column(column,"physical-gamma",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS); var definition=new RangeImportDefinition(job,new OperationId(new UUID(0,601),1,0),fencedDirectory,List.of(nativeManifest));
-        var importedPlan=new RatisNodePlan(NODE,INCARNATION,List.of(first.plan().domains().getFirst(),new RatisNodePlan.Domain(fencedDirectory,extra.columns(),Set.of())),plan.catalogue(),List.of(),List.of(definition),Map.of(),20); var imported=new RatisNodeManifest(List.of(first.schema(DOMAIN),second),importedPlan,settings(),3,5); var importedCold=RatisNodeManifest.decode(RatisNodeManifest.encode(imported)); assertArrayEquals(definition.encode(),importedCold.plan().importDefinition(group).encode()); assertEquals(fencedDirectory.domainId(),importedCold.plan().groupDirectory(group).domainId());
+        var importedPlan=new RatisNodePlan(NODE,INCARNATION,List.of(first.plan().domains().getFirst(),new RatisNodePlan.Domain(fencedDirectory,extra.columns(),Set.of())),plan.catalogue(),List.of(),List.of(definition),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(first.plan().domains().getFirst(),new RatisNodePlan.Domain(fencedDirectory,extra.columns(),Set.of()))),RatisPoolFixtures.groups(plan.catalogue(),List.of())); var imported=new RatisNodeManifest(List.of(first.schema(DOMAIN),second),importedPlan,settings(),3,5); var importedCold=RatisNodeManifest.decode(RatisNodeManifest.encode(imported)); assertArrayEquals(definition.encode(),importedCold.plan().importDefinition(group).encode()); assertEquals(fencedDirectory.domainId(),importedCold.plan().groupDirectory(group).domainId());
         var count=bytes.clone(); ByteBuffer.wrap(count).putInt(4,65); assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(count));
     }
 
@@ -307,7 +308,7 @@ class RatisNodeManifestTest {
         var columns=original.plan().columns().entrySet().stream().map(e->new NativeSstImportManifest.Column(e.getKey(),e.getValue(),false,List.of())).toList();UUID firstId=new UUID(5,2),secondId=new UUID(5,1),session=new UUID(5,3);
         var first=new RangeImportDefinition(firstId,new OperationId(session,1,0),initial,List.of(new NativeSstImportManifest(firstId,a.groupId(),a.rangeEpoch(),DOMAIN,initial.schemaDigest(),a.lowerInclusive(),a.upperExclusive(),columns,RatisRangeImportRecord.DISTRIBUTED_LIMITS)));
         var second=new RangeImportDefinition(secondId,new OperationId(session,1,1),first.targetDirectory(),List.of(new NativeSstImportManifest(secondId,b.groupId(),b.rangeEpoch(),DOMAIN,initial.schemaDigest(),b.lowerInclusive(),b.upperExclusive(),columns,RatisRangeImportRecord.DISTRIBUTED_LIMITS)));
-        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(initial,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(second,first),Map.of(),20);
+        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(initial,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(second,first),Map.of(),20,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(initial,original.plan().columns(),Set.of()))),RatisPoolFixtures.groups(original.plan().catalogue(),List.of()));
         var value=new RatisNodeManifest(List.of(original.schema(DOMAIN)),plan,settings(),3,5);byte[] encoded=RatisNodeManifest.encode(value);var cold=RatisNodeManifest.decode(encoded);
         assertArrayEquals(encoded,RatisNodeManifest.encode(cold));assertArrayEquals(first.encode(),cold.plan().imports().getFirst().encode());assertArrayEquals(second.encode(),cold.plan().importDefinition(b.groupId()).encode());assertArrayEquals(first.targetDirectory().payloadDigest(),cold.plan().importDefinition(b.groupId()).sourceDirectory().payloadDigest());
     }

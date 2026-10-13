@@ -64,15 +64,17 @@ public final class RatisNodePlan {
     private final String peerId,address;
     private final List<RaftGroup> localGroups;
     private final byte[] identity;
+    private final Map<UUID,RatisNativePoolSpec> pools;private final Map<UUID,UUID> domainPools,groupPools;
 
     public RatisNodePlan(UUID nodeId,UUID nodeIncarnation,Collection<Domain> domains,Catalogue catalogue,List<Home> homes,
-            Collection<RangeImportDefinition> imports,Map<String,String> streamAddresses,int maxLocalGroups) {
+            Collection<RangeImportDefinition> imports,Map<String,String> streamAddresses,int maxLocalGroups,Collection<RatisNativePoolSpec> pools,Map<UUID,UUID> domainPools,Map<UUID,UUID> groupPools) {
         this.nodeId=Objects.requireNonNull(nodeId); this.nodeIncarnation=Objects.requireNonNull(nodeIncarnation); this.catalogue=Objects.requireNonNull(catalogue); this.maxLocalGroups=maxLocalGroups;
+        if(pools.isEmpty() || pools.size()>RatisNodeResourceBudget.MAX_POOLS || groupPools.size()>MAX_DATA_GROUPS+1+MAX_HOME_GROUPS)throw new IllegalArgumentException("Invalid bounded physical pool placement");var declared=new TreeMap<UUID,RatisNativePoolSpec>(UUID_ORDER);long poolBytes=0;for(var spec:pools){if(declared.put(spec.id(),spec)!=null || (poolBytes+=spec.encode().length)>4L*1024*1024)throw new IllegalArgumentException("Native pool declarations duplicate/exceed metadata budget");}this.pools=Collections.unmodifiableMap(declared);this.domainPools=Map.copyOf(domainPools);this.groupPools=Map.copyOf(groupPools);if(!declared.keySet().containsAll(domainPools.values()) || !declared.keySet().containsAll(groupPools.values()))throw new IllegalArgumentException("Placement names an undeclared native pool");
         if(domains.size()<1 || domains.size()>MAX_DOMAINS || homes.size()>2 || imports.size()>RangeImportDefinition.MAX_GROUPS || streamAddresses.size()>4096) throw new IllegalArgumentException("Node aggregate count capacity exceeded");
         this.domains=domains.stream().sorted(Comparator.comparing(Domain::domainId,UUID_ORDER)).toList();
         if(this.domains.isEmpty() || this.domains.size()>MAX_DOMAINS) throw new IllegalArgumentException("Invalid bounded DATA domain count");
         var first=this.domains.getFirst().directory(); clusterId=first.clusterId(); databaseId=first.databaseId();
-        var index=new TreeMap<UUID,Domain>(UUID_ORDER); var byGroup=new HashMap<UUID,Domain>(); var allColumns=new TreeMap<UUID,String>(UUID_ORDER); var allMerges=new HashSet<UUID>(); var physicalNames=new HashSet<String>(); var ranges=new HashSet<UUID>(); ranges.add(catalogue.groupId()); long domainBytes=0,metadataBytes=0; int dataGroups=0;
+        var index=new TreeMap<UUID,Domain>(UUID_ORDER); var byGroup=new HashMap<UUID,Domain>(); var allColumns=new TreeMap<UUID,String>(UUID_ORDER); var allMerges=new HashSet<UUID>(); var physicalNames=new HashSet<String>(); var ranges=new HashSet<UUID>(); ranges.add(catalogue.groupId()); long domainBytes=0,metadataBytes=poolBytes; int dataGroups=0;
         for(var domain:this.domains) {
             var directory=domain.directory(); domainBytes+=RangeDirectoryCodec.encode(directory).length;
             if(!clusterId.equals(directory.clusterId()) || !databaseId.equals(directory.databaseId()) || directory.domainId().equals(catalogue.groupId()) || index.put(directory.domainId(),domain)!=null || domainBytes>MAX_DOMAIN_BYTES) throw new IllegalArgumentException("DATA domain namespace/identity/metadata budget differs");
@@ -119,6 +121,7 @@ public final class RatisNodePlan {
             groups.replaceAll((id,group)->streaming(group));
         }
         if(metadataBytes>MAX_METADATA_BYTES) throw new IllegalArgumentException("Aggregate node metadata exceeds byte capacity");
+        if(!this.domainPools.keySet().equals(domainIndex.keySet()) || !this.groupPools.containsKey(catalogue.groupId()))throw new IllegalArgumentException("Pool placements must cover all DATA domains and catalogue");for(var home:this.homes)for(var range:home.directory().ranges())if(!this.groupPools.containsKey(range.groupId()))throw new IllegalArgumentException("Dedicated HOME pool placement missing");var counts=new HashMap<UUID,Integer>();for(var group:groups.values()){var assigned=poolId(group.getGroupId().getUuid());if(counts.merge(assigned,1,Integer::sum)>this.pools.get(assigned).maximumGroups())throw new IllegalArgumentException("Physical pool group ceiling exceeded");}
         peerId=local.peer(); address=local.address(); localGroups=List.copyOf(groups.values()); identity=digest();
     }
     private void inspect(UUID group,List<ReplicaDescriptor> replicas,Map<UUID,Server> nodes,Map<String,Server> peers,
@@ -143,6 +146,9 @@ public final class RatisNodePlan {
                 .setId(replica.peerId()).setAddress(replica.address())
                 .setStartupRole(replica.role()==ReplicaDescriptor.Role.VOTER ? RaftPeerRole.FOLLOWER : RaftPeerRole.LISTENER).build()).toList());
     }
+    public Map<UUID,RatisNativePoolSpec> pools(){return pools;}public Map<UUID,UUID> domainPools(){return domainPools;}public Map<UUID,UUID> groupPools(){return groupPools;}
+    public UUID poolId(UUID group){var override=groupPools.get(group);if(override!=null)return override;var domain=groupDomains.get(group);if(domain==null)throw new IllegalArgumentException("Group has no declared pool placement");return domainPools.get(domain.domainId());}
+    public UUID incomingPoolId(UUID domain,UUID group){domain(domain);return groupPools.getOrDefault(group,domainPools.get(domain));}
     public UUID nodeId() { return nodeId; }
     public UUID nodeIncarnation() { return nodeIncarnation; }
     public UUID clusterId() { return clusterId; } public UUID databaseId() { return databaseId; }
@@ -178,6 +184,7 @@ public final class RatisNodePlan {
     private byte[] digest() {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
+            output.writeInt(pools.size());for(var spec:pools.values()){var encoded=spec.encode();output.writeInt(encoded.length);output.write(encoded);}for(var placement:List.of(domainPools,groupPools)){output.writeInt(placement.size());for(var id:placement.keySet().stream().sorted(UUID_ORDER).toList()){uuid(output,id);uuid(output,placement.get(id));}}
             uuid(output,clusterId); uuid(output,databaseId); output.writeInt(maxLocalGroups); output.writeInt(domains.size());
             for(var domain:domains) { var directory=domain.directory(); uuid(output,directory.domainId()); output.write(new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),0,directory.columns(),directory.routingPrefixBytes(),directory.ranges()).payloadDigest()); }
             uuid(output,catalogue.groupId()); output.writeLong(catalogue.epoch()); output.write(catalogue.schemaDigest());

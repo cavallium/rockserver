@@ -20,13 +20,13 @@ class RatisCatalogueGenesisTest {
         var directory=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.schemaDigest(),0,source.columns(),source.routingPrefixBytes(),source.ranges());
         var local=directory.ranges().getFirst().replicas().getFirst();
         var replica=new ReplicaDescriptor(local.nodeId(),local.nodeIncarnation(),new UUID(9,9),local.peerId(),local.address(),local.role());
-        return new RatisNodePlan(local.nodeId(), local.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data"), Set.of())), new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,List.of(replica)), List.of(), List.of(), Map.of(), 2);
+        return new RatisNodePlan(local.nodeId(), local.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data"), Set.of())), new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,List.of(replica)), List.of(), List.of(), Map.of(), 2,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data"), Set.of()))),RatisPoolFixtures.groups(new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,List.of(replica)),List.of()));
     }
     RatisNodePlan secondDomain(RatisSessionEpochsTest outer) {
         var first=plan(outer);var d=first.domains().getFirst().directory();var source=d.ranges().getFirst();UUID column=new UUID(22,3);
         var range=new RangeDescriptor(new UUID(26,2),new UUID(23,1),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,source.replicas());
         var directory=new RangeDirectory(d.clusterId(),d.databaseId(),new UUID(26,1),d.schemaEpoch(),d.schemaDigest(),0,Set.of(column),0,List.of(range));
-        return new RatisNodePlan(first.nodeId(), first.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, Map.of(column,"domain-two"), Set.of())), first.catalogue(), List.of(), List.of(), Map.of(), 2);
+        return new RatisNodePlan(first.nodeId(), first.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, Map.of(column,"domain-two"), Set.of())), first.catalogue(), List.of(), List.of(), Map.of(), 2,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(directory, Map.of(column,"domain-two"), Set.of()))),RatisPoolFixtures.groups(first.catalogue(),List.of()));
     }
     static DatabaseDomainRoster roster(RatisNodePlan plan) { var directory=plan.domains().getFirst().directory(); return DatabaseDomainRoster.initial(directory.clusterId(),directory.databaseId(),List.of(directory.domainId())); }
     @Test void additionalDomainRetainsLedgerAndOriginalPublicationAcrossLostReplyAndLaterIssuance() throws Exception {

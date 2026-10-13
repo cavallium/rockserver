@@ -31,7 +31,7 @@ class RatisSchemaCatalogueTest {
                 schema.columnIds(),schema.routingPrefixBytes(),source.ranges());
         var local=source.ranges().getFirst().replicas().getFirst();
         var replica=new ReplicaDescriptor(local.nodeId(),local.nodeIncarnation(),new UUID(9,9),local.peerId(),local.address(),local.role());
-        return new RatisNodePlan(local.nodeId(), local.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data"), Set.of())), new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,List.of(replica)), List.of(), List.of(), Map.of(), 2);
+        return new RatisNodePlan(local.nodeId(), local.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data"), Set.of())), new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,List.of(replica)), List.of(), List.of(), Map.of(), 2,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data"), Set.of()))),RatisPoolFixtures.groups(new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,List.of(replica)),List.of()));
     }
     private static RatisSchemaCatalogue catalogue(RatisSessionEpochsTest outer,RaftClient client) {
         return new RatisSchemaCatalogue(client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
@@ -259,7 +259,7 @@ class RatisSchemaCatalogueTest {
             }
             Files.delete(journal.resolve("block")); Files.delete(journal); Files.write(journal,pending);
             try (var publication=new RatisSchemaPublication(journal,f.client,plan,schema)) { assertEquals(CommandResult.Status.SUCCESS,publication.execute().status()); }
-            var c=plan.catalogue(); var changed=new RatisNodePlan(plan.nodeId(), plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(plan.domains().getFirst().directory(), plan.columns(), plan.merges())), new RatisNodePlan.Catalogue(c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn(),new UUID(99,99),c.replicas()), List.of(), List.of(), Map.of(), 2);
+            var c=plan.catalogue(); var changed=new RatisNodePlan(plan.nodeId(), plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(plan.domains().getFirst().directory(), plan.columns(), plan.merges())), new RatisNodePlan.Catalogue(c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn(),new UUID(99,99),c.replicas()), List.of(), List.of(), Map.of(), 2,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(plan.domains().getFirst().directory(), plan.columns(), plan.merges()))),RatisPoolFixtures.groups(new RatisNodePlan.Catalogue(c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn(),new UUID(99,99),c.replicas()),List.of()));
             assertThrows(IOException.class,() -> new RatisSchemaPublication(journal,f.client,changed,schema),"Intent binds the unused catalogue sessions column too");
             byte[] valid=Files.readAllBytes(journal), damaged=valid.clone(); damaged[damaged.length/2]^=1; Files.write(journal,damaged);
             assertThrows(IOException.class,() -> new RatisSchemaPublication(journal,f.client,plan,schema));

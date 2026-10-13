@@ -23,7 +23,7 @@ class RatisRangeImportDataClientTest {
         var definition=RatisRangeImportCatalogueTest.definition(cluster,database,new OperationId(UUID.randomUUID(),0,1));
         var manifest=definition.manifests().getFirst();var range=definition.sourceDirectory().ranges().getFirst();var voter=range.replicas().stream().filter(r->r.role()==ReplicaDescriptor.Role.VOTER).findFirst().orElseThrow();
         var binding=new RatisNodePlan.Catalogue(catalogue,1,new byte[32],UUID.randomUUID(),UUID.randomUUID(),List.of(voter));
-        var plan=new RatisNodePlan(voter.nodeId(), voter.nodeIncarnation(), List.of(new RatisNodePlan.Domain(definition.sourceDirectory(), manifest.physicalNames(), Set.of())), binding, List.of(), List.of(definition), Map.of("owner1","127.0.0.1:9101","owner2","127.0.0.1:9102"), 2);
+        var plan=new RatisNodePlan(voter.nodeId(), voter.nodeIncarnation(), List.of(new RatisNodePlan.Domain(definition.sourceDirectory(), manifest.physicalNames(), Set.of())), binding, List.of(), List.of(definition), Map.of("owner1","127.0.0.1:9101","owner2","127.0.0.1:9102"), 2,RatisPoolFixtures.pools(),RatisPoolFixtures.domains(List.of(new RatisNodePlan.Domain(definition.sourceDirectory(), manifest.physicalNames(), Set.of()))),RatisPoolFixtures.groups(binding,List.of()));
         var catalogueClient=mock(RaftClient.class);when(catalogueClient.getGroupId()).thenReturn(RaftGroupId.valueOf(catalogue));
         UUID identity=UUID.randomUUID();var request=new RatisReferencedFile.Request(range.groupId(),identity,9,manifest.encode().length,manifest.digest());
         var reference=new RatisReferencedFile(range.groupId(),1,1,identity,9,request.length(),request.sha256());var recovered=new AtomicReference<RatisReferencedFile>();

@@ -103,4 +103,110 @@ class RatisNodeResourceBudgetTest {
         }
     }
 
+    @Test void protectedFinalizationCompletesWithOrdinaryFullAndDuplicateInputsDoNotDonateCharge() throws Exception {
+        var pool=UUID.randomUUID();
+        var budget=new RatisNodeResourceBudget(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(1024*1024,1),new RatisNodeResourceBudget.Lane(32L*1024*1024,8)),Map.of(pool,new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(1024*1024,1),new RatisNodeResourceBudget.Lane(32L*1024*1024,8))));
+        var helper=new RatisParticipantPrepareTest(); helper.root=root; helper.dataInitializer=machine->machine.nodeResources(budget,pool);
+        try(var home=helper.new Node("protected-home",true);var data=helper.new Node("protected-data",false);var other=helper.new Node("ordinary-full",false);
+            var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
+            var initial=helper.register(home,data,pin,data.f.put(2),0);
+            var abort=initial.decide(it.cavallium.rockserver.core.common.distributed.TransactionStatus.Phase.ABORT);
+            assertEquals(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,home.statuses.execute(home.statuses.prepare(new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,4),1,1),initial,abort)).status());
+            var ordinary=other.f.propose(other.f.put(0)); assertNull(ordinary.getException());
+            assertThrows(IOException.class,()->data.f.propose(data.f.put(8)));
+            try(var plan=data.f.machine.prepareFinalization(home.statuses,initial.transactionId(),new it.cavallium.rockserver.core.common.distributed.OperationId(UUID.randomUUID(),3,0))) {
+                var first=data.wire.propose(plan.bytes()); var duplicate=data.wire.propose(plan.bytes());
+                assertNull(first.getException()); assertNull(duplicate.getException());
+                var charged=budget.stats().protectedLane(); assertEquals(3,charged.owners());
+                data.f.machine.cancelTransaction(first);
+                assertEquals(charged,budget.stats().protectedLane());
+                data.f.machine.preAppendTransaction(duplicate); duplicate.initLogEntry(1,1);
+                assertNotNull(data.f.machine.applyTransaction(duplicate).get(5,java.util.concurrent.TimeUnit.SECONDS));
+                assertNotNull(data.routed.finalizedParticipant(data.f.groupId,initial.transactionId()));
+                assertEquals(0,budget.stats().protectedLane().bytes()); assertEquals(1,budget.stats().ordinary().owners());
+            } finally { other.f.machine.cancelTransaction(ordinary); }
+            assertEquals(0,budget.stats().ordinary().bytes());
+        }
+    }
+    @Test void canceledBlockedHomeLookupKeepsProtectedGraphUntilActualLookupExits() throws Exception {
+        var pool=UUID.randomUUID(); var lane=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(1024*1024,1),new RatisNodeResourceBudget.Lane(32L*1024*1024,8));
+        var budget=new RatisNodeResourceBudget(lane,Map.of(pool,lane));
+        var helper=new RatisParticipantPrepareTest(); helper.root=root; helper.dataInitializer=machine->machine.nodeResources(budget,pool);
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);var drained=new CompletableFuture<Void>();
+        try(var home=helper.new Node("lookup-home",true);var data=helper.new Node("lookup-data",false);
+            var pin=data.f.store.captureTracked(helper.scope(data,1,4));var executor=java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var initial=helper.register(home,data,pin,data.f.put(2),0);
+            var abort=initial.decide(it.cavallium.rockserver.core.common.distributed.TransactionStatus.Phase.ABORT);
+            assertEquals(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,home.statuses.execute(home.statuses.prepare(new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,4),1,1),initial,abort)).status());
+            home.wire.afterRead=()->{entered.countDown();try {if(!release.await(5,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("HOME lookup timeout");}catch(InterruptedException failure){throw new AssertionError(failure);}};
+            var recovery=new it.cavallium.rockserver.core.common.distributed.OperationId(UUID.randomUUID(),3,0);
+            var observer=executor.submit(()->{try(var plan=data.f.machine.prepareFinalization(home.statuses,initial.transactionId(),recovery)){return plan.bytes();}finally{drained.complete(null);}});
+            try {
+                assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS));
+                var charged=budget.stats().protectedLane(); assertTrue(charged.bytes()>0); assertEquals(1,charged.owners());
+                assertTrue(observer.cancel(false)); data.f.machine.notifyNotLeader(java.util.List.of());
+                assertFalse(drained.isDone()); assertEquals(charged,budget.stats().protectedLane());
+                assertThrows(IllegalStateException.class,()->data.f.machine.prepareFinalization(home.statuses,initial.transactionId(),recovery));
+                assertEquals(charged,budget.stats().protectedLane());
+            } finally {release.countDown();}
+            drained.get(5,java.util.concurrent.TimeUnit.SECONDS); home.wire.afterRead=null;
+            assertEquals(0,budget.stats().protectedLane().bytes()); assertEquals(0,data.f.machine.protectedFinalizationSlots());
+        }
+    }
+
+    private final class BudgetSnapshotHome implements AutoCloseable {
+        final RatisRetentionAdmissionTest.Fixture f; final RatisParticipantPrepareTest.Wire wire;
+        final RatisRoutedClient routed; final RatisSnapshotFences homes; long sequence;
+        BudgetSnapshotHome(RatisParticipantPrepareTest helper,RatisNodeResourceBudget budget,UUID pool) throws Exception {
+            var validation=new java.util.concurrent.atomic.AtomicReference<java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand>>(command->{});
+            var column=UUID.randomUUID();
+            var interval=new it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.Interval(UUID.randomUUID(),java.util.Set.of(column),null,null);
+            f=new RatisRetentionAdmissionTest.Fixture(root.resolve("budget-snapshot-home"),RatisRangeStateMachine.RetentionLimits.defaults(),command->validation.get().accept(command),System::nanoTime,interval,machine->{
+                machine.nodeResources(budget,pool);
+                machine.role(RatisNodePlan.Role.SNAPSHOT_HOME,(key,value)->RatisSnapshotFences.validateRecord(helper.cluster,helper.database,machine.getGroupId().getUuid(),1,key,value));
+                machine.snapshotHomeStorage(helper.cluster,helper.database,column);
+            });
+            var replica=new it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),"fixture","127.0.0.1:12345",it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor.Role.VOTER);
+            var route=new it.cavallium.rockserver.core.common.distributed.RangeDescriptor(f.groupId,f.groupId,1,0,null,null,it.cavallium.rockserver.core.common.distributed.RangeDescriptor.TopologyState.ACTIVE,java.util.List.of(replica));
+            var directory=new it.cavallium.rockserver.core.common.distributed.RangeDirectory(helper.cluster,helper.database,interval.domainId(),1,new byte[32],0,java.util.Set.of(column),0,java.util.List.of(route));
+            wire=new RatisParticipantPrepareTest.Wire(f); routed=new RatisRoutedClient(directory,wire); homes=new RatisSnapshotFences(routed,column);
+            validation.set(RatisSnapshotFences.validator(helper.cluster,helper.database,f.groupId,1,new byte[32],column));
+        }
+        void advance(it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus before,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus next) throws Exception {
+            var id=new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7100),1,sequence++);
+            assertEquals(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,homes.execute(homes.prepare(id,before,next)).status());
+        }
+        public void close() throws Exception {routed.close();f.close();}
+    }
+    @Test void snapshotHomeProgressUsesProtectedLaneButFreshRegistrationStillRequiresOrdinaryCapacity() throws Exception {
+        var pool=UUID.randomUUID(); var lane=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(1024*1024,1),new RatisNodeResourceBudget.Lane(64L*1024*1024,16));
+        var budget=new RatisNodeResourceBudget(lane,Map.of(pool,lane));
+        var helper=new RatisParticipantPrepareTest(); helper.root=root; helper.dataInitializer=machine->machine.nodeResources(budget,pool);
+        try(var home=new BudgetSnapshotHome(helper,budget,pool);var data=helper.new Node("snapshot-budget-data",false);var other=helper.new Node("snapshot-ordinary-full",false)) {
+            var scope=helper.scope(data,1,4);
+            var participant=new it.cavallium.rockserver.core.common.distributed.SnapshotFence.Participant(data.f.groupId,data.f.groupId,1,new byte[32],new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7200),1,0),new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7200),1,1),scope);
+            var fence=new it.cavallium.rockserver.core.common.distributed.SnapshotFence(helper.cluster,helper.database,data.directory.domainId(),UUID.randomUUID(),home.f.groupId,1,new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7300),1,0),0,1,new byte[32],java.util.List.of(participant));
+            var initial=it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.begin(fence); home.advance(null,initial);
+            var ordinary=other.f.propose(other.f.put(0)); assertNull(ordinary.getException());
+            try {
+                var another=new it.cavallium.rockserver.core.common.distributed.SnapshotFence(fence.clusterId(),fence.databaseId(),fence.domainId(),UUID.randomUUID(),fence.homeGroup(),fence.homeEpoch(),new it.cavallium.rockserver.core.common.distributed.OperationId(new UUID(0,7301),1,0),0,1,new byte[32],fence.participants());
+                assertThrows(IOException.class,()->home.advance(null,it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.begin(another)));
+                it.cavallium.rockserver.core.common.distributed.ApplyPosition installed;
+                try(var install=data.f.machine.prepareSnapshotInstall(home.homes,fence)) { installed=RatisSnapshotRecord.Result.decode(data.wire.append(install.bytes())).position(); }
+                var ready=initial.ready(data.f.groupId,installed); home.advance(initial,ready);
+                it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus captured;
+                try(var actual=data.f.machine.captureSnapshotGate(home.homes,fence)) {
+                    captured=ready.capture(data.f.groupId,new it.cavallium.rockserver.core.common.distributed.SnapshotFenceStatus.Capture(UUID.randomUUID(),UUID.randomUUID(),actual.position()));
+                    home.advance(ready,captured);
+                }
+                var complete=captured.complete(); home.advance(captured,complete);
+                try(var release=data.f.machine.prepareSnapshotRelease(home.homes,fence)) { assertNotNull(RatisSnapshotRecord.Result.decode(data.wire.append(release.bytes())).position()); }
+                var consumed=complete.consume(); home.advance(complete,consumed);
+                assertEquals(consumed,home.homes.read(fence.fenceId()));
+                assertEquals(1,budget.stats().ordinary().owners()); assertEquals(0,budget.stats().protectedLane().bytes());
+            } finally {other.f.machine.cancelTransaction(ordinary);}
+            assertEquals(0,budget.stats().ordinary().bytes());
+        }
+    }
+
 }

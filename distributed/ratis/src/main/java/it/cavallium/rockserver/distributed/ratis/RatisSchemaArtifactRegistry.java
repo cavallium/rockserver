@@ -19,11 +19,11 @@ final class RatisSchemaArtifactRegistry implements AutoCloseable {
     private final FileChannel lockChannel;
     private final java.nio.channels.FileLock lock;
     private final Map<String,Entry> entries=new java.util.concurrent.ConcurrentHashMap<>();
-    private long diskBytes;
+    private long diskBytes;private final RatisSchemaReplicaAdmission admission;private final UUID poolId;
     private final Map<String,Long> orphans=new HashMap<>();
-    RatisSchemaArtifactRegistry(Path root,RatisSchemaReplicaService.Limits limits) throws IOException { this(root,limits,RatisSchemaArtifactRegistry::diskForce); }
-    RatisSchemaArtifactRegistry(Path root,RatisSchemaReplicaService.Limits limits,Force forcing) throws IOException {
-        this.forcing=forcing; this.root=root.toAbsolutePath().normalize(); this.limits=limits;
+    RatisSchemaArtifactRegistry(Path root,RatisSchemaReplicaService.Limits limits,RatisSchemaReplicaAdmission admission,UUID poolId) throws IOException { this(root,limits,RatisSchemaArtifactRegistry::diskForce,admission,poolId); }
+    RatisSchemaArtifactRegistry(Path root,RatisSchemaReplicaService.Limits limits,Force forcing,RatisSchemaReplicaAdmission admission,UUID poolId) throws IOException {
+        this.admission=Objects.requireNonNull(admission);this.poolId=Objects.requireNonNull(poolId);this.forcing=forcing; this.root=root.toAbsolutePath().normalize(); this.limits=limits;
         Files.createDirectories(this.root);
         if (Files.isSymbolicLink(this.root) || !Files.isDirectory(this.root,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Invalid schema staging directory");
         lockChannel=FileChannel.open(this.root.resolve("lock"),CREATE,WRITE);
@@ -49,13 +49,13 @@ final class RatisSchemaArtifactRegistry implements AutoCloseable {
                         }
                         if (files==0) { Files.delete(directory); force(this.root); count--; continue; }
                         diskBytes+=charge; if (diskBytes>limits.maximumDiskBytes()) throw new IOException("Interrupted schema staging exceeds budget");
-                        orphans.put(name,charge); continue;
+                        admission.disk(poolId,this.root+"/"+name,charge);orphans.put(name,charge); continue;
                     }
                     var begin=RatisSchemaReplicaRpc.request(read(directory.resolve("manifest"),RatisSchemaReplicaRpc.MAX_BYTES));
                     if (begin.kind()!=ScopedTransactionRpc.SCHEMA_ARTIFACT_BEGIN || !directory.getFileName().toString().equals(key(begin))) throw new IOException("Schema staging owner changed");
                     long charge=charge(begin); diskBytes=Math.addExact(diskBytes,charge);
                     if (diskBytes>limits.maximumDiskBytes()) throw new IOException("Schema staging disk budget exceeded");
-                    var entry=new Entry(begin,directory,charge); validateFiles(entry); entries.put(key(begin),entry);
+                    admission.disk(poolId,this.root+"/"+key(begin),charge);var entry=new Entry(begin,directory,charge); validateFiles(entry); entries.put(key(begin),entry);
                 }
             }
             lock=acquired;
@@ -81,7 +81,7 @@ final class RatisSchemaArtifactRegistry implements AutoCloseable {
             if (entries.size()+orphans.size()-(orphans.containsKey(key(request)) ? 1 : 0)>=limits.maximumUploads() || charge>limits.maximumDiskBytes()-diskBytes+(orphans.getOrDefault(key(request),0L))) throw new IOException("Schema staging capacity unavailable");
             long free=Files.getFileStore(root).getUsableSpace();
             if (free<limits.minimumFreeBytes() || charge>free-limits.minimumFreeBytes()) throw new IOException("Schema staging disk headroom unavailable");
-            Path directory=root.resolve(key(request));
+            admission.disk(poolId,root+"/"+key(request),charge);Path directory=root.resolve(key(request));
             if (Files.exists(directory.resolve("released"),LinkOption.NOFOLLOW_LINKS)) throw new IOException("Operator upload staging was released");
             if (orphans.containsKey(key(request))) diskBytes-=orphans.remove(key(request)); else Files.createDirectory(directory);
             force(root);
@@ -134,13 +134,13 @@ final class RatisSchemaArtifactRegistry implements AutoCloseable {
             }
             force(entry.directory()); Files.deleteIfExists(entry.directory().resolve("manifest")); force(entry.directory());
             Files.delete(entry.directory().resolve("released")); force(entry.directory()); Files.delete(entry.directory()); force(root);
-            entries.remove(key(entry.begin())); diskBytes-=entry.charge();
+            entries.remove(key(entry.begin())); diskBytes-=entry.charge();admission.released(poolId,root+"/"+key(entry.begin()));
         }
         String suffix="-"+target.binding().groupId()+"-"+target.replica().replicaId()+"-"+target.replica().nodeIncarnation();
         for (var name:List.copyOf(orphans.keySet())) if (name.endsWith(suffix)) {
             Path directory=root.resolve(name),released=directory.resolve("released");
             if (Files.exists(released,LinkOption.NOFOLLOW_LINKS) && Arrays.equals(read(released,32),identity)) {
-                Files.delete(released); force(directory); Files.delete(directory); force(root); diskBytes-=orphans.remove(name);
+                Files.delete(released); force(directory); Files.delete(directory); force(root); diskBytes-=orphans.remove(name);admission.released(poolId,root+"/"+name);
             }
         }
     }
