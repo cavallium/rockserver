@@ -52,6 +52,21 @@ public class ConfigParser {
 		}
 	}
 
+	/** Immutable bounded CONF input for declared native pool configuration. */
+	public void addSourceBytes(byte[] configuration) {
+		if (configuration == null || configuration.length < 1 || configuration.length > 1024 * 1024) {
+			throw new IllegalArgumentException("Invalid bounded configuration source");
+		}
+		try {
+			java.nio.charset.StandardCharsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+					.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT).decode(java.nio.ByteBuffer.wrap(configuration));
+		} catch (java.nio.charset.CharacterCodingException invalid) {
+			throw new IllegalArgumentException("Configuration source is not UTF-8", invalid);
+		}
+		sourceBuilders.add(InputStreamConfigSourceBuilder.builder()
+				.setConfig(new java.io.ByteArrayInputStream(configuration.clone())).setFormat("conf"));
+	}
+
 	public DatabaseConfig parse() {
 		try {
 			gsb.addSource(InputStreamConfigSourceBuilder
