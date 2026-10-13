@@ -17,6 +17,7 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
         public static Limits defaults() { return new Limits(16,MAX_FILES,1024L*1024*1024); }
     }
     public record Snapshot(int openWorkers,int persistedFiles,long reservedBytes) {}
+    public record RecoveryStatus(boolean scanned,int unresolvedDecisions,int activeWorkers) {}
     private record Key(UUID group,UUID transaction) {
         String filename() { return group+"-"+transaction+".bin"; }
     }
@@ -151,6 +152,12 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
         if (!file.preparedPosition.equals(selected.position()) || !Arrays.equals(file.preparedDigest,selected.preparation().digest())) throw new IOException("Completed recovery native preparation changed");
     }
     public synchronized Snapshot stats() { return new Snapshot(workers.size()+opening,persistedFiles,reservedBytes); }
+    /** Uninspected cold files remain unresolved even when no worker fits the admission budget. */
+    public synchronized RecoveryStatus recoveryStatus() {
+        int unresolved=0;
+        for (var file:files.values()) if (!file.complete) unresolved++;
+        return new RecoveryStatus(discovered,unresolved,workers.size()+opening+(active ? 1 : 0));
+    }
 
     private void scan() throws IOException {
         synchronized (this) { if (discovered) return; }

@@ -21,9 +21,12 @@ class RatisParticipantRecoveryRegistryTest {
         try (var f=fixture("completed")) {
             f.committedTransactionWithRightStillPrepared(); var prepared=f.data.preparedParticipant(f.right.f.groupId,helper.tx); long bytes;
             try (var registry=registry(path,f,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024))) {
+                assertFalse(registry.recoveryStatus().scanned());
                 long before=f.writes(); assertTrue(registry.step(f.right.f.groupId,prepared)); assertEquals(1,f.writes()-before);
+                assertEquals(new RatisParticipantRecoveryRegistry.RecoveryStatus(true,1,1),registry.recoveryStatus());
                 assertEquals(1,registry.stats().openWorkers()); assertEquals(1,registry.stats().persistedFiles());
                 assertEquals(1,registry.cycle(1)); assertEquals(0,registry.stats().openWorkers()); bytes=registry.stats().reservedBytes(); assertTrue(bytes>0 && bytes<RatisDurableParticipantRecovery.MAX_BYTES);
+                assertEquals(new RatisParticipantRecoveryRegistry.RecoveryStatus(true,0,0),registry.recoveryStatus());
                 assertFalse(f.transactions.statuses.read(helper.tx).fullyFinalized());
             }
             try (var registry=registry(path,f,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024))) {

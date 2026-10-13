@@ -128,6 +128,11 @@ public final class RatisNodeService implements AutoCloseable {
             roster.requireUnchanged(complete.roster());
         } finally { synchronized (this) { checks--; } }
     }
+    public RatisNodeReadiness.Report readiness() throws IOException {
+        synchronized (this) { requireOpen();if(checks>=32)throw new IOException("Node service check budget exhausted");checks++; }
+        try { return node.readiness(); }
+        finally { synchronized (this) { checks--; } }
+    }
     private void requireOpen() throws IOException { if (closed || closeRequested || closing) throw new IOException("Node service is closing/closed"); }
     @Override public void close() throws IOException {
         synchronized (this) {

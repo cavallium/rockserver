@@ -1292,6 +1292,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         snapshotPinClock=nanos;capturedSnapshots=newSnapshotPins(nanos);
     }
     long transactionGeneration() { return admissionGeneration.get(); }
+    RatisNodeReadiness.MachineStamp readinessStamp(){
+        synchronized(admissions){return new RatisNodeReadiness.MachineStamp(admissionGeneration.get(),schemaConfigurationStamp,schemaConfigurationPending,storageFailure,schemaActivationObserverFailure!=null?schemaActivationObserverFailure:topologyActivationObserverFailure);}
+    }
+
     long transactionTerm() { var a=store.applied(); return a==null ? -1 : a.term(); }
     UUID transactionOwnerIncarnation() { return transactionIncarnation; }
     void checkTransactionOwner() throws IOException {

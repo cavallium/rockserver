@@ -764,6 +764,30 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     public synchronized State state() { return closed ? State.CLOSED : closeRequested ? State.STOPPING : starting ? State.STARTING : started ? State.RUNNING : State.OPEN; }
     public synchronized boolean started() { return state()==State.RUNNING; }
+    /** Local native/Raft evidence only; this does not establish remote quorum availability. */
+    public RatisNodeReadiness.Report readiness() {
+        var sources=new ArrayList<RatisNodeReadiness.GroupSource>();
+        for (var entry:groups.entries()) {
+            var id=entry.group().getGroupId();var machine=machines.get(id);var store=stores.get(id.getUuid());
+            if (machine==null || store==null) throw new IllegalStateException("Registered readiness owner is missing");
+            var local=entry.group().getPeer(RaftPeerId.valueOf(plan.peerId()));
+            boolean serving=!entry.retired() && local!=null && local.getStartupRole()!=RaftPeerRole.LISTENER;
+            sources.add(new RatisNodeReadiness.GroupSource(entry.group(),entry.descriptor(),entry.directory()==null ? null : entry.directory().domainId(),
+                    entry.directory()==null ? plan.catalogue().schemaDigest() : entry.directory().schemaDigest(),entry.role(),RaftPeerId.valueOf(plan.peerId()),serving,store,machine,
+                    () -> server==null ? null : server.getDivision(id),machine::readinessStamp));
+        }
+        return RatisNodeReadiness.evaluate(plan.nodeId(),plan.nodeIncarnation(),this::readinessStamp,sources);
+    }
+    private synchronized RatisNodeReadiness.NodeStamp readinessStamp() {
+        var registry=participantRecoveries;
+        var recovery=registry==null ? new RatisNodeReadiness.Recovery(groups.dataGroups().isEmpty(),0,0,participantRecoveryFailure())
+                : recoveryStamp(registry.recoveryStatus());
+        Throwable failure=maintenanceFailure();if(failure==null)failure=retirementFailure();if(failure==null)failure=transactionExpiryFailure();
+        return new RatisNodeReadiness.NodeStamp(state(),installing,groups.entries(),recovery,failure);
+    }
+    private RatisNodeReadiness.Recovery recoveryStamp(RatisParticipantRecoveryRegistry.RecoveryStatus status) {
+        return new RatisNodeReadiness.Recovery(status.scanned(),status.unresolvedDecisions(),status.activeWorkers(),participantRecoveryFailure());
+    }
     public RatisSessionClockService.Snapshot maintenanceStatus() { return service==null ? null : service.latest(); }
     public Throwable maintenanceFailure() { return service==null ? null : service.lastFailure(); }
     public Throwable retirementFailure() { if (retirementCoordinator!=null && retirementCoordinator.lastFailure()!=null) return retirementCoordinator.lastFailure(); return retirementService==null ? null : retirementService.lastFailure(); }

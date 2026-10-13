@@ -71,7 +71,13 @@ class RatisNodeServiceTest {
             publish(env,schema); var fake=new RatisNodeRuntimeTest.FakeServer(); var manifest=manifest(env,schema);
             try (var service=RatisNodeService.recover(manifest,env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
                 assertEquals(RatisNodeRuntime.State.OPEN,service.state()); assertThrows(IOException.class,service::verifyCatalogue);
+                var unopened=service.readiness();assertFalse(unopened.ready());
+                assertEquals(env.plan.localGroups().size(),unopened.groups().size());
+                assertTrue(unopened.issues().stream().anyMatch(issue -> issue.reason()==RatisNodeReadiness.Reason.NODE_NOT_RUNNING));
                 service.start(); assertEquals(RatisNodeRuntime.State.RUNNING,service.state());
+                var operational=service.readiness();assertEquals(RatisNodeRuntime.State.RUNNING,operational.state());
+                assertEquals(env.plan.localGroups().size(),operational.groups().size());
+                assertFalse(operational.ready(),"A started fixture without current-term Raft/native continuity cannot certify readiness");
                 assertThrows(IOException.class,service::start); assertEquals(RatisNodeRuntime.State.RUNNING,service.state()); service.verifyCatalogue();
                 env.catalogue.missingSchema=true; assertThrows(IOException.class,service::verifyCatalogue);
                 assertEquals(RatisNodeRuntime.State.RUNNING,service.state(),"Local running state does not cache catalogue readiness");
