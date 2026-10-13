@@ -7,6 +7,7 @@ use tonic::service::{interceptor::InterceptedService, Interceptor};
 use tonic::{transport::Channel, Request, Status};
 
 pub const MAX_COLUMNS: usize = 256;
+pub const MAX_SNAPSHOT_TTL_MILLIS: u128 = 24 * 60 * 60 * 1000;
 pub const MAX_CHUNKS: i32 = 65536;
 pub const MAX_BOUND_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MANIFEST_ITEMS: i32 = 128;
@@ -56,7 +57,7 @@ impl Limits {
             || self.maximum_disk_bytes < self.maximum_file_bytes
             || nanos == 0
             || nanos > i64::MAX as u128
-            || !(1..=60000).contains(&millis)
+            || !(1..=MAX_SNAPSHOT_TTL_MILLIS).contains(&millis)
             || self.snapshot_ttl.as_nanos() != millis * 1_000_000
         {
             return Err(invalid("invalid export limits"));
@@ -825,6 +826,11 @@ mod tests {
     #[test]
     fn limits_require_bounded_journal_and_exact_millisecond_ttl() {
         assert!(Limits::default().encode().is_ok());
+        let mut maximum = Limits::default();
+        maximum.snapshot_ttl = Duration::from_millis(MAX_SNAPSHOT_TTL_MILLIS as u64);
+        assert!(maximum.encode().is_ok());
+        maximum.snapshot_ttl += Duration::from_millis(1);
+        assert!(maximum.encode().is_err());
         let mut l = Limits::default();
         l.snapshot_ttl = Duration::from_nanos(1_000_001);
         assert!(l.encode().is_err());

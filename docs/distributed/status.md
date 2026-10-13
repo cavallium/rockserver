@@ -132,6 +132,11 @@ This section and the remaining gates at the end describe the current branch.
   before ACK, discarded replies, exact connection-journal reopening and public
   RELEASE pin drain. Native source stores stayed live during journal reopening;
   no network listener, quorum or external-consumer adoption is established.
+  Public Java/Rust export retention now accepts the same finite 24-hour maximum
+  as READ_ONLY capture; the default remains 60 seconds. Configured native pin age,
+  source disk/chunk quotas and the original lifetime still apply. Twenty-three
+  core transport/model cases and ten Rust export cases pass this request-bound
+  alignment; no long-duration native retention acceptance is claimed.
 - Logical export migration passed an actual collision-bucket workflow under an
   explicitly immutable source schema. Common destination transactions validate the
   epoch/owner fence, write both logical members and the full chunk checkpoint

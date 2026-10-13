@@ -15,7 +15,7 @@ public record RatisSnapshotCaptureRequest(SnapshotFence fence,UUID owner,UUID sn
         }
     }
     public static final int HEADER_BYTES=45, MAX_BYTES=HEADER_BYTES+SnapshotFence.MAX_BYTES;
-    public static Duration maximumTtl(Mode mode) {return Objects.requireNonNull(mode)==Mode.READ_ONLY ? Duration.ofHours(24) : Duration.ofSeconds(60);}
+    public static Duration maximumTtl(Mode mode) {return Objects.requireNonNull(mode)==Mode.READ_ONLY ? it.cavallium.rockserver.core.common.export.ExportJobs.MAX_SNAPSHOT_TTL : Duration.ofSeconds(60);}
     /** Validate before converting; both current wire milliseconds and monotonic nanoseconds remain bounded. */
     public static void requireTtl(Duration ttl,Mode mode) {
         Objects.requireNonNull(ttl);var maximum=maximumTtl(mode);

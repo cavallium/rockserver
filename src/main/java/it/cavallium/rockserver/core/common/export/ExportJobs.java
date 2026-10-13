@@ -11,6 +11,7 @@ import java.util.UUID;
 /** Bounded, host-independent export requests and results. */
 public final class ExportJobs {
     public static final int MAX_COLUMNS = 256;
+    public static final Duration MAX_SNAPSHOT_TTL = Duration.ofHours(24);
     public static final int MAX_CHUNKS = 65536;
     public static final int MAX_BOUND_BYTES = 2 * 1024 * 1024;
     public static final int MAX_MANIFEST_ITEMS = 128;
@@ -42,12 +43,12 @@ public final class ExportJobs {
                     || maximumDiskBytes < maximumFileBytes
                     || maximumChunkDuration.isZero() || maximumChunkDuration.isNegative()
                     || snapshotTtl.isZero() || snapshotTtl.isNegative()
-                    || snapshotTtl.compareTo(Duration.ofSeconds(60)) > 0) {
+                    || snapshotTtl.compareTo(MAX_SNAPSHOT_TTL) > 0) {
                 throw new IllegalArgumentException("Invalid export limits");
             }
             long ttlMillis = snapshotTtl.toMillis();
             if (ttlMillis < 1 || !snapshotTtl.equals(Duration.ofMillis(ttlMillis))) {
-                throw new IllegalArgumentException("Snapshot TTL must be 1..60000 whole milliseconds");
+                throw new IllegalArgumentException("Snapshot TTL must be positive whole milliseconds within 24 hours");
             }
             maximumChunkDuration.toNanos();
         }

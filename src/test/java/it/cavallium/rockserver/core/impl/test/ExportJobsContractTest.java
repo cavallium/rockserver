@@ -59,11 +59,12 @@ class ExportJobsContractTest {
         assertThrows(IllegalArgumentException.class, () -> limits(1, 8L * 1024 * 1024, defaults.maximumDiskBytes(), Duration.ofSeconds(60)));
         assertThrows(IllegalArgumentException.class, () -> limits(1, 65L * 1024 * 1024, defaults.maximumDiskBytes(), Duration.ofSeconds(60)));
         assertThrows(IllegalArgumentException.class, () -> limits(1, defaults.maximumJournalBytes(), 1, Duration.ofSeconds(60)));
-        assertThrows(IllegalArgumentException.class, () -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), Duration.ofSeconds(61)));
+        assertThrows(IllegalArgumentException.class, () -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), ExportJobs.MAX_SNAPSHOT_TTL.plusMillis(1)));
         assertThrows(IllegalArgumentException.class, () -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), Duration.ofNanos(500)));
         assertThrows(IllegalArgumentException.class, () -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), Duration.ofNanos(1_000_001)));
         assertDoesNotThrow(() -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), Duration.ofMillis(1)));
-        assertDoesNotThrow(() -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), Duration.ofMillis(60_000)));
+        assertDoesNotThrow(() -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), ExportJobs.MAX_SNAPSHOT_TTL));
+        assertDoesNotThrow(() -> limits(1, defaults.maximumJournalBytes(), defaults.maximumDiskBytes(), Duration.ofHours(1)));
         assertThrows(IllegalArgumentException.class, () -> new ExportJobs.ManifestRequest(job, -1, 1, 65536));
         assertThrows(IllegalArgumentException.class, () -> new ExportJobs.ManifestRequest(job, 0, 129, 65536));
         assertThrows(IllegalArgumentException.class, () -> new ExportJobs.ManifestRequest(job, 0, 1, 65535));
