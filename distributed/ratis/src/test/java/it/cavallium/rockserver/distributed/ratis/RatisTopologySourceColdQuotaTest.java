@@ -173,7 +173,7 @@ class RatisTopologySourceColdQuotaTest {
                 assertThrows(java.util.concurrent.ExecutionException.class,()->owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));assertEquals(0,owner.store.activeSnapshotPins());assertEquals(managed,files(owner.machine.sourceSnapshotDirectory()));assertTrue(f.imageFiles().isEmpty());
                 assertTrue(Files.isRegularFile(intent.get()));charge=owner.artifacts.reservedImageBytes();assertTrue(charge>0);owner.machine.notifyTermIndexUpdated(1,originalCut.index()+1);
             }
-            try(var owner=f.open(true)) {
+            try(var owner=f.open(true);var unrelated=owner.store.captureForRecovery()) {
                 assertTrue(owner.store.applied().index()>originalCut.index());assertEquals(charge,owner.artifacts.reservedImageBytes());var managed=files(owner.machine.sourceSnapshotDirectory());
                 abandonedReply=owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request);
                 var abandoned=assertThrows(RatisTopologySourceSnapshotRpc.AbandonedException.class,()->RatisTopologySourceSnapshotRpc.reply(abandonedReply,RatisTopologySourceSnapshotRpc.PREPARE,f.request)).receipt();
@@ -181,12 +181,12 @@ class RatisTopologySourceColdQuotaTest {
                 assertEquals(f.parent.replicas().stream().filter(replica->replica.nodeId().equals(f.env.plan.nodeId()) && replica.nodeIncarnation().equals(f.env.plan.nodeIncarnation())).findFirst().orElseThrow(),abandoned.sourceOwner());
                 assertArrayEquals(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,f.request),RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,abandoned.original()));
                 successor=abandoned.successorRequest();assertNotEquals(f.request.transferId(),successor.transferId());
-                assertEquals(managed,files(owner.machine.sourceSnapshotDirectory()));assertEquals(0,owner.store.activeSnapshotPins());assertTrue(f.imageFiles().isEmpty());
+                assertEquals(managed,files(owner.machine.sourceSnapshotDirectory()));assertEquals(1,owner.store.activeSnapshotPins(),"Unrelated native pin remains held through A abandonment");assertTrue(f.imageFiles().isEmpty());
                 assertFalse(Files.exists(intent.get()),"Original capture intent is reclaimed only after forced abandonment cleanup");assertEquals(0,owner.artifacts.reservedImageBytes());
                 assertArrayEquals(abandonedReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request),"A repeats its terminal receipt, never a later READY image");
                 successorReply=owner.action(RatisTopologySourceSnapshotRpc.PREPARE,successor);
                 var ready=RatisTopologySourceSnapshotRpc.reply(successorReply,RatisTopologySourceSnapshotRpc.PREPARE,successor);
-                assertEquals(successor.transferId(),ready.request().transferId());assertTrue(ready.image().position().index()>originalCut.index());assertEquals(2,f.imageFiles().size());assertEquals(1,owner.store.activeSnapshotPins());assertTrue(owner.artifacts.reservedImageBytes()>0);
+                assertEquals(successor.transferId(),ready.request().transferId());assertTrue(ready.image().position().index()>originalCut.index());assertEquals(2,f.imageFiles().size());assertEquals(2,owner.store.activeSnapshotPins(),"B owns its pin independently of the unrelated reader");assertTrue(owner.artifacts.reservedImageBytes()>0);
                 assertArrayEquals(abandonedReply,owner.action(RatisTopologySourceSnapshotRpc.PREPARE,f.request));assertEquals(2,f.imageFiles().size());
                 assertTrue(f.imageFiles().stream().noneMatch(path->path.toString().contains(f.request.transferId().toString())),"Neither old A image may be substituted by B");
             }

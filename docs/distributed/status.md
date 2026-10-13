@@ -51,8 +51,9 @@ This section and the remaining gates at the end describe the current branch.
   node/pool byte and owner limits. Proposal input and scoped-handle leases pass
   controlled accounting checks; manifest validation and HOME lifecycle fixtures
   pass together. Native staging and participant preparation now retain shared
-  charges through actual drain, including cancellation. Other custom-record holds
-  and retained buffers still need charges; the full volatile envelope remains open.
+  charges through actual drain, including cancellation. Custom proof/preparation
+  holds and append inputs now keep shared leases through actual native cleanup;
+  this bounds those project-owned buffers, not every opaque native allocation.
 - HOME USER status rows now reserve their complete terminal growth within 1,024
   rows and 16 MiB, independently of protected recovery credits. Consumed rows stay
   charged until retirement. Native checks passed racing registration rejection as
@@ -83,7 +84,11 @@ This section and the remaining gates at the end describe the current branch.
   file. Actual native controller/source recovery passes A-to-B registration, transfer,
   release and journal retry; native registration, recovery permission and the journal
   retain the chosen request. Terminal replay remains available at full image quota
-  under bounded metadata ownership. Schema disk accounting covers upload staging.
+  under bounded metadata ownership. Pending publication recovery, prospective
+  identity credits and per-attempt pin drainage pass 72 source/runtime cases across
+  the repair gate and the corrected five-case publication selection. The boundary
+  fixture leaves room for two captures, isolating the identity ceiling.
+  Schema disk accounting covers upload staging.
   Four actual two-pool cases now pass cold retained quotas, canceled work ownership,
   unknown cleanup and independent pool limits. The immutable native operator cache
   has a separate persisted node ceiling: every declared pool reserves its bounded
@@ -100,7 +105,10 @@ This section and the remaining gates at the end describe the current branch.
   one charge per physical coalesced task until actual drain. Twelve executor cases
   pass. Ordinary point/page construction reserves before decoding; exact configured
   HOME status reads use the protected lane for completion. Nine graph cases pass.
-  Retained custom PREPARE holds and custom append buffers still need separate leases.
+  Retained custom PREPARE holds and custom append buffers now have separate leases.
+  Six native cases include canceled lookups, unknown append, strict term exclusion
+  and exact saved INSTALL replay while older native cleanup is blocked. The combined
+  publication/proof gate passes 123 Ratis cases plus 13 unique core learner cases.
 - Snapshot/CDC gap resynchronization passed a two-range native workflow using the
   original snapshot capture vector, atomic destination effects/checkpoints, lost
   replies and MERGE deduplication. A retention gap invalidates incomplete staging.
@@ -1134,16 +1142,15 @@ Relocation currently admits preparation/abort while its source stays writable.
 
 ## Remaining architecture gates
 
-- Complete restore quota/unknown-force acceptance, plus public backend
-  capture/transaction/export workflows.
-- Complete the two-pool dynamic/import/schema/backup matrix and cold artifact
-  quotas. Reserve configured durable replica ceilings before opening/voting and
-  reconstruct retained claims on recovery. Finish shared accounting for remaining
-  custom proof/retained-buffer paths.
-- Complete and validate replica-local maintenance integration without presenting
-  physical SST identities as cluster-wide files.
-- Compose snapshot plus CDC tail gap recovery and export-based consumer migration;
-  establish adoption by the intended external consumers.
+- Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold
+  artifact quotas against the architecture. Controlled restore quota/unknown-force,
+  durable ownership claims and custom proof accounting checks are recorded above;
+  they do not prove the full resource envelope.
+- Complete general public schema witnessing for logical export migration and
+  establish adoption by the intended external consumers. Controlled snapshot/CDC
+  resynchronization and schema-bound export migration are recorded above.
+- Qualify opaque native allocation bounds for maintenance inventory and other
+  retained native work where Java accounting alone is insufficient.
 - Verify all documented topology, schema, import, retirement and repair workflows
   together under the final source/configuration, then reconcile contracts and status.
 - Independent quorum/restart/fault and representative performance/resource gates
