@@ -113,7 +113,7 @@ class RatisRetentionAdmissionTest {
         final RaftGroup group=RaftGroup.valueOf(RaftGroupId.valueOf(groupId),peer);
         final AtomicReference<RatisRangeStateMachine.Leadership> leadership=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         final DistributedStoragePool pool; final RaftStorage storage; final ReplicatedRangeStore store; final RatisRangeStateMachine machine;
-        final RatisProofQueryService proofQueries=new RatisProofQueryService();
+        final RatisProofQueryService proofQueries=new RatisProofQueryService(RatisProofFixtures.admission());
         Fixture(Path root,RatisRangeStateMachine.RetentionLimits limits) throws Exception {
             this(root,limits,command -> {});
         }

@@ -38,7 +38,7 @@ class RatisDatabaseRestoreControllerTest {
                 if(node!=null){assertArrayEquals(frozen.encode(),restored.encode());return new RatisDatabaseRestoreController.Execution(plan,client,routes,this);} frozen=restored;var owner=restored.catalogue().replicas().getFirst();
                 var base=resources.settings();int columns=Math.max(2,restored.domains().stream().mapToInt(d->d.schema().columnIds().size()).max().orElse(0));var limits=new NativeRangeImage.Limits(base.images().maxRowBytes(),base.images().maxImageBytes(),columns);
                 UUID poolId=UUID.nameUUIDFromBytes((restored.archiveId()+":"+owner.nodeIncarnation()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                var pool=new RatisNativePoolSpec(poolId,("database="+ConfigPrinter.stringify(ConfigParser.parseDefault())).getBytes(java.nio.charset.StandardCharsets.UTF_8),RatisNodePlan.MAX_DATA_GROUPS+1,limits,base.retention(),base.exports().pins(),RatisSchemaReplicaService.Limits.defaults(),base.resources().pool());
+                var pool=new RatisNativePoolSpec(poolId,("database="+ConfigPrinter.stringify(ConfigParser.parseDefault())).getBytes(java.nio.charset.StandardCharsets.UTF_8),RatisNodePlan.MAX_DATA_GROUPS+1,limits,base.retention(),base.exports().pins(),RatisSchemaReplicaService.Limits.defaults(),base.resources().pool(),256L<<30);
                 var placements=new HashMap<UUID,UUID>();for(var domain:restored.domains())placements.put(domain.schema().domainId(),poolId);
                 plan=restored.nodePlan(owner,Map.of(),List.of(pool),placements,Map.of(restored.catalogue().groupId(),poolId));
                 var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{

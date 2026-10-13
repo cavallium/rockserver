@@ -44,8 +44,8 @@ class RatisTopologyCdcPollTest {
         final AtomicReference<RatisRangeStateMachine.Leadership> leader=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         final AtomicReference<SessionEpochLedger> ledger;
         final DistributedStoragePool pool; final ReplicatedRangeStore store; final RaftStorage storage; final RatisRangeStateMachine machine;
-        final RatisProofQueryService queries=new RatisProofQueryService();
-        final RatisProofQueryService sourceQueries=RatisProofQueryService.sourceOutcomeLane();
+        final RatisProofQueryService queries=new RatisProofQueryService(RatisProofFixtures.admission());
+        final RatisProofQueryService sourceQueries=RatisProofQueryService.sourceOutcomeLane(RatisProofFixtures.admission());
         NativeTopologyFreeze freeze; NativeTopologySeed seed; ReplicatedRangeStore child;
         long index;
         Fixture(Path path) throws Exception { this(path,id(1),id(2),id(3)); }

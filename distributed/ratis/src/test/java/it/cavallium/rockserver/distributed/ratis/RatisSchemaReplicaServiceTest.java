@@ -60,7 +60,7 @@ class RatisSchemaReplicaServiceTest {
         final DistributedStoragePool pool;
         final ReplicatedRangeStore store;
         final RWScheduler scheduler=new RWScheduler(3,3,"schema-replica-test");
-        final RatisProofQueryService queries=new RatisProofQueryService();
+        final RatisProofQueryService queries=new RatisProofQueryService(RatisProofFixtures.admission());
         final RaftStorage storage;
         final RaftGroup raftGroup;
         final RaftServer server;

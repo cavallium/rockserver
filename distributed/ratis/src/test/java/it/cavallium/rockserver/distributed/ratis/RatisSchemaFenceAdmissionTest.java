@@ -38,7 +38,7 @@ class RatisSchemaFenceAdmissionTest {
         final AtomicReference<RatisRangeStateMachine.Leadership> leader=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         final AtomicReference<SchemaChange.Status> status=new AtomicReference<>(SchemaChange.Status.begin(definition.header()).beginFencing(new byte[32]));
         final DistributedStoragePool pool; final RaftStorage storage; final ReplicatedRangeStore store; final RatisRangeStateMachine machine;
-        final RatisProofQueryService queries=new RatisProofQueryService();
+        final RatisProofQueryService queries=new RatisProofQueryService(RatisProofFixtures.admission());
         volatile Runnable beforeRead=() -> {};
         volatile RangeDirectory authorityDirectory=directory;
         Fixture(Path root) throws Exception { this(root,false); }

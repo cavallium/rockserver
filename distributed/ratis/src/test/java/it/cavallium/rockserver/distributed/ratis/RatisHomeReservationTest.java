@@ -33,7 +33,7 @@ class RatisHomeReservationTest {
         final RaftPeer peer=RaftPeer.newBuilder().setId("home").setAddress("127.0.0.1:9997").build();
         final RaftGroup group=RaftGroup.valueOf(RaftGroupId.valueOf(groupId),peer);
         final DistributedStoragePool pool;final ReplicatedRangeStore store;final RaftStorage storage;final RatisRangeStateMachine machine;
-        final RatisProofQueryService queries=RatisProofQueryService.operationRerouteLane();final AtomicReference<RatisRangeStateMachine.Leadership> leader=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
+        final RatisProofQueryService queries=RatisProofQueryService.operationRerouteLane(RatisProofFixtures.admission());final AtomicReference<RatisRangeStateMachine.Leadership> leader=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         final AtomicInteger sourceReads=new AtomicInteger();volatile Runnable beforeSource=()->{};
         final ReplicatedRangeStore nativeCatalogue;final UUID catalogueColumn=id(21);
         final DistributedCommand original;

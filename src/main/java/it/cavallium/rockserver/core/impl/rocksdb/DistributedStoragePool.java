@@ -857,6 +857,19 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
 
     /** Configure once, before opening any range. Every native snapshot in this pool shares the guard. */
+    /** Permanent metadata owners, independent of currently exposed Raft groups. */
+    public static final int MAX_RETAINED_METADATA_OWNERS=MAX_OWNERSHIP_HISTORY;
+    public record RetainedMetadataOwner(RangeOwnership.Owner owner,RangeOwnership.Interval interval,boolean retired,boolean pending) {}
+    public List<RetainedMetadataOwner> retainedMetadataOwners() throws RocksDBException {
+        nativeMutation.acquireUninterruptibly();handleLifetime.readLock().lock();try{
+            synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}
+            var result=new ArrayList<RetainedMetadataOwner>();var db=loaded.db().get();var state=handles.get(STATE_COLUMN);
+            for(var record:ownershipHistory){var group=record.owner().groupId();boolean retired=topologyRetirements.containsKey(group);boolean pending=topologyBirths.containsKey(group)&&db.get(state,groupSchemaKey(group,0x63))==null || topologyLearners.containsKey(group)&&db.get(state,groupSchemaKey(group,0x68))==null;
+                byte[] key=groupSchemaKey(group,0x40);int size=db.get(state,key,new byte[0]);if(size!=org.rocksdb.RocksDB.NOT_FOUND){if(size>NativeSstImportManifest.MAX_BYTES)throw new IllegalStateException("Import metadata inventory exceeds bound");var manifest=NativeSstImportManifest.decode(db.get(state,key));if(!manifest.groupId().equals(group) || ownershipHistory.stream().noneMatch(original->original.owner().groupId().equals(group) && manifest.rangeEpoch()==original.owner().epoch() && manifest.domainId().equals(original.interval().domainId()) && original.interval().columns().containsAll(manifest.physicalNames().keySet()) && Arrays.equals(manifest.lowerInclusive(),original.interval().lowerInclusive()) && Arrays.equals(manifest.upperExclusive(),original.interval().upperExclusive())))throw new IllegalStateException("Import metadata inventory changed ownership");pending|=db.get(state,groupSchemaKey(group,0x43))==null;}
+                result.add(new RetainedMetadataOwner(record.owner(),record.interval(),retired,pending));
+            }return List.copyOf(result);
+        }finally{handleLifetime.readLock().unlock();nativeMutation.release();}
+    }
     /** Bounded durable group inventory, including virgin births and retained inactive metadata. */
     public Set<UUID> persistedRangeGroups(int maximum) throws RocksDBException {
         if(maximum<1 || maximum>65536)throw new IllegalArgumentException("Invalid native group inventory ceiling");nativeMutation.acquireUninterruptibly();handleLifetime.readLock().lock();try{synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}var groups=new HashSet<UUID>();for(var entry:ownershipHistory){groups.add(entry.owner().groupId());if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");}try(var iterator=loaded.db().get().newIterator(handles.get(STATE_COLUMN))){iterator.seekToFirst();while(iterator.isValid()){var key=iterator.key();if(key.length<16 || Arrays.equals(key,OWNERSHIP_HISTORY_KEY) || Arrays.equals(key,BIRTHS_KEY) || Arrays.equals(key,TOPOLOGY_SEEDS_KEY) || Arrays.equals(key,CAPACITY_KEY)){iterator.next();continue;}var input=java.nio.ByteBuffer.wrap(key);groups.add(new UUID(input.getLong(),input.getLong()));if(groups.size()>maximum)throw new IllegalStateException("Native group inventory exceeds declared ceiling");var next=Arrays.copyOf(key,16);int index=15;while(index>=0 && (next[index]&255)==255){next[index]=0;index--;}if(index<0)break;next[index]++;iterator.seek(next);}iterator.status();}return Set.copyOf(groups);}finally{handleLifetime.readLock().unlock();nativeMutation.release();}

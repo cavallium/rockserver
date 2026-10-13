@@ -15,7 +15,7 @@ import java.util.*;
 public final class RatisNodeManifest {
     /** Includes the file checksum; encoded bodies leave room for its 32 bytes. */
     public static final int MAX_BYTES=RatisNodePlan.MAX_METADATA_BYTES;
-    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=256;
+    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=272;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
@@ -117,7 +117,7 @@ public final class RatisNodeManifest {
         for(var limits:List.of(settings.resources().node(),settings.resources().pool())) {
             for(var lane:List.of(limits.ordinary(),limits.protectedLane()))output.putLong(lane.bytes()).putInt(lane.owners());
         }
-        output.putLong(settings.resources().maximumSourceImageDiskBytes());return output.array();
+        output.putLong(settings.resources().maximumSourceImageDiskBytes()).putLong(settings.resources().maximumDurableMetadataBytes()).putLong(settings.resources().maximumOperatorCacheBytes());return output.array();
     }
     public static RatisNodeManifest decode(byte[] bytes) {
         Objects.requireNonNull(bytes);
@@ -184,8 +184,8 @@ public final class RatisNodeManifest {
         var replicaLimits=new RatisSchemaReplicaService.Limits(input.getInt(),input.getLong(),input.getLong(),input.getInt(),input.getInt(),input.getLong());
         var nodeLimits=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()),new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()));
         var poolLimits=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()),new RatisNodeResourceBudget.Lane(input.getLong(),input.getInt()));
-        long sourceImageDisk=input.getLong();if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
-        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io),new RatisNodeRuntime.ResourceLimits(nodeLimits,poolLimits,sourceImageDisk));
+        long sourceImageDisk=input.getLong(),durableMetadata=input.getLong(),operatorCache=input.getLong();if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
+        var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io),new RatisNodeRuntime.ResourceLimits(nodeLimits,poolLimits,sourceImageDisk,durableMetadata,operatorCache));
         var recovered=catalogue(catalogue,directories.getFirst(),directoryColumn,sessionsColumn); var domains=new ArrayList<RatisNodePlan.Domain>();
         for(int i=0;i<directories.size();i++) { var directory=directories.get(i); var bindings=new HashMap<UUID,String>(); for(var column:directory.columns()) { var name=columns.get(column); if(name==null) throw new IllegalArgumentException("Manifest DATA physical binding missing"); bindings.put(column,name); } domains.add(new RatisNodePlan.Domain(directory,bindings,mergeColumns(schemas.get(i)))); }
         var plan=new RatisNodePlan(node,incarnation,domains,recovered,homes,imports,streamAddresses,groups,pools,domainPools,groupPools);

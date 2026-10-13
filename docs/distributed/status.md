@@ -54,7 +54,8 @@ This section and the remaining gates at the end describe the current branch.
   charged until retirement. Native checks passed racing registration rejection as
   a saved no-effects conflict, protected completion at full capacity, cold/image
   reconstruction and exact retry after an unknown native write. This bounds HOME
-  status metadata; other catalogue and per-role durable ceilings remain open.
+  status metadata; complete role claims are described below, with filesystem space
+  remaining a separate bound.
 - Session epoch advancement now physically deletes obsolete receipt and ACK
   namespaces through the current epoch-first keys. Native reproduction confirmed
   the former leak; the repaired session/source/image/reclamation workflows passed.
@@ -65,7 +66,27 @@ This section and the remaining gates at the end describe the current branch.
   group/domain placement. Two actual native databases passed writes, service cold
   reopening and shared pin admission. Node/pool graph ceilings, schema upload/work
   quotas and cohort action/retention leases passed their focused fixtures. Source
-  image disk capacity is conservatively partitioned across declared pools.
+  image disk capacity is conservatively partitioned across declared pools. Cold
+  source-artifact review found that the durable disk check currently follows native
+  image capture; pre-capture reservations and original-cut recovery are being
+  repaired and are not yet accepted. Schema disk accounting covers upload staging.
+  Four actual two-pool cases now pass cold retained quotas, canceled work ownership,
+  unknown cleanup and independent pool limits. The immutable native operator cache
+  has a separate persisted node ceiling: every declared pool reserves its bounded
+  152 MiB envelope before native open. Six core cache cases and a native Runtime
+  envelope case pass bounded cold inventory, pending cleanup and early rejection.
+- Forced node/pool canonical metadata ceilings now reserve complete role claims
+  before native ownership and voting. Five fixtures pass aggregate rejection before
+  native open, exact unknown-force retry, retained policy identity, historical owner
+  accounting across close and partial unpublished sidecar recovery. A native import,
+  activation, CREATE and cold-reopen case preserves both columns and the original
+  import receipt. These ceilings cover canonical metadata/promises,
+  not SST/WAL amplification or filesystem capacity.
+- Proof tasks now charge the shared protected node/pool graph before cloning, with
+  one charge per physical coalesced task until actual drain. Twelve executor cases
+  pass. Ordinary point/page construction reserves before decoding; exact configured
+  HOME status reads use the protected lane for completion. Nine graph cases pass.
+  Retained custom PREPARE holds and custom append buffers still need separate leases.
 - Snapshot/CDC gap resynchronization passed a two-range native workflow using the
   original snapshot capture vector, atomic destination effects/checkpoints, lost
   replies and MERGE deduplication. A retention gap invalidates incomplete staging.

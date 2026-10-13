@@ -31,9 +31,9 @@ class RatisImportPublicationAdmissionTest {
         final RaftPeer peer=RaftPeer.newBuilder().setId("catalogue-fixture").build();
         final RaftGroup group;
         final DistributedCommand publication;
-        final RatisProofQueryService queries=RatisProofQueryService.importPublicationLane();
+        final RatisProofQueryService queries=RatisProofQueryService.importPublicationLane(RatisProofFixtures.admission());
         final AtomicLong term=new AtomicLong(1);
-        final RatisProofQueryService authority=RatisProofQueryService.authorityLane();
+        final RatisProofQueryService authority=RatisProofQueryService.authorityLane(RatisProofFixtures.admission());
         Fixture(RatisRangeStateMachine.ImportPublicationAdmission admission) throws Exception {
             this(admission,machine->{});
         }

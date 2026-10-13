@@ -60,7 +60,7 @@ class RatisRangeImportApplyTest {
                 .setCallId(1).setType(org.apache.ratis.protocol.RaftClientRequest.writeRequestType()).setMessage(message(record.encode())).build());
     }
     @Test void freshProposalsRequirePreparedCutAndCancellationRetainsActualCatalogueRead() throws Exception {
-        var input=input("proposal",false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var queries=new RatisProofQueryService();
+        var input=input("proposal",false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var queries=new RatisProofQueryService(RatisProofFixtures.admission());
         var reads=new java.util.concurrent.atomic.AtomicInteger(); var block=new java.util.concurrent.atomic.AtomicBoolean(true);
         var leader=new java.util.concurrent.atomic.AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         var completedFile=new java.util.concurrent.atomic.AtomicReference<RatisReferencedFile>();
@@ -178,7 +178,7 @@ class RatisRangeImportApplyTest {
         }
     }
     @Test void committedImportUsesOrderedAsyncLaneAndKeepsPinsAfterObserverCancellation() throws Exception {
-        var input=input("raft-apply",false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var queries=new RatisProofQueryService();
+        var input=input("raft-apply",false); var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var queries=new RatisProofQueryService(RatisProofFixtures.admission());
         var fileEntered=new CountDownLatch(1); var fileRelease=new CountDownLatch(1);
         try(var io=Executors.newSingleThreadExecutor();var pool=pool(root.resolve("raft-native"));var files=new RatisReferencedFiles(root.resolve("raft-files"),group,RatisReferencedFiles.Limits.defaults(),io);
             var storage=org.apache.ratis.server.storage.RaftStorage.newBuilder().setDirectory(root.resolve("raft-log").toFile())

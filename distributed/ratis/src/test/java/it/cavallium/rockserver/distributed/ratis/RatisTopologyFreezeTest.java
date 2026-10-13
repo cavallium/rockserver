@@ -47,7 +47,7 @@ class RatisTopologyFreezeTest {
         final ReplicatedRangeStore store;
         final RaftStorage storage;
         final RatisRangeStateMachine machine;
-        final RatisProofQueryService queries=new RatisProofQueryService();
+        final RatisProofQueryService queries=new RatisProofQueryService(RatisProofFixtures.admission());
         volatile Runnable beforeRead=()->{};
         volatile Runnable afterProof=()->{};
         volatile Runnable beforeProof=()->{};

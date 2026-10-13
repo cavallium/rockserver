@@ -35,7 +35,7 @@ class RatisTopologyExecutionAdmissionTest {
         final RaftGroup group;
         final AtomicLong term=new AtomicLong(1);
         final AtomicInteger reads=new AtomicInteger();
-        final RatisProofQueryService queries=RatisProofQueryService.importPublicationLane();
+        final RatisProofQueryService queries=RatisProofQueryService.importPublicationLane(RatisProofFixtures.admission());
         volatile Runnable beforeRead=()->{};
         volatile boolean unavailable;
         Fixture(boolean admission)throws Exception {

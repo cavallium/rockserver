@@ -25,7 +25,7 @@ class RatisOperationRerouteCoordinatorTest {
     final class Fixture implements AutoCloseable {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest();final RatisSessionEpochsTest.Fixture catalogue;
         final RatisTopologyCdcPollTest.Fixture source;final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"reroute-complete");
-        final RatisProofQueryService proofs=new RatisProofQueryService(),reroutes=RatisProofQueryService.operationRerouteLane(),publications=RatisProofQueryService.sourceOutcomeLane();
+        final RatisProofQueryService proofs=new RatisProofQueryService(RatisProofFixtures.admission()),reroutes=RatisProofQueryService.operationRerouteLane(RatisProofFixtures.admission()),publications=RatisProofQueryService.sourceOutcomeLane(RatisProofFixtures.admission());
         final UUID homeGroup=new UUID(0,500),homeColumn=new UUID(0,501);final Map<UUID,ReplicatedRangeStore> stores=new HashMap<>();final Map<UUID,RatisRangeStateMachine> machines=new HashMap<>();final List<RaftStorage> storage=new ArrayList<>();
         final RatisDurableLogicalSession logical;final Path logicalRoot=root.resolve("logical");final RatisRoutedClient data,homeClient;final RatisTransactionStatuses homes;final RatisOperationRerouteCoordinator coordinator;final RatisDurableSessionClient window;
         int opens;boolean losePromotion,losePublication,loseAck,loseConsume;volatile boolean promotionUncertain,ackUncertain,consumeUncertain;final List<HomeRecovery> consumes=new ArrayList<>();final List<DistributedCommand> ackCommands=new ArrayList<>();final Path windowPath=root.resolve("window.bin");

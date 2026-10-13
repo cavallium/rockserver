@@ -25,7 +25,7 @@ class RatisTopologyAuthorityTest {
         final TopologyChange.Definition definition;
         final RaftStorage storage;
         final RatisRangeStateMachine machine;
-        final RatisProofQueryService authority=RatisProofQueryService.authorityLane();
+        final RatisProofQueryService authority=RatisProofQueryService.authorityLane(RatisProofFixtures.admission());
         final AtomicLong term=new AtomicLong(1);
         final AtomicLong writes=new AtomicLong(30);
         volatile Runnable beforeAuthority=()->{};

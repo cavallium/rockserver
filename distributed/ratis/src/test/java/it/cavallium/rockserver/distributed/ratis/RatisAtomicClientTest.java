@@ -49,8 +49,8 @@ class RatisAtomicClientTest {
         final RatisTransactionStatuses homes;
         final RatisSnapshotFences snapshots;
         final RWScheduler scheduler=RWScheduler.forTesting(1,1,1,4,1,"public-atomic-test");
-        final RatisProofQueryService proofs=new RatisProofQueryService();
-        final RatisProofQueryService rerouteProofs=RatisProofQueryService.operationRerouteLane();
+        final RatisProofQueryService proofs=new RatisProofQueryService(RatisProofFixtures.admission());
+        final RatisProofQueryService rerouteProofs=RatisProofQueryService.operationRerouteLane(RatisProofFixtures.admission());
         final RatisSnapshotHelpService snapshotHelp;
         RatisParticipantRecoveryRegistry snapshotRecoveries;
         final AtomicInteger helped=new AtomicInteger();

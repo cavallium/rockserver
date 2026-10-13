@@ -69,6 +69,26 @@ class RatisNodeResourceBudgetTest {
             assertEquals(0,budget.stats().ordinary().bytes());
         }
     }
+    @Test void pointConstructionRejectsBeforeDecodeAndNativeReadWhenSharedGraphIsFull() throws Exception {
+        var pool=UUID.randomUUID();var clock=new java.util.concurrent.atomic.AtomicLong(100);
+        long capacity=16L<<20;var lane=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(capacity,8),new RatisNodeResourceBudget.Lane(8192,4));
+        var budget=new RatisNodeResourceBudget(lane,Map.of(pool,lane));
+        try(var first=fixture("read-first",budget,pool,clock);var second=fixture("read-second",budget,pool,clock)) {
+            assertEquals(it.cavallium.rockserver.core.common.distributed.CommandResult.Status.SUCCESS,second.apply(second.propose(second.put(0)),1));
+            var request=org.apache.ratis.protocol.Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(ScopedTransactionRpc.pointRequest(second.column,new byte[]{0})));
+            try(var occupied=budget.reserve(pool,RatisNodeResourceBudget.Kind.ORDINARY,capacity,1)) {
+                var failure=assertThrows(java.util.concurrent.ExecutionException.class,()->second.machine.query(request).get(5,java.util.concurrent.TimeUnit.SECONDS));
+                assertInstanceOf(IOException.class,failure.getCause());
+                // A valid envelope with an undecodable body is rejected by admission first.
+                var malformed=org.apache.ratis.protocol.Message.valueOf(org.apache.ratis.thirdparty.com.google.protobuf.ByteString.copyFrom(ScopedTransactionRpc.frame(ScopedTransactionRpc.POINT,new byte[0])));
+                var rejected=assertThrows(java.util.concurrent.ExecutionException.class,()->first.machine.query(malformed).get(5,java.util.concurrent.TimeUnit.SECONDS));
+                assertInstanceOf(IOException.class,rejected.getCause());assertEquals(capacity,budget.stats().ordinary().bytes());
+            }
+            assertArrayEquals(new byte[]{7},ScopedTransactionRpc.pointValue(second.machine.query(request).get(5,java.util.concurrent.TimeUnit.SECONDS).getContent().toByteArray(),16));
+            assertEquals(new RatisNodeResourceBudget.Usage(0,0),budget.stats().ordinary());
+        }
+    }
+
     @Test void canceledNativeStagingRetainsSharedBytesUntilActualReturn() throws Exception {
         var a=UUID.randomUUID(); var b=UUID.randomUUID(); var clock=new java.util.concurrent.atomic.AtomicLong(100);
         var capacity=RatisScopedTransactions.STAGING_BUILD_BYTES+8192;

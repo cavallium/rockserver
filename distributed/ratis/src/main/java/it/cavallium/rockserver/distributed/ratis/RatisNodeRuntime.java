@@ -46,11 +46,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private static final ServerFactory DEFAULT_SERVER_FACTORY=RatisNodeRuntime::buildServer;
     @FunctionalInterface interface SchemaReplicaClientFactory { RatisSchemaReplicaClient create() throws IOException; }
     @FunctionalInterface interface HomeClientFactory { RatisRoutedClient connect(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) throws IOException; }
-    public record ResourceLimits(RatisNodeResourceBudget.Limits node,RatisNodeResourceBudget.Limits pool,long maximumSourceImageDiskBytes) {
-        public ResourceLimits {Objects.requireNonNull(node);Objects.requireNonNull(pool);if(maximumSourceImageDiskBytes<1 || maximumSourceImageDiskBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node source image disk budget");}
+    public record ResourceLimits(RatisNodeResourceBudget.Limits node,RatisNodeResourceBudget.Limits pool,long maximumSourceImageDiskBytes,long maximumDurableMetadataBytes,long maximumOperatorCacheBytes) {
+        public ResourceLimits {if(maximumOperatorCacheBytes<1 || maximumOperatorCacheBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node operator cache ceiling");if(maximumDurableMetadataBytes<1 || maximumDurableMetadataBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid canonical node metadata ceiling");Objects.requireNonNull(node);Objects.requireNonNull(pool);if(maximumSourceImageDiskBytes<1 || maximumSourceImageDiskBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node source image disk budget");}
         public static ResourceLimits defaults() {
-            return new ResourceLimits(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L*1024*1024,1024),new RatisNodeResourceBudget.Lane(128L*1024*1024,256)),
-                    new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,512),new RatisNodeResourceBudget.Lane(128L*1024*1024,128)),1L<<30);
+            return new ResourceLimits(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L*1024*1024,1024),new RatisNodeResourceBudget.Lane(1L<<30,256)),
+                    new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,512),new RatisNodeResourceBudget.Lane(512L<<20,128)),1L<<30,1L<<40,16L<<30);
         }
     }
     public record Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,
@@ -121,11 +121,14 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final Set<UUID> virginSeedAdds=new HashSet<>();
     private final Map<UUID,PoolOwner> pools=new LinkedHashMap<>();private final Map<UUID,UUID> groupPools=new ConcurrentHashMap<>(); private RaftServer server; private RatisCatalogueClock clock;
     static RatisNodeResourceBudget.Limits poolResources(RatisNodeResourceBudget.Limits spec,RatisNodeResourceBudget.Limits ceiling){return new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(Math.min(spec.ordinary().bytes(),ceiling.ordinary().bytes()),Math.min(spec.ordinary().owners(),ceiling.ordinary().owners())),new RatisNodeResourceBudget.Lane(Math.min(spec.protectedLane().bytes(),ceiling.protectedLane().bytes()),Math.min(spec.protectedLane().owners(),ceiling.protectedLane().owners())));}
+    private RatisMetadataClaims metadataClaims;
     private final class PoolOwner{final RatisNativePoolSpec spec;final DistributedStoragePool pool;RatisSchemaReplicaService schemas;RatisSnapshotCohortService cohorts;RatisTopologySourceSnapshotArtifacts artifacts;RatisTopologySourceSnapshotService sources;boolean closed;PoolOwner(RatisNativePoolSpec spec,DistributedStoragePool pool){this.spec=spec;this.pool=pool;}NativeRangeImage.Limits images(){var value=spec.images();return new NativeRangeImage.Limits(Math.min(value.maxRowBytes(),settings.images().maxRowBytes()),Math.min(value.maxImageBytes(),settings.images().maxImageBytes()),Math.min(value.maxColumns(),settings.images().maxColumns()));}RatisRangeStateMachine.RetentionLimits retention(){var value=spec.retention();var node=settings.retention();return new RatisRangeStateMachine.RetentionLimits(Math.min(value.dataCount(),node.dataCount()),Math.min(value.dataBytes(),node.dataBytes()),Math.min(value.maintenanceCount(),node.maintenanceCount()),Math.min(value.maintenanceBytes(),node.maintenanceBytes()));}PoolSnapshotAdmission.Limits pins(){var value=spec.pins();var node=settings.exports().pins();return new PoolSnapshotAdmission.Limits(Math.min(value.maximumPins(),node.maximumPins()),Math.min(value.maximumEstimatedBytes(),node.maximumEstimatedBytes()),value.maximumAge().compareTo(node.maximumAge())<0?value.maximumAge():node.maximumAge(),Math.max(value.minimumFreeBytes(),node.minimumFreeBytes()));}}
     public UUID poolId(UUID group){return owner(group).spec.id();}DistributedStoragePool nativePool(UUID poolId){var owner=pools.get(poolId);if(owner==null)throw new IllegalArgumentException("Undeclared pool");return owner.pool;}
     private PoolOwner owner(UUID group){var id=groupPools.get(group);var owner=id==null?null:pools.get(id);if(owner==null)throw new IllegalArgumentException("Group has no opened native pool: "+group);return owner;}
     private void requirePoolCapacity(UUID pool,Collection<UUID> requested){var proposed=new HashSet<UUID>();groupPools.forEach((group,id)->{if(id.equals(pool))proposed.add(group);});proposed.addAll(requested);if(proposed.size()>plan.pools().get(pool).maximumGroups())throw new IllegalArgumentException("Physical pool group ceiling exhausted");}
     private synchronized void assignPool(UUID group,UUID pool){requirePoolCapacity(pool,List.of(group));var previous=groupPools.putIfAbsent(group,pool);if(previous!=null && !previous.equals(pool))throw new IllegalArgumentException("Recovered group conflicts with declared native pool");}
+    private RatisMetadataClaims.Claim metadataClaim(RatisNativePoolSpec spec,UUID group,RatisNodePlan.Role role){var value=spec.retention();var node=settings.retention();var effective=new RatisRangeStateMachine.RetentionLimits(Math.min(value.dataCount(),node.dataCount()),Math.min(value.dataBytes(),node.dataBytes()),Math.min(value.maintenanceCount(),node.maintenanceCount()),Math.min(value.maintenanceBytes(),node.maintenanceBytes()));return RatisMetadataClaims.claim(spec.id(),group,role,effective,spec.replicas());}
+    private void reserveDataMetadata(PoolOwner owner,Collection<UUID> groups)throws IOException{var claims=new ArrayList<RatisMetadataClaims.Claim>();for(var group:groups)claims.add(metadataClaim(owner.spec,group,RatisNodePlan.Role.DATA));metadataClaims.reserve(claims);}
     private PoolOwner seedOwner(UUID intent){PoolOwner found=null;for(var owner:pools.values())if(owner.pool.topologySeed(intent)!=null){if(found!=null)throw new IllegalArgumentException("Seed is duplicated across pools");found=owner;}if(found==null)throw new IllegalArgumentException("Unknown forced seed pool");return found;}
     private PoolOwner learnerOwner(NativeTopologyLearnerRegistration registration){PoolOwner found=null;for(var owner:pools.values())if(owner.pool.topologyLearners().stream().anyMatch(registration::equals)){if(found!=null)throw new IllegalArgumentException("Learner is duplicated across pools");found=owner;}if(found==null)throw new IllegalArgumentException("Unknown forced learner pool");return found;}
     private void requireIncomingOwnership(RangeDirectory directory,Collection<RangeDescriptor> incoming,Set<UUID> replaced){for(var proposed:incoming)for(var existing:groups.entries()){if(existing.role()!=RatisNodePlan.Role.DATA || existing.retired() || existing.descriptor().groupId().equals(proposed.groupId()) || replaced.contains(existing.descriptor().groupId()) || Collections.disjoint(directory.columns(),existing.directory().columns()))continue;var current=existing.descriptor();if((current.upperExclusive()==null || proposed.lowerInclusive()==null || Arrays.compareUnsigned(proposed.lowerInclusive(),current.upperExclusive())<0) && (proposed.upperExclusive()==null || current.lowerInclusive()==null || Arrays.compareUnsigned(current.lowerInclusive(),proposed.upperExclusive())<0))throw new IllegalArgumentException("Node-local ownership intervals overlap across native pools");}}
@@ -309,6 +312,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }
         } else {
             if (startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Node identity is absent; explicit placement initialization is required");
+            if(Files.exists(root.resolve("metadata-claims"),LinkOption.NOFOLLOW_LINKS) || Files.exists(root.resolve("metadata-claims.pending"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Unidentified metadata claims must not be adopted");
             for (String directory:List.of("native","raft","sessions","recovery","schema-replicas","referenced-files","topology-exposure")) {
                 Path path=root.resolve(directory);
                 if(directory.equals("native")){requireInitialPoolStaging(path);continue;}
@@ -323,12 +327,17 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (snapshotPlan!=null) {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
-        proofQueries=new RatisProofQueryService();importPreflightQueries=RatisProofQueryService.importPreflightLane();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();topologyImageQueries=RatisProofQueryService.topologyImageLane();relocationOwnerQueries=RatisProofQueryService.relocationOwnerLane();relocationClients=new RatisRelocationDataClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId());
+        RatisProofQueryService.ResourceAdmission proofAdmission=(group,bytes)-> {
+            var pool=groupPools.get(group);
+            if(pool==null)throw new IOException("Proof query has no declared native pool");
+            return resources.reserve(pool,RatisNodeResourceBudget.Kind.PROTECTED,bytes,1)::close;
+        };
+        proofQueries=new RatisProofQueryService(proofAdmission);importPreflightQueries=RatisProofQueryService.importPreflightLane(proofAdmission);sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane(proofAdmission);topologyImageQueries=RatisProofQueryService.topologyImageLane(proofAdmission);relocationOwnerQueries=RatisProofQueryService.relocationOwnerLane(proofAdmission);relocationClients=new RatisRelocationDataClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId());
         if(groups.raftGroups().stream().anyMatch(group->groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.TRANSACTION_HOME))
-            operationRerouteQueries=RatisProofQueryService.operationRerouteLane();
+            operationRerouteQueries=RatisProofQueryService.operationRerouteLane(proofAdmission);
         if (groups.raftGroups().stream().anyMatch(group -> groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.CATALOGUE)) {
-            authorityQueries=RatisProofQueryService.authorityLane();
-            importPublicationQueries=RatisProofQueryService.importPublicationLane();
+            authorityQueries=RatisProofQueryService.authorityLane(proofAdmission);
+            importPublicationQueries=RatisProofQueryService.importPublicationLane(proofAdmission);
         }
         if (transactionHomes!=null) snapshotHelp=new RatisSnapshotHelpService(scheduler);
         var metadataBindings=new HashMap<UUID,String>();
@@ -343,6 +352,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }
         }
         sharedSnapshots=new PoolSnapshotAdmission.Shared(settings.exports().pins(),System::nanoTime);schemaAdmission=new RatisSchemaReplicaAdmission(schemaReplicaConfig.limits(),resources);for(var group:groups.raftGroups())assignPool(group.getGroupId().getUuid(),plan.poolId(group.getGroupId().getUuid()));
+        // Caches have no reclamation protocol: reserve every declared pool's entire bounded envelope.
+        if(Math.multiplyExact((long)plan.pools().size(),DistributedOperatorArtifacts.MAX_CACHE_BYTES)>settings.resources().maximumOperatorCacheBytes())
+            throw new IOException("Node immutable operator cache ceiling exhausted");
+        for(var spec:plan.pools().values())DistributedOperatorArtifacts.inventory(spec.nativePath(root));
+        var metadataCeilings=new HashMap<UUID,Long>();plan.pools().forEach((id,spec)->metadataCeilings.put(id,spec.maximumDurableMetadataBytes()));metadataClaims=new RatisMetadataClaims(root.resolve("metadata-claims"),settings.resources().maximumDurableMetadataBytes(),metadataCeilings);
+        var initialClaims=new ArrayList<RatisMetadataClaims.Claim>();for(var group:groups.raftGroups()){var id=group.getGroupId().getUuid();initialClaims.add(metadataClaim(plan.pools().get(groupPools.get(id)),id,groups.require(id).role()));}metadataClaims.reserve(initialClaims);
         for(var spec:plan.pools().values()){
             var bindings=new HashMap<UUID,String>();var schemas=new ArrayList<DistributedSchema>();for(var domain:plan.domains())if(domain.directory().ranges().stream().anyMatch(range->spec.id().equals(plan.poolId(range.groupId())) && plan.localGroups().stream().anyMatch(group->group.getGroupId().getUuid().equals(range.groupId())))){bindings.putAll(domain.columns());var schema=logicalSchemas.get(domain.domainId());if(schema!=null)schemas.add(schema);}var metadata=new HashMap<UUID,String>();for(var group:groups.raftGroups())if(spec.id().equals(groupPools.get(group.getGroupId().getUuid())))switch(groups.require(group.getGroupId().getUuid()).role()){case DATA->{}case CATALOGUE->{metadata.put(plan.catalogue().directoryColumn(),"catalogue-directory");metadata.put(plan.catalogue().sessionsColumn(),"catalogue-sessions");}case TRANSACTION_HOME,SNAPSHOT_HOME->{var home=plan.home(group.getGroupId().getUuid());metadata.put(home.column(),home.physicalName());}}
             var nativePool=schemas.isEmpty()?DistributedStoragePool.open(spec.nativePath(root),spec.config(),LoggerFactory.getLogger(RatisNodeRuntime.class)):DistributedStoragePool.open(spec.nativePath(root),spec.config(),LoggerFactory.getLogger(RatisNodeRuntime.class),schemas,bindings,metadata);var owner=new PoolOwner(spec,nativePool);pools.put(spec.id(),owner);nativePool.configureSnapshotAdmission(owner.pins(),sharedSnapshots);initializePoolServices(owner);
@@ -350,7 +365,20 @@ public final class RatisNodeRuntime implements AutoCloseable {
         // Discover every pool before creating any Raft group; a group cannot silently move between databases.
         var discovered=new ArrayList<NativeTopologySeed>();for(var owner:pools.values()){for(var seed:owner.pool.topologySeeds()){for(var parent:seed.definition().parents())assignPool(parent.groupId(),owner.spec.id());for(var target:seed.definition().targets())assignPool(target.groupId(),owner.spec.id());discovered.add(seed);}for(var learner:owner.pool.topologyLearners()){assignPool(learner.definition().targets().getFirst().groupId(),owner.spec.id());}}
         discovered.sort(Comparator.comparingLong(seed->seed.definition().sourceDirectory().generation()));for(var seed:discovered)groups.register(seed);for(var owner:pools.values())for(var learner:owner.pool.topologyLearners())groups.register(learner);
-        try { for(var owner:pools.values())for(var id:owner.pool.persistedRangeGroups(owner.spec.maximumGroups()))if(!owner.spec.id().equals(groupPools.get(id)))throw new IOException("Unknown or misplaced durable native group: "+id); } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Cannot inspect durable native pool groups",failure); }
+        try{
+            var exposed=new HashMap<UUID,RatisRuntimeGroups.Entry>();for(var entry:groups.entries())exposed.put(entry.group().getGroupId().getUuid(),entry);
+            var retainedClaims=new ArrayList<RatisMetadataClaims.Claim>();var unqualified=new ArrayList<UUID>();
+            for(var owner:pools.values()){
+                var historical=new HashSet<UUID>();for(var retained:owner.pool.retainedMetadataOwners()){
+                    var id=retained.owner().groupId();historical.add(id);var entry=exposed.get(id);RatisNodePlan.Role role;
+                    if(entry!=null){if(!owner.spec.id().equals(groupPools.get(id)))throw new IOException("Misplaced durable native group: "+id);role=entry.role();}
+                    else{role=RatisNodePlan.Role.DATA;if(!plan.domainPools().containsKey(retained.interval().domainId()) || !retained.retired()&&!retained.pending())unqualified.add(id);}
+                    retainedClaims.add(metadataClaim(owner.spec,id,role));
+                }
+                for(var id:owner.pool.persistedRangeGroups(RatisNodePlan.MAX_LOCAL_GROUPS))if(!historical.contains(id))throw new IOException("Native metadata has no permanent ownership history: "+id);
+            }
+            metadataClaims.reserve(retainedClaims);if(!unqualified.isEmpty())throw new IOException("Unqualified unexposed native owners: "+unqualified);
+        }catch(org.rocksdb.RocksDBException failure){throw new IOException("Cannot reconstruct retained metadata claims",failure);}
         loadRelocationIntents();
         var allowed=new HashSet<UUID>(); for (var group:groups.raftGroups()) allowed.add(group.getGroupId().getUuid());
         try (var entries=Files.list(logs)) {
@@ -655,7 +683,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private void beginSeedLifecycle(boolean seed)throws IOException{synchronized(this){if(installing || starting || closing || closeRequested || closed || seed && learnerAttempt!=null || !seed && seedAttempt!=null)throw new IOException("Node lifecycle or retained force attempt prevents another topology mutation");installing=true;}}
     private void endSeedLifecycle(){synchronized(this){installing=false;}}
     private void installTopologySeedOwned(NativeTopologySeed seed)throws IOException,org.rocksdb.RocksDBException{
-            Objects.requireNonNull(seed);var owner=seedOwner(seed.definition().intentId());var pool=owner.pool;var forced=pool.topologySeed(seed.definition().intentId());if(forced==null || !forced.equals(seed))throw new IOException("Topology seed is not the exact forced native artifact");for(var parent:forced.definition().parents())assignPool(parent.groupId(),owner.spec.id());for(var target:forced.definition().targets())assignPool(target.groupId(),owner.spec.id());groups.register(forced);
+            Objects.requireNonNull(seed);var owner=seedOwner(seed.definition().intentId());reserveDataMetadata(owner,seed.definition().targets().stream().map(RangeDescriptor::groupId).toList());var pool=owner.pool;var forced=pool.topologySeed(seed.definition().intentId());if(forced==null || !forced.equals(seed))throw new IOException("Topology seed is not the exact forced native artifact");for(var parent:forced.definition().parents())assignPool(parent.groupId(),owner.spec.id());for(var target:forced.definition().targets())assignPool(target.groupId(),owner.spec.id());groups.register(forced);
             for(var target:forced.definition().targets()){
                 var id=RaftGroupId.valueOf(target.groupId());if(machines.containsKey(id))continue;var entry=groups.require(target.groupId());var store=pool.reopenTopologyRange(forced.birth(target.groupId()),seedSchema(forced));
                 var directory=store.schemaInstallation()==null ? entry.directory() : store.schemaInstallation().definition().targetDirectory();
@@ -686,7 +714,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             var target=current.definition().targets().getFirst();var proposed=org.apache.ratis.proto.RaftProtos.RaftConfigurationProto.newBuilder();
             for(var peer:groups.group(target).getPeers().stream().sorted(Comparator.comparing(peer->peer.getId().toString())).toList()){if(peer.getStartupRole()==RaftPeerRole.LISTENER)proposed.addListeners(peer.getRaftPeerProto());else proposed.addPeers(peer.getRaftPeerProto());}
             var registration=new NativeTopologyLearnerRegistration(current.definition(),image.topologyOrigin(),evidence.schema(),receiver,current.catalogue(),current.cut(),image.position(),image.sha256(),cfg.data(),proposed.build().toByteArray(),evidence.physicalNames(),evidence.mergeColumns(),evidence.sourceSchemaRows());
-            var owner=pools.get(plan.incomingPoolId(view.definition().sourceDirectory().domainId(),target.groupId()));requirePoolCapacity(owner.spec.id(),List.of(target.groupId()));requireIncomingOwnership(view.definition().targetDirectory(),List.of(target),Set.of());learnerAttemptPool=owner.spec.id();learnerAttempt=registration;owner.pool.openTopologyLearner(registration);installTopologyLearnerOwned(registration);learnerAttempt=null;return registration;
+            var owner=pools.get(plan.incomingPoolId(view.definition().sourceDirectory().domainId(),target.groupId()));requirePoolCapacity(owner.spec.id(),List.of(target.groupId()));requireIncomingOwnership(view.definition().targetDirectory(),List.of(target),Set.of());reserveDataMetadata(owner,List.of(target.groupId()));learnerAttemptPool=owner.spec.id();learnerAttempt=registration;owner.pool.openTopologyLearner(registration);installTopologyLearnerOwned(registration);learnerAttempt=null;return registration;
         }catch(org.rocksdb.RocksDBException|IllegalArgumentException|IllegalStateException failure){throw new IOException("Learner force/register failed",failure);}finally{endSeedLifecycle();}
     }
     private void requireLearnerReceiver(RatisTopologyJoinAuthority.View view,ReplicaDescriptor receiver)throws IOException{
@@ -695,7 +723,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 || !source.clusterId().equals(plan.clusterId()) || !source.databaseId().equals(plan.databaseId()) || !plan.directory(source.domainId()).domainId().equals(source.domainId()))throw new IOException("Learner receiver/catalogue/bootstrap identity differs");
     }
     private void installTopologyLearnerOwned(NativeTopologyLearnerRegistration registration)throws IOException,org.rocksdb.RocksDBException{
-        var owner=learnerOwner(registration);var pool=owner.pool;assignPool(registration.definition().targets().getFirst().groupId(),owner.spec.id());var forced=pool.topologyLearners().stream().filter(registration::equals).findFirst().orElseThrow(()->new IOException("Learner is not exact forced native history"));groups.register(forced);var id=RaftGroupId.valueOf(forced.definition().targets().getFirst().groupId());var entry=groups.require(id.getUuid());
+        var owner=learnerOwner(registration);reserveDataMetadata(owner,List.of(registration.definition().targets().getFirst().groupId()));var pool=owner.pool;assignPool(registration.definition().targets().getFirst().groupId(),owner.spec.id());var forced=pool.topologyLearners().stream().filter(registration::equals).findFirst().orElseThrow(()->new IOException("Learner is not exact forced native history"));groups.register(forced);var id=RaftGroupId.valueOf(forced.definition().targets().getFirst().groupId());var entry=groups.require(id.getUuid());
         if(!machines.containsKey(id)){var store=pool.openTopologyLearner(forced);var machine=RatisRangeStateMachine.withSessions(store,entry.group(),owner.images(),command->{},epochs,entry.directory(),owner.retention());machine.nodeResources(resources,owner.spec.id());configureDataMachine(machine,entry.directory(),entry.descriptor());machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(id.getUuid(),store);machines.put(id,machine);}
         requireSeedStorage(entry);markSeedExposure(entry);var actual=new HashSet<RaftGroupId>();server.getGroupIds().forEach(actual::add);if(!actual.contains(id))addGroup(entry.group());else verify(entry.group());
     }
@@ -723,7 +751,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if(saved!=null){request.requireSeed(saved);installTopologySeedOwned(saved);return saved;}
             var attempt=seedAttempt;if(attempt!=null && (!Arrays.equals(attempt.definition().encode(),request.definition().encode()) || !attempt.local().equals(request.owner())))throw new IOException("Unknown SEED force requires exact original definition/local retry");
             if(attempt==null){var view=seedAuthority.read(request.definition().header(),TopologyChange.Stage.SEED);view.require(RatisTopologyAuthority.Request.of(request.definition().header(),TopologyChange.Stage.SEED));if(!view.catalogue().equals(request.catalogue()) || !Arrays.equals(view.definition().encode(),request.definition().encode()) || !Arrays.equals(view.admissionDigest(),request.originalAdmissionDigest()))throw new IOException("Fresh SEED authority changed original definition/catalogue");parents=requireSeedParents(request,true);attempt=new SeedAttempt(request.definition(),view.state(),request.owner());seedAttempt=attempt;}
-            var seed=pool.seedTopology(attempt.definition(),attempt.authority(),parents,attempt.local());request.requireSeed(seed);seedAttempt=null;installTopologySeedOwned(seed);return seed;
+            reserveDataMetadata(owner,attempt.definition().targets().stream().map(RangeDescriptor::groupId).toList());var seed=pool.seedTopology(attempt.definition(),attempt.authority(),parents,attempt.local());request.requireSeed(seed);seedAttempt=null;installTopologySeedOwned(seed);return seed;
         }catch(org.rocksdb.RocksDBException failure){throw new IOException("Native SEED force/register did not complete",failure);}catch(IllegalArgumentException|IllegalStateException invalid){throw new IOException("Invalid SEED owner/authority/native binding",invalid);}finally{endSeedLifecycle();}
     }
     private void observeTopologyActivation(TopologyChange.Definition definition,NativeTopologyActivation activation){

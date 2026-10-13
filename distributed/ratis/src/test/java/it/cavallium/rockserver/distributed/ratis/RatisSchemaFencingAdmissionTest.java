@@ -43,7 +43,7 @@ class RatisSchemaFencingAdmissionTest {
         final AtomicReference<RatisRangeStateMachine.Leadership> leader=new AtomicReference<>(new RatisRangeStateMachine.Leadership(1,true));
         final AtomicInteger calls=new AtomicInteger();
         final DistributedStoragePool pool; final ReplicatedRangeStore store; final RaftStorage storage; final RatisRangeStateMachine machine;
-        final RatisProofQueryService queries=new RatisProofQueryService(),authorityQueries=RatisProofQueryService.authorityLane(); final RatisSchemaReplicaClient replicas;
+        final RatisProofQueryService queries=new RatisProofQueryService(RatisProofFixtures.admission()),authorityQueries=RatisProofQueryService.authorityLane(RatisProofFixtures.admission()); final RatisSchemaReplicaClient replicas;
         final RaftPeer peer=RaftPeer.newBuilder().setId("catalogue").build();
         final RaftGroup group=RaftGroup.valueOf(RaftGroupId.valueOf(catalogue),peer);
         final DistributedCommand fencing;

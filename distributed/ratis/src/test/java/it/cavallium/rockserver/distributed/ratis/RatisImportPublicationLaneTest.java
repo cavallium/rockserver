@@ -8,7 +8,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class RatisImportPublicationLaneTest {
     @Test void expandedMetadataLaneIsIndependentAndActualOwnershipDrains()throws Exception{
-        var lane=RatisProofQueryService.importPublicationLane();var ordinary=new RatisProofQueryService();var entered=new CountDownLatch(1);var resume=new CountDownLatch(1);long weight=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;var group=UUID.randomUUID();
+        var lane=RatisProofQueryService.importPublicationLane(RatisProofFixtures.admission());var ordinary=new RatisProofQueryService(RatisProofFixtures.admission());var entered=new CountDownLatch(1);var resume=new CountDownLatch(1);long weight=RatisProofQueryService.IMPORT_PUBLICATION_BYTES;var group=UUID.randomUUID();
         try{
             assertThrows(ExecutionException.class,()->ordinary.submit(group,new byte[]{1},weight,false,input->Message.valueOf("Unexpected")).get(5,TimeUnit.SECONDS));
             var first=lane.submit(group,new byte[]{1},weight,false,input->{entered.countDown();if(!resume.await(5,TimeUnit.SECONDS))throw new AssertionError("Lookup timed out");return Message.valueOf("Ready");});assertTrue(entered.await(5,TimeUnit.SECONDS));

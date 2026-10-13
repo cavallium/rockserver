@@ -4223,6 +4223,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private CompletableFuture<Message> query(Message request,boolean freshBarrier) {
         try {
             int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),Math.max(RatisSnapshotCohortRpc.MAX_REQUEST_BYTES,Math.max(RatisOperationRerouteAdmissionRpc.MAX_BYTES,RatisSourceOutcomeRpc.MAX_REQUEST_BYTES)));
+            try (var construction=readConstructionLease(kind,request.getContent().asReadOnlyByteBuffer())) {
             byte[] encoded = request.getContent().toByteArray();
             if (!ScopedTransactionRpc.ownerSnapshot(kind) && !ScopedTransactionRpc.ownerExport(kind) && !(kind>=RatisSnapshotCohortRpc.OWNER && kind<=RatisSnapshotCohortRpc.CANCEL)) requireHealthy();
             if (ScopedTransactionRpc.schemaReplica(kind)) {
@@ -4454,9 +4455,38 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 });
             }
             return CompletableFuture.completedFuture(framedQuery(encoded,freshBarrier));
+            }
         } catch (Throwable failure) {
             return CompletableFuture.failedFuture(failure);
         }
+    }
+
+    private RatisNodeResourceBudget.Lease readConstructionLease(int kind,ByteBuffer request) throws IOException {
+        long responseBytes;
+        switch (kind) {
+            case ScopedTransactionRpc.POINT, ScopedTransactionRpc.GET, ScopedTransactionRpc.SNAPSHOT_GET ->
+                    responseBytes=4L*DistributedCommandCodec.MAX_ENCODED_BYTES;
+            case ScopedTransactionRpc.PAGE, ScopedTransactionRpc.SNAPSHOT_PAGE -> {
+                if (request.remaining()<ScopedTransactionRpc.HEADER_BYTES+8) throw new IOException("Truncated page request");
+                int end=request.limit(),items=request.getInt(end-8),bytes=request.getInt(end-4);
+                if (items<1 || items>it.cavallium.rockserver.core.common.distributed.PhysicalRangePage.MAX_ITEMS
+                        || bytes<it.cavallium.rockserver.core.common.distributed.PhysicalRangePage.HEADER_BYTES
+                        || bytes>it.cavallium.rockserver.core.common.distributed.PhysicalRangePage.MAX_BYTES)
+                    throw new IOException("Invalid page construction budget");
+                // Native rows, immutable row copies, serialization and response framing overlap.
+                responseBytes=8L*bytes;
+            }
+            default -> { return null; }
+        }
+        var lane=RatisNodeResourceBudget.Kind.ORDINARY;
+        // Exact configured HOME status reads are required by protected completion protocols.
+        if(kind==ScopedTransactionRpc.POINT && (homeReservations || snapshotHomeConfigured)
+                && request.remaining()==ScopedTransactionRpc.HEADER_BYTES+36
+                && request.getLong(ScopedTransactionRpc.HEADER_BYTES)==homeColumn.getMostSignificantBits()
+                && request.getLong(ScopedTransactionRpc.HEADER_BYTES+8)==homeColumn.getLeastSignificantBits()
+                && request.getInt(ScopedTransactionRpc.HEADER_BYTES+16)==16)
+            lane=RatisNodeResourceBudget.Kind.PROTECTED;
+        return reserveNodeResources(lane,256L+4L*request.remaining()+responseBytes,1);
     }
 
     private CompletableFuture<Message> snapshotHelpQuery(byte[] encoded,boolean freshBarrier) throws Exception {

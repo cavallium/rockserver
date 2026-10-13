@@ -18,10 +18,66 @@ import java.security.*;
 import java.util.*;
 
 /** Bounded trusted local artifacts and CF birth identities, readable before RocksDB opens. */
-final class DistributedOperatorArtifacts {
+public final class DistributedOperatorArtifacts {
     private static final Object FILES=new Object();
     private static final int MAX_ARTIFACTS=64,MAX_BINDINGS=4096,MAX_INDEX_BYTES=8*1024*1024,MAX_DESCRIPTOR_BYTES=64*1024;
-    private static final long MAX_ARTIFACT_BYTES=128L*1024*1024;
+    public static final long MAX_JAR_PAYLOAD_BYTES=128L*1024*1024;
+    public static final long MAX_CACHE_METADATA_BYTES=2L*MAX_INDEX_BYTES;
+    public static final long MAX_PENDING_BYTES=MAX_INDEX_BYTES;
+    public static final int MAX_PENDING_FILES=1;
+    public static final long MAX_CACHE_BYTES=MAX_JAR_PAYLOAD_BYTES+MAX_CACHE_METADATA_BYTES+MAX_PENDING_BYTES;
+    private static final long MAX_ARTIFACT_BYTES=MAX_JAR_PAYLOAD_BYTES;
+    @FunctionalInterface interface Force { void force(Path path) throws IOException; }
+    private final Force forcing;
+    private boolean pendingUncertain;
+    public record Inventory(long jarPayloadBytes,long metadataBytes,long pendingBytes,int artifacts,int descriptors,int pendingFiles) {}
+    /** Bounds every cache file, including unreferenced immutable artifacts and interrupted writes. */
+    public static Inventory inventory(Path poolPath) throws IOException {
+        Path absolute=poolPath.toAbsolutePath().normalize();
+        if(absolute.getFileName()==null) throw new IllegalArgumentException("Pool needs a named path");
+        synchronized(FILES) { return inventoryDirectory(absolute.resolveSibling(absolute.getFileName()+".operators")); }
+    }
+    private static Inventory inventoryDirectory(Path directory) throws IOException {
+        if(!Files.exists(directory,LinkOption.NOFOLLOW_LINKS)) return new Inventory(0,0,0,0,0,0);
+        if(Files.isSymbolicLink(directory) || !Files.isDirectory(directory,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Invalid operator cache directory");
+        long jars=0,descriptorsBytes=0,bindingsBytes=0,pendingBytes=0;int artifacts=0,descriptors=0,pending=0,files=0;
+        try(var children=Files.newDirectoryStream(directory)) {
+            for(var file:children) {
+                if(++files>2*MAX_ARTIFACTS+MAX_PENDING_FILES+2 || Files.isSymbolicLink(file) || !Files.isRegularFile(file,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Invalid or unbounded operator cache inventory");
+                String name=file.getFileName().toString();long size=Files.size(file);
+                if(name.matches("[0-9a-f]{64}\\.jar")) {
+                    if(size<1 || size>MergeOperatorRegistry.MAX_DISTRIBUTED_JAR_BYTES || ++artifacts>MAX_ARTIFACTS || size>MAX_ARTIFACT_BYTES-jars) throw new IOException("Operator JAR payload exceeds cache ceiling");
+                    if(!name.equals(fileDigest(file,size)+".jar")) throw new IOException("Operator JAR filename differs from immutable payload");
+                    jars+=size;
+                } else if(name.matches("[0-9a-f]{64}\\.operator")) {
+                    if(size<1 || size>MAX_DESCRIPTOR_BYTES || ++descriptors>MAX_ARTIFACTS || size>MAX_INDEX_BYTES-descriptorsBytes) throw new IOException("Operator descriptor inventory exceeds cache ceiling");
+                    descriptorsBytes+=size;
+                    byte[] bytes=read(file,MAX_DESCRIPTOR_BYTES);
+                    if(!name.equals(HexFormat.of().formatHex(sha(bytes))+".operator")) throw new IOException("Operator descriptor filename differs from canonical body");
+                    var descriptor=decodeDescriptor(bytes);
+                    Path artifact=directory.resolve(descriptor.artifactSha256()+".jar");
+                    if(!Files.isRegularFile(artifact,LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(artifact)) throw new IOException("Operator descriptor lacks immutable JAR payload");
+                } else if(name.equals("bindings")) {
+                    if(size>MAX_INDEX_BYTES) throw new IOException("Operator bindings exceed cache ceiling");bindingsBytes=size;
+                } else if(name.equals("lock")) {
+                    if(size!=0) throw new IOException("Operator cache lock contains foreign data");
+                } else if(name.matches("\\.operator-[0-9]{1,20}\\.tmp")) {
+                    if(++pending>MAX_PENDING_FILES || size>MAX_PENDING_BYTES-pendingBytes) throw new IOException("Operator pending files exceed cache ceiling");pendingBytes+=size;
+                } else throw new IOException("Foreign operator cache file: "+name);
+            }
+        }
+        return new Inventory(jars,descriptorsBytes+bindingsBytes,pendingBytes,artifacts,descriptors,pending);
+    }
+
+    private static String fileDigest(Path file,long expected) throws IOException {
+        MessageDigest digest;
+        try { digest=MessageDigest.getInstance("SHA-256"); } catch(NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
+        long total=0;byte[] buffer=new byte[8192];
+        try(var input=Files.newInputStream(file,LinkOption.NOFOLLOW_LINKS)) {
+            for(int n;(n=input.read(buffer))!=-1;) { total+=n;if(total>expected)throw new IOException("Operator cache file grew during inventory");digest.update(buffer,0,n); }
+        }
+        if(total!=expected)throw new IOException("Operator cache file changed during inventory");return HexFormat.of().formatHex(digest.digest());
+    }
     private final Path directory,index;
     private byte[] bootstrap;
     private Map<String,Binding> bindings;
@@ -34,10 +90,13 @@ final class DistributedOperatorArtifacts {
     private static BucketShape bucketShape(DistributedSchema.Column column) {
         var shape=column.schema(); return column.operator()==null || shape.variableLengthKeysCount()==0 ? null : new BucketShape(shape.keys(),shape.variableTailKeys(),shape.hasValue());
     }
-    DistributedOperatorArtifacts(Path poolPath) throws IOException {
+    DistributedOperatorArtifacts(Path poolPath) throws IOException { this(poolPath,DistributedOperatorArtifacts::diskForce); }
+    DistributedOperatorArtifacts(Path poolPath,Force forcing) throws IOException {
+        this.forcing=Objects.requireNonNull(forcing);
         Path absolute=poolPath.toAbsolutePath().normalize();
         if(absolute.getFileName()==null) throw new IllegalArgumentException("Pool needs a named path");
-        directory=absolute.resolveSibling(absolute.getFileName()+".operators"); index=directory.resolve("bindings"); bindings=readBindings();
+        directory=absolute.resolveSibling(absolute.getFileName()+".operators"); index=directory.resolve("bindings");
+        synchronized(FILES) { inventoryDirectory(directory);pendingUncertain=Files.exists(directory,LinkOption.NOFOLLOW_LINKS);bindings=readBindings(); }
     }
     boolean qualified() { return Files.exists(index,LinkOption.NOFOLLOW_LINKS); }
     Path directory() { return directory; }
@@ -53,8 +112,7 @@ final class DistributedOperatorArtifacts {
         synchronized(FILES) {
             ensureDirectory();
             try(var lock=FileChannel.open(directory.resolve("lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);var ignored=lock.lock()) {
-                try(var abandoned=Files.newDirectoryStream(directory,".operator-*.tmp")) { for(var file:abandoned) Files.delete(file); }
-                force(directory);
+                preparePending(0);
                 int count=0; long bytes=0;
                 try(var files=Files.newDirectoryStream(directory,"*.jar")) { for(var file:files) { count++; bytes=Math.addExact(bytes,Files.size(file)); } }
                 Path artifact=artifact(descriptor); boolean exists=Files.exists(artifact,LinkOption.NOFOLLOW_LINKS);
@@ -251,22 +309,39 @@ final class DistributedOperatorArtifacts {
             if(channel.size()>maximum) throw new IOException("Artifact exceeds budget"); var bytes=ByteBuffer.allocate((int)channel.size()); while(bytes.hasRemaining()) if(channel.read(bytes)<0) throw new EOFException("Artifact shortened"); if(channel.size()!=bytes.capacity()) throw new IOException("Artifact changed while reading"); return bytes.array();
         }
     }
-    private static void immutable(Path destination,byte[] bytes,int maximum) throws IOException {
+    private void immutable(Path destination,byte[] bytes,int maximum) throws IOException {
         if(Files.exists(destination,LinkOption.NOFOLLOW_LINKS)) { if(!Arrays.equals(read(destination,maximum),bytes)) throw new IOException("Immutable staged artifact changed"); force(destination.getParent()); return; }
         Path temporary=writeTemporary(destination,bytes);
         try { Files.createLink(destination,temporary); force(destination.getParent()); }
-        finally { Files.deleteIfExists(temporary); force(destination.getParent()); }
+        finally { Files.deleteIfExists(temporary); force(destination.getParent()); pendingUncertain=false; }
     }
-    private static void replace(Path destination,byte[] bytes) throws IOException {
+    private void replace(Path destination,byte[] bytes) throws IOException {
         Path temporary=writeTemporary(destination,bytes);
         try { Files.move(temporary,destination,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING); force(destination.getParent()); }
-        finally { Files.deleteIfExists(temporary); }
+        finally { Files.deleteIfExists(temporary); force(destination.getParent()); pendingUncertain=false; }
     }
-    private static Path writeTemporary(Path destination,byte[] bytes) throws IOException {
+    private void preparePending(long futureBytes) throws IOException {
+        if(!Thread.holdsLock(FILES)) throw new IllegalStateException("Operator pending writes require exclusive cache ownership");
+        var inventory=inventoryDirectory(directory);
+        if(futureBytes<0 || futureBytes>MAX_PENDING_BYTES) throw new IOException("Operator pending write exceeds cache ceiling");
+        if(inventory.pendingFiles()!=0 || pendingUncertain) {
+            pendingUncertain=true;
+            try(var pending=Files.newDirectoryStream(directory,".operator-*.tmp")) { for(var file:pending) Files.delete(file); }
+            force(directory);pendingUncertain=false;
+        }
+        if(inventoryDirectory(directory).pendingFiles()!=0) throw new IOException("Operator pending cleanup has not drained");
+    }
+    private Path writeTemporary(Path destination,byte[] bytes) throws IOException {
+        preparePending(bytes.length);pendingUncertain=true;
         var temporary=Files.createTempFile(destination.getParent(),".operator-",".tmp");
         try(var channel=FileChannel.open(temporary,StandardOpenOption.WRITE,StandardOpenOption.TRUNCATE_EXISTING)) { var buffer=ByteBuffer.wrap(bytes); while(buffer.hasRemaining()) channel.write(buffer); channel.force(true); }
-        catch(Throwable failure) { Files.deleteIfExists(temporary); throw failure; } return temporary;
+        catch(Throwable failure) {
+            try { Files.deleteIfExists(temporary);force(destination.getParent());pendingUncertain=false; }
+            catch(Throwable cleanup) { if(cleanup!=failure)failure.addSuppressed(cleanup); }
+            throw failure;
+        } return temporary;
     }
-    private static void force(Path directory) throws IOException { try(var channel=FileChannel.open(directory,StandardOpenOption.READ)) { channel.force(true); } }
+    private void force(Path directory) throws IOException { forcing.force(directory); }
+    private static void diskForce(Path directory) throws IOException { try(var channel=FileChannel.open(directory,StandardOpenOption.READ)) { channel.force(true); } }
     private static byte[] sha(byte[] bytes) { try { return MessageDigest.getInstance("SHA-256").digest(bytes); } catch(NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); } }
 }

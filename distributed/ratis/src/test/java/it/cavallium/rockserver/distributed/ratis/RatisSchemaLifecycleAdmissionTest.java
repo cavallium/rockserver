@@ -42,7 +42,7 @@ class RatisSchemaLifecycleAdmissionTest {
         final AtomicReference<SchemaChange.Status> status=new AtomicReference<>(SchemaChange.Status.begin(create.header()).beginFencing(new byte[32]));
         final AtomicReference<RangeDirectory> directory=new AtomicReference<>(sourceDirectory);
         final DistributedStoragePool pool; final ReplicatedRangeStore store; final RaftStorage storage; final RatisRangeStateMachine machine;
-        final RatisProofQueryService queries=new RatisProofQueryService();
+        final RatisProofQueryService queries=new RatisProofQueryService(RatisProofFixtures.admission());
         final AtomicReference<ApplyPosition> authorityPosition=new AtomicReference<>(new ApplyPosition(1,10));
         volatile UUID authorityGroup=id(20);
         volatile Runnable beforeRead=() -> {};
