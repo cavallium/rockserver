@@ -6,6 +6,8 @@ import it.cavallium.rockserver.core.common.export.ExportJobs;
 import it.cavallium.rockserver.core.config.ConfigParser;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.*;
@@ -44,8 +46,24 @@ class RatisAggregateExportColdCleanupTest {
             runtimeRoot=Files.createDirectory(root.resolve("runtime"));factoryRoot=root.resolve("aggregate");
             for(var directory:List.of(f.directory,fixture.extraDirectory))routes.put(directory.domainId(),new RatisRoutedClient(directory,transport()));
             openRuntime(false);
+            openFactory();
+        }
+        void openFactory()throws Exception {
             factory=new RatisDatabaseBackendFactory(factoryRoot,plan,f.catalogue.client,routes,f.scheduler,(name,shape)->name.equals("second-domain")?fixture.extraDomain:f.schema.domainId(),(name,type,hash,revision)->{throw new IOException("No operators in cleanup fixture");},RatisDatabaseBackendFactory.Policy.defaults(),directory->new RatisRoutedClient(directory,transport()),new RatisSchemaReplicaClient(1));
             backend=factory.exports();
+        }
+        /** Test-only abrupt client-process exit: no normal close/drain runs and no durable progress is rewritten. */
+        void loseStoppedClientOwners()throws Exception {
+            assertNull(node,"Actual old Runtime and its native cohorts must already be stopped");
+            assertEquals(0,field(backend,"active",Integer.class));assertTrue(field(backend,"controls",Set.class).isEmpty());
+            for(var driver:field(backend,"drivers",Map.class).values())assertFalse(field(driver,"active",Boolean.class));
+            for(var binding:new ArrayList<>(field(factory,"exportBindings",Map.class).values()))((AutoCloseable)binding).close();
+            for(var parent:field(backend,"parents",Map.class).values())((RatisAggregateExportJournal)parent).close();
+            field(backend,"lock",FileLock.class).close();field(backend,"channel",FileChannel.class).close();
+            for(var name:List.of("exportDelivery","exportAllocations","replicas","transactions","snapshots")) {
+                var member=RatisDatabaseBackendFactory.class.getDeclaredField(name);member.setAccessible(true);var owner=member.get(factory);if(owner!=null)((AutoCloseable)owner).close();
+            }
+            backend=null;factory=null;
         }
         void openRuntime(boolean recover)throws Exception {
             var fake=new RatisNodeRuntimeTest.FakeServer();current=fake;
@@ -136,4 +154,41 @@ class RatisAggregateExportColdCleanupTest {
             assertArrayEquals(protectedBytes,Files.readAllBytes(outside));assertNotNull(source.f.catalogue.epochs.read(),"Factory cleanup must leave borrowed catalogue ownership usable");
         }
     }
+    @Test void freshFactoryRestoresForcedPendingGraphAndCleansOnlyOriginalRuntimeCohort()throws Exception {
+        try(var source=new Source()) {
+            var created=await(source.backend.createExport(RatisDatabaseExportWorkflowTest.request(new UUID(2100,1),List.of(74L,75L)),RequestContext.batch()));
+            for(int visit=0;visit<128;visit++){await(source.backend.stepExport(created.jobId(),RequestContext.batch()));var saved=source.parent();if(saved.hasBarrier() && saved.snapshot().phase()==RatisDatabaseBackupJournal.Phase.REPORTED)break;}
+            var parent=source.parent();assertEquals(RatisDatabaseBackupJournal.Phase.REPORTED,parent.snapshot().phase());var captured=parent.captures();assertNotNull(captured);
+            byte[] definition=parent.input().encode(),vector=parent.captureBytes();var slots=List.copyOf(parent.slots());var reference=RatisSnapshotCohortRpc.reference(parent.snapshot().requests().getFirst());var pool=source.pool();assertEquals(1,pool.snapshotAdmissionStats().pins());
+            assertThrows(ExecutionException.class,()->await(source.backend.cancelExport(created.jobId(),RequestContext.batch())));
+            assertEquals(ExportJobs.Phase.CANCELLED,parent.phase());assertFalse(parent.drained());
+            Path path=parent.path();byte[] forcedParent=Files.readAllBytes(path);var forcedSources=new HashMap<Path,byte[]>();for(var slot:slots)forcedSources.put(slot.snapshot(),Files.readAllBytes(slot.snapshot()));long issued=source.issued();
+            source.node.close();source.node=null;assertEquals(0,pool.snapshotAdmissionStats().pins());source.loseStoppedClientOwners();
+            assertArrayEquals(forcedParent,Files.readAllBytes(path));for(var entry:forcedSources.entrySet())assertArrayEquals(entry.getValue(),Files.readAllBytes(entry.getKey()));
+            source.openRuntime(true);assertEquals(RatisSnapshotCohortRpc.Phase.GONE,RatisPoolFixtures.cohortService(source.node).state(reference).phase());source.advancePublishedDirectories();source.openFactory();
+            assertNull(field(source.factory,"exportAllocations",Object.class),"Cold cleanup loader must not initialize an issued allocation owner");
+            var restored=source.parent();assertEquals(created.jobId(),restored.input().jobId());assertArrayEquals(definition,restored.input().encode());assertArrayEquals(vector,restored.captureBytes());assertEquals(slots,restored.slots());assertFalse(restored.drained());
+            assertEquals(issued,source.issued());assertEquals(1,source.cohortCaptures.get());assertEquals(0,source.ordinaryCaptures.get());source.denyDrain=false;
+            var missing=slots.getFirst();assertTrue(restored.hasSourceIdentity(missing));Path original=missing.snapshot(),held=original.resolveSibling(original.getFileName()+".held-by-test");
+            Files.move(original,held,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(original.getParent());
+            try {
+                assertThrows(ExecutionException.class,()->await(source.backend.cancelExport(created.jobId(),RequestContext.batch())),"Missing original forced snapshot metadata cannot be recreated by a cold loader");
+                assertFalse(Files.exists(original));assertNull(field(source.factory,"exportAllocations",Object.class));assertEquals(issued,source.issued());assertEquals(1,source.cohortCaptures.get());assertEquals(0,source.ordinaryCaptures.get());
+            }finally{Files.move(held,original,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(original.getParent());}
+            assertArrayEquals(forcedSources.get(original),Files.readAllBytes(original));
+            await(source.backend.cancelExport(created.jobId(),RequestContext.batch()));
+            var status=await(source.backend.exportStatus(created.jobId(),RequestContext.batch()));assertEquals(ExportJobs.Phase.CANCELLED,status.phase());assertFalse(status.cleanupPending());assertTrue(restored.drained());
+            assertNull(field(source.factory,"exportAllocations",Object.class));assertArrayEquals(definition,restored.input().encode());assertArrayEquals(vector,restored.captureBytes());assertEquals(slots,restored.slots());assertEquals(issued,source.issued());assertEquals(1,source.cohortCaptures.get());assertEquals(0,source.ordinaryCaptures.get());assertEquals(Set.of(reference.processIncarnation()),source.cancelledProcesses);
+            var bindings=field(source.factory,"exportBindings",Map.class);assertEquals(slots.size(),bindings.size());
+            for(var slot:slots) {
+                var owner=bindings.get(slot.fence().fenceId());assertTrue(field(owner,"ownsRoute",Boolean.class),"Advanced current directory requires an owned frozen cleanup view");
+                var journal=field(owner,"journal",RatisDurableSnapshot.class);var saved=journal.snapshot();assertEquals(slot.fence(),saved.initial().fence());assertTrue(saved.observedHome().consumed());
+                for(var participant:saved.participants()){assertEquals(captured.captures().stream().filter(home->home.fence().fenceId().equals(slot.fence().fenceId())).findFirst().orElseThrow().progress(participant.route().groupId()).capture(),participant.captureToken());assertTrue(participant.captureReleased()||participant.captureReleaseLost());}
+            }
+            await(source.backend.releaseExport(created.jobId(),RequestContext.batch()));assertEquals(ExportJobs.Phase.RELEASED,restored.phase());source.factory.close();source.factory=null;
+            assertEquals(0,source.pool().snapshotAdmissionStats().pins());assertNotNull(source.f.catalogue.epochs.read());
+            try(var retained=RatisAggregateExportJournal.reopen(path)){assertEquals(ExportJobs.Phase.RELEASED,retained.phase());assertTrue(retained.drained());assertArrayEquals(definition,retained.input().encode());assertArrayEquals(vector,retained.captureBytes());assertEquals(slots,retained.slots());}
+        }
+    }
+
 }
