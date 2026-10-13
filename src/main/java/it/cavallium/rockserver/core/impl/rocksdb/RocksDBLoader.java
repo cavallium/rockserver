@@ -88,40 +88,48 @@ public class RocksDBLoader {
             if (Files.notExists(jniPath)) {
                 Files.createDirectories(jniPath);
             }
-            loadLibraryFromJarToTemp(jniPath);
-
-            RocksDB.loadLibrary(List.of(jniPath.toAbsolutePath().toString()));
+            var library=loadLibraryFromJarToTemp(jniPath);
+            RocksDB.loadLibrary(List.of(library.getParent().toAbsolutePath().toString()));
         } catch (IOException e) {
             RocksDB.loadLibrary();
         }
     }
 
-    private static Path loadLibraryFromJarToTemp(final Path tmpDir) throws IOException {
-        var temp1 = tmpDir.resolve(bugJniLibraryFileName);
-        if (Files.exists(temp1)) {
-            return temp1;
-        }
-        try (InputStream is = RocksDB.class.getClassLoader().getResourceAsStream(jniLibraryFileName)) {
-            if (is != null) {
-                Files.copy(is, temp1, StandardCopyOption.REPLACE_EXISTING);
-                return temp1;
-            }
-        }
-
-        if (bugFallbackJniLibraryFileName == null) {
-            throw new RuntimeException("rocksdb was not found inside JAR.");
-        }
-
-        var temp2 = tmpDir.resolve(bugFallbackJniLibraryFileName);
-        try (InputStream is = RocksDB.class.getClassLoader().getResourceAsStream(fallbackJniLibraryFileName)) {
-            if (is != null) {
-                Files.copy(is, temp2, StandardCopyOption.REPLACE_EXISTING);
-                return temp2;
-            }
-        }
-
+    private static final int JNI_COPY_BUFFER_BYTES=64*1024;
+    @FunctionalInterface interface NativeResource { InputStream open(String name)throws IOException; }
+    record EmbeddedNative(String resource,String filename,String sha256) {}
+    private static EmbeddedNative embeddedNative;
+    private static IOException embeddedNativeFailure;
+    private static synchronized EmbeddedNative embeddedNative()throws IOException {
+        if(embeddedNative==null && embeddedNativeFailure==null)try{embeddedNative=selectNative(jniLibraryFileName,bugJniLibraryFileName,fallbackJniLibraryFileName,bugFallbackJniLibraryFileName,name->RocksDB.class.getClassLoader().getResourceAsStream(name));}catch(IOException failure){embeddedNativeFailure=failure;}
+        if(embeddedNativeFailure!=null)throw embeddedNativeFailure;return embeddedNative;
+    }
+    /** The selected platform binary is hashed once; extraction and loading use that exact resource and alias. */
+    private static Path loadLibraryFromJarToTemp(final Path versionRoot)throws IOException {
+        return extractNative(versionRoot,embeddedNative(),name->RocksDB.class.getClassLoader().getResourceAsStream(name));
+    }
+    static EmbeddedNative selectNative(String primary,String primaryFilename,String fallback,String fallbackFilename,NativeResource resources)throws IOException {
+        try(var input=resources.open(primary)){if(input!=null)return new EmbeddedNative(primary,primaryFilename,nativeDigest(input));}
+        if(fallback!=null && fallbackFilename!=null)try(var input=resources.open(fallback)){if(input!=null)return new EmbeddedNative(fallback,fallbackFilename,nativeDigest(input));}
         throw new RuntimeException("rocksdb was not found inside JAR.");
     }
+    static Path extractNative(Path versionRoot,EmbeddedNative selected,NativeResource resources)throws IOException {
+        Path directory=versionRoot.resolve("sha256-"+selected.sha256()),target=directory.resolve(selected.filename());Files.createDirectories(directory);
+        if(Files.isRegularFile(target)){try(var input=Files.newInputStream(target)){if(nativeDigest(input).equals(selected.sha256()))return target;}}
+        Path temporary=Files.createTempFile(directory,"jni-",".part");
+        try {
+            var digest=nativeSha256();var buffer=new byte[JNI_COPY_BUFFER_BYTES];
+            try(var input=resources.open(selected.resource());var output=java.nio.channels.FileChannel.open(temporary,java.nio.file.StandardOpenOption.WRITE)) {
+                if(input==null)throw new IOException("Selected embedded native resource disappeared");
+                for(int count;(count=input.read(buffer))!=-1;){if(count==0)continue;digest.update(buffer,0,count);var bytes=java.nio.ByteBuffer.wrap(buffer,0,count);while(bytes.hasRemaining())output.write(bytes);}output.force(true);
+            }
+            if(!HexFormat.of().formatHex(digest.digest()).equals(selected.sha256()))throw new IOException("Selected embedded native bytes changed after hashing");
+            Files.move(temporary,target,StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);
+            return target;
+        }finally{Files.deleteIfExists(temporary);}
+    }
+    private static String nativeDigest(InputStream input)throws IOException {var digest=nativeSha256();var buffer=new byte[JNI_COPY_BUFFER_BYTES];for(int count;(count=input.read(buffer))!=-1;)if(count!=0)digest.update(buffer,0,count);return HexFormat.of().formatHex(digest.digest());}
+    private static java.security.MessageDigest nativeSha256(){try{return java.security.MessageDigest.getInstance("SHA-256");}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}
 
     public record LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
                            DBOptions dbOptions, Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap,
