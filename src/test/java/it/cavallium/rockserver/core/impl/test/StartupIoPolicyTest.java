@@ -28,11 +28,11 @@ class StartupIoPolicyTest {
     @Test void bootstrapRequiresRealCompletedWindowsAndIdleNeverGrowsAdmission() {
         var idle = sample(0, 0, false);
         assertEquals(StartupIoPolicy.UNKNOWN, idle.pressureMask());
-        assertFalse(idle.capturePressure()); assertFalse(idle.qualifiedHealthy());
+        assertFalse(idle.capturePressure()); assertFalse(idle.qualifiedHealthy()); assertTrue(idle.idleNeutral());
         calibrate();
         assertFalse(sample(0, 0, false).qualifiedHealthy());
         var busy = sample(2, 1, false);
-        assertTrue(busy.capturePressure()); assertFalse(busy.qualifiedHealthy());
+        assertTrue(busy.capturePressure()); assertFalse(busy.qualifiedHealthy()); assertFalse(busy.idleNeutral());
         assertNotEquals(0, busy.pressureMask() & StartupIoPolicy.FOREGROUND);
     }
     @Test void measuredMeanAndWindowMaximumCausePressureAndRecoveryNeedsFreshWindows() {
@@ -88,6 +88,7 @@ class StartupIoPolicyTest {
             var decision = policy.sample(idle, idle.sampledNanos());
             assertEquals(i < StartupIoPolicy.RECOVERY_WINDOWS - 1, decision.capturePressure());
             assertFalse(decision.qualifiedHealthy());
+            assertEquals(i == StartupIoPolicy.RECOVERY_WINDOWS - 1, decision.idleNeutral());
             assertSame(decision, policy.sample(idle, idle.sampledNanos()));
         }
         var idle = input(0, 0, false);
@@ -106,4 +107,39 @@ class StartupIoPolicyTest {
         assertTrue(policy.sample(urgent, urgent.sampledNanos()).capturePressure());
         assertNotEquals(0, policy.sample(healthy, healthy.sampledNanos()).pressureMask() & StartupIoPolicy.URGENT);
     }
+    @Test void completedUncalibratedWindowsAreNeverIdleNeutralEvenWithoutCapturePressure() {
+        counters.recordPoint(100, false);
+        var result = sample(0, 0, false);
+        assertEquals(StartupIoPolicy.UNKNOWN, result.pressureMask());
+        assertFalse(result.capturePressure());
+        assertFalse(result.qualifiedHealthy());
+        assertFalse(result.idleNeutral());
+    }
+
+    @Test void staleIncompleteOrUnconservedIdleCannotBecomeNeutral() {
+        var idle = input(0, 0, false);
+        assertTrue(policy.sample(idle, idle.sampledNanos()).idleNeutral());
+        idle = input(0, 0, false);
+        assertFalse(policy.sample(idle, idle.sampledNanos() + StartupIoPolicy.MAX_SAMPLE_AGE_NANOS + 1).idleNeutral());
+        var incomplete = new StartupIoPolicy.InputSample(++epoch, epoch * 100_000_000, true, false,
+                2, 0, 0, 100, 100, false, counters.snapshot(epoch));
+        assertFalse(policy.sample(incomplete, incomplete.sampledNanos()).idleNeutral());
+        var empty = new StartupReadCompletions.Cohort(0, 0, 0, 0, 0);
+        var unconserved = new StartupReadCompletions.Snapshot(++epoch, 0, 1, 0, empty, empty, true);
+        var forged = new StartupIoPolicy.InputSample(epoch, epoch * 100_000_000, true, true,
+                2, 0, 0, 100, 100, false, unconserved);
+        assertFalse(policy.sample(forged, forged.sampledNanos()).idleNeutral());
+    }
+
+    @Test void contradictorySameEpochCannotRestoreIdleNeutrality() {
+        var idle = input(0, 0, false);
+        assertTrue(policy.sample(idle, idle.sampledNanos()).idleNeutral());
+        var busy = new StartupIoPolicy.InputSample(idle.epoch(), idle.sampledNanos(), true, true,
+                2, 1, 0, 100, 99, false, idle.reads());
+        assertFalse(policy.sample(busy, busy.sampledNanos()).idleNeutral());
+        assertFalse(policy.sample(idle, idle.sampledNanos()).idleNeutral());
+        assertFalse(policy.sample(null, idle.sampledNanos()).idleNeutral());
+        assertFalse(policy.sample(idle, idle.sampledNanos()).idleNeutral());
+    }
+
 }

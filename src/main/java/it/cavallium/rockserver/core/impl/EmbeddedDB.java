@@ -3239,15 +3239,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var storageWorkloads = new HashMap<String, Set<String>>();
 		var admission = resources.settings().admission();
 		for (var group : admission.storageGroups().values()) {
-			var workloads = new HashSet<>(group.workloadGroups());
-			if (group.id().equals(admission.defaultStorageId())) {
-				for (String workload : startupReadGroups.keySet()) {
-					if (!workload.equals(":shared") && admission.storageForWorkload(workload).id().equals(group.id()))
-						workloads.add(workload);
-				}
-			}
-			workloads.add(":shared");
-			storageWorkloads.put(group.id(), workloads);
+			storageWorkloads.put(group.id(), new HashSet<>());
 		}
 		var workloadCaches = new HashMap<String, List<SnapshotCache>>();
 		for (String workload : startupReadGroups.keySet()) workloadCaches.put(workload, new ArrayList<>());
@@ -3257,11 +3249,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			addStartupCache(workloadCaches, fallbackWorkloadGroup, fallbackCache == null ? "default" : fallbackCache);
 			if (admission.enabled()) {
 				addStartupStorageWorkload(storageWorkloads, fallbackWorkloadGroup, fallback);
+				var named = new HashMap<String, it.cavallium.rockserver.core.config.NamedColumnConfig>();
 				for (var column : Objects.requireNonNullElse(config.global().columnOptions(),
-						new it.cavallium.rockserver.core.config.NamedColumnConfig[0])) {
-					addStartupStorageWorkload(storageWorkloads,
-							columnWorkloadGroups.getOrDefault(column.name(), fallbackWorkloadGroup), column);
+						new it.cavallium.rockserver.core.config.NamedColumnConfig[0])) named.put(column.name(), column);
+				var relevantWorkloads = new HashSet<String>();
+				relevantWorkloads.add(fallbackWorkloadGroup); // Future unnamed columns inherit this physical route.
+				for (String columnName : columnCaches.keySet()) {
+					String workload = columnWorkloadGroups.getOrDefault(columnName, fallbackWorkloadGroup);
+					relevantWorkloads.add(workload);
+					addStartupStorageWorkload(storageWorkloads, workload, named.containsKey(columnName) ? named.get(columnName) : fallback);
 				}
+				for (var group : admission.storageGroups().values()) {
+					for (String workload : group.workloadGroups()) {
+						if (relevantWorkloads.contains(workload)) storageWorkloads.get(group.id()).add(workload);
+					}
+				}
+				// Shared CDC/global urgency remains a veto on every domain, without qualifying owner growth.
+				storageWorkloads.values().forEach(owners -> owners.add(":shared"));
 			}
 		} catch (org.github.gestalt.config.exceptions.GestaltException failure) {
 			throw new IllegalStateException("Cannot resolve startup cache workload", failure);
