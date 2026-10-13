@@ -11,24 +11,25 @@ import java.util.function.LongSupplier;
 final class RatisGenerationRegistry implements AutoCloseable {
     record Owned(DistributedSchema schema,RangeDirectory directory,RatisRocksDBConnection.Generation generation) {}
     private final Path root;
-    private final RatisRoutedClient routed;
+    private final Map<UUID,RatisRoutedClient> routed;
     private final RatisSchemaCatalogue schemas;
     private final RatisRocksDBConnection.GenerationFactory factory;
     private final LongSupplier ids;
     private final int maximum;
     private final Capacity capacity;
     private final Map<String,Owned> generations=new LinkedHashMap<>();
-    RatisGenerationRegistry(Path root,RatisRoutedClient routed,RatisSchemaCatalogue schemas,RatisRocksDBConnection.GenerationFactory factory,LongSupplier ids,int maximum,DistributedSchema initial,Capacity capacity) throws IOException {
-        this.root=root; this.routed=routed; this.schemas=schemas; this.factory=factory; this.ids=ids; this.maximum=maximum; this.capacity=capacity; Files.createDirectories(root);
+    RatisGenerationRegistry(Path root,Map<UUID,RatisRoutedClient> routed,RatisSchemaCatalogue schemas,RatisRocksDBConnection.GenerationFactory factory,LongSupplier ids,int maximum,Capacity capacity) throws IOException {
+        this.root=root; this.routed=Map.copyOf(routed); this.schemas=schemas; this.factory=factory; this.ids=ids; this.maximum=maximum; this.capacity=capacity; Files.createDirectories(root);
         try {
+        if(routed.size()>maximum)throw new IOException("Declared domains exceed the shared generation budget");var currentSchemas=new ArrayList<DistributedSchema>();long schemaBytes=0;for(var data:routed.values()){var schema=schemas.read(data.directory().schemaDigest());if(schema==null)throw new IOException("Advertised domain schema content is missing");schema.requireMatches(data.directory());schemaBytes+=DistributedSchemaCodec.encodedSize(schema)+RangeDirectoryCodec.encode(data.directory()).length;if(schemaBytes>16L*1024*1024)throw new IOException("Database generation metadata exceeds shared byte budget");currentSchemas.add(schema);}requireUnique(currentSchemas);
         try (var files=Files.newDirectoryStream(root)) {
             for (var folder:files) {
                 if (!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unexpected connection generation entry");
                 var in=ByteBuffer.wrap(SessionJournalFiles.read(folder.resolve("binding"),8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); if (in.hasRemaining() || !folder.getFileName().toString().equals(key(schema))) throw new IOException("Invalid generation binding");
-                schema.requireMatches(directory); routed.requireKnownSchema(schema); if (!Arrays.equals(routed.directory(schema).payloadDigest(),directory.payloadDigest())) throw new IOException("Original generation placement changed"); add(schema,directory,folder,false);
+                schema.requireMatches(directory); var data=data(schema.domainId());data.requireKnownSchema(schema); if (!Arrays.equals(data.directory(schema).payloadDigest(),directory.payloadDigest())) throw new IOException("Original generation placement changed"); add(schema,directory,folder,false);
             }
         }
-        routed.requireKnownSchema(initial); if (!generations.containsKey(key(initial))) add(initial,routed.directory(initial),root.resolve(key(initial)),true);
+        for(var domain:routed.keySet())current(domain);validateColumns();
         } catch (Throwable failure) { try { close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Generation inventory open failed",failure); }
     }
     private static String key(DistributedSchema schema) { return HexFormat.of().formatHex(schema.digest()); }
@@ -45,9 +46,20 @@ final class RatisGenerationRegistry implements AutoCloseable {
         var owned=new Owned(schema,directory,Objects.requireNonNull(factory.create(schema,directory,folder,ids)));
         synchronized(this) { generations.put(key(schema),owned); }
     }
-    Owned current() throws IOException {
-        var directory=routed.directory(); var key=HexFormat.of().formatHex(directory.schemaDigest()); Owned current; synchronized(this) { current=generations.get(key); } if (current!=null) return current;
-        var schema=schemas.read(directory.schemaDigest()); if (schema==null) throw new IOException("Activated immutable schema absent from catalogue"); routed.requireKnownSchema(schema); schema.requireMatches(directory); add(schema,directory,root.resolve(key),true); synchronized(this) { return generations.get(key); }
+    private RatisRoutedClient data(UUID domain)throws IOException {var data=routed.get(domain);if(data==null)throw new IOException("Generation belongs to an undeclared database domain");return data;}
+    Owned current(UUID domain) throws IOException {
+        var data=data(domain);var directory=data.directory();var key=HexFormat.of().formatHex(directory.schemaDigest());Owned current;synchronized(this){current=generations.get(key);}if(current!=null)return current;
+        var schema=schemas.read(directory.schemaDigest());if(schema==null)throw new IOException("Activated immutable schema absent from catalogue");data.requireKnownSchema(schema);schema.requireMatches(directory);add(schema,directory,root.resolve(key),true);validateColumns();synchronized(this){return generations.get(key);}
+    }
+    List<Owned> current()throws IOException {var owners=new ArrayList<Owned>();for(var domain:routed.keySet())owners.add(current(domain));return List.copyOf(owners);}
+    Owned column(long column)throws IOException {for(var owner:current())if(owner.schema.columns().stream().anyMatch(c->c.apiId()==column))return owner;throw new IOException("Unknown database column API identity");}
+    Owned column(String name)throws IOException {Owned found=null;for(var owner:current())if(owner.schema.columns().stream().anyMatch(c->c.name().equals(name))){if(found!=null)throw new IOException("Ambiguous database column name");found=owner;}return found;}
+    private static void requireUnique(Collection<DistributedSchema> schemas)throws IOException {
+        var ids=new HashSet<Long>();var columns=new HashSet<UUID>();var names=new HashSet<String>();for(var schema:schemas)for(var column:schema.columns())if(!ids.add(column.apiId()) || !columns.add(column.columnId()) || !names.add(column.name()))throw new IOException("Database domains share a column UUID/API identity/name");
+    }
+    private void validateColumns()throws IOException {
+        var ids=new HashSet<Long>();var columns=new HashSet<UUID>();var names=new HashSet<String>();
+        for(var domain:routed.keySet()){var digest=HexFormat.of().formatHex(data(domain).directory().schemaDigest());var owner=generations.get(digest);if(owner==null)continue;for(var column:owner.schema.columns())if(!ids.add(column.apiId()) || !columns.add(column.columnId()) || !names.add(column.name()))throw new IOException("Database domains share a column UUID/API identity/name");}
     }
     Owned transaction(long id) throws IOException { for (var generation:all()) if (generation.generation().adapter().ownsTransactionOrUpdate(id)) return generation; throw new IOException("Original transaction/update handle not owned by this connection"); }
     Owned iterator(long id) throws IOException { for (var generation:all()) if (generation.generation().adapter().ownsIterator(id)) return generation; throw new IOException("Original iterator handle not owned by this connection"); }

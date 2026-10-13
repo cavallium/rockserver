@@ -5,6 +5,10 @@ import it.cavallium.rockserver.core.config.*;
 import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.io.IOException;
 import java.nio.file.*;
+import java.net.URI;
+import it.cavallium.rockserver.core.server.Server;
+import it.cavallium.rockserver.core.server.ServerBuilder;
+import it.cavallium.rockserver.core.common.Utils.HostAndPort;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import org.apache.ratis.RaftConfigKeys;
@@ -46,6 +50,11 @@ public final class RatisNodeService implements AutoCloseable {
     private final RatisNodeManifest manifest; private final Resources resources; private final RatisNodeRuntime node;
     private final RatisSchemaCatalogue schemas; private final RatisDatabaseDomainRoster roster;
     private boolean starting,closing,closed,closeRequested; private int checks;
+    private RatisDatabaseBackendFactory frontendBackend;
+    private Server frontend;
+    private boolean frontendOpening,frontendClosed,backendClosed;
+    @FunctionalInterface interface BackendCreator { RatisDatabaseBackendFactory create() throws IOException; }
+    @FunctionalInterface interface ListenerCreator { Server create(RatisRocksDBConnection connection) throws IOException; }
     private RatisNodeService(RatisNodeManifest manifest,Resources resources,RatisNodeRuntime node) {
         this.manifest=manifest; this.resources=resources; this.node=node; var plan=manifest.plan(); var c=plan.catalogue();
         schemas=new RatisSchemaCatalogue(resources.catalogue,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
@@ -112,6 +121,38 @@ public final class RatisNodeService implements AutoCloseable {
         catch (IOException | RuntimeException | Error failure) { synchronized (this) { closeRequested=true; } throw failure; }
         finally { synchronized (this) { starting=false; } }
     }
+    /** Own the public listener and backend; shared node transports outlive their actual drain. */
+    public void startFrontend(Path backendRoot,URI listen,RatisRocksDBConnection.DomainPlacement placement,
+            RatisSchemaClient.TrustedOperatorResolver resolver,RatisDatabaseBackendFactory.Policy policy) throws IOException {
+        requireListenAddress(listen);
+        startFrontend(() -> new RatisDatabaseBackendFactory(backendRoot,manifest.plan(),resources.catalogue,
+                resources.routed,resources.scheduler,placement,resolver,policy),connection -> {
+            var builder=new ServerBuilder();builder.setClient(connection);
+            builder.setHttpAddress(new HostAndPort(listen.getHost(),listen.getPort()));
+            builder.setUseThrift(listen.getScheme().equals("thrift"));return builder.build();
+        },listen);
+    }
+    static void requireListenAddress(URI listen) {
+        Objects.requireNonNull(listen);
+        if (!("grpc".equals(listen.getScheme()) || "thrift".equals(listen.getScheme())) || listen.getHost()==null
+                || listen.getPort()<1 || listen.getPort()>65535 || listen.getRawUserInfo()!=null
+                || listen.getRawQuery()!=null || listen.getRawFragment()!=null
+                || listen.getRawPath()!=null && !listen.getRawPath().isEmpty())
+            throw new IllegalArgumentException("Frontend address requires grpc://host:port or thrift://host:port");
+    }
+    void startFrontend(BackendCreator backend,ListenerCreator listener,URI listen) throws IOException {
+        synchronized(this) {
+            requireOpen();if(frontendOpening || frontendBackend!=null || node.state()!=RatisNodeRuntime.State.RUNNING)
+                throw new IOException("Node frontend cannot start in its current state");frontendOpening=true;
+        }
+        try {
+            verifyCatalogue();
+            var owner=Objects.requireNonNull(backend.create());synchronized(this){frontendBackend=owner;}
+            var connection=owner.open(listen);
+            var server=Objects.requireNonNull(listener.create(connection));synchronized(this){frontend=server;}
+            server.start();
+        } finally { synchronized(this){frontendOpening=false;} }
+    }
     public synchronized RatisNodeRuntime.State state() { return closed ? RatisNodeRuntime.State.CLOSED : closeRequested ? RatisNodeRuntime.State.STOPPING : node.state(); }
     /** Fresh exact schema and directory observations. This does not prove permanent availability or all-replica placement. */
     public void verifyCatalogue() throws IOException {
@@ -143,9 +184,11 @@ public final class RatisNodeService implements AutoCloseable {
     @Override public void close() throws IOException {
         synchronized (this) {
             if (closed) return;
-            if (starting || closing || checks!=0) throw new IOException("Node service work is active"); closeRequested=true; closing=true;
+            if (starting || closing || frontendOpening || checks!=0) throw new IOException("Node service work is active"); closeRequested=true; closing=true;
         }
         try {
+            if(frontend!=null && !frontendClosed){frontend.close();frontendClosed=true;}
+            if(frontendBackend!=null && !backendClosed){frontendBackend.close();backendClosed=true;}
             node.close(); // On a drain/pin/close failure retain all dependencies and ownership for retry.
             resources.close(); synchronized (this) { closed=true; }
         } finally { synchronized (this) { closing=false; } }

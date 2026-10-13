@@ -1,0 +1,115 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.common.distributed.*;
+import java.io.*;
+import java.nio.file.*;
+import java.time.Duration;
+import it.cavallium.rockserver.core.impl.RWScheduler;
+import static org.mockito.Mockito.*;
+import static org.mockito.ArgumentMatchers.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import static org.junit.jupiter.api.Assertions.*;
+import static it.cavallium.rockserver.distributed.ratis.RatisAtomicClientTest.*;
+
+class RatisRangeDeleteTest {
+    @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    static <T>T await(CompletableFuture<T> future)throws Exception{return future.get(15,TimeUnit.SECONDS);}
+    static void seed(RatisAtomicClientTest.Fixture f,long column,Keys key,int value,long sequence)throws IOException{RatisRocksDBAdapterTest.seed(f,column,key,value(value),sequence);}
+    static String stack(Throwable failure){var output=new StringWriter();failure.printStackTrace(new PrintWriter(output));return output.toString();}
+    @Test void expiredOriginalBusinessBeforeInitialHomeLeavesNoRowOrPrepareAndLocallySettlesExactFailure()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("native-expired"),true)) {
+            seed(f,71,key(2),11,1900);seed(f,71,key(200),12,1901);var commit=f.separateIdentity(10);
+            var snapshot=new RatisSnapshotClient.Identity(new UUID(990,1),new OperationId(f.session,1,600),new OperationId(f.session,1,601));var allocation=new RatisRocksDBAdapter.Allocation(root.resolve("unused-snapshot"),root.resolve("unused-commit"),new RatisTransactionClient.Identity(snapshot,commit));
+            var allocations=new AtomicInteger();RatisRocksDBAdapter.AllocationSource source=context->{allocations.incrementAndGet();return CompletableFuture.completedFuture(allocation);};
+            var expired=new AtomicBoolean();f.beforeHomeCommand=()->{if(!expired.compareAndSet(false,true))return;assertEquals(2,f.opens.get());try{var before=f.catalogue.epochs.read();var next=before.advanceTime(f.grant.expiresAtMillis());assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(f.outer.operation(7),before,next)).status());var home=f.homeDirectory.ranges().getFirst();var control=DistributedCommand.sessionControl(home.groupId(),home.rangeEpoch(),f.homeDirectory.schemaDigest(),new OperationId(commit.firstControl().sessionId(),commit.firstControl().epoch(),900),RangeSessionControl.advance(next),-1);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.append(home,DistributedCommandCodec.encode(control))).status());}catch(Exception failure){throw new RuntimeException(failure);}};
+            Path folder=root.resolve("expired-range");try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,source,folder)) {
+                var failure=assertThrows(ExecutionException.class,()->await(owner.delete(71,key(2),key(201),RequestContext.batch()).observer()));assertTrue(failure.getCause().getMessage().contains("SESSION_EXPIRED"),()->stack(failure.getCause()));f.beforeHomeCommand=null;
+                assertNull(f.homes.read(commit.transaction()));for(var group:f.groups)assertNull(f.stores.get(group).preparedParticipant(commit.transaction()));assertArrayEquals(new byte[]{11},f.get(71,key(2)));assertArrayEquals(new byte[]{12},f.get(71,key(200)));assertEquals(1,allocations.get());assertEquals(RatisRocksDBDirect.RecoveryState.NONE,owner.recoveryState());
+            }
+            int opened=f.opens.get();try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,source,folder)) {var failure=assertThrows(ExecutionException.class,()->await(owner.resume(RequestContext.batch()).observer()));assertTrue(failure.getCause().getMessage().contains("SESSION_EXPIRED"),()->stack(failure.getCause()));assertEquals(opened,f.opens.get());assertEquals(1,allocations.get());assertNull(f.homes.read(commit.transaction()));}
+        }
+    }
+    @Test void fixedBoundsClipBothShardsAndUnboundedSentinelDeletesMaximumCompleteKey()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("fixed"),true);var tx=RatisRocksDBAdapterTest.client(f,f.data);var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,new RatisRocksDBAdapterTest.Allocations(f),root.resolve("fixed-job"));var adapter=new RatisRocksDBAdapter(f.schema,f.directory,tx,context->CompletableFuture.failedFuture(new IOException("No second allocator")),null,null).rangeDeletes(owner)) {
+            seed(f,71,key(1),1,1900);seed(f,71,key(2),2,1901);seed(f,71,key(128),3,1902);seed(f,71,key(200),4,1903);seed(f,71,key(255),5,1904);seed(f,71,key(0),6,1905);
+            await(adapter.api(RequestContext.batch()).deleteRangeAsync(71,key(2),key(201)));assertArrayEquals(new byte[]{1},f.get(71,key(1)));assertNull(f.get(71,key(2)));assertNull(f.get(71,key(128)));assertNull(f.get(71,key(200)));assertArrayEquals(new byte[]{5},f.get(71,key(255)));assertEquals(2,f.opens.get());
+            await(adapter.api(RequestContext.batch()).deleteRangeAsync(71,null,null));assertNull(f.get(71,key(0)));assertNull(f.get(71,key(1)));assertNull(f.get(71,key(255)));assertEquals(4,f.opens.get());assertEquals(RatisRocksDBDirect.RecoveryState.NONE,owner.recoveryState());assertTrue(f.stores.values().stream().allMatch(store->store.activeSnapshotPins()==0));
+        }
+    }
+    @Test void hashedRangeDeletesOnlyRequestedCollisionMembersAndKeepsBothNeighbours()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("hashed"),true);var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,new RatisRocksDBAdapterTest.Allocations(f),root.resolve("hashed-job"))) {
+            seed(f,74,member(2,"alpha"),1,1900);seed(f,74,member(2,"bravo"),2,1901);seed(f,74,member(2,"charlie"),3,1902);seed(f,74,member(2,"delta"),4,1903);seed(f,74,member(200,"bravo"),5,1904);
+            await(owner.delete(74,member(2,"bravo"),member(2,"delta"),RequestContext.batch()).observer());assertArrayEquals(new byte[]{1},f.get(74,member(2,"alpha")));assertNull(f.get(74,member(2,"bravo")));assertNull(f.get(74,member(2,"charlie")));assertArrayEquals(new byte[]{4},f.get(74,member(2,"delta")));assertArrayEquals(new byte[]{5},f.get(74,member(200,"bravo")));
+            await(owner.delete(74,key(2),key(201),RequestContext.batch()).observer());assertNull(f.get(74,member(2,"alpha")));assertNull(f.get(74,member(2,"delta")));assertNull(f.get(74,member(200,"bravo")));assertEquals(3,f.opens.get());
+        }
+    }
+    @Test void liveUnknownInitialHomeReplyResumesTheOwnedJournalWithoutOverlappingItsLock()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("live-unknown"),true);var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,new RatisRocksDBAdapterTest.Allocations(f),root.resolve("live-job"))) {
+            seed(f,71,key(2),1,1900);seed(f,71,key(200),2,1901);f.beforeHomeRead=()->{throw new UncheckedIOException(new IOException("HOME proof temporarily unavailable"));};assertThrows(ExecutionException.class,()->await(owner.delete(71,key(2),key(201),RequestContext.batch()).observer()));int opened=f.opens.get();assertEquals(2,opened);assertArrayEquals(new byte[]{1},f.get(71,key(2)));f.beforeHomeRead=null;
+            await(owner.resume(RequestContext.batch()).observer());assertEquals(opened,f.opens.get());assertNull(f.get(71,key(2)));assertNull(f.get(71,key(200)));
+        }
+    }
+    @Test void coldUnknownAcceptedJournalPreservesItsOriginalRemoteCuts()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("cold-unknown"),true)) {
+            seed(f,71,key(2),1,1900);seed(f,71,key(200),2,1901);var allocations=new RatisRocksDBAdapterTest.Allocations(f);Path folder=root.resolve("cold-job");f.beforeHomeRead=()->{throw new UncheckedIOException(new IOException("Lost original HOME lookup"));};
+            try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)){assertThrows(ExecutionException.class,()->await(owner.delete(71,key(2),key(201),RequestContext.batch()).observer()));}
+            int opened=f.opens.get();assertEquals(2,opened);assertEquals(0,f.captureCloses.get());f.beforeHomeRead=null;
+            try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)){await(owner.resume(RequestContext.batch()).observer());assertEquals(opened,f.opens.get());assertEquals(1,allocations.count.get());assertNull(f.get(71,key(2)));assertNull(f.get(71,key(200)));}
+        }
+    }
+    @Test void genuineConcurrentWriteMakesRangeAbortAndConsumeBeforeExposingConflict()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("range-conflict"),true);var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,new RatisRocksDBAdapterTest.Allocations(f),root.resolve("conflict-job"))) {
+            seed(f,71,key(2),1,1900);seed(f,71,key(200),2,1901);var once=new AtomicBoolean();f.beforeAuthorize=()->{if(once.compareAndSet(false,true))try{seed(f,71,key(2),9,1902);}catch(IOException failure){throw new UncheckedIOException(failure);}};
+            var failure=assertThrows(ExecutionException.class,()->await(owner.delete(71,key(2),key(201),RequestContext.batch()).observer()));assertTrue(failure.getCause().getMessage().contains("CONFLICT"));assertArrayEquals(new byte[]{9},f.get(71,key(2)));assertArrayEquals(new byte[]{2},f.get(71,key(200)));assertEquals(RatisRocksDBDirect.RecoveryState.NONE,owner.recoveryState());
+            var identity=new UUID(220,2);var home=f.homes.read(identity);assertEquals(TransactionStatus.Phase.ABORT,home.phase());assertTrue(home.fullyFinalized());assertTrue(home.consumed());
+        }
+    }
+    @Test void ownerDeadlineAfterAcceptedCaptureDoesNotAllocateReplacementCuts()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("deadline"),true)) {
+            seed(f,71,key(2),1,1900);seed(f,71,key(200),2,1901);var expired=new AtomicBoolean();var scheduler=spy(f.scheduler);
+            doReturn(10L).when(scheduler).resolveMonotonicDeadline(any(RequestContext.class));doAnswer(call->expired.get()).when(scheduler).isMonotonicDeadlineExpired(anyLong());doAnswer(call->expired.get()?0L:TimeUnit.SECONDS.toNanos(1)).when(scheduler).remainingMonotonicDeadlineNanos(anyLong());doAnswer(call->f.scheduler.executor(call.getArgument(0),call.getArgument(1),Long.MAX_VALUE)).when(scheduler).executor(any(WorkloadProfile.class),any(OperationFamily.class),anyLong());
+            try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,scheduler,new RatisRocksDBAdapterTest.Allocations(f),root.resolve("deadline-job"))) {f.beforeHomeRead=()->expired.set(true);assertThrows(ExecutionException.class,()->await(owner.delete(71,key(2),key(201),RequestContext.batch()).observer()));int opened=f.opens.get();assertEquals(2,opened);f.beforeHomeRead=null;expired.set(false);await(owner.resume(RequestContext.batch()).observer());assertEquals(opened,f.opens.get());assertNull(f.get(71,key(2)));assertNull(f.get(71,key(200)));}
+        }
+    }
+    @Test void failedConsumptionLiveRetryKeepsSavedResultAndExactEpochZeroRequest()throws Exception {consumptionRetry(false);}
+    @Test void failedConsumptionColdRetryKeepsSavedResultAndExactEpochZeroRequest()throws Exception {consumptionRetry(true);}
+    private void consumptionRetry(boolean cold)throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve(cold?"cold-consume":"live-consume"),true)) {
+            seed(f,71,key(2),1,1900);seed(f,71,key(200),2,1901);var base=f.transport();var blocked=new AtomicBoolean();var lose=new AtomicBoolean(true);var controls=new ArrayList<byte[]>();
+            try(var home=new RatisRoutedClient(f.homeDirectory,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{if(blocked.get())throw new IOException("Applied consume proof unavailable");return base.read(route,column,key);}public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{return base.command(route,command);}public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{if(blocked.get())throw new IOException("Retained consume proof unavailable");return base.transaction(route,bytes,fresh);}public byte[] participant(RangeDescriptor route,byte[] bytes)throws IOException{var result=base.participant(route,bytes);if(HomeRecovery.isRecovery(bytes) && HomeRecovery.decode(bytes).action()==HomeRecovery.Action.CONSUME){controls.add(bytes.clone());if(lose.getAndSet(false)){blocked.set(true);throw new IOException("Lost applied protected consume");}}return result;}})) {
+                var homes=new RatisTransactionStatuses(home,f.homeColumn);var allocations=new RatisRocksDBAdapterTest.Allocations(f);Path folder=root.resolve(cold?"cold-consume-job":"live-consume-job");var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,homes,f.scheduler,allocations,folder);
+                try{var first=owner;assertThrows(ExecutionException.class,()->await(first.delete(71,key(2),key(201),RequestContext.batch()).observer()));assertEquals(1,controls.size());assertEquals(0,HomeRecovery.decode(controls.getFirst()).operation().epoch());int opened=f.opens.get();blocked.set(false);if(cold){owner.close();owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,homes,f.scheduler,allocations,folder);}await(owner.resume(RequestContext.batch()).observer());assertEquals(1,controls.size());assertEquals(opened,f.opens.get());assertEquals(1,allocations.count.get());assertTrue(f.homes.read(new UUID(220,2)).consumed());assertNull(f.get(71,key(2)));assertNull(f.get(71,key(200)));}
+                finally{blocked.set(false);owner.close();}
+            }
+        }
+    }
+
+    @Test void emptyStagingResetPreservesOriginalCutAndCannotClearAFrozenPlan()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("reset"),true)) {
+            seed(f,71,key(2),1,1900);var column=f.schema.column(71).columnId();var scope=new TransactionScope(List.of(TransactionScope.Span.point(column,new byte[]{2})));
+            try(var capture=f.data.openTransaction(scope,Duration.ofSeconds(30))) {var cut=capture.snapshot();var id=capture.captureId();var mutation=new Mutation(Mutation.Kind.PUT,column,new byte[]{2},new byte[]{9});capture.stage(List.of(mutation));assertArrayEquals(new byte[]{9},capture.get(column,new byte[]{2}));capture.stage(List.of());assertEquals(cut,capture.snapshot());assertEquals(id,capture.captureId());assertArrayEquals(new byte[]{1},capture.get(column,new byte[]{2}));capture.stage(List.of(mutation));var planned=capture.plan(new DistributedCommand(capture.descriptor().groupId(),capture.descriptor().rangeEpoch(),f.schema.digest(),new OperationId(f.session,1,500),List.of(mutation)));assertNotNull(planned.acceptance());assertThrows(IOException.class,()->capture.stage(List.of()));assertArrayEquals(new byte[]{1},f.get(71,key(2)));}
+        }
+    }
+
+    @Test void completeInputSidecarWithoutMainRecoversOriginalCompletedOperation()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("input-only"),true)) {seed(f,71,key(2),1,1900);var allocations=new RatisRocksDBAdapterTest.Allocations(f);Path folder=root.resolve("input-only-job");try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)){await(owner.delete(71,key(2),key(3),RequestContext.batch()).observer());}Files.move(folder.resolve("input"),folder.resolve("input.pending"));int opened=f.opens.get();try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)){await(owner.resume(RequestContext.batch()).observer());assertTrue(Files.isRegularFile(folder.resolve("input")));assertFalse(Files.exists(folder.resolve("input.pending")));assertEquals(opened,f.opens.get());assertEquals(1,allocations.count.get());assertNull(f.get(71,key(2)));}}
+    }
+    @Test void completeInputSidecarExtendsOlderInputWithoutNewCapture()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("input-older"),true)) {seed(f,71,key(2),1,1900);seed(f,71,key(200),2,1901);Path folder=root.resolve("input-older-job");var original=new java.util.concurrent.atomic.AtomicReference<byte[]>();var base=f.transport();try(var routed=new RatisRoutedClient(f.directory,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor r,UUID c,byte[] k)throws IOException{return base.read(r,c,k);}public CommandResult command(RangeDescriptor r,DistributedCommand c)throws IOException{return base.command(r,c);}public byte[] participant(RangeDescriptor r,byte[] b)throws IOException{return base.participant(r,b);}public byte[] transaction(RangeDescriptor r,byte[] b,boolean fresh)throws IOException{if(ScopedTransactionRpc.kind(b,ScopedTransactionRpc.MAX_REQUEST_BYTES)==ScopedTransactionRpc.OPEN && original.get()==null)original.set(Files.readAllBytes(folder.resolve("input")));return base.transaction(r,b,fresh);}})) {var allocations=new RatisRocksDBAdapterTest.Allocations(f);f.beforeHomeRead=()->{throw new UncheckedIOException(new IOException("Keep original accepted operation unresolved"));};try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,routed,f.homes,f.scheduler,allocations,folder)){assertThrows(ExecutionException.class,()->await(owner.delete(71,key(2),key(201),RequestContext.batch()).observer()));}byte[] latest=Files.readAllBytes(folder.resolve("input"));Files.write(folder.resolve("input.pending"),latest);Files.write(folder.resolve("input"),original.get());int opened=f.opens.get();f.beforeHomeRead=null;try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,routed,f.homes,f.scheduler,allocations,folder)){await(owner.resume(RequestContext.batch()).observer());assertEquals(opened,f.opens.get());assertEquals(1,allocations.count.get());assertFalse(Files.exists(folder.resolve("input.pending")));assertNull(f.get(71,key(2)));assertNull(f.get(71,key(200)));}}}
+    }
+    @Test void completeAtomicSidecarColdRecoveryUsesExactAcceptedHandles()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("atomic-side"),true)) {seed(f,71,key(2),1,1900);seed(f,71,key(200),2,1901);var allocations=new RatisRocksDBAdapterTest.Allocations(f);Path folder=root.resolve("atomic-side-job");f.beforeHomeRead=()->{throw new UncheckedIOException(new IOException("Accepted HOME response unavailable"));};try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)){assertThrows(ExecutionException.class,()->await(owner.delete(71,key(2),key(201),RequestContext.batch()).observer()));}Files.move(folder.resolve("atomic"),folder.resolve("atomic.pending"));int opened=f.opens.get();f.beforeHomeRead=null;try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)){await(owner.resume(RequestContext.batch()).observer());assertFalse(Files.exists(folder.resolve("atomic.pending")));assertTrue(Files.isRegularFile(folder.resolve("atomic")));assertEquals(opened,f.opens.get());assertEquals(1,allocations.count.get());assertNull(f.get(71,key(2)));assertNull(f.get(71,key(200)));}}
+    }
+    @Test void changedChecksummedInputSidecarAndPartialAtomicSidecarAreRejected()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("bad-side"),true)) {seed(f,71,key(2),1,1900);var allocations=new RatisRocksDBAdapterTest.Allocations(f);Path folder=root.resolve("bad-side-job");try(var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)){await(owner.delete(71,key(2),key(3),RequestContext.batch()).observer());}byte[] input=SessionJournalFiles.read(folder.resolve("input"),RatisRangeDeleteClient.MAX_BYTES);java.nio.ByteBuffer.wrap(input).putLong(36,72);SessionJournalFiles.write(folder.resolve("input.pending"),input,RatisRangeDeleteClient.MAX_BYTES);int opened=f.opens.get();assertThrows(IOException.class,()->new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder));assertEquals(opened,f.opens.get());Files.delete(folder.resolve("input.pending"));byte[] atomic=Files.readAllBytes(folder.resolve("atomic"));Files.write(folder.resolve("atomic.pending"),Arrays.copyOf(atomic,atomic.length-1));assertThrows(IOException.class,()->new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder));assertEquals(opened,f.opens.get());assertArrayEquals(atomic,Files.readAllBytes(folder.resolve("atomic")));}
+    }
+    @Test void cancellationAtActualDrainKeepsCompletedOriginalUntilExplicitDelivery()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("drain-cancel"),true);var owner=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,new RatisRocksDBAdapterTest.Allocations(f),root.resolve("drain-cancel-job"))) {seed(f,71,key(2),1,1900);var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var once=new AtomicBoolean();f.beforeHomeRead=()->{if(once.compareAndSet(false,true)){entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Actual HOME wait did not release");}catch(Exception failure){throw new RuntimeException(failure);}}};var owned=owner.delete(71,key(2),key(3),RequestContext.batch());assertTrue(entered.await(10,TimeUnit.SECONDS));var cancellation=owned.drained().thenRun(owned.cancel());release.countDown();await(cancellation);assertTrue(owned.observer().isCancelled());assertEquals(RatisRocksDBDirect.RecoveryState.COMPLETE,owner.recoveryState());int opened=f.opens.get();seed(f,71,key(2),9,1901);f.beforeHomeRead=null;await(owner.resume(RequestContext.batch()).observer());assertEquals(opened,f.opens.get());assertArrayEquals(new byte[]{9},f.get(71,key(2)));assertEquals(RatisRocksDBDirect.RecoveryState.NONE,owner.recoveryState());}
+    }
+
+}

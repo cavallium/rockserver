@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import java.io.IOException;
+import it.cavallium.rockserver.core.common.distributed.*;
 import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
@@ -19,10 +20,14 @@ class RatisConnectionCloseTest {
         try (var x=tests.new Fixture(); var replicas=new RatisSchemaReplicaClient(1,(range,owner) -> { throw new IOException("No replica query during close"); }); var workers=Executors.newFixedThreadPool(2)) {
             var outer=x.f.outer;
             var binding=new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,x.f.directory.ranges().getFirst().replicas());
+            var schemaCatalogue=new RatisSchemaCatalogue(x.f.catalogue.client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
+            assertEquals(CommandResult.Status.SUCCESS,schemaCatalogue.execute(schemaCatalogue.prepare(outer.operation(300),x.f.schema)).status());
+            var directories=new RatisCatalogue(x.f.catalogue.client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn);
+            assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(outer.operation(301),null,x.f.directory)).status());
             var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var firstCloses=new AtomicInteger(); var nextCloses=new AtomicInteger();
             AutoCloseable first=() -> { firstCloses.incrementAndGet(); entered.countDown(); if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Dependency close barrier timed out"); };
             AutoCloseable next=nextCloses::incrementAndGet;
-            var connection=new RatisRocksDBConnection(URI.create("rockserver+ratis://fixture"),root.resolve("connection"),x.f.schema,x.routed,x.f.scheduler,binding,x.f.catalogue.client,replicas,null,null,
+            var connection=new RatisRocksDBConnection(URI.create("rockserver+ratis://fixture"),root.resolve("connection"),java.util.Map.of(x.f.schema.domainId(),x.routed),(name,shape)->x.f.schema.domainId(),x.f.scheduler,binding,x.f.catalogue.client,replicas,null,null,
                     (schema,directory,path,ids) -> new RatisRocksDBConnection.Generation(x.adapter,x.direct,null,x.transactions,null,List.of(x.session)),RatisRocksDBConnection.Limits.defaults(),List.of(first,next));
             try {
                 var closing=workers.submit(() -> { connection.close(); return null; });

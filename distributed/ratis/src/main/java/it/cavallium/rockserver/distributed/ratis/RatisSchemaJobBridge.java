@@ -11,7 +11,7 @@ import static it.cavallium.rockserver.distributed.ratis.RatisSchemaRequests.*;
 
 /** One bounded blocking controller lane, isolated from native DATA workers and observer cancellation. */
 final class RatisSchemaJobBridge implements AutoCloseable {
-    @FunctionalInterface interface ClientFactory { RatisSchemaClient create(RatisSchemaClient.Checkpoint checkpoint) throws IOException; }
+    @FunctionalInterface interface ClientFactory { RatisSchemaClient create(UUID domain,RatisSchemaClient.Checkpoint checkpoint) throws IOException; }
     @FunctionalInterface interface Prepare { RatisSchemaClient.Handle create(RatisSchemaClient client,UUID id) throws Exception; }
     private final Path root,clientRoot;
     private final RWScheduler clock;
@@ -22,41 +22,40 @@ final class RatisSchemaJobBridge implements AutoCloseable {
     private final ExecutorService lane;
     private final ScheduledExecutorService timer;
     private final Map<UUID,Entry> entries=new LinkedHashMap<>();
-    private RatisSchemaClient client;
+    private RatisSchemaClient client;private UUID clientDomain;private final Map<UUID,RatisRoutedClient> routed;
     private Entry current;
     private int actual;
     private long bytes;
     private boolean stopping,closed;
     private volatile Thread worker;
     private static final class Entry {
-        final UUID id; final Kind kind;
+        final UUID id,domain; final Kind kind;
         volatile State state; volatile RatisSchemaClient.Phase phase; volatile Result result;
         volatile boolean cancelled; volatile long deadline;
         CompletableFuture<Result> observer;
-        Entry(UUID id,Kind kind,State state) { this.id=id; this.kind=kind; this.state=state; }
+        Entry(UUID id,UUID domain,Kind kind,State state) { this.id=id;this.domain=Objects.requireNonNull(domain); this.kind=kind; this.state=state; }
         Status status() { return new Status(id,kind,state,phase,result); }
     }
-    RatisSchemaJobBridge(Path root,Path clientRoot,RWScheduler clock,ClientFactory factory,RatisSchemaClient.TrustedOperatorResolver resolver,it.cavallium.rockserver.distributed.ratis.RatisRoutedClient routed,int requests,int queued,long maximumBytes) throws IOException {
-        this.root=root; this.clientRoot=clientRoot; this.clock=clock; this.factory=factory; this.resolver=resolver; maximumRequests=requests; maximumQueued=queued; this.maximumBytes=maximumBytes;
+    RatisSchemaJobBridge(Path root,Path clientRoot,RWScheduler clock,ClientFactory factory,RatisSchemaClient.TrustedOperatorResolver resolver,Map<UUID,RatisRoutedClient> routed,int requests,int queued,long maximumBytes) throws IOException {
+        this.routed=Map.copyOf(routed);if(routed.isEmpty())throw new IllegalArgumentException("Schema bridge requires declared domains");this.root=root; this.clientRoot=clientRoot; this.clock=clock; this.factory=factory; this.resolver=resolver; maximumRequests=requests; maximumQueued=queued; this.maximumBytes=maximumBytes;
         Files.createDirectories(root); Files.createDirectories(clientRoot);
         try (var files=Files.newDirectoryStream(root,"*.bridge")) {
-            for (var file:files) { if (entries.size()>=requests) throw new IOException("Schema request inventory exceeds connection limits"); var e=decode(SessionJournalFiles.read(file,4096)); if (!file.getFileName().toString().equals(e.id+".bridge") || entries.putIfAbsent(e.id,e)!=null) throw new IOException("Invalid schema bridge identity"); if (e.state!=State.DONE && e.state!=State.ABORTED && e.state!=State.CONFLICT) e.state=Files.exists(clientPath(e.id),LinkOption.NOFOLLOW_LINKS) ? State.PAUSED : State.NOT_STARTED; }
+            for (var file:files) { if (entries.size()>=requests) throw new IOException("Schema request inventory exceeds connection limits"); var e=decode(SessionJournalFiles.read(file,4096)); if (!routed.containsKey(e.domain) || !file.getFileName().toString().equals(e.id+".bridge") || entries.putIfAbsent(e.id,e)!=null) throw new IOException("Invalid schema bridge identity"); if (e.state!=State.DONE && e.state!=State.ABORTED && e.state!=State.CONFLICT) e.state=Files.exists(clientPath(e.id),LinkOption.NOFOLLOW_LINKS) ? State.PAUSED : State.NOT_STARTED; }
         }
-        client=factory.create(this::checkpoint);
         try {
-        var history=new ArrayList<Map.Entry<UUID,Long>>();
-        for (var entry:entries.values()) if (Files.exists(clientPath(entry.id),LinkOption.NOFOLLOW_LINKS)) {
-            var fields=RatisSchemaClientJournal.read(clientPath(entry.id)); var definition=fields.get("definition"); if (definition!=null) history.add(Map.entry(entry.id,it.cavallium.rockserver.core.common.distributed.SchemaChange.Definition.decode(definition).targetSchema().schemaEpoch()));
-        }
-        history.sort(Map.Entry.comparingByValue());
-        long bootstrapEpoch=routed.directory().schemaEpoch();
-        for (var entry:history) if (entry.getValue()>bootstrapEpoch) try (var handle=client.reopen(entry.getKey(),resolver)) { client.completed(handle); }
-        history.sort(Map.Entry.<UUID,Long>comparingByValue().reversed());
-        for (var entry:history) if (entry.getValue()<=routed.directory().schemaEpoch()) try (var handle=client.reopen(entry.getKey(),resolver)) { client.completed(handle); }
-        } catch (Throwable failure) { try { client.close(); } catch (Throwable cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Schema history restoration failed",failure); }
+            for(var domain:routed.keySet()) {
+                select(domain);var data=routed.get(domain);var history=new ArrayList<Map.Entry<UUID,Long>>();
+                for(var entry:entries.values())if(entry.domain.equals(domain) && Files.exists(clientPath(entry.id),LinkOption.NOFOLLOW_LINKS)){var fields=RatisSchemaClientJournal.read(clientPath(entry.id));var definition=fields.get("definition");if(definition!=null)history.add(Map.entry(entry.id,it.cavallium.rockserver.core.common.distributed.SchemaChange.Definition.decode(definition).targetSchema().schemaEpoch()));}
+                history.sort(Map.Entry.comparingByValue());long bootstrapEpoch=data.directory().schemaEpoch();
+                for(var entry:history)if(entry.getValue()>bootstrapEpoch)try(var handle=client.reopen(entry.getKey(),resolver)){client.completed(handle);}
+                history.sort(Map.Entry.<UUID,Long>comparingByValue().reversed());
+                for(var entry:history)if(entry.getValue()<=data.directory().schemaEpoch())try(var handle=client.reopen(entry.getKey(),resolver)){client.completed(handle);}
+            }
+        }catch(Throwable failure){try{if(client!=null)client.close();}catch(Throwable cleanup){failure.addSuppressed(cleanup);}if(failure instanceof IOException io)throw io;throw new IOException("Schema history restoration failed",failure);}
         lane=Executors.newSingleThreadExecutor(task -> Thread.ofPlatform().daemon(true).name("ratis-schema-connection").unstarted(() -> { worker=Thread.currentThread(); task.run(); }));
         timer=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon(true).name("ratis-schema-observers").factory());
     }
+    private void select(UUID domain)throws IOException {if(!routed.containsKey(domain))throw new IOException("Schema domain is not declared");if(domain.equals(clientDomain))return;if(client!=null)client.close();client=null;clientDomain=null;client=factory.create(domain,this::checkpoint);clientDomain=domain;}
     boolean isWorkerThread() { return worker==Thread.currentThread(); }
     private Path clientPath(UUID id) { return clientRoot.resolve(id+".request"); }
     private void checkpoint(Path file,Map<String,byte[]> fields) throws IOException {
@@ -68,16 +67,16 @@ final class RatisSchemaJobBridge implements AutoCloseable {
         RatisSchemaClientJournal.write(file,fields);
     }
     RatisSchemaClient.TrustedOperatorResolver resolver() { return resolver; }
-    CompletableFuture<Long> check(String name,byte[] hash,RequestContext context) {
+    CompletableFuture<Long> check(UUID domain,String name,byte[] hash,RequestContext context) {
         var result=new CompletableFuture<Long>(); long deadline=clock.resolveMonotonicDeadline(context);
         synchronized (this) { if (closed || stopping || actual>=maximumQueued) return CompletableFuture.failedFuture(new RejectedExecutionException("Schema read admission exhausted")); actual++; }
-        lane.execute(() -> { try { if (deadline!=Long.MAX_VALUE && clock.remainingMonotonicDeadlineNanos(deadline)<=0) throw new TimeoutException("Operator check deadline expired"); var value=client.checkOperator(name,hash); if (deadline!=Long.MAX_VALUE && clock.remainingMonotonicDeadlineNanos(deadline)<=0) throw new TimeoutException("Operator check deadline expired"); result.complete(value); } catch (Throwable failure) { result.completeExceptionally(failure); } finally { synchronized (this) { actual--; } } });
+        lane.execute(() -> { try { if (deadline!=Long.MAX_VALUE && clock.remainingMonotonicDeadlineNanos(deadline)<=0) throw new TimeoutException("Operator check deadline expired"); select(domain);var value=client.checkOperator(name,hash); if (deadline!=Long.MAX_VALUE && clock.remainingMonotonicDeadlineNanos(deadline)<=0) throw new TimeoutException("Operator check deadline expired"); result.complete(value); } catch (Throwable failure) { result.completeExceptionally(failure); } finally { synchronized (this) { actual--; } } });
         return result.copy();
     }
     synchronized List<Status> pending() { return entries.values().stream().filter(e -> e.state!=State.DONE && e.state!=State.ABORTED).map(Entry::status).toList(); }
     synchronized Status status(UUID id) { var e=entries.get(id); if (e==null) throw new IllegalArgumentException("Unknown schema request token"); return e.status(); }
-    CompletableFuture<Result> submit(Kind kind,long charge,RequestContext context,Prepare prepare) {
-        Entry e=new Entry(UUID.randomUUID(),kind,State.QUEUED);
+    CompletableFuture<Result> submit(UUID domain,Kind kind,long charge,RequestContext context,Prepare prepare) {
+        Entry e=new Entry(UUID.randomUUID(),domain,kind,State.QUEUED);
         synchronized (this) { if (entries.size()>=maximumRequests) return CompletableFuture.failedFuture(new IOException("Durable schema request capacity exhausted")); entries.put(e.id,e); }
         return schedule(e,charge,context,prepare,false);
     }
@@ -100,7 +99,7 @@ final class RatisSchemaJobBridge implements AutoCloseable {
     private void run(Entry e,long charge,Prepare prepare,boolean abort,CompletableFuture<Result> view,ScheduledFuture<?> timeout) {
         RatisSchemaClient.Handle handle=null; Result outcome=null; Throwable problem=null;
         try {
-            current=e; persist(e);
+            select(e.domain);current=e; persist(e);
             if (e.cancelled || stopping || expired(e)) { e.state=Files.exists(clientPath(e.id),LinkOption.NOFOLLOW_LINKS) ? State.PAUSED : State.NOT_STARTED; throw new CancellationException("Schema action paused before controller dispatch"); }
             handle=prepare==null ? client.reopen(e.id,resolver) : prepare.create(client,e.id);
             e.state=State.RUNNING; e.phase=handle.phase(); persist(e);
@@ -123,7 +122,7 @@ final class RatisSchemaJobBridge implements AutoCloseable {
             if (e.state!=State.DONE && e.state!=State.ABORTED && e.state!=State.CONFLICT) e.state=Files.exists(clientPath(e.id),LinkOption.NOFOLLOW_LINKS) ? State.PAUSED : State.NOT_STARTED;
             try { persist(e); } catch (Throwable checkpoint) { failure.addSuppressed(checkpoint); }
             problem=new RatisSchemaRequestPendingException(e.status(),failure);
-            try { if (handle!=null) { handle.close(); handle=null; } client.close(); client=factory.create(this::checkpoint); } catch (Throwable reset) { failure.addSuppressed(reset); }
+            try { if (handle!=null) { handle.close(); handle=null; } if(client!=null)client.close(); client=factory.create(e.domain,this::checkpoint);clientDomain=e.domain; } catch (Throwable reset) { failure.addSuppressed(reset); }
         } finally {
             try { if (handle!=null) handle.close(); } catch (IOException failure) { if (problem==null) problem=new RatisSchemaRequestPendingException(e.status(),failure); else problem.addSuppressed(failure); }
             current=null; if (timeout!=null) timeout.cancel(false);
@@ -135,10 +134,10 @@ final class RatisSchemaJobBridge implements AutoCloseable {
     synchronized void stop() { stopping=true; for (var e:entries.values()) if (e.observer!=null) e.cancelled=true; }
     @Override public void close() throws IOException { stop(); synchronized (this) { if (actual!=0) throw new IOException("Schema actual I/O remains active; ownership retained"); if (closed) return; } client.close(); lane.shutdown(); timer.shutdown(); synchronized (this) { closed=true; } }
     private void persist(Entry e) throws IOException {
-        var out=new ByteArrayOutputStream(); try (var data=new DataOutputStream(out)) { data.writeLong(e.id.getMostSignificantBits()); data.writeLong(e.id.getLeastSignificantBits()); data.writeUTF(e.kind.name()); data.writeUTF(e.state.name()); data.writeUTF(e.phase==null ? "" : e.phase.name()); data.writeBoolean(e.result!=null); if (e.result!=null) { data.writeLong(e.result.value()); data.writeBoolean(e.result.changed()); data.writeBoolean(e.result.aborted()); } }
+        var out=new ByteArrayOutputStream(); try (var data=new DataOutputStream(out)) { data.writeLong(e.id.getMostSignificantBits()); data.writeLong(e.id.getLeastSignificantBits());data.writeLong(e.domain.getMostSignificantBits());data.writeLong(e.domain.getLeastSignificantBits()); data.writeUTF(e.kind.name()); data.writeUTF(e.state.name()); data.writeUTF(e.phase==null ? "" : e.phase.name()); data.writeBoolean(e.result!=null); if (e.result!=null) { data.writeLong(e.result.value()); data.writeBoolean(e.result.changed()); data.writeBoolean(e.result.aborted()); } }
         SessionJournalFiles.write(root.resolve(e.id+".bridge"),out.toByteArray(),4096);
     }
     private static Entry decode(byte[] bytes) throws IOException {
-        try (var in=new DataInputStream(new ByteArrayInputStream(bytes))) { var e=new Entry(new UUID(in.readLong(),in.readLong()),Kind.valueOf(in.readUTF()),State.valueOf(in.readUTF())); String phase=in.readUTF(); e.phase=phase.isEmpty() ? null : RatisSchemaClient.Phase.valueOf(phase); if (in.readBoolean()) e.result=new Result(e.id,e.kind,in.readLong(),in.readBoolean(),in.readBoolean()); if (in.read()!=-1) throw new IOException("Trailing schema bridge bytes"); return e; } catch (RuntimeException invalid) { throw new IOException("Invalid schema bridge record",invalid); }
+        try (var in=new DataInputStream(new ByteArrayInputStream(bytes))) { var e=new Entry(new UUID(in.readLong(),in.readLong()),new UUID(in.readLong(),in.readLong()),Kind.valueOf(in.readUTF()),State.valueOf(in.readUTF())); String phase=in.readUTF(); e.phase=phase.isEmpty() ? null : RatisSchemaClient.Phase.valueOf(phase); if (in.readBoolean()) e.result=new Result(e.id,e.kind,in.readLong(),in.readBoolean(),in.readBoolean()); if (in.read()!=-1) throw new IOException("Trailing schema bridge bytes"); return e; } catch (RuntimeException invalid) { throw new IOException("Invalid schema bridge record",invalid); }
     }
 }

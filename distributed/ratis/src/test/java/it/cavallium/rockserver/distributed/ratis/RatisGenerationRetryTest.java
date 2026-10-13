@@ -23,10 +23,10 @@ class RatisGenerationRetryTest {
                 return f.factory.create(schema,directory,path,ids);
             };
             var limits=RatisRocksDBConnection.Limits.defaults();
-            assertThrows(IOException.class,() -> new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,f.direct.f.schema,f.direct.routed,f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of()));
+            assertThrows(IOException.class,() -> new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of()));
             Path binding=f.connectionRoot.resolve("generations").resolve(HexFormat.of().formatHex(f.direct.f.schema.digest())).resolve("binding");
             byte[] original=Files.readAllBytes(binding);
-            try (var recovered=new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,f.direct.f.schema,f.direct.routed,f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of())) {
+            try (var recovered=new RatisRocksDBConnection(URI.create("ratis://controlled/retry"),f.connectionRoot,java.util.Map.of(f.direct.f.schema.domainId(),f.direct.routed),(name,shape)->f.direct.f.schema.domainId(),f.direct.f.scheduler,f.binding,f.direct.f.catalogue.client,replicas,null,null,factory,limits,List.of())) {
                 assertEquals(71,recovered.getSyncApi(RequestContext.batch()).getColumnId("atomic-0"));
                 assertArrayEquals(original,Files.readAllBytes(binding)); assertEquals(2,calls.get());
             }

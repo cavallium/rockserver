@@ -51,6 +51,72 @@ class RatisNodeServiceTest {
         }
     }
 
+    @Test void frontendDrainFailuresRetainBackendAndNodeForExactCloseRetry() throws Exception {
+        var schema=schema();
+        try(var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
+            initialize(env,schema);publish(env,schema);var fake=new RatisNodeRuntimeTest.FakeServer();
+            try(var service=RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
+                service.start();var backend=org.mockito.Mockito.mock(RatisDatabaseBackendFactory.class);
+                var connection=org.mockito.Mockito.mock(RatisRocksDBConnection.class);
+                org.mockito.Mockito.when(backend.open(org.mockito.ArgumentMatchers.any())).thenReturn(connection);
+                var backendCloses=new java.util.concurrent.atomic.AtomicInteger();
+                org.mockito.Mockito.doAnswer(call -> {if(backendCloses.incrementAndGet()==1)throw new IOException("Backend actual work retained");return null;}).when(backend).close();
+                var listenerCloses=new java.util.concurrent.atomic.AtomicInteger();var starts=new java.util.concurrent.atomic.AtomicInteger();
+                var listener=new it.cavallium.rockserver.core.server.Server(connection) {
+                    public void start(){starts.incrementAndGet();}
+                    public void close() throws IOException {if(listenerCloses.incrementAndGet()==1)throw new IOException("Listener work retained");}
+                };
+                service.startFrontend(() -> backend,ignored -> listener,java.net.URI.create("grpc://localhost:5333"));
+                assertEquals(1,starts.get());assertThrows(IOException.class,service::close);
+                assertEquals(0,backendCloses.get());assertEquals(0,fake.closes);assertEquals(0,env.catalogue.closes.get());
+                assertThrows(IOException.class,service::close);assertEquals(2,listenerCloses.get());assertEquals(1,backendCloses.get());
+                assertEquals(0,fake.closes);assertFalse(env.timer.isDisposed());
+                service.close();assertEquals(2,listenerCloses.get());assertEquals(2,backendCloses.get());assertEquals(1,fake.closes);
+            }
+        }
+    }
+    @Test void backendOpenKeepsNodeResourcesOwnedUntilTheActualAttemptReturns() throws Exception {
+        var schema=schema();
+        try(var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest());var executor=java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            initialize(env,schema);publish(env,schema);var fake=new RatisNodeRuntimeTest.FakeServer();
+            try(var service=RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
+                service.start();var backend=org.mockito.Mockito.mock(RatisDatabaseBackendFactory.class);
+                var connection=org.mockito.Mockito.mock(RatisRocksDBConnection.class);
+                var backendCloses=new java.util.concurrent.atomic.AtomicInteger();
+                org.mockito.Mockito.doAnswer(call -> {backendCloses.incrementAndGet();return null;}).when(backend).close();
+                var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+                org.mockito.Mockito.when(backend.open(org.mockito.ArgumentMatchers.any())).thenAnswer(call -> {
+                    entered.countDown();if(!release.await(5,java.util.concurrent.TimeUnit.SECONDS))throw new IOException("Fixture open timed out");return connection;
+                });
+                var opening=executor.submit(() -> {service.startFrontend(() -> backend,ignored -> new it.cavallium.rockserver.core.server.Server(connection){public void start(){}},java.net.URI.create("grpc://localhost:5333"));return null;});
+                try {
+                    assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS));assertThrows(IOException.class,service::close);
+                    assertEquals(0,backendCloses.get());assertEquals(0,fake.closes);assertFalse(env.timer.isDisposed());
+                } finally {release.countDown();}
+                opening.get(5,java.util.concurrent.TimeUnit.SECONDS);service.close();org.mockito.Mockito.verify(backend).close();assertEquals(1,fake.closes);
+            }
+        }
+    }
+    @Test void failedListenerStartRetainsConstructedOwnersUntilServiceClose() throws Exception {
+        var schema=schema();
+        try(var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
+            initialize(env,schema);publish(env,schema);var fake=new RatisNodeRuntimeTest.FakeServer();
+            try(var service=RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
+                service.start();var backend=org.mockito.Mockito.mock(RatisDatabaseBackendFactory.class);
+                var connection=org.mockito.Mockito.mock(RatisRocksDBConnection.class);
+                org.mockito.Mockito.when(backend.open(org.mockito.ArgumentMatchers.any())).thenReturn(connection);
+                var closed=new java.util.concurrent.atomic.AtomicInteger();
+                var listener=new it.cavallium.rockserver.core.server.Server(connection) {
+                    public void start() throws IOException {throw new IOException("Listener start failed");}
+                    public void close(){closed.incrementAndGet();}
+                };
+                assertThrows(IOException.class,() -> service.startFrontend(() -> backend,ignored -> listener,java.net.URI.create("thrift://localhost:5333")));
+                org.mockito.Mockito.verify(backend,org.mockito.Mockito.never()).close();assertEquals(0,fake.closes);
+                service.close();assertEquals(1,closed.get());org.mockito.Mockito.verify(backend).close();assertEquals(1,fake.closes);
+            }
+        }
+    }
+
     void publish(RatisNodeRuntimeTest.Env env,DistributedSchema schema) throws Exception {
         var o=env.outer; var c=new RatisSchemaCatalogue(env.catalogue.client,o.cluster,o.database,o.catalogue,1,new byte[32],o.directoryColumn);
         c.execute(c.prepare(o.operation(1),schema)); var d=env.plan.directory(env.routed.directory().domainId());

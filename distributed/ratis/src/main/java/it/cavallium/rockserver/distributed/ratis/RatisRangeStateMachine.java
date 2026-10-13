@@ -4558,9 +4558,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (generation!=admissionGeneration.get()) throw new IOException("Participant authorization lost leader generation"); checkTransactionOwner();
             }
             case ScopedTransactionRpc.STAGE -> {
-                var handle=ScopedTransactionRpc.readHandle(input); var command=DistributedCommandCodec.decode(ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); end(input);
-                byte[] result=scopedTransactions.stage(handle,command).encode();
-                reply=ByteBuffer.allocate(32+result.length).put(command.payloadDigest()).put(result).array();
+                var handle=ScopedTransactionRpc.readHandle(input);var prefix=ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false);end(input);
+                var command=prefix.length==0?null:DistributedCommandCodec.decode(prefix);
+                byte[] result=(command==null?scopedTransactions.reset(handle):scopedTransactions.stage(handle,command)).encode();
+                reply=ByteBuffer.allocate(32+result.length).put(command==null?OperatorUpload.sha256(prefix):command.payloadDigest()).put(result).array();
             }
             case ScopedTransactionRpc.PLAN -> {
                 var handle=ScopedTransactionRpc.readHandle(input); var command=DistributedCommandCodec.decode(ScopedTransactionRpc.blob(input,DistributedCommandCodec.MAX_ENCODED_BYTES,false)); end(input);

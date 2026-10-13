@@ -137,6 +137,11 @@ final class RatisScopedTransactions implements AutoCloseable {
         var entry=begin(handle,false); try { var page=entry.staging==null ? entry.pin.page(column,lower,upper,reverse,resume,items,bytes) : entry.staging.page(column,lower,upper,reverse,resume,items,bytes); checked(entry); return page; }
         finally { finish(entry,false); }
     }
+    CommandResult reset(ScopedTransactionRpc.Handle handle)throws Exception {
+        var entry=begin(handle,false);
+        try{releaseStaging(entry);checked(entry);return new CommandResult(CommandResult.Status.SUCCESS,List.of());}
+        finally{finish(entry,false);}
+    }
     CommandResult stage(ScopedTransactionRpc.Handle handle,DistributedCommand command) throws Exception {
         var entry=begin(handle,false); long reserved=0; ReplicatedRangeStore.ScopedStaging replacement=null;
         try {

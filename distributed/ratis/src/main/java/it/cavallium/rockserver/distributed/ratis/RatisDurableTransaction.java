@@ -156,9 +156,17 @@ public final class RatisDurableTransaction implements AutoCloseable {
     public synchronized Snapshot snapshot() throws IOException {
         requireOpen(); return new Snapshot(initial,observed,pending,homeResult,homeSuperseded,lastHome,pendingRecovery,recoveryReceipt,entries.values().stream().map(Entry::progress).toList(),homeRetirementProof);
     }
+    private boolean rejectedInitialAbsent;
+    /** Exact definite initial rejection; no participant request was ever frozen or submitted. */
+    synchronized boolean initialRegistrationRejected() {
+        return initial.origin()==null && observed==null && pending!=null && pendingRecovery==null && !homeSuperseded && homeResult!=null && homeResult.status()==CommandResult.Status.SESSION_EXPIRED && expected(pending)==null && next(pending).equals(initial)
+                && entries.values().stream().allMatch(e->e.registration==null && e.preparation==null && e.vote==null && e.finalization==null && e.receipt==null && e.outcome==null && e.retirementProof==null);
+    }
+    synchronized boolean initialRegistrationNoEffect(){return initialRegistrationRejected() && (rejectedInitialAbsent || homeRetirementProof!=null);}
     /** Returns the globally ordered business outcome only after every native finalization and home ACK is durable. */
     public synchronized CommandResult result() throws IOException {
         requireOpen();
+        if(initialRegistrationNoEffect())return homeResult;
         if(noEffectReservationState(observed) && observed.terminal())return observed.terminalBusinessResult();
         if (homeRetirementProof!=null && (observed==null || !observed.fullyFinalized()
                 || entries.values().stream().anyMatch(entry -> entry.outcome==null && (observed.phase()!=TransactionStatus.Phase.ABORT || entry.retirementProof==null)))) throw new RatisTransactionOutcomeExpiredException(initial.transactionId());
@@ -290,7 +298,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         try {
             var read=homes.readRegistration(initial.transactionId());
             try { requireHomeRoute(read.descriptor()); } catch (IllegalArgumentException invalid) { throw new IOException("Home read changed frozen range incarnation",invalid); }
-            var status=read.status();
+            var status=read.status();synchronized(this){rejectedInitialAbsent=status==null && initialRegistrationRejected();}
             if(status!=null && status.reserved()) {
                 if(!status.equals(registrationExpected()))throw new IOException("HOME reservation differs from promoted journal origin");
                 synchronized(this){if(observed!=null && !observed.reserved())throw new IOException("Promoted HOME regressed to reservation");}

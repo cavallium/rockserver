@@ -92,7 +92,7 @@ public final class DistributedSchemaCodec {
         try { return MessageDigest.getInstance("SHA-256").digest(encode(schema)); }
         catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
     }
-    static long encodedSize(DistributedSchema schema) {
+    public static long encodedSize(DistributedSchema schema) {
         long size=HEADER_BYTES;
         for (var column:schema.columns()) {
             var shape=column.schema(); size+=38L+text(column.name()).length+4L*shape.keysCount()+shape.variableLengthKeysCount();

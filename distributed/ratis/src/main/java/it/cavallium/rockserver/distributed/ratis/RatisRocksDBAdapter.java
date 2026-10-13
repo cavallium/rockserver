@@ -28,7 +28,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private final AllocationSource allocations;
     private final RatisRocksDBDirect direct;
     private final RatisRocksDBBatches batches;
-    private final RatisRocksDBRanges ranges;
+    private final RatisRocksDBRanges ranges;private RatisRangeDeleteClient rangeDeletes;
     private final RatisRocksDBIterators iterators;
     private final java.util.function.LongSupplier handleIds;
     private final Map<Long,Entry> entries=new LinkedHashMap<>();
@@ -94,6 +94,8 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         if(batches!=null && !batches.binds(schema,directory)) throw new IllegalArgumentException("Bulk owner differs from adapter's frozen generation");
         this.batches=batches; this.direct=direct; this.ranges=ranges; this.schema=Objects.requireNonNull(schema); this.directory=Objects.requireNonNull(directory); this.transactions=Objects.requireNonNull(transactions); this.allocations=Objects.requireNonNull(allocations); this.handleIds=Objects.requireNonNull(handleIds); schema.requireMatches(directory); iterators=new RatisRocksDBIterators(schema,handleIds);
     }
+    synchronized RatisRocksDBAdapter rangeDeletes(RatisRangeDeleteClient owner){if(rangeDeletes!=null || closing || !owner.binds(schema,directory))throw new IllegalStateException("Range delete owner differs or is already configured");rangeDeletes=owner;return this;}
+    RatisRangeDeleteClient rangeDeletes(){return rangeDeletes;}
     synchronized boolean ownsTransactionOrUpdate(long id) { return entries.containsKey(id); }
     boolean ownsIterator(long id) { return iterators.owns(id); }
     CompletableFuture<Void> retryStoppedFlowsCleanup() { return CompletableFuture.allOf(iterators.retryStoppedFlowsCleanup(),ranges==null ? CompletableFuture.completedFuture(null) : ranges.retryRetiredReadsCleanup()); }
@@ -138,6 +140,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     public synchronized Stats stats() { return new Stats(entries.size(),(int)entries.values().stream().filter(entry -> entry.acquiring).count()); }
     private CompletableFuture<?> dispatch(RocksDBAPICommand<?,?,?> request,Deadline deadline) throws Exception {
         synchronized (this) { if (closing) throw new IOException("Adapter closing"); }
+        if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange range){if(rangeDeletes==null)throw unsupported();var owned=rangeDeletes.delete(range.columnId(),range.startKeysInclusive(),range.endKeysExclusive(),deadline.remaining());track(owned.drained());var tracker=tracking.get();if(tracker!=null)tracker.cancel.add(owned.cancel());return owned.observer();}
         if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch batch) { if(batches==null) throw unsupported(); return batchView(batches.putBatch(batch.columnId(),batch.batchPublisher(),batch.mode(),deadline.remaining())); }
         if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch batch) { if(batches==null) throw unsupported(); return batchView(batches.mergeBatch(batch.columnId(),batch.batchPublisher(),batch.mode(),deadline.remaining())); }
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction open) return open(open.transactionLeaseTtl(),deadline);
@@ -250,13 +253,15 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         });
     }
     private CompletableFuture<Long> open(Duration ttl,Deadline deadline) { return open(ttl,deadline,Mode.EXPLICIT); }
-    private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode) {
+    CompletableFuture<Long> openAt(long id,Duration ttl,RequestContext context){if(id<=0)return CompletableFuture.failedFuture(new IllegalArgumentException("Invalid connection transaction identity"));return open(ttl,new Deadline(context),Mode.EXPLICIT,id);}
+    private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode) {return open(ttl,deadline,mode,0);}
+    private CompletableFuture<Long> open(Duration ttl,Deadline deadline,Mode mode,long forcedId) {
         try {
             if (Objects.requireNonNull(ttl).isZero() || ttl.isNegative() || ttl.compareTo(Duration.ofSeconds(60))>0 || !ttl.equals(Duration.ofMillis(ttl.toMillis()))) throw new IllegalArgumentException("Transaction TTL must be whole milliseconds up to60seconds");
             var scope=new TransactionScope(schema.columns().stream().map(column -> TransactionScope.Span.range(column.columnId(),null,null)).toList()); scope.participants(directory,SnapshotFence.MAX_PARTICIPANTS);
             final Entry entry;
             synchronized (this) { if (closing || entries.size()>=MAX_TRANSACTIONS) throw RocksDBException.of(SERVER_OVERLOADED,"Transaction ID capacity exhausted");
-                long id=handleIds.getAsLong(); if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); entry=new Entry(id,mode); entries.put(entry.id,entry); }
+                long id=forcedId==0?handleIds.getAsLong():forcedId; if (id<=0 || entries.containsKey(id)) throw new IllegalStateException("Shared handle allocator returned an invalid or reused ID"); entry=new Entry(id,mode); entries.put(entry.id,entry); }
             var view=new CompletableFuture<Long>();
             CompletableFuture<Allocation> allocation;
             try { allocation=Objects.requireNonNull(allocations.allocate(deadline.remaining())); }

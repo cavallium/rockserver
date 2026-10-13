@@ -49,7 +49,7 @@ class RatisRocksDBConnectionTest {
             };
         }
         RatisRocksDBConnection open(int queuedData) throws Exception { return open(queuedData,8); }
-        RatisRocksDBConnection open(int queuedData,int generations) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/native"),connectionRoot,direct.f.schema,direct.routed,direct.f.scheduler,binding,direct.f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(generations,64,8,128L*1024*1024,queuedData),List.of(replicas)); }
+        RatisRocksDBConnection open(int queuedData,int generations) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/native"),connectionRoot,java.util.Map.of(direct.f.schema.domainId(),direct.routed),(name,shape)->direct.f.schema.domainId(),direct.f.scheduler,binding,direct.f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(generations,64,8,128L*1024*1024,queuedData),List.of(replicas)); }
         public void close() throws Exception { direct.close(); }
     }
     @Test void commonSyncAsyncDataSchemaNoopsAndReopenUseOwnedNativeGenerations() throws Exception {
@@ -142,12 +142,12 @@ class RatisRocksDBConnectionTest {
                         assertEquals(CommandResult.Status.SUCCESS,data.execute(data.prepareSessionControl(control)).status());
                     }
                     return RatisDurableSessionClient.create(window,data,issuance,grant,RatisSessionClient.Limits.defaults());
-                }).create(schema,directory,path,ids);
+                },List.of()).create(schema,directory,path,ids);
             };
             Path connectionRoot=root.resolve("dynamic-connection"); var limits=new RatisRocksDBConnection.Limits(4,64,8,128L*1024*1024,8);
             long recreated;
             var dataKey=new Keys(Buf.wrap(new byte[]{0,0,0,0,0,0,0,2}));
-            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,nativeSchema.initial,routed.get(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of())) {
+            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,java.util.Map.of(nativeSchema.initial.domainId(),routed.get()),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of())) {
                 var async=connection.getAsyncApi(RequestContext.batch()); var sync=connection.getSyncApi(RequestContext.batch());
                 UUID pendingId;
                 try(var pin=nativeSchema.peers.getFirst().store.capture()) {
@@ -170,7 +170,7 @@ class RatisRocksDBConnectionTest {
                 public CommandResult command(RangeDescriptor range,DistributedCommand command) throws IOException { try { if(command.sessionControl()!=null) epochs.sessionControlAdmission(routed.get().directory(),range.groupId()).accept(command); CommandResult first=null; for(var peer:nativeSchema.peers) { var result=CommandResult.decode(peer.store.apply(peer.next(),command)); if(first==null) first=result; } return first; } catch(Exception failure) { throw new IOException(failure); } }
             })) {
                 routed.set(cold); long before=nativeSchema.peers.getFirst().store.applied().index();
-                try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,nativeSchema.initial,cold,homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of())) {
+                try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,java.util.Map.of(nativeSchema.initial.domainId(),cold),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of())) {
                     assertEquals(4,cold.directory().schemaEpoch()); assertArrayEquals(new byte[]{9},connection.getSyncApi(RequestContext.batch()).get(0,recreated,dataKey,RequestType.<Buf>current()).toByteArray());
                     for(var recovery:await(connection.directRecoveryStatus(RequestContext.batch()))) if(recovery.state()==RatisRocksDBDirect.RecoveryState.COMPLETE) assertNull(await(connection.resumeDirectRequest(recovery.schemaDigest(),RequestContext.batch())));
                     assertEquals(before,nativeSchema.peers.getFirst().store.applied().index(),"Cold history and retained callbacks do not submit new DATA"); assertTrue(connection.pendingSchemaRequests().isEmpty());
@@ -194,7 +194,7 @@ class RatisRocksDBConnectionTest {
                     var before=epochs.read(); var issuance=before.issue(UUID.randomUUID(),1000); var grant=issuance.grants().getLast(); assertEquals(CommandResult.Status.SUCCESS,epochs.execute(epochs.prepare(nativeSchema.outer.operation(operations.getAndIncrement()),before,issuance)).status());
                     for(var range:placement.ranges()) { var control=epochs.prepareSessionBinding(placement,range.groupId(),new OperationId(new UUID(950,1),issuance.nextEpoch(),operations.getAndIncrement()),grant,32,-1); assertEquals(CommandResult.Status.SUCCESS,nativeSchema.routed.execute(nativeSchema.routed.prepareSessionControl(control)).status()); }
                     return RatisDurableSessionClient.create(window,nativeSchema.routed,issuance,grant,RatisSessionClient.Limits.defaults());
-                }).create(schema,directory,path,ids);
+                },List.of()).create(schema,directory,path,ids);
                 try {
                     var transactions=mock(RatisTransactionClient.class); var snapshots=mock(RatisSnapshotClient.class);
                     when(transactions.open(any(),any(),any(),any(),any(),any())).thenAnswer(call -> {
@@ -217,9 +217,9 @@ class RatisRocksDBConnectionTest {
                     return new RatisRocksDBConnection.Generation(adapter,base.direct(),ranges,transactions,snapshots,List.of(base));
                 } catch(Throwable failure) { try { base.close(); } catch(Throwable cleanup) { failure.addSuppressed(cleanup); } if(failure instanceof IOException io) throw io; throw new IOException(failure); }
             };
-            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/old-handles"),root.resolve("handle-connection"),nativeSchema.initial,nativeSchema.routed,homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,new RatisRocksDBConnection.Limits(2,64,8,128L*1024*1024,8),List.of())) {
+            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/old-handles"),root.resolve("handle-connection"),java.util.Map.of(nativeSchema.initial.domainId(),nativeSchema.routed),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,new RatisRocksDBConnection.Limits(2,64,8,128L*1024*1024,8),List.of())) {
                 var api=connection.getAsyncApi(RequestContext.batch()); await(api.putAsync(0,7,dataKey,value(1),RequestType.none()));
-                long oldTransaction=await(api.openTransactionAsync(Duration.ofSeconds(10))); await(api.putAsync(0,7,dataKey,value(2),RequestType.none()));
+                long oldTransaction=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertEquals(0,activePins.get());assertArrayEquals(new byte[]{1},await(api.getAsync(oldTransaction,7,dataKey,RequestType.<Buf>current())).toByteArray());assertEquals(1,activePins.get()); await(api.putAsync(0,7,dataKey,value(2),RequestType.none()));
                 long oldCursor=await(api.openIteratorAsync(0,7,dataKey,null,false,Duration.ofSeconds(10))); assertNotEquals(oldTransaction,oldCursor); assertEquals(2,activePins.get());
                 var failure=assertThrows(ExecutionException.class,() -> await(api.createColumnAsync("after-old-handles",RatisSchemaClientTest.shape()))); UUID token=assertInstanceOf(RatisSchemaRequestPendingException.class,failure.getCause()).requestId();
                 assertEquals(SchemaChange.Phase.FENCED,nativeSchema.admin.readHead(nativeSchema.initial.domainId()).status().phase()); assertEquals(1,nativeSchema.routed.directory().schemaEpoch());

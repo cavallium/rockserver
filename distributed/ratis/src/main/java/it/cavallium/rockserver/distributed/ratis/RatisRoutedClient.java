@@ -853,18 +853,15 @@ public final class RatisRoutedClient implements AutoCloseable {
             byte[] reply=call(ScopedTransactionRpc.PAGE,body.array());
             try { return ScopedTransactionRpc.decodePage(reply); } catch (IllegalArgumentException malformed) { throw new IOException("Invalid transaction page reply",malformed); }
         }
-        /** Replaces an ephemeral staged prefix with an equal or extended one. No mutation is submitted to consensus. */
+        /** Equal/extended prefixes are immutable; an empty prefix explicitly clears only unfrozen ephemeral staging. */
         public CommandResult stage(List<Mutation> mutations,List<KeyPredicate> predicates) throws IOException {
-            var prefix=new DistributedCommand(descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,new OperationId(handle.id(),0,0),mutations,predicates);
-            byte[] encoded=DistributedCommandCodec.encode(prefix); var body=ByteBuffer.allocate(60+encoded.length); ScopedTransactionRpc.writeHandle(body,handle); ScopedTransactionRpc.putBlob(body,encoded);
+            boolean reset=mutations.isEmpty() && predicates.isEmpty();
+            var prefix=reset?null:new DistributedCommand(descriptor.groupId(),descriptor.rangeEpoch(),schemaDigest,new OperationId(handle.id(),0,0),mutations,predicates);
+            byte[] encoded=reset?new byte[0]:DistributedCommandCodec.encode(prefix),digest=reset?OperatorUpload.sha256(encoded):prefix.payloadDigest();var body=ByteBuffer.allocate(60+encoded.length);ScopedTransactionRpc.writeHandle(body,handle);ScopedTransactionRpc.putBlob(body,encoded);
             byte[] reply=call(ScopedTransactionRpc.STAGE,body.array());
-            if (reply.length<32 || !Arrays.equals(prefix.payloadDigest(),Arrays.copyOf(reply,32))) throw new IOException("Staging reply differs from requested prefix");
-            try {
-                var result=CommandResult.decode(Arrays.copyOfRange(reply,32,reply.length));
-                long returns=prefix.mutations().stream().filter(m -> m.returnMode()!=Mutation.ReturnMode.NONE).count();
-                if (result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=returns) throw new IOException("Staging reply differs from requested result plan");
-                return result;
-            } catch (IllegalArgumentException malformed) { throw new IOException("Invalid staging reply",malformed); }
+            if(reply.length<32 || !Arrays.equals(digest,Arrays.copyOf(reply,32)))throw new IOException("Staging reply differs from requested prefix");
+            try{var result=CommandResult.decode(Arrays.copyOfRange(reply,32,reply.length));long returns=mutations.stream().filter(m->m.returnMode()!=Mutation.ReturnMode.NONE).count();if(result.status()!=CommandResult.Status.SUCCESS || result.valueCount()!=returns)throw new IOException("Staging reply differs from requested result plan");return result;}
+            catch(IllegalArgumentException malformed){throw new IOException("Invalid staging reply",malformed);}
         }
         public CommandResult stage(List<Mutation> mutations) throws IOException { return stage(mutations,List.of()); }
         public byte[] participantPlanDigest(DistributedCommand intent,CommandResult stagedResult) throws IOException { return participantIntent(intent,stagedResult).payloadDigest(); }

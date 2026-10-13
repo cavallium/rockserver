@@ -19,20 +19,20 @@ class RatisSchemaJobBridgeTest {
         var scheduler=RWScheduler.forTesting(1,1,1,4,1,"schema-bridge-test");
         try (var f=new RatisSchemaClientTest.Fixture(root)) {
             Path requests=Files.createDirectory(root.resolve("requests")),sdk=Files.createDirectory(root.resolve("sdk"));
-            RatisSchemaJobBridge.ClientFactory factory=checkpoint -> new RatisSchemaClient(sdk,f.outer.cluster,f.outer.database,f.directory.domainId(),f.catalogue,f.client,f.routed,f.replicas,null,checkpoint);
+            RatisSchemaJobBridge.ClientFactory factory=(domain,checkpoint) -> new RatisSchemaClient(sdk,f.outer.cluster,f.outer.database,f.directory.domainId(),f.catalogue,f.client,f.routed,f.replicas,null,checkpoint);
             RatisSchemaClient.TrustedOperatorResolver resolver=(name,className,sha,revision) -> { throw new AssertionError("No operator resolution in this workflow"); };
             UUID cancelledId;
             long writes=f.nativeStore.next.get();
-            try (var bridge=new RatisSchemaJobBridge(requests,sdk,scheduler,factory,resolver,f.routed,8,4,16L*1024*1024)) {
+            try (var bridge=new RatisSchemaJobBridge(requests,sdk,scheduler,factory,resolver,java.util.Map.of(f.routed.directory().domainId(),f.routed),8,4,16L*1024*1024)) {
                 var entered=new CountDownLatch(1); var release=new CountDownLatch(1); var id=new AtomicReference<UUID>();
-                var cancelled=bridge.submit(Kind.DELETE_IF_EXISTS,65536,RequestContext.batch(),(client,request) -> {
+                var cancelled=bridge.submit(f.routed.directory().domainId(),Kind.DELETE_IF_EXISTS,65536,RequestContext.batch(),(client,request) -> {
                     id.set(request); entered.countDown();
                     if (!release.await(5,TimeUnit.SECONDS)) throw new TimeoutException("Test did not release initial checkpoint");
                     return client.prepareDeleteIfExists(request,"missing");
                 });
                 try { assertTrue(entered.await(5,TimeUnit.SECONDS)); assertTrue(cancelled.cancel(false)); }
                 finally { release.countDown(); }
-                var fresh=bridge.submit(Kind.DELETE_IF_EXISTS,65536,RequestContext.batch(),(client,request) -> client.prepareDeleteIfExists(request,"missing"));
+                var fresh=bridge.submit(f.routed.directory().domainId(),Kind.DELETE_IF_EXISTS,65536,RequestContext.batch(),(client,request) -> client.prepareDeleteIfExists(request,"missing"));
                 var result=fresh.get(5,TimeUnit.SECONDS); assertFalse(result.changed());
                 cancelledId=id.get(); assertNotEquals(cancelledId,result.requestId());
                 assertEquals(State.NOT_STARTED,bridge.status(cancelledId).state());
@@ -42,9 +42,9 @@ class RatisSchemaJobBridgeTest {
                 assertEquals(State.DONE,bridge.status(result.requestId()).state());
                 assertEquals(writes,f.nativeStore.next.get()); assertFalse(bridge.busy());
             }
-            try (var reopened=new RatisSchemaJobBridge(requests,sdk,scheduler,factory,resolver,f.routed,8,4,16L*1024*1024)) {
+            try (var reopened=new RatisSchemaJobBridge(requests,sdk,scheduler,factory,resolver,java.util.Map.of(f.routed.directory().domainId(),f.routed),8,4,16L*1024*1024)) {
                 assertEquals(State.NOT_STARTED,reopened.status(cancelledId).state());
-                var result=reopened.submit(Kind.DELETE_IF_EXISTS,65536,RequestContext.batch(),(client,request) -> client.prepareDeleteIfExists(request,"missing")).get(5,TimeUnit.SECONDS);
+                var result=reopened.submit(f.directory.domainId(),Kind.DELETE_IF_EXISTS,65536,RequestContext.batch(),(client,request) -> client.prepareDeleteIfExists(request,"missing")).get(5,TimeUnit.SECONDS);
                 assertFalse(result.changed()); assertEquals(writes,f.nativeStore.next.get());
             }
             assertEquals(0,f.nativeStore.closes.get());
@@ -58,13 +58,13 @@ class RatisSchemaJobBridgeTest {
             RatisSchemaClient.TrustedOperatorResolver resolver=(name,className,sha,revision) -> { throw new AssertionError("No operator resolution in this workflow"); };
             DistributedSchema intermediate;
             byte[] finalDigest;
-            RatisSchemaJobBridge.ClientFactory factory=checkpoint -> new RatisSchemaClient(sdk,f.outer.cluster,f.outer.database,f.initial.domainId(),f.catalogue,f.client,f.routed,f.replicas,null,checkpoint);
-            try (var bridge=new RatisSchemaJobBridge(requests,sdk,scheduler,factory,resolver,f.routed,8,4,16L*1024*1024)) {
-                var first=bridge.submit(Kind.CREATE,65536,RequestContext.batch(),(client,id) -> client.prepareCreate(id,"first",RatisSchemaClientTest.shape())).get(10,TimeUnit.SECONDS);
+            RatisSchemaJobBridge.ClientFactory factory=(domain,checkpoint) -> new RatisSchemaClient(sdk,f.outer.cluster,f.outer.database,f.initial.domainId(),f.catalogue,f.client,f.routed,f.replicas,null,checkpoint);
+            try (var bridge=new RatisSchemaJobBridge(requests,sdk,scheduler,factory,resolver,java.util.Map.of(f.routed.directory().domainId(),f.routed),8,4,16L*1024*1024)) {
+                var first=bridge.submit(f.routed.directory().domainId(),Kind.CREATE,65536,RequestContext.batch(),(client,id) -> client.prepareCreate(id,"first",RatisSchemaClientTest.shape())).get(10,TimeUnit.SECONDS);
                 assertTrue(first.changed());
                 var catalogue=new RatisSchemaCatalogue(f.client,f.outer.cluster,f.outer.database,f.catalogue.groupId(),f.catalogue.epoch(),f.catalogue.schemaDigest(),f.catalogue.directoryColumn());
                 intermediate=catalogue.read(f.routed.directory().schemaDigest());
-                var second=bridge.submit(Kind.CREATE,65536,RequestContext.batch(),(client,id) -> client.prepareCreate(id,"second",RatisSchemaClientTest.shape())).get(10,TimeUnit.SECONDS);
+                var second=bridge.submit(f.routed.directory().domainId(),Kind.CREATE,65536,RequestContext.batch(),(client,id) -> client.prepareCreate(id,"second",RatisSchemaClientTest.shape())).get(10,TimeUnit.SECONDS);
                 assertTrue(second.changed()); assertNotEquals(first.value(),second.value());
                 assertEquals(3,f.routed.directory().schemaEpoch()); finalDigest=f.routed.directory().schemaDigest();
             }
@@ -72,8 +72,8 @@ class RatisSchemaJobBridgeTest {
                 public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { throw new AssertionError("History restoration must use forced local proofs"); }
                 public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { throw new AssertionError("History restoration must not submit DATA"); }
             })) {
-                RatisSchemaJobBridge.ClientFactory recovered=checkpoint -> new RatisSchemaClient(sdk,f.outer.cluster,f.outer.database,f.initial.domainId(),f.catalogue,f.client,cold,f.replicas,null,checkpoint);
-                try (var bridge=new RatisSchemaJobBridge(requests,sdk,scheduler,recovered,resolver,cold,8,4,16L*1024*1024)) {
+                RatisSchemaJobBridge.ClientFactory recovered=(domain,checkpoint) -> new RatisSchemaClient(sdk,f.outer.cluster,f.outer.database,f.initial.domainId(),f.catalogue,f.client,cold,f.replicas,null,checkpoint);
+                try (var bridge=new RatisSchemaJobBridge(requests,sdk,scheduler,recovered,resolver,java.util.Map.of(cold.directory().domainId(),cold),8,4,16L*1024*1024)) {
                     assertArrayEquals(finalDigest,cold.directory().schemaDigest()); assertEquals(3,cold.directory().schemaEpoch());
                     assertArrayEquals(f.initialDirectory.payloadDigest(),cold.directory(f.initial).payloadDigest());
                     assertEquals(2,cold.directory(intermediate).schemaEpoch()); assertTrue(bridge.pending().isEmpty());

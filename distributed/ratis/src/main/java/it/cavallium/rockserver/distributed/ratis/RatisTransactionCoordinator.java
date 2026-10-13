@@ -51,7 +51,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         finally { synchronized (this) { active=false; } }
     }
     private Step advance() throws IOException {
-        journal.refreshHome(); journal.resolveHomeFromObserved();
+        journal.refreshHome(); journal.resolveHomeFromObserved();if(journal.initialRegistrationNoEffect())return new Step(Action.COMPLETE,null,true);
         var snapshot=journal.snapshot();
         if (snapshot.pendingHome()!=null && snapshot.homeResult()==null && !snapshot.homeSuperseded()) {
             journal.executeHome(); return result(Action.RETRIED_HOME,null);
@@ -127,6 +127,7 @@ public final class RatisTransactionCoordinator implements AutoCloseable {
         return Objects.requireNonNull(controls.nextAfter(snapshot.lastHome()),"Missing coordinator operation identity");
     }
     private Step result(Action action,UUID group) throws IOException {
+        if(journal.initialRegistrationRejected()){journal.refreshHome();journal.resolveHomeFromObserved();if(journal.initialRegistrationNoEffect())return new Step(action,group,true);}
         var snapshot=journal.snapshot();
         boolean complete=snapshot.observedHome()!=null && snapshot.observedHome().fullyFinalized() && snapshot.participants().stream().allMatch(p -> p.outcome()!=null || p.retirementProof()!=null
                 && (snapshot.observedHome().phase()==TransactionStatus.Phase.ABORT || snapshot.observedHome().gcEligible()));

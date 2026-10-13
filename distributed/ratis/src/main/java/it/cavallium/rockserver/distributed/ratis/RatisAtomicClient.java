@@ -244,8 +244,8 @@ public final class RatisAtomicClient implements AutoCloseable {
         private Void consumeWork(Task<Void> work)throws Exception {
                 work.check();
                 if (rejected!=null) { rejected.consume(); return null; }
-                try{journal.refreshHome();}catch(RatisHomeRetiredException retired){if(!consumptionOnly || !retired.proof().equals(journal.snapshot().homeRetirementProof()))throw retired;return null;}
-                journal.resolveHomeFromObserved(); var saved=journal.snapshot();
+                try{journal.refreshHome();}catch(RatisHomeRetiredException retired){if(journal.initialRegistrationNoEffect())return null;if(!consumptionOnly || !retired.proof().equals(journal.snapshot().homeRetirementProof()))throw retired;return null;}
+                journal.resolveHomeFromObserved();if(journal.initialRegistrationNoEffect())return null; var saved=journal.snapshot();
                 if (saved.observedHome()!=null && saved.observedHome().consumed()) return null;
                 if(consumptionOnly){if(saved.observedHome()==null || !saved.observedHome().fullyFinalized())throw new IOException("Application-ACK cleanup lacks a fully finalized HOME");}else journal.result();
                 var consumed=saved.observedHome().consume();

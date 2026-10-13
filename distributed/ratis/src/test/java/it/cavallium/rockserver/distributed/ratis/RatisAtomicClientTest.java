@@ -59,7 +59,7 @@ class RatisAtomicClientTest {
         final Map<UUID,RaftGroup> raftGroups=new HashMap<>();
         final List<RaftStorage> storages=new ArrayList<>();
         final AtomicInteger opens=new AtomicInteger(),captureCloses=new AtomicInteger(),submissions=new AtomicInteger(),rpcs=new AtomicInteger(),captureRequests=new AtomicInteger();
-        volatile Runnable beforeAuthorize,beforeHomeRead,beforeSnapshotCapture,beforeSnapshotRead,beforeSnapshotRelease,beforePromotion;
+        volatile Runnable beforeAuthorize,beforeHomeRead,beforeHomeCommand,beforeSnapshotCapture,beforeSnapshotRead,beforeSnapshotRelease,beforePromotion;
         volatile UUID losePrepareGroup,loseCaptureGroup;
         volatile TransactionStatus allowedReservation;
         volatile boolean losePromotion;
@@ -184,6 +184,7 @@ class RatisAtomicClientTest {
                 }
                 public RangeStateView stateView(RangeDescriptor route) throws IOException { return RangeStateView.decode(ScopedTransactionRpc.parse(transaction(route,ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0]),true),ScopedTransactionRpc.MAX_REPLY_BYTES).body()); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException {
+                    if(route.groupId().equals(homeGroup) && beforeHomeCommand!=null && command.mutations().size()==1 && command.predicates().size()==1 && command.predicates().getFirst().expectedValue()==null){var initial=TransactionStatus.decode(command.mutations().getFirst().value());if(initial.origin()==null && initial.phase()==TransactionStatus.Phase.PREPARING && initial.generation()==0)beforeHomeCommand.run();}
                     if(route.groupId().equals(homeGroup) && command.mutations().size()==1) {var next=TransactionStatus.decode(command.mutations().getFirst().value());if(next.origin()!=null && next.phase()==TransactionStatus.Phase.PREPARING && next.generation()==1)promotionSubmissions.incrementAndGet();}
                     var result=CommandResult.decode(append(route,DistributedCommandCodec.encode(command)));
                     if(losePromotion && route.groupId().equals(homeGroup) && TransactionStatus.decode(command.mutations().getFirst().value()).origin()!=null && TransactionStatus.decode(command.mutations().getFirst().value()).generation()==1) {losePromotion=false;throw new IOException("Lost applied promotion reply");}
