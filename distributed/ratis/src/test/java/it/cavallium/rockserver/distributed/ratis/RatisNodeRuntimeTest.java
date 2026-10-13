@@ -243,7 +243,7 @@ class RatisNodeRuntimeTest {
                 return fake.create(plan,logs,machines);
             };
             try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, bound, null, null, recovery)) {
-                assertEquals(0,node.participantRecoveryStatus().openWorkers()); node.start(); assertEquals(2,env.timer.activePeriods());
+                assertEquals(0,node.participantRecoveryStatus().openWorkers()); node.start(); assertEquals(3,env.timer.activePeriods());
                 env.timer.fire(); RatisTransactionRecoveryServiceTest.idle(env.scheduler); assertNull(node.participantRecoveryFailure()); assertEquals(0,node.participantRecoveryStatus().persistedFiles());
             }
             assertEquals(0,env.timer.activePeriods()); assertEquals(0,homes.closes);
@@ -286,7 +286,7 @@ class RatisNodeRuntimeTest {
             homes.execute(homes.prepare(new OperationId(helper.session,1,2),aborted,acknowledged));
             var consumed=acknowledged.consume(); homes.execute(homes.prepare(new OperationId(helper.session,1,3),acknowledged,consumed));
             assertEquals(consumed,homes.read(initial.transactionId()));
-            assertEquals(3,f.env.timer.activePeriods(),"DATA expiry, participant recovery and local HOME retirement timers are activated");
+            assertEquals(4,f.env.timer.activePeriods(),"DATA expiry, participant recovery, pool pressure and HOME retirement timers are activated");
             var live=f.env.catalogue.epochs.read(); var expired=live.advanceTime(100);
             f.env.catalogue.epochs.execute(f.env.catalogue.epochs.prepare(f.env.outer.operation(2),live,expired));
             for (var directory:List.of(f.plan.domains().getFirst().directory(),home.directory())) {
@@ -314,7 +314,7 @@ class RatisNodeRuntimeTest {
     @Test void automaticRetirementTimerAndDurableOwnershipDrainBeforeRuntimeReopen() throws Exception {
         var helper=new RatisHomeRolesTest(); helper.root=root;
         try (var f=helper.new Fixture("retirement-reopen")) {
-            assertEquals(3,f.env.timer.activePeriods()); f.env.timer.fire(); retirementService(f.node).tick().get(5,java.util.concurrent.TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler);
+            assertEquals(4,f.env.timer.activePeriods()); f.env.timer.fire(); retirementService(f.node).tick().get(5,java.util.concurrent.TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler);
             assertNull(f.node.retirementFailure()); assertEquals(0,f.node.pendingRetirements());
             assertTrue(Files.isDirectory(f.env.nodeRoot.resolve("retirement")));
             f.node.close(); assertEquals(0,f.env.timer.activePeriods()); assertEquals(1,f.server.closes);
@@ -325,7 +325,7 @@ class RatisNodeRuntimeTest {
             var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),
                     f.env.settings().retention(),f.env.settings().clockPeriod(),1,4,f.env.settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
             try (var reopened=RatisNodeRuntime.open(f.plan, f.env.nodeRoot, ConfigParser.parseDefault(), f.env.catalogue.epochs, Map.of(f.data.directory().domainId(), f.data), f.env.scheduler, f.env.timer, () -> 20L, settings, RatisNodeRuntime.Startup.RECOVER, f.server::create, null, null, null, f::client)) {
-                assertEquals(0,reopened.pendingRetirements()); reopened.start(); assertEquals(3,f.env.timer.activePeriods());
+                assertEquals(0,reopened.pendingRetirements()); reopened.start(); assertEquals(4,f.env.timer.activePeriods());
                 f.env.timer.fire(); retirementService(reopened).tick().get(5,java.util.concurrent.TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler);
                 assertNull(reopened.retirementFailure()); assertEquals(0,reopened.pendingRetirements());
             }
@@ -365,7 +365,7 @@ class RatisNodeRuntimeTest {
             var first=new FakeServer();
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first)) {
                 assertFalse(node.started()); node.start(); assertTrue(node.started()); assertEquals(2,first.storages.size());
-                assertEquals(1,env.timer.activePeriods()); assertNull(node.maintenanceStatus());
+                assertEquals(2,env.timer.activePeriods()); assertNull(node.maintenanceStatus());
                 assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
             }
             assertEquals(1,first.closes); assertTrue(first.allFencedAtClose); assertEquals(0,env.timer.activePeriods());
@@ -446,7 +446,7 @@ class RatisNodeRuntimeTest {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
             env.catalogue.unavailable=true;
             try (var node=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) {
-                node.start(); assertTrue(node.started()); assertEquals(2,env.timer.activePeriods()); env.timer.fire();
+                node.start(); assertTrue(node.started()); assertEquals(3,env.timer.activePeriods()); env.timer.fire();
                 var settled=new java.util.concurrent.CompletableFuture<Void>();
                 env.scheduler.executor(it.cavallium.rockserver.core.common.RequestContext.batch(),it.cavallium.rockserver.core.common.OperationFamily.MUTATION).execute(() -> settled.complete(null));
                 settled.get(5,java.util.concurrent.TimeUnit.SECONDS);

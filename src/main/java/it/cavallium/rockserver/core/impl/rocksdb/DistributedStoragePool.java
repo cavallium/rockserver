@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.core.impl.rocksdb;
 
 import it.cavallium.rockserver.core.config.DatabaseConfig;
+import it.cavallium.rockserver.core.impl.StoragePressureSignal;
+import it.cavallium.rockserver.core.impl.RocksDBLongProperty;
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.nio.ByteBuffer;
 import it.cavallium.rockserver.core.config.GlobalDatabaseConfig;
@@ -56,7 +58,7 @@ public final class DistributedStoragePool implements AutoCloseable {
     private static byte[] groupSchemaKey(UUID group,int tag) { return ByteBuffer.allocate(17).putLong(group.getMostSignificantBits()).putLong(group.getLeastSignificantBits()).put((byte)tag).array(); }
     private volatile PoolSnapshotAdmission snapshotAdmission;
     private volatile List<ColumnFamilyHandle> pressureColumns = List.of();
-    private List<Path> storageVolumes = List.of();
+    private volatile List<Path> storageVolumes = List.of();
     private final Set<SchemaInstallPlan> schemaPlans=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private final Set<ReplicatedRangeStore.SchemaInstallCaptureGate> schemaCaptures=java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private final Map<Object,java.util.concurrent.CompletableFuture<Void>> schemaCleanups=new java.util.IdentityHashMap<>();
@@ -912,6 +914,30 @@ public final class DistributedStoragePool implements AutoCloseable {
         for (Path volume : storageVolumes) free = Math.min(free, Files.getFileStore(volume).getUsableSpace());
         return new PoolSnapshotAdmission.Sample(bytes, free, sampledAt);
         } finally { handleLifetime.readLock().unlock(); }
+    }
+
+    public record WorkloadPressure(boolean pressured,int reasonMask,boolean diskPressure,long freeBytes,long sampledAtNanos) {}
+    /** Fresh pool-local sampling holds DB/CF lifetime protection through every property read. */
+    public WorkloadPressure currentWorkloadPressure(long minimumFreeBytes) throws IOException,RocksDBException {
+        if(minimumFreeBytes<0)throw new IllegalArgumentException("Negative free-space reserve");
+        handleLifetime.readLock().lock();
+        try {
+            synchronized(admission){if(closing || closed)throw new IOException("Pool is closing");}
+            long sampled=System.nanoTime();var db=loaded.db().get();var signal=new StoragePressureSignal();
+            signal.reset(db.getLongProperty(RocksDBLongProperty.IS_WRITE_STOPPED.getName()),
+                    db.getLongProperty(RocksDBLongProperty.ACTUAL_DELAYED_WRITE_RATE.getName()));
+            if(!signal.pressured())for(var entry:handles.entrySet()) {
+                var options=loaded.definitiveColumnFamilyOptionsMap().get(entry.getKey());
+                if(options==null)throw new IOException("Pressure column has no effective options");
+                signal.observeColumn(entry.getValue().getID(),db.getLongProperty(entry.getValue(),RocksDBLongProperty.ESTIMATE_PENDING_COMPACTION_BYTES.getName()),options.softPendingCompactionBytesLimit());
+                if(signal.pressured())break;
+            }
+            long free=Long.MAX_VALUE;
+            for(var volume:storageVolumes.isEmpty()?List.of(loaded.definitiveDbPath()):storageVolumes)
+                free=Math.min(free,Files.getFileStore(volume).getUsableSpace());
+            boolean disk=free<minimumFreeBytes;
+            return new WorkloadPressure(signal.pressured() || disk,signal.reasonMask(),disk,free,sampled);
+        } finally {handleLifetime.readLock().unlock();}
     }
 
     private record RecoveredSchema(NativeSchemaInstallation current,List<NativeSchemaInstallation> chain,NativeSchemaFence pending) {}

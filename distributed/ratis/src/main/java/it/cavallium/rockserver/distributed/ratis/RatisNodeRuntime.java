@@ -117,6 +117,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final List<RatisSessionPropagation> propagations=new ArrayList<>();
     private final Map<RatisNodePlan.Role,RatisRoutedClient> homeClients=new EnumMap<>(RatisNodePlan.Role.class);
     private RatisTransactionExpiryService transactionExpiry;
+    private RatisPoolPressureService poolPressure;
     private RecoverySettings recoverySettings;
     private RatisParticipantRecoveryRegistry participantRecoveries;
     private RatisTransactionRecoveryService participantRecoveryService;
@@ -464,6 +465,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         for(var entry:groups.entries())markSeedExposure(entry);
         server=factory.create(plan,logs,Collections.unmodifiableMap(machines));
         transactionExpiry=new RatisTransactionExpiryService(scheduler,this::expiryMachines,32);
+        poolPressure=new RatisPoolPressureService(scheduler,() -> pool.currentWorkloadPressure(Math.max(settings.exports().pins().minimumFreeBytes(),settings.exports().io().minimumFreeBytes())));
         var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (groups.require(id.getUuid()).role()==RatisNodePlan.Role.DATA) local.add(id.getUuid());
         if (recoverySettings!=null && !local.isEmpty()) {
             participantRecoveries=new RatisParticipantRecoveryRegistry(root.resolve("recovery"),recoverySettings.homes(),routedClients,group->groups.require(group).directory(),recoverySettings.takeover(),groups::dataGroups,recoverySettings.limits());
@@ -709,6 +711,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for (var group:groups.raftGroups()){verify(group);virginSeedAdds.remove(group.getGroupId().getUuid());}
             if (service!=null) service.start(timer,settings.clockPeriod());
             transactionExpiry.start(timer,Duration.ofMillis(100));
+            poolPressure.start(timer);
             if (participantRecoveryService!=null) participantRecoveryService.start(timer,recoverySettings.period());
             if (retirementService!=null) retirementService.start(timer,Duration.ofSeconds(1));
             synchronized (this) { started=true; }
@@ -795,7 +798,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         var registry=participantRecoveries;
         var recovery=registry==null ? new RatisNodeReadiness.Recovery(groups.dataGroups().isEmpty(),0,0,participantRecoveryFailure())
                 : recoveryStamp(registry.recoveryStatus());
-        Throwable failure=maintenanceFailure();if(failure==null)failure=retirementFailure();if(failure==null)failure=transactionExpiryFailure();
+        Throwable failure=maintenanceFailure();if(failure==null)failure=retirementFailure();if(failure==null)failure=transactionExpiryFailure();if(failure==null && poolPressure!=null)failure=poolPressure.failure();
         return new RatisNodeReadiness.NodeStamp(state(),installing,groups.entries(),recovery,failure);
     }
     private RatisNodeReadiness.Recovery recoveryStamp(RatisParticipantRecoveryRegistry.RecoveryStatus status) {
@@ -896,6 +899,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Snapshot HELP did not drain",failure); }
             }
             if (participantRecoveries!=null) participantRecoveries.close();
+            if(poolPressure!=null) {
+                try{poolPressure.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS);}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Pool pressure sampler drain interrupted",interrupted);}
+                catch(ExecutionException | TimeoutException failure){throw new IOException("Pool pressure sampler did not drain",failure);}
+            }
             if (transactionExpiry!=null) {
                 try { transactionExpiry.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Transaction expiry drain interrupted",interrupted); }

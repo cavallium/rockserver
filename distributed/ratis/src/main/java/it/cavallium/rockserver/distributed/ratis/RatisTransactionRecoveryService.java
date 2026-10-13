@@ -72,6 +72,8 @@ public final class RatisTransactionRecoveryService {
         }
     }
 
+    void requestQuantum() { request(); }
+
     // Periodic requests allocate no discarded dependent futures while a quantum is already queued/running.
     private Task request() {
         final Task task;
