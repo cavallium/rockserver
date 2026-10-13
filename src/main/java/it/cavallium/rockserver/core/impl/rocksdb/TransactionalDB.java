@@ -152,9 +152,7 @@ public sealed interface TransactionalDB extends Closeable {
 				if (this.closed) {
 					return;
 				}
-				this.closed = true;
 				List<Exception> exceptions = new ArrayList<>();
-				boolean lastOpenDatabase = RocksDBEnvLifecycle.afterCloseAndIsLast();
 				Env env = null;
 				try {
 					databaseTasks.close();
@@ -176,7 +174,9 @@ public sealed interface TransactionalDB extends Closeable {
 					exceptions.add(ex);
 				}
 				try {
-					db.cancelAllBackgroundWork(true);
+					if (db.isOwningHandle()) {
+						db.cancelAllBackgroundWork(true);
+					}
 				} catch (Exception ex) {
 					exceptions.add(ex);
 				}
@@ -193,11 +193,15 @@ public sealed interface TransactionalDB extends Closeable {
 					if (db.isOwningHandle()) {
 						db.closeE();
 					}
-				} catch (RocksDBException e) {
+				} catch (Exception e) {
 					exceptions.add(e);
 				}
-				if (lastOpenDatabase && env != null) {
-					RocksDBEnvLifecycle.shutdownThreadPoolsOnLastClose(env, exceptions);
+				if (!db.isOwningHandle()) {
+					this.closed = true;
+					boolean lastOpenDatabase = RocksDBEnvLifecycle.afterCloseAndIsLast();
+					if (lastOpenDatabase && env != null) {
+						RocksDBEnvLifecycle.shutdownThreadPoolsOnLastClose(env, exceptions);
+					}
 				}
 				if (!exceptions.isEmpty()) {
 					IOException ex;
