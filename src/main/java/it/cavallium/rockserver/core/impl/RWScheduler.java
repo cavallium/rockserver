@@ -564,10 +564,7 @@ public final class RWScheduler {
 			topologyWorkers = Math.addExact(topologyWorkers, groupWorkers);
 			completions = Math.addExact(completions, scratch[POOL_TELEMETRY_COMPLETED_TASKS]);
 			if (moreReadContention(scratch, target)) {
-				System.arraycopy(scratch, 0, target, 0,
-						Math.min(POOL_TELEMETRY_LENGTH, Math.min(target.length, scratch.length)));
-				if (target.length > POOL_TELEMETRY_NON_RUN_OUTCOMES && scratch.length <= POOL_TELEMETRY_NON_RUN_OUTCOMES)
-					target[POOL_TELEMETRY_NON_RUN_OUTCOMES] = -1;
+				System.arraycopy(scratch, 0, target, 0, POOL_TELEMETRY_LENGTH);
 			}
 		}
 		target[POOL_TELEMETRY_COMPLETED_TASKS] = completions;

@@ -1506,7 +1506,7 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 	void copyPoolTelemetry(long[] target) {
 		Objects.requireNonNull(target, "target");
 		int profileCount = PROFILES.length;
-		int requiredLength = RWScheduler.POOL_TELEMETRY_SCALARS + profileCount * 2;
+		int requiredLength = RWScheduler.POOL_TELEMETRY_LENGTH;
 		if (target.length < requiredLength) {
 			throw new IllegalArgumentException("Pool telemetry buffer requires at least "
 					+ requiredLength + " entries");
@@ -1529,10 +1529,8 @@ final class ProfiledWorkloadExecutor extends AbstractExecutorService {
 			target[RWScheduler.POOL_TELEMETRY_COMPLETED_TASKS] = completedTasks;
 			target[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] = failedTasks;
 			target[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES] = terminalOutcomes;
-			if (target.length > RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES) {
-				target[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES] =
-						terminalOutcomes - outcomes[RWScheduler.TerminalOutcome.RUN.ordinal()];
-			}
+			target[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES] =
+					terminalOutcomes - outcomes[RWScheduler.TerminalOutcome.RUN.ordinal()];
 			target[RWScheduler.POOL_TELEMETRY_BATCH_LIMITED] =
 					batchQueued > batchStartAllowance ? 1L : 0L;
 			target[RWScheduler.POOL_TELEMETRY_BATCH_ALLOWANCE] = batchStartAllowance;

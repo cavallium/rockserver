@@ -78,6 +78,8 @@ class RWSchedulerTest {
 		assertEquals(RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.values().length,
 				RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE);
 		assertEquals(RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.values().length,
+				RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES);
+		assertEquals(RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES + 1,
 				RWScheduler.POOL_TELEMETRY_LENGTH);
 		var scheduler = scheduler(1, "primitive-telemetry-allocation");
 		var telemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH + 1];
