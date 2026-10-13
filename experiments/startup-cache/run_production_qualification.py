@@ -22,6 +22,11 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
+def cache_inventory(root):
+    return [{"name": str(file.relative_to(root)), "bytes": file.stat().st_size, "sha256": sha256(file)}
+            for file in sorted(root.rglob("*")) if file.is_file()]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--classpath", required=True, help="Built production classes and candidate JNI/runtime dependencies")
@@ -116,9 +121,17 @@ def main():
         return
     runs = json.loads((out / "runs.json").read_text()) if args.resume else []
     for run in runs:
+        if json.loads((out / (run["label"] + ".json")).read_text()) != run["report"]:
+            raise RuntimeError("Retained report differs from run receipt")
+        restart = json.loads((out / (run["label"] + "-restart.json")).read_text())
+        if restart.get("persisted_writes_verified") != 128 or restart.get("data_mismatches") != 0:
+            raise RuntimeError("Retained reopen verification incomplete")
         for label in (run["label"], run["label"] + "-restart"):
             if (out / (label + ".exit")).read_text().strip() != "0":
                 raise RuntimeError(f"Retained trial has no accepted exit evidence: {label}")
+            resources = json.loads((out / (label + ".resources.json")).read_text())
+            if resources.get("timeout") is not False:
+                raise RuntimeError(f"Retained resource receipt timed out/missing: {label}")
     environment = {k: v for k, v in os.environ.items() if not k.startswith(("RSHC_TEST_", "ROCKSDB_TEST_"))}
 
     def java(label, db, cache, mode):
@@ -241,6 +254,14 @@ def run_disks(java, args, out, manifest, runs):
             if root.parent != disk or cache_root.parent != cache_disk or not (root / ".task-owned").is_file() or not (cache_root / ".task-owned").is_file():
                 raise RuntimeError("Retained fixture ownership/topology mismatch")
             seed_db, seed_cache = root / "seed-db", cache_root / "seed-cache"
+            cache_receipt = out / f"disk-{disk_index}-seed-cache.json"
+            inventory = cache_inventory(seed_cache)
+            if cache_receipt.exists():
+                if json.loads(cache_receipt.read_text())["files"] != inventory:
+                    raise RuntimeError("Retained seed-cache changed")
+            else:
+                write_json(cache_receipt, {"files": inventory,
+                    "provenance": "First hashed during resume; initial-run hash unavailable"})
             for entry in json.loads((out / f"disk-{disk_index}-fixture.json").read_text()):
                 if sha256(seed_db / entry["name"]) != entry["sha256"]:
                     raise RuntimeError("Retained seed changed")
@@ -262,6 +283,8 @@ def run_disks(java, args, out, manifest, runs):
             (out / f"cache-disk-{disk_index}.txt").write_text(subprocess.run(["findmnt", "-T", str(cache_root)], capture_output=True, text=True, check=True).stdout)
             seed_db, seed_cache = root / "seed-db", cache_root / "seed-cache"
             java(f"disk-{disk_index}-seed", seed_db, seed_cache, "seed")
+            write_json(out / f"disk-{disk_index}-seed-cache.json", {
+                "files": cache_inventory(seed_cache), "provenance": "Hashed immediately after fresh seed capture/close"})
             fixture = []
             for file in sorted(seed_db.iterdir()):
                 if file.is_file():
