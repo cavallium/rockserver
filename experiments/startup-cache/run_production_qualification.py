@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--data-sample-every", type=int, default=64, help="Production DATA sampling; 1 explicitly stresses capture")
     parser.add_argument("--metadata-sample-every", type=int, default=16, help="Production METADATA sampling; 1 explicitly stresses capture")
     parser.add_argument("--prepare-only", action="store_true", help="Compile/record contract; creates no disk fixtures or measured runs")
+    parser.add_argument("--resume", action="store_true", help="Resume same frozen manifest, skipping trials with completed reopen evidence")
     args = parser.parse_args()
     if not 1 <= args.dataset_mib <= 1024 or not 1 <= args.operations <= 1_000_000 or not 1 <= args.pairs <= 10 or not 10 <= args.timeout <= 3600:
         parser.error("Bounded dataset 1..1024 MiB, operations 1..1000000, pairs 1..10, timeout 10..3600 seconds required")
@@ -48,10 +49,10 @@ def main():
     if not 100 <= args.capture_period_ms <= 86400000:
         parser.error("Capture period must be100..86400000ms")
     out = args.output.resolve()
-    out.mkdir(parents=True, exist_ok=False)
+    out.mkdir(parents=True, exist_ok=args.resume)
     source = Path(__file__).parent / "java" / "StartupProductionQualification.java"
     classes = out / "classes"
-    classes.mkdir()
+    classes.mkdir(exist_ok=args.resume)
     cp_entries = [Path(p).resolve(strict=True) for p in args.classpath.split(os.pathsep)]
     artifacts = []
     for path in cp_entries:
@@ -88,6 +89,19 @@ def main():
                 "capture_period_scope": "production default" if args.capture_period_ms == 300000 else "explicit accelerated qualification override; not production default",
                 "writer": "Target maximum128writes/sec, cyclic128deterministic keys, continues until fixed reader workload ends",
                 "retained_fixture_roots": [], "retained_cache_roots": []}
+    if args.resume:
+        retained = json.loads((out / "manifest.json").read_text())
+        for key in ("source_sha256", "support_sha256", "runtime_artifacts", "acceptance_predefined"):
+            if retained[key] != manifest[key]:
+                raise RuntimeError(f"Cannot resume changed input: {key}")
+        for key, value in manifest["parameters"].items():
+            if key not in ("resume", "prepare_only") and retained["parameters"][key] != value:
+                raise RuntimeError(f"Cannot resume changed workload: {key}")
+        write_json(out / "manifest-before-resume.json", retained)
+        write_json(out / "result-before-resume.json", json.loads((out / "result.json").read_text()))
+        retained.setdefault("resumptions", []).append({"runner_sha256": manifest["runner_sha256"], "git_head": manifest["git_head"]})
+        retained["run_status"] = "ACTIVE_RESUMED"
+        manifest = retained
     write_json(out / "manifest.json", manifest)
     command = ["javac", "--release", "25", "-Xlint:all,-restricted", "-Werror", "-cp", args.classpath,
                "-d", str(classes), str(source)]
@@ -100,7 +114,11 @@ def main():
         write_json(out / "result.json", {"status": "PREPARED", "measured": False})
         print(out)
         return
-    runs = []
+    runs = json.loads((out / "runs.json").read_text()) if args.resume else []
+    for run in runs:
+        for label in (run["label"], run["label"] + "-restart"):
+            if (out / (label + ".exit")).read_text().strip() != "0":
+                raise RuntimeError(f"Retained trial has no accepted exit evidence: {label}")
     environment = {k: v for k, v in os.environ.items() if not k.startswith(("RSHC_TEST_", "ROCKSDB_TEST_"))}
 
     def java(label, db, cache, mode):
@@ -206,6 +224,8 @@ def main():
                                 "performance_acceptance": performance})
     write_json(out / "result.json", {"correctness_status": "PASS", "performance_comparisons": comparisons,
                                       "scope": manifest["scope"], "runs": runs})
+    manifest["run_status"] = "COMPLETE"
+    write_json(out / "manifest.json", manifest)
     print(out)
 
 
@@ -214,33 +234,55 @@ def run_disks(java, args, out, manifest, runs):
         disk = disk.resolve(strict=True)
         if shutil.disk_usage(disk).free < 5 * args.dataset_mib * 1024**2 + 1024**3:
             raise RuntimeError(f"Insufficient reserved free space on {disk}")
-        root = Path(tempfile.mkdtemp(prefix="rockserver-startup-qualification-", dir=disk))
-        (root / ".task-owned").write_text("startup-production-qualification-v1\n")
-        manifest["retained_fixture_roots"].append(str(root))
-        write_json(out / "manifest.json", manifest)
-        (out / f"disk-{disk_index}.txt").write_text(subprocess.run(["findmnt", "-T", str(root)], capture_output=True, text=True, check=True).stdout)
         cache_disk = args.cache_disk[disk_index].resolve(strict=True)
-        if cache_disk == disk:
-            raise RuntimeError("Use a separate faster cache parent than DB parent")
-        if shutil.disk_usage(cache_disk).free < 1024**3:
-            raise RuntimeError("Cache disk free-space reserve insufficient")
-        cache_root = Path(tempfile.mkdtemp(prefix="rockserver-startup-cache-qualification-", dir=cache_disk))
-        (cache_root / ".task-owned").write_text("startup-production-qualification-cache-v1\n")
-        manifest["retained_cache_roots"].append(str(cache_root))
-        write_json(out / "manifest.json", manifest)
-        (out / f"cache-disk-{disk_index}.txt").write_text(subprocess.run(["findmnt", "-T", str(cache_root)], capture_output=True, text=True, check=True).stdout)
-        seed_db, seed_cache = root / "seed-db", cache_root / "seed-cache"
-        java(f"disk-{disk_index}-seed", seed_db, seed_cache, "seed")
-        fixture = []
-        for file in sorted(seed_db.iterdir()):
-            if file.is_file():
-                fixture.append({"name": file.name, "bytes": file.stat().st_size, "sha256": sha256(file)})
-        write_json(out / f"disk-{disk_index}-fixture.json", fixture)
+        if args.resume:
+            root = Path(manifest["retained_fixture_roots"][disk_index])
+            cache_root = Path(manifest["retained_cache_roots"][disk_index])
+            if root.parent != disk or cache_root.parent != cache_disk or not (root / ".task-owned").is_file() or not (cache_root / ".task-owned").is_file():
+                raise RuntimeError("Retained fixture ownership/topology mismatch")
+            seed_db, seed_cache = root / "seed-db", cache_root / "seed-cache"
+            for entry in json.loads((out / f"disk-{disk_index}-fixture.json").read_text()):
+                if sha256(seed_db / entry["name"]) != entry["sha256"]:
+                    raise RuntimeError("Retained seed changed")
+        else:
+            root = Path(tempfile.mkdtemp(prefix="rockserver-startup-qualification-", dir=disk))
+            (root / ".task-owned").write_text("startup-production-qualification-v1\n")
+            manifest["retained_fixture_roots"].append(str(root))
+            write_json(out / "manifest.json", manifest)
+            (out / f"disk-{disk_index}.txt").write_text(subprocess.run(["findmnt", "-T", str(root)], capture_output=True, text=True, check=True).stdout)
+            cache_disk = args.cache_disk[disk_index].resolve(strict=True)
+            if cache_disk == disk:
+                raise RuntimeError("Use a separate faster cache parent than DB parent")
+            if shutil.disk_usage(cache_disk).free < 1024**3:
+                raise RuntimeError("Cache disk free-space reserve insufficient")
+            cache_root = Path(tempfile.mkdtemp(prefix="rockserver-startup-cache-qualification-", dir=cache_disk))
+            (cache_root / ".task-owned").write_text("startup-production-qualification-cache-v1\n")
+            manifest["retained_cache_roots"].append(str(cache_root))
+            write_json(out / "manifest.json", manifest)
+            (out / f"cache-disk-{disk_index}.txt").write_text(subprocess.run(["findmnt", "-T", str(cache_root)], capture_output=True, text=True, check=True).stdout)
+            seed_db, seed_cache = root / "seed-db", cache_root / "seed-cache"
+            java(f"disk-{disk_index}-seed", seed_db, seed_cache, "seed")
+            fixture = []
+            for file in sorted(seed_db.iterdir()):
+                if file.is_file():
+                    fixture.append({"name": file.name, "bytes": file.stat().st_size, "sha256": sha256(file)})
+            write_json(out / f"disk-{disk_index}-fixture.json", fixture)
         for pair in range(args.pairs):
             order = MODES if pair % 2 == 0 else tuple(reversed(MODES))
             for mode in order:
                 label = f"disk-{disk_index}-pair-{pair}-{mode}"
+                if any(run["label"] == label for run in runs):
+                    continue
                 run_root = root / label
+                if run_root.exists():
+                    archive = out / (label + "-partial-before-resume")
+                    archive.mkdir(exist_ok=False)
+                    for file in out.glob(label + ".*"):
+                        file.rename(archive / file.name)
+                    run_root.rename(root / (label + "-partial-before-resume"))
+                    old_cache = cache_root / label
+                    if old_cache.exists():
+                        old_cache.rename(cache_root / (label + "-partial-before-resume"))
                 run_root.mkdir()
                 db, cache = run_root / "db", cache_root / label
                 shutil.copytree(seed_db, db)
