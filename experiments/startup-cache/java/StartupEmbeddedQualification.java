@@ -41,6 +41,31 @@ public final class StartupEmbeddedQualification {
                 "accepted", r[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS] + w[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
                 "terminal", r[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES] + w[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]);
     }
+    private static String codeSource(Class<?> type) {
+        var source = type.getProtectionDomain().getCodeSource();
+        if (source == null) throw new IllegalStateException("Missing CodeSource for " + type.getName());
+        return source.getLocation().toExternalForm();
+    }
+    private static Map<String, Object> nativeIdentity() throws ClassNotFoundException {
+        String expected = System.getProperty("rockserver.startup.expected-native-sha256");
+        if (expected == null || !expected.matches("[0-9a-f]{64}"))
+            throw new IllegalArgumentException("Required expected native SHA256 JVM property is missing or malformed");
+        String expectedHome = System.getProperty("rockserver.startup.expected-user-home");
+        String actualHome = System.getProperty("user.home");
+        if (expectedHome == null || expectedHome.isEmpty() || !expectedHome.equals(actualHome))
+            throw new IllegalArgumentException("Effective user.home mismatch before native loading: expected="
+                    + expectedHome + ", actual=" + actualHome);
+        // Initialize and fingerprint the actual dladdr-selected SO equally in every mode, before DB timers.
+        String actual = NativeStartupBridge.cacheCompatibilityId();
+        if (!actual.equals(expected))
+            throw new IllegalStateException("Loaded native SHA256 mismatch: expected=" + expected + ", actual=" + actual);
+        return Map.of("loaded_native_sha256", actual, "expected_native_sha256", expected,
+                "user_home", actualHome, "code_sources", Map.of(
+                    "org.rocksdb.RocksDB", codeSource(org.rocksdb.RocksDB.class),
+                    "org.rocksdb.NativeLibraryLoader", codeSource(Class.forName("org.rocksdb.NativeLibraryLoader", false,
+                            org.rocksdb.RocksDB.class.getClassLoader())),
+                    "it.cavallium.rockserver.core.impl.EmbeddedDB", codeSource(EmbeddedDB.class)));
+    }
     private static Map<String, Object> serviceHistogram(Histogram histogram) {
         var result = new LinkedHashMap<String, Object>(histogram.report());
         result.put("service_failures", result.remove("native_failures"));
@@ -169,6 +194,7 @@ public final class StartupEmbeddedQualification {
         output.put("workload_timeout_seconds", workloadSeconds);
         output.put("bounded_inflight_requests_per_lane", 1);
         output.put("caller_lanes", "two asynchronous read lanes plus one asynchronous put/readback lane");
+        output.put("native_identity", nativeIdentity());
         Path conf = config(db, cache, mode, direct, dataSample, metadataSample, period);
         output.put("effective_config", Files.readString(conf));
         long beforeOpen = System.nanoTime();

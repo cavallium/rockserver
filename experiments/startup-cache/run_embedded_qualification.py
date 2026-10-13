@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Serialized paired fresh-JVM qualification through EmbeddedConnection's production service path."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,8 @@ import statistics
 import subprocess
 import tempfile
 import time
+import zipfile
+from urllib.parse import unquote, urlparse
 from experiment_support import sha256
 
 MODES = ("none", "cache", "admission", "both")
@@ -23,6 +26,28 @@ def save(path, value):
 def tree_manifest(root):
     return [{"name": str(p.relative_to(root)), "bytes": p.stat().st_size, "sha256": sha256(p)}
             for p in sorted(root.rglob("*")) if p.is_file()]
+
+
+def classpath_resource(entries, resource):
+    for entry in entries:
+        if entry.is_dir():
+            file = entry / resource
+            if file.is_file():
+                return {"classpath_entry": str(entry), "resource": resource, "sha256": sha256(file)}
+        elif zipfile.is_zipfile(entry):
+            with zipfile.ZipFile(entry) as jar:
+                if resource in jar.namelist():
+                    with jar.open(resource) as content:
+                        digest = hashlib.file_digest(content, "sha256").hexdigest()
+                    return {"classpath_entry": str(entry), "resource": resource, "sha256": digest}
+    raise RuntimeError(f"Required classpath resource missing: {resource}")
+
+
+def code_source_path(location):
+    source = urlparse(location)
+    if source.scheme != "file" or source.netloc not in ("", "localhost"):
+        raise RuntimeError(f"Unsupported runtime CodeSource: {location}")
+    return str(Path(unquote(source.path)).resolve(strict=True))
 
 
 def main():
@@ -64,6 +89,10 @@ def main():
     source_dir = Path(__file__).parent / "java"
     sources = [source_dir / (name + ".java") for name in ("StartupProductionQualification", "StartupEmbeddedQualification")]
     entries = [Path(v).resolve(strict=True) for v in a.classpath.split(os.pathsep)]
+    native_artifact = classpath_resource(entries, "librocksdbjni-linux64.so")
+    expected_sources = {name: classpath_resource(entries, name.replace(".", "/") + ".class")["classpath_entry"]
+                        for name in ("org.rocksdb.RocksDB", "org.rocksdb.NativeLibraryLoader",
+                                     "it.cavallium.rockserver.core.impl.EmbeddedDB")}
     # Capture all actual production class/resource identities, including config defaults and controller.
     artifacts = [{"path": str(f), "sha256": sha256(f)} for entry in entries
                  for f in ([entry] if entry.is_file() else sorted(entry.rglob("*"))) if f.is_file()]
@@ -71,6 +100,10 @@ def main():
                 "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                 "sources": [{"path": str(s), "sha256": sha256(s)} for s in sources],
                 "runner_sha256": sha256(Path(__file__)), "runtime_artifacts": artifacts,
+                "expected_native_artifact": native_artifact, "expected_code_sources": expected_sources,
+                "java_option_environment": {name: os.environ.get(name) for name in
+                    ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")},
+                "native_identity_scope": "Fresh per-child user.home; actual dladdr-selected SO SHA and real CodeSources checked. Loading/hash precedes DB-open/request timers equally in all modes; whole-child resource receipts include it.",
                 "machine": platform.uname()._asdict(),
                 "parameters": {k: str(v) if isinstance(v, Path) else [str(x) for x in v] if isinstance(v, list) else v for k, v in vars(a).items()},
                 "declared_seed_history": {"requested_keys": a.seed_hot_keys, "effective_keys": effective_seed_keys,
@@ -106,12 +139,21 @@ def main():
     runs = []
 
     def java(label, db, cache, mode):
-        command = ["java", "-Xms32m", "-Xmx256m", "--enable-native-access=ALL-UNNAMED", "-cp",
+        home = out / (label + ".user-home")
+        home.mkdir(exist_ok=False)
+        command = ["java", "-Xms32m", "-Xmx256m", "--enable-native-access=ALL-UNNAMED",
+                   "-Duser.home=" + str(home),
+                   "-Drockserver.startup.expected-user-home=" + str(home),
+                   "-Drockserver.startup.expected-native-sha256=" + native_artifact["sha256"], "-cp",
                    str(classes) + os.pathsep + a.classpath, "it.cavallium.rockserver.core.impl.rocksdb.StartupEmbeddedQualification",
                    str(db), str(cache), mode, str(a.dataset_mib), str(a.operations), str(not a.buffered_reads).lower(),
                    str(a.data_sample_every), str(a.metadata_sample_every), str(a.capture_period_ms), str(a.timeout),
                    str(a.seed_hot_keys), str(a.seed_passes), str(a.startup_window_ms)]
         save(out / (label + ".command.json"), command)
+        save(out / (label + ".identity-expected.json"), {"user_home": str(home),
+            "native_artifact": native_artifact, "code_sources": expected_sources,
+            "java_option_environment": {name: env.get(name) for name in
+                ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")}})
         started = time.monotonic()
         timed_out = False
         process_io = {}
@@ -144,6 +186,15 @@ def main():
         if len(reports) != 1 or reports[0].get("data_mismatches") != 0:
             raise RuntimeError(f"{label}: missing report or data mismatch")
         report = reports[0]
+        identity = report.get("native_identity", {})
+        if identity.get("loaded_native_sha256") != native_artifact["sha256"] or identity.get("expected_native_sha256") != native_artifact["sha256"]:
+            raise RuntimeError(f"{label}: loaded native bytes differ from first classpath SO resource")
+        if identity.get("user_home") != str(home):
+            raise RuntimeError(f"{label}: effective user.home differs from isolated child home")
+        actual_sources = identity.get("code_sources", {})
+        if set(actual_sources) != set(expected_sources) or any(code_source_path(actual_sources[name]) != expected
+                for name, expected in expected_sources.items()):
+            raise RuntimeError(f"{label}: runtime CodeSources differ from first classpath class owners")
         for artifact in artifacts:
             if sha256(artifact["path"]) != artifact["sha256"]:
                 raise RuntimeError("Runtime artifact changed during qualification")
