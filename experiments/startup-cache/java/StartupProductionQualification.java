@@ -74,6 +74,7 @@ public final class StartupProductionQualification {
         var s = budget.snapshot();
         return Map.ofEntries(Map.entry("active", s.active()), Map.entry("queued", s.queued()),
                 Map.entry("admitted", s.admitted()), Map.entry("completed_find_table", s.completedFindTable()),
+                Map.entry("owned_successful_file_opens", s.ownedSuccessfulFileOpens()),
                 Map.entry("failed", s.failed()), Map.entry("peak_active", s.peakActive()),
                 Map.entry("logical_bytes", s.logicalBytes()), Map.entry("limit", s.limit()),
                 Map.entry("pressured_admissions", s.pressuredAdmissions()));
