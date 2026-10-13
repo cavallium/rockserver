@@ -950,6 +950,7 @@ class RatisNodeRuntimeTest {
             });
             return (RaftServer.Division)Proxy.newProxyInstance(RaftServer.Division.class.getClassLoader(),new Class<?>[]{RaftServer.Division.class},(proxy,method,args) -> switch (method.getName()) {
                 case "getRaftConf" -> configuration; case "getStateMachine" -> machines.get(id);
+                case "getGroup" -> group;case "getId" -> server.getId();
                 case "getRaftLog" -> actualLogs.computeIfAbsent(id,key->{var log=org.mockito.Mockito.mock(org.apache.ratis.server.raftlog.RaftLog.class);org.mockito.Mockito.when(log.getLastCommittedIndex()).thenAnswer(invocation->machines.get(key).getLastAppliedTermIndex().getIndex());return log;});
                 case "getInfo" -> Proxy.newProxyInstance(DivisionInfo.class.getClassLoader(),new Class<?>[]{DivisionInfo.class},(p,m,a) -> switch (m.getName()) {
                     case "isLeader" -> leader; case "isLeaderReady" -> ready; case "getCurrentTerm" -> term;case "getLastAppliedIndex" -> machines.get(id).getLastAppliedTermIndex().getIndex();case "isAlive" -> true;case "getLifeCycleState" -> org.apache.ratis.util.LifeCycle.State.RUNNING; default -> throw new AssertionError(m);
