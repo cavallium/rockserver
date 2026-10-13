@@ -38,6 +38,9 @@ def main():
     p.add_argument("--capture-period-ms", type=int, default=300000)
     p.add_argument("--data-sample-every", type=int, default=64)
     p.add_argument("--metadata-sample-every", type=int, default=16)
+    p.add_argument("--seed-hot-keys", type=int, default=4096, help="Declared seed keys, clipped to dataset; original default4096")
+    p.add_argument("--seed-passes", type=int, default=1, help="Verified Get passes; repeated passes deterministically shuffled")
+    p.add_argument("--startup-window-ms", type=int, default=5000, help="Separate post-open public request-start window,100..60000ms")
     p.add_argument("--buffered-reads", action="store_true")
     p.add_argument("--prepare-only", action="store_true")
     a = p.parse_args()
@@ -49,6 +52,11 @@ def main():
     for sample in (a.data_sample_every, a.metadata_sample_every):
         if not 1 <= sample <= 65536 or sample & (sample - 1):
             p.error("Sampling must be a power of two in 1..65536")
+    effective_seed_keys = min(a.dataset_mib * 1024**2 // 4096, a.seed_hot_keys)
+    if not 1 <= a.seed_hot_keys <= 262144 or not 1 <= a.seed_passes <= 1024 or effective_seed_keys * a.seed_passes > 1048576:
+        p.error("Declared history must be bounded to1048576 verified Gets, keys1..262144, passes1..1024")
+    if not 100 <= a.startup_window_ms <= 60000:
+        p.error("Startup request window must be100..60000ms")
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     classes = out / "classes"
@@ -65,6 +73,11 @@ def main():
                 "runner_sha256": sha256(Path(__file__)), "runtime_artifacts": artifacts,
                 "machine": platform.uname()._asdict(),
                 "parameters": {k: str(v) if isinstance(v, Path) else [str(x) for x in v] if isinstance(v, list) else v for k, v in vars(a).items()},
+                "declared_seed_history": {"requested_keys": a.seed_hot_keys, "effective_keys": effective_seed_keys,
+                    "passes": a.seed_passes, "verified_gets": effective_seed_keys * a.seed_passes,
+                    "order": "sequential" if a.seed_passes == 1 else "deterministic per-pass shuffle",
+                    "permission": "Actual controller idle before history and before/after manual capture; never override feedback"},
+                "startup_window_scope": "Separate public request-start window after EmbeddedConnection open returns; service latency includes queue/native/future wait; full-workload thresholds unchanged",
                 "ownership": "New task-owned roots. Sequential exited child JVMs; immutable seed backups restore the same canonical DB/cache paths before every trial. No namespace rebasing.",
                 "feedback": "Actual production loader/controller, native-call completion cohorts and scheduler pools. Observer reads counters every100ms; never publishes feedback.",
                 "bulk_semantics": "Public async eight-key ExistsMulti presence checks; async Get verifies values. One in-flight future per caller lane. Not raw value-returning MultiGet.",
@@ -96,7 +109,8 @@ def main():
         command = ["java", "-Xms32m", "-Xmx256m", "--enable-native-access=ALL-UNNAMED", "-cp",
                    str(classes) + os.pathsep + a.classpath, "it.cavallium.rockserver.core.impl.rocksdb.StartupEmbeddedQualification",
                    str(db), str(cache), mode, str(a.dataset_mib), str(a.operations), str(not a.buffered_reads).lower(),
-                   str(a.data_sample_every), str(a.metadata_sample_every), str(a.capture_period_ms), str(a.timeout)]
+                   str(a.data_sample_every), str(a.metadata_sample_every), str(a.capture_period_ms), str(a.timeout),
+                   str(a.seed_hot_keys), str(a.seed_passes), str(a.startup_window_ms)]
         save(out / (label + ".command.json"), command)
         started = time.monotonic()
         timed_out = False
