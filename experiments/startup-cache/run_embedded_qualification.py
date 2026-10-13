@@ -67,7 +67,9 @@ def main():
                 "parameters": {k: str(v) if isinstance(v, Path) else [str(x) for x in v] if isinstance(v, list) else v for k, v in vars(a).items()},
                 "ownership": "New task-owned roots. Sequential exited child JVMs; immutable seed backups restore the same canonical DB/cache paths before every trial. No namespace rebasing.",
                 "feedback": "Actual production loader/controller, native-call completion cohorts and scheduler pools. Observer reads counters every100ms; never publishes feedback.",
-                "bulk_semantics": "Public eight-key ExistsMulti presence checks; public Get verifies values. Not raw value-returning MultiGet.",
+                "bulk_semantics": "Public async eight-key ExistsMulti presence checks; async Get verifies values. One in-flight future per caller lane. Not raw value-returning MultiGet.",
+                "scheduler_gate": "Accepted/terminal deltas must conserve and cover all verified public request completions; queue/active demand sampled without injection",
+                "timeout_scope": "Single monotonic foreground deadline equals --timeout; whole child also has the same timeout including open/capture/close",
                 "counter_attribution": "Start/end deltas bracket foreground, excluding startup and final capture. SSD hits/FindTable calls in that window can include concurrent native opening; logical bytes are not physical I/O.",
                 "cold_state": "Fresh JVM, same-path restored immutable fixture; no global cache drop. " + ("Direct data reads bypass OS data page cache; " if not a.buffered_reads else "Buffered data page cache uncontrolled; ") + "copying and hashing can warm metadata/devices. Paired order alternates.",
                 "resource_bounds": {"heap_max_bytes": 256 * 1024**2, "primary_cache_bytes": 32 * 1024**2,
@@ -75,7 +77,7 @@ def main():
                                     "snapshot_budget_bytes": 16 * 1024**2, "snapshot_disk_budget_bytes": 48 * 1024**2},
                 "acceptance_predefined": {"minimum_pairs": 3, "material_gain_ratio": 1.10, "protected_p99_max_ratio": 1.20,
                     "periodic_capture": "Every cache candidate requires both roles publishing during foreground that spans two capture periods; post-workload manual capture excluded",
-                    "admission": "Every admission candidate requires actual admitted FindTable calls plus sampled foreground overlap",
+                    "admission": "Every admission candidate requires actual owned successful file opens during foreground plus sampled overlap; FindTable cache hits alone do not qualify",
                     "correctness": "All values/presence results verified, all128writer keys survive fresh-JVM restart, zero failures/timeouts/resource violations",
                     "spread": "Any pair crossing the thresholds is inconclusive or regression"}, "retained_roots": []}
     save(out / "manifest.json", manifest)
@@ -94,7 +96,7 @@ def main():
         command = ["java", "-Xms32m", "-Xmx256m", "--enable-native-access=ALL-UNNAMED", "-cp",
                    str(classes) + os.pathsep + a.classpath, "it.cavallium.rockserver.core.impl.rocksdb.StartupEmbeddedQualification",
                    str(db), str(cache), mode, str(a.dataset_mib), str(a.operations), str(not a.buffered_reads).lower(),
-                   str(a.data_sample_every), str(a.metadata_sample_every), str(a.capture_period_ms)]
+                   str(a.data_sample_every), str(a.metadata_sample_every), str(a.capture_period_ms), str(a.timeout)]
         save(out / (label + ".command.json"), command)
         started = time.monotonic()
         timed_out = False
@@ -144,6 +146,9 @@ def main():
         report["periodic_published_snapshots_during_foreground"] = {role: counter["snapshots"] - start_counters[role]["snapshots"] for role, counter in end_counters.items()}
         report["foreground_find_table_calls_including_hits"] = report.get("admission_at_foreground_end", {}).get("completed_find_table", 0) - report.get("admission_at_foreground_start", {}).get("completed_find_table", 0)
         report["foreground_owned_successful_file_opens"] = report.get("admission_at_foreground_end", {}).get("owned_successful_file_opens", 0) - report.get("admission_at_foreground_start", {}).get("owned_successful_file_opens", 0)
+        report["admission_foreground_classification"] = ("actual owned file opens" if report["foreground_owned_successful_file_opens"] > 0
+            else "late foreground winner/table-cache hits; no owned open observed" if report["foreground_find_table_calls_including_hits"] > 0
+            else "no foreground-window FindTable call observed")
         report["cache_directory_bytes"] = sum(v.stat().st_size for v in cache.rglob("*") if v.is_file()) if cache.exists() else 0
         if report["cache_directory_bytes"] > 48 * 1024**2:
             raise RuntimeError(f"{label}: native disk budget exceeded")
@@ -151,8 +156,10 @@ def main():
         if admission.get("failed", 0) or admission.get("peak_active", 0) > 4:
             raise RuntimeError(f"{label}: native admission resource/failure bound")
         scheduler = report.get("scheduler_after")
-        if scheduler and (scheduler["active"] or scheduler["queued"] or scheduler["accepted"] != scheduler["terminal"]):
-            raise RuntimeError(f"{label}: service scheduler did not conserve completed operations")
+        if scheduler and (scheduler["active"] or scheduler["queued"] or scheduler["accepted"] != scheduler["terminal"]
+                          or report.get("scheduler_accepted_delta", 0) < report.get("verified_public_request_completions", 1)
+                          or report.get("scheduler_accepted_delta") != report.get("scheduler_terminal_delta")):
+            raise RuntimeError(f"{label}: service scheduler did not conserve public async admission")
         save(out / (label + ".json"), report)
         return report
 
@@ -212,7 +219,7 @@ def main():
                          and r["foreground_elapsed_ns"] >= 2 * a.capture_period_ms * 1000000
                          and all(r["periodic_published_snapshots_during_foreground"].get(role, 0) > 0 for role in ("data", "metadata"))))
                     and (mode not in ("admission", "both") or (r["opening_overlap"]["operations"] > 0
-                         and r["foreground_find_table_calls_including_hits"] > 0)) for r in candidate)
+                         and r["foreground_owned_successful_file_opens"] > 0)) for r in candidate)
                 result = "PASS" if a.pairs >= 3 and min(gains) >= 1.10 and max(tails) <= 1.20 else "INCONCLUSIVE_OR_REGRESSION"
                 if not exercised:
                     result = "INCONCLUSIVE_MECHANISM_NOT_EXERCISED"

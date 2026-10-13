@@ -41,6 +41,29 @@ public final class StartupEmbeddedQualification {
                 "accepted", r[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS] + w[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
                 "terminal", r[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES] + w[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]);
     }
+    private static <T> T awaitRequest(Future<T> request, long deadline) throws Exception {
+        try {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) throw new TimeoutException("Measured workload deadline expired");
+            return request.get(remaining, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            request.cancel(false);
+            Thread.currentThread().interrupt();
+            throw interrupted;
+        } catch (TimeoutException timeout) {
+            request.cancel(false);
+            throw timeout;
+        }
+    }
+    private static Map<String, Long> settledScheduler(RWScheduler scheduler) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        for (;;) {
+            var stats = schedulerStats(scheduler);
+            if (stats.get("active") == 0 && stats.get("queued") == 0 && stats.get("accepted").equals(stats.get("terminal"))) return stats;
+            if (System.nanoTime() >= deadline) throw new IllegalStateException("Service scheduler did not settle: " + stats);
+            Thread.sleep(1);
+        }
+    }
     private static Map<String, String> cacheStats(RocksDBLoader.StartupResources resources) {
         var c = resources.snapshotCaches();
         return c.isEmpty() ? Map.of() : stats(c.getFirst(), c.getLast());
@@ -96,7 +119,7 @@ public final class StartupEmbeddedQualification {
         return Files.writeString(db.resolveSibling(db.getFileName() + ".embedded.conf"), text);
     }
     public static void main(String[] args) throws Exception {
-        if (args.length != 9) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB operations direct dataSampling metadataSampling periodMs");
+        if (args.length != 10) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB operations direct dataSampling metadataSampling periodMs workloadTimeoutSeconds");
         Path db = Path.of(args[0]).toAbsolutePath(), cache = Path.of(args[1]).toAbsolutePath();
         String mode = args[2];
         if (!Set.of("seed", "none", "cache", "admission", "both", "verify").contains(mode)) throw new IllegalArgumentException(mode);
@@ -104,6 +127,8 @@ public final class StartupEmbeddedQualification {
         boolean direct = Boolean.parseBoolean(args[5]), seed = mode.equals("seed"), checking = mode.equals("verify");
         int dataSample = Integer.parseInt(args[6]), metadataSample = Integer.parseInt(args[7]);
         long period = Long.parseLong(args[8]);
+        int workloadSeconds = Integer.parseInt(args[9]);
+        if (workloadSeconds < 10 || workloadSeconds > 3600) throw new IllegalArgumentException("Workload timeout bound");
         if (mib < 1 || mib > 1024 || operations < 1 || operations > 1_000_000 || period < 100 || period > 86400000)
             throw new IllegalArgumentException("Unbounded workload");
         int count = Math.toIntExact(mib * MIB / VALUE_BYTES);
@@ -117,6 +142,9 @@ public final class StartupEmbeddedQualification {
         output.put("cache_geometry", "Loader HCC DATA28MiB/METADATA4MiB; loader WBM auto16MiB charged within DATA; matched modes");
         output.put("data_sample_every", dataSample); output.put("metadata_sample_every", metadataSample);
         output.put("capture_period_ms", period); output.put("capture_period_override", period != 300000);
+        output.put("workload_timeout_seconds", workloadSeconds);
+        output.put("bounded_inflight_requests_per_lane", 1);
+        output.put("caller_lanes", "two asynchronous read lanes plus one asynchronous put/readback lane");
         Path conf = config(db, cache, mode, direct, dataSample, metadataSample, period);
         output.put("effective_config", Files.readString(conf));
         long beforeOpen = System.nanoTime();
@@ -124,12 +152,12 @@ public final class StartupEmbeddedQualification {
         long beforeClose;
         try (var connection = new EmbeddedConnection(db, "embedded-qualification", conf)) {
             output.put("embedded_connection_open_ns", System.nanoTime() - beforeOpen);
-            var api = connection.getSyncApi(RequestContext.batch(Duration.ofMinutes(5)));
+            var api = connection.getSyncApi(RequestContext.batch(Duration.ofSeconds(workloadSeconds)));
             long column = seed ? api.createColumn("entries", ColumnSchema.of(IntList.of(8), ObjectList.of(), true)) : api.getColumnId("entries");
             var internal = connection.getInternalDB();
             var resources = (RocksDBLoader.StartupResources) field(internal, "startupResources");
             retainedCaches = resources.snapshotCaches();
-            var scheduler = (RWScheduler) field(internal, "scheduler");
+            var scheduler = internal.getScheduler();
             var budget = resources.budgets().values().stream().findFirst().orElse(null);
             if (seed) {
                 for (int i = 0; i < count; i++) {
@@ -152,14 +180,17 @@ public final class StartupEmbeddedQualification {
                 for (int i = 0; i < WRITES; i++) verifyValue(api.get(0, column, keys(writeKey(i)), RequestType.current()), ~i);
                 output.put("persisted_writes_verified", WRITES);
             } else {
+                var async = connection.getAsyncApi(RequestContext.batch(Duration.ofSeconds(workloadSeconds)));
                 var point = new Histogram(); var hot = new Histogram(); var cold = new Histogram();
                 var bulk = new Histogram(); var write = new Histogram(); var overlap = new Histogram(); var steady = new Histogram();
                 var samples = Collections.synchronizedList(new ArrayList<Map<String, Object>>());
                 var running = new AtomicBoolean(true); var opening = new AtomicBoolean(); var readers = new AtomicInteger(2);
                 var completedWrites = new AtomicLong(); var duringReads = new AtomicLong();
                 var start = new CountDownLatch(1);
+                var schedulerBefore = settledScheduler(scheduler);
                 long started = System.nanoTime();
-                output.put("scheduler_before", schedulerStats(scheduler));
+                long workDeadline = started + TimeUnit.SECONDS.toNanos(workloadSeconds);
+                output.put("scheduler_before", schedulerBefore);
                 output.put("cache_stats_at_foreground_start", cacheStats(resources));
                 if (budget != null) output.put("admission_at_foreground_start", admission(budget));
                 long foregroundEnded;
@@ -192,12 +223,12 @@ public final class StartupEmbeddedQualification {
                                     if (op % 4 == 0) {
                                         var batch = new ArrayList<Keys>();
                                         for (int i = 0; i < 8; i++) batch.add(keys(key((id + i * 997) % count)));
-                                        long before = System.nanoTime(); var values = api.existsMulti(0, column, batch);
+                                        long before = System.nanoTime(); var values = awaitRequest(async.existsMultiAsync(0, column, batch), workDeadline);
                                         long ns = System.nanoTime() - before; bulk.record(ns); (activeOpen ? overlap : steady).record(ns);
                                         if (!values.equals(Collections.nCopies(8, true))) throw new IllegalStateException("ExistsMulti mismatch");
                                     } else {
                                         Keys requestKey = keys(key(id));
-                                        long before = System.nanoTime(); Buf value = api.get(0, column, requestKey, RequestType.current());
+                                        long before = System.nanoTime(); Buf value = awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline);
                                         long ns = System.nanoTime() - before; point.record(ns); (op % 2 == 0 ? hot : cold).record(ns); (activeOpen ? overlap : steady).record(ns);
                                         verifyValue(value, id);
                                     }
@@ -212,9 +243,9 @@ public final class StartupEmbeddedQualification {
                             for (int sequence = 0; sequence < WRITES || readers.get() > 0; sequence++) {
                                 int id = sequence % WRITES; long cycle = System.nanoTime(); boolean activeReaders = readers.get() > 0;
                                 Keys requestKey = keys(writeKey(id)); Buf requestValue = Buf.wrap(value(~id));
-                                long before = System.nanoTime(); api.put(0, column, requestKey, requestValue, RequestType.none());
+                                long before = System.nanoTime(); awaitRequest(async.putAsync(0, column, requestKey, requestValue, RequestType.none()), workDeadline);
                                 write.record(System.nanoTime() - before);
-                                verifyValue(api.get(0, column, keys(writeKey(id)), RequestType.current()), ~id);
+                                verifyValue(awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline), ~id);
                                 completedWrites.incrementAndGet(); if (activeReaders) duringReads.incrementAndGet();
                                 long pause = 1_000_000_000L / 128 - (System.nanoTime() - cycle);
                                 if (pause > 0) TimeUnit.NANOSECONDS.sleep(pause);
@@ -223,7 +254,7 @@ public final class StartupEmbeddedQualification {
                     }));
                     start.countDown();
                     try {
-                        for (var task : tasks) task.get(5, TimeUnit.MINUTES);
+                        for (var task : tasks) awaitRequest(task, workDeadline);
                         foregroundEnded = System.nanoTime();
                         output.put("cache_stats_before_final_capture", cacheStats(resources));
                         if (budget != null) output.put("admission_at_foreground_end", admission(budget));
@@ -236,7 +267,15 @@ public final class StartupEmbeddedQualification {
                 output.put("completed_writes", completedWrites.get()); output.put("writes_during_read_tasks", duringReads.get());
                 output.put("opening_overlap", overlap.report()); output.put("steady_or_unclassified", steady.report());
                 output.put("overlap_classification", budget == null ? "unclassified: admission disabled" : "approximate: latest100ms actual admission sample");
-                output.put("scheduler_after", schedulerStats(scheduler)); output.put("samples", samples);
+                var schedulerAfter = settledScheduler(scheduler);
+                long accepted = schedulerAfter.get("accepted") - schedulerBefore.get("accepted");
+                long terminal = schedulerAfter.get("terminal") - schedulerBefore.get("terminal");
+                long requests = 2L * operations + 2 * completedWrites.get();
+                if (accepted < requests || accepted != terminal)
+                    throw new IllegalStateException("Public asynchronous requests lacked conserved admission: " + accepted + "/" + terminal + " expected at least " + requests);
+                output.put("scheduler_after", schedulerAfter);
+                output.put("scheduler_accepted_delta", accepted); output.put("scheduler_terminal_delta", terminal);
+                output.put("verified_public_request_completions", requests); output.put("samples", samples);
                 if (!resources.snapshotCaches().isEmpty()) {
                     output.put("capture_status", captureIdle(resources));
                     output.put("final_capture_scope", "post-workload, actual idle controller feedback; no feedback override, excluded from timed workload");
