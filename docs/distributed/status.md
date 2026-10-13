@@ -1195,12 +1195,26 @@ futures under scheduler pressure; routed client leases and bounded retirement
 remain owned through actual completion. Controlled validation covers 73 distinct
 Ratis cases and 27 public gRPC/Thrift/core cases. The runtime cleanup case restarts
 the exclusive node root and advances current directories before retrying original
-cleanup, with no recapture or new grants. It retains factory/client bindings across
-restart; fresh factory reconstruction and independent-node acceptance remain open.
-Evidence: `/tmp/rockserver-aggregate-gone-and-pool-final-gate.log`,
+cleanup, with no recapture or new grants. A further cold-recovery fixture reconstructs the factory after actual node shutdown,
+preserves the original forced capture graph and refuses to recreate missing bound
+snapshot journals. Cleanup and release retain the original grants and tokens after
+current directories advance. Independent-node acceptance remains open.
+Evidence: `/tmp/rockserver-native-callers-ownership-and-cold-factory-gate.log`
+(28 core/Ratis cases, including both cold-cleanup cases),
+`/tmp/rockserver-native-export-pool-interaction-gate.log` (21 client/export cases),
+`/tmp/rockserver-aggregate-gone-and-pool-final-gate.log`,
 `/tmp/rockserver-aggregate-async-consumer-regression.log` with repaired backup/capture
 cases in `/tmp/rockserver-aggregate-backup-typed-validation-gate.log`, and
 `/tmp/rockserver-aggregate-public-protocol-final-gate.log`.
+
+Bounded native SST inventory and scalar table qualification now precede JNI copies
+and reject excessive file/property/key inventory. The same Debug native candidate
+passes import, archive and selective-compaction checks. Range iterators use the
+retained owning database wrapper so closing them releases native references; atomic
+range-delete writes retain the required base database. Import, historical snapshot,
+range-delete and cold reopen pass together. JNI extraction uses the selected binary
+content hash rather than artifact coordinates as its cache identity. These local
+candidate checks do not establish production ABI, hardware or filesystem bounds.
 
 ## Remaining architecture gates
 
@@ -1208,8 +1222,7 @@ cases in `/tmp/rockserver-aggregate-backup-typed-validation-gate.log`, and
   artifact quotas against the architecture. Controlled restore quota/unknown-force,
   durable ownership claims and custom proof accounting checks are recorded above;
   they do not prove the full resource envelope.
-- Verify fresh factory reconstruction of pending aggregate exports and adoption
-  by the intended external consumers. The frontend route and controlled aggregate
+- Verify adoption of aggregate exports by the intended external consumers. The frontend route and controlled aggregate
   export/cleanup workflows are implemented; independent endpoint acceptance remains
   open. Controlled snapshot/CDC resynchronization is recorded above.
 - Complete shared follower intake and resident Raft-log cache bounds, learner
