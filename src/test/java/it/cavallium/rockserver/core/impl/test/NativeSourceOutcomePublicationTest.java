@@ -16,7 +16,10 @@ class NativeSourceOutcomePublicationTest {
     final NativeHomeRecoveryTest home=new NativeHomeRecoveryTest();
     byte[] hash(byte[] value)throws Exception { return MessageDigest.getInstance("SHA-256").digest(value); }
     NativeSourceOutcomeCredit.Request reserve(NativeTopologyCdcTest.Fixture f,NativeHomeRecoveryTest.Fixture h,long sequence,int homeIndex)throws Exception {
-        var original=f.write(f.parent,sequence,8);var schema=topology.helper.outer.schema();var directory=f.definition.targetDirectory();
+        return reserveOriginal(f,h,f.write(f.parent,sequence,8),homeIndex);
+    }
+    NativeSourceOutcomeCredit.Request reserveOriginal(NativeTopologyCdcTest.Fixture f,NativeHomeRecoveryTest.Fixture h,DistributedCommand original,int homeIndex)throws Exception {
+        long sequence=original.operationId().sequence();var schema=topology.helper.outer.schema();var directory=f.definition.targetDirectory();
         var origin=new OperationRerouteOrigin(schema.clusterId(),schema.databaseId(),schema.domainId(),topology.lineage(f.definition.parents().getFirst()),original.operationId(),original.receiptDigest(),hash(f.freeze.encode()),f.parent.applied(),directory.payloadDigest(),new byte[32],2,new OperationId(home.user,5,sequence*256));
         var reservation=TransactionStatus.reserve(origin,schema.schemaEpoch(),schema.digest());h.store.configureHomeRecoveryReservations(schema.clusterId(),schema.databaseId(),home.column);
         assertEquals(CommandResult.Status.SUCCESS,home.apply(h,homeIndex,home.cas(origin.firstControl(),null,reservation)).status());
@@ -89,6 +92,40 @@ class NativeSourceOutcomePublicationTest {
             var old=request.origin();var origin=new OperationRerouteOrigin(old.clusterId(),old.databaseId(),old.domainId(),old.source(),accepted.operationId(),accepted.receiptDigest(),old.absenceCommitment(),old.absenceCut(),old.targetDirectoryDigest(),old.planDigest(),old.targetParticipantCount(),new OperationId(home.user,5,512));var reservation=TransactionStatus.reserve(origin,request.home().definition().schemaEpoch(),request.home().definition().schemaDigest());
             var acceptedRequest=new NativeSourceOutcomeCredit.Request(accepted,origin,request.targetDirectory(),request.freeze(),new HomeIdentity(home.group,1,new byte[32],home.column,reservation));assertEquals(8,acceptedRequest.maximumResultBytes());assertEquals(92,acceptedRequest.reservedBytes());
         }
+    }
+
+    @Test void durableSourceAckPromiseWinsRaceWithOrdinaryNamespaceGrowthAndAllowsTerminalPublication() throws Exception {
+        try(var f=topology.new Fixture(root.resolve("aux-source"));var h=home.new Fixture(root.resolve("aux-home"))) {
+            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(100,100*92);f.parent.configureSessionMetadataCapacity(2);
+            var original=f.write(f.parent,1,8);original=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),original.operationId(),original.mutations(),List.of(),0);
+            var request=reserveOriginal(f,h,original,1);assertEquals(1,f.parent.estimateSourceSessionMetadata(request).additionalNamespaces());
+            f.parent.applySourceOutcomeCredit(new ApplyPosition(1,3),request);assertEquals(0,f.parent.estimateSourceSessionMetadata(request).additionalNamespaces());
+            var issuer=new UUID(0,8000);var competitor=new UUID(0,8001);
+            var ack=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),new OperationId(issuer,1,1),List.of(),List.of(),0);
+            assertEquals(1,f.parent.estimateSessionMetadata(ack).reservedNamespaces());assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.parent.apply(new ApplyPosition(1,4),ack)).status());
+            var rival=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),new OperationId(competitor,1,1),List.of(),List.of(),0);
+            assertEquals(1,f.parent.estimateSessionMetadata(rival).reservedNamespaces());assertEquals(CommandResult.Status.CONFLICT,CommandResult.decode(f.parent.apply(new ApplyPosition(1,5),rival)).status());
+            assertEquals(NativeSourceOutcomePublication.Outcome.RETAINED,f.parent.publishSourceOutcome(new ApplyPosition(1,6),request,success()).outcome());
+            assertEquals(2,f.parent.estimateSessionMetadata(rival).retainedNamespaces());assertEquals(0,f.parent.estimateSessionMetadata(rival).reservedNamespaces());
+            var known=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),new OperationId(issuer,1,2),List.of(),List.of(),1);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.parent.apply(new ApplyPosition(1,7),known)).status());
+            try(var pin=f.parent.captureForRecovery()){assertArrayEquals(topology.helper.helper.key(9),pin.get(topology.helper.outer.fixed,topology.helper.helper.key(1)));}
+            var floor=DistributedCommand.advanceSessionEpochFloor(original.groupId(),original.rangeEpoch(),original.schemaDigest(),new OperationId(new UUID(0,8002),2,0),2);assertEquals(2,f.parent.estimateSessionMetadata(floor).removedNamespaces());assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.parent.apply(new ApplyPosition(1,8),floor)).status());
+            assertEquals(0,f.parent.estimateSessionMetadata(floor).retainedNamespaces());
+        }
+    }
+
+    @Test void receiverBudgetIncludesActualFloorsAndUnconsumedSourceNamespacePromises() throws Exception {
+        var image=root.resolve("promised.image");
+        try(var f=topology.new Fixture(root.resolve("promise-donor"));var h=home.new Fixture(root.resolve("promise-home"))) {
+            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(100,100*92);
+            var original=f.write(f.parent,1,8);original=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),original.operationId(),original.mutations(),List.of(),0);
+            var request=reserveOriginal(f,h,original,1);f.parent.applySourceOutcomeCredit(new ApplyPosition(1,3),request);
+            for(int n=0;n<2;n++){var acknowledgement=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),new OperationId(new UUID(0,8100+n),1,1),List.of(),List.of(),0);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.parent.apply(new ApplyPosition(1,4+n),acknowledgement)).status());}
+            assertThrows(IllegalStateException.class,()->f.parent.configureSessionMetadataCapacity(2));
+            try(var pin=f.parent.captureForRecovery()){NativeRangeImage.write(image,pin,pin.interval(),topology.limits);}
+            assertDoesNotThrow(()->NativeRangeImage.inspectSessionMetadata(image,topology.limits,3));assertThrows(java.io.IOException.class,()->NativeRangeImage.inspectSessionMetadata(image,topology.limits,2));
+        }
+        try(var f=topology.new Fixture(root.resolve("promise-receiver"))){f.parent.configureSessionMetadataCapacity(2);var cut=f.parent.applied();f.parent.fence();assertThrows(java.io.IOException.class,()->f.parent.installSnapshot(image,topology.limits));assertEquals(cut,f.parent.applied());assertFalse(f.parent.pendingInstallation());}
     }
 
 }

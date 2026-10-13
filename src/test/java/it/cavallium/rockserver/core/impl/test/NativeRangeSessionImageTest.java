@@ -67,6 +67,20 @@ class NativeRangeSessionImageTest {
         assertInvalid(1, rows);
     }
 
+    private static Row acknowledgement(long epoch,int id){return new Row(ByteBuffer.allocate(41).putLong(0).putLong(1).put((byte)2).putLong(epoch).putLong(0).putLong(id).array(),ByteBuffer.allocate(12).putInt(1).putLong(0).array());}
+    private static Row acknowledgementCount(long count){return new Row(key((byte)0x15,null),ByteBuffer.allocate(8).putLong(count).array());}
+    @Test void orphanReplayFloorsAreLegalButCounterEpochAndFinitePopulationAreRequired() throws Exception {
+        assertValid(1,List.of(acknowledgement(1,1),acknowledgementCount(1)));
+        assertInvalid(1,List.of(acknowledgement(1,1)));
+        assertInvalid(1,List.of(acknowledgement(1,1),acknowledgementCount(0)));
+        assertInvalid(2,List.of(acknowledgement(1,1),acknowledgementCount(1)));
+        var rows=new ArrayList<Row>();for(int n=0;n<=it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES;n++)rows.add(acknowledgement(1,n));rows.add(acknowledgementCount(rows.size()));
+        var large=image(1,rows);var bounded=new NativeRangeImage.Limits(256,8L*1024*1024,1);
+        var failure=assertThrows(IOException.class,()->NativeRangeImage.inspect(large,bounded));assertTrue(failure.getMessage().contains("session floor"),failure.toString());
+        var valid=image(1,List.of(acknowledgement(1,1),acknowledgement(1,2),acknowledgementCount(2)));
+        assertThrows(IOException.class,()->NativeRangeImage.inspectSessionMetadata(valid,LIMITS,1));
+    }
+
     private void assertValid(long floor, List<Row> controls) throws Exception {
         Path image = image(floor, controls);
         assertDoesNotThrow(() -> NativeRangeImage.inspect(image, LIMITS));

@@ -124,6 +124,30 @@ class NativeSessionBindingTest {
         }
     }
 
+    @Test void smallAuxiliaryCapAllowsKnownIssuerAndNetFloorProgressButSavesRacingConflict() throws Exception {
+        try(var f=new Fixture(root)) {
+            f.store.configureSessionMetadataCapacity(2);var first=OTHER;var second=new UUID(0,3001);var third=new UUID(0,3002);
+            java.util.function.Function<UUID,DistributedCommand> acknowledgement=sid->new DistributedCommand(GROUP,1,new byte[32],new OperationId(sid,1,1),List.of(),List.of(),0);
+            var a=acknowledgement.apply(first);var b=acknowledgement.apply(second);var c=acknowledgement.apply(third);
+            assertEquals(CommandResult.Status.SUCCESS,f.apply(a));assertEquals(1,f.store.estimateSessionMetadata(b).additionalNamespaces());
+            assertEquals(1,f.store.estimateSessionMetadata(c).additionalNamespaces());assertEquals(CommandResult.Status.SUCCESS,f.apply(b));
+            assertEquals(CommandResult.Status.CONFLICT,f.apply(c));assertEquals(CommandResult.Status.CONFLICT,f.apply(c));assertEquals(0,f.store.estimateSessionMetadata(c).additionalNamespaces());
+            var known=new DistributedCommand(GROUP,1,new byte[32],new OperationId(first,1,2),List.of(),List.of(),1);assertEquals(0,f.store.estimateSessionMetadata(known).additionalNamespaces());assertEquals(CommandResult.Status.SUCCESS,f.apply(known));
+            var floor=DistributedCommand.advanceSessionEpochFloor(GROUP,1,new byte[32],new OperationId(ADMIN,2,0),2);assertEquals(2,f.store.estimateSessionMetadata(floor).removedNamespaces());assertEquals(CommandResult.Status.SUCCESS,f.apply(floor));
+            var fresh=new DistributedCommand(GROUP,1,new byte[32],new OperationId(third,2,1),List.of(),List.of(),0);assertEquals(CommandResult.Status.SUCCESS,f.apply(fresh));
+            var stale=acknowledgement.apply(new UUID(0,3003));var estimate=f.store.estimateSessionMetadata(stale);assertEquals(0,estimate.additionalNamespaces());assertEquals(0,estimate.removedNamespaces());
+        }
+    }
+    @Test void corruptPersistedNamespaceCounterFailsActualRecoveryAndExport() throws Exception {
+        try(var f=new Fixture(root)) {
+            var ack=new DistributedCommand(GROUP,1,new byte[32],new OperationId(OTHER,1,1),List.of(),List.of(),0);assertEquals(CommandResult.Status.SUCCESS,f.apply(ack));
+            byte[] count=ByteBuffer.allocate(17).putLong(GROUP.getMostSignificantBits()).putLong(GROUP.getLeastSignificantBits()).put((byte)0x15).array();f.db.put(f.state(),count,ByteBuffer.allocate(8).putLong(2).array());
+            var ownership=new RangeOwnership();var owner=new RangeOwnership.Owner(GROUP,1);ownership.register(owner,new RangeOwnership.Interval(DOMAIN,Set.of(COLUMN),null,null),RangeOwnership.State.ACTIVE);
+            assertThrows(IllegalStateException.class,()->new ReplicatedRangeStore(f.db,ownership,owner,new byte[32],Map.of(COLUMN,f.handles.get(1)),f.state(),f.handles.get(3),Set.of()));
+            try(var pin=f.store.capture()){assertThrows(java.io.IOException.class,()->NativeRangeImage.write(root.resolve("bad-counter.image"),pin,pin.interval(),LIMITS));}
+        }
+    }
+
     static final class Fixture implements AutoCloseable {
         final DBOptions options=new DBOptions().setCreateIfMissing(true).setCreateMissingColumnFamilies(true);
         final ColumnFamilyOptions cfOptions=new ColumnFamilyOptions(); final List<ColumnFamilyHandle> handles=new ArrayList<>();

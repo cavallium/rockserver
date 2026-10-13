@@ -4,6 +4,9 @@ import it.cavallium.rockserver.core.common.distributed.*;
 import it.cavallium.rockserver.core.impl.rocksdb.*;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.io.IOException;
 import java.util.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -62,6 +65,31 @@ class NativeCatalogueHistoryTest {
         }
         NativeRangeImage.inspectCatalogueHistory(image,helper.limits,helper.column,NativeCatalogueHistoryTest::history);
         try(var f=helper.new Fixture(path)){configure(f);assertEquals(history,f.store.catalogueHistoryCapacity());assertEquals(CommandResult.Status.CONFLICT,helper.apply(f,++index,directoryPut(102,null,directory(101,1))).status());}
+    }
+
+    static int metadataValue(byte[] image,int tag,int valueBytes) {
+        byte[] key=ByteBuffer.allocate(tag==0x79 ? 49 : 17).putLong(0).putLong(1).put((byte)tag).array();
+        for(int offset=0;offset+9+key.length+valueBytes<=image.length;offset++)if(image[offset]==2 && ByteBuffer.wrap(image,offset+1,4).getInt()==key.length && ByteBuffer.wrap(image,offset+5,4).getInt()==valueBytes && Arrays.equals(image,offset+9,offset+9+key.length,key,0,key.length))return offset+9+key.length;
+        throw new AssertionError("Native metadata record absent");
+    }
+    static byte[] reseal(byte[] bytes) throws Exception {byte[] checksum=MessageDigest.getInstance("SHA-256").digest(Arrays.copyOf(bytes,bytes.length-32));System.arraycopy(checksum,0,bytes,bytes.length-32,32);return bytes;}
+    @Test void validChecksumLedgerAndCreditForgeriesFailBeforeTargetMutationAndColdExposure() throws Exception {
+        var image=root.resolve("valid.image");byte[] original;CatalogueHistory.State ledger;
+        try(var f=helper.new Fixture(root.resolve("donor"))){configure(f);helper.apply(f,1,put(0,70000,null,new byte[]{1}));ledger=f.store.catalogueHistoryCapacity();try(var pin=f.store.capture()){NativeRangeImage.write(image,pin,pin.interval(),helper.limits);}original=Files.readAllBytes(image);}
+        for(int tag:List.of(0x78,0x79)) {
+            byte[] modified=original.clone();int offset=metadataValue(modified,tag,tag==0x78 ? CatalogueHistory.STATE_BYTES : CatalogueHistory.CREDIT_BYTES);
+            if(tag==0x78)ByteBuffer.wrap(modified,offset+8,8).putLong(ledger.actualRows()+1);else modified[offset]=1;
+            var forged=root.resolve("forged-"+tag+".image");Files.write(forged,reseal(modified));
+            assertThrows(IOException.class,()->NativeRangeImage.inspectCatalogueHistory(forged,helper.limits,helper.column,NativeCatalogueHistoryTest::history));
+            try(var f=helper.new Fixture(root.resolve("target-"+tag))){configure(f);var marker=f.store.applied();f.store.fence();assertThrows(IOException.class,()->f.store.installSnapshot(forged,helper.limits));assertEquals(marker,f.store.applied());assertFalse(f.store.pendingInstallation());var dbField=ReplicatedRangeStore.class.getDeclaredField("db");dbField.setAccessible(true);var columnsField=ReplicatedRangeStore.class.getDeclaredField("columns");columnsField.setAccessible(true);@SuppressWarnings("unchecked")var columns=(Map<UUID,org.rocksdb.ColumnFamilyHandle>)columnsField.get(f.store);assertNull(((org.rocksdb.RocksDB)dbField.get(f.store)).get(columns.get(helper.column),key(70000)));}
+        }
+        try(var f=helper.new Fixture(root.resolve("cold-corrupt"))) {
+            configure(f);helper.apply(f,1,put(0,70000,null,new byte[]{1}));
+            var dbField=ReplicatedRangeStore.class.getDeclaredField("db");dbField.setAccessible(true);var stateField=ReplicatedRangeStore.class.getDeclaredField("state");stateField.setAccessible(true);
+            var db=(org.rocksdb.RocksDB)dbField.get(f.store);var state=(org.rocksdb.ColumnFamilyHandle)stateField.get(f.store);
+            byte[] key=ByteBuffer.allocate(17).putLong(0).putLong(1).put((byte)0x78).array();var saved=f.store.catalogueHistoryCapacity();db.put(state,key,new CatalogueHistory.State(saved.actualBytes()+1,saved.actualRows(),saved.promisedBytes(),saved.promisedRows()).encode());
+        }
+        try(var f=helper.new Fixture(root.resolve("cold-corrupt"))){assertThrows(IllegalStateException.class,()->configure(f));}
     }
 
 }

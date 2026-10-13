@@ -296,6 +296,8 @@ public final class ReplicatedRangeStore {
         }
         if(bytes+credits.size()*(49L+NativeSourceOutcomePublication.BYTES)>NativeSourceOutcomeCredit.MAX_METADATA_BYTES || credits.keySet().stream().anyMatch(publications::containsKey) || publications.size()+credits.size()>NativeSourceOutcomeCredit.MAX_PUBLICATIONS)throw new IllegalStateException("Source credit/publication overlap");
         sourceOutcomeCredits=Map.copyOf(credits);sourceOutcomePublications=Map.copyOf(publications);
+        if(sessionAckEpochs==null)validateSessionMetadata(null);
+        if(sessionAckCount+sourceSessionMetadataPromises(minimumSessionEpoch(null),null,null)>sessionAckLimit)throw new IllegalStateException("Source ACK namespace promises exceed native capacity");
         if((!credits.isEmpty() || !publications.isEmpty()) && activeTopologyFreeze==null)throw new IllegalStateException("Source outcomes lack sealed parent");for(var credit:credits.values())if(!credit.request().freeze().equals(activeTopologyFreeze))throw new IllegalStateException("Source credit original seal changed");
     }
     private Runnable sourcePublicationGc(WriteBatch batch,long minimum,long ack,OperationId operation) throws RocksDBException {
@@ -3842,6 +3844,7 @@ public final class ReplicatedRangeStore {
                 if(!activeTopologyFreeze.equals(incoming[0])) throw new IOException("Snapshot cannot discard/change native topology FREEZE");
             }
             if(catalogueHistoryColumn!=null)NativeRangeImage.inspectCatalogueHistory(image,limits,catalogueHistoryColumn,catalogueHistoryKeys);
+            NativeRangeImage.inspectSessionMetadata(image,limits,sessionAckLimit);
             if(cdc!=null) cdc.validateImage(image,limits,expected.position());
             if(importBirth!=null) {
                 byte[][] incoming=new byte[3][];
@@ -5175,7 +5178,7 @@ public final class ReplicatedRangeStore {
         if(snapshot==null){sessionAckCount=count;sessionAckEpochs=epochs;}return count;
     }
     public void configureSessionMetadataCapacity(int maximumNamespaces) throws RocksDBException {
-        if(maximumNamespaces<1 || maximumNamespaces>MAX_SESSION_ACK_NAMESPACES)throw new IllegalArgumentException("Invalid session ACK namespace capacity");enterNative();applyLane.lock();try {if(validateSessionMetadata(null)>maximumNamespaces)throw new IllegalStateException("Existing session ACK namespaces exceed configured capacity");sessionAckLimit=maximumNamespaces;}finally {applyLane.unlock();leaveNative();}
+        if(maximumNamespaces<1 || maximumNamespaces>MAX_SESSION_ACK_NAMESPACES)throw new IllegalArgumentException("Invalid session ACK namespace capacity");enterNative();applyLane.lock();try {if(validateSessionMetadata(null)+sourceSessionMetadataPromises(minimumSessionEpoch(null),null,null)>maximumNamespaces)throw new IllegalStateException("Existing session ACK namespaces/promises exceed configured capacity");sessionAckLimit=maximumNamespaces;}finally {applyLane.unlock();leaveNative();}
     }
     public record SessionMetadataEstimate(ApplyPosition position,int retainedNamespaces,int reservedNamespaces,int maximumNamespaces,int removedNamespaces,int additionalNamespaces,boolean existingReceipt) {}
     private record SessionMetadataChange(int count,long minimumEpoch,long newEpoch,boolean additional) {}

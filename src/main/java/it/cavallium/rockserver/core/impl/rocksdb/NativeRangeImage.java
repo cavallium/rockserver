@@ -160,7 +160,7 @@ public final class NativeRangeImage {
                 tracker.finish();
                 try { pin.validateSessionMetadataImage(); pin.validateCatalogueHistoryImage(); pin.validateHomeCreditImage(tracker.homeCredits); pin.validateHomeRecoveryImage(tracker.homeRecoveries);
                 pin.validateSnapshotHomeImage(); }
-                catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("HOME image user/promise/recovery proof differs",invalid); }
+                catch (IllegalArgumentException | IllegalStateException invalid) { throw new IOException("Native image metadata accounting/recovery proof differs",invalid); }
                 output.writeByte(0);
                 output.writeLong(tracker.count);
                 bodyOutput.on(false);
@@ -189,7 +189,7 @@ public final class NativeRangeImage {
     public static Manifest inspectCatalogueHistory(Path image,Limits limits,UUID historyColumn,java.util.function.Predicate<byte[]> historyKeys) throws IOException {
         Objects.requireNonNull(historyColumn);Objects.requireNonNull(historyKeys);long[] counts=new long[4];int[] directories={0};byte[][] stored={null};
         var manifest=visit(image,limits,(section,column,key,value)-> {
-            if(section==Section.USER && column.equals(historyColumn) && key.length==16){if(++directories[0]>it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster.MAX_DOMAINS || value.length>it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IOException("Catalogue directory image reservation bound exceeded");var directory=it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec.decode(value);byte[] domain=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();if(!Arrays.equals(key,domain))throw new IOException("Catalogue directory image key/domain differs");}
+            if(section==Section.USER && column.equals(historyColumn) && key.length==16){if(++directories[0]>it.cavallium.rockserver.core.common.distributed.DatabaseDomainRoster.MAX_DOMAINS || value.length>it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IOException("Catalogue directory image reservation bound exceeded");it.cavallium.rockserver.core.common.distributed.RangeDirectory directory;try{directory=it.cavallium.rockserver.core.common.distributed.RangeDirectoryCodec.decode(value);}catch(IllegalArgumentException invalid){throw new IOException("Invalid catalogue directory image",invalid);}byte[] domain=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();if(!Arrays.equals(key,domain))throw new IOException("Catalogue directory image key/domain differs");}
             if(section==Section.USER && column.equals(historyColumn) && historyKeys.test(key)){counts[0]=Math.addExact(counts[0],key.length+(long)value.length);counts[1]++;}
             if(section==Section.STATE && key.length>16 && key[16]==0x78){if(key.length!=17 || stored[0]!=null)throw new IOException("Invalid catalogue history state key");stored[0]=value;counts[0]+=key.length+(long)value.length;counts[1]++;}
             if(section==Section.STATE && key.length>16 && key[16]==0x79){if(key.length!=49)throw new IOException("Invalid catalogue history credit key");var credit=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.Credit.decode(value);if(!Arrays.equals(Arrays.copyOfRange(key,17,49),credit.definition()))throw new IOException("Catalogue credit identity changed");counts[0]=Math.addExact(counts[0],key.length+(long)value.length);counts[1]++;counts[2]=Math.addExact(counts[2],credit.bytes());counts[3]=Math.addExact(counts[3],credit.rows());}
@@ -198,6 +198,18 @@ public final class NativeRangeImage {
         if(stored[0]==null){if(counts[1]!=0)throw new IOException("Catalogue history inventory lacks state");return manifest;}
         try {var actual=new it.cavallium.rockserver.core.common.distributed.CatalogueHistory.State(counts[0],counts[1],counts[2],counts[3]);if(!actual.equals(it.cavallium.rockserver.core.common.distributed.CatalogueHistory.State.decode(stored[0])))throw new IOException("Catalogue history image accounting differs from inventory");}
         catch(IllegalArgumentException failure){throw new IOException("Invalid catalogue history image accounting",failure);}return manifest;
+    }
+
+    /** Receiver policy qualification, including durable terminal-publication namespace promises. */
+    public static Manifest inspectSessionMetadata(Path image,Limits limits,int maximumNamespaces) throws IOException {
+        if(maximumNamespaces<1 || maximumNamespaces>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES)throw new IllegalArgumentException("Invalid receiver session metadata capacity");
+        var retained=new HashSet<OperationId>();var promises=new HashSet<OperationId>();long[] floor={0};
+        var manifest=visit(image,limits,(section,column,key,value)->{if(section!=Section.STATE || key.length<=16)return;
+            if(key[16]==3)floor[0]=ByteBuffer.wrap(value,4,8).getLong();
+            if(key[16]==2){var id=ByteBuffer.wrap(key,17,24);long epoch=id.getLong();retained.add(new OperationId(new UUID(id.getLong(),id.getLong()),epoch,0));}
+            if(key[16]==0x65){var original=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value).request().original();if(original.acknowledgedThrough()>=0)promises.add(new OperationId(original.operationId().sessionId(),original.operationId().epoch(),0));}
+        });
+        promises.removeIf(id->id.epoch()<floor[0] || retained.contains(id));if(retained.size()+promises.size()>maximumNamespaces)throw new IOException("Image exceeds receiver ACK namespace capacity");return manifest;
     }
 
     /** Qualified TX HOME reverse proof, including an image with no credit rows. Does not activate native admission. */
@@ -416,6 +428,7 @@ public final class NativeRangeImage {
         private long acknowledgementNamespaces;
         private long minimumAcknowledgementEpoch=Long.MAX_VALUE;
         private Long acknowledgementNamespaceCount;
+        private final Set<OperationId> acknowledgementNamespaceIds=new HashSet<>();
         private boolean marker;
         private boolean usagePresent;
         private SessionAuthority sessionAuthority;
@@ -761,7 +774,8 @@ public final class NativeRangeImage {
                     if (++acknowledgementNamespaces>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES || key.length != 41 || value.length != 12 || ByteBuffer.wrap(key, 17, 8).getLong() < 0) {
                         throw new IOException("Invalid image session floor shape");
                     }
-                    minimumAcknowledgementEpoch=Math.min(minimumAcknowledgementEpoch,ByteBuffer.wrap(key,17,8).getLong());
+                    long namespaceEpoch=ByteBuffer.wrap(key,17,8).getLong();var namespace=ByteBuffer.wrap(key,25,16);acknowledgementNamespaceIds.add(new OperationId(new UUID(namespace.getLong(),namespace.getLong()),namespaceEpoch,0));
+                    minimumAcknowledgementEpoch=Math.min(minimumAcknowledgementEpoch,namespaceEpoch);
                     var floorValue = ByteBuffer.wrap(value);
                     if (floorValue.getInt() != 1) throw new IOException("Unsupported image session floor version");
                     long floor = floorValue.getLong();
@@ -908,6 +922,8 @@ public final class NativeRangeImage {
             if(!sourceCredits.isEmpty() || !sourcePublications.isEmpty()) {
                 if(topologyFreeze==null || sourceCredits.keySet().stream().anyMatch(sourcePublications::containsKey) || sourceCredits.size()+sourcePublications.size()>it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_PUBLICATIONS)throw new IOException("Source outcome image lacks exact sealed prefix or duplicates original publication");
                 for(var credit:sourceCredits.values())if(!credit.request().freeze().equals(topologyFreeze))throw new IOException("Source credit image changed original seal");
+                var futureNamespaces=new HashSet<OperationId>();for(var credit:sourceCredits.values()){var original=credit.request().original();var id=original.operationId();var namespace=new OperationId(id.sessionId(),id.epoch(),0);if(original.acknowledgedThrough()>=0 && id.epoch()>=epochFloor && !acknowledgementNamespaceIds.contains(namespace))futureNamespaces.add(namespace);}
+                if(acknowledgementNamespaces+futureNamespaces.size()>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES)throw new IOException("Source ACK namespace promises exceed image capacity");
                 if(sourceOutcomeBytes+sourceCredits.size()*(49L+it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication.BYTES)>it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IOException("Source image would consume promised publication metadata");
             }
             if (homeRecoveries.size()+homeCreditCount>ReplicatedRangeStore.MAX_HOME_RECOVERIES || homeRecoveryBytes+homeCreditBytes>ReplicatedRangeStore.MAX_HOME_RECOVERY_BYTES) throw new IOException("HOME image actual/future capacity exceeded");
