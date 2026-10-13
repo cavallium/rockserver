@@ -212,6 +212,16 @@ public final class NativeRangeImage {
         promises.removeIf(id->id.epoch()<floor[0] || retained.contains(id));if(retained.size()+promises.size()>maximumNamespaces)throw new IOException("Image exceeds receiver ACK namespace capacity");return manifest;
     }
 
+    /** Effective receiver receipt ceiling, including already promised source outcomes. */
+    public static Manifest inspectReceiptCapacity(Path image,Limits limits,long maximumCount,long maximumBytes) throws IOException {
+        if(maximumCount<1 || maximumBytes<92)throw new IllegalArgumentException("Invalid receiver receipt capacity");long[] total={0,0};
+        var manifest=visit(image,limits,(section,column,key,value)-> {
+            if(section==Section.RECEIPTS){total[0]++;total[1]=Math.addExact(total[1],key.length+(long)value.length);}
+            if(section==Section.STATE && key.length>16 && key[16]==0x65){var credit=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value);total[0]++;total[1]=Math.addExact(total[1],credit.request().reservedBytes());}
+            if(total[0]>maximumCount || total[1]>maximumBytes)throw new IOException("Image receipts/promises exceed receiver capacity");
+        });return manifest;
+    }
+
     /** Qualified TX HOME reverse proof, including an image with no credit rows. Does not activate native admission. */
     public static Manifest inspectHomeRecoveryReservations(Path image,Limits limits,UUID cluster,UUID database,UUID column) throws IOException {
         return visitHomeRecoveryReservations(image,limits,cluster,database,column,(section,id,key,value) -> {});

@@ -199,7 +199,7 @@ public final class ReplicatedRangeStore {
     /** Trusted adapter bootstrap; ordinary standalone admission is unchanged without promises. */
     public void configureSourceOutcomeCapacity(long count,long bytes) {
         if(count<1 || bytes<92)throw new IllegalArgumentException("Invalid source receipt capacity");enterNative();applyLane.lock();
-        try { if(sourceOutcomeCountLimit!=0 && (sourceOutcomeCountLimit!=count || sourceOutcomeByteLimit!=bytes))throw new IllegalStateException("Source receipt capacity already configured");sourceOutcomeCountLimit=count;sourceOutcomeByteLimit=bytes;if(!sourceOutcomeCredits.isEmpty())checkSourceOutcomeUsage(readUsage(usageKey),null); }
+        try { if(sourceOutcomeCountLimit!=0 && (sourceOutcomeCountLimit!=count || sourceOutcomeByteLimit!=bytes))throw new IllegalStateException("Source receipt capacity already configured");ensureReceiptUsage();var effective=readUsage(usageKey).plus(sourceOutcomePromises(null));if(effective.count()>count || effective.bytes()>bytes)throw new IllegalStateException("Retained receipts/promises exceed proposed source capacity");sourceOutcomeCountLimit=count;sourceOutcomeByteLimit=bytes; }
         catch(RocksDBException failure) { throw new IllegalStateException("Cannot qualify source receipt capacity",failure); }
         finally { applyLane.unlock();leaveNative(); }
     }
@@ -594,13 +594,14 @@ public final class ReplicatedRangeStore {
     public void catalogueHistoryWriteObserver(HomeStatusWriteObserver observer){catalogueHistoryWriteObserver=Objects.requireNonNull(observer);}
     private int catalogueDirectorySlots=-1;
     private volatile UUID catalogueHistoryColumn;
+    private UUID catalogueLedgerColumn;
     private java.util.function.Predicate<byte[]> catalogueHistoryKeys;
     private java.util.function.Function<DistributedCommand,CatalogueHistory.Directive> catalogueHistoryPolicy;
     private CatalogueHistory.State catalogueHistoryCache;
-    public void configureCatalogueHistory(UUID column,java.util.function.Predicate<byte[]> keys,java.util.function.Function<DistributedCommand,CatalogueHistory.Directive> policy) throws RocksDBException {
-        Objects.requireNonNull(column);Objects.requireNonNull(keys);Objects.requireNonNull(policy);enterNative();applyLane.lock();try {
-            if(!catalogueScopeCompaction || homeRecoveryContext!=null || snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column)) || catalogueHistoryColumn!=null && !catalogueHistoryColumn.equals(column))throw new IllegalArgumentException("Catalogue history role/column changed");
-            catalogueHistoryColumn=column;catalogueHistoryKeys=keys;catalogueHistoryPolicy=policy;catalogueHistoryCache=null;catalogueDirectorySlots=-1;catalogueHistoryCache=verifyCatalogueHistory(null);
+    public void configureCatalogueHistory(UUID column,UUID ledgerColumn,java.util.function.Predicate<byte[]> keys,java.util.function.Function<DistributedCommand,CatalogueHistory.Directive> policy) throws RocksDBException {
+        Objects.requireNonNull(column);Objects.requireNonNull(ledgerColumn);Objects.requireNonNull(keys);Objects.requireNonNull(policy);enterNative();applyLane.lock();try {
+            if(column.equals(ledgerColumn) || !catalogueScopeCompaction || homeRecoveryContext!=null || snapshotHomeContext!=null || !columns.keySet().equals(Set.of(column,ledgerColumn)) || catalogueHistoryColumn!=null && (!catalogueHistoryColumn.equals(column) || !catalogueLedgerColumn.equals(ledgerColumn)))throw new IllegalArgumentException("Catalogue history role/column changed");
+            catalogueHistoryColumn=column;catalogueLedgerColumn=ledgerColumn;catalogueHistoryKeys=keys;catalogueHistoryPolicy=policy;catalogueHistoryCache=null;catalogueDirectorySlots=-1;catalogueHistoryCache=verifyCatalogueHistory(null);
         }finally {applyLane.unlock();leaveNative();}
     }
     private byte[] catalogueHistoryKey(byte[] suffix){return ByteBuffer.allocate(16+suffix.length).put(markerKey).put(suffix).array();}
@@ -627,7 +628,7 @@ public final class ReplicatedRangeStore {
     private static void requireCatalogueDirectory(byte[] key,byte[] value){if(value.length>RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IllegalArgumentException("Catalogue directory value exceeds pre-reserved slot");var directory=RangeDirectoryCodec.decode(value);if(!Arrays.equals(key,uuidBytes(directory.domainId())))throw new IllegalArgumentException("Catalogue directory key/domain differs");}
     private record CatalogueChange(CatalogueHistory.Directive directive,CatalogueHistory.Update update,int directoryDelta) {}
     private CatalogueChange catalogueHistoryChange(DistributedCommand command,List<Mutation> effects) throws RocksDBException {
-        if(catalogueHistoryColumn==null || effects.isEmpty())return null;
+        if(catalogueHistoryColumn==null || effects.stream().noneMatch(effect->effect.columnId().equals(catalogueHistoryColumn)))return null;
         var directive=Objects.requireNonNull(catalogueHistoryPolicy.apply(command));
         for(var effect:effects)if(effect.columnId().equals(catalogueHistoryColumn) && effect.kind()!=Mutation.Kind.PUT && effect.kind()!=Mutation.Kind.DELETE)throw new IllegalArgumentException("Catalogue accounting requires bounded point mutations");
         var delta=new CatalogueHistory.Delta(0,0);var touched=new java.util.HashSet<String>();int directoryDelta=0;
@@ -3844,6 +3845,7 @@ public final class ReplicatedRangeStore {
                 if(!activeTopologyFreeze.equals(incoming[0])) throw new IOException("Snapshot cannot discard/change native topology FREEZE");
             }
             if(catalogueHistoryColumn!=null)NativeRangeImage.inspectCatalogueHistory(image,limits,catalogueHistoryColumn,catalogueHistoryKeys);
+            if(sourceOutcomeCountLimit!=0)NativeRangeImage.inspectReceiptCapacity(image,limits,sourceOutcomeCountLimit,sourceOutcomeByteLimit);
             NativeRangeImage.inspectSessionMetadata(image,limits,sessionAckLimit);
             if(cdc!=null) cdc.validateImage(image,limits,expected.position());
             if(importBirth!=null) {

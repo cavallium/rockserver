@@ -128,4 +128,16 @@ class NativeSourceOutcomePublicationTest {
         try(var f=topology.new Fixture(root.resolve("promise-receiver"))){f.parent.configureSessionMetadataCapacity(2);var cut=f.parent.applied();f.parent.fence();assertThrows(java.io.IOException.class,()->f.parent.installSnapshot(image,topology.limits));assertEquals(cut,f.parent.applied());assertFalse(f.parent.pendingInstallation());}
     }
 
+    @Test void creditFreeColdCapacityAndTighterReceiverValidateExistingReceiptsBeforePublication() throws Exception {
+        var path=root.resolve("ordinary-source");var image=root.resolve("ordinary-receipts.image");
+        try(var f=topology.new Fixture(path)) {
+            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.parent.apply(new ApplyPosition(1,2),f.write(f.parent,1,8));
+            assertTrue(f.parent.sourceOutcomeCredits().isEmpty());assertEquals(2,f.parent.receiptUsage().retainedCount());
+            assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(1,92));f.parent.configureSourceOutcomeCapacity(2,184);
+            try(var pin=f.parent.capture()){NativeRangeImage.write(image,pin,pin.interval(),topology.limits);}
+        }
+        try(var f=topology.new Fixture(path)){assertTrue(f.parent.sourceOutcomeCredits().isEmpty());assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(1,184));assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(2,92));f.parent.configureSourceOutcomeCapacity(2,184);}
+        try(var f=topology.new Fixture(root.resolve("tighter-target"))){f.parent.configureSourceOutcomeCapacity(1,92);var cut=f.parent.applied();f.parent.fence();assertThrows(java.io.IOException.class,()->f.parent.installSnapshot(image,topology.limits));assertEquals(cut,f.parent.applied());assertFalse(f.parent.pendingInstallation());}
+    }
+
 }
