@@ -35,7 +35,7 @@
         <execution><id>unchanged-release-classes</id><phase>generate-resources</phase><goals><goal>unpack</goal></goals><configuration><artifactItems><artifactItem>
           <groupId>org.apache.ratis</groupId><artifactId>ratis-server</artifactId><version>${ratis.version}</version><type>jar</type>
           <outputDirectory>${project.build.outputDirectory}</outputDirectory>
-          <excludes>org/apache/ratis/server/leader/InstallSnapshotRequests*.class,org/apache/ratis/server/impl/ReadIndexHeartbeats*.class,org/apache/ratis/server/impl/LeaderStateImpl*.class,org/apache/ratis/server/impl/RaftServerImpl*.class,META-INF/MANIFEST.MF,META-INF/*.SF,META-INF/*.RSA,META-INF/*.DSA</excludes>
+          <excludes>org/apache/ratis/server/leader/InstallSnapshotRequests*.class,org/apache/ratis/server/impl/ReadIndexHeartbeats*.class,org/apache/ratis/server/impl/LeaderStateImpl*.class,org/apache/ratis/server/impl/RaftServerImpl*.class,org/apache/ratis/server/impl/StateMachineUpdater*.class,META-INF/MANIFEST.MF,META-INF/*.SF,META-INF/*.RSA,META-INF/*.DSA</excludes>
         </artifactItem></artifactItems></configuration></execution>
       </executions>
     </plugin>

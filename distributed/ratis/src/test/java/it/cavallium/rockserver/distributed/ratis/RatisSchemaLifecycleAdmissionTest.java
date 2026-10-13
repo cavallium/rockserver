@@ -53,7 +53,8 @@ class RatisSchemaLifecycleAdmissionTest {
         final java.util.concurrent.atomic.AtomicInteger epochReads=new java.util.concurrent.atomic.AtomicInteger();
         Fixture(Path root) throws Exception { this(root,false); }
         Fixture(Path root,boolean sessions) throws Exception { this(root,sessions,java.util.function.UnaryOperator.identity()); }
-        Fixture(Path root,boolean sessions,java.util.function.UnaryOperator<DistributedStoragePool> storageView) throws Exception {
+        Fixture(Path root,boolean sessions,java.util.function.UnaryOperator<DistributedStoragePool> storageView) throws Exception {this(root,sessions,storageView,machine->{});}
+        Fixture(Path root,boolean sessions,java.util.function.UnaryOperator<DistributedStoragePool> storageView,java.util.function.Consumer<RatisRangeStateMachine> configure) throws Exception {
             pool=DistributedStoragePool.open(root.resolve("native"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
             store=pool.openRange(new RangeOwnership.Owner(groupId,1),new RangeOwnership.Interval(id(3),Set.of(column),null,null),source.digest(),Map.of(column,"data"),Set.of()); store.enableLogicalSchema(source);
             storage=RaftStorage.newBuilder().setDirectory(root.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build(); storage.initialize();
@@ -71,7 +72,7 @@ class RatisSchemaLifecycleAdmissionTest {
                 var epochs=new RatisSessionEpochs(client,id(1),id(2),id(20),1,new byte[32],id(21));
                 machine=RatisRangeStateMachine.withSessions(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),command -> {},epochs,sourceDirectory,RatisRangeStateMachine.RetentionLimits.defaults(),leader::get);
             } else machine=new RatisRangeStateMachine(store,group,new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),command -> {},command -> {},leader::get);
-            machine.schemaStorage(storageView.apply(pool)); machine.proofQueries(queries);
+            configure.accept(machine);machine.schemaStorage(storageView.apply(pool)); machine.proofQueries(queries);
             machine.schemaActivated((definition,proof) -> { activations.incrementAndGet(); onActivation.run(); });
             machine.schemaAuthority((header,digest) -> { beforeRead.run(); return new RatisSchemaAuthority.View(new RatisSchemaAuthority.Request(id(1),id(2),id(3)),authorityGroup,authorityPosition.get(),directory.get(),new RatisSchemaAdministration.Head(status.get(),2)); },sourceDirectory);
             var server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> { if (method.getName().equals("getId")) return peer.getId(); if (method.getName().equals("toString")) return "identity-schema-fixture"; throw new AssertionError("Unexpected server access "+method); });
