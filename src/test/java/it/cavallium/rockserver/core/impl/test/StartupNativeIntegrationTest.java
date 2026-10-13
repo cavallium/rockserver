@@ -58,8 +58,8 @@ class StartupNativeIntegrationTest {
         Path config = config("workflow", true, "0B");
         seed(dbPath, config, "seed");
         List<SnapshotCache> closedCaches;
-        try (var exported = new SimpleMeterRegistry();
-                var connection = new EmbeddedConnection(dbPath, "capture", config)) {
+        var exported = new SimpleMeterRegistry();
+        try (var connection = new EmbeddedConnection(dbPath, "capture", config)) {
             var internal = connection.getInternalDB();
             ((CompositeMeterRegistry) internal.getMetricsRegistry()).add(exported);
             var resources = resources(internal);
@@ -93,6 +93,8 @@ class StartupNativeIntegrationTest {
             assertEquals(value(7), api.get(0, temporary, key(7), RequestType.current()));
             api.deleteColumn(temporary);
             assertAdmissionConservation(resources.budgets().values().iterator().next().snapshot());
+        } finally {
+            exported.close();
         }
         closedCaches.forEach(cache -> {
             assertFalse(cache.isOwningHandle());

@@ -30,12 +30,17 @@ public final class StartupProductionQualification {
     static final class Histogram {
         final long[] buckets = new long[512];
         long count;
+        long failures;
         synchronized void record(long nanos) {
             long duration = Math.max(1, nanos);
             int shift = Math.max(0, 60 - Long.numberOfLeadingZeros(duration));
             int bucket = duration < 8 ? (int) duration : shift * 8 + (int) (duration >>> shift);
             buckets[bucket]++;
             count++;
+        }
+        synchronized void record(long nanos, boolean failed) {
+            record(nanos);
+            if (failed) failures++;
         }
         synchronized long percentile(int percentile) {
             if (count == 0) return 0;
@@ -51,7 +56,7 @@ public final class StartupProductionQualification {
             throw new AssertionError();
         }
         synchronized Map<String, Object> report() {
-            return Map.of("operations", count, "p50_upper_ns", percentile(50),
+            return Map.of("operations", count, "native_failures", failures, "p50_upper_ns", percentile(50),
                     "p95_upper_ns", percentile(95), "p99_upper_ns", percentile(99));
         }
     }
@@ -122,7 +127,7 @@ public final class StartupProductionQualification {
         }
     }
     public static void main(String[] args) throws Exception {
-        if (args.length != 9) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB readOperations directReads dataSampleEvery metadataSampleEvery capturePeriodMs");
+        if (args.length != 12) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB readOperations directReads dataSampleEvery metadataSampleEvery capturePeriodMs seedHotKeys seedPasses startupWindowMs");
         Path dbPath = Path.of(args[0]), cachePath = Path.of(args[1]);
         String mode = args[2];
         if (!Set.of("seed", "none", "cache", "admission", "both", "verify").contains(mode)) throw new IllegalArgumentException(mode);
@@ -133,13 +138,22 @@ public final class StartupProductionQualification {
         boolean direct = Boolean.parseBoolean(args[5]);
         int dataSampling = Integer.parseInt(args[6]), metadataSampling = Integer.parseInt(args[7]);
         long capturePeriodMs = Long.parseLong(args[8]);
+        int seedHotKeys = Integer.parseInt(args[9]), seedPasses = Integer.parseInt(args[10]);
+        long startupWindowMs = Long.parseLong(args[11]);
         if (capturePeriodMs < 100 || capturePeriodMs > 86400000) throw new IllegalArgumentException("Capture period bound");
         if (mib < 1 || mib > 1024 || operations < 1 || operations > 1_000_000) throw new IllegalArgumentException("Unbounded fixture");
         int keys = Math.toIntExact(mib * MIB / VALUE_BYTES);
+        int effectiveSeedHotKeys = Math.min(keys, seedHotKeys);
+        if (seedHotKeys < 1 || seedHotKeys > 262144 || seedPasses < 1 || seedPasses > 1024
+                || (long) effectiveSeedHotKeys * seedPasses > 1_048_576
+                || startupWindowMs < 100 || startupWindowMs > 60000)
+            throw new IllegalArgumentException("Warm-history/window bound");
         if (seed && Files.exists(dbPath)) throw new IllegalArgumentException("Seed needs new database path");
         if (!seed && !Files.readString(dbPath.resolve(MARKER)).equals("v1:" + keys)) throw new IllegalArgumentException("Fixture marker mismatch");
         RocksDBLoader.loadLibrary();
         var output = new LinkedHashMap<String, Object>();
+        output.put("seed_hot_keys_requested", seedHotKeys); output.put("seed_hot_keys_effective", effectiveSeedHotKeys);
+        output.put("seed_passes", seedPasses); output.put("startup_window_ms", startupWindowMs);
         output.put("mode", mode); output.put("direct_reads", direct); output.put("fixture_keys", keys);
         output.put("primary_cache_capacity_bytes", CAPACITY);
         output.put("cache_geometry", "AutoHyperClockCache data28MiB/metadata4MiB, estimatedEntryCharge0/shards-1; matched baseline/candidate");
@@ -150,6 +164,8 @@ public final class StartupProductionQualification {
         output.put("snapshot_budget_bytes", 16 * MIB); output.put("disk_budget_bytes", 48 * MIB);
         var hotPoint = new Histogram(); var coldPoint = new Histogram();
         var point = new Histogram(); var multi = new Histogram(); var writes = new Histogram();
+        var startupPoint = new Histogram(); var startupHot = new Histogram();
+        var startupBulk = new Histogram(); var startupWrites = new Histogram();
         var overlap = new Histogram(); var steady = new Histogram();
         var samples = Collections.synchronizedList(new ArrayList<Map<String, Object>>());
         var running = new AtomicBoolean(true);
@@ -182,7 +198,19 @@ public final class StartupProductionQualification {
                             flushToLevelOne(db, flush);
                             output.put("fixture_live_sst_files", db.getLiveFilesMetaData().size());
                             output.put("fixture_l0_files", db.getLiveFilesMetaData().stream().filter(f -> f.level() == 0).count());
-                            for (int i = 0; i < Math.min(keys, 4096); i++) verify(db.get(key(i)), i);
+                            int[] history = new int[effectiveSeedHotKeys];
+                            for (int i = 0; i < history.length; i++) history[i] = i;
+                            var order = new Random(271828);
+                            for (int pass = 0; pass < seedPasses; pass++) {
+                                // Default one-pass history preserves the original sequential seed.
+                                if (seedPasses > 1) for (int i = history.length - 1; i > 0; i--) {
+                                    int selected = order.nextInt(i + 1), old = history[i];
+                                    history[i] = history[selected]; history[selected] = old;
+                                }
+                                for (int id : history) verify(db.get(key(id)), id);
+                            }
+                            output.put("seed_verified_foreground_gets", (long) history.length * seedPasses);
+                            output.put("seed_history_order", seedPasses == 1 ? "sequential" : "deterministic per-pass shuffle");
                             int status = captureBoth(snapshot, metadataSnapshot);
                             output.put("capture_status", status);
                             if (status != 0) throw new IllegalStateException("Fixture capture status: " + status);
@@ -266,14 +294,25 @@ public final class StartupProductionQualification {
                                                 List<byte[]> values;
                                                 long before = System.nanoTime(), ns; boolean failed = true;
                                                 try { values = db.multiGetAsList(read, batch); failed = false; }
-                                                finally { ns = System.nanoTime() - before; completions.recordBulk(ns, batch.size(), failed); }
+                                                finally {
+                                                    ns = System.nanoTime() - before;
+                                                    completions.recordBulk(ns, batch.size(), failed);
+                                                    if (before - started < startupWindowMs * 1_000_000L) startupBulk.record(ns, failed);
+                                                }
                                                 multi.record(ns); (opening ? overlap : steady).record(ns);
                                                 for (int i = 0; i < ids.length; i++) verify(values.get(i), ids[i]);
                                             } else {
                                                 byte[] nativeKey = key(id), actual;
                                                 long before = System.nanoTime(), ns; boolean failed = true;
                                                 try { actual = db.get(read, nativeKey); failed = false; }
-                                                finally { ns = System.nanoTime() - before; completions.recordPoint(ns, failed); }
+                                                finally {
+                                                    ns = System.nanoTime() - before;
+                                                    completions.recordPoint(ns, failed);
+                                                    if (before - started < startupWindowMs * 1_000_000L) {
+                                                        startupPoint.record(ns, failed);
+                                                        if (op % 2 == 0) startupHot.record(ns, failed);
+                                                    }
+                                                }
                                                 point.record(ns); (op % 2 == 0 ? hotPoint : coldPoint).record(ns); (opening ? overlap : steady).record(ns);
                                                 verify(actual, id);
                                             }
@@ -291,8 +330,14 @@ public final class StartupProductionQualification {
                                         long cycleStarted = System.nanoTime();
                                         boolean readersActive = readersRemaining.get() > 0;
                                         byte[] nativeKey = writeKey(i), nativeValue = value(~i);
-                                        long before = System.nanoTime(); db.put(writeOptions, nativeKey, nativeValue);
-                                        writes.record(System.nanoTime() - before);
+                                        long before = System.nanoTime(), nativeNanos;
+                                        boolean writeFailed = true;
+                                        try { db.put(writeOptions, nativeKey, nativeValue); writeFailed = false; }
+                                        finally {
+                                            nativeNanos = System.nanoTime() - before;
+                                            if (before - started < startupWindowMs * 1_000_000L) startupWrites.record(nativeNanos, writeFailed);
+                                        }
+                                        writes.record(nativeNanos);
                                         byte[] actual; boolean failed = true;
                                         before = System.nanoTime();
                                         try { actual = db.get(nativeKey); failed = false; }
@@ -315,6 +360,11 @@ public final class StartupProductionQualification {
                                 monitor.get();
                             }
                             output.put("foreground_elapsed_ns", foregroundEnded - started);
+                            output.put("startup_post_open", Map.of(
+                                    "scope", "Foreground calls whose native start is in [0, window) after foreground launch; excludes open/WAL, close, and value verification; point excludes writer verification reads",
+                                    "window_ms", startupWindowMs, "window_elapsed_ns", Math.min(foregroundEnded - started, startupWindowMs * 1_000_000L),
+                                    "point", startupPoint.report(), "hot_point", startupHot.report(),
+                                    "multi_get", startupBulk.report(), "writes", startupWrites.report()));
                             output.put("completed_writes", completedWrites.get());
                             output.put("writes_during_read_tasks", writesDuringReads.get());
                             output.put("writer_target_max_ops_per_second", 128);
