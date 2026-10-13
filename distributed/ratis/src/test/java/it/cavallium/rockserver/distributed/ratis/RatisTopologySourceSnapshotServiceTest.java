@@ -13,11 +13,47 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 class RatisTopologySourceSnapshotServiceTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     RatisTopologySourceSnapshotService.Limits limits(){return RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024);}
+    @Test void oneBatchWorkerMakesRecoveryProgressWhileBootstrapHasNoRateCredits()throws Exception {
+        var scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(1,1,1,16,16,"one-source-build-worker");
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root)){
+            var bootstrap=fixture.request(50);var recovery=new Request(new java.util.UUID(0,52),bootstrap.header(),bootstrap.catalogue(),fixture.donor,Purpose.RECOVERY);
+            var denied=new CountDownLatch(1);var allow=new java.util.concurrent.atomic.AtomicBoolean();var controller=new RatisMigrationController(RatisMigrationController.Policy.defaults(),java.util.Set.of(new java.util.UUID(0,100)),System::nanoTime,()->RatisDiskRunway.State.EMERGENCY);
+            var host=(RatisTopologySourceSnapshotService.Host)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{RatisTopologySourceSnapshotService.Host.class},(proxy,method,args)->{
+                if(method.getName().equals("chunkReady") && args[0].equals(bootstrap)){denied.countDown();return allow.get();}
+                try{return method.invoke(fixture,args);}catch(java.lang.reflect.InvocationTargetException failed){throw failed.getCause();}
+            });
+            RatisTopologySourceSnapshotService.ResourceAdmission admission=(request,bytes)->request.purpose()==Purpose.RECOVERY?controller.reserveRecovery(new java.util.UUID(0,100),bytes):fixture.transferAdmission().reserve(request,bytes);
+            try(var service=new RatisTopologySourceSnapshotService(host,limits(),scheduler,admission)){
+                var waiting=service.prepareAsync(bootstrap);assertTrue(denied.await(5,TimeUnit.SECONDS));
+                try(var saturated=fixture.graph.reserve(new java.util.UUID(0,100),RatisNodeResourceBudget.Kind.ORDINARY,(256L<<20)-fixture.graph.stats().ordinary().bytes(),1)){
+                    var completed=service.prepareAsync(recovery).get(5,TimeUnit.SECONDS);assertEquals(Purpose.RECOVERY,completed.request().purpose());assertFalse(waiting.isDone());assertEquals(0,controller.usage().recoveryOwners());
+                }
+                allow.set(true);waiting.get(5,TimeUnit.SECONDS);service.stop().get(5,TimeUnit.SECONDS);assertEquals(0,fixture.graph.stats().ordinary().owners());
+            }finally{allow.set(true);}
+        }finally{scheduler.dispose();}
+    }
+    @Test void heldBatchBuildLeavesReleaseIndependentAndStopWaitsForActualCapture()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root)){
+            var entered=new CountDownLatch(1);var unblock=new CountDownLatch(1);var first=fixture.request(50);var second=fixture.request(51);
+            var host=(RatisTopologySourceSnapshotService.Host)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{RatisTopologySourceSnapshotService.Host.class},(proxy,method,args)->{
+                if(method.getName().equals("capture") && args[0].equals(second)){entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));}
+                try{return method.invoke(fixture,args);}catch(java.lang.reflect.InvocationTargetException failed){throw failed.getCause();}
+            });
+            try(var service=new RatisTopologySourceSnapshotService(host,limits(),fixture.scheduler,fixture.transferAdmission())){
+                service.prepare(first);service.transfer(first).get(5,TimeUnit.SECONDS);
+                var actual=service.prepareAsync(second);assertTrue(entered.await(5,TimeUnit.SECONDS));assertTrue(actual.copy().cancel(true));
+                service.release(first);assertEquals(1,fixture.durableReleases.get());assertEquals(1,fixture.pinCloses.get());
+                var stopped=service.stop();assertFalse(stopped.isDone());assertEquals(1,fixture.graph.stats().ordinary().owners());
+                unblock.countDown();assertThrows(ExecutionException.class,()->actual.get(5,TimeUnit.SECONDS));stopped.get(5,TimeUnit.SECONDS);
+                assertEquals(0,fixture.graph.stats().ordinary().owners());assertEquals(0,service.stats().leases());
+            }finally{unblock.countDown();}
+        }
+    }
     @Test void abandonedReplayAtFullImageBudgetOwnsOnlyBoundedMetadata()throws Exception {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root)){
             var old=fixture.request(49);var next=fixture.request(50);var terminal=new Abandoned(old,next.transferId(),fixture.store.applied(),fixture.donor,new byte[32]);var entered=new CountDownLatch(1);var unblock=new CountDownLatch(1);
             var host=new RatisTopologySourceSnapshotService.Host(){
-                public RatisTopologySourceSnapshotService.Lease capture(Request request)throws Exception{return fixture.capture(request);}
+                public RatisTopologySourceSnapshotService.Lease capture(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission admission)throws Exception{return fixture.capture(request,admission);}
                 public Abandoned abandoned(Request request)throws Exception{if(request.transferId().equals(old.transferId())){entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return terminal;}return null;}
                 public Abandoned abandon(Request request)throws Exception{return fixture.abandon(request);}
                 public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
@@ -73,7 +109,7 @@ class RatisTopologySourceSnapshotServiceTest {
             var host=new RatisTopologySourceSnapshotService.Host(){
                     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
                     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
-                public RatisTopologySourceSnapshotService.Lease capture(Request request)throws Exception{entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return fixture.capture(request);}
+                public RatisTopologySourceSnapshotService.Lease capture(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission admission)throws Exception{entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return fixture.capture(request,admission);}
                 public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
                 public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                 public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);}

@@ -35,7 +35,9 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         @Override public void close()throws Exception{retained.close();}
     }
     public interface Host {
-        Lease capture(Request request)throws Exception;
+        Lease capture(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission admission)throws Exception;
+        default boolean chunkReady(Request request,long bytes)throws IOException{return true;}
+        default void transferFinished(Request request){}
         Abandoned abandoned(Request request)throws Exception;
         Abandoned abandon(Request request)throws Exception;
         void requireOwner(Lease lease)throws Exception;
@@ -45,19 +47,63 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException;
     }
     public static final long TRANSFER_BYTES=256+PUBLICATION_LOOKUP_BYTES+4L*(CHUNK_BYTES+MAX_REQUEST_BYTES+MAX_REPLY_BYTES);
-    @FunctionalInterface public interface ResourceAdmission {RatisProofQueryService.ResourceLease reserve(long bytes)throws IOException;}
+    @FunctionalInterface public interface ResourceAdmission {RatisProofQueryService.ResourceLease reserve(Request request,long bytes)throws IOException;}
     public record Stats(int leases,int active,long reservedImageBytes,long metadataBytes,int released) {}
     private static final class Entry {
         final Request request; long imageCharge,metadataCharge; Lease lease; boolean busy=true,installed,unusable;
         Entry(Request request,long imageCharge,long metadataCharge){this.request=request;this.imageCharge=imageCharge;this.metadataCharge=metadataCharge;}
     }
     private final Host host;private final Limits limits;private final ResourceAdmission admission;private final RWScheduler.WorkloadExecutor executor;
+    private final ScheduledExecutorService rateWakeup=Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon(true).name("ratis-migration-rate").factory());
+    private final Set<Preparation> preparations=new LinkedHashSet<>();
     private final Set<Transfer> transfers=new LinkedHashSet<>();private final CompletableFuture<Void> stopped=new CompletableFuture<>();
     private final Map<UUID,Entry> entries=new LinkedHashMap<>();private final Map<UUID,byte[]> released=new HashMap<>();private final Set<UUID> releaseLookups=new HashSet<>();
     private long imageBytes,metadataBytes;private int active;private boolean stopping;
     public RatisTopologySourceSnapshotService(Host host,Limits limits,RWScheduler scheduler,ResourceAdmission admission){this.host=Objects.requireNonNull(host);this.limits=Objects.requireNonNull(limits);this.admission=Objects.requireNonNull(admission);executor=Objects.requireNonNull(scheduler).executor(RequestContext.batch(),OperationFamily.FULL_SCAN_AGGREGATE);}
+    /** The actual image write/inspect/hash runs in bounded BATCH work, outside the proof/control worker. */
+    public CompletableFuture<Prepared> prepareAsync(Request request){
+        final Preparation task;final RatisProofQueryService.ResourceLease resource;
+        try{resource=Objects.requireNonNull(admission.reserve(request,TRANSFER_BYTES));}catch(Exception failure){return CompletableFuture.failedFuture(failure);}
+        synchronized(this){if(stopping || preparations.size()>=MAX_LEASES){resource.close();return CompletableFuture.failedFuture(new IOException("Source image build admission exhausted"));}task=new Preparation(request,resource);preparations.add(task);}
+        try{task.handle=executor.executeCooperatively(task,TRANSFER_BYTES);boolean stop;synchronized(this){stop=stopping;}if(stop)task.handle.cancel();}catch(RuntimeException rejected){task.reject(rejected);}
+        return task.result.copy();
+    }
+    /** A bounded native owner waits off the scheduler worker; each IO quantum still enters the BATCH lane. */
+    private final class Preparation implements RWScheduler.CooperativeCompletionTask {
+        final Request request;final RatisProofQueryService.ResourceLease resource;final CompletableFuture<Prepared> result=new CompletableFuture<>();final Semaphore permit=new Semaphore(0);
+        volatile RWScheduler.CooperativeHandle handle;boolean started,actualFinished,logicalFinished,settled;int requestedBytes;Prepared value;Throwable failure;
+        Preparation(Request request,RatisProofQueryService.ResourceLease resource){this.request=request;this.resource=resource;}
+        public RWScheduler.CooperativeResult runCooperatively(RWScheduler.CooperativeContext context){
+            boolean start;int bytes;
+            synchronized(RatisTopologySourceSnapshotService.this){start=!started;if(start)started=true;bytes=requestedBytes;if(actualFinished){if(failure!=null)context.fail(failure instanceof RuntimeException runtime?runtime:new CompletionException(failure));return RWScheduler.CooperativeResult.COMPLETE;}}
+            if(start)try{Thread.ofVirtual().name("ratis-source-image-owner").start(this::build);}catch(RuntimeException rejected){synchronized(RatisTopologySourceSnapshotService.this){actualFinished=true;failure=rejected;}context.fail(rejected);return RWScheduler.CooperativeResult.COMPLETE;}
+            if(bytes>0){try{if(!host.chunkReady(request,bytes)){rateWakeup.schedule(this::resume,10,TimeUnit.MILLISECONDS);return RWScheduler.CooperativeResult.PARK;}}
+                catch(Exception failed){context.fail(new CompletionException(failed));return RWScheduler.CooperativeResult.COMPLETE;}
+                synchronized(RatisTopologySourceSnapshotService.this){requestedBytes=0;}permit.release();
+            }
+            return RWScheduler.CooperativeResult.PARK;
+        }
+        private void build(){try{value=prepareOwned(request,this::beforeBytes);}catch(Throwable failed){synchronized(RatisTopologySourceSnapshotService.this){if(failure==null)failure=failed;}}finally{synchronized(RatisTopologySourceSnapshotService.this){actualFinished=true;}resume();settle();}}
+        private void beforeBytes(int bytes)throws IOException{
+            synchronized(RatisTopologySourceSnapshotService.this){requireOpen();if(logicalFinished)throw new IOException("Source image submission terminated",failure);requestedBytes=bytes;}
+            resume();try{permit.acquire();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Source image owner interrupted",interrupted);}
+            synchronized(RatisTopologySourceSnapshotService.this){requireOpen();if(logicalFinished)throw new IOException("Source image submission terminated",failure);}
+        }
+        private void resume(){RWScheduler.CooperativeHandle current;synchronized(RatisTopologySourceSnapshotService.this){if(logicalFinished)return;current=handle;}if(current==null)rateWakeup.schedule(this::resume,10,TimeUnit.MILLISECONDS);else current.resume();}
+        public void completeCooperatively(){synchronized(RatisTopologySourceSnapshotService.this){logicalFinished=true;}settle();}
+        public void reject(RuntimeException rejected){synchronized(RatisTopologySourceSnapshotService.this){if(failure==null)failure=rejected;logicalFinished=true;if(!started)actualFinished=true;}permit.release();settle();}
+        private void settle(){Throwable problem;Prepared prepared;synchronized(RatisTopologySourceSnapshotService.this){if(settled || !logicalFinished || !actualFinished)return;settled=true;problem=failure;prepared=value;}
+            resource.close();synchronized(RatisTopologySourceSnapshotService.this){preparations.remove(this);}checkStopped();if(problem==null)result.complete(prepared);else result.completeExceptionally(problem);
+        }
+    }
     public synchronized Stats stats(){return new Stats(entries.size(),active,imageBytes,metadataBytes,released.size());}
-    public Prepared prepare(Request request)throws IOException {
+    private void awaitImageBytes(Request request,int bytes)throws IOException {
+        while(true){synchronized(this){requireOpen();}if(host.chunkReady(request,bytes))return;
+            try{Thread.sleep(10);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Source image admission interrupted",interrupted);}
+        }
+    }
+    Prepared prepare(Request request)throws IOException {return prepareOwned(request,bytes->awaitImageBytes(request,bytes));}
+    private Prepared prepareOwned(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission imageAdmission)throws IOException {
         Objects.requireNonNull(request);Entry entry;boolean capture;
         synchronized(this){
             requireOpen();requireNotReleased(request);if(releaseLookups.contains(request.transferId()))throw new IOException("Durable release lookup still owns this transfer");entry=entries.get(request.transferId());
@@ -74,7 +120,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 var terminal=host.abandoned(request);if(terminal!=null)throw new AbandonedException(terminal);
                 synchronized(this){if(entry.imageCharge==0){long charge=3L*MAX_REPLY_BYTES;long captures=entries.values().stream().filter(value->value.imageCharge!=0).count();if(captures>=limits.maximumLeases() || limits.maximumImageBytes()>limits.maximumReservedImageBytes()-imageBytes || charge-entry.metadataCharge>limits.maximumMetadataBytes()-metadataBytes)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Source snapshot admission exhausted");requireOpen();entry.imageCharge=limits.maximumImageBytes();imageBytes+=entry.imageCharge;metadataBytes+=charge-entry.metadataCharge;entry.metadataCharge=charge;}}
                 Lease candidate=null;
-                try {candidate=Objects.requireNonNull(host.capture(request));requireRequest(request,candidate.prepared().request());
+                try {candidate=Objects.requireNonNull(host.capture(request,imageAdmission));requireRequest(request,candidate.prepared().request());
                     if(candidate.prepared().image().bytes()>limits.maximumImageBytes())throw new IOException("Captured source image exceeds reserved quota");
                     host.requireOwner(candidate);long charge=3L*preparedBytes(candidate.prepared());
                     synchronized(this){entry.lease=candidate;metadataBytes+=charge-entry.metadataCharge;entry.metadataCharge=charge;candidate=null;}
@@ -91,7 +137,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
     public CompletableFuture<Prepared> transfer(Request request) {
         RatisProofQueryService.ResourceLease resource=null;Transfer task=null;
         try {
-            Objects.requireNonNull(request);resource=Objects.requireNonNull(admission.reserve(TRANSFER_BYTES));
+            Objects.requireNonNull(request);resource=Objects.requireNonNull(admission.reserve(request,TRANSFER_BYTES));
             synchronized(this){requireOpen();requireNotReleased(request);var entry=entries.get(request.transferId());if(entry!=null){requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");}
                 if(active>=MAX_LEASES || PUBLICATION_LOOKUP_BYTES>limits.maximumMetadataBytes()-metadataBytes || !releaseLookups.add(request.transferId()))throw new IOException("Source transfer lookup admission exhausted");
                 active++;metadataBytes+=PUBLICATION_LOOKUP_BYTES;task=new Transfer(request,resource);transfers.add(task);resource=null;
@@ -115,6 +161,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 host.requireOwner(entry.lease);
                 if(chunks==null)chunks=RockserverSnapshotRequests.openSource(entry.lease.source(),RaftPeerId.valueOf(request.receiver().peerId()),request.transferId().toString(),entry.lease.snapshot(),CHUNK_BYTES);
                 if(!chunks.hasNext())throw new IOException("Snapshot producer did not yield a final receiver response");
+                if(!host.chunkReady(request,CHUNK_BYTES)){rateWakeup.schedule(this::resumeRate,10,TimeUnit.MILLISECONDS);return RWScheduler.CooperativeResult.PARK;}
                 var chunk=chunks.next();var reply=host.send(chunk);requireReply(chunk,reply);host.requireOwner(entry.lease);
                 synchronized(RatisTopologySourceSnapshotService.this){requireOpen();}
                 if(reply.getResult()!=InstallSnapshotResult.ALREADY_INSTALLED && !chunk.getSnapshotChunk().getDone())return RWScheduler.CooperativeResult.YIELD;
@@ -122,6 +169,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 host.requireReceiverInstalled(entry.lease);host.requireOwner(entry.lease);return RWScheduler.CooperativeResult.COMPLETE;
             }catch(Exception problem){failure=problem;context.fail(problem instanceof RuntimeException runtime?runtime:new CompletionException(problem));return RWScheduler.CooperativeResult.COMPLETE;}
         }
+        private void resumeRate(){RWScheduler.CooperativeHandle current;synchronized(RatisTopologySourceSnapshotService.this){if(terminal)return;current=handle;}if(current==null)rateWakeup.schedule(this::resumeRate,10,TimeUnit.MILLISECONDS);else current.resume();}
         private void closeReader()throws IOException{if(chunks!=null){chunks.close();chunks=null;}}
         @Override public void completeCooperatively(){synchronized(RatisTopologySourceSnapshotService.this){if(stopping && failure==null)failure=new IOException("Source transfer owner stopping");if(failure==null)entry.installed=true;}settle();}
         @Override public void reject(RuntimeException rejected){synchronized(RatisTopologySourceSnapshotService.this){if(failure==null)failure=rejected;}settle();}
@@ -135,7 +183,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 else finish(entry,problem);
             }catch(IOException cleanup){if(problem==null)problem=cleanup;else problem.addSuppressed(cleanup);}
             synchronized(RatisTopologySourceSnapshotService.this){settled=true;}
-            try {if(problem==null)result.complete(entry.lease.prepared());else result.completeExceptionally(problem);}finally{resource.close();synchronized(RatisTopologySourceSnapshotService.this){transfers.remove(this);settling=false;}checkStopped();}
+            try {if(problem==null)result.complete(entry.lease.prepared());else result.completeExceptionally(problem);}finally{try{host.transferFinished(request);}finally{resource.close();synchronized(RatisTopologySourceSnapshotService.this){transfers.remove(this);settling=false;}checkStopped();}}
         }
     }
     public void release(Request request)throws IOException {
@@ -168,13 +216,14 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         finally{synchronized(this){active--;entry.busy=false;if(success){entries.remove(entry.request.transferId(),entry);imageBytes-=entry.imageCharge;metadataBytes-=entry.metadataCharge;if(remember)released.put(entry.request.transferId(),digest(entry.request));}notifyAll();}checkStopped();}
     }
     public CompletableFuture<Void> stop(){
-        List<Transfer> tasks;List<Entry> idle;
-        synchronized(this){stopping=true;tasks=List.copyOf(transfers);idle=entries.values().stream().filter(entry->!entry.busy).toList();for(var entry:idle){entry.busy=true;active++;}}
+        List<Transfer> tasks;List<Preparation> builds;List<Entry> idle;
+        synchronized(this){stopping=true;tasks=List.copyOf(transfers);builds=List.copyOf(preparations);idle=entries.values().stream().filter(entry->!entry.busy).toList();for(var entry:idle){entry.busy=true;active++;}}
+        for(var build:builds){var handle=build.handle;if(handle!=null)handle.cancel();}
         for(var task:tasks){var handle=task.handle;if(handle!=null)handle.cancel();if(task.terminal)task.settle();}
         for(var entry:idle)try{retire(entry,false);}catch(IOException unknown){/* Retryable close retains the exact lease and its image quota. */}
         checkStopped();return stopped.copy();
     }
-    private void checkStopped(){boolean complete;synchronized(this){complete=stopping && active==0 && entries.isEmpty() && transfers.isEmpty();}if(complete)stopped.complete(null);}
+    private void checkStopped(){boolean complete;synchronized(this){complete=stopping && active==0 && entries.isEmpty() && transfers.isEmpty() && preparations.isEmpty();}if(complete){rateWakeup.shutdown();stopped.complete(null);}}
     @Override public void close()throws IOException{var completion=stop();if(!completion.isDone())throw new IOException("Source snapshot stop waits for actual capture/transfer/cleanup drainage");try{completion.join();}catch(CompletionException failed){throw new IOException("Source stop did not settle",failed.getCause());}}
     static void requireReply(InstallSnapshotRequestProto request,InstallSnapshotReplyProto reply)throws IOException {
         var expected=request.getServerRequest();

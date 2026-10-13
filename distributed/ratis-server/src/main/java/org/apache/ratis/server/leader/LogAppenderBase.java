@@ -1,0 +1,310 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.ratis.server.leader;
+
+import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.proto.RaftProtos.AppendEntriesRequestProto;
+import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
+import org.apache.ratis.proto.RaftProtos.LogEntryProto;
+import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.raftlog.RaftLog.EntryWithData;
+import org.apache.ratis.server.raftlog.RaftLogIOException;
+import org.apache.ratis.statemachine.SnapshotInfo;
+import org.apache.ratis.util.AwaitForSignal;
+import org.apache.ratis.util.DataQueue;
+import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.LifeCycle;
+import org.apache.ratis.util.Preconditions;
+import org.apache.ratis.util.SizeInBytes;
+import org.apache.ratis.util.TimeDuration;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongUnaryOperator;
+
+/**
+ * An abstract implementation of {@link LogAppender}.
+ */
+public abstract class LogAppenderBase implements LogAppender {
+  private final String name;
+  private final RaftServer.Division server;
+  private final LeaderState leaderState;
+  private final FollowerInfo follower;
+
+  private final DataQueue<EntryWithData> buffer;
+  private volatile boolean migrationWaiting;
+  protected final boolean isMigrationWaiting(){return migrationWaiting;}
+  private final java.util.concurrent.ConcurrentHashMap<Long,MigrationLogStateMachine.Lease> migrationOwners=new java.util.concurrent.ConcurrentHashMap<>();
+  /** Transfer only to the transport that actually owns this exact request. */
+  protected final MigrationLogStateMachine.Lease takeMigrationOwner(long callId) { return migrationOwners.remove(callId); }
+  protected final void releaseUnsentMigrationOwners() { migrationOwners.forEach((id,lease)->{if(migrationOwners.remove(id,lease))lease.close();}); }
+  static boolean migrationListener(org.apache.ratis.server.RaftConfiguration configuration,org.apache.ratis.protocol.RaftPeerId peer) {
+    // getPeer searches current and previous configurations. Promotion must exempt either voter membership.
+    return configuration.getPeer(peer,org.apache.ratis.proto.RaftProtos.RaftPeerRole.FOLLOWER)==null
+        && configuration.getPeer(peer,org.apache.ratis.proto.RaftProtos.RaftPeerRole.LISTENER)!=null;
+  }
+
+  private final int snapshotChunkMaxSize;
+
+  private final LogAppenderDaemon daemon;
+  private final AwaitForSignal eventAwaitForSignal;
+
+  private final AtomicBoolean heartbeatTrigger = new AtomicBoolean();
+  private final TimeDuration waitTimeMin;
+
+  protected LogAppenderBase(RaftServer.Division server, LeaderState leaderState, FollowerInfo f) {
+    this.follower = f;
+    this.name = follower.getName() + "-" + JavaUtils.getClassSimpleName(getClass());
+    this.server = server;
+    this.leaderState = leaderState;
+
+    final RaftProperties properties = server.getRaftServer().getProperties();
+    this.snapshotChunkMaxSize = RaftServerConfigKeys.Log.Appender.snapshotChunkSizeMax(properties).getSizeInt();
+
+    final SizeInBytes bufferByteLimit = RaftServerConfigKeys.Log.Appender.bufferByteLimit(properties);
+    final int bufferElementLimit = RaftServerConfigKeys.Log.Appender.bufferElementLimit(properties);
+    this.buffer = new DataQueue<>(this, bufferByteLimit, bufferElementLimit, EntryWithData::getSerializedSize);
+    this.daemon = new LogAppenderDaemon(this);
+    this.eventAwaitForSignal = new AwaitForSignal(name);
+
+    this.waitTimeMin = RaftServerConfigKeys.Log.Appender.waitTimeMin(properties);
+  }
+
+  @Override
+  public void triggerHeartbeat() {
+    if (heartbeatTrigger.compareAndSet(false, true)) {
+      notifyLogAppender();
+    }
+  }
+
+  protected void resetHeartbeatTrigger() {
+    heartbeatTrigger.set(false);
+  }
+
+  @Override
+  public boolean shouldSendAppendEntries() {
+    return heartbeatTrigger.get() || LogAppender.super.shouldSendAppendEntries();
+  }
+
+  @Override
+  public long getHeartbeatWaitTimeMs() {
+    return heartbeatTrigger.get() ? 0 :
+        LogAppender.super.getHeartbeatWaitTimeMs();
+  }
+
+  @Override
+  public AwaitForSignal getEventAwaitForSignal() {
+    return eventAwaitForSignal;
+  }
+
+  @Override
+  public final RaftServer.Division getServer() {
+    return server;
+  }
+
+  @Override
+  public String toString() {
+    return name;
+  }
+
+  @Override
+  public void start() {
+    daemon.tryToStart();
+  }
+
+  @Override
+  public boolean isRunning() {
+    return daemon.isWorking()
+        && isLeaderAlive();
+  }
+
+  private boolean isLeaderAlive() {
+    return server.getInfo().isAlive()
+        && server.getInfo().isLeader()
+        && getRaftLog().isOpened();
+  }
+
+  @Override
+  public CompletableFuture<LifeCycle.State> stopAsync() {
+    return daemon.tryToClose();
+  }
+
+  void restart() {
+    if (daemon.isClosingOrClosed()) {
+      LOG.warn("{}: daemon is closing or closed, skipping restart", this);
+      return;
+    }
+    if (!isLeaderAlive()) {
+      LOG.warn("{}: leader is not ready, skipping restart", this);
+      return;
+    }
+    getLeaderState().restart(this);
+  }
+
+  protected TimeDuration getWaitTimeMin() {
+    return waitTimeMin;
+  }
+
+  protected TimeDuration getRemainingWaitTime() {
+    return waitTimeMin.add(getFollower().getLastRpcSendTime().elapsedTime().negate());
+  }
+
+  @Override
+  public final FollowerInfo getFollower() {
+    return follower;
+  }
+
+  @Override
+  public final LeaderState getLeaderState() {
+    return leaderState;
+  }
+
+  public boolean hasPendingDataRequests() {
+    return false;
+  }
+
+
+  protected long getNextIndexForInconsistency(long requestFirstIndex, long replyNextIndex) {
+    long next = replyNextIndex;
+    final long i = getFollower().getMatchIndex() + 1;
+    if (i > next && i != requestFirstIndex) {
+      // Ideally, we should set nextIndex to a value greater than matchIndex.
+      // However, we must not resend the same first entry due to some special cases (e.g. the log is empty).
+      // Otherwise, the follower will reply INCONSISTENCY again.
+      next = i;
+    }
+    if (next == requestFirstIndex && next > RaftLog.LEAST_VALID_LOG_INDEX) {
+      // Avoid resending the same first entry.
+      next--;
+    }
+    return next;
+  }
+
+  protected LongUnaryOperator getNextIndexForError(long newNextIndex) {
+    return oldNextIndex -> {
+      final long m = getFollower().getMatchIndex() + 1;
+      final long n = oldNextIndex <= 0L ? oldNextIndex : Math.min(oldNextIndex - 1, newNextIndex);
+      if (m > n) {
+        if (m > newNextIndex) {
+          LOG.info("Set nextIndex to matchIndex + 1 (= " + m + ")");
+        }
+        return m;
+      } else if (oldNextIndex <= 0L) {
+        return oldNextIndex; // no change.
+      } else {
+        LOG.info("Decrease nextIndex to " + n);
+        return n;
+      }
+    };
+  }
+
+
+  @Override
+  public AppendEntriesRequestProto newAppendEntriesRequest(long callId, boolean heartbeat)
+      throws RaftLogIOException {
+    migrationWaiting=false;
+    final long heartbeatWaitTimeMs = getHeartbeatWaitTimeMs();
+    final TermIndex previous = getPrevious(follower.getNextIndex());
+    if (heartbeatWaitTimeMs <= 0L || heartbeat) {
+      // heartbeat
+      return leaderState.newAppendEntriesRequestProto(follower, Collections.emptyList(),
+          hasPendingDataRequests()? null : previous, callId);
+    }
+
+    Preconditions.assertTrue(buffer.isEmpty(), () -> "buffer has " + buffer.getNumElements() + " elements.");
+
+    final long snapshotIndex = follower.getSnapshotIndex();
+    final long leaderNext = getRaftLog().getNextIndex();
+    final long followerNext = follower.getNextIndex();
+
+    if (previous == null && followerNext > RaftLog.LEAST_VALID_LOG_INDEX && followerNext != snapshotIndex + 1) {
+      LOG.info("{}: Skipping appendEntries since the previous log entry is unavailable:" +
+              " follower {} nextIndex={} and snapshotIndex={} but leader startIndex={}",
+          this, follower.getName(), followerNext, snapshotIndex, getRaftLog().getStartIndex());
+      return null;
+    }
+
+    MigrationLogStateMachine.Lease migration=null;
+    if(leaderNext>followerNext && migrationListener(server.getRaftConf(),getFollowerId())
+        && server.getStateMachine() instanceof MigrationLogStateMachine controlled) {
+      try { migration=controlled.reserveListenerTail(MigrationLogStateMachine.MAX_TAIL_BYTES); }
+      catch(java.io.IOException exhausted) { migration=null; }
+      if(migration==null){migrationWaiting=true;return null;}
+    }
+    try {
+    final long halfMs = heartbeatWaitTimeMs/2;
+    for (long next = followerNext; leaderNext > next && getHeartbeatWaitTimeMs() - halfMs > 0; ) {
+      if (!buffer.offer(getRaftLog().getEntryWithData(next++))) {
+        break;
+      }
+      if(migration!=null)break; // One bounded legal head; never materialize a second head before admission.
+    }
+    if (buffer.isEmpty()) {
+      return null;
+    }
+
+    final List<LogEntryProto> protos = buffer.pollList(getHeartbeatWaitTimeMs(), EntryWithData::getEntry,
+        (entry, time, exception) -> LOG.warn("Failed to get " + entry
+            + " in " + time.toString(TimeUnit.MILLISECONDS, 3), exception));
+    buffer.clear();
+    assertProtos(protos, followerNext, previous, snapshotIndex);
+    var request=leaderState.newAppendEntriesRequestProto(follower, protos, previous, callId);
+    if(migration!=null && !protos.isEmpty()){try{migration.materialized(request.getSerializedSize());}catch(java.io.IOException invalid){throw new RaftLogIOException(invalid);}migrationOwners.put(callId,migration);migration=null;}
+    return request;
+    } finally {if(migration!=null)migration.close();buffer.clear();}
+  }
+
+  private void assertProtos(List<LogEntryProto> protos, long nextIndex, TermIndex previous, long snapshotIndex) {
+    if (protos.isEmpty()) {
+      return;
+    }
+    final long firstIndex = protos.get(0).getIndex();
+    Preconditions.assertTrue(firstIndex == nextIndex,
+        () -> follower.getName() + ": firstIndex = " + firstIndex + " != nextIndex = " + nextIndex);
+    if (firstIndex > RaftLog.LEAST_VALID_LOG_INDEX) {
+      // Check if nextIndex is 1 greater than the snapshotIndex. If yes, then
+      // we do not have to check for the existence of previous.
+      if (nextIndex != snapshotIndex + 1) {
+        Objects.requireNonNull(previous,
+            () -> follower.getName() + ": Previous TermIndex not found for firstIndex = " + firstIndex);
+        Preconditions.assertTrue(previous.getIndex() == firstIndex - 1,
+            () -> follower.getName() + ": Previous = " + previous + " but firstIndex = " + firstIndex);
+      }
+    }
+  }
+
+  @Override
+  public InstallSnapshotRequestProto newInstallSnapshotNotificationRequest(TermIndex firstAvailableLogTermIndex) {
+    Preconditions.assertTrue(firstAvailableLogTermIndex.getIndex() >= 0);
+    synchronized (server) {
+      return LeaderProtoUtils.toInstallSnapshotRequestProto(server, getFollowerId(), firstAvailableLogTermIndex);
+    }
+  }
+
+  @Override
+  public Iterable<InstallSnapshotRequestProto> newInstallSnapshotRequests(String requestId, SnapshotInfo snapshot) {
+    return new InstallSnapshotRequests(server, getFollowerId(), requestId, snapshot, snapshotChunkMaxSize);
+  }
+}

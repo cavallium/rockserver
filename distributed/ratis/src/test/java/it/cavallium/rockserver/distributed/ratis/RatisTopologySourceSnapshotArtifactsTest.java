@@ -15,6 +15,16 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.*;
 
 class RatisTopologySourceSnapshotArtifactsTest {
+    @Test void heldColdImageValidationDoesNotOwnTheGlobalArtifactMonitor()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var first=fixture.capture(fixture.request(50),NativeRangeImage.IoAdmission.UNLIMITED);var second=fixture.capture(fixture.request(51),NativeRangeImage.IoAdmission.UNLIMITED);var helper=open(artifacts());var executor=java.util.concurrent.Executors.newSingleThreadExecutor()){
+            helper.retain(first.prepared(),managed(first,root.resolve("first-managed")));helper.retain(second.prepared(),managed(second,root.resolve("second-managed")));
+            var entered=new java.util.concurrent.CountDownLatch(1);var unblock=new java.util.concurrent.CountDownLatch(1);
+            var actual=executor.submit(()->helper.lookupAdmitted(second.prepared().request(),bytes->{assertFalse(Thread.holdsLock(helper));entered.countDown();try{assertTrue(unblock.await(5,TimeUnit.SECONDS));}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}}));
+            try{assertTrue(entered.await(5,TimeUnit.SECONDS));assertThrows(IOException.class,helper::close);helper.released(first.prepared().request());assertTrue(helper.isReleased(first.prepared().request()));}
+            finally{unblock.countDown();}
+            assertArrayEquals(second.prepared().image().sha256(),actual.get(5,TimeUnit.SECONDS).prepared().image().sha256());
+        }
+    }
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     final NativeRangeImage.Limits limits=new NativeRangeImage.Limits(4*1024*1024,8*1024*1024,16);
     Path artifacts()throws IOException{return Files.createDirectories(root.resolve("artifacts"));}
@@ -25,7 +35,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
     }
     @Test void retainCloseColdLookupPreservesExactNativeCutAndRestoresStandardMd5()throws Exception {
         Path owned=artifacts(),original=root.resolve("source-managed"),restored=Files.createDirectories(root.resolve("restored"));
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50))){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50),NativeRangeImage.IoAdmission.UNLIMITED)){
             var info=managed(lease,original);Path durable;
             try(var helper=open(owned)){var saved=helper.retain(lease.prepared(),info);durable=saved.image();assertTrue(Files.isRegularFile(durable));assertSame(lease.prepared(),saved.prepared());}
             Files.delete(info.getFiles().getFirst().getPath());
@@ -38,7 +48,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
     }
     @Test void forcedReleaseSurvivesPartialCleanupAndNeverDeletesManagedSnapshot()throws Exception {
         Path owned=artifacts(),sourceDir=root.resolve("managed");
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50))){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50),NativeRangeImage.IoAdmission.UNLIMITED)){
             var info=managed(lease,sourceDir);UUID id=lease.prepared().request().transferId();var deletes=new AtomicInteger();
             SessionJournalFiles.Removal fail=path->{assertTrue(Files.exists(owned.resolve(id+".released")));if(deletes.incrementAndGet()==2)throw new IOException("controlled partial cleanup");Files.delete(path);};
             try(var helper=new RatisTopologySourceSnapshotArtifacts(owned,limits,64*1024*1024,128*1024*1024,4,fail)){helper.retain(lease.prepared(),info);assertThrows(IOException.class,()->helper.released(lease.prepared().request()));assertTrue(Files.exists(owned.resolve(id+".prepared")));}
@@ -47,7 +57,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
     }
     @Test void originalMetadataSymlinksAndForeignDataCannotBeOverwritten()throws Exception {
         Path owned=artifacts(),managedDir=root.resolve("managed");
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50));var helper=open(owned)){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50),NativeRangeImage.IoAdmission.UNLIMITED);var helper=open(owned)){
             var info=managed(lease,managedDir);var saved=helper.retain(lease.prepared(),info);var request=lease.prepared().request();
             var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver(),request.purpose());assertThrows(IOException.class,()->helper.lookup(changed));
             var old=lease.prepared();var foreignMetadata=new RatisTopologySourceSnapshotRpc.Prepared(request,old.image(),old.schema(),old.sourceOwner(),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(old.sourceCfg().term(),old.sourceCfg().index(),new byte[]{1}),old.schemaRows());
@@ -58,7 +68,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
     }
     @Test void imageAndMetadataQuotaFailBeforeAnyDurableMutation()throws Exception {
         Path owned=artifacts(),managedDir=root.resolve("managed");
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50))){var info=managed(lease,managedDir);
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50),NativeRangeImage.IoAdmission.UNLIMITED)){var info=managed(lease,managedDir);
             try(var helper=new RatisTopologySourceSnapshotArtifacts(owned,limits,2*lease.prepared().image().bytes()-1,128*1024*1024,4)){assertThrows(IOException.class,()->helper.retain(lease.prepared(),info));}
             try(var helper=new RatisTopologySourceSnapshotArtifacts(owned,limits,64*1024*1024,1,4)){assertThrows(IOException.class,()->helper.retain(lease.prepared(),info));}
             try(var files=Files.list(owned)){assertEquals(List.of("artifacts.lock"),files.map(path->path.getFileName().toString()).sorted().toList());}
@@ -66,7 +76,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
     }
     @Test void forcedMetadataRepairsExactOwnedPendingCopyAndRejectsUncertainPrefix()throws Exception {
         Path owned=artifacts(),managedDir=root.resolve("managed");
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50))){var info=managed(lease,managedDir);var request=lease.prepared().request();Path durable;
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50),NativeRangeImage.IoAdmission.UNLIMITED)){var info=managed(lease,managedDir);var request=lease.prepared().request();Path durable;
             try(var helper=open(owned)){durable=helper.retain(lease.prepared(),info).image();}
             byte[] bytes=Files.readAllBytes(durable);Files.delete(durable);Path pending=durable.resolveSibling(durable.getFileName()+".pending");Files.write(pending,Arrays.copyOf(bytes,64));
             try(var helper=open(owned)){var repaired=helper.lookup(request);assertArrayEquals(lease.prepared().image().sha256(),NativeRangeImage.inspect(repaired.image(),limits).sha256());}
@@ -75,7 +85,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
     }
     @Test void completeForcedMetadataSidecarRecoversWithoutAChangedCapture()throws Exception {
         Path owned=artifacts(),managedDir=root.resolve("managed");
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50))){var info=managed(lease,managedDir);var request=lease.prepared().request();
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50),NativeRangeImage.IoAdmission.UNLIMITED)){var info=managed(lease,managedDir);var request=lease.prepared().request();
             try(var helper=open(owned)){helper.retain(lease.prepared(),info);}
             Path metadata=owned.resolve(request.transferId()+".prepared");Path pending=metadata.resolveSibling(metadata.getFileName()+".pending");Files.move(metadata,pending);
             try(var helper=open(owned)){var saved=helper.lookup(request);assertArrayEquals(lease.prepared().image().sha256(),saved.prepared().image().sha256());assertTrue(Files.exists(metadata));assertFalse(Files.exists(pending));}
@@ -89,8 +99,8 @@ class RatisTopologySourceSnapshotArtifactsTest {
                 var host=new RatisTopologySourceSnapshotService.Host(){
                     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
                     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
-                    public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request input)throws Exception{
-                        var held=fixture.capture(input);boolean adopted=false;
+                    public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request input,NativeRangeImage.IoAdmission admission)throws Exception{
+                        var held=fixture.capture(input,admission);boolean adopted=false;
                         try{var saved=helper.retain(held.prepared(),managed(held,fixture.image.getParent()));var result=new RatisTopologySourceSnapshotService.Lease(saved.prepared(),held.source(),saved.snapshot(),held.retained());adopted=true;return result;}finally{if(!adopted)held.close();}
                     }
                     public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
@@ -112,8 +122,8 @@ class RatisTopologySourceSnapshotArtifactsTest {
                 var host=new RatisTopologySourceSnapshotService.Host(){
                     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
                     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
-                    public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request input)throws Exception{
-                        var held=fixture.capture(input);boolean adopted=false;
+                    public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request input,NativeRangeImage.IoAdmission admission)throws Exception{
+                        var held=fixture.capture(input,admission);boolean adopted=false;
                         try{var saved=helper.retain(held.prepared(),managed(held,fixture.image.getParent()));var result=new RatisTopologySourceSnapshotService.Lease(saved.prepared(),held.source(),saved.snapshot(),held.retained());adopted=true;return result;}finally{if(!adopted)held.close();}
                     }
                     public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
@@ -128,7 +138,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                 var replayOnly=new RatisTopologySourceSnapshotService.Host(){
                     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
                     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
-                    public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request){throw new AssertionError("Cold release cannot recapture");}
+                    public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request,NativeRangeImage.IoAdmission admission){throw new AssertionError("Cold release cannot recapture");}
                     public void requireOwner(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot acquire owner permission");}
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot create a new installation proof");}
                     public void released(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot create a receipt");}

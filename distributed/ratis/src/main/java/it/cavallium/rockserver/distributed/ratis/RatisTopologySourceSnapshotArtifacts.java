@@ -13,7 +13,6 @@ import org.apache.ratis.io.MD5Hash;
 import org.apache.ratis.server.storage.FileInfo;
 import org.apache.ratis.statemachine.SnapshotInfo;
 import org.apache.ratis.statemachine.impl.*;
-import org.apache.ratis.util.MD5FileUtil;
 import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnapshotRpc.*;
 
 /** Forced transfer-ID artifacts. Closing a live/process owner preserves files; only durable RELEASE reclaims them. */
@@ -30,7 +29,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     synchronized void captureForceObserver(CaptureForceObserver observer){captureForceObserver=Objects.requireNonNull(observer);}
     synchronized void removalObserver(SessionJournalFiles.Removal observer){removal=Objects.requireNonNull(observer);}
     public static final class AdmissionRejected extends IOException{AdmissionRejected(String message){super(message);}}
-    private boolean closed;
+    private volatile boolean closed;
     public enum PublicationPhase { CAPTURING,READY,ABANDONED }
     private record Publication(PublicationPhase phase,Request request,ApplyPosition cut,ReplicaDescriptor owner,byte[] configurationDigest,byte[] captureDigest,byte[] preparedDigest,UUID successor,long maximumImageBytes) {}
     @FunctionalInterface interface PublicationForceObserver{void forced(PublicationPhase phase)throws IOException;}
@@ -73,14 +72,14 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         var file=path(id,"reserved");if(exists(file)){var prior=reservation(id);if(!Arrays.equals(request(PREPARE,request),request(PREPARE,prior.request())))throw new AdmissionRejected("Original source reservation request changed");SessionJournalFiles.force(file);SessionJournalFiles.force(root);inventory(null,null);return;}
         var usage=inventoryUsage();long imageCharge=Math.multiplyExact(2,imageLimits.maxImageBytes()),metadataCharge=6L*MAX_METADATA_FILE+6L*MAX_PUBLICATION_FILE+256+3L*(reservationBytes(request).length+32);
         if(usage.count()>=maximumArtifacts || publicationCount()>=MAX_RELEASED || imageCharge>maximumImageBytes-usage.imageBytes() || metadataCharge>maximumMetadataBytes-usage.metadataBytes())throw new AdmissionRejected("Durable source image/metadata reservation exhausted");
-        SessionJournalFiles.write(file,reservationBytes(request),MAX_RESERVATION_FILE);inventory(null,null);
+        writeMetadata(file,reservationBytes(request),MAX_RESERVATION_FILE);inventory(null,null);
     }
     public synchronized long reservedImageBytes()throws IOException{requireOpen();return inventoryUsage().imageBytes();}
     private record Capture(Request request,byte[] lower,byte[] upper,ApplyPosition cut,DistributedSchema schema,ReplicaDescriptor owner,ReplicatedRangeStore.Configuration configuration,Map<String,byte[]> rows,byte[] origin) {}
     public synchronized void capture(Request request,TopologyChange.Definition definition,ReplicatedRangeStore.SnapshotPin pin,DistributedSchema schema,ReplicaDescriptor owner)throws Exception {
         var reserved=reservation(request.transferId());requireRequestIo(request,reserved.request());request.header().requireDefinition(definition);var parent=definition.parents().getFirst();if(!pin.groupId().equals(parent.groupId()) || pin.rangeEpoch()!=parent.rangeEpoch() || !Arrays.equals(pin.interval().lowerInclusive(),parent.lowerInclusive()) || !Arrays.equals(pin.interval().upperExclusive(),parent.upperExclusive()) || !pin.interval().domainId().equals(definition.sourceDirectory().domainId()) || !pin.interval().columns().equals(definition.sourceDirectory().columns()) || !Arrays.equals(pin.schemaDigest(),schema.digest()))throw new IOException("Source capture pin changed original range/schema");var rows=new TreeMap<String,byte[]>();pin.visitState((key,value)->{if(NativeTopologyLearnerSchema.row(key))rows.put(HexFormat.of().formatHex(key),value.clone());});
         var origin=pin.topologyImageOrigin();var capture=new Capture(request,pin.interval().lowerInclusive(),pin.interval().upperExclusive(),pin.position(),schema,owner,pin.configuration(),NativeTopologyLearnerSchema.copy(rows),origin==null?new byte[32]:digest(origin.encode()));byte[] encoded=encodeCapture(capture);var prior=publication(request);if(prior!=null&&prior.phase()==PublicationPhase.CAPTURING&&!prior.cut().equals(pin.position()))throw new OriginalCutUnavailable();beginPublication(request,capture.cut(),capture.owner(),capture.configuration(),digest(encoded));var file=path(request.transferId(),"capture");
-        if(exists(file)){if(!Arrays.equals(read(file,MAX_METADATA_FILE),encoded)){var original=publication(request);if(original!=null&&original.phase()==PublicationPhase.CAPTURING&&!pin.position().equals(original.cut()))throw new OriginalCutUnavailable();throw new IOException("Original source capture cut/configuration/schema changed");}SessionJournalFiles.force(file);SessionJournalFiles.force(root);}else{SessionJournalFiles.write(file,encoded,MAX_METADATA_FILE);}
+        if(exists(file)){if(!Arrays.equals(read(file,MAX_METADATA_FILE),encoded)){var original=publication(request);if(original!=null&&original.phase()==PublicationPhase.CAPTURING&&!pin.position().equals(original.cut()))throw new OriginalCutUnavailable();throw new IOException("Original source capture cut/configuration/schema changed");}SessionJournalFiles.force(file);SessionJournalFiles.force(root);}else{writeMetadata(file,encoded,MAX_METADATA_FILE);}
         captureForceObserver.forced(file);
     }
     private static byte[] encodeCapture(Capture capture)throws IOException {
@@ -98,7 +97,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     public synchronized PublicationPhase publicationPhase(Request request)throws IOException{var publication=publication(request);return publication==null?null:publication.phase();}
     public synchronized Abandoned abandoned(Request request)throws IOException{var publication=publication(request);if(publication==null||publication.phase()!=PublicationPhase.ABANDONED)return null;cleanupAbandoned(publication);return abandoned(publication);}
     private static Abandoned abandoned(Publication publication){return new Abandoned(publication.request(),publication.successor(),publication.cut(),publication.owner(),publication.configurationDigest());}
-    public synchronized Abandoned abandon(Request request,ReplicatedRangeStore.Configuration current,ApplyPosition completed)throws IOException{
+    public synchronized Abandoned abandon(Request request,ReplicatedRangeStore.Configuration current,ApplyPosition completed)throws IOException{requireIdle(request.transferId());
         var original=publication(request);if(original==null||original.phase()==PublicationPhase.READY)throw new IOException("Only positively unpublished CAPTURING source may be abandoned");if(original.phase()==PublicationPhase.ABANDONED){cleanupAbandoned(original);return abandoned(original);}
         var capture=exists(path(request.transferId(),"capture"))?capture(request.transferId()):null;if((capture==null?!Arrays.equals(configurationDigest(current),original.configurationDigest()):!Arrays.equals(current.data(),capture.configuration().data())) || !RatisRelocationOwnerRpc.covers(completed,original.cut()))throw new IOException("Source abandonment lost original qualified configuration/prefix");
         UUID successor;do{successor=UUID.randomUUID();}while(successor.equals(request.transferId())||successor.equals(new UUID(0,0)));var terminal=new Publication(PublicationPhase.ABANDONED,request,original.cut(),original.owner(),original.configurationDigest(),original.captureDigest(),new byte[32],successor,original.maximumImageBytes());writePublication(terminal);cleanupAbandoned(terminal);return abandoned(terminal);
@@ -107,7 +106,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         var original=publication(request);if(original!=null){if(original.phase()==PublicationPhase.ABANDONED)throw new AbandonedException(abandoned(original));if(!original.cut().equals(cut)||!Arrays.equals(original.captureDigest(),captureDigest))throw new IOException("Source publication changed original capture");return;}
         writePublication(new Publication(PublicationPhase.CAPTURING,request,cut,owner,configurationDigest(cfg),captureDigest,new byte[32],new UUID(0,0),reservation(request.transferId()).maximumImageBytes()));
     }
-    private void ready(Prepared prepared)throws IOException{
+    private synchronized void ready(Prepared prepared)throws IOException{
         var original=publication(prepared.request());if(original==null){beginPublication(prepared.request(),prepared.image().position(),prepared.sourceOwner(),prepared.sourceCfg(),digest(reply(PREPARE,prepared)));original=publication(prepared.request());}
         if(original.phase()==PublicationPhase.ABANDONED)throw new AbandonedException(abandoned(original));byte[] readyDigest=digest(reply(PREPARE,prepared));if(original.phase()==PublicationPhase.READY){if(!Arrays.equals(original.preparedDigest(),readyDigest))throw new IOException("READY source identity changed");return;}
         writePublication(new Publication(PublicationPhase.READY,original.request(),original.cut(),original.owner(),original.configurationDigest(),original.captureDigest(),readyDigest,new UUID(0,0),original.maximumImageBytes()));
@@ -116,23 +115,40 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private Publication publication(Request request)throws IOException{var file=path(request.transferId(),"publication");if(!exists(file))return null;var value=decodePublication(read(file,MAX_PUBLICATION_FILE));requireRequestIo(request,value.request());SessionJournalFiles.force(file);SessionJournalFiles.force(root);return value;}
     private static byte[] encodePublication(Publication value)throws IOException{var buffer=new ByteArrayOutputStream();var out=new DataOutputStream(buffer);out.writeInt(0x53505542);out.writeByte(value.phase().ordinal());blob(out,request(PREPARE,value.request()));out.writeLong(value.cut().term());out.writeLong(value.cut().index());var owner=value.owner();uuid(out,owner.nodeId());uuid(out,owner.nodeIncarnation());uuid(out,owner.replicaId());out.writeUTF(owner.peerId());out.writeUTF(owner.address());out.writeByte(owner.role().ordinal());out.write(value.configurationDigest());out.write(value.captureDigest());out.write(value.preparedDigest());uuid(out,value.successor());out.writeLong(value.maximumImageBytes());out.flush();if(buffer.size()+32>MAX_PUBLICATION_FILE)throw new IOException("Source publication exceeds bound");return buffer.toByteArray();}
     private Publication decodePublication(byte[] bytes)throws IOException{try{var in=new DataInputStream(new ByteArrayInputStream(bytes));if(in.readInt()!=0x53505542)throw new IOException("Invalid source publication");int phase=in.readUnsignedByte();if(phase>=PublicationPhase.values().length)throw new IOException("Invalid source publication phase");var request=request(blob(in,MAX_REQUEST_BYTES));var cut=new ApplyPosition(in.readLong(),in.readLong());UUID node=uuid(in),incarnation=uuid(in),replica=uuid(in);String peer=in.readUTF(),address=in.readUTF();int role=in.readUnsignedByte();if(role>=ReplicaDescriptor.Role.values().length)throw new IOException("Invalid source publication owner");var owner=new ReplicaDescriptor(node,incarnation,replica,peer,address,ReplicaDescriptor.Role.values()[role]);byte[] cfg=in.readNBytes(32),capture=in.readNBytes(32),prepared=in.readNBytes(32);UUID successor=uuid(in);long maximum=in.readLong();var value=new Publication(PublicationPhase.values()[phase],request,cut,owner,cfg,capture,prepared,successor,maximum);if(cut.term()<1||maximum<1||maximum>imageLimits.maxImageBytes()||!request.header().parents().getFirst().owner(owner.replicaId()).equals(TopologyChange.Owner.of(owner))||in.available()!=0||!Arrays.equals(bytes,encodePublication(value)))throw new IOException("Invalid source publication binding");if(value.phase()==PublicationPhase.ABANDONED)new Abandoned(request,successor,cut,owner,cfg);else if(!successor.equals(new UUID(0,0)))throw new IOException("Nonterminal source publication carries successor");return value;}catch(IllegalArgumentException malformed){throw new IOException("Invalid source publication",malformed);}}
-    private void writePublication(Publication value)throws IOException{SessionJournalFiles.write(path(value.request().transferId(),"publication"),encodePublication(value),MAX_PUBLICATION_FILE);publicationForceObserver.forced(value.phase());}
+    private void writePublication(Publication value)throws IOException{writeMetadata(path(value.request().transferId(),"publication"),encodePublication(value),MAX_PUBLICATION_FILE);publicationForceObserver.forced(value.phase());}
     private void cleanupAbandoned(Publication publication)throws IOException{
         UUID id=publication.request().transferId();var settled=path(id,"abandoned-settled");byte[] expected=digest(encodePublication(publication));if(exists(settled)){if(!Arrays.equals(read(settled,64),expected))throw new IOException("Abandoned settlement changed");SessionJournalFiles.force(settled);SessionJournalFiles.force(root);return;}
         var sourceDir=root.resolve(id+".source");if(Files.exists(sourceDir,LinkOption.NOFOLLOW_LINKS)){directory(sourceDir);try(var files=Files.newDirectoryStream(sourceDir)){int count=0;for(var file:files){if(++count>4)throw new IOException("Abandoned source directory exceeds bound");regular(file,imageLimits.maxImageBytes());removal.delete(file);}}removal.delete(sourceDir);}
-        for(var suffix:List.of("image.pending","image","prepared.pending","prepared","capture.pending","capture","reserved.pending","reserved")){var file=path(id,suffix);if(exists(file))removal.delete(file);}removal.force(root);SessionJournalFiles.write(settled,expected,64);
+        for(var suffix:List.of("image.pending","image","prepared.pending","prepared","capture.pending","capture","reserved.pending","reserved")){var file=path(id,suffix);if(exists(file))removal.delete(file);}removal.force(root);writeMetadata(settled,expected,64);
     }
     private static void nullable(DataOutputStream out,byte[] bound)throws IOException{if(bound==null)out.writeInt(-1);else{if(bound.length>MAX_BOUND_BYTES)throw new IOException("Source capture bound exceeds limit");blob(out,bound);}}
     private static byte[] nullable(DataInputStream in)throws IOException{int length=in.readInt();if(length==-1)return null;if(length<0 || length>MAX_BOUND_BYTES || length>in.available())throw new IOException("Invalid source capture bound");return in.readNBytes(length);}
     private static void blob(DataOutputStream out,byte[] bytes)throws IOException{out.writeInt(bytes.length);out.write(bytes);}private static byte[] blob(DataInputStream in,int maximum)throws IOException{int size=in.readInt();if(size<0 || size>maximum || size>in.available())throw new IOException("Invalid source capture field");return in.readNBytes(size);}private static void uuid(DataOutputStream out,UUID id)throws IOException{out.writeLong(id.getMostSignificantBits());out.writeLong(id.getLeastSignificantBits());}private static UUID uuid(DataInputStream in)throws IOException{return new UUID(in.readLong(),in.readLong());}
-    public synchronized Saved lookup(Request request)throws IOException {
+    private synchronized void writeMetadata(Path file,byte[] body,int maximum)throws IOException{SessionJournalFiles.write(file,body,maximum);}
+    private final Set<UUID> bulkOwners=new HashSet<>();
+    private final ThreadLocal<NativeRangeImage.IoAdmission> imageAdmission=ThreadLocal.withInitial(()->NativeRangeImage.IoAdmission.UNLIMITED);
+    private AutoCloseable ownBulk(UUID id,NativeRangeImage.IoAdmission admission)throws IOException{
+        Objects.requireNonNull(admission);synchronized(this){requireOpen();if(bulkOwners.size()>=maximumArtifacts || !bulkOwners.add(id))throw new IOException("Source artifact bulk owner is active");}
+        imageAdmission.set(Objects.requireNonNull(admission));
+        return ()->{imageAdmission.remove();synchronized(this){bulkOwners.remove(id);}};
+    }
+    private void requireIdle(UUID id)throws IOException{if(bulkOwners.contains(id))throw new IOException("Actual source artifact validation/publication is active");}
+    /** Full image validation is owned per transfer; no rate callback executes under the artifact monitor. */
+    public Saved lookupAdmitted(Request request,NativeRangeImage.IoAdmission admission)throws IOException{
+        try(var owner=ownBulk(request.transferId(),admission)){return lookupOwned(request);}catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException("Source lookup owner failed",failure);}
+    }
+    public Saved retainAdmitted(Prepared prepared,SnapshotInfo snapshot,NativeRangeImage.IoAdmission admission)throws IOException{
+        try(var owner=ownBulk(prepared.request().transferId(),admission)){return retainOwned(prepared,snapshot);}catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException("Source publication owner failed",failure);}
+    }
+    public synchronized Saved lookup(Request request)throws IOException {requireIdle(request.transferId());return lookupOwned(request);}
+    private Saved lookupOwned(Request request)throws IOException {
         requireOpen();UUID id=request.transferId();var published=publication(request);if(published!=null&&published.phase()==PublicationPhase.ABANDONED){cleanupAbandoned(published);throw new AbandonedException(abandoned(published));}
         if(exists(path(id,"released"))){var receipt=receipt(id);requireReceipt(request,receipt);cleanup(receipt);throw new IOException("Source transfer was durably released");}
         if(!exists(path(id,"capture")) && exists(path(id,"capture.pending"))){var pending=path(id,"capture.pending");var original=decodeCapture(id,read(pending,MAX_METADATA_FILE));requireRequestIo(request,original.request());SessionJournalFiles.force(pending);Files.move(pending,path(id,"capture"),StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(path(id,"capture"));SessionJournalFiles.force(root);}
         if(!exists(path(id,"prepared")) && exists(path(id,"prepared.pending"))){
-            var pending=path(id,"prepared.pending");var prepared=decodeMetadata(id,read(pending,MAX_METADATA_FILE));requireRequestIo(request,prepared.request());inventory(null,null);Files.move(pending,path(id,"prepared"),StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(path(id,"prepared"));SessionJournalFiles.force(root);
+            var pending=path(id,"prepared.pending");var prepared=decodeMetadata(id,read(pending,MAX_METADATA_FILE));requireRequestIo(request,prepared.request());inventory(null,null);synchronized(this){Files.move(pending,path(id,"prepared"),StandardCopyOption.ATOMIC_MOVE);}SessionJournalFiles.force(path(id,"prepared"));SessionJournalFiles.force(root);
         }
-        if(!exists(path(id,"prepared")) && exists(path(id,"capture"))){var original=capture(id);requireRequestIo(request,original.request());var file=sourcePath(id,original.cut());if(exists(file)){var image=NativeRangeImage.inspect(file,imageLimits);byte[] origin=image.topologyOrigin()==null?new byte[32]:digest(image.topologyOrigin().encode());if(!image.position().equals(original.cut()) || !Arrays.equals(image.interval().lowerInclusive(),original.lower()) || !Arrays.equals(image.interval().upperExclusive(),original.upper()) || !Arrays.equals(origin,original.origin()))throw new IOException("Original capture image/provenance changed");var prepared=new Prepared(request,image,original.schema(),original.owner(),original.configuration(),original.rows());retain(prepared,snapshot(file,prepared));}}
+        if(!exists(path(id,"prepared")) && exists(path(id,"capture"))){var original=capture(id);requireRequestIo(request,original.request());var file=sourcePath(id,original.cut());if(exists(file)){var image=NativeRangeImage.inspectAdmitted(file,imageLimits,imageAdmission.get());byte[] origin=image.topologyOrigin()==null?new byte[32]:digest(image.topologyOrigin().encode());if(!image.position().equals(original.cut()) || !Arrays.equals(image.interval().lowerInclusive(),original.lower()) || !Arrays.equals(image.interval().upperExclusive(),original.upper()) || !Arrays.equals(origin,original.origin()))throw new IOException("Original capture image/provenance changed");var prepared=new Prepared(request,image,original.schema(),original.owner(),original.configuration(),original.rows());retainOwned(prepared,snapshot(file,prepared));}}
         if(!exists(path(id,"prepared"))){if(published!=null&&published.phase()==PublicationPhase.READY)throw new IOException("READY source lost original metadata; abandonment forbidden");if(exists(path(id,"image")) || exists(path(id,"image.pending")) || exists(path(id,"prepared.pending")))throw new IOException("Unbound or uncertain source artifact cannot be recaptured");return null;}
         var prepared=metadata(id);requireRequestIo(request,prepared.request());inventory(null,null);cleanMetadataPending(path(id,"prepared"),reply(PREPARE,prepared));
         Path image=path(id,"image");if(!exists(image)){
@@ -141,23 +157,24 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         }
         validateImage(prepared,image);ready(prepared);var saved=new Saved(prepared,image,snapshot(image,prepared));return new Saved(prepared,image,restoreOriginal(saved));
     }
-    public synchronized Saved retain(Prepared prepared,SnapshotInfo snapshot)throws IOException {
+    public synchronized Saved retain(Prepared prepared,SnapshotInfo snapshot)throws IOException {requireIdle(prepared.request().transferId());return retainOwned(prepared,snapshot);}
+    private Saved retainOwned(Prepared prepared,SnapshotInfo snapshot)throws IOException {
         requireOpen();Objects.requireNonNull(prepared);Objects.requireNonNull(snapshot);reserve(prepared.request());UUID id=prepared.request().transferId();
         if(exists(path(id,"released"))){requireReceipt(prepared.request(),receipt(id));throw new IOException("Released source transfer cannot be retained again");}
         if(snapshot.getFiles().size()!=1 || snapshot.getTerm()!=prepared.image().position().term() || snapshot.getIndex()!=prepared.image().position().index())throw new IOException("Source snapshot identity changed");
         Path source=snapshot.getFiles().getFirst().getPath().toAbsolutePath().normalize();
-        regular(source,prepared.image().bytes());validateImage(prepared,source);MD5Hash md5=MD5FileUtil.computeMd5ForFile(source.toFile());var declared=snapshot.getFiles().getFirst().getFileDigest();if(declared!=null && !declared.equals(md5))throw new IOException("Source snapshot MD5 changed");
+        regular(source,prepared.image().bytes());validateImage(prepared,source);MD5Hash md5=MD5Hash.newInstance(NativeRangeImage.md5Admitted(source,imageAdmission.get()));var declared=snapshot.getFiles().getFirst().getFileDigest();if(declared!=null && !declared.equals(md5))throw new IOException("Source snapshot MD5 changed");
         byte[] encoded=reply(PREPARE,prepared);inventory(prepared,encoded);
         Path metadata=path(id,"prepared");if(exists(metadata)){byte[] prior=read(metadata,MAX_METADATA_FILE);if(!Arrays.equals(prior,encoded))throw new IOException("Original forced source metadata changed");}
         else {
             if(exists(path(id,"image")) || exists(path(id,"image.pending")))throw new IOException("Foreign image already uses transfer identity");
-            cleanMetadataPending(metadata,encoded);SessionJournalFiles.write(metadata,encoded,MAX_METADATA_FILE);
+            cleanMetadataPending(metadata,encoded);synchronized(this){writeMetadata(metadata,encoded,MAX_METADATA_FILE);}
         }
         cleanMetadataPending(metadata,encoded);var original=sourcePath(id,prepared.image().position());ensureOriginalDirectory(id);publishImage(source,original,prepared);publishImage(original,path(id,"image"),prepared);validateImage(prepared,path(id,"image"));
         ready(prepared);return new Saved(prepared,path(id,"image"),new SingleFileSnapshotInfo(new FileInfo(original,md5),snapshot.getTerm(),snapshot.getIndex()));
     }
     private Path sourcePath(UUID id,ApplyPosition cut){return root.resolve(id+".source").resolve(SimpleStateMachineStorage.getSnapshotFileName(cut.term(),cut.index()));}
-    private void ensureOriginalDirectory(UUID id)throws IOException {
+    private synchronized void ensureOriginalDirectory(UUID id)throws IOException {
         var owned=root.resolve(id+".source");directory(root);
         if(!Files.exists(owned,LinkOption.NOFOLLOW_LINKS))Files.createDirectory(owned);
         directory(owned);SessionJournalFiles.force(owned);SessionJournalFiles.force(root);
@@ -170,11 +187,13 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         Path target=sourcePath(prepared.request().transferId(),prepared.image().position());ensureOriginalDirectory(prepared.request().transferId());publishImage(saved.image(),target,prepared);return snapshot(target,prepared);
     }
     /** Retry an already forced release only. This never creates a receipt or authorizes an unknown transfer. */
-    public synchronized boolean isReleased(Request request)throws IOException {
+    public boolean isReleased(Request request)throws IOException {try(var owner=ownBulk(request.transferId(),NativeRangeImage.IoAdmission.UNLIMITED)){return isReleasedOwned(request);}catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException(failure);}}
+    private boolean isReleasedOwned(Request request)throws IOException {
         requireOpen();if(!exists(path(request.transferId(),"released")))return false;
         var receipt=receipt(request.transferId());requireReceipt(request,receipt);cleanup(receipt);return true;
     }
-    public synchronized void released(Request request)throws IOException {
+    public void released(Request request)throws IOException {try(var owner=ownBulk(request.transferId(),NativeRangeImage.IoAdmission.UNLIMITED)){releasedOwned(request);}catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException(failure);}}
+    private void releasedOwned(Request request)throws IOException {
         requireOpen();UUID id=request.transferId();Receipt receipt;
         if(exists(path(id,"released"))){receipt=receipt(id);requireReceipt(request,receipt);}
         else {
@@ -183,7 +202,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
             byte[] encoded=reply(PREPARE,prepared);receipt=new Receipt(id,digest(request(RELEASE,request)),digest(encoded),prepared.image().sha256(),prepared.image().bytes(),reservation(id).maximumImageBytes(),prepared.image().position());
             if(Files.exists(path(id,"released.pending"),LinkOption.NOFOLLOW_LINKS))regular(path(id,"released.pending"),RELEASE_BODY_BYTES+32);
             Path releasePending=path(id,"released.pending");if(exists(releasePending)){byte[] body=encode(receipt);requirePrefixBytes(releasePending,ByteBuffer.allocate(body.length+32).put(body).put(digest(body)).array());Files.delete(releasePending);SessionJournalFiles.force(root);}
-            SessionJournalFiles.write(path(id,"released"),encode(receipt),RELEASE_BODY_BYTES+32);
+            writeMetadata(path(id,"released"),encode(receipt),RELEASE_BODY_BYTES+32);
         }
         cleanup(receipt);
     }
@@ -194,24 +213,24 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         if(exists(pending)){
             regular(pending,receipt.imageBytes());
             if(exists(image))requirePrefix(pending,image);
-            else {var partial=NativeRangeImage.inspect(pending,imageLimits);if(!Arrays.equals(partial.sha256(),receipt.imageDigest()) || partial.bytes()!=receipt.imageBytes())throw new IOException("Uncertain staging image cannot be reclaimed");}
+            else {var partial=NativeRangeImage.inspectAdmitted(pending,imageLimits,imageAdmission.get());if(!Arrays.equals(partial.sha256(),receipt.imageDigest()) || partial.bytes()!=receipt.imageBytes())throw new IOException("Uncertain staging image cannot be reclaimed");}
         }
         Path metadataPending=path(receipt.id(),"prepared.pending");
         if(exists(metadataPending)){if(metadataBody==null){metadataBody=read(metadataPending,MAX_METADATA_FILE);if(!Arrays.equals(digest(metadataBody),receipt.metadataDigest()))throw new IOException("Uncertain released metadata staging");}requirePrefixBytes(metadataPending,ByteBuffer.allocate(metadataBody.length+32).put(metadataBody).put(digest(metadataBody)).array());}
-        if(exists(image)){regular(image,receipt.imageBytes());var manifest=NativeRangeImage.inspect(image,imageLimits);if(manifest.bytes()!=receipt.imageBytes() || !Arrays.equals(manifest.sha256(),receipt.imageDigest()))throw new IOException("Released source image changed");removal.delete(image);}
+        if(exists(image)){regular(image,receipt.imageBytes());var manifest=NativeRangeImage.inspectAdmitted(image,imageLimits,imageAdmission.get());if(manifest.bytes()!=receipt.imageBytes() || !Arrays.equals(manifest.sha256(),receipt.imageDigest()))throw new IOException("Released source image changed");removal.delete(image);}
         if(exists(pending)){regular(pending,receipt.imageBytes());removal.delete(pending);}
         if(exists(metadataPending))removal.delete(metadataPending);
         var source=sourcePath(receipt.id(),receipt.cut());var sourceDir=source.getParent();if(Files.exists(sourceDir,LinkOption.NOFOLLOW_LINKS)){
             if(!Files.isDirectory(sourceDir,LinkOption.NOFOLLOW_LINKS))throw new IOException("Source original namespace changed");
-            try(var files=Files.newDirectoryStream(sourceDir)){for(var file:files){var name=file.getFileName().toString();if(!name.equals(source.getFileName().toString()) && !name.equals(source.getFileName()+".pending"))throw new IOException("Unsettled source build prevents cleanup");regular(file,receipt.imageBytes());if(name.endsWith(".pending")){if(!exists(source))throw new IOException("Partial original source image lacks settled original");requirePrefix(file,source);}else{var imageManifest=NativeRangeImage.inspect(file,imageLimits);if(!Arrays.equals(imageManifest.sha256(),receipt.imageDigest()) || !imageManifest.position().equals(receipt.cut()))throw new IOException("Source original changed before cleanup");}removal.delete(file);}}
+            try(var files=Files.newDirectoryStream(sourceDir)){for(var file:files){var name=file.getFileName().toString();if(!name.equals(source.getFileName().toString()) && !name.equals(source.getFileName()+".pending"))throw new IOException("Unsettled source build prevents cleanup");regular(file,receipt.imageBytes());if(name.endsWith(".pending")){if(!exists(source))throw new IOException("Partial original source image lacks settled original");requirePrefix(file,source);}else{var imageManifest=NativeRangeImage.inspectAdmitted(file,imageLimits,imageAdmission.get());if(!Arrays.equals(imageManifest.sha256(),receipt.imageDigest()) || !imageManifest.position().equals(receipt.cut()))throw new IOException("Source original changed before cleanup");}removal.delete(file);}}
             removal.delete(sourceDir);
         }
         if(exists(metadata))removal.delete(metadata);for(var suffix:List.of("capture.pending","capture","reserved.pending","reserved")){var file=path(receipt.id(),suffix);if(exists(file))removal.delete(file);}removal.force(root);
-        SessionJournalFiles.write(path(receipt.id(),"settled"),digest(encode(receipt)),64);
+        writeMetadata(path(receipt.id(),"settled"),digest(encode(receipt)),64);
     }
     private record Usage(int count,long imageBytes,long metadataBytes) {}
-    private long metadataUsage()throws IOException{return inventoryUsage().metadataBytes();}
-    private void inventory(Prepared candidate,byte[] candidateBytes)throws IOException{inventoryUsage(candidate,candidateBytes);}
+    private synchronized long metadataUsage()throws IOException{return inventoryUsage().metadataBytes();}
+    private synchronized void inventory(Prepared candidate,byte[] candidateBytes)throws IOException{inventoryUsage(candidate,candidateBytes);}
     private Usage inventoryUsage()throws IOException{return inventoryUsage(null,null);}
     private Usage inventoryUsage(Prepared candidate,byte[] candidateBytes)throws IOException {
         publicationCount();
@@ -263,11 +282,11 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         if(exists(target)){validateImage(prepared,target);SessionJournalFiles.force(target);SessionJournalFiles.force(target.getParent());return;}
         Path pending=target.resolveSibling(target.getFileName()+".pending");
         if(exists(pending)){regular(pending,prepared.image().bytes());requirePrefix(pending,source);Files.delete(pending);SessionJournalFiles.force(pending.getParent());}
-        try{Files.createLink(pending,source);}catch(UnsupportedOperationException|IOException unavailable){if(exists(pending))throw new IOException("Uncertain source hardlink publication",unavailable);Files.copy(source,pending);}
+        try{Files.createLink(pending,source);}catch(UnsupportedOperationException|IOException unavailable){if(exists(pending))throw new IOException("Uncertain source hardlink publication",unavailable);try(var input=Files.newInputStream(source);var output=Files.newOutputStream(pending,StandardOpenOption.CREATE_NEW,StandardOpenOption.WRITE)){var buffer=new byte[65536];while(true){imageAdmission.get().beforeBytes(buffer.length);int count=input.read(buffer);if(count==-1)break;imageAdmission.get().beforeBytes(count);output.write(buffer,0,count);}}}
         validateImage(prepared,pending);SessionJournalFiles.force(pending);Files.move(pending,target,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(target.getParent());
     }
     private void validateImage(Prepared prepared,Path file)throws IOException {
-        regular(file,prepared.image().bytes());if(Files.size(file)!=prepared.image().bytes())throw new IOException("Source image length changed");var actual=NativeRangeImage.inspect(file,imageLimits);var expected=prepared.image();
+        regular(file,prepared.image().bytes());if(Files.size(file)!=prepared.image().bytes())throw new IOException("Source image length changed");var actual=NativeRangeImage.inspectAdmitted(file,imageLimits,imageAdmission.get());var expected=prepared.image();
         if(!actual.owner().equals(expected.owner()) || !actual.interval().domainId().equals(expected.interval().domainId()) || !actual.interval().columns().equals(expected.interval().columns()) || !Arrays.equals(actual.interval().lowerInclusive(),expected.interval().lowerInclusive()) || !Arrays.equals(actual.interval().upperExclusive(),expected.interval().upperExclusive())
                 || !actual.position().equals(expected.position()) || !Arrays.equals(actual.schemaDigest(),expected.schemaDigest()) || !actual.deterministicMergeColumns().equals(expected.deterministicMergeColumns()) || actual.rows()!=expected.rows() || actual.bytes()!=expected.bytes() || !Arrays.equals(actual.sha256(),expected.sha256())
                 || !Arrays.equals(actual.topologyOrigin()==null?null:actual.topologyOrigin().encode(),expected.topologyOrigin()==null?null:expected.topologyOrigin().encode()))throw new IOException("Source image checksum/cut/schema/geometry changed");
@@ -280,12 +299,12 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private static void requireReceipt(Request request,Receipt receipt)throws IOException{if(!Arrays.equals(receipt.requestDigest(),digest(request(RELEASE,request))))throw new IOException("Released source request changed");}
     private static void requireRequestIo(Request expected,Request actual)throws IOException{try{requireRequest(expected,actual);}catch(IllegalArgumentException changed){throw new IOException("Original source request changed",changed);}}
     private static void requirePrepared(Prepared expected,Prepared actual)throws IOException{if(!Arrays.equals(reply(PREPARE,expected),reply(PREPARE,actual)))throw new IOException("Original source image metadata changed");}
-    private static void cleanMetadataPending(Path path,byte[] body)throws IOException{Path pending=path.resolveSibling(path.getFileName()+".pending");if(exists(pending)){regular(pending,MAX_METADATA_FILE);requirePrefixBytes(pending,ByteBuffer.allocate(body.length+32).put(body).put(digest(body)).array());Files.delete(pending);SessionJournalFiles.force(path.getParent());}}
-    private static void requirePrefix(Path partial,Path source)throws IOException{try(var left=FileChannel.open(partial,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS);var right=FileChannel.open(source,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS)){if(left.size()>right.size())throw new IOException("Uncertain staging image length");var a=ByteBuffer.allocate(65536);var b=ByteBuffer.allocate(65536);long offset=0;while(offset<left.size()){int count=(int)Math.min(a.capacity(),left.size()-offset);a.clear().limit(count);b.clear().limit(count);fill(left,a);fill(right,b);if(Arrays.mismatch(a.array(),0,count,b.array(),0,count)!=-1)throw new IOException("Uncertain staging image changed");offset+=count;}}}
+    private synchronized void cleanMetadataPending(Path path,byte[] body)throws IOException{Path pending=path.resolveSibling(path.getFileName()+".pending");if(exists(pending)){regular(pending,MAX_METADATA_FILE);requirePrefixBytes(pending,ByteBuffer.allocate(body.length+32).put(body).put(digest(body)).array());Files.delete(pending);SessionJournalFiles.force(path.getParent());}}
+    private void requirePrefix(Path partial,Path source)throws IOException{try(var left=FileChannel.open(partial,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS);var right=FileChannel.open(source,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS)){if(left.size()>right.size())throw new IOException("Uncertain staging image length");var a=ByteBuffer.allocate(65536);var b=ByteBuffer.allocate(65536);long offset=0;while(offset<left.size()){int count=(int)Math.min(a.capacity(),left.size()-offset);a.clear().limit(count);b.clear().limit(count);imageAdmission.get().beforeBytes(count);fill(left,a);imageAdmission.get().beforeBytes(count);fill(right,b);if(Arrays.mismatch(a.array(),0,count,b.array(),0,count)!=-1)throw new IOException("Uncertain staging image changed");offset+=count;}}}
     private static void requirePrefixBytes(Path partial,byte[] source)throws IOException{try(var file=FileChannel.open(partial,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS)){if(file.size()>source.length)throw new IOException("Uncertain metadata staging length");var bytes=ByteBuffer.allocate((int)file.size());fill(file,bytes);if(Arrays.mismatch(bytes.array(),0,bytes.capacity(),source,0,bytes.capacity())!=-1)throw new IOException("Uncertain metadata staging changed");}}
     private static void fill(FileChannel file,ByteBuffer bytes)throws IOException{while(bytes.hasRemaining())if(file.read(bytes)<0)throw new IOException("Truncated source artifact");}
     private static byte[] read(Path file,int maximum)throws IOException{regular(file,maximum);Path pending=file.resolveSibling(file.getFileName()+".pending");if(exists(pending))regular(pending,maximum);return SessionJournalFiles.read(file,maximum);}
-    private static SnapshotInfo snapshot(Path path,Prepared prepared)throws IOException{return new SingleFileSnapshotInfo(new FileInfo(path,MD5FileUtil.computeMd5ForFile(path.toFile())),prepared.image().position().term(),prepared.image().position().index());}
+    private SnapshotInfo snapshot(Path path,Prepared prepared)throws IOException{return new SingleFileSnapshotInfo(new FileInfo(path,MD5Hash.newInstance(NativeRangeImage.md5Admitted(path,imageAdmission.get()))),prepared.image().position().term(),prepared.image().position().index());}
     private static String name(Prepared prepared){return SimpleStateMachineStorage.getSnapshotFileName(prepared.image().position().term(),prepared.image().position().index());}
     private Path path(UUID id,String suffix){return root.resolve(id+"."+suffix);}
     private static boolean exists(Path path){return Files.exists(path,LinkOption.NOFOLLOW_LINKS);}
@@ -293,5 +312,5 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private static void regular(Path path,long maximum)throws IOException{directory(path.getParent());if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS) || Files.size(path)>maximum)throw new IOException("Source artifact is foreign/symlink/oversized");}
     private static byte[] digest(byte[] body){try{return MessageDigest.getInstance("SHA-256").digest(body);}catch(NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}
     private void requireOpen()throws IOException{if(closed || !lock.isValid())throw new IOException("Source artifact owner closed/fenced");}
-    @Override public synchronized void close()throws IOException{if(closed)return;closed=true;try{lock.release();}finally{lockChannel.close();}}
+    @Override public synchronized void close()throws IOException{if(closed)return;if(!bulkOwners.isEmpty())throw new IOException("Actual source artifact work remains active");closed=true;try{lock.release();}finally{lockChannel.close();}}
 }
