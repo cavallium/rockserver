@@ -23,13 +23,14 @@ public final class StartupIoPolicy {
      */
     public record Decision(int pressureMask, boolean capturePressure, boolean qualifiedHealthy) {}
 
+    /** Fresh idle recovery windows permit capture again, without qualifying admission growth. */
     public Decision sample(InputSample input, long nowNanos) {
-        if (input == null) { recovering = true; return unknown(true); }
+        if (input == null) { recovering = true; return last = unknown(true); }
         // Repeated consumers cannot add a healthy window or drain a tail again.
         if (previous != null && input.epoch() == previous.epoch()) {
             if (input.equals(previous) && fresh(input, nowNanos)) return last;
             recovering = true; goodWindows = 0;
-            return new Decision(UNKNOWN | FOREGROUND | (input.urgentRecovery() ? URGENT : 0), true, false);
+            return last = new Decision(UNKNOWN | FOREGROUND | (input.urgentRecovery() ? URGENT : 0), true, false);
         }
         boolean reset = previous != null && (input.epoch() < previous.epoch()
                 || input.sampledNanos() <= previous.sampledNanos()
@@ -57,6 +58,10 @@ public final class StartupIoPolicy {
             return last = new Decision(FOREGROUND, true, false);
         }
         if (!completed) {
+            if (!busy && recovering) {
+                if (++goodWindows >= RECOVERY_WINDOWS) { recovering = false; goodWindows = 0; }
+                return last = new Decision(UNKNOWN | (recovering ? FOREGROUND : 0), recovering, false);
+            }
             goodWindows = 0;
             return last = new Decision(UNKNOWN | (busy || recovering ? FOREGROUND : 0),
                     busy || recovering, false);

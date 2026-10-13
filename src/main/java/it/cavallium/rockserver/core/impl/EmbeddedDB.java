@@ -330,7 +330,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			ColumnFamilyHandle handle,
 			@Nullable ColumnInstance registeredColumn,
 			long effectiveSoftPendingCompactionBytesLimit, int effectiveLevel0SlowdownWritesTrigger,
-			int effectiveMaxWriteBufferNumber, int effectiveMinWriteBufferNumberToMerge) {
+			int effectiveMaxWriteBufferNumber, int effectiveMinWriteBufferNumberToMerge, String workloadGroup) {
 	}
 
 	private static long storagePressurePendingCompactionBytesOverride() {
@@ -363,6 +363,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicInteger retainedRangeSnapshots = new AtomicInteger();
 	private final AtomicInteger activeNativeMultiGets = new AtomicInteger();
 	private final PointReadCompletionCounters pointReadCompletions = new PointReadCompletionCounters();
+	private final Map<String, StartupReadCompletions> startupReadGroups = new ConcurrentHashMap<>();
+	private final NonBlockingHashMapLong<StartupReadCompletions> startupReadsByHandle = new NonBlockingHashMapLong<>();
+	private boolean startupReadsEnabled;
 	private final AtomicLong bulkReadTailNanos = new AtomicLong();
 	private final AtomicLong nativeBulkReadCompletions = new AtomicLong();
 	private final AtomicLong nativeBulkReadKeys = new AtomicLong();
@@ -432,6 +435,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final EnumMap<WriteElisionRequest, EnumMap<WriteElisionDecision, Counter>> writeElisionDecisionCounters;
 	private final RocksDBStatistics rocksDBStatistics;
 	private @Nullable CompactionIoController compactionIoController;
+	private @Nullable StartupIoController startupIoController;
+	private @Nullable RocksDBLoader.StartupResources startupResources;
 	private volatile @Nullable Runnable compactionIoSampleObserver;
 	private final boolean fastGet;
 	private final @Nullable NativeRocksDBGet fastGetReader;
@@ -655,6 +660,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			recoverRawScanPinsAtStartup(loadedDb.db().get(), loadedDb.definitiveDbPath(), config);
 		} catch (IOException | RuntimeException | Error recoveryFailure) {
 			try {
+				if (loadedDb.startupResources() != null) loadedDb.startupResources().stopSnapshotJobs();
+			} catch (Throwable stopFailure) { recoveryFailure.addSuppressed(stopFailure); }
+			try {
 				loadedDb.db().close();
 			} catch (Throwable closeFailure) {
 				recoveryFailure.addSuppressed(closeFailure);
@@ -666,6 +674,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			throw recoveryFailure;
 		}
+		this.startupResources = loadedDb.startupResources();
+		this.startupReadsEnabled = startupResources != null && (startupResources.settings().admission().enabled()
+				|| !startupResources.snapshotCaches().isEmpty());
 		this.db = loadedDb.db();
 		this.dbOptions = loadedDb.dbOptions();
 		this.refs = loadedDb.refs();
@@ -703,10 +714,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				maxBackgroundJobs = bgJobs >= 0 ? bgJobs : Runtime.getRuntime().availableProcessors();
 			}
 			memoryUpperBoundConfig = new RocksDBStatistics.MemoryUpperBoundConfig(
-					maxBackgroundJobs, compactionReadaheadBytes, writableFileMaxBufferBytes);
+					maxBackgroundJobs, compactionReadaheadBytes, writableFileMaxBufferBytes,
+					startupResources == null ? 0 : startupResources.settings().snapshotAuxiliaryBytes());
 		} catch (GestaltException e) {
 			memoryUpperBoundConfig = new RocksDBStatistics.MemoryUpperBoundConfig(
-					Runtime.getRuntime().availableProcessors(), 0, 0);
+					Runtime.getRuntime().availableProcessors(), 0, 0,
+					startupResources == null ? 0 : startupResources.settings().snapshotAuxiliaryBytes());
 		}
 		var configuredWalDirectory = dbOptions.walDir();
 		var walDirectory = configuredWalDirectory == null || configuredWalDirectory.isBlank()
@@ -860,6 +873,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			logger.error("Failed to load metrics", ex);
 		}
 
+		if (startupReadsEnabled) {
+			startupReadGroups.put("default", new StartupReadCompletions());
+			for (String group : workloadGroups.keySet()) startupReadGroups.put(group, new StartupReadCompletions());
+			startupReadGroups.put(":shared", new StartupReadCompletions());
+		}
 		loadExistingColumns(loadedDb.mergeOperators());
         if (tablePropertiesEnabled) {
             rocksDBStatistics.setTablePropertiesMetrics(new TablePropertiesMetrics(name, metrics.getRegistry(),
@@ -875,6 +893,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var afterLoad = Instant.now();
 
 		loadTimer.record(Duration.between(beforeLoad, afterLoad));
+		if (startupReadsEnabled) {
+			try { startStartupIo(loadedDb.definitiveColumnCacheNames()); }
+			catch (RuntimeException | Error failure) {
+				try { close(); } catch (Throwable cleanupFailure) { failure.addSuppressed(cleanupFailure); }
+				throw failure;
+			}
+		}
 		if (loadedDb.compactionIoLimiter() != null) {
 			try {
 				long readaheadCeiling;
@@ -1113,7 +1138,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				handle,
 				null,
 				options.softPendingCompactionBytesLimit(), options.level0SlowdownWritesTrigger(),
-				options.maxWriteBufferNumber(), options.minWriteBufferNumberToMerge());
+				options.maxWriteBufferNumber(), options.minWriteBufferNumberToMerge(),
+				columnWorkloadGroups.getOrDefault(name, fallbackWorkloadGroup));
 	}
 
 	private void upsertStoragePressureColumn(StoragePressureColumn replacement) {
@@ -1169,14 +1195,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 
 		var column = new ColumnInstance(cfh, schema, mergeOp);
-		columnWorkloadNames.put(id, columnWorkloadGroups.getOrDefault(name, fallbackWorkloadGroup));
+		String workload = columnWorkloadGroups.getOrDefault(name, fallbackWorkloadGroup);
+		columnWorkloadNames.put(id, workload);
+		if (startupReadsEnabled) startupReadsByHandle.put(cfh.getNativeHandle(),
+				startupReadGroups.computeIfAbsent(workload, _ -> new StartupReadCompletions()));
 		this.columns.put(id, column);
 		upsertStoragePressureColumn(new StoragePressureColumn(
 				pressureColumn.id(),
 				pressureColumn.handle(),
 				column,
 				pressureColumn.effectiveSoftPendingCompactionBytesLimit(), pressureColumn.effectiveLevel0SlowdownWritesTrigger(),
-				pressureColumn.effectiveMaxWriteBufferNumber(), pressureColumn.effectiveMinWriteBufferNumberToMerge()));
+				pressureColumn.effectiveMaxWriteBufferNumber(), pressureColumn.effectiveMinWriteBufferNumberToMerge(), workload));
 
 		logger.info("Registered column: " + column);
 		return id;
@@ -1377,6 +1406,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		synchronized (columnEditLock) {
 			var col = this.columns.remove(id);
 			Objects.requireNonNull(col, () -> "Column does not exist: " + id);
+			startupReadsByHandle.remove(col.cfh().getNativeHandle());
 			removeStoragePressureColumn(id);
 
 			if (this.columnNamesIndex.remove(name) == null) {
@@ -1410,6 +1440,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// Statistics reads use the same operation gate as API calls. Stop their
 			// producer before closing admission, then make shutdown-aware logical
 			// reads release their leases before waiting for genuinely active work.
+			if (startupIoController != null) startupIoController.close();
+			if (startupResources != null) startupResources.stopSnapshotJobs();
 			if (compactionIoController != null) compactionIoController.close();
 			logger.info("Closing... stopping background statistics");
 			try {
@@ -3159,8 +3191,161 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private byte[] pointGetForUpdate(org.rocksdb.Transaction transaction, ReadOptions options,
 			ColumnFamilyHandle column, byte[] key) throws org.rocksdb.RocksDBException {
 		long started = System.nanoTime();
-		try { return transaction.getForUpdate(options, column, key, true); }
-		finally { recordCompactionForegroundRead(started, 0); }
+		long startupStarted = startStartupRead();
+		boolean failed = true;
+		try {
+			byte[] result = transaction.getForUpdate(options, column, key, true);
+			failed = false;
+			return result;
+		} finally {
+			recordStartupRead(column, startupStarted, 0, failed);
+			recordCompactionForegroundRead(started, 0);
+		}
+	}
+
+	private long startStartupRead() {
+		return startupReadsEnabled ? System.nanoTime() : 0L;
+	}
+
+	private void recordStartupRead(ColumnFamilyHandle column, long started, int keys, boolean failed) {
+		if (!startupReadsEnabled) return;
+		long elapsed = Math.max(0L, System.nanoTime() - started);
+		var completions = startupReadsByHandle.get(column.getNativeHandle());
+		if (completions == null) return;
+		recordStartupReadElapsed(completions, elapsed, keys, failed);
+	}
+
+	private static void recordStartupReadElapsed(StartupReadCompletions completions, long elapsed, int keys, boolean failed) {
+		if (keys == 0) completions.recordPoint(elapsed, failed);
+		else completions.recordBulk(elapsed, keys, failed);
+	}
+
+	private void recordStartupBulk(ColumnFamilyHandle column, long started, int keys,
+			@Nullable List<org.rocksdb.ByteBufferGetStatus> statuses) {
+		if (!startupReadsEnabled) return;
+		long elapsed = Math.max(0L, System.nanoTime() - started);
+		var completions = startupReadsByHandle.get(column.getNativeHandle());
+		if (completions == null) return;
+		boolean failed = statuses == null || statuses.size() != keys;
+		if (statuses != null) for (var status : statuses) {
+			Code code = status.status.getCode();
+			failed |= code != Code.Ok && code != Code.NotFound;
+		}
+		recordStartupReadElapsed(completions, elapsed, keys, failed);
+	}
+
+	private void startStartupIo(Map<String, String> columnCaches) {
+		var resources = Objects.requireNonNull(startupResources);
+		var storageWorkloads = new HashMap<String, Set<String>>();
+		var admission = resources.settings().admission();
+		for (var group : admission.storageGroups().values()) {
+			var workloads = new HashSet<>(group.workloadGroups());
+			if (group.id().equals(admission.defaultStorageId())) {
+				for (String workload : startupReadGroups.keySet()) {
+					if (!workload.equals(":shared") && admission.storageForWorkload(workload).id().equals(group.id()))
+						workloads.add(workload);
+				}
+			}
+			workloads.add(":shared");
+			storageWorkloads.put(group.id(), workloads);
+		}
+		var workloadCaches = new HashMap<String, List<SnapshotCache>>();
+		for (String workload : startupReadGroups.keySet()) workloadCaches.put(workload, new ArrayList<>());
+		try {
+			var fallback = config.global().fallbackColumnOptions();
+			String fallbackCache = fallback.blockCacheName();
+			addStartupCache(workloadCaches, fallbackWorkloadGroup, fallbackCache == null ? "default" : fallbackCache);
+			if (admission.enabled()) {
+				addStartupStorageWorkload(storageWorkloads, fallbackWorkloadGroup, fallback);
+				for (var column : Objects.requireNonNullElse(config.global().columnOptions(),
+						new it.cavallium.rockserver.core.config.NamedColumnConfig[0])) {
+					addStartupStorageWorkload(storageWorkloads,
+							columnWorkloadGroups.getOrDefault(column.name(), fallbackWorkloadGroup), column);
+				}
+			}
+		} catch (org.github.gestalt.config.exceptions.GestaltException failure) {
+			throw new IllegalStateException("Cannot resolve startup cache workload", failure);
+		}
+		for (var entry : columnCaches.entrySet()) {
+			String workload = columnWorkloadGroups.getOrDefault(entry.getKey(), fallbackWorkloadGroup);
+			addStartupCache(workloadCaches, workload, entry.getValue());
+		}
+		// Cross-column CDC resolution can touch every physical domain.
+		workloadCaches.put(":shared", resources.snapshotCaches());
+		startupIoController = new StartupIoController(name, resources.budgets(), storageWorkloads,
+				workloadCaches, this::sampleStartupIo, metrics.getRegistry());
+	}
+
+	private void addStartupStorageWorkload(Map<String, Set<String>> groups, String workload,
+			it.cavallium.rockserver.core.config.FallbackColumnConfig column) throws org.github.gestalt.config.exceptions.GestaltException {
+		var resources = Objects.requireNonNull(startupResources);
+		var paths = RocksDBLoader.getVolumeConfigs(definitiveDbPath, column);
+		if (paths.isEmpty()) {
+			groups.get(RocksDBLoader.physicalStorageFor(resources.settings(), definitiveDbPath)).add(workload);
+		} else for (var path : paths) {
+			groups.get(RocksDBLoader.physicalStorageFor(resources.settings(), path.path())).add(workload);
+		}
+	}
+
+	private void addStartupCache(Map<String, List<SnapshotCache>> groups, String workload, String cacheName) {
+		var selected = groups.computeIfAbsent(workload, _ -> new ArrayList<>());
+		if (caches.get(cacheName) instanceof SnapshotCache cache && !selected.contains(cache)) selected.add(cache);
+		if (metadataCaches.get(cacheName) instanceof SnapshotCache cache && !selected.contains(cache)) selected.add(cache);
+	}
+
+	private Map<String, StartupIoPolicy.InputSample> sampleStartupIo(long epoch) {
+		ops.beginOp();
+		long sampledNanos = System.nanoTime();
+		try {
+			var nativeDb = db.get();
+			boolean databaseUrgent = nativeDb.getLongProperty(ROCKSDB_IS_WRITE_STOPPED_PROPERTY) != 0
+					|| nativeDb.getLongProperty(ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
+			var urgentGroups = new HashSet<String>();
+			var incompleteGroups = new HashSet<String>();
+			for (var column : storagePressureColumns) {
+				String workload = column.workloadGroup();
+				var registered = column.registeredColumn();
+				if (registered != null && !tryBeginColumnUse(registered)) { incompleteGroups.add(workload); continue; }
+				try {
+					long debt = nativeDb.getLongProperty(column.handle(), ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
+					long limit = column.effectiveSoftPendingCompactionBytesLimit();
+					boolean urgent = limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
+					long l0 = Long.parseUnsignedLong(nativeDb.getProperty(column.handle(), "rocksdb.num-files-at-level0"));
+					int trigger = column.effectiveLevel0SlowdownWritesTrigger();
+					urgent |= trigger >= 0 && Long.compareUnsigned(l0, trigger) >= 0;
+					int buffers = column.effectiveMaxWriteBufferNumber();
+					if (buffers <= 3 || column.effectiveMinWriteBufferNumberToMerge() > buffers - 2) {
+						long immutable = nativeDb.getLongProperty(column.handle(), RocksDBLongProperty.NUM_IMMUTABLE_MEM_TABLE.getName());
+						urgent |= Long.compareUnsigned(immutable, Math.max(1L, (long) buffers - 1)) >= 0;
+					}
+					if (urgent) urgentGroups.add(workload);
+				} finally { if (registered != null) registered.endUse(); }
+			}
+			var samples = new HashMap<String, StartupIoPolicy.InputSample>();
+			var telemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+			var writes = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+			for (var entry : startupReadGroups.entrySet()) {
+				String group = entry.getKey();
+				var reads = entry.getValue().snapshot(epoch);
+				if (group.equals(":shared")) {
+					samples.put(group, new StartupIoPolicy.InputSample(epoch, sampledNanos, true, true,
+							1, 0, 0, 0, 0, databaseUrgent, reads));
+					continue;
+				}
+				var groupScheduler = workloadGroups.getOrDefault(group, scheduler);
+				groupScheduler.copyPoolTelemetry(RWScheduler.Pool.READ, telemetry);
+				groupScheduler.copyPoolTelemetry(RWScheduler.Pool.WRITE, writes);
+				samples.put(group, new StartupIoPolicy.InputSample(epoch, sampledNanos, true, !incompleteGroups.contains(group),
+						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_WORKER_COUNT], writes[RWScheduler.POOL_TELEMETRY_WORKER_COUNT])),
+						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS], writes[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS])),
+						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS], writes[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS])),
+						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS], writes[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS]),
+						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES], writes[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]), databaseUrgent || urgentGroups.contains(group), reads));
+			}
+			return samples;
+		} catch (org.rocksdb.RocksDBException failure) {
+			throw new IllegalStateException("Cannot sample startup storage recovery", failure);
+		} finally { ops.endOp(); }
 	}
 
 	private void recordCompactionForegroundRead(long started, int bulkKeys) {
@@ -3359,7 +3544,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						long pendingCompactionBytes = rocksDb.getLongProperty(
 								pressureColumn.handle(),
 								ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
-						var groupSignal = workloadGroupPressure.get(columnWorkloadNames.getOrDefault(pressureColumn.id(), "default"));
+						var groupSignal = workloadGroupPressure.get(pressureColumn.workloadGroup());
 						if (groupSignal != null) groupSignal.observeColumn(pressureColumn.id(), pendingCompactionBytes,
 								pressureColumn.effectiveSoftPendingCompactionBytesLimit());
 						storagePressureSignal.observeColumn(pressureColumn.id(),
@@ -5348,14 +5533,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			int keyLength = calculatedKey.getBackingByteArrayLength();
 
 			if (output == FastGetOutput.EXACT_HEAP) {
-				byte[] value = reader.getHeap(col.cfh(), keyArray, keyOffset, keyLength);
+				long startupStarted = startStartupRead();
+				boolean failed = true;
+				byte[] value;
+				try {
+					value = reader.getHeap(col.cfh(), keyArray, keyOffset, keyLength);
+					failed = false;
+				} finally { recordStartupRead(col.cfh(), startupStarted, 0, failed); }
 				return value == null
 						? new FastGetResult(false, null, false, null)
 						: new FastGetResult(true, Buf.wrap(value), false, null);
 			}
 
-			NativeRocksDBGet.PinnedGetLease lease = reader.getPinned(
-					col.cfh(), keyArray, keyOffset, keyLength);
+			long startupStarted = startStartupRead();
+			boolean failed = true;
+			NativeRocksDBGet.PinnedGetLease lease;
+			try {
+				lease = reader.getPinned(col.cfh(), keyArray, keyOffset, keyLength);
+				failed = false;
+			} finally { recordStartupRead(col.cfh(), startupStarted, 0, failed); }
 			if (lease == null) {
 				return new FastGetResult(false, null, false, null);
 			}
@@ -6303,12 +6499,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var nativeDb = db.get();
 			var columnHandles = List.of(col.cfh());
 			var sample = sampleLatency ? existsMultiPerfSampler.begin(nativeDb) : null;
-			List<org.rocksdb.ByteBufferGetStatus> statuses;
+			List<org.rocksdb.ByteBufferGetStatus> statuses = null;
 			long readStarted = System.nanoTime();
 			activeNativeMultiGets.incrementAndGet();
+			long startupStarted = startStartupRead();
 			try {
 				statuses = nativeDb.multiGetByteBuffers(readOptions, columnHandles, nativeKeys, emptyValues);
 			} finally {
+				recordStartupBulk(col.cfh(), startupStarted, nativeKeys.length, statuses);
 				activeNativeMultiGets.decrementAndGet();
 				recordCompactionForegroundRead(readStarted, nativeKeys.length);
 				if (sample != null) existsMultiPerfSampler.finish(sample);
@@ -6341,16 +6539,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var nativeKeys = calculatedKeys.stream().map(Buf::toByteArray).toList();
 		List<byte[]> values;
 		long readStarted = System.nanoTime();
+		var handles = Collections.nCopies(nativeKeys.size(), col.cfh());
+		var nativeDb = tx == null ? db.get() : null;
+		boolean failed = true;
 		activeNativeMultiGets.incrementAndGet();
+		long startupStarted = startStartupRead();
 		try {
 			if (tx == null) {
-				values = db.get().multiGetAsList(readOptions,
-						Collections.nCopies(nativeKeys.size(), col.cfh()),
+				values = nativeDb.multiGetAsList(readOptions,
+						handles,
 						nativeKeys);
 			} else {
 				values = tx.val().multiGetAsList(readOptions, col.cfh(), nativeKeys);
 			}
+			failed = false;
 		} finally {
+			recordStartupRead(col.cfh(), startupStarted, nativeKeys.size(), failed);
 			activeNativeMultiGets.decrementAndGet();
 			recordCompactionForegroundRead(readStarted, nativeKeys.size());
 		}
@@ -6411,13 +6615,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					//noinspection ConstantValue
 					assert tx == null;
 					foundValue = null;
-					existsValue = db
-							.get()
-							.keyExists(col.cfh(),
+					var nativeDb = db.get();
+					long startupStarted = startStartupRead();
+					boolean failed = true;
+					try {
+						existsValue = nativeDb.keyExists(col.cfh(),
 									calculatedKey.getBackingByteArray(),
 									calculatedKey.getBackingByteArrayOffset(),
 									calculatedKey.getBackingByteArrayLength()
 							);
+						failed = false;
+					} finally { recordStartupRead(col.cfh(), startupStarted, 0, failed); }
 				} else {
 					foundValue = null;
 					existsValue = false;
@@ -10685,7 +10893,12 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (forUpdate || tx.isFromGetForUpdate()) {
 					previousRawBucketByteArray = pointGetForUpdate(tx.val(), readOptions, col.cfh(), calculatedKeyArray);
 				} else {
-					previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKeyArray);
+					long startupStarted = startStartupRead();
+					boolean failed = true;
+					try {
+						previousRawBucketByteArray = tx.val().get(readOptions, col.cfh(), calculatedKeyArray);
+						failed = false;
+					} finally { recordStartupRead(col.cfh(), startupStarted, 0, failed); }
 				}
 				return toBuf(previousRawBucketByteArray);
 			} else {
@@ -10693,12 +10906,18 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				if (fastGet) {
 					return dbGetFast(col.cfh(), readOptions, calculatedKey);
 				} else {
-					var previousRawBucketByteArray = db.get(col.cfh(),
+					long startupStarted = startStartupRead();
+					boolean failed = true;
+					byte[] previousRawBucketByteArray;
+					try {
+						previousRawBucketByteArray = db.get(col.cfh(),
 							readOptions,
 							calculatedKey.getBackingByteArray(),
 							calculatedKey.getBackingByteArrayOffset(),
 							calculatedKey.getBackingByteArrayLength()
 					);
+					failed = false;
+					} finally { recordStartupRead(col.cfh(), startupStarted, 0, failed); }
 					return toBuf(previousRawBucketByteArray);
 				}
 			}
@@ -10744,7 +10963,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		long readStarted = System.nanoTime();
 		try {
 			var reader = Objects.requireNonNull(fastGetReader);
-			byte[] value = useDefaultReadOptions
+			long startupStarted = startStartupRead();
+			boolean failed = true;
+			byte[] value;
+			try {
+				value = useDefaultReadOptions
 					? reader.getHeap(cfh,
 							calculatedKey.getBackingByteArray(),
 							calculatedKey.getBackingByteArrayOffset(),
@@ -10754,6 +10977,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							calculatedKey.getBackingByteArray(),
 							calculatedKey.getBackingByteArrayOffset(),
 							calculatedKey.getBackingByteArrayLength());
+			failed = false;
+			} finally { recordStartupRead(cfh, startupStarted, 0, failed); }
 			return toBuf(value);
 
 		} finally { recordCompactionForegroundRead(readStarted, 0); }
@@ -11993,12 +12218,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			resolutionObserver.run();
 		}
 		final List<byte[]> resolvedValues;
+		var nativeDb = db.get();
+		var sharedReads = startupReadsEnabled
+				? startupReadGroups.computeIfAbsent(":shared", _ -> new StartupReadCompletions()) : null;
 		activeNativeMultiGets.incrementAndGet();
+		long startupStarted = startStartupRead();
+		boolean failed = true;
 		try {
-			resolvedValues = db.get().multiGetAsList(cfHandles, keysToResolve);
+			resolvedValues = nativeDb.multiGetAsList(cfHandles, keysToResolve);
+			failed = false;
 		} catch (org.rocksdb.RocksDBException error) {
 			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, error);
-		} finally { activeNativeMultiGets.decrementAndGet(); }
+		} finally {
+			if (sharedReads != null) sharedReads.recordBulk(
+					Math.max(0L, System.nanoTime() - startupStarted), keysToResolve.size(), failed);
+			activeNativeMultiGets.decrementAndGet();
+		}
 
 		int resolutionIndex = 0;
 		long transformedBytes = 0L;
