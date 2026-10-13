@@ -3273,7 +3273,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		// Cross-column CDC resolution can touch every physical domain.
 		workloadCaches.put(":shared", resources.snapshotCaches());
 		startupIoController = new StartupIoController(name, resources.budgets(), storageWorkloads,
-				workloadCaches, this::sampleStartupIo, metrics.getRegistry());
+				workloadCaches, caches, metadataCaches, this::sampleStartupIo, metrics.getRegistry());
 	}
 
 	private void addStartupStorageWorkload(Map<String, Set<String>> groups, String workload,

@@ -22,6 +22,44 @@ class NativeStartupBridgeTest {
             throw e;
         }
     }
+    private static final String CACHE_STATS = """
+            {"sample_candidates":1,"sampled":2,"dropped":3,"snapshots":4,"snapshot_bytes":5,
+             "aborts":6,"errors":7,"rejected":8,"data_hits":9,"index_hits":10,"filter_hits":11,
+             "dictionary_hits":12,"replay_bytes":13,"lookup_reserved_bytes":14,
+             "oversized_decoder_rejections":15,"feedback":16}
+            """;
+
+    private static NativeStartupBridge.CacheStats parseStats(String json) throws Exception {
+        var method = NativeStartupBridge.class.getDeclaredMethod("parseCacheStats", String.class);
+        method.setAccessible(true);
+        try { return (NativeStartupBridge.CacheStats) method.invoke(null, json); }
+        catch (InvocationTargetException e) {
+            if (e.getCause() instanceof RuntimeException failure) throw failure;
+            throw e;
+        }
+    }
+
+    @Test void mapsAllNativeCacheCountersByName() throws Exception {
+        var stats = parseStats(CACHE_STATS);
+        long[] actual = {stats.sampleCandidates(), stats.sampled(), stats.dropped(), stats.snapshots(),
+                stats.snapshotBytes(), stats.aborts(), stats.errors(), stats.rejected(), stats.dataHits(),
+                stats.indexHits(), stats.filterHits(), stats.dictionaryHits(), stats.replayBytes(),
+                stats.lookupReservedBytes(), stats.oversizedDecoderRejections(), stats.feedback()};
+        for (int i = 0; i < actual.length; i++) assertEquals(i + 1, actual[i]);
+        assertEquals(0, parseStats(CACHE_STATS.replace("\"data_hits\":9", "\"data_hits\":0")).dataHits());
+    }
+
+    @Test void rejectsMissingMalformedAndNonIntegralNativeCacheStats() {
+        for (String json : new String[]{"not JSON", "{}",
+                CACHE_STATS.replace("\"data_hits\":9", "\"data_hits\":null"),
+                CACHE_STATS.replace("\"data_hits\":9", "\"data_hits\":1.5"),
+                CACHE_STATS.replace("\"data_hits\":9", "\"data_hits\":-1")}) {
+            var failure = assertThrows(IllegalStateException.class, () -> parseStats(json));
+            assertEquals("Invalid native snapshot cache stats", failure.getMessage());
+            assertNotNull(failure.getCause());
+        }
+    }
+
     @Test void artifactFingerprintFitsNativeCompatibilityBound(@TempDir Path directory) throws Exception {
         Path artifact = Files.writeString(directory.resolve("native.so"), "abc");
         var method = NativeStartupBridge.class.getDeclaredMethod("artifactFingerprint", Path.class);
