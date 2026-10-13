@@ -30,6 +30,7 @@ import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 import java.util.regex.Pattern;
@@ -55,7 +56,7 @@ class StartupNativeIntegrationTest {
     @Test
     void embeddedReadsCaptureAndReplayAcrossReopenAndDynamicColumnLifecycle() throws Exception {
         Path dbPath = directory.resolve("db");
-        Path config = config("workflow", true, "0B");
+        Path config = config("workflow", true, "0B", 1);
         seed(dbPath, config, "seed");
         List<SnapshotCache> closedCaches;
         var exported = new SimpleMeterRegistry();
@@ -120,7 +121,7 @@ class StartupNativeIntegrationTest {
     @Test
     void twoDatabasesShareOneNativeCapAndClosingOneLeavesTheOtherUsable() throws Exception {
         String storage = "shared_" + UUID.randomUUID().toString().replace('-', '_');
-        Path config = config(storage, true, "0B");
+        Path config = config(storage, true, "0B", 1);
         Path firstPath = directory.resolve("first"), secondPath = directory.resolve("second");
         seed(firstPath, config, "seed-first");
         seed(secondPath, config, "seed-second");
@@ -157,9 +158,50 @@ class StartupNativeIntegrationTest {
     }
 
     @Test
+    void actualHealthyReadsGrowSharedAdmissionDespiteAnIdleDatabase() throws Exception {
+        String storage = "idle_peer_" + UUID.randomUUID().toString().replace('-', '_');
+        Path config = config(storage, false, "0B", 4);
+        Path activePath = directory.resolve("active"), idlePath = directory.resolve("idle");
+        seed(activePath, config, "seed-active");
+        seed(idlePath, config, "seed-idle");
+        try (var active = new EmbeddedConnection(activePath, "healthy-owner", config);
+                var idle = new EmbeddedConnection(idlePath, "idle-owner", config);
+                var executor = Executors.newSingleThreadExecutor()) {
+            var budget = resources(active.getInternalDB()).budgets().get(storage);
+            var api = active.getSyncApi(RequestContext.batch());
+            long column = api.getColumnId("entries");
+            var running = new AtomicBoolean(true);
+            var reads = executor.submit(() -> {
+                int number = 0;
+                while (running.get()) {
+                    int id = number++ % (FILES * KEYS_PER_FILE);
+                    assertEquals(value(id), api.get(0, column, key(id), RequestType.current()));
+                    Thread.sleep(5);
+                }
+                return null;
+            });
+            try {
+                // Both actual controllers publish their cohorts; this test injects no feedback.
+                await(() -> budget.snapshot().limit() > 1, "healthy owner growth with an idle peer");
+                var stats = budget.snapshot();
+                assertEquals(2, stats.publishers());
+                assertTrue(stats.limit() <= 4, stats::toString);
+                assertTrue(stats.peakActive() <= 4, stats::toString);
+                assertEquals(0, stats.pressureMask() & 7, stats::toString);
+            } finally {
+                running.set(false);
+                reads.get(10, TimeUnit.SECONDS);
+            }
+            verifyReads(idle);
+        }
+        assertControllerStopped("healthy-owner");
+        assertControllerStopped("idle-owner");
+    }
+
+    @Test
     void liveSnapshotNamespaceContentionRejectsSecondLoaderWithoutDisturbingOwner() throws Exception {
         Path dbPath = directory.resolve("exclusive");
-        Path config = config("exclusive", true, "0B");
+        Path config = config("exclusive", true, "0B", 1);
         seed(dbPath, config, "seed-exclusive");
         try (var owner = new EmbeddedConnection(dbPath, "exclusive-owner", config)) {
             var parsed = ConfigParser.parse(config);
@@ -178,7 +220,7 @@ class StartupNativeIntegrationTest {
     @Test
     void actualNativeCaptureCancellationReturnsBeforeHolderDisposal() throws Exception {
         Path dbPath = directory.resolve("cancel");
-        Path config = config("cancel", true, "128KiB");
+        Path config = config("cancel", true, "128KiB", 1);
         seed(dbPath, config, "seed-cancel");
         try (var connection = new EmbeddedConnection(dbPath, "cancel-owner", config)) {
             verifyReads(connection);
@@ -200,7 +242,7 @@ class StartupNativeIntegrationTest {
         assertControllerStopped("cancel-owner");
     }
 
-    private Path config(String storage, boolean snapshots, String writeCeiling) throws Exception {
+    private Path config(String storage, boolean snapshots, String writeCeiling, int maximumOpens) throws Exception {
         return Files.writeString(directory.resolve(storage + ".conf"), """
                 database.metrics.jmx.enabled = false
                 database.metrics.influx.enabled = false
@@ -217,7 +259,7 @@ class StartupNativeIntegrationTest {
                 database.global.startup-io: {
                   enabled: true
                   default-storage-id: "%s"
-                  storage-groups: [{id: "%s", maximum-opens: 1, progress-interval: PT0.02S,
+                  storage-groups: [{id: "%s", maximum-opens: %d, progress-interval: PT0.02S,
                     stale-after: PT2S, paths: ["%s"]}]
                 }
                 database.global.hot-cache-snapshot: {
@@ -238,7 +280,7 @@ class StartupNativeIntegrationTest {
                   levels: []
                   bloom-filter: {bits-per-key: 10, use-ribbon: false, optimize-for-hits: false}
                 }
-                """.formatted(storage, storage, directory, snapshots, directory.resolve("snapshots"), writeCeiling));
+                """.formatted(storage, storage, maximumOpens, directory, snapshots, directory.resolve("snapshots"), writeCeiling));
     }
 
     private void seed(Path dbPath, Path config, String name) throws Exception {
