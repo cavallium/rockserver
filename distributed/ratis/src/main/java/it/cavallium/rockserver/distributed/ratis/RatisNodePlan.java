@@ -85,11 +85,13 @@ public final class RatisNodePlan {
         domainIndex=Collections.unmodifiableMap(index); groupDomains=Map.copyOf(byGroup); columns=Collections.unmodifiableMap(allColumns); merges=Set.copyOf(allMerges); metadataBytes+=domainBytes;
         this.homes=homes.stream().sorted(Comparator.comparing(Home::role)).toList();
         var imported=new HashMap<UUID,RangeImportDefinition>(); var jobs=new HashSet<UUID>(); long importBytes=0;
-        this.imports=imports.stream().sorted(Comparator.comparing(RangeImportDefinition::importId,UUID_ORDER)).toList();
+        this.imports=imports.stream().sorted(Comparator.comparing((RangeImportDefinition definition)->definition.sourceDirectory().domainId(),UUID_ORDER).thenComparingLong(definition->definition.sourceDirectory().generation()).thenComparing(RangeImportDefinition::importId,UUID_ORDER)).toList();
         if(this.imports.size()>RangeImportDefinition.MAX_GROUPS) throw new IllegalArgumentException("Node import definition count exceeds bound");
+        var importDirectories=new HashMap<UUID,RangeDirectory>();domainIndex.forEach((id,domain)->importDirectories.put(id,domain.directory()));
         for(var definition:this.imports) {
             var domain=domainIndex.get(definition.sourceDirectory().domainId()); importBytes+=definition.encode().length;
-            if(domain==null || importBytes>RangeImportDefinition.MAX_BYTES || !jobs.add(definition.importId()) || !Arrays.equals(domain.directory().payloadDigest(),definition.sourceDirectory().payloadDigest())) throw new IllegalArgumentException("Node import differs from its exact frozen DATA domain");
+            if(domain==null || importBytes>RangeImportDefinition.MAX_BYTES || !jobs.add(definition.importId()) || !Arrays.equals(importDirectories.get(domain.domainId()).payloadDigest(),definition.sourceDirectory().payloadDigest())) throw new IllegalArgumentException("Node import differs from its exact frozen DATA domain");
+            importDirectories.put(domain.domainId(),definition.targetDirectory());
             for(var manifest:definition.manifests()) if(!manifest.physicalNames().equals(domain.columns()) || !manifest.mergeColumns().equals(domain.merges()) || groupDomains.get(manifest.groupId())!=domain || imported.put(manifest.groupId(),definition)!=null) throw new IllegalArgumentException("Node import physical bindings/target ownership differ");
         }
         groupImports=Map.copyOf(imported); metadataBytes+=importBytes;

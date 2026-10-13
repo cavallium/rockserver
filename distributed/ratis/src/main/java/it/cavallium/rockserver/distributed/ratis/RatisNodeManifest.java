@@ -151,13 +151,13 @@ public final class RatisNodeManifest {
         }
         require(input,4+SETTINGS_BYTES); int importCount=input.getInt();
         if(importCount<0 || importCount>RangeImportDefinition.MAX_GROUPS || 4L*importCount>input.remaining()-SETTINGS_BYTES) throw new IllegalArgumentException("Invalid node import count");
-        var imports=new ArrayList<RangeImportDefinition>(importCount); UUID previousImport=null; long importBytes=0;
+        var imports=new ArrayList<RangeImportDefinition>(importCount); var importIds=new HashSet<UUID>(); long importBytes=0;
         for(int i=0;i<importCount;i++) {
             byte[] encoded=blob(input,RangeImportDefinition.MAX_BYTES); importBytes+=encoded.length;
             if(importBytes>RangeImportDefinition.MAX_BYTES) throw new IllegalArgumentException("Node import definitions exceed byte bound");
             var definition=RangeImportDefinition.decode(encoded);
-            if(previousImport!=null && UUID_ORDER.compare(previousImport,definition.importId())>=0) throw new IllegalArgumentException("Noncanonical node import order");
-            previousImport=definition.importId(); imports.add(definition);
+            if(!importIds.add(definition.importId()))throw new IllegalArgumentException("Duplicate node import identity");
+            imports.add(definition);
         }
         require(input,4+SETTINGS_BYTES); int streamCount=input.getInt();
         if(streamCount<0 || streamCount>4096 || 8L*streamCount>input.remaining()-SETTINGS_BYTES)throw new IllegalArgumentException("Invalid stream endpoint count");

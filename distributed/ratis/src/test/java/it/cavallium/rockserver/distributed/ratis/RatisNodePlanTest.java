@@ -194,4 +194,21 @@ class RatisNodePlanTest {
         var cat=catalogue(List.of(remote())); var first=manyRanges(1,512); var second=manyRanges(2,513); assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(first,second),cat,List.of(),List.of(),Map.of(),RatisNodePlan.MAX_DATA_GROUPS+1));
     }
 
+    @Test void sequentialImportsQualifyEveryInitiallyFencedGroupWithoutRebasing() {
+        var replica=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
+        var a=new RangeDescriptor(LOW_GROUP,LOW_GROUP,1,0,null,new byte[]{64},RangeDescriptor.TopologyState.FENCED,List.of(replica));
+        var b=new RangeDescriptor(HIGH_GROUP,HIGH_GROUP,1,0,new byte[]{64},null,RangeDescriptor.TopologyState.FENCED,List.of(replica));
+        var initial=directory(0,List.of(a,b));var domain=new RatisNodePlan.Domain(initial,Map.of(COLUMN,"data"),Set.of());
+        var firstId=new UUID(4,2);var secondId=new UUID(4,1);
+        var firstManifest=new NativeSstImportManifest(firstId,a.groupId(),1,DOMAIN,initial.schemaDigest(),a.lowerInclusive(),a.upperExclusive(),List.of(new NativeSstImportManifest.Column(COLUMN,"data",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
+        var secondManifest=new NativeSstImportManifest(secondId,b.groupId(),1,DOMAIN,initial.schemaDigest(),b.lowerInclusive(),b.upperExclusive(),List.of(new NativeSstImportManifest.Column(COLUMN,"data",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
+        var first=new RangeImportDefinition(firstId,new OperationId(new UUID(4,3),1,0),initial,List.of(firstManifest));
+        var second=new RangeImportDefinition(secondId,new OperationId(new UUID(4,3),1,1),first.targetDirectory(),List.of(secondManifest));
+        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(domain),catalogue(List.of(remote())),List.of(),List.of(second,first),Map.of(),2);
+        assertEquals(List.of(first,second),plan.imports());assertSame(first,plan.importDefinition(a.groupId()));assertSame(second,plan.importDefinition(b.groupId()));assertArrayEquals(first.targetDirectory().payloadDigest(),plan.importDefinition(b.groupId()).sourceDirectory().payloadDigest());
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(domain),catalogue(List.of(remote())),List.of(),List.of(second),Map.of(),2));
+        var fork=new RangeImportDefinition(secondId,second.operation(),initial,List.of(secondManifest));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(domain),catalogue(List.of(remote())),List.of(),List.of(first,fork),Map.of(),2));
+    }
+
 }

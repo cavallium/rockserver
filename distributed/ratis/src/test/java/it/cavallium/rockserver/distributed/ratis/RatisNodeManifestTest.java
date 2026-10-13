@@ -278,4 +278,17 @@ class RatisNodeManifestTest {
         var count=bytes.clone(); ByteBuffer.wrap(count).putInt(4,65); assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(count));
     }
 
+    @Test void batchedImportChainSurvivesCurrentColdManifestWithoutReorderedAuthority() {
+        var original=manifest(false);var active=original.plan().directory(DOMAIN);var old=active.ranges().getFirst();
+        var a=new RangeDescriptor(old.rangeId(),old.groupId(),old.rangeEpoch(),old.configurationVersion(),null,new byte[]{64},RangeDescriptor.TopologyState.FENCED,old.replicas());
+        var b=new RangeDescriptor(new UUID(0,778),new UUID(0,777),old.rangeEpoch(),old.configurationVersion(),new byte[]{64},null,RangeDescriptor.TopologyState.FENCED,old.replicas());
+        var initial=new RangeDirectory(active.clusterId(),active.databaseId(),active.domainId(),active.schemaEpoch(),active.schemaDigest(),active.generation(),active.columns(),active.routingPrefixBytes(),List.of(a,b));
+        var columns=original.plan().columns().entrySet().stream().map(e->new NativeSstImportManifest.Column(e.getKey(),e.getValue(),false,List.of())).toList();UUID firstId=new UUID(5,2),secondId=new UUID(5,1),session=new UUID(5,3);
+        var first=new RangeImportDefinition(firstId,new OperationId(session,1,0),initial,List.of(new NativeSstImportManifest(firstId,a.groupId(),a.rangeEpoch(),DOMAIN,initial.schemaDigest(),a.lowerInclusive(),a.upperExclusive(),columns,RatisRangeImportRecord.DISTRIBUTED_LIMITS)));
+        var second=new RangeImportDefinition(secondId,new OperationId(session,1,1),first.targetDirectory(),List.of(new NativeSstImportManifest(secondId,b.groupId(),b.rangeEpoch(),DOMAIN,initial.schemaDigest(),b.lowerInclusive(),b.upperExclusive(),columns,RatisRangeImportRecord.DISTRIBUTED_LIMITS)));
+        var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(initial,original.plan().columns(),Set.of())),original.plan().catalogue(),List.of(),List.of(second,first),Map.of(),20);
+        var value=new RatisNodeManifest(List.of(original.schema(DOMAIN)),plan,settings(),3,5);byte[] encoded=RatisNodeManifest.encode(value);var cold=RatisNodeManifest.decode(encoded);
+        assertArrayEquals(encoded,RatisNodeManifest.encode(cold));assertArrayEquals(first.encode(),cold.plan().imports().getFirst().encode());assertArrayEquals(second.encode(),cold.plan().importDefinition(b.groupId()).encode());assertArrayEquals(first.targetDirectory().payloadDigest(),cold.plan().importDefinition(b.groupId()).sourceDirectory().payloadDigest());
+    }
+
 }

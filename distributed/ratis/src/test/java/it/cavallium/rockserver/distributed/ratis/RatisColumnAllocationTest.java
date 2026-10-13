@@ -145,4 +145,16 @@ class RatisColumnAllocationTest {
             assertThrows(IllegalArgumentException.class,() -> catalogue.execute(new DistributedCommand(outer.catalogue,1,new byte[32],outer.operation(2),wrong,publication.predicates())));
         }
     }
+    @Test void frozenReservationSetPreservesInterleavedSchemaIdsAndExactUnknownRetry()throws Exception {
+        var outer=new RatisSessionEpochsTest();
+        try(var f=outer.new Fixture(root)){
+            var allocation=allocator(outer,f);var a=List.of(new RatisColumnAllocation.Reservation(id(1),id(11),id(21),1),new RatisColumnAllocation.Reservation(id(3),id(11),id(23),3));var b=List.of(new RatisColumnAllocation.Reservation(id(2),id(12),id(22),2),new RatisColumnAllocation.Reservation(id(4),id(12),id(24),4));
+            var all=new ArrayList<RatisColumnAllocation.Reservation>();all.addAll(b);all.addAll(a);var command=allocation.prepareReservations(outer.operation(0),all,null);byte[] exact=DistributedCommandCodec.encode(command);
+            f.writeOverride=new byte[4];assertThrows(IOException.class,()->allocation.execute(command));f.writeOverride=null;assertEquals(CommandResult.Status.SUCCESS,allocation.execute(DistributedCommandCodec.decode(exact)).status());assertEquals(4,RatisColumnAllocation.counter(allocation.readCounter()));
+            int sequence=1;for(var owned:List.of(a,b)){var columns=new ArrayList<DistributedSchema.Column>();var reservations=new HashMap<UUID,RatisColumnAllocation.Reservation>();for(var r:owned){columns.add(new DistributedSchema.Column(r.apiId(),r.columnId(),"column-"+r.apiId(),ColumnSchema.of(IntArrayList.of(8),ObjectArrayList.of(),true),null));reservations.put(r.columnId(),allocation.read(r.requestId()));}var schema=new DistributedSchema(outer.cluster,outer.database,owned.getFirst().domainId(),0,0,columns);var catalogue=schemas(outer,f);assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(sequence++),schema,allocation.readCounter(),Map.of(),Map.of(),reservations)).status());assertArrayEquals(DistributedSchemaCodec.encode(schema),DistributedSchemaCodec.encode(catalogue.read(schema.digest())));}
+            assertThrows(IllegalArgumentException.class,()->allocation.prepareReservations(outer.operation(3),all,allocation.readCounter()));
+            var duplicate=List.of(new RatisColumnAllocation.Reservation(id(8),id(13),id(28),5),new RatisColumnAllocation.Reservation(id(9),id(14),id(28),6));assertThrows(IllegalArgumentException.class,()->allocation.prepareReservations(outer.operation(4),duplicate,allocation.readCounter()));
+        }
+    }
+
 }

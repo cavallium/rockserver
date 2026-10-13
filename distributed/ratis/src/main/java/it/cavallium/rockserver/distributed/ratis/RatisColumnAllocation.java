@@ -45,6 +45,15 @@ public final class RatisColumnAllocation {
                 List.of(new KeyPredicate(column,reservationKey(request),null),new KeyPredicate(column,counterKey(),frozenCounterWitness)));
         validator.accept(command); return command;
     }
+    /** Reserve a frozen fresh schema set without remapping its sparse or interleaved API IDs. */
+    public DistributedCommand prepareReservations(OperationId operation,Collection<Reservation> requested,byte[] frozenCounterWitness) {
+        if(requested.isEmpty() || requested.size()>RangeDirectoryCodec.MAX_COLUMNS)throw new IllegalArgumentException("Invalid reservation set size");
+        var ordered=requested.stream().sorted(Comparator.comparingLong(Reservation::apiId)).toList();long maximum=ordered.getLast().apiId();
+        var mutations=new ArrayList<Mutation>();var predicates=new ArrayList<KeyPredicate>();
+        mutations.add(new Mutation(Mutation.Kind.PUT,column,counterKey(),counterValue(maximum)));predicates.add(new KeyPredicate(column,counterKey(),frozenCounterWitness));
+        for(var reservation:ordered){byte[] key=reservationKey(reservation.requestId());mutations.add(new Mutation(Mutation.Kind.PUT,column,key,reservation.encode()));predicates.add(new KeyPredicate(column,key,null));}
+        var command=new DistributedCommand(group,epoch,schema,operation,mutations,predicates);validator.accept(command);return command;
+    }
     public CommandResult execute(DistributedCommand command) throws IOException {
         validator.accept(command); var result=content(RatisRoutedClient.rpc(() -> client.io().send(Message.valueOf(ByteString.copyFrom(DistributedCommandCodec.encode(command))))),CommandResult.MAX_BYTES);
         try { var decoded=CommandResult.decode(result); if (decoded.valueCount()!=0 || decoded.status()==CommandResult.Status.RESULT_TOO_LARGE) throw new IllegalArgumentException("Invalid allocation outcome"); return decoded; }
@@ -55,7 +64,18 @@ public final class RatisColumnAllocation {
         byte[] expected=schema.clone();
         return command -> {
             if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1 || command.minimumSessionEpoch()!=-1 || command.hasBucketData() || !command.groupId().equals(group) || command.rangeEpoch()!=epoch || !Arrays.equals(command.schemaDigest(),expected)
-                    || command.mutations().size()!=2 || command.predicates().size()!=2) throw new IllegalArgumentException("Invalid allocation envelope");
+                    || command.mutations().size()<2 || command.mutations().size()>RangeDirectoryCodec.MAX_COLUMNS+1 || command.predicates().size()!=command.mutations().size()) throw new IllegalArgumentException("Invalid allocation envelope");
+            if(Arrays.equals(command.mutations().getFirst().key(),counterKey())){
+                requirePair(command,0,column,counterKey());long previous=counter(command.predicates().getFirst().expectedValue()),maximum=previous;
+                var requests=new HashSet<UUID>();var columns=new HashSet<UUID>();
+                for(int i=1;i<command.mutations().size();i++){
+                    byte[] key=command.mutations().get(i).key();if(key.length!=17 || key[0]!=RESERVATION_TAG)throw new IllegalArgumentException("Invalid reservation set key");
+                    var in=ByteBuffer.wrap(key);in.get();UUID request=new UUID(in.getLong(),in.getLong());var reservation=Reservation.decode(request,command.mutations().get(i).value());requirePair(command,i,column,key);
+                    if(command.predicates().get(i).expectedValue()!=null || reservation.apiId()<=maximum || !requests.add(request) || !columns.add(reservation.columnId()))throw new IllegalArgumentException("Reservation set is not fresh and canonical");maximum=reservation.apiId();
+                }
+                if(counter(command.mutations().getFirst().value())!=maximum)throw new IllegalArgumentException("Reservation set changed its high water");return;
+            }
+            if(command.mutations().size()!=2)throw new IllegalArgumentException("Invalid next-ID reservation shape");
             byte[] key=command.mutations().getFirst().key(); if (key.length!=17 || key[0]!=RESERVATION_TAG) throw new IllegalArgumentException("Invalid reservation key");
             var in=ByteBuffer.wrap(key); in.get(); var request=new UUID(in.getLong(),in.getLong());
             var reservation=Reservation.decode(request,command.mutations().getFirst().value());
