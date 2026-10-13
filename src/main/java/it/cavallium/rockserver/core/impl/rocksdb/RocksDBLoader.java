@@ -9,6 +9,8 @@ import it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator;
 import java.io.InputStream;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 
 import org.github.gestalt.config.exceptions.GestaltException;
@@ -132,14 +134,97 @@ public class RocksDBLoader {
                            Map<String, Long> cacheCapacities,
                            Map<String, Cache> metadataCaches,
                            Map<String, Long> metadataCacheCapacities,
-                           Map<String, String> definitiveColumnCacheNames, @Nullable RateLimiter compactionIoLimiter) {
+                           Map<String, String> definitiveColumnCacheNames, @Nullable RateLimiter compactionIoLimiter,
+                           @Nullable StartupResources startupResources) {
+        public LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
+                        DBOptions dbOptions, Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap,
+                        Map<String, @Nullable FFMAbstractMergeOperator> mergeOperators,
+                        RocksDBObjects refs, @Nullable Cache cache, Map<String, Cache> caches,
+                        Map<String, Long> cacheCapacities, Map<String, Cache> metadataCaches,
+                        Map<String, Long> metadataCacheCapacities, Map<String, String> definitiveColumnCacheNames,
+                        @Nullable RateLimiter compactionIoLimiter) {
+            this(db, path, definitiveDbPath, dbOptions, definitiveColumnFamilyOptionsMap, mergeOperators,
+                    refs, cache, caches, cacheCapacities, metadataCaches, metadataCacheCapacities,
+                    definitiveColumnCacheNames, compactionIoLimiter, null);
+        }
+
         public LoadedDb(TransactionalDB db, @Nullable Path path, @NotNull Path definitiveDbPath,
                         DBOptions dbOptions, Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap,
                         Map<String, @Nullable FFMAbstractMergeOperator> mergeOperators,
                         RocksDBObjects refs, @Nullable Cache cache, Map<String, Cache> caches,
                         Map<String, Long> cacheCapacities, Map<String, String> definitiveColumnCacheNames) {
             this(db, path, definitiveDbPath, dbOptions, definitiveColumnFamilyOptionsMap, mergeOperators,
-                    refs, cache, caches, cacheCapacities, Map.of(), Map.of(), definitiveColumnCacheNames, null);
+                    refs, cache, caches, cacheCapacities, Map.of(), Map.of(), definitiveColumnCacheNames, null, null);
+        }
+    }
+
+    public static final class StartupResources {
+        private final StartupSettings settings;
+        private final Map<String, NativeStartupBridge.Budget> budgets;
+        private final NativeStartupBridge.AdmissionConfig admissionConfig;
+        private final List<SnapshotCache> snapshotCaches = new ArrayList<>();
+        private boolean stopped;
+
+        private StartupResources(StartupSettings settings, RocksDBObjects refs) {
+            this.settings = settings;
+            var createdBudgets = new LinkedHashMap<String, NativeStartupBridge.Budget>();
+            if (settings.admission().enabled()) {
+                // Resolve physical aliases before creating any admission owners.
+                var physicalOwners = new HashMap<Path, String>();
+                for (var group : settings.admission().storageGroups().values()) {
+                    for (Path directory : group.paths()) {
+                        Path physical = canonicalStartupDirectory(directory);
+                        String previous = physicalOwners.putIfAbsent(physical, group.id());
+                        if (previous != null && !previous.equals(group.id())) {
+                            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                                    "Startup storage directory " + physical + " belongs to both " + previous + " and " + group.id());
+                        }
+                    }
+                }
+                for (var group : settings.admission().storageGroups().values()) {
+                    var budget = NativeStartupBridge.createBudget(new NativeStartupBridge.BudgetConfig(
+                            group.id(), group.maximumOpens(), Math.toIntExact(group.progressIntervalMillis()),
+                            Math.toIntExact(group.staleAfterMillis())));
+                    refs.add(budget);
+                    createdBudgets.put(group.id(), budget);
+                }
+                admissionConfig = NativeStartupBridge.createAdmissionConfig(
+                        createdBudgets.get(settings.admission().defaultStorageId()));
+                refs.add(admissionConfig);
+                for (var group : settings.admission().storageGroups().values()) {
+                    for (Path directory : group.paths()) {
+                        admissionConfig.addRoute("", directory, createdBudgets.get(group.id()));
+                        Path physical = canonicalStartupDirectory(directory);
+                        if (!physical.equals(directory)) {
+                            admissionConfig.addRoute("", physical, createdBudgets.get(group.id()));
+                        }
+                    }
+                }
+            } else {
+                admissionConfig = null;
+            }
+            budgets = Collections.unmodifiableMap(createdBudgets);
+        }
+
+        public StartupSettings settings() { return settings; }
+        public Map<String, NativeStartupBridge.Budget> budgets() { return budgets; }
+        public @Nullable NativeStartupBridge.AdmissionConfig admissionConfig() { return admissionConfig; }
+        public List<SnapshotCache> snapshotCaches() { return List.copyOf(snapshotCaches); }
+
+        public synchronized void stopSnapshotJobs() {
+            if (stopped) return;
+            Throwable failure = null;
+            for (var cache : snapshotCaches) {
+                try {
+                    cache.stop();
+                } catch (RuntimeException | Error ex) {
+                    if (failure == null) failure = ex;
+                    else failure.addSuppressed(ex);
+                }
+            }
+            if (failure instanceof Error error) throw error;
+            if (failure instanceof RuntimeException exception) throw exception;
+            stopped = true;
         }
     }
 
@@ -147,11 +232,13 @@ public class RocksDBLoader {
 
         private final RocksDB db;
         private final List<ColumnFamilyHandle> handles;
+        private final StartupResources startupResources;
         private boolean released;
 
-        private OpenedDbGuard(RocksDB db, List<ColumnFamilyHandle> handles) {
+        private OpenedDbGuard(RocksDB db, List<ColumnFamilyHandle> handles, StartupResources startupResources) {
             this.db = db;
             this.handles = handles;
+            this.startupResources = startupResources;
         }
 
         private void release() {
@@ -165,6 +252,11 @@ public class RocksDBLoader {
             }
 
             RuntimeException cleanupFailure = null;
+            try {
+                startupResources.stopSnapshotJobs();
+            } catch (RuntimeException | Error ex) {
+                cleanupFailure = recordCleanupFailure(cleanupFailure, ex);
+            }
             try {
                 db.cancelAllBackgroundWork(true);
             } catch (Exception ex) {
@@ -191,7 +283,7 @@ public class RocksDBLoader {
             }
         }
 
-        private static RuntimeException recordCleanupFailure(RuntimeException failure, Exception next) {
+        private static RuntimeException recordCleanupFailure(RuntimeException failure, Throwable next) {
             if (failure == null) {
                 return new RuntimeException("Failed to close RocksDB after startup handoff failure", next);
             }
@@ -657,7 +749,15 @@ public class RocksDBLoader {
             @Nullable MeterRegistry meterRegistry,
             @Nullable String databaseName) {
         var refs = new RocksDBObjects();
+        StartupResources startupResources = null;
         try {
+            var settings = resolveStartupSettings(config,
+                    path == null ? Path.of(".").toAbsolutePath() : path.toAbsolutePath(),
+                    Runtime.getRuntime().availableProcessors());
+            if (path == null && settings.caches().values().stream().anyMatch(StartupSettings.CacheSnapshot::enabled)) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Hot cache snapshots require a persistent database");
+            }
             // Get databases directory path
             Path definitiveDbPath;
             if (path != null) {
@@ -669,10 +769,19 @@ public class RocksDBLoader {
                     throw new RuntimeException(e);
                 }
             }
-            var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
+            validateSnapshotDirectories(definitiveDbPath, config, settings);
+            startupResources = new StartupResources(settings, refs);
+            var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger, startupResources);
             return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger,
                     meterRegistry, databaseName);
         } catch (RuntimeException | Error failure) {
+            if (startupResources != null) {
+                try {
+                    startupResources.stopSnapshotJobs();
+                } catch (RuntimeException | Error closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
             try {
                 refs.close();
             } catch (RuntimeException closeFailure) {
@@ -687,7 +796,8 @@ public class RocksDBLoader {
                             Map<String, Cache> caches,
                             Map<String, Long> cacheCapacities,
                             Map<String, Cache> metadataCaches,
-                            Map<String, Long> metadataCacheCapacities, @Nullable RateLimiter compactionIoLimiter) {}
+                            Map<String, Long> metadataCacheCapacities, @Nullable RateLimiter compactionIoLimiter,
+                            StartupResources startupResources) {}
 
     private static DBOptions newCompatibleDBOptions() {
         // DBOptions.getDBOptionsFromProps(), unlike the public constructor, does not bootstrap JNI itself.
@@ -717,7 +827,8 @@ public class RocksDBLoader {
         Path definitiveDbPath,
         DatabaseConfig databaseOptions,
         RocksDBObjects refs,
-        Logger logger) {
+        Logger logger,
+        StartupResources startupResources) {
         try {
             var readahead = databaseOptions.global().adaptiveCompactionReadaheadMaxSize();
             if (readahead != null && (readahead.longValue() < 0
@@ -866,14 +977,14 @@ public class RocksDBLoader {
                     String cacheName = entry.getKey();
                     var budget = entry.getValue();
                     double ratio = budget.metadataSize() > 0 ? 0.0d : highPriorityPoolRatio;
-                    Cache dataCache = newBlockCache(databaseOptions.global(), budget.dataSize(), ratio,
-                            cacheName, logger);
+                    Cache dataCache = newStartupBlockCache(databaseOptions.global(), budget.dataSize(), ratio,
+                            cacheName, false, definitiveDbPath, startupResources, logger);
                     refs.add(dataCache);
                     blockCaches.put(cacheName, dataCache);
                     blockCacheCapacities.put(cacheName, budget.dataSize());
                     if (budget.metadataSize() > 0) {
-                        Cache metadataCache = newBlockCache(databaseOptions.global(), budget.metadataSize(),
-                                0.0d, cacheName + " metadata", logger);
+                        Cache metadataCache = newStartupBlockCache(databaseOptions.global(), budget.metadataSize(),
+                                0.0d, cacheName, true, definitiveDbPath, startupResources, logger);
                         refs.add(metadataCache);
                         metadataCaches.put(cacheName, metadataCache);
                         metadataCacheCapacities.put(cacheName, budget.metadataSize());
@@ -979,7 +1090,8 @@ public class RocksDBLoader {
                     Collections.unmodifiableMap(new LinkedHashMap<>(blockCaches)),
                     Collections.unmodifiableMap(new LinkedHashMap<>(blockCacheCapacities)),
                     Collections.unmodifiableMap(new LinkedHashMap<>(metadataCaches)),
-                    Collections.unmodifiableMap(new LinkedHashMap<>(metadataCacheCapacities)), compactionIoLimiter);
+                    Collections.unmodifiableMap(new LinkedHashMap<>(metadataCacheCapacities)), compactionIoLimiter,
+                    startupResources);
         } catch (GestaltException e) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.ROCKSDB_CONFIG_ERROR, e);
         }
@@ -1044,6 +1156,65 @@ public class RocksDBLoader {
         } catch (ArithmeticException overflow) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
                     "Block cache '" + name + "' size plus write-buffer-manager overflows", overflow);
+        }
+    }
+
+    private static Cache newStartupBlockCache(GlobalDatabaseConfig globalConfig, long size,
+            double highPriorityPoolRatio, String name, boolean metadata, Path dbPath,
+            StartupResources resources, Logger logger) throws GestaltException {
+        var snapshot = resources.settings().caches().get(name);
+        if (snapshot == null || !snapshot.enabled()) {
+            return newBlockCache(globalConfig, size, highPriorityPoolRatio,
+                    metadata ? name + " metadata" : name, logger);
+        }
+        var policy = metadata ? snapshot.metadata() : snapshot.data();
+        boolean clock = globalConfig.useClockCache() && highPriorityPoolRatio == 0.0d;
+        if (globalConfig.useClockCache() && !clock) {
+            logger.warn("HyperClockCache cannot reserve capacity for RocksDB metadata with this JNI; "
+                    + "using LRUCache for '{}' because block-cache-high-priority-ratio={}", name, highPriorityPoolRatio);
+        }
+        try {
+            var cache = new SnapshotCache(new NativeStartupBridge.CacheConfig(clock ? 1 : 0, -1,
+                    size, 0, policy.diskBudgetBytes(), policy.snapshotBudgetBytes(), policy.collectorEntries(),
+                    policy.indexRamBytes(), policy.maximumBlockBytes(), policy.minimumFreeDiskBytes(),
+                    policy.lookupBufferBytes(), policy.snapshotDeadlineMillis(), policy.periodMillis(),
+                    policy.readCeilingBytesPerSecond(), policy.writeCeilingBytesPerSecond(), policy.sampleEvery(),
+                    policy.lookupConcurrency(), highPriorityPoolRatio, canonicalDirectory(snapshot.directory()),
+                    snapshotNamespace(canonicalDirectory(dbPath), name, metadata)));
+            resources.snapshotCaches.add(cache);
+            return cache;
+        } catch (IOException ex) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Failed to resolve hot cache snapshot path", ex);
+        }
+    }
+
+    private static StartupSettings resolveStartupSettings(DatabaseConfig config, Path dbPath, int maximumOpens) {
+        try {
+            return StartupSettings.resolve(config, dbPath, maximumOpens);
+        } catch (GestaltException | IllegalArgumentException ex) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Failed to resolve startup settings", ex);
+        }
+    }
+
+    private static void validateSnapshotDirectories(Path dbPath, DatabaseConfig config, StartupSettings settings) {
+        if (settings.caches().values().stream().noneMatch(StartupSettings.CacheSnapshot::enabled)) return;
+        try {
+            var databaseDirectories = new ArrayList<Path>();
+            databaseDirectories.add(dbPath);
+            getWalDir(dbPath, config).ifPresent(databaseDirectories::add);
+            getVolumeConfigs(dbPath, config.global().fallbackColumnOptions()).stream()
+                    .map(DbPathRecord::path).forEach(databaseDirectories::add);
+            for (var column : config.global().columnOptions()) {
+                getVolumeConfigs(dbPath, column).stream().map(DbPathRecord::path).forEach(databaseDirectories::add);
+            }
+            for (var snapshot : settings.caches().values()) {
+                if (snapshot.enabled()) requireSeparateSnapshotDirectory(snapshot.directory(), databaseDirectories);
+            }
+        } catch (IOException | GestaltException ex) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Failed to validate hot cache snapshot directories", ex);
         }
     }
 
@@ -1120,6 +1291,73 @@ public class RocksDBLoader {
                             + walSizeLimitMb);
         }
         return walSizeLimitMb;
+    }
+
+    private static Path canonicalStartupDirectory(Path directory) {
+        try {
+            return canonicalDirectory(directory);
+        } catch (IOException ex) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Failed to resolve startup storage directory " + directory, ex);
+        }
+    }
+
+    /** Uses the same canonical path routing for opening and foreground feedback. */
+    public static String physicalStorageFor(StartupSettings settings, Path directory) {
+        Path physical = canonicalStartupDirectory(directory);
+        String storage = settings.admission().defaultStorageId();
+        int depth = -1;
+        for (var group : settings.admission().storageGroups().values()) {
+            for (Path configured : group.paths()) {
+                Path prefix = canonicalStartupDirectory(configured);
+                if (physical.startsWith(prefix) && prefix.getNameCount() > depth) {
+                    storage = group.id();
+                    depth = prefix.getNameCount();
+                }
+            }
+        }
+        return storage;
+    }
+
+    /** A stable, native-safe namespace unique to one physical DB and cache pool. */
+    static String snapshotNamespace(Path canonicalDbPath, String cacheName, boolean metadata) {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            for (String component : List.of(canonicalDbPath.toString(), cacheName, metadata ? "METADATA" : "DATA")) {
+                byte[] bytes = component.getBytes(StandardCharsets.UTF_8);
+                digest.update(java.nio.ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());
+                digest.update(bytes);
+            }
+            return "rs_" + Base64.getUrlEncoder().withoutPadding().encodeToString(digest.digest());
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new AssertionError(impossible);
+        }
+    }
+
+    /** Resolve existing symlinked parents as well as paths that have not been created yet. */
+    static Path canonicalDirectory(Path directory) throws IOException {
+        Path absolute = directory.toAbsolutePath().normalize();
+        Path existing = absolute;
+        while (!Files.exists(existing)) {
+            existing = existing.getParent();
+            if (existing == null) {
+                throw new IOException("No existing parent for " + directory);
+            }
+        }
+        return existing.toRealPath().resolve(existing.relativize(absolute)).normalize();
+    }
+
+    static void requireSeparateSnapshotDirectory(Path directory, Collection<Path> databaseDirectories)
+            throws IOException {
+        Path snapshot = canonicalDirectory(directory);
+        for (Path databaseDirectory : databaseDirectories) {
+            Path database = canonicalDirectory(databaseDirectory);
+            if (snapshot.startsWith(database) || database.startsWith(snapshot)) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Hot cache snapshot directory must be separate from DB, WAL and SST directories: "
+                                + snapshot + " overlaps " + database);
+            }
+        }
     }
 
     private static Optional<Path> getWalDir(Path definitiveDbPath, DatabaseConfig databaseOptions)
@@ -1235,6 +1473,20 @@ public class RocksDBLoader {
                 mergeOperators.put(name, columnFamilyOptions.mergeOperator());
             }
 
+            var admissionConfig = optionsWithCache.startupResources().admissionConfig();
+            if (admissionConfig != null) {
+                for (var entry : columnConfigMap.entrySet()) {
+                    var volumes = getVolumeConfigs(definitiveDbPath, entry.getValue());
+                    List<Path> directories = volumes.isEmpty() ? List.of(definitiveDbPath)
+                            : volumes.stream().map(DbPathRecord::path).toList();
+                    for (Path directory : directories) {
+                        String storage = physicalStorageFor(optionsWithCache.startupResources().settings(), directory);
+                        admissionConfig.addRoute(entry.getKey(), directory,
+                                optionsWithCache.startupResources().budgets().get(storage));
+                    }
+                }
+                admissionConfig.attach(rocksdbOptions);
+            }
             var handles = new ArrayList<ColumnFamilyHandle>();
             RocksDB db;
             boolean envRegistered = false;
@@ -1297,7 +1549,7 @@ public class RocksDBLoader {
                 }
             }
 
-            try (var openedDbGuard = new OpenedDbGuard(db, handles)) {
+            try (var openedDbGuard = new OpenedDbGuard(db, handles, optionsWithCache.startupResources())) {
                 handles.forEach(refs::add);
 
                 logger.info("Opened RocksDB with effective WAL configuration: "
@@ -1331,7 +1583,8 @@ public class RocksDBLoader {
                         optionsWithCache.cacheCapacities(),
                         optionsWithCache.metadataCaches(),
                         optionsWithCache.metadataCacheCapacities(),
-                        Collections.unmodifiableMap(new HashMap<>(definitiveColumnCacheNames)), optionsWithCache.compactionIoLimiter());
+                        Collections.unmodifiableMap(new HashMap<>(definitiveColumnCacheNames)), optionsWithCache.compactionIoLimiter(),
+                        optionsWithCache.startupResources());
                 openedDbGuard.release();
                 envRegistered = false;
                 return loadedDb;

@@ -1,0 +1,301 @@
+package it.cavallium.rockserver.core.impl.rocksdb;
+
+import static it.cavallium.rockserver.core.impl.rocksdb.StartupProductionQualification.*;
+
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.client.EmbeddedConnection;
+import it.cavallium.rockserver.core.common.*;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+/** Paired in-process service qualification; production loader, schedulers and feedback controller own all policy. */
+public final class StartupEmbeddedQualification {
+    private static final String EMBEDDED_MARKER = ".startup-embedded-qualification";
+    private static Keys keys(byte[] bytes) { return new Keys(Buf.wrap(bytes)); }
+    private static void verifyValue(Buf actual, int id) {
+        if (!Objects.equals(actual, Buf.wrap(value(id)))) throw new IllegalStateException("Data mismatch: " + id);
+    }
+    private static Object field(Object owner, String name) throws ReflectiveOperationException {
+        var field = owner.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(owner);
+    }
+    private static long[] telemetry(RWScheduler scheduler, RWScheduler.Pool pool) {
+        var result = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+        scheduler.copyPoolTelemetry(pool, result);
+        return result;
+    }
+    private static Map<String, Long> schedulerStats(RWScheduler scheduler) {
+        var r = telemetry(scheduler, RWScheduler.Pool.READ);
+        var w = telemetry(scheduler, RWScheduler.Pool.WRITE);
+        return Map.of("active", r[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS] + w[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS],
+                "queued", r[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS] + w[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS],
+                "accepted", r[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS] + w[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
+                "terminal", r[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES] + w[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]);
+    }
+    private static <T> T awaitRequest(Future<T> request, long deadline) throws Exception {
+        try {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) throw new TimeoutException("Measured workload deadline expired");
+            return request.get(remaining, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            request.cancel(false);
+            Thread.currentThread().interrupt();
+            throw interrupted;
+        } catch (TimeoutException timeout) {
+            request.cancel(false);
+            throw timeout;
+        }
+    }
+    private static Map<String, Long> settledScheduler(RWScheduler scheduler) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        for (;;) {
+            var stats = schedulerStats(scheduler);
+            if (stats.get("active") == 0 && stats.get("queued") == 0 && stats.get("accepted").equals(stats.get("terminal"))) return stats;
+            if (System.nanoTime() >= deadline) throw new IllegalStateException("Service scheduler did not settle: " + stats);
+            Thread.sleep(1);
+        }
+    }
+    private static Map<String, String> cacheStats(RocksDBLoader.StartupResources resources) {
+        var c = resources.snapshotCaches();
+        return c.isEmpty() ? Map.of() : stats(c.getFirst(), c.getLast());
+    }
+    private static void awaitCapturePermission(RocksDBLoader.StartupResources resources) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        // Observe actual controller feedback; never force a healthy sample or override native pressure.
+        while (resources.snapshotCaches().stream().anyMatch(c -> !c.stats().contains("\"feedback\":0"))) {
+            if (System.nanoTime() >= deadline) throw new IllegalStateException("Controller did not permit idle capture: " + cacheStats(resources));
+            Thread.sleep(25);
+        }
+    }
+    private static int captureIdle(RocksDBLoader.StartupResources resources) throws Exception {
+        awaitCapturePermission(resources);
+        var c = resources.snapshotCaches();
+        return captureBoth(c.getFirst(), c.getLast());
+    }
+    private static Path config(Path db, Path cache, String mode, boolean direct, int dataSample, int metadataSample, long period) throws Exception {
+        boolean seed = mode.equals("seed"), snapshots = seed || mode.equals("cache") || mode.equals("both");
+        boolean admission = mode.equals("admission") || mode.equals("both");
+        String text = """
+                database.metrics.jmx.enabled = false
+                database.metrics.influx.enabled = false
+                database.parallelism: {read: 4, write: 4}
+                database.global: {
+                  enable-fast-get: true
+                  adaptive-compaction-io: false
+                  use-direct-io: %s
+                  allow-rocksdb-memory-mapping: false
+                  disable-auto-compactions: true
+                  maximum-open-files: -1
+                  max-file-opening-threads: 4
+                  open-files-async: %s
+                  use-clock-cache: true
+                  block-cache: 32MiB
+                  block-cache-metadata-size: 4MiB
+                  write-buffer-manager: 0B
+                  startup-io: {enabled: %s, default-storage-id: embedded_qualification,
+                    storage-groups: [{id: embedded_qualification, maximum-opens: 4,
+                      progress-interval: PT0.1S, stale-after: PT2S, paths: ["%s"]}]}
+                  hot-cache-snapshot: {enabled: %s, directory: "%s",
+                    data: {disk-budget: 36MiB, snapshot-budget: 12MiB, collector-entries: 8192, index-ram: 4MiB,
+                      maximum-block: 256KiB, lookup-buffer: 2MiB, minimum-free-disk: 64MiB,
+                      snapshot-deadline: PT5S, period: "PT%sS", sample-every: %d, lookup-concurrency: 2,
+                      read-ceiling: 8MiB, write-ceiling: 8MiB},
+                    metadata: {disk-budget: 12MiB, snapshot-budget: 4MiB, collector-entries: 2048, index-ram: 2MiB,
+                      maximum-block: 256KiB, lookup-buffer: 2MiB, minimum-free-disk: 64MiB,
+                      snapshot-deadline: PT5S, period: "PT%sS", sample-every: %d, lookup-concurrency: 2,
+                      read-ceiling: 8MiB, write-ceiling: 8MiB}}
+                  fallback-column-options: {volumes: [], levels: [], first-level-sst-size: 16MiB, max-last-level-sst-size: 16MiB,
+                    write-buffer-size: 8MiB, block-size: 16KiB, cache-index-and-filter-blocks: true,
+                    pin-index-and-filter-blocks: false}
+                }
+                """.formatted(direct, !seed && !mode.equals("verify"), admission, db, snapshots, cache,
+                seed ? "0" : period / 1000.0, dataSample, seed ? "0" : period / 1000.0, metadataSample);
+        return Files.writeString(db.resolveSibling(db.getFileName() + ".embedded.conf"), text);
+    }
+    public static void main(String[] args) throws Exception {
+        if (args.length != 10) throw new IllegalArgumentException("db cache seed|none|cache|admission|both|verify datasetMiB operations direct dataSampling metadataSampling periodMs workloadTimeoutSeconds");
+        Path db = Path.of(args[0]).toAbsolutePath(), cache = Path.of(args[1]).toAbsolutePath();
+        String mode = args[2];
+        if (!Set.of("seed", "none", "cache", "admission", "both", "verify").contains(mode)) throw new IllegalArgumentException(mode);
+        int mib = Integer.parseInt(args[3]), operations = Integer.parseInt(args[4]);
+        boolean direct = Boolean.parseBoolean(args[5]), seed = mode.equals("seed"), checking = mode.equals("verify");
+        int dataSample = Integer.parseInt(args[6]), metadataSample = Integer.parseInt(args[7]);
+        long period = Long.parseLong(args[8]);
+        int workloadSeconds = Integer.parseInt(args[9]);
+        if (workloadSeconds < 10 || workloadSeconds > 3600) throw new IllegalArgumentException("Workload timeout bound");
+        if (mib < 1 || mib > 1024 || operations < 1 || operations > 1_000_000 || period < 100 || period > 86400000)
+            throw new IllegalArgumentException("Unbounded workload");
+        int count = Math.toIntExact(mib * MIB / VALUE_BYTES);
+        if (seed && Files.exists(db)) throw new IllegalArgumentException("Seed requires a new task-owned DB path");
+        if (!seed && !Files.readString(db.resolve(EMBEDDED_MARKER)).equals("v1:" + count)) throw new IllegalArgumentException("Fixture marker mismatch");
+        System.setProperty("rockserver.core.print-config", "false");
+        var output = new LinkedHashMap<String, Object>();
+        output.put("mode", mode); output.put("fixture_keys", count); output.put("direct_reads", direct);
+        output.put("scope", "EmbeddedConnection public in-process service APIs; network/transport excluded");
+        output.put("primary_cache_capacity_bytes", CAPACITY);
+        output.put("cache_geometry", "Loader HCC DATA28MiB/METADATA4MiB; loader WBM auto16MiB charged within DATA; matched modes");
+        output.put("data_sample_every", dataSample); output.put("metadata_sample_every", metadataSample);
+        output.put("capture_period_ms", period); output.put("capture_period_override", period != 300000);
+        output.put("workload_timeout_seconds", workloadSeconds);
+        output.put("bounded_inflight_requests_per_lane", 1);
+        output.put("caller_lanes", "two asynchronous read lanes plus one asynchronous put/readback lane");
+        Path conf = config(db, cache, mode, direct, dataSample, metadataSample, period);
+        output.put("effective_config", Files.readString(conf));
+        long beforeOpen = System.nanoTime();
+        List<SnapshotCache> retainedCaches = List.of();
+        long beforeClose;
+        try (var connection = new EmbeddedConnection(db, "embedded-qualification", conf)) {
+            output.put("embedded_connection_open_ns", System.nanoTime() - beforeOpen);
+            var api = connection.getSyncApi(RequestContext.batch(Duration.ofSeconds(workloadSeconds)));
+            long column = seed ? api.createColumn("entries", ColumnSchema.of(IntList.of(8), ObjectList.of(), true)) : api.getColumnId("entries");
+            var internal = connection.getInternalDB();
+            var resources = (RocksDBLoader.StartupResources) field(internal, "startupResources");
+            retainedCaches = resources.snapshotCaches();
+            var scheduler = internal.getScheduler();
+            var budget = resources.budgets().values().stream().findFirst().orElse(null);
+            if (seed) {
+                for (int i = 0; i < count; i++) {
+                    api.put(0, column, keys(key(i)), Buf.wrap(value(i)), RequestType.none());
+                    if ((i + 1) % 2048 == 0) api.flush();
+                }
+                api.flush(); api.compact();
+                var files = api.getSstMetadata(column, -1).files();
+                output.put("fixture_live_sst_files", files.size());
+                output.put("fixture_l0_files", files.stream().filter(f -> f.level() == 0).count());
+                if (files.isEmpty() || files.stream().anyMatch(f -> f.level() == 0))
+                    throw new IllegalStateException("Fixture must contain compacted non-L0 SSTs");
+                // Native sampling rejects observations under pressure: wait before the existing single prime pass.
+                awaitCapturePermission(resources);
+                for (int i = 0; i < Math.min(count, 4096); i++) verifyValue(api.get(0, column, keys(key(i)), RequestType.current()), i);
+                int status = captureIdle(resources);
+                if (status != 0) throw new IllegalStateException("Seed durable capture failed: " + status);
+                output.put("capture_status", status); output.put("cache_stats", cacheStats(resources));
+                output.put("cache_compatibility_id", resources.snapshotCaches().getFirst().compatibilityId());
+                Files.writeString(db.resolve(EMBEDDED_MARKER), "v1:" + count);
+            } else if (checking) {
+                for (int i = 0; i < WRITES; i++) verifyValue(api.get(0, column, keys(writeKey(i)), RequestType.current()), ~i);
+                output.put("persisted_writes_verified", WRITES);
+            } else {
+                var async = connection.getAsyncApi(RequestContext.batch(Duration.ofSeconds(workloadSeconds)));
+                var point = new Histogram(); var hot = new Histogram(); var cold = new Histogram();
+                var bulk = new Histogram(); var write = new Histogram(); var overlap = new Histogram(); var steady = new Histogram();
+                var samples = Collections.synchronizedList(new ArrayList<Map<String, Object>>());
+                var running = new AtomicBoolean(true); var opening = new AtomicBoolean(); var readers = new AtomicInteger(2);
+                var completedWrites = new AtomicLong(); var duringReads = new AtomicLong();
+                var start = new CountDownLatch(1);
+                var schedulerBefore = settledScheduler(scheduler);
+                long started = System.nanoTime();
+                long workDeadline = started + TimeUnit.SECONDS.toNanos(workloadSeconds);
+                output.put("scheduler_before", schedulerBefore);
+                output.put("cache_stats_at_foreground_start", cacheStats(resources));
+                if (budget != null) output.put("admission_at_foreground_start", admission(budget));
+                long foregroundEnded;
+                try (var pool = Executors.newFixedThreadPool(4)) {
+                    var monitor = pool.submit(() -> {
+                        try {
+                            while (running.get()) {
+                                var sample = new LinkedHashMap<String, Object>();
+                                sample.put("elapsed_ns", System.nanoTime() - started);
+                                sample.put("scheduler", schedulerStats(scheduler));
+                                if (budget != null) {
+                                    var counters = budget.snapshot(); opening.set(counters.active() + counters.queued() > 0);
+                                    sample.put("admission", admission(budget));
+                                }
+                                sample.put("cache_stats", cacheStats(resources));
+                                samples.add(sample);
+                                Thread.sleep(100);
+                            }
+                        } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+                    });
+                    var tasks = new ArrayList<Future<?>>();
+                    for (int lane = 0; lane < 2; lane++) {
+                        final int salt = lane;
+                        tasks.add(pool.submit(() -> {
+                            try {
+                                start.await(); var random = new Random(314159L + salt);
+                                for (int op = 0; op < operations; op++) {
+                                    int id = op % 2 == 0 ? random.nextInt(Math.min(count, 1024)) : random.nextInt(count);
+                                    boolean activeOpen = opening.get();
+                                    if (op % 4 == 0) {
+                                        var batch = new ArrayList<Keys>();
+                                        for (int i = 0; i < 8; i++) batch.add(keys(key((id + i * 997) % count)));
+                                        long before = System.nanoTime(); var values = awaitRequest(async.existsMultiAsync(0, column, batch), workDeadline);
+                                        long ns = System.nanoTime() - before; bulk.record(ns); (activeOpen ? overlap : steady).record(ns);
+                                        if (!values.equals(Collections.nCopies(8, true))) throw new IllegalStateException("ExistsMulti mismatch");
+                                    } else {
+                                        Keys requestKey = keys(key(id));
+                                        long before = System.nanoTime(); Buf value = awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline);
+                                        long ns = System.nanoTime() - before; point.record(ns); (op % 2 == 0 ? hot : cold).record(ns); (activeOpen ? overlap : steady).record(ns);
+                                        verifyValue(value, id);
+                                    }
+                                }
+                            } catch (Exception failure) { throw new CompletionException(failure); }
+                            finally { readers.decrementAndGet(); }
+                        }));
+                    }
+                    tasks.add(pool.submit(() -> {
+                        try {
+                            start.await();
+                            for (int sequence = 0; sequence < WRITES || readers.get() > 0; sequence++) {
+                                int id = sequence % WRITES; long cycle = System.nanoTime(); boolean activeReaders = readers.get() > 0;
+                                Keys requestKey = keys(writeKey(id)); Buf requestValue = Buf.wrap(value(~id));
+                                long before = System.nanoTime(); awaitRequest(async.putAsync(0, column, requestKey, requestValue, RequestType.none()), workDeadline);
+                                write.record(System.nanoTime() - before);
+                                verifyValue(awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline), ~id);
+                                completedWrites.incrementAndGet(); if (activeReaders) duringReads.incrementAndGet();
+                                long pause = 1_000_000_000L / 128 - (System.nanoTime() - cycle);
+                                if (pause > 0) TimeUnit.NANOSECONDS.sleep(pause);
+                            }
+                        } catch (Exception failure) { throw new CompletionException(failure); }
+                    }));
+                    start.countDown();
+                    try {
+                        for (var task : tasks) awaitRequest(task, workDeadline);
+                        foregroundEnded = System.nanoTime();
+                        output.put("cache_stats_before_final_capture", cacheStats(resources));
+                        if (budget != null) output.put("admission_at_foreground_end", admission(budget));
+                    }
+                    finally { running.set(false); pool.shutdownNow(); monitor.get(10, TimeUnit.SECONDS); }
+                }
+                output.put("foreground_elapsed_ns", foregroundEnded - started);
+                output.put("point", point.report()); output.put("hot_point", hot.report()); output.put("cold_point", cold.report());
+                output.put("exists_multi", bulk.report()); output.put("writes", write.report());
+                output.put("completed_writes", completedWrites.get()); output.put("writes_during_read_tasks", duringReads.get());
+                output.put("opening_overlap", overlap.report()); output.put("steady_or_unclassified", steady.report());
+                output.put("overlap_classification", budget == null ? "unclassified: admission disabled" : "approximate: latest100ms actual admission sample");
+                var schedulerAfter = settledScheduler(scheduler);
+                long accepted = schedulerAfter.get("accepted") - schedulerBefore.get("accepted");
+                long terminal = schedulerAfter.get("terminal") - schedulerBefore.get("terminal");
+                long requests = 2L * operations + 2 * completedWrites.get();
+                if (accepted < requests || accepted != terminal)
+                    throw new IllegalStateException("Public asynchronous requests lacked conserved admission: " + accepted + "/" + terminal + " expected at least " + requests);
+                output.put("scheduler_after", schedulerAfter);
+                output.put("scheduler_accepted_delta", accepted); output.put("scheduler_terminal_delta", terminal);
+                output.put("verified_public_request_completions", requests); output.put("samples", samples);
+                if (!resources.snapshotCaches().isEmpty()) {
+                    output.put("capture_status", captureIdle(resources));
+                    output.put("final_capture_scope", "post-workload, actual idle controller feedback; no feedback override, excluded from timed workload");
+                    output.put("cache_stats", cacheStats(resources));
+                    output.put("cache_usage_bytes", resources.snapshotCaches().stream().mapToLong(SnapshotCache::getUsage).sum());
+                }
+                if (budget != null) output.put("admission_before_close", admission(budget));
+            }
+            beforeClose = System.nanoTime();
+        }
+        output.put("embedded_connection_close_ns", System.nanoTime() - beforeClose);
+        if (retainedCaches.stream().anyMatch(SnapshotCache::isOwningHandle))
+            throw new IllegalStateException("Snapshot holders remained open after service shutdown");
+        output.put("snapshot_holders_closed", true);
+        output.put("data_mismatches", 0); output.put("status", "PASS");
+        System.out.println(json(output));
+    }
+}
