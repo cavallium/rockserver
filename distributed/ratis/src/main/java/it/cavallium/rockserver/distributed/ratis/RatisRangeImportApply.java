@@ -45,8 +45,8 @@ public final class RatisRangeImportApply {
     public UUID groupId() { return manifest.groupId(); }
     public RangeImportDefinition definition() { return definition; }
     public void requireGroup(UUID group) { if(!groupId().equals(group))throw new IllegalArgumentException("Foreign import apply group"); }
-    /** Original committed reply, qualified locally without file pins or catalogue RPC. */
-    public synchronized byte[] recoveredResult(RatisRangeImportRecord record) throws RocksDBException {
+    /** Original reply uses immutable binding fields and the store's own metadata synchronization; it never borrows the trusted RPC monitor. */
+    public byte[] recoveredResult(RatisRangeImportRecord record) throws RocksDBException {
         record.requireDefinition(definition);
         if(record instanceof RatisRangeImportRecord.Install install) {
             var receipt=store.importReceipt(); if(receipt==null)return null;
