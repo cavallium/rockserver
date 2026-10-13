@@ -41,6 +41,9 @@ def main():
     parser.add_argument("--buffered-reads", action="store_true", help="Explicit uncontrolled OS data-cache ablation")
     parser.add_argument("--data-sample-every", type=int, default=64, help="Production DATA sampling; 1 explicitly stresses capture")
     parser.add_argument("--metadata-sample-every", type=int, default=16, help="Production METADATA sampling; 1 explicitly stresses capture")
+    parser.add_argument("--seed-hot-keys", type=int, default=4096, help="Explicit declared seed foreground keys, clipped to dataset; original default 4096")
+    parser.add_argument("--seed-passes", type=int, default=1, help="Actual verified Get passes; original default 1, repeated passes deterministically shuffled")
+    parser.add_argument("--startup-window-ms", type=int, default=5000, help="Separate post-open native-call-start window, bounded 100..60000ms")
     parser.add_argument("--prepare-only", action="store_true", help="Compile/record contract; creates no disk fixtures or measured runs")
     parser.add_argument("--resume", action="store_true", help="Resume same frozen manifest, skipping trials with completed reopen evidence")
     args = parser.parse_args()
@@ -53,6 +56,11 @@ def main():
         parser.error("Provide exactly one matching --cache-disk for each --disk")
     if not 100 <= args.capture_period_ms <= 86400000:
         parser.error("Capture period must be100..86400000ms")
+    effective_seed_keys = min(args.dataset_mib * 1024**2 // 4096, args.seed_hot_keys)
+    if not 1 <= args.seed_hot_keys <= 262144 or not 1 <= args.seed_passes <= 1024 or effective_seed_keys * args.seed_passes > 1_048_576:
+        parser.error("Declared seed history must be bounded to 1048576 verified Gets, keys 1..262144, passes 1..1024")
+    if not 100 <= args.startup_window_ms <= 60000:
+        parser.error("Startup window must be 100..60000ms")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=args.resume)
     source = Path(__file__).parent / "java" / "StartupProductionQualification.java"
@@ -76,6 +84,10 @@ def main():
                 "cache_geometry": "AutoHyperClockCache DATA28MiB METADATA4MiB, estimatedEntryCharge0/shards-1 baseline/candidate matched",
                 "feedback": "Real StartupIoPolicy and StartupReadCompletions, 1second coherent native-call cohorts, 3tracked foreground tasks including writes; 100ms sampled admission-overlap classification",
                 "service_acceptance": "Requires separate paired EmbeddedDB service gate",
+                "declared_seed_history": {"requested_keys": args.seed_hot_keys, "effective_keys": effective_seed_keys,
+                                          "passes": args.seed_passes, "verified_gets": effective_seed_keys * args.seed_passes,
+                                          "order": "sequential" if args.seed_passes == 1 else "deterministic per-pass shuffle"},
+                "startup_window_scope": "Separate post-open foreground native-call-start window; no open/WAL or close; full-workload thresholds unchanged",
                 "sampling_scope": "Production DATA 64/METADATA 16 defaults; explicit sample-every 1 is capture stress only",
                 "runtime_artifacts": artifacts, "machine": platform.uname()._asdict(),
                 "parameters": {k: str(v) if isinstance(v, Path) else [str(p) for p in v] if isinstance(v, list) else v
@@ -138,7 +150,7 @@ def main():
         command = ["java", "-Xms32m", "-Xmx256m", "--enable-native-access=ALL-UNNAMED",
                    "-cp", str(classes) + os.pathsep + args.classpath,
                    "it.cavallium.rockserver.core.impl.rocksdb.StartupProductionQualification",
-                   str(db), str(cache), mode, str(args.dataset_mib), str(args.operations), str(not args.buffered_reads).lower(), str(args.data_sample_every), str(args.metadata_sample_every), str(args.capture_period_ms)]
+                   str(db), str(cache), mode, str(args.dataset_mib), str(args.operations), str(not args.buffered_reads).lower(), str(args.data_sample_every), str(args.metadata_sample_every), str(args.capture_period_ms), str(args.seed_hot_keys), str(args.seed_passes), str(args.startup_window_ms)]
         write_json(out / (label + ".command.json"), command)
         with (out / (label + ".stdout")).open("w") as stdout, (out / (label + ".stderr")).open("w") as stderr:
             started = time.monotonic()
@@ -181,6 +193,9 @@ def main():
         if "cache_stats" in report:
             counters = {role: json.loads(raw) for role, raw in report["cache_stats"].items()}
             report["cache_counters"] = counters
+            report["snapshot_occupancy_bytes_including_header_and_index"] = {role: stats["snapshot_bytes"] for role, stats in counters.items()}
+            report["snapshot_occupancy_fraction"] = {role: stats["snapshot_bytes"] / ((12 if role == "data" else 4) * 1024**2) for role, stats in counters.items()}
+            report["sample_candidates_observations_not_unique_entries"] = {role: stats["sample_candidates"] for role, stats in counters.items()}
             for role, stats in counters.items():
                 snapshot_budget = (12 if role == "data" else 4) * 1024**2
                 if stats["errors"] or stats["rejected"] or stats["snapshot_bytes"] > snapshot_budget or stats["lookup_reserved_bytes"] > 2 * 1024**2:
@@ -219,7 +234,7 @@ def main():
                                    "overlap_classification": report["overlap_classification"],
                                    "opening_overlap_operations": report["opening_overlap"]["operations"],
                                    "completed_find_table_calls_including_hits": opening.get("completed_find_table"),
-                                   "actual_physical_opened_ssts": "not exposed by API"})
+                                   "owned_successful_physical_file_open_events": opening.get("owned_successful_file_opens")})
             mechanism_exercised = all(
                 (mode not in ("cache", "both") or
                  (report.get("actual_secondary_hits", 0) > 0 and report.get("durable_final_capture")
