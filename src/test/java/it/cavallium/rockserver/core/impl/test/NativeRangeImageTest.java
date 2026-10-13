@@ -45,6 +45,29 @@ class NativeRangeImageTest {
         return new Mutation(Mutation.Kind.PUT, column, key(key), bytes(value));
     }
 
+    @Test void admittedImageCanSpanManyBurstsAndHashesThroughTheSameGate()throws Exception {
+        try(var pool=new Pool(directory.resolve("admitted-pool"))){
+            pool.store.applyNoop(new ApplyPosition(1,0));pool.db.put(pool.handles.get(1),key(0x80),new byte[3*1024*1024]);
+            var limits=new Limits(4*1024*1024,8*1024*1024,4);var calls=new java.util.concurrent.atomic.AtomicInteger();var charged=new java.util.concurrent.atomic.AtomicLong();
+            IoAdmission gate=bytes->{assertTrue(bytes>0 && bytes<=1024*1024);calls.incrementAndGet();charged.addAndGet(bytes);};
+            try(var pin=pool.store.capture()){
+                var path=directory.resolve("admitted.image");var written=NativeRangeImage.writeAdmitted(path,pin,interval(),limits,gate);
+                assertTrue(written.bytes()>3*1024*1024);assertTrue(calls.get()>3);assertTrue(charged.get()>=written.bytes());
+                long before=charged.get();var inspected=NativeRangeImage.inspectAdmitted(path,limits,gate);assertArrayEquals(written.sha256(),inspected.sha256());assertTrue(charged.get()-before>=written.bytes());
+                before=charged.get();assertArrayEquals(MessageDigest.getInstance("MD5").digest(Files.readAllBytes(path)),NativeRangeImage.md5Admitted(path,gate));assertTrue(charged.get()-before>=written.bytes());
+            }
+        }
+    }
+    @Test void deniedImageIoPublishesNothingAndLeavesTheOriginalPinReusable()throws Exception {
+        try(var pool=new Pool(directory.resolve("denied-pool"))){pool.store.applyNoop(new ApplyPosition(1,0));
+            try(var pin=pool.store.capture()){
+                var path=directory.resolve("denied.image");assertThrows(IOException.class,()->NativeRangeImage.writeAdmitted(path,pin,interval(),LIMITS,bytes->{throw new IOException("controlled admission denial");}));assertFalse(Files.exists(path));
+                var calls=new java.util.concurrent.atomic.AtomicInteger();assertThrows(IOException.class,()->NativeRangeImage.writeAdmitted(path,pin,interval(),LIMITS,bytes->{if(calls.incrementAndGet()>1)throw new IOException("controlled write denial");}));assertFalse(Files.exists(path));
+                var written=NativeRangeImage.writeAdmitted(path,pin,interval(),LIMITS,IoAdmission.UNLIMITED);assertArrayEquals(written.sha256(),NativeRangeImage.inspect(path,LIMITS).sha256());
+            }
+        }
+    }
+
     @Test
     void exportsOneNativeCutWithExactSortedIntervalsAndOriginalReceipts() throws Exception {
         try (Pool pool = new Pool(directory.resolve("pool"))) {

@@ -80,6 +80,25 @@ public final class NativeRangeImage {
         void accept(Section section, UUID columnId, byte[] key, byte[] value) throws IOException;
     }
 
+    @FunctionalInterface public interface IoAdmission {
+        /** Before the actual read/write; the caller owns cancellation and any waiting. Maximum quantum is 1 MiB. */
+        void beforeBytes(int bytes)throws IOException;
+        IoAdmission UNLIMITED=bytes->{};
+    }
+    private static final int IO_QUANTUM=1024*1024;
+    private static OutputStream admittedOutput(OutputStream output,IoAdmission admission){return new FilterOutputStream(output){
+        public void write(int value)throws IOException{admission.beforeBytes(1);out.write(value);}
+        public void write(byte[] bytes,int offset,int length)throws IOException{while(length>0){int count=Math.min(length,IO_QUANTUM);admission.beforeBytes(count);out.write(bytes,offset,count);offset+=count;length-=count;}}
+    };}
+    private static InputStream admittedInput(InputStream input,IoAdmission admission){return new FilterInputStream(input){
+        public int read()throws IOException{admission.beforeBytes(1);return in.read();}
+        public int read(byte[] bytes,int offset,int length)throws IOException{if(length==0)return 0;int count=Math.min(length,IO_QUANTUM);admission.beforeBytes(count);return in.read(bytes,offset,count);}
+    };}
+    public static byte[] md5Admitted(Path image,IoAdmission admission)throws IOException{
+        final MessageDigest digest;try{digest=MessageDigest.getInstance("MD5");}catch(NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}
+        try(var input=admittedInput(Files.newInputStream(image),Objects.requireNonNull(admission))){var bytes=new byte[65536];for(int count;(count=input.read(bytes))!=-1;)digest.update(bytes,0,count);}return digest.digest();
+    }
+
     private record HomeContext(UUID cluster,UUID database,UUID column) {}
     private record SnapshotHomeContext(UUID cluster,UUID database,UUID column) {}
     private record Header(RangeOwnership.Owner owner, RangeOwnership.Interval interval,
@@ -102,6 +121,10 @@ public final class NativeRangeImage {
     public static Manifest write(Path destination, ReplicatedRangeStore.SnapshotPin pin,
                                  RangeOwnership.Interval interval, Limits limits)
             throws IOException, RocksDBException {
+        return writeAdmitted(destination,pin,interval,limits,IoAdmission.UNLIMITED);
+    }
+    public static Manifest writeAdmitted(Path destination,ReplicatedRangeStore.SnapshotPin pin,RangeOwnership.Interval interval,Limits limits,IoAdmission admission)throws IOException,RocksDBException {
+        Objects.requireNonNull(admission).beforeBytes(1);
         Objects.requireNonNull(pin, "pin");
         Objects.requireNonNull(interval, "interval");
         Objects.requireNonNull(limits, "limits");
@@ -130,7 +153,7 @@ public final class NativeRangeImage {
             try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE,
                     StandardOpenOption.TRUNCATE_EXISTING)) {
                 var counted = new BoundedOutput(new DigestOutputStream(new BufferedOutputStream(
-                        Channels.newOutputStream(channel)), whole), limits.maxImageBytes());
+                        admittedOutput(Channels.newOutputStream(channel),admission)), whole), limits.maxImageBytes());
                 var bodyOutput = new DigestOutputStream(counted, body);
                 var output = new DataOutputStream(bodyOutput);
                 writeHeader(output, header);
@@ -184,6 +207,8 @@ public final class NativeRangeImage {
     public static Manifest inspect(Path image, Limits limits) throws IOException {
         return visit(image, limits, (section, column, key, value) -> {});
     }
+
+    public static Manifest inspectAdmitted(Path image,Limits limits,IoAdmission admission)throws IOException{return visit(image,limits,(section,column,key,value)->{},true,null,null,Objects.requireNonNull(admission));}
 
     /** Role-qualified history inventory; authority/classification is installed by trusted catalogue bootstrap. */
     public static Manifest inspectCatalogueHistory(Path image,Limits limits,UUID historyColumn,java.util.function.Predicate<byte[]> historyKeys) throws IOException {
@@ -242,14 +267,15 @@ public final class NativeRangeImage {
      * Use inspect first for validation before effects, and still require visit success afterward.
      */
     public static Manifest visit(Path image, Limits limits, RowVisitor visitor) throws IOException { return visit(image,limits,visitor,true,null,null); }
-    private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required,SnapshotHomeContext snapshotHome) throws IOException {
+    private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required,SnapshotHomeContext snapshotHome) throws IOException {return visit(image,limits,visitor,verifyCreditUsers,required,snapshotHome,IoAdmission.UNLIMITED);}
+    private static Manifest visit(Path image, Limits limits, RowVisitor visitor,boolean verifyCreditUsers,HomeContext required,SnapshotHomeContext snapshotHome,IoAdmission admission) throws IOException {
         Objects.requireNonNull(limits, "limits");
         Objects.requireNonNull(visitor, "visitor");
         long size = Files.size(image);
         if (size <= HASH_BYTES || size > limits.maxImageBytes()) throw new IOException("Invalid image byte size");
         MessageDigest whole = digest();
         MessageDigest body = digest();
-        try (var source = new BufferedInputStream(Files.newInputStream(image))) {
+        try (var source = new BufferedInputStream(admittedInput(Files.newInputStream(image),admission))) {
             var counted = new BoundedInput(new DigestInputStream(source, whole), size);
             var bodyInput = new DigestInputStream(counted, body);
             var input = new DataInputStream(bodyInput);

@@ -35,7 +35,7 @@
         <execution><id>unchanged-release-classes</id><phase>generate-resources</phase><goals><goal>unpack</goal></goals><configuration><artifactItems><artifactItem>
           <groupId>org.apache.ratis</groupId><artifactId>ratis-grpc</artifactId><version>${ratis.version}</version><type>jar</type>
           <outputDirectory>${project.build.outputDirectory}</outputDirectory>
-          <excludes>org/apache/ratis/grpc/server/GrpcServerProtocolService*.class,META-INF/MANIFEST.MF,META-INF/*.SF,META-INF/*.RSA,META-INF/*.DSA</excludes>
+          <excludes>org/apache/ratis/grpc/server/GrpcLogAppender*.class,org/apache/ratis/grpc/server/GrpcServerProtocolService*.class,META-INF/MANIFEST.MF,META-INF/*.SF,META-INF/*.RSA,META-INF/*.DSA</excludes>
         </artifactItem></artifactItems></configuration></execution>
       </executions>
     </plugin>

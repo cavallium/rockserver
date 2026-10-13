@@ -1253,6 +1253,22 @@ capture-loss/ABORT replay, borrowed cleanup ownership, backup/export and fresh-f
 recovery. Evidence: `/tmp/rockserver-async-metadata-combined-acceptance-gate.log`.
 No network listener, independent quorum or external-consumer acceptance is established.
 
+Learner migration now shares configured node/pool byte rates and finite ownership
+across source-image preparation, snapshot chunks and outgoing listener log tails.
+Current and previous voters bypass learner throttling. A fair head accumulates
+credit under continuous small arrivals; actual materialized bytes refund unused
+head allowance. Payload credits survive both transport return and ACK/terminal
+drain. Separate bounded recovery bulk credits do not borrow protected control bytes.
+
+Image preparation grants incremental write/read/hash quanta through cooperative
+BATCH work while retaining a bounded native owner. A one-worker fixture confirms
+recovery progresses while optional bootstrap lacks credits. Artifact lookup and
+release I/O use per-transfer ownership outside the shared metadata monitor. The
+95-case gate passes image, transport, controller, runtime, manifest, artifact and
+source-service cases: `/tmp/rockserver-migration-worker-e82-final-gate.log`. Native
+owner concurrency is bounded separately from scheduler worker count; this is
+controlled correctness/resource evidence, not measured throughput or quorum density.
+
 ## Remaining architecture gates
 
 - Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold
@@ -1262,7 +1278,7 @@ No network listener, independent quorum or external-consumer acceptance is estab
 - Verify adoption of aggregate exports by the intended external consumers. The frontend route and controlled aggregate
   export/cleanup workflows are implemented; independent endpoint acceptance remains
   open. Controlled snapshot/CDC resynchronization is recorded above.
-- Complete learner pressure/rate controls and native pre-I/O file-growth admission.
+- Complete native pre-I/O file-growth admission and its application ownership wiring.
   Qualify bounded native CF/MANIFEST startup and recovery output; filesystem size
   observations and declared flush headroom are not hard allocation bounds.
 - Verify all documented topology, schema, import, retirement and repair workflows

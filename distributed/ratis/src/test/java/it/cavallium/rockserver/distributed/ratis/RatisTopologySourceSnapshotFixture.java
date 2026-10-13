@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.*;
 final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSnapshotService.Host,AutoCloseable {
     final it.cavallium.rockserver.core.impl.RWScheduler scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(4,1,1,16,16,"source-snapshot-fixture");
     final RatisNodeResourceBudget graph=new RatisNodeResourceBudget(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L<<20,16),new RatisNodeResourceBudget.Lane(256L<<20,16)),Map.of(new UUID(0,100),new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L<<20,16),new RatisNodeResourceBudget.Lane(256L<<20,16))));
-    RatisTopologySourceSnapshotService.ResourceAdmission transferAdmission(){return bytes->{var lease=graph.reserve(new UUID(0,100),RatisNodeResourceBudget.Kind.ORDINARY,bytes,1);return lease::close;};}
+    RatisTopologySourceSnapshotService.ResourceAdmission transferAdmission(){return (request,bytes)->{var lease=graph.reserve(new UUID(0,100),RatisNodeResourceBudget.Kind.ORDINARY,bytes,1);return lease::close;};}
     static UUID id(int n){return new UUID(0,n);}
     final UUID group=id(4),column=id(5);
     final ReplicaDescriptor donor=new ReplicaDescriptor(id(10),id(11),id(12),"donor","127.0.0.1:7001",ReplicaDescriptor.Role.VOTER);
@@ -66,14 +66,14 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
     RatisTopologySourceSnapshotRpc.Request request(int n){return new RatisTopologySourceSnapshotRpc.Request(id(n),definition.header(),id(40),receiver,RatisTopologySourceSnapshotRpc.Purpose.BOOTSTRAP);}
     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request){return null;}
     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws IOException{throw new IOException("Fixture has no source publication abandonment authority");}
-    @Override public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request)throws Exception {
+    @Override public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission admission)throws Exception {
         captures.incrementAndGet();var captureImage=request.transferId().equals(id(50))?image:image.resolveSibling("native-"+request.transferId()+".image");var pin=store.capture();boolean adopted=false;
         try {
-            var manifest=NativeRangeImage.write(captureImage,pin,pin.interval(),new NativeRangeImage.Limits(4*1024*1024,8*1024*1024,16));
+            var manifest=NativeRangeImage.writeAdmitted(captureImage,pin,pin.interval(),new NativeRangeImage.Limits(4*1024*1024,8*1024*1024,16),admission);
             var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,schema,donor,pin.configuration(),Map.of());
-            var snapshot=new SingleFileSnapshotInfo(new FileInfo(captureImage,MD5Hash.newInstance(MessageDigest.getInstance("MD5").digest(Files.readAllBytes(captureImage)))),manifest.position().term(),manifest.position().index());
+            var snapshot=new SingleFileSnapshotInfo(new FileInfo(captureImage,MD5Hash.newInstance(NativeRangeImage.md5Admitted(captureImage,admission))),manifest.position().term(),manifest.position().index());
             var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,snapshot,()->{pin.close();pinCloses.incrementAndGet();});adopted=true;return lease;
-        }finally{if(!adopted)pin.close();}
+        }finally{if(!adopted){pin.close();pinCloses.incrementAndGet();}}
     }
     @Override public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception {if(!owner)throw new IOException("controlled owner loss");assertEquals(store.applied(),lease.prepared().image().position());assertEquals(store.configuration().term(),lease.prepared().sourceCfg().term());assertEquals(store.configuration().index(),lease.prepared().sourceCfg().index());assertArrayEquals(store.configuration().data(),lease.prepared().sourceCfg().data());}
     @Override public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception {proofs.incrementAndGet();assertEquals(0,imageDescriptors(),"File reader closes before native qualification");if(!installed || !Arrays.equals(MessageDigest.getInstance("SHA-256").digest(received.toByteArray()),lease.prepared().image().sha256()))throw new IOException("Receiver has not qualified the exact installed image");}
