@@ -23,7 +23,7 @@ class DistributedOperatorArtifactsTest {
         }
     }
     private static void qualify(Object cache,DistributedSchema schema,Map<UUID,String> plain,boolean virgin) throws Exception {
-        invoke(cache,"qualifyBootstrap",new Class<?>[]{DistributedSchema.class,Map.class,Map.class,boolean.class},schema,Map.of(),plain,virgin);
+        invoke(cache,"qualifyBootstrap",new Class<?>[]{Collection.class,Map.class,Map.class,boolean.class},List.of(schema),Map.of(),plain,virgin);
     }
     @Test void staleConcurrentCacheCannotOverwritePublishedBootstrapOrImmutableRows() throws Exception {
         var path=root.resolve("pool"); var schema=new DistributedSchema(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),0,0,List.of());
@@ -44,14 +44,14 @@ class DistributedOperatorArtifactsTest {
         Path path=root.resolve("bucket-shape");
         it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool.stageOperator(path,operator,new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
         var cache=cache(path); var names=Map.of(column.columnId(),"bucket");
-        invoke(cache,"qualifyBootstrap",new Class<?>[]{DistributedSchema.class,Map.class,Map.class,boolean.class},bucket,names,Map.of(),true);
+        invoke(cache,"qualifyBootstrap",new Class<?>[]{Collection.class,Map.class,Map.class,boolean.class},List.of(bucket),names,Map.of(),true);
         var reopened=cache(path);
         try(var callback=(it.cavallium.rockserver.core.impl.FFMAbstractMergeOperator)invoke(reopened,"resolve",new Class<?>[]{String.class},"bucket")) { assertInstanceOf(it.cavallium.rockserver.core.impl.rocksdb.DistributedBucketMergeOperator.class,callback); }
         assertThrows(java.io.IOException.class,() -> invoke(reopened,"requireSchemaBindings",new Class<?>[]{DistributedSchema.class,Map.class},fixed,names));
         var wrongShape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(it.cavallium.rockserver.core.common.ColumnHashType.XXHASH8),true,operator.name(),operator.version(),operator.className());
         var changed=new DistributedSchema(bucket.clusterId(),bucket.databaseId(),bucket.domainId(),bucket.schemaEpoch(),0,List.of(new DistributedSchema.Column(column.apiId(),column.columnId(),column.name(),wrongShape,operator)));
         assertThrows(java.io.IOException.class,() -> invoke(reopened,"requireSchemaBindings",new Class<?>[]{DistributedSchema.class,Map.class},changed,names));
-        assertThrows(RuntimeException.class,() -> it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool.open(path,it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass()),changed,names,Map.of()));
+        assertThrows(RuntimeException.class,() -> it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool.open(path,it.cavallium.rockserver.core.config.ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass()),List.of(changed),names,Map.of()));
         assertFalse(Files.exists(path.resolve("CURRENT")),"Wrong shape must be rejected before writable native open");
     }
 

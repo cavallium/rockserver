@@ -9,15 +9,15 @@ final class RatisCdcDeliveryAuthority {
     @FunctionalInterface interface DefinitionReader { TopologyChange.Definition read(TopologyChange.Header header) throws IOException; }
     @FunctionalInterface interface DirectoryReader { RangeDirectory read(UUID domain) throws IOException; }
     @FunctionalInterface interface LineageReader { RangeDirectory read(DistributedCdcSubscription.Definition definition,DistributedCdcCheckpoint.Lineage lineage) throws IOException; }
-    private final RatisRoutedClient client;
+    private final Map<UUID,RatisRoutedClient> clients;
     private final DirectoryReader directories;
     private final LineageReader lineages;
     private final RatisTopologyCatalogue.OwnerProofReader topologyOwners;
     private final DefinitionReader definitions;
-    RatisCdcDeliveryAuthority(RatisRoutedClient client,DirectoryReader directories) { this(client,directories,null,null,null); }
-    RatisCdcDeliveryAuthority(RatisRoutedClient client,DirectoryReader directories,LineageReader lineages) { this(client,directories,lineages,null,null); }
-    RatisCdcDeliveryAuthority(RatisRoutedClient client,DirectoryReader directories,LineageReader lineages,RatisTopologyCatalogue.OwnerProofReader topologyOwners) { this(client,directories,lineages,topologyOwners,null); }
-    RatisCdcDeliveryAuthority(RatisRoutedClient client,DirectoryReader directories,LineageReader lineages,RatisTopologyCatalogue.OwnerProofReader topologyOwners,DefinitionReader definitions) { this.client=Objects.requireNonNull(client); this.directories=Objects.requireNonNull(directories); this.lineages=lineages; this.topologyOwners=topologyOwners; this.definitions=definitions; }
+    RatisCdcDeliveryAuthority(Map<UUID,RatisRoutedClient> clients,DirectoryReader directories) { this(clients,directories,null,null,null); }
+    RatisCdcDeliveryAuthority(Map<UUID,RatisRoutedClient> clients,DirectoryReader directories,LineageReader lineages) { this(clients,directories,lineages,null,null); }
+    RatisCdcDeliveryAuthority(Map<UUID,RatisRoutedClient> clients,DirectoryReader directories,LineageReader lineages,RatisTopologyCatalogue.OwnerProofReader topologyOwners) { this(clients,directories,lineages,topologyOwners,null); }
+    RatisCdcDeliveryAuthority(Map<UUID,RatisRoutedClient> clients,DirectoryReader directories,LineageReader lineages,RatisTopologyCatalogue.OwnerProofReader topologyOwners,DefinitionReader definitions) { this.clients=Map.copyOf(clients);if(this.clients.isEmpty() || this.clients.size()>DatabaseDomainRoster.MAX_DOMAINS)throw new IllegalArgumentException("Invalid CDC DATA domain scope");for(var entry:this.clients.entrySet())if(!entry.getKey().equals(entry.getValue().directory().domainId()))throw new IllegalArgumentException("CDC DATA domain binding differs"); this.directories=Objects.requireNonNull(directories); this.lineages=lineages; this.topologyOwners=topologyOwners; this.definitions=definitions; }
     void validate(DistributedCommand command) throws IOException {
         if(!RatisCdcSubscriptionCatalogue.requiresOwnerAdmission(command)) throw new IOException("Expected new CDC delivery/handoff bounds");
         var next=DistributedCdcSubscription.decode(command.mutations().getFirst().value()); var old=DistributedCdcSubscription.decode(command.predicates().getFirst().expectedValue()); next.requireSuccessorOf(old);
@@ -53,6 +53,7 @@ final class RatisCdcDeliveryAuthority {
     }
     private void witness(RangeDirectory directory,DistributedCdcSubscription.Definition definition,DistributedCdcCheckpoint.Lineage lineage,DistributedCdcCheckpoint.Cursor cursor,DistributedCdcCheckpoint.Cursor previous) throws IOException {
         if(directory==null || !directory.clusterId().equals(definition.clusterId()) || !directory.databaseId().equals(definition.databaseId()) || !directory.domainId().equals(definition.domainId()) || !directory.columns().containsAll(definition.columns()) || directory.ranges().stream().noneMatch(r->r.rangeId().equals(lineage.rangeId()) && r.groupId().equals(lineage.groupId()) && r.rangeEpoch()==lineage.rangeEpoch())) throw new IOException("CDC lineage directory is absent/foreign");
+        var client=clients.get(definition.domainId());if(client==null)throw new IOException("CDC DATA domain is not configured");
         var result=client.pollCdcDirectory(directory,lineage,cursor,1,RatisCdcPollRpc.REPLY_BASE_BYTES+1);
         if(result.outcome()==RatisCdcPollRpc.Outcome.GAP || !result.fromVerified()) throw new IOException("CDC cursor has no retained/current DATA witness");
         if(previous==null || !previous.covers(result.floor())) throw new IOException("CDC transition crosses an undelivered retention gap");

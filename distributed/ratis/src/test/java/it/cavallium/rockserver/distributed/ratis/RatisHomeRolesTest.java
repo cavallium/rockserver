@@ -23,13 +23,13 @@ class RatisHomeRolesTest {
             var homes=new ArrayList<RatisNodePlan.Home>(); int n=0;
             for (var role:List.of(RatisNodePlan.Role.TRANSACTION_HOME,RatisNodePlan.Role.SNAPSHOT_HOME)) {
                 int id=++n; UUID group=new UUID(91,id),column=new UUID(92,id); byte[] digest=new byte[32]; digest[0]=(byte)id;
-                var local=env.plan.directory().ranges().getFirst().replicas().stream().filter(replica -> replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow();
+                var local=env.plan.domains().getFirst().directory().ranges().getFirst().replicas().stream().filter(replica -> replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow();
                 var replica=new ReplicaDescriptor(local.nodeId(),local.nodeIncarnation(),new UUID(96,id),local.peerId(),local.address(),ReplicaDescriptor.Role.VOTER);
                 var route=new RangeDescriptor(group,group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
                 var directory=new RangeDirectory(env.outer.cluster,env.outer.database,new UUID(93,id),id,digest,0,Set.of(column),0,List.of(route));
                 homes.add(new RatisNodePlan.Home(role,directory,column,"home-"+id));
             }
-            return new RatisNodePlan(env.plan.nodeId(),env.plan.nodeIncarnation(),env.plan.directory(),env.plan.catalogue(),env.plan.columns(),env.plan.merges(),homes,env.plan.localGroups().size()+2);
+            return new RatisNodePlan(env.plan.nodeId(), env.plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(env.plan.domains().getFirst().directory(), env.plan.columns(), env.plan.merges())), env.plan.catalogue(), homes, List.of(), Map.of(), env.plan.localGroups().size()+2);
     }
     final class Fixture implements AutoCloseable {
         final RatisNodeRuntimeTest.Env env;
@@ -42,8 +42,8 @@ class RatisHomeRolesTest {
         Fixture(String name) throws Exception { this(name,false); }
         Fixture(String name,boolean catalogue) throws Exception {
             env=new RatisNodeRuntimeTest.Env(Files.createDirectory(root.resolve(name)),catalogue);
-            plan=plan(env); data=client(plan.directory());
-            node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,data,env.scheduler,env.timer,() -> 20L,new RatisNodeRuntime.Settings(new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),env.settings().retention(),env.settings().clockPeriod(),1,4,env.settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults()),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,server::create,null,null,null,this::client);
+            plan=plan(env); data=client(plan.domains().getFirst().directory());
+            node=RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(data.directory().domainId(), data), env.scheduler, env.timer, () -> 20L, new RatisNodeRuntime.Settings(new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),env.settings().retention(),env.settings().clockPeriod(),1,4,env.settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults()), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, server::create, null, null, null, this::client);
             try {
             node.start(); var before=env.catalogue.epochs.read(); var live=before.issue(session,100); env.catalogue.epochs.execute(env.catalogue.epochs.prepare(env.outer.operation(1),before,live));
             for (var home:plan.homes()) {
@@ -71,12 +71,12 @@ class RatisHomeRolesTest {
             } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
         }
         TransactionStatus transaction() {
-            var data=plan.directory().ranges().getFirst();
-            return TransactionStatus.begin(env.outer.cluster,env.outer.database,plan.directory().domainId(),new UUID(94,1),new OperationId(new UUID(94,2),1,0),1,plan.directory().schemaDigest(),new byte[32],List.of(new TransactionStatus.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.directory().schemaDigest(),new byte[32],null,false)));
+            var data=plan.domains().getFirst().directory().ranges().getFirst();
+            return TransactionStatus.begin(env.outer.cluster,env.outer.database,plan.domains().getFirst().directory().domainId(),new UUID(94,1),new OperationId(new UUID(94,2),1,0),1,plan.domains().getFirst().directory().schemaDigest(),new byte[32],List.of(new TransactionStatus.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.domains().getFirst().directory().schemaDigest(),new byte[32],null,false)));
         }
         SnapshotFence fence() {
-            var data=plan.directory().ranges().getFirst(); var home=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME).directory().ranges().getFirst();
-            return new SnapshotFence(env.outer.cluster,env.outer.database,plan.directory().domainId(),new UUID(95,1),home.groupId(),home.rangeEpoch(),new OperationId(new UUID(95,1),1,0),plan.directory().generation(),plan.directory().schemaEpoch(),plan.directory().schemaDigest(),List.of(new SnapshotFence.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.directory().schemaDigest(),new OperationId(new UUID(95,2),1,0),new OperationId(new UUID(95,2),1,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
+            var data=plan.domains().getFirst().directory().ranges().getFirst(); var home=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME).directory().ranges().getFirst();
+            return new SnapshotFence(env.outer.cluster,env.outer.database,plan.domains().getFirst().directory().domainId(),new UUID(95,1),home.groupId(),home.rangeEpoch(),new OperationId(new UUID(95,1),1,0),plan.domains().getFirst().directory().generation(),plan.domains().getFirst().directory().schemaEpoch(),plan.domains().getFirst().directory().schemaDigest(),List.of(new SnapshotFence.Participant(data.rangeId(),data.groupId(),data.rangeEpoch(),plan.domains().getFirst().directory().schemaDigest(),new OperationId(new UUID(95,2),1,0),new OperationId(new UUID(95,2),1,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
         }
         @Override public void close() throws Exception { node.close(); data.close(); env.close(); }
     }
@@ -84,9 +84,9 @@ class RatisHomeRolesTest {
         try (var env=new RatisNodeRuntimeTest.Env(Files.createDirectory(root.resolve("wrong-home"))); var reader=new RatisNodeRuntimeTest.TransactionHomeReader(env,env.outer.cluster)) {
             var plan=plan(env); var fake=new RatisNodeRuntimeTest.FakeServer();
             var snapshot=new RatisSnapshotFences(reader.routed,reader.routed.directory().columns().iterator().next());
-            assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,null,snapshot,null,directory -> { throw new AssertionError("Rejected before client allocation"); }));
+            assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, null, snapshot, null, directory -> { throw new AssertionError("Rejected before client allocation"); }));
             var recovery=new RatisNodeRuntime.RecoverySettings(reader.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),java.time.Duration.ofMillis(100),1);
-            assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,null,null,recovery,directory -> { throw new AssertionError("Rejected before client allocation"); }));
+            assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, null, null, recovery, directory -> { throw new AssertionError("Rejected before client allocation"); }));
             assertFalse(fake.created); try (var files=Files.list(env.nodeRoot)) { assertTrue(files.findAny().isEmpty()); }
         }
     }
@@ -111,19 +111,19 @@ class RatisHomeRolesTest {
     }
     @Test void declaredTransactionHomeAutomaticallyRecoversDecidedParticipantsAndWaitsForUndecidedHomes() throws Exception {
         try (var f=new Fixture("default-recovery")) {
-            var route=f.plan.directory().ranges().getFirst(); var machine=f.machine(route.groupId());
+            var route=f.plan.domains().getFirst().directory().ranges().getFirst(); var machine=f.machine(route.groupId());
             var field=RatisRangeStateMachine.class.getDeclaredField("store"); field.setAccessible(true); var store=(ReplicatedRangeStore)field.get(machine);
             var grants=f.env.catalogue.epochs.read();
-            var binding=f.env.catalogue.epochs.prepareSessionBinding(f.plan.directory(),route.groupId(),new OperationId(admin,1,20),grants.grants().getFirst(),32,-1);
+            var binding=f.env.catalogue.epochs.prepareSessionBinding(f.plan.domains().getFirst().directory(),route.groupId(),new OperationId(admin,1,20),grants.grants().getFirst(),32,-1);
             f.append(route.groupId(),DistributedCommandCodec.encode(binding));
             var txPlan=f.plan.home(RatisNodePlan.Role.TRANSACTION_HOME); var homes=new RatisTransactionStatuses(f.clients.get(txPlan.role()),txPlan.column());
-            var business=new DistributedCommand(route.groupId(),route.rangeEpoch(),f.plan.directory().schemaDigest(),new OperationId(session,1,0),List.of(new Mutation(Mutation.Kind.PUT,f.env.outer.data,new byte[]{1},new byte[]{9})));
+            var business=new DistributedCommand(route.groupId(),route.rangeEpoch(),f.plan.domains().getFirst().directory().schemaDigest(),new OperationId(session,1,0),List.of(new Mutation(Mutation.Kind.PUT,f.env.outer.data,new byte[]{1},new byte[]{9})));
             var scope=new TransactionScope(List.of(TransactionScope.Span.point(f.env.outer.data,new byte[]{1})));
             TransactionStatus initial; ParticipantVote vote;
             try (var pin=store.captureTracked(scope)) {
                 var accepted=machine.participantIntent(pin,business);
-                var participant=new TransactionStatus.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),f.plan.directory().schemaDigest(),accepted.payloadDigest(),null,false);
-                initial=TransactionStatus.begin(f.env.outer.cluster,f.env.outer.database,f.plan.directory().domainId(),new UUID(97,1),business.operationId(),f.plan.directory().schemaEpoch(),f.plan.directory().schemaDigest(),accepted.payloadDigest(),List.of(participant));
+                var participant=new TransactionStatus.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),f.plan.domains().getFirst().directory().schemaDigest(),accepted.payloadDigest(),null,false);
+                initial=TransactionStatus.begin(f.env.outer.cluster,f.env.outer.database,f.plan.domains().getFirst().directory().domainId(),new UUID(97,1),business.operationId(),f.plan.domains().getFirst().directory().schemaEpoch(),f.plan.domains().getFirst().directory().schemaDigest(),accepted.payloadDigest(),List.of(participant));
                 homes.execute(homes.prepare(new OperationId(session,1,3),null,initial));
                 try (var proposal=machine.prepareParticipant(pin,business,new OperationId(session,1,1),homes,initial.transactionId())) { vote=f.data.executeParticipant(f.data.prepareParticipant(proposal.preparation())); }
             }
@@ -137,7 +137,7 @@ class RatisHomeRolesTest {
             // Expire the real catalogue grant, then replicate its verified authority cut to both ranges.
             var live=f.env.catalogue.epochs.read(); var expired=live.advanceTime(100);
             f.env.catalogue.epochs.execute(f.env.catalogue.epochs.prepare(f.env.outer.operation(2),live,expired)); assertEquals(2,expired.minimumEpoch());
-            for (var directory:List.of(f.plan.directory(),txPlan.directory())) {
+            for (var directory:List.of(f.plan.domains().getFirst().directory(),txPlan.directory())) {
                 var target=directory.ranges().getFirst();
                 var advance=f.env.catalogue.epochs.prepareAuthorityAdvance(directory,target.groupId(),new OperationId(admin,2,80),-1);
                 f.append(target.groupId(),DistributedCommandCodec.encode(advance));
@@ -166,9 +166,9 @@ class RatisHomeRolesTest {
         try (var f=new Fixture("capabilities")) {
             for (var home:f.plan.homes()) {
                 var group=home.directory().ranges().getFirst().groupId(); var machine=f.machine(group);
-                var finalization=new ParticipantFinalization(group,1,f.plan.directory().ranges().getFirst().groupId(),new OperationId(admin,2,0),f.transaction().decide(TransactionStatus.Phase.ABORT));
+                var finalization=new ParticipantFinalization(group,1,f.plan.domains().getFirst().directory().ranges().getFirst().groupId(),new OperationId(admin,2,0),f.transaction().decide(TransactionStatus.Phase.ABORT));
                 byte[] encoded=RatisParticipantRecord.encode(finalization); assertThrows(IOException.class,() -> f.append(group,encoded));
-                var gate=RatisSnapshotRecord.install(f.fence(),f.plan.directory().ranges().getFirst().groupId()); assertThrows(IOException.class,() -> f.append(group,gate.encode()));
+                var gate=RatisSnapshotRecord.install(f.fence(),f.plan.domains().getFirst().directory().ranges().getFirst().groupId()); assertThrows(IOException.class,() -> f.append(group,gate.encode()));
                 var before=machine.getLastAppliedTermIndex();
                 var committed=TransactionContext.newBuilder().setStateMachine(machine).setServerRole(RaftPeerRole.FOLLOWER).setLogEntry(LogEntryProto.newBuilder().setTerm(1).setIndex(before.getIndex()+1).setStateMachineLogEntry(StateMachineLogEntryProto.newBuilder().setLogData(ByteString.copyFrom(encoded))).build()).build();
                 assertThrows(ExecutionException.class,() -> machine.applyTransaction(committed).get(5,TimeUnit.SECONDS)); assertEquals(before,machine.getLastAppliedTermIndex());

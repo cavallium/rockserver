@@ -48,7 +48,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
         Path owned=artifacts(),managedDir=root.resolve("managed");
         try(var fixture=new RatisTopologySourceSnapshotFixture(root.resolve("source"));var lease=fixture.capture(fixture.request(50));var helper=open(owned)){
             var info=managed(lease,managedDir);var saved=helper.retain(lease.prepared(),info);var request=lease.prepared().request();
-            var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver());assertThrows(IOException.class,()->helper.lookup(changed,managedDir));
+            var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver(),request.purpose());assertThrows(IOException.class,()->helper.lookup(changed,managedDir));
             var old=lease.prepared();var foreignMetadata=new RatisTopologySourceSnapshotRpc.Prepared(request,old.image(),old.schema(),old.sourceOwner(),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(old.sourceCfg().term(),old.sourceCfg().index(),new byte[]{1}),old.schemaRows());
             assertThrows(IOException.class,()->helper.retain(foreignMetadata,info));
             byte[] bytes=Files.readAllBytes(saved.image());Files.delete(saved.image());Files.write(saved.image(),new byte[]{1});assertThrows(IOException.class,()->helper.lookup(request,managedDir));assertThrows(IOException.class,()->helper.released(request));Files.delete(saved.image());Files.write(saved.image(),bytes);
@@ -129,7 +129,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto send(org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto request){throw new AssertionError("Cold release cannot send chunks");}
                 };
                 try(var service=new RatisTopologySourceSnapshotService(replayOnly,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
-                    var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver());
+                    var changed=new RatisTopologySourceSnapshotRpc.Request(request.transferId(),request.header(),new UUID(0,99),request.receiver(),request.purpose());
                     assertThrows(IOException.class,()->service.release(changed));service.release(request);service.release(request);
                     assertThrows(IOException.class,()->service.release(fixture.request(51)));assertFalse(helper.isReleased(fixture.request(51)));
                     assertEquals(1,fixture.captures.get());assertEquals(1,fixture.pinCloses.get());assertEquals(1,fixture.durableReleases.get());assertEquals(0,service.stats().leases());

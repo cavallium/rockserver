@@ -38,7 +38,8 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
     }
     private final Path directory;
     private final RatisTransactionStatuses homes;
-    private final RatisRoutedClient data;
+    private final Map<UUID,RatisRoutedClient> data;
+    private final java.util.function.Function<UUID,RangeDirectory> groupDirectory;
     private final boolean takeover;
     private final java.util.function.Supplier<Set<UUID>> allowedGroups;
     private final Limits limits;
@@ -51,17 +52,18 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
     private int opening,persistedFiles;
     private boolean discovered,active,stopping,closing;
 
-    public RatisParticipantRecoveryRegistry(Path existingDirectory,RatisTransactionStatuses homes,RatisRoutedClient data,
+    public RatisParticipantRecoveryRegistry(Path existingDirectory,RatisTransactionStatuses homes,Map<UUID,RatisRoutedClient> data,java.util.function.Function<UUID,RangeDirectory> groupDirectory,
             boolean takeover,Set<UUID> allowedGroups,Limits limits) throws IOException {
-        this(existingDirectory,homes,data,takeover,fixedGroups(Set.copyOf(allowedGroups)),limits);
+        this(existingDirectory,homes,data,groupDirectory,takeover,fixedGroups(Set.copyOf(allowedGroups)),limits);
     }
     private static java.util.function.Supplier<Set<UUID>> fixedGroups(Set<UUID> groups){return ()->groups;}
-    public RatisParticipantRecoveryRegistry(Path existingDirectory,RatisTransactionStatuses homes,RatisRoutedClient data,
+    public RatisParticipantRecoveryRegistry(Path existingDirectory,RatisTransactionStatuses homes,Map<UUID,RatisRoutedClient> data,java.util.function.Function<UUID,RangeDirectory> groupDirectory,
             boolean takeover,java.util.function.Supplier<Set<UUID>> allowedGroups,Limits limits)throws IOException{
-        this.directory=Objects.requireNonNull(existingDirectory).toAbsolutePath().normalize(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
+        this.directory=Objects.requireNonNull(existingDirectory).toAbsolutePath().normalize(); this.homes=Objects.requireNonNull(homes); this.data=Map.copyOf(data);this.groupDirectory=Objects.requireNonNull(groupDirectory);
         this.takeover=takeover;
         this.allowedGroups=Objects.requireNonNull(allowedGroups); this.limits=Objects.requireNonNull(limits);allowedGroups();
-        homes.requireDatabaseBinding(data.directory().clusterId(),data.directory().databaseId());
+        if(this.data.isEmpty() || this.data.size()>DatabaseDomainRoster.MAX_DOMAINS)throw new IllegalArgumentException("Invalid recovery DATA domain scope");
+        for(var entry:this.data.entrySet()){var directory=entry.getValue().directory();if(!entry.getKey().equals(directory.domainId()))throw new IllegalArgumentException("Recovery DATA domain binding differs");homes.requireDatabaseBinding(directory.clusterId(),directory.databaseId());}
         if (!Files.isDirectory(directory,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Participant recovery directory must already exist");
         var lockPath=directory.resolve("registry.lock");
         if (Files.exists(lockPath,LinkOption.NOFOLLOW_LINKS)) requireEmptyLock(lockPath);
@@ -206,10 +208,11 @@ public final class RatisParticipantRecoveryRegistry implements RatisSnapshotRead
         makeRoom(); reserve(file);
         RatisDurableParticipantRecovery journal=null;
         try {
+            var directory=groupDirectory.apply(file.key.group);if(directory==null)throw new IOException("Recovery participant directory is absent");var data=this.data.get(directory.domainId());if(data==null)throw new IOException("Recovery participant domain is not configured");
             if (file.persisted) journal=RatisDurableParticipantRecovery.reopen(file.path,homes,data);
             else {
                 if (selected==null) throw new IOException("Unpublished recovery file has no native preparation input");
-                var route=data.directory().ranges().stream().filter(r -> r.groupId().equals(file.key.group)).findFirst().orElseThrow(() -> new IOException("Allowed participant route is absent"));
+                var route=directory.ranges().stream().filter(r -> r.groupId().equals(file.key.group)).findFirst().orElseThrow(() -> new IOException("Allowed participant route is absent"));
                 journal=RatisDurableParticipantRecovery.create(file.path,homes,data,selected,route);
                 synchronized (this) { file.persisted=true; persistedFiles++; }
             }

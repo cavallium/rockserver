@@ -91,6 +91,28 @@ public final class RatisSnapshotCoordinator implements AutoCloseable {
         if (progress.captureToken()==null) return result(Action.CAPTURED,group);
         return transition(journal.snapshot(),home.capture(group,token),Action.CAPTURE_REPORTED,group);
     }
+    /** Reports only an already forced global cohort vector; never creates or executes a capture. */
+    public Step reportExternalCaptures(SnapshotFenceStatus expected) throws IOException {
+        Objects.requireNonNull(expected);
+        synchronized(this){if(closed || active)throw new IOException("Snapshot coordinator closed or step active");active=true;}
+        try {
+            journal.refreshHome();journal.resolveHomeFromObserved();var snapshot=journal.snapshot();var home=snapshot.observedHome();
+            if(expected.phase()!=SnapshotFenceStatus.Phase.INSTALLING || !expected.allReady() || !expected.fence().equals(snapshot.initial().fence())
+                    || expected.progress().stream().anyMatch(p->p.capture()==null) || home==null || home.phase()==SnapshotFenceStatus.Phase.ABORT)
+                throw new IOException("External reporting lacks the original global capture vector");
+            UUID missing=null;
+            for(var progress:expected.progress()) {
+                var local=snapshot.participant(progress.groupId());var observed=home.progress(progress.groupId());
+                if(!Objects.equals(progress.ready(),observed.ready()) || !Objects.equals(progress.ready(),local.readyProof())
+                        || !Objects.equals(progress.capture(),local.captureToken()) || local.captureLost()
+                        || observed.capture()!=null && !progress.capture().equals(observed.capture()))throw new IOException("External reporting changed READY/capture vector");
+                if(observed.capture()==null && missing==null)missing=progress.groupId();
+            }
+            if(home.phase()==SnapshotFenceStatus.Phase.COMPLETE) {if(missing!=null)throw new IOException("COMPLETE lacks original capture vector");return result(Action.CAPTURE_REPORTED,null);}
+            if(missing==null)return result(Action.CAPTURE_REPORTED,null);
+            return transition(snapshot,home.capture(missing,expected.progress(missing).capture()),Action.CAPTURE_REPORTED,missing);
+        } finally {synchronized(this){active=false;}}
+    }
     private UUID select(RatisDurableSnapshot.Snapshot snapshot,Predicate<RatisDurableSnapshot.ParticipantProgress> needsWork) {
         for (int i=0;i<groups.size();i++) { UUID group=groups.get(cursor); cursor=(cursor+1)%groups.size(); if (needsWork.test(snapshot.participant(group))) return group; }
         return null;

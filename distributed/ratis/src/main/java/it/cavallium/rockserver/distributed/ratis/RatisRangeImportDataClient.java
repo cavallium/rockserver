@@ -25,16 +25,16 @@ public final class RatisRangeImportDataClient implements RatisRangeImportControl
     private final List<DataStreamClient> failedCloses=new ArrayList<>(); private int active; private boolean closing; private IOException broken;
     public RatisRangeImportDataClient(RatisNodePlan plan,RaftClient catalogue,Parameters parameters) {
         this(plan,catalogue,(range,id)->connected(plan,range,id),(control,primary)->RatisStreamingTransport.connect(plan,control,primary,parameters),
-                new RatisRangeImportOwnerClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId()));
+                new RatisRangeImportOwnerClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId()));
     }
     RatisRangeImportDataClient(RatisNodePlan plan,RaftClient catalogue,Connections connections,Streams streams,RatisRangeImportOwnerClient owners) {
         this.plan=Objects.requireNonNull(plan);this.streams=Objects.requireNonNull(streams);this.owners=Objects.requireNonNull(owners);
-        authority=new RatisRangeImportAuthority.Client(catalogue,plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
+        authority=new RatisRangeImportAuthority.Client(catalogue,plan.clusterId(),plan.databaseId(),plan.catalogue().groupId());
         clients=new RatisClientPool(MAX_CLIENTS,range->connections.open(range,ClientId.randomId()),null,(range,id)->connections.open(range,ClientId.valueOf(id)));
     }
     private RangeDescriptor range(RangeImportDefinition definition,UUID group) throws IOException {
         var qualified=plan.importDefinition(group);
-        if(qualified==null || !Arrays.equals(qualified.digest(),definition.digest()) || !Arrays.equals(plan.directory().payloadDigest(),definition.sourceDirectory().payloadDigest()))throw new IOException("Import differs from operator-qualified placement");
+        if(qualified==null || !Arrays.equals(qualified.digest(),definition.digest()) || !Arrays.equals(plan.directory(definition.sourceDirectory().domainId()).payloadDigest(),definition.sourceDirectory().payloadDigest()))throw new IOException("Import differs from operator-qualified placement");
         return plan.groupDescriptor(group);
     }
     private synchronized void enter()throws IOException{if(closing || broken!=null || active>=MAX_CALLS)throw new IOException("Import data transport unavailable",broken);active++;}

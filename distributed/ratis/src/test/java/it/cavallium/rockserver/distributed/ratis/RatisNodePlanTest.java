@@ -28,7 +28,7 @@ class RatisNodePlanTest {
         return new RangeDirectory(CLUSTER,DATABASE,DOMAIN,1,new byte[32],generation,Set.of(COLUMN),0,ranges);
     }
     private static RatisNodePlan plan(RangeDirectory directory,RatisNodePlan.Catalogue catalogue,int budget) {
-        return new RatisNodePlan(NODE,INCARNATION,directory,catalogue,Map.of(COLUMN,"data"),Set.of(),budget);
+        return new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,Map.of(COLUMN,"data"),Set.of())),catalogue,List.of(),List.of(),Map.of(),budget);
     }
 
     @Test void dataOnlyListenerUsesOneGlobalPeerAndExactEndpointWithSortedLocalGroups() {
@@ -72,7 +72,7 @@ class RatisNodePlanTest {
         }
         assertDoesNotThrow(() -> plan(directory,catalogue,RangeDirectoryCodec.MAX_RANGES+1));
         assertThrows(IllegalArgumentException.class,() -> plan(directory(0,List.of(range(HIGH_GROUP,null,null,List.of(remote())))),catalogue(List.of(remote())),2));
-        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,new UUID(9,9),directory,catalogue,Map.of(COLUMN,"data"),Set.of(),2));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,new UUID(9,9),List.of(new RatisNodePlan.Domain(directory,Map.of(COLUMN,"data"),Set.of())),catalogue,List.of(),List.of(),Map.of(),2));
         var inactive=new RangeDescriptor(HIGH_GROUP,HIGH_GROUP,1,0,null,null,RangeDescriptor.TopologyState.FENCED,List.of(local));
         assertThrows(IllegalArgumentException.class,() -> plan(directory(0,List.of(inactive)),catalogue,2));
         assertThrows(IllegalArgumentException.class,() -> plan(directory(0,List.of(range(CATALOGUE,null,null,List.of(local)))),catalogue,2));
@@ -82,9 +82,9 @@ class RatisNodePlanTest {
         assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan.Catalogue(CATALOGUE,-1,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(local)));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan.Catalogue(CATALOGUE,1,new byte[31],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(local)));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan.Catalogue(CATALOGUE,1,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(local,local)));
-        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,directory,catalogue,Map.of(COLUMN,"default"),Set.of(),2));
-        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,directory,catalogue,Map.of(COLUMN,"data"),Set.of(DIRECTORY_COLUMN),2));
-        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,directory,catalogue,Map.of(),Set.of(),2));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,Map.of(COLUMN,"default"),Set.of())),catalogue,List.of(),List.of(),Map.of(),2));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,Map.of(COLUMN,"data"),Set.of(DIRECTORY_COLUMN))),catalogue,List.of(),List.of(),Map.of(),2));
+        assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,Map.of(),Set.of())),catalogue,List.of(),List.of(),Map.of(),2));
     }
 
     @Test void defensiveCopiesAndDigestBindImmutableLocalPlacement() {
@@ -95,19 +95,19 @@ class RatisNodePlanTest {
         assertEquals(0,catalogue.schemaDigest()[0]); assertEquals(1,catalogue.replicas().size());
         var directory=directory(0,List.of(range(HIGH_GROUP,null,null,List.of(local))));
         var columns=new HashMap<>(Map.of(COLUMN,"data")); var merges=new HashSet<>(Set.of(COLUMN));
-        var original=new RatisNodePlan(NODE,INCARNATION,directory,catalogue,columns,merges,1);
+        var original=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,columns,merges)),catalogue,List.of(),List.of(),Map.of(),1);
         columns.clear(); merges.clear(); byte[] digest=original.identityDigest(); original.identityDigest()[0]^=1;
         assertArrayEquals(digest,original.identityDigest()); assertEquals(Map.of(COLUMN,"data"),original.columns()); assertEquals(Set.of(COLUMN),original.merges());
         assertThrows(UnsupportedOperationException.class,() -> original.columns().clear());
         assertThrows(UnsupportedOperationException.class,() -> original.merges().clear());
         assertThrows(UnsupportedOperationException.class,() -> catalogue.replicas().clear());
         var expanded=directory(5,List.of(range(HIGH_GROUP,null,new byte[] {127},List.of(local)),range(LOW_GROUP,new byte[] {127},null,List.of(local))));
-        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,expanded,catalogue,Map.of(COLUMN,"data"),Set.of(COLUMN),2).identityDigest()));
-        assertArrayEquals(digest,new RatisNodePlan(NODE,INCARNATION,directory(5,directory.ranges()),catalogue,Map.of(COLUMN,"data"),Set.of(COLUMN),1).identityDigest());
-        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,directory,catalogue,Map.of(COLUMN,"other"),Set.of(COLUMN),1).identityDigest()));
-        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,directory,catalogue,Map.of(COLUMN,"data"),Set.of(),1).identityDigest()));
+        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(expanded,Map.of(COLUMN,"data"),Set.of(COLUMN))),catalogue,List.of(),List.of(),Map.of(),2).identityDigest()));
+        assertArrayEquals(digest,new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory(5,directory.ranges()),Map.of(COLUMN,"data"),Set.of(COLUMN))),catalogue,List.of(),List.of(),Map.of(),1).identityDigest());
+        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,Map.of(COLUMN,"other"),Set.of(COLUMN))),catalogue,List.of(),List.of(),Map.of(),1).identityDigest()));
+        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,Map.of(COLUMN,"data"),Set.of())),catalogue,List.of(),List.of(),Map.of(),1).identityDigest()));
         var changedCatalogue=new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(remote()));
-        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,directory,changedCatalogue,Map.of(COLUMN,"data"),Set.of(COLUMN),1).identityDigest()));
+        assertFalse(Arrays.equals(digest,new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory,Map.of(COLUMN,"data"),Set.of(COLUMN))),changedCatalogue,List.of(),List.of(),Map.of(),1).identityDigest()));
     }
     private static RatisNodePlan.Home home(RatisNodePlan.Role role,UUID group,UUID column,UUID domain,String name,List<ReplicaDescriptor> replicas) {
         byte[] schema=new byte[32]; schema[0]=9;
@@ -116,7 +116,7 @@ class RatisNodePlanTest {
     }
     private static RatisNodePlan withHomes(List<RatisNodePlan.Home> homes) {
         var local=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
-        return new RatisNodePlan(NODE,INCARNATION,directory(0,List.of(range(HIGH_GROUP,null,null,List.of(local)))),catalogue(List.of(local,remote())),Map.of(COLUMN,"data"),Set.of(),homes,100);
+        return new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(directory(0,List.of(range(HIGH_GROUP,null,null,List.of(local)))),Map.of(COLUMN,"data"),Set.of())),catalogue(List.of(local,remote())),homes,List.of(),Map.of(),100);
     }
     @Test void dedicatedHomeRolesAreQualifiedCanonicalAndSeparateFromDataAndCatalogue() {
         var local=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
@@ -164,6 +164,34 @@ class RatisNodePlanTest {
         var inactive=new RangeDescriptor(new UUID(0,100),new UUID(0,100),1,0,null,null,RangeDescriptor.TopologyState.FENCED,List.of(local));
         var inactiveDirectory=new RangeDirectory(CLUSTER,DATABASE,new UUID(0,300),1,new byte[32],0,Set.of(column),0,List.of(inactive));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodePlan.Home(tx.role(),inactiveDirectory,column,tx.physicalName()));
+    }
+    private static RatisNodePlan.Domain dataDomain(int n,int columns) {
+        var names=new LinkedHashMap<UUID,String>(); for(int i=0;i<columns;i++) names.put(new UUID(n,100+i),"domain-"+n+"-"+i); var range=range(new UUID(n,200),null,null,List.of(local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER)));
+        var directory=new RangeDirectory(CLUSTER,DATABASE,new UUID(n,300),1,new byte[32],0,names.keySet(),0,List.of(range)); return new RatisNodePlan.Domain(directory,names,Set.of());
+    }
+    @Test void twoDataDomainsShareOneNamespaceAndCanonicalAggregateBindingsWithCorrectGroupLookup() {
+        var first=dataDomain(1,1); var second=dataDomain(2,2); var cat=catalogue(List.of(remote())); var plan=new RatisNodePlan(NODE,INCARNATION,List.of(second,first),cat,List.of(),List.of(),Map.of(),20);
+        assertEquals(List.of(first,second),plan.domains()); assertSame(second,plan.domain(second.domainId())); assertSame(second.directory(),plan.groupDirectory(second.directory().ranges().getFirst().groupId())); assertEquals(3,plan.columns().size()); assertEquals(20,plan.maxLocalGroups()); assertEquals(2,plan.localGroups().size());
+        var ordered=new RatisNodePlan(NODE,INCARNATION,List.of(first,second),cat,List.of(),List.of(),Map.of(),20); assertArrayEquals(plan.identityDigest(),ordered.identityDigest()); assertFalse(Arrays.equals(plan.identityDigest(),new RatisNodePlan(NODE,INCARNATION,List.of(first,second),cat,List.of(),List.of(),Map.of(),21).identityDigest()));
+        assertThrows(UnsupportedOperationException.class,()->plan.domains().clear()); assertThrows(IllegalArgumentException.class,()->plan.domain(UUID.randomUUID()));
+    }
+    @Test void globalDataCollisionsAndAggregateBudgetsCannotHideBehindDistinctDomains() {
+        var first=dataDomain(1,1); var second=dataDomain(2,1); var cat=catalogue(List.of(remote()));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(first,first),cat,List.of(),List.of(),Map.of(),20));
+        var range=second.directory().ranges().getFirst(); var sameRange=new RangeDescriptor(first.directory().ranges().getFirst().rangeId(),range.groupId(),range.rangeEpoch(),range.configurationVersion(),null,null,range.topologyState(),range.replicas()); var sameGroup=new RangeDescriptor(range.rangeId(),first.directory().ranges().getFirst().groupId(),range.rangeEpoch(),range.configurationVersion(),null,null,range.topologyState(),range.replicas());
+        for(var changed:List.of(sameRange,sameGroup)) { var directory=new RangeDirectory(CLUSTER,DATABASE,second.domainId(),1,new byte[32],0,second.columns().keySet(),0,List.of(changed)); assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(first,new RatisNodePlan.Domain(directory,second.columns(),Set.of())),cat,List.of(),List.of(),Map.of(),20)); }
+        var alias=new RatisNodePlan.Domain(second.directory(),Map.of(second.columns().keySet().iterator().next(),first.columns().values().iterator().next()),Set.of()); assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(first,alias),cat,List.of(),List.of(),Map.of(),20));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(dataDomain(1,129),dataDomain(2,128)),cat,List.of(),List.of(),Map.of(),20));
+        var many=new ArrayList<RatisNodePlan.Domain>(); for(int n=1;n<=65;n++) many.add(dataDomain(n,1)); assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,many,cat,List.of(),List.of(),Map.of(),100));
+        assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(first,second),cat,List.of(),List.of(),Map.of(),1));
+    }
+    private static RatisNodePlan.Domain manyRanges(int domain,int count) {
+        var ranges=new ArrayList<RangeDescriptor>(); var replica=local("local","127.0.0.1:9001",ReplicaDescriptor.Role.VOTER);
+        for(int i=0;i<count;i++) { byte[] lower=i==0 ? null : new byte[]{(byte)(i>>>8),(byte)i}; int next=i+1; byte[] upper=i==count-1 ? null : new byte[]{(byte)(next>>>8),(byte)next}; ranges.add(range(new UUID(domain,1000+i),lower,upper,List.of(replica))); }
+        UUID column=new UUID(domain,999); var directory=new RangeDirectory(CLUSTER,DATABASE,new UUID(domain,900),1,new byte[32],0,Set.of(column),2,ranges); return new RatisNodePlan.Domain(directory,Map.of(column,"many-"+domain),Set.of());
+    }
+    @Test void dataGroupCapacityIsDatabaseWideRatherThanMultipliedByDomainCount() {
+        var cat=catalogue(List.of(remote())); var first=manyRanges(1,512); var second=manyRanges(2,513); assertThrows(IllegalArgumentException.class,()->new RatisNodePlan(NODE,INCARNATION,List.of(first,second),cat,List.of(),List.of(),Map.of(),RatisNodePlan.MAX_DATA_GROUPS+1));
     }
 
 }

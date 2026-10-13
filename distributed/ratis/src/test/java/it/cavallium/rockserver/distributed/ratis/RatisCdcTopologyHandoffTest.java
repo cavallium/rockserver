@@ -50,10 +50,10 @@ class RatisCdcTopologyHandoffTest {
                     catch(Exception error) { throw new IOException(error); }
                 }
             });
-            var authority=new RatisCdcDeliveryAuthority(routed,domain->source,(definition,lineage)->topology.definition.targetDirectory().ranges().stream().anyMatch(r->r.groupId().equals(lineage.groupId())) ? topology.definition.targetDirectory() : source,(definition,expected)->{
+            var authority=new RatisCdcDeliveryAuthority(Map.of(routed.directory().domainId(), routed), domain->source, (definition,lineage)->topology.definition.targetDirectory().ranges().stream().anyMatch(r->r.groupId().equals(lineage.groupId())) ? topology.definition.targetDirectory() : source, (definition,expected)->{
                 if(ownersUnavailable) throw new IOException("Original native owners unavailable");
                 var range=(expected.stage()==TopologyChange.Stage.FREEZE ? definition.parents() : definition.targets()).stream().filter(r->r.groupId().equals(expected.groupId())).findFirst().orElseThrow(); var evidence=topology.proof(definition,expected.stage(),range,topology.local); return new RatisTopologyCatalogue.QualifiedOwner(evidence.proof(),evidence.completedCut());
-            },header->{header.requireDefinition(topology.definition);return topology.definition;});
+            }, header->{header.requireDefinition(topology.definition);return topology.definition;});
             byte[][] prepared={null}; var store=topology.env.catalogue.store; var binding=topology.plan.catalogue();
             var validator=RatisCdcSubscriptionCatalogue.validator(source.clusterId(),source.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn());
             var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
@@ -79,9 +79,9 @@ class RatisCdcTopologyHandoffTest {
         RatisTopologyOwnerRpc.Evidence actualLateListenerSeed() throws Exception {
             var definition=topology.definition; var source=definition.sourceDirectory(); var parent=definition.parents().getFirst(); var listener=parent.replicas().stream().filter(r->r.role()==ReplicaDescriptor.Role.LISTENER).findFirst().orElseThrow();
             var original=topology.plan.catalogue(); var binding=new RatisNodePlan.Catalogue(original.groupId(),original.epoch(),original.schemaDigest(),original.directoryColumn(),original.sessionsColumn(),List.of(topology.local));
-            var plan=new RatisNodePlan(listener.nodeId(),listener.nodeIncarnation(),source,binding,topology.plan.columns(),Set.of(),16);
+            var plan=new RatisNodePlan(listener.nodeId(), listener.nodeIncarnation(), List.of(new RatisNodePlan.Domain(source, topology.plan.columns(), Set.of())), binding, List.of(), List.of(), Map.of(), 16);
             lateRouted=new RatisRoutedClient(source,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor r,UUID c,byte[] k){throw new AssertionError();}public CommandResult command(RangeDescriptor r,DistributedCommand c){throw new AssertionError();}});
-            lateNode=RatisNodeRuntime.open(plan,Files.createDirectory(root.resolve("listener")),ConfigParser.parseDefault(),topology.env.catalogue.epochs,lateRouted,topology.env.scheduler,topology.env.timer,()->20L,topology.env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,lateServer::create,RatisTopologyControllerTest.logicalSchema());
+            lateNode=RatisNodeRuntime.open(plan, Files.createDirectory(root.resolve("listener")), ConfigParser.parseDefault(), topology.env.catalogue.epochs, Map.of(lateRouted.directory().domainId(), lateRouted), topology.env.scheduler, topology.env.timer, ()->20L, topology.env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, lateServer::create, List.of(RatisTopologyControllerTest.logicalSchema()));
             RatisTopologySeedRuntimeTest.field(lateNode,"seedAuthority",(RatisNodeRuntime.SeedAuthorityReader)topology::authority); lateNode.start();
             var machine=lateServer.machines.get(RaftGroupId.valueOf(parent.groupId())); var store=RatisTopologySeedRuntimeTest.field(machine,"store",ReplicatedRangeStore.class);
             var user=new DistributedCommand(parent.groupId(),parent.rangeEpoch(),definition.header().schemaDigest(),new OperationId(new UUID(176,40),0,0),List.of(new Mutation(Mutation.Kind.PUT,RatisTopologyControllerTest.COLUMN,new byte[]{1},new byte[]{42})));

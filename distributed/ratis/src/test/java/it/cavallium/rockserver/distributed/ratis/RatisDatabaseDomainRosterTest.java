@@ -19,7 +19,7 @@ class RatisDatabaseDomainRosterTest {
     RatisCatalogue catalogue(RatisSessionEpochsTest outer,RatisSessionEpochsTest.Fixture fixture) { return new RatisCatalogue(fixture.client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn); }
     RatisDatabaseDomainRoster rosters(RatisSessionEpochsTest outer,RaftClient client) { return new RatisDatabaseDomainRoster(client,outer.cluster,outer.database,outer.catalogue,1,new byte[32],outer.directoryColumn); }
     RangeDirectory directory(RatisSessionEpochsTest outer,int n) {
-        var initial=new RatisCatalogueGenesisTest().plan(outer).directory(); var r=initial.ranges().getFirst(); var range=new RangeDescriptor(new UUID(850,n),new UUID(851,n),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,r.replicas());
+        var initial=new RatisCatalogueGenesisTest().plan(outer).domains().getFirst().directory(); var r=initial.ranges().getFirst(); var range=new RangeDescriptor(new UUID(850,n),new UUID(851,n),1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,r.replicas());
         return new RangeDirectory(outer.cluster,outer.database,new UUID(852,n),initial.schemaEpoch(),initial.schemaDigest(),0,initial.columns(),0,List.of(range));
     }
     @Test void concurrentDomainAdditionsConflictAtomicallyAndNeverPublishAnUnrosteredDirectory() throws Exception {
@@ -33,18 +33,18 @@ class RatisDatabaseDomainRosterTest {
     }
     @Test void lostAppliedGenesisThenLaterAdditionReopensOriginalBitsAndSavedOutcome() throws Exception {
         var outer=new RatisSessionEpochsTest(); try(var fixture=outer.new Fixture(root)) {
-            var helper=new RatisCatalogueGenesisTest(); var plan=helper.plan(outer); var after=DatabaseDomainRoster.initial(outer.cluster,outer.database,List.of(plan.directory().domainId())); Path journal=root.resolve("genesis.bin"); byte[] original;
-            try(var genesis=new RatisCatalogueGenesis(journal,fixture.client,plan,10,null,null,after)) { original=DistributedCommandCodec.encode(genesis.preparedCommand()); fixture.writeOverride=new byte[4]; assertThrows(IOException.class,genesis::execute); }
+            var helper=new RatisCatalogueGenesisTest(); var plan=helper.plan(outer); var after=DatabaseDomainRoster.initial(outer.cluster,outer.database,List.of(plan.domains().getFirst().directory().domainId())); Path journal=root.resolve("genesis.bin"); byte[] original;
+            try(var genesis=new RatisCatalogueGenesis(journal,fixture.client,plan,plan.domains().getFirst().directory().domainId(),10,null,null,after)) { original=DistributedCommandCodec.encode(genesis.preparedCommand()); fixture.writeOverride=new byte[4]; assertThrows(IOException.class,genesis::execute); }
             fixture.writeOverride=null; var second=directory(outer,2); var catalogue=catalogue(outer,fixture); assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(outer.operation(0),null,second,after)).status()); var extended=rosters(outer,fixture.client).read();
-            try(var genesis=new RatisCatalogueGenesis(journal,fixture.client,plan,10,null,null,after)) { assertArrayEquals(original,DistributedCommandCodec.encode(genesis.preparedCommand())); assertEquals(CommandResult.Status.SUCCESS,genesis.execute().status()); }
+            try(var genesis=new RatisCatalogueGenesis(journal,fixture.client,plan,plan.domains().getFirst().directory().domainId(),10,null,null,after)) { assertArrayEquals(original,DistributedCommandCodec.encode(genesis.preparedCommand())); assertEquals(CommandResult.Status.SUCCESS,genesis.execute().status()); }
             assertEquals(extended,rosters(outer,fixture.client).read()); assertEquals(2,rosters(outer,fixture.client).readComplete().directories().size());
         }
     }
     @Test void advertisedIncompleteDomainBlocksCompleteViewUntilFrozenLaterPublication() throws Exception {
         var outer=new RatisSessionEpochsTest(); try(var fixture=outer.new Fixture(root)) {
-            var helper=new RatisCatalogueGenesisTest(); var first=helper.plan(outer); var second=helper.secondDomain(outer); var after=DatabaseDomainRoster.initial(outer.cluster,outer.database,List.of(first.directory().domainId(),second.directory().domainId())); var reader=rosters(outer,fixture.client);
-            try(var genesis=new RatisCatalogueGenesis(root.resolve("first.bin"),fixture.client,first,10,null,null,after)) { assertEquals(CommandResult.Status.SUCCESS,genesis.execute().status()); } assertEquals(2,reader.read().domainIds().size()); assertThrows(IOException.class,reader::readComplete);
-            try(var genesis=new RatisCatalogueGenesis(root.resolve("second.bin"),fixture.client,second,0,fixture.epochs.read(),after,after)) { assertEquals(1,genesis.preparedCommand().mutations().size()); assertEquals(CommandResult.Status.SUCCESS,genesis.execute().status()); } assertEquals(2,reader.readComplete().directories().size());
+            var helper=new RatisCatalogueGenesisTest(); var first=helper.plan(outer); var second=helper.secondDomain(outer); var after=DatabaseDomainRoster.initial(outer.cluster,outer.database,List.of(first.domains().getFirst().directory().domainId(),second.domains().getFirst().directory().domainId())); var reader=rosters(outer,fixture.client);
+            try(var genesis=new RatisCatalogueGenesis(root.resolve("first.bin"),fixture.client,first,first.domains().getFirst().directory().domainId(),10,null,null,after)) { assertEquals(CommandResult.Status.SUCCESS,genesis.execute().status()); } assertEquals(2,reader.read().domainIds().size()); assertThrows(IOException.class,reader::readComplete);
+            try(var genesis=new RatisCatalogueGenesis(root.resolve("second.bin"),fixture.client,second,second.domains().getFirst().directory().domainId(),0,fixture.epochs.read(),after,after)) { assertEquals(1,genesis.preparedCommand().mutations().size()); assertEquals(CommandResult.Status.SUCCESS,genesis.execute().status()); } assertEquals(2,reader.readComplete().directories().size());
         }
     }
     @Test void staleForeignShrinkingOrStandaloneRosterCannotHideIssuedDomains() throws Exception {

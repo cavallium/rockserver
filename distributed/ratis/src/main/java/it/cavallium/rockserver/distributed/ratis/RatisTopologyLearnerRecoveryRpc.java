@@ -1,0 +1,11 @@
+package it.cavallium.rockserver.distributed.ratis;
+
+/** Fresh server-owned qualification of a registered receiver's exact later image and local schema preparation. */
+public final class RatisTopologyLearnerRecoveryRpc {
+    public static final int KIND=109,MAX_REQUEST_BYTES=RatisTopologySourceSnapshotRpc.MAX_REQUEST_BYTES,MAX_REPLY_BYTES=RatisTopologySourceSnapshotRpc.MAX_REPLY_BYTES;
+    private RatisTopologyLearnerRecoveryRpc(){}
+    public static byte[] request(RatisTopologySourceSnapshotRpc.Request request){if(request.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.RECOVERY)throw new IllegalArgumentException("Expected registered learner recovery");var packet=ScopedTransactionRpc.parse(RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.PREPARE,request),MAX_REQUEST_BYTES);return ScopedTransactionRpc.frame(KIND,packet.body());}
+    public static RatisTopologySourceSnapshotRpc.Request decode(byte[] bytes){var packet=ScopedTransactionRpc.parse(bytes,MAX_REQUEST_BYTES);if(packet.kind()!=KIND)throw new IllegalArgumentException("Invalid learner recovery kind");var request=RatisTopologySourceSnapshotRpc.request(ScopedTransactionRpc.frame(RatisTopologySourceSnapshotRpc.PREPARE,packet.body()));if(request.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.RECOVERY)throw new IllegalArgumentException("Expected recovery purpose");return request;}
+    public static byte[] reply(RatisTopologySourceSnapshotRpc.Prepared prepared){if(prepared.request().purpose()!=RatisTopologySourceSnapshotRpc.Purpose.RECOVERY)throw new IllegalArgumentException("Expected recovery image");var packet=ScopedTransactionRpc.parse(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,prepared),MAX_REPLY_BYTES);return ScopedTransactionRpc.frame(KIND,packet.body());}
+    public static RatisTopologySourceSnapshotRpc.Prepared reply(byte[] bytes,RatisTopologySourceSnapshotRpc.Request expected){var packet=ScopedTransactionRpc.parse(bytes,MAX_REPLY_BYTES);if(packet.kind()!=KIND)throw new IllegalArgumentException("Invalid recovery image reply");return RatisTopologySourceSnapshotRpc.reply(ScopedTransactionRpc.frame(RatisTopologySourceSnapshotRpc.PREPARE,packet.body()),RatisTopologySourceSnapshotRpc.PREPARE,expected);}
+}

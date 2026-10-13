@@ -22,18 +22,18 @@ class RatisNodeServiceTest {
                 new DistributedSchema.Column(71,o.data,"data",ColumnSchema.of(IntArrayList.of(1),new ObjectArrayList<>(),true),null)));
     }
     RatisNodeManifest manifest(RatisNodeRuntimeTest.Env env,DistributedSchema schema) {
-        return new RatisNodeManifest(schema,env.plan,new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),
+        return new RatisNodeManifest(List.of(schema),env.plan,new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),
                 RatisRangeStateMachine.RetentionLimits.defaults(),Duration.ofSeconds(1),1,2,Duration.ofMillis(100),RatisNodeRuntime.ExportResources.defaults()),3,3);
     }
     RatisNodeService.Resources resources(RatisNodeRuntimeTest.Env env) {
-        env.resourcesTransferred=true; return new RatisNodeService.Resources(env.catalogue.client,env.routed,env.scheduler,env.timer);
+        env.resourcesTransferred=true; return new RatisNodeService.Resources(env.catalogue.client,Map.of(env.routed.directory().domainId(),env.routed),env.scheduler,env.timer);
     }
     @Test void recoveryUsesPersistedReplicaBudgetsAndBorrowedPolicy() throws Exception {
         var schema=schema();
         try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
             initialize(env,schema);
             var original=manifest(env,schema); var limits=new RatisSchemaReplicaService.Limits(3,96L*1024*1024,80L*1024*1024,5,7,0);
-            var configured=RatisNodeManifest.decode(RatisNodeManifest.encode(new RatisNodeManifest(schema,env.plan,original.settings(),3,3,limits)));
+            var configured=RatisNodeManifest.decode(RatisNodeManifest.encode(new RatisNodeManifest(List.of(schema),env.plan,original.settings(),3,3,limits)));
             class Policy implements RatisSchemaReplicaService.OperatorPolicy,AutoCloseable {
                 int closes;
                 public it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract admit(DistributedSchema.Operator operator) throws IOException { throw new IOException("This node fixture has no approved operator"); }
@@ -53,15 +53,14 @@ class RatisNodeServiceTest {
 
     void publish(RatisNodeRuntimeTest.Env env,DistributedSchema schema) throws Exception {
         var o=env.outer; var c=new RatisSchemaCatalogue(env.catalogue.client,o.cluster,o.database,o.catalogue,1,new byte[32],o.directoryColumn);
-        c.execute(c.prepare(o.operation(1),schema)); var d=env.plan.directory();
+        c.execute(c.prepare(o.operation(1),schema)); var d=env.plan.directory(env.routed.directory().domainId());
         var initial=new RangeDirectory(d.clusterId(),d.databaseId(),d.domainId(),d.schemaEpoch(),d.schemaDigest(),0,d.columns(),d.routingPrefixBytes(),d.ranges());
         var directory=new RatisCatalogue(env.catalogue.client,o.cluster,o.database,o.catalogue,1,new byte[32],o.directoryColumn);
         directory.execute(directory.prepare(o.operation(2),null,initial)); directory.execute(directory.prepare(o.operation(3),initial,d));
     }
     void initialize(RatisNodeRuntimeTest.Env env,DistributedSchema schema) throws Exception {
         var fake=new RatisNodeRuntimeTest.FakeServer();
-        try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,
-                env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,schema)) {
+        try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, List.of(schema))) {
             node.start();
         }
     }
@@ -88,7 +87,7 @@ class RatisNodeServiceTest {
             var fake=new RatisNodeRuntimeTest.FakeServer();
             try (var service=RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
                 service.start(); var field=RatisRangeStateMachine.class.getDeclaredField("store"); field.setAccessible(true);
-                var store=(ReplicatedRangeStore)field.get(fake.machines.values().iterator().next());
+                var store=(ReplicatedRangeStore)field.get(fake.machines.get(org.apache.ratis.protocol.RaftGroupId.valueOf(env.plan.directory(schema.domainId()).ranges().getFirst().groupId())));
                 try (var pin=store.capture()) {
                     assertThrows(IOException.class,service::close); assertEquals(RatisNodeRuntime.State.STOPPING,service.state());
                     assertEquals(0,env.catalogue.closes.get()); assertEquals(0,env.transportCloses); assertFalse(env.timer.isDisposed());
@@ -130,7 +129,7 @@ class RatisNodeServiceTest {
                         try { return method.invoke(env.catalogue.client,args); }
                         catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
                     });
-            var owned=new RatisNodeService.Resources(client,env.routed,env.scheduler,env.timer);
+            var owned=new RatisNodeService.Resources(client,Map.of(env.routed.directory().domainId(),env.routed),env.scheduler,env.timer);
             var failure=assertThrows(IOException.class,() -> RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),owned,new RatisNodeRuntimeTest.FakeServer()::create));
             assertEquals(1,failure.getSuppressed().length); assertEquals("fixture close failure",failure.getSuppressed()[0].getMessage());
             assertEquals(1,env.catalogue.closes.get()); assertEquals(1,env.transportCloses); assertTrue(env.timer.isDisposed());

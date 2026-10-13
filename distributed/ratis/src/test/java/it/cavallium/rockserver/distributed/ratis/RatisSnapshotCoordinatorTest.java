@@ -61,7 +61,7 @@ class RatisSnapshotCoordinatorTest {
                     } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException(failure); }
                 }
             });
-            registry=new RatisParticipantRecoveryRegistry(java.nio.file.Files.createDirectory(root.resolve(name+"-recoveries")),transactions.statuses,data,false,Set.of(left.f.groupId,right.f.groupId),RatisParticipantRecoveryRegistry.Limits.defaults());
+            registry=new RatisParticipantRecoveryRegistry(java.nio.file.Files.createDirectory(root.resolve(name+"-recoveries")), transactions.statuses, Map.of(data.directory().domainId(), data), group -> data.directory(), false, Set.of(left.f.groupId,right.f.groupId), RatisParticipantRecoveryRegistry.Limits.defaults());
             recovery=(group,prepared) -> { assertEquals(0,captures.get()); boolean progress=registry.step(group,prepared); if (progress) helped.incrementAndGet(); return progress; };
         }
         RangeDescriptor route(RatisParticipantPrepareTest.Node node,byte[] lower,byte[] upper) {

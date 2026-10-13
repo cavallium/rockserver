@@ -14,40 +14,44 @@ import java.util.*;
 /** Bounded durable node configuration; it conveys no placement-creation, recovery-wipe or service-start authority. */
 public final class RatisNodeManifest {
     /** Includes the file checksum; encoded bodies leave room for its 32 bytes. */
-    public static final int MAX_BYTES=8*1024*1024;
+    public static final int MAX_BYTES=RatisNodePlan.MAX_METADATA_BYTES;
     private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=200;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
     };
-    private final DistributedSchema schema;
+    private final Map<UUID,DistributedSchema> schemas;
     private final RatisNodePlan plan;
     private final RatisNodeRuntime.Settings settings;
     private final int readThreads,writeThreads;
     private final RatisSchemaReplicaService.Limits schemaReplicaLimits;
 
-    public RatisNodeManifest(DistributedSchema schema,RatisNodePlan plan,RatisNodeRuntime.Settings settings,int readThreads,int writeThreads) {
-        this(schema,plan,settings,readThreads,writeThreads,RatisSchemaReplicaService.Limits.defaults());
+    public RatisNodeManifest(Collection<DistributedSchema> schemas,RatisNodePlan plan,RatisNodeRuntime.Settings settings,int readThreads,int writeThreads) {
+        this(schemas,plan,settings,readThreads,writeThreads,RatisSchemaReplicaService.Limits.defaults());
     }
-    public RatisNodeManifest(DistributedSchema schema,RatisNodePlan plan,RatisNodeRuntime.Settings settings,int readThreads,int writeThreads,RatisSchemaReplicaService.Limits replicaLimits) {
+    public RatisNodeManifest(Collection<DistributedSchema> schemas,RatisNodePlan plan,RatisNodeRuntime.Settings settings,int readThreads,int writeThreads,RatisSchemaReplicaService.Limits replicaLimits) {
         schemaReplicaLimits=Objects.requireNonNull(replicaLimits);
-        this.schema=Objects.requireNonNull(schema); this.plan=Objects.requireNonNull(plan); this.settings=Objects.requireNonNull(settings);
-        schema.requireMatches(plan.directory());
-        if (!plan.columns().keySet().equals(schema.columnIds()) || !plan.merges().equals(mergeColumns(schema))
-                || readThreads<WorkloadSettings.MIN_PRODUCTION_DATA_THREADS || readThreads>256
-                || writeThreads<WorkloadSettings.MIN_PRODUCTION_DATA_THREADS || writeThreads>256) {
-            throw new IllegalArgumentException("Manifest schema/merge bindings or scheduler budget differ");
+        this.plan=Objects.requireNonNull(plan); this.settings=Objects.requireNonNull(settings);
+        if(schemas.size()!=plan.domains().size()) throw new IllegalArgumentException("Manifest schemas must cover exactly every DATA domain");
+        var byDomain=new TreeMap<UUID,DistributedSchema>(UUID_ORDER); var apiIds=new HashSet<Long>(); long bytes=0;
+        for(var schema:schemas) {
+            var domain=plan.domain(schema.domainId()); schema.requireMatches(domain.directory()); bytes+=DistributedSchemaCodec.encode(schema).length+RangeDirectoryCodec.encode(domain.directory()).length;
+            if(byDomain.put(schema.domainId(),schema)!=null || !domain.merges().equals(mergeColumns(schema)) || bytes>RatisNodePlan.MAX_DOMAIN_BYTES) throw new IllegalArgumentException("Manifest DATA schema coverage/merges/metadata differs");
+            for(var column:schema.columns()) if(!apiIds.add(column.apiId())) throw new IllegalArgumentException("DATA domains share a logical API column identity");
         }
+        if(byDomain.size()!=plan.domains().size() || readThreads<WorkloadSettings.MIN_PRODUCTION_DATA_THREADS || readThreads>256 || writeThreads<WorkloadSettings.MIN_PRODUCTION_DATA_THREADS || writeThreads>256) throw new IllegalArgumentException("Manifest schema coverage or scheduler budget differs"); this.schemas=Collections.unmodifiableMap(byDomain);
         int requiredColumns=plan.localGroups().stream().mapToInt(group -> switch (plan.role(group.getGroupId().getUuid())) {
-            case DATA -> schema.columnIds().size(); case CATALOGUE -> 2; case TRANSACTION_HOME, SNAPSHOT_HOME -> 1;
+            case DATA -> plan.groupDirectory(group.getGroupId().getUuid()).columns().size(); case CATALOGUE -> 2; case TRANSACTION_HOME, SNAPSHOT_HOME -> 1;
         }).max().orElseThrow();
         if (settings.images().maxColumns()<requiredColumns) throw new IllegalArgumentException("Manifest snapshot column budget is below local group scope");
         for (String name:plan.columns().values()) text(name);
         for (var home:plan.homes()) text(home.physicalName());
         nanos(settings.clockPeriod()); nanos(settings.shutdownTimeout());
-        this.readThreads=readThreads; this.writeThreads=writeThreads;
+        this.readThreads=readThreads; this.writeThreads=writeThreads; encodedSize(this);
     }
-    public DistributedSchema schema() { return schema; }
+    public Map<UUID,DistributedSchema> schemas() { return schemas; }
+    public DistributedSchema schema(UUID domain) { var schema=schemas.get(domain); if(schema==null) throw new IllegalArgumentException("Manifest has no DATA domain schema"); return schema; }
+    public DistributedSchema schemaForGroup(UUID group) { if(plan.role(group)!=RatisNodePlan.Role.DATA) throw new IllegalArgumentException("Group is not DATA"); return schema(plan.groupDirectory(group).domainId()); }
     public RatisNodePlan plan() { return plan; }
     public RatisNodeRuntime.Settings settings() { return settings; }
     public RatisSchemaReplicaService.Limits schemaReplicaLimits() { return schemaReplicaLimits; }
@@ -59,21 +63,32 @@ public final class RatisNodeManifest {
         return Set.copyOf(columns);
     }
 
+    private static long encodedSize(RatisNodeManifest manifest) {
+        long size=4L+4+8L*manifest.plan.domains().size()+4+RangeDirectoryCodec.encode(synthetic(manifest.plan)).length+72+12+SETTINGS_BYTES;
+        for(var domain:manifest.plan.domains()) size+=DistributedSchemaCodec.encode(manifest.schema(domain.domainId())).length+RangeDirectoryCodec.encode(domain.directory()).length;
+        for(var home:manifest.plan.homes()) size+=25L+RangeDirectoryCodec.encode(home.directory()).length+text(home.physicalName()).length;
+        for(var name:manifest.plan.columns().values()) size+=20L+text(name).length;
+        for(var definition:manifest.plan.imports()) size+=4L+definition.encode().length;
+        for(var entry:manifest.plan.streamAddresses().entrySet())size+=8L+text(entry.getKey()).length+text(entry.getValue()).length;
+        if(size>MAX_BYTES-32)throw new IllegalArgumentException("Node manifest exceeds byte budget");return size;
+    }
     public static byte[] encode(RatisNodeManifest manifest) {
         Objects.requireNonNull(manifest);
-        byte[] schema=DistributedSchemaCodec.encode(manifest.schema), directory=RangeDirectoryCodec.encode(manifest.plan.directory());
+        var schemaBytes=new ArrayList<byte[]>(); var directoryBytes=new ArrayList<byte[]>(); long domainBytes=0;
+        for(var domain:manifest.plan.domains()) { byte[] schema=DistributedSchemaCodec.encode(manifest.schema(domain.domainId())),directory=RangeDirectoryCodec.encode(domain.directory()); schemaBytes.add(schema); directoryBytes.add(directory); domainBytes+=schema.length+directory.length; }
+        if(domainBytes>RatisNodePlan.MAX_DOMAIN_BYTES) throw new IllegalArgumentException("Manifest DATA metadata exceeds aggregate bound");
         byte[] catalogue=RangeDirectoryCodec.encode(synthetic(manifest.plan));
-        long size=4L+12+schema.length+directory.length+catalogue.length+72+12+SETTINGS_BYTES;
+        long size=4L+4+8L*schemaBytes.size()+domainBytes+4+catalogue.length+72+12+SETTINGS_BYTES;
         for (var home:manifest.plan.homes()) size+=25L+RangeDirectoryCodec.encode(home.directory()).length+text(home.physicalName()).length;
         for (var name:manifest.plan.columns().values()) size+=20L+text(name).length;
         for(var definition:manifest.plan.imports()) size+=4L+definition.encode().length;
         for(var entry:manifest.plan.streamAddresses().entrySet())size+=8L+text(entry.getKey()).length+text(entry.getValue()).length;
         if (size>MAX_BYTES-32) throw new IllegalArgumentException("Node manifest exceeds byte budget");
         var output=ByteBuffer.allocate((int)size).putInt(MAGIC);
-        blob(output,schema); blob(output,directory); blob(output,catalogue);
+        output.putInt(schemaBytes.size()); for(int i=0;i<schemaBytes.size();i++){blob(output,schemaBytes.get(i));blob(output,directoryBytes.get(i));} blob(output,catalogue);
         var c=manifest.plan.catalogue(); uuid(output,c.directoryColumn()); uuid(output,c.sessionsColumn());
         uuid(output,manifest.plan.nodeId()); uuid(output,manifest.plan.nodeIncarnation());
-        output.putInt(manifest.plan.localGroups().size()).putInt(manifest.plan.columns().size());
+        output.putInt(manifest.plan.maxLocalGroups()).putInt(manifest.plan.columns().size());
         for (UUID column:manifest.plan.columns().keySet().stream().sorted(UUID_ORDER).toList()) {
             uuid(output,column); blob(output,text(manifest.plan.columns().get(column)));
         }
@@ -102,8 +117,15 @@ public final class RatisNodeManifest {
         if (bytes.length<172 || bytes.length>MAX_BYTES-32) throw new IllegalArgumentException("Invalid node manifest size");
         var input=ByteBuffer.wrap(bytes);
         if (input.getInt()!=MAGIC) throw new IllegalArgumentException("Unsupported node manifest header");
-        var schema=DistributedSchemaCodec.decode(blob(input,DistributedSchemaCodec.MAX_BYTES));
-        var directory=RangeDirectoryCodec.decode(blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES));
+        require(input,4); int domainCount=input.getInt();
+        if(domainCount<1 || domainCount>RatisNodePlan.MAX_DOMAINS || domainCount*8L>input.remaining()) throw new IllegalArgumentException("Invalid manifest DATA domain count");
+        var schemas=new ArrayList<DistributedSchema>(domainCount); var directories=new ArrayList<RangeDirectory>(domainCount); UUID previousDomain=null; long domainBytes=0;
+        for(int i=0;i<domainCount;i++) {
+            byte[] schemaBytes=blob(input,(int)Math.min(DistributedSchemaCodec.MAX_BYTES,RatisNodePlan.MAX_DOMAIN_BYTES-domainBytes)); domainBytes+=schemaBytes.length; byte[] directoryBytes=blob(input,(int)Math.min(RangeDirectoryCodec.MAX_ENCODED_BYTES,RatisNodePlan.MAX_DOMAIN_BYTES-domainBytes)); domainBytes+=directoryBytes.length;
+            if(domainBytes>RatisNodePlan.MAX_DOMAIN_BYTES) throw new IllegalArgumentException("Manifest DATA metadata exceeds aggregate bound");
+            var schema=DistributedSchemaCodec.decode(schemaBytes); var directory=RangeDirectoryCodec.decode(directoryBytes); schema.requireMatches(directory);
+            if(previousDomain!=null && UUID_ORDER.compare(previousDomain,directory.domainId())>=0) throw new IllegalArgumentException("Noncanonical manifest DATA domain order"); previousDomain=directory.domainId(); schemas.add(schema); directories.add(directory);
+        }
         var catalogue=RangeDirectoryCodec.decode(blob(input,RangeDirectoryCodec.MAX_ENCODED_BYTES));
         require(input,72+4+SETTINGS_BYTES);
         UUID directoryColumn=uuid(input), sessionsColumn=uuid(input), node=uuid(input), incarnation=uuid(input);
@@ -154,10 +176,11 @@ public final class RatisNodeManifest {
         var replicaLimits=new RatisSchemaReplicaService.Limits(input.getInt(),input.getLong(),input.getLong(),input.getInt(),input.getInt(),input.getLong());
         if (clock<=0 || shutdown<=0 || input.hasRemaining()) throw new IllegalArgumentException("Invalid node manifest durations/trailing data");
         var settings=new RatisNodeRuntime.Settings(images,retention,Duration.ofNanos(clock),visits,ranges,Duration.ofNanos(shutdown),new RatisNodeRuntime.ExportResources(pins,source,io));
-        var recovered=catalogue(catalogue,directory,directoryColumn,sessionsColumn);
-        var plan=new RatisNodePlan(node,incarnation,directory,recovered,columns,mergeColumns(schema),homes,imports,streamAddresses,groups);
-        if (plan.localGroups().size()!=groups) throw new IllegalArgumentException("Manifest group budget is not canonical");
-        var manifest=new RatisNodeManifest(schema,plan,settings,reads,writes,replicaLimits);
+        var recovered=catalogue(catalogue,directories.getFirst(),directoryColumn,sessionsColumn); var domains=new ArrayList<RatisNodePlan.Domain>();
+        for(int i=0;i<directories.size();i++) { var directory=directories.get(i); var bindings=new HashMap<UUID,String>(); for(var column:directory.columns()) { var name=columns.get(column); if(name==null) throw new IllegalArgumentException("Manifest DATA physical binding missing"); bindings.put(column,name); } domains.add(new RatisNodePlan.Domain(directory,bindings,mergeColumns(schemas.get(i)))); }
+        var plan=new RatisNodePlan(node,incarnation,domains,recovered,homes,imports,streamAddresses,groups);
+        if(!plan.columns().equals(columns)) throw new IllegalArgumentException("Manifest has unrelated physical column bindings");
+        var manifest=new RatisNodeManifest(schemas,plan,settings,reads,writes,replicaLimits);
         if (!Arrays.equals(bytes,encode(manifest))) throw new IllegalArgumentException("Noncanonical node manifest encoding");
         return manifest;
     }
@@ -178,9 +201,9 @@ public final class RatisNodeManifest {
         }
     }
     private static RangeDirectory synthetic(RatisNodePlan plan) {
-        var c=plan.catalogue(); var d=plan.directory();
+        var c=plan.catalogue();
         var range=new RangeDescriptor(c.groupId(),c.groupId(),c.epoch(),0,null,null,RangeDescriptor.TopologyState.ACTIVE,c.replicas());
-        return new RangeDirectory(d.clusterId(),d.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),0,
+        return new RangeDirectory(plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),0,
                 Set.of(c.directoryColumn(),c.sessionsColumn()),0,List.of(range));
     }
     private static RatisNodePlan.Catalogue catalogue(RangeDirectory c,RangeDirectory d,UUID directoryColumn,UUID sessionsColumn) {

@@ -27,7 +27,7 @@ class RatisRetirementCoordinatorTest {
         });
     }
     RatisRetirementCoordinator coordinator(String path,RatisTransactionStatuses homes,RatisSnapshotFences snapshots,RatisRoutedClient data,List<RatisRetirementCoordinator.Source> sources) throws IOException {
-        return new RatisRetirementCoordinator(root.resolve(path),homes,snapshots,data,sources,RatisRetirementJournal.Limits.defaults());
+        return new RatisRetirementCoordinator(root.resolve(path), homes, snapshots, Map.of(data.directory().domainId(), data), sources, RatisRetirementJournal.Limits.defaults());
     }
     @Test void consumedCommitAndAbortRetireDataThenHomeOneMutationPerVisit() throws Exception {
         var owner=new RatisHomeRetirementRpcTest(); owner.root=root;

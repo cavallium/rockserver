@@ -63,7 +63,7 @@ class RatisCdcSubscriptionControllerTest {
                 }
                 public void close() { transportClosed=true; }
             });
-            var authority=new RatisCdcDeliveryAuthority(routed,domain -> directory); byte[][] prepared={null};
+            var authority=new RatisCdcDeliveryAuthority(Map.of(routed.directory().domainId(), routed), domain -> directory); byte[][] prepared={null};
             var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args) -> {
                 var message=(Message)args[0]; byte[] bytes=message.getContent().toByteArray();
                 if(method.getName().equals("sendReadOnly")) {

@@ -216,12 +216,13 @@ public final class RatisRoutedClient implements AutoCloseable {
 
     /** Frozen original replica and process incarnation; reads never reselect the current leader. */
     public static final class SnapshotTarget {
-        private final RangeDirectory source; private final SnapshotFence fence; private final RangeDescriptor descriptor; private final ReplicaDescriptor replica; private final UUID incarnation; private final ScopedTransactionRpc.SnapshotBinding binding;
-        private SnapshotTarget(RangeDirectory source,SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation) { this.source=source; this.fence=fence; this.descriptor=descriptor; this.replica=replica; this.incarnation=incarnation; binding=ScopedTransactionRpc.SnapshotBinding.of(fence); }
+        private final RangeDirectory source; private final SnapshotFence fence; private final RangeDescriptor descriptor; private final ReplicaDescriptor replica; private final UUID incarnation;private final RatisSnapshotCohortRpc.Capabilities cohort; private final ScopedTransactionRpc.SnapshotBinding binding;
+        private SnapshotTarget(RangeDirectory source,SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation,RatisSnapshotCohortRpc.Capabilities cohort) { this.cohort=cohort;this.source=source; this.fence=fence; this.descriptor=descriptor; this.replica=replica; this.incarnation=incarnation; binding=ScopedTransactionRpc.SnapshotBinding.of(fence); }
         public SnapshotFence fence() { return fence; }
         public RangeDescriptor descriptor() { return descriptor; }
         public ReplicaDescriptor replica() { return replica; }
         public UUID incarnation() { return incarnation; }
+        public RatisSnapshotCohortRpc.Capabilities cohort(){return cohort;}
     }
     public RatisSnapshotReadiness snapshotReadiness(SnapshotFence fence,UUID group) throws IOException {
         var observed=current(); var descriptor=observed.ranges().stream().filter(r -> r.groupId().equals(group)).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot participant route absent"));
@@ -247,13 +248,18 @@ public final class RatisRoutedClient implements AutoCloseable {
             var owner=RatisSnapshotOwner.decode(transaction(descriptor,ScopedTransactionRpc.SNAPSHOT_OWNER,new byte[0],true));
             if (!owner.groupId().equals(group) || owner.rangeEpoch()!=descriptor.rangeEpoch() || !Arrays.equals(owner.schemaDigest(),observed.schemaDigest())) throw new IllegalArgumentException("Snapshot owner reply changed range/schema");
             var replica=descriptor.replicas().stream().filter(r -> r.peerId().equals(owner.peerId()) && r.role()==ReplicaDescriptor.Role.VOTER).findFirst().orElseThrow(() -> new IllegalArgumentException("Snapshot owner is not a frozen voter"));
-            return new SnapshotTarget(identity,fence,descriptor,replica,owner.incarnation());
+            return new SnapshotTarget(identity,fence,descriptor,replica,owner.incarnation(),owner.cohort());
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid snapshot owner reply",malformed); }
     }
     public SnapshotTarget restoreSnapshotTarget(SnapshotFence fence,RangeDescriptor descriptor,ReplicaDescriptor replica,UUID incarnation) {
         Objects.requireNonNull(incarnation); requireSnapshotRoute(current(),descriptor,fence,descriptor.groupId());
         if (!descriptor.replicas().contains(replica) || replica.role()!=ReplicaDescriptor.Role.VOTER) throw new IllegalArgumentException("Snapshot replica differs from frozen route");
-        return new SnapshotTarget(identity,fence,descriptor,replica,incarnation);
+        return new SnapshotTarget(identity,fence,descriptor,replica,incarnation,null);
+    }
+    /** Exact frozen voter route; no current-leader or arbitrary-endpoint fallback. */
+    public byte[] cohortQuery(SnapshotTarget anchor,int kind,byte[] body)throws IOException {
+        Objects.requireNonNull(anchor);requireIdentity(anchor.source);if(kind<RatisSnapshotCohortRpc.OWNER || kind>RatisSnapshotCohortRpc.CANCEL)throw new IllegalArgumentException("Invalid cohort operation");beginCall();
+        try{var packet=ScopedTransactionRpc.parse(transport.snapshot(anchor.descriptor,anchor.replica,ScopedTransactionRpc.frame(kind,body)),RatisSnapshotCohortRpc.MAX_REPLY_BYTES);if(packet.kind()!=kind)throw new IOException("Cohort reply operation changed");return packet.body();}finally{endCall();}
     }
     public byte[] snapshotGet(SnapshotTarget target,SnapshotFenceStatus.Capture token,UUID column,byte[] key) throws IOException {
         Objects.requireNonNull(key); if (key.length>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Snapshot key exceeds bound");
@@ -1357,11 +1363,11 @@ public final class RatisRoutedClient implements AutoCloseable {
     /** Addresses the frozen peer directly; capture creation additionally verifies trusted home authority on that participant. */
     static byte[] snapshotOnOwner(RaftClient client,RangeDescriptor descriptor,ReplicaDescriptor owner,byte[] request) throws IOException {
         if (!descriptor.replicas().contains(owner)) throw new IllegalArgumentException("Snapshot owner is absent from frozen route");
-        var packet=ScopedTransactionRpc.parse(request,ScopedTransactionRpc.MAX_REQUEST_BYTES);
-        if (!ScopedTransactionRpc.ownerSnapshot(packet.kind()) && !ScopedTransactionRpc.ownerExport(packet.kind())) throw new IllegalArgumentException("Owner transport accepts only bound snapshot/export operations");
-        var reply=client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(request)),0,RaftPeerId.valueOf(owner.peerId()));
+        int kind=ScopedTransactionRpc.kind(request,Math.max(ScopedTransactionRpc.MAX_REQUEST_BYTES,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES));boolean cohort=kind>=RatisSnapshotCohortRpc.OWNER && kind<=RatisSnapshotCohortRpc.CANCEL;var packet=ScopedTransactionRpc.parse(request,cohort?RatisSnapshotCohortRpc.MAX_REQUEST_BYTES:ScopedTransactionRpc.MAX_REQUEST_BYTES);
+        if (!cohort && !ScopedTransactionRpc.ownerSnapshot(packet.kind()) && !ScopedTransactionRpc.ownerExport(packet.kind())) throw new IllegalArgumentException("Owner transport accepts only bound snapshot/export operations");
+        var reply=kind==RatisSnapshotCohortRpc.OWNER ? client.io().sendReadOnly(Message.valueOf(ByteString.copyFrom(request))) : client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(request)),0,RaftPeerId.valueOf(owner.peerId()));
         if (reply!=null && (!reply.getServerId().equals(RaftPeerId.valueOf(owner.peerId())) || !reply.getRaftGroupId().equals(RaftGroupId.valueOf(descriptor.groupId())))) throw new IOException("Snapshot reply came from another peer/group");
-        return RaftTransport.content(reply,ScopedTransactionRpc.MAX_REPLY_BYTES);
+        return RaftTransport.content(reply,cohort?RatisSnapshotCohortRpc.MAX_REPLY_BYTES:ScopedTransactionRpc.MAX_REPLY_BYTES);
     }
 
     private static final class RaftTransport implements Transport {

@@ -37,7 +37,7 @@ class RatisCdcDeliveryAdmissionTest {
                     catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}catch(ExecutionException|TimeoutException failure){throw new IOException(failure);}
                 }
             })) {
-                authority.set(new RatisCdcDeliveryAuthority(client,domain->directory));
+                authority.set(new RatisCdcDeliveryAuthority(Map.of(client.directory().domainId(), client), domain->directory));
                 byte[] key=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();
                 var seed=new DistributedCommand(f.catalogue.outer.catalogue,1,new byte[32],new OperationId(new UUID(9,605),1,0),List.of(new Mutation(Mutation.Kind.PUT,f.catalogue.outer.directoryColumn,key,RangeDirectoryCodec.encode(directory))));
                 f.catalogue.nativeCatalogue.store.apply(new ApplyPosition(1,f.catalogue.nativeCatalogue.next.getAndIncrement()),seed);
@@ -77,7 +77,7 @@ class RatisCdcDeliveryAdmissionTest {
                     catch(ExecutionException | TimeoutException failure) { throw new IOException(failure); }
                 }
             })) {
-            authority.set(new RatisCdcDeliveryAuthority(client,domain->directory));
+            authority.set(new RatisCdcDeliveryAuthority(Map.of(client.directory().domainId(), client), domain->directory));
             byte[] key=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();
             var seed=new DistributedCommand(f.catalogue.outer.catalogue,1,new byte[32],new OperationId(new UUID(9,601),1,0),List.of(new Mutation(Mutation.Kind.PUT,f.catalogue.outer.directoryColumn,key,RangeDirectoryCodec.encode(directory))));
             f.catalogue.nativeCatalogue.store.apply(new ApplyPosition(1,f.catalogue.nativeCatalogue.next.getAndIncrement()),seed);
@@ -137,7 +137,7 @@ class RatisCdcDeliveryAdmissionTest {
                     catch(ExecutionException | TimeoutException failure) { throw new IOException(failure); }
                 }
             })) {
-                authority.set(new RatisCdcDeliveryAuthority(client,domain->directory));
+                authority.set(new RatisCdcDeliveryAuthority(Map.of(client.directory().domainId(), client), domain->directory));
                 byte[] key=ByteBuffer.allocate(16).putLong(directory.domainId().getMostSignificantBits()).putLong(directory.domainId().getLeastSignificantBits()).array();
                 var seed=new DistributedCommand(f.catalogue.outer.catalogue,1,new byte[32],new OperationId(new UUID(9,801),1,0),List.of(new Mutation(Mutation.Kind.PUT,f.catalogue.outer.directoryColumn,key,RangeDirectoryCodec.encode(directory))));
                 f.catalogue.nativeCatalogue.store.apply(new ApplyPosition(1,f.catalogue.nativeCatalogue.next.getAndIncrement()),seed);

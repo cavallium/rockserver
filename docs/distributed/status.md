@@ -897,7 +897,15 @@ server process, network/quorum probe, power-loss run or deployment was performed
 The October 12 checkpoint adds an authoritative database DATA-domain roster.
 Initial directory publication guards and updates that roster atomically; aggregate
 bootstrap advertises every declared domain and rejects incomplete catalogue reads.
-This does not yet give the node manifest/service multiple DATA-domain startup.
+The node plan, manifest, service and runtime now carry all declared DATA domains.
+They share one pool, catalogue, clock, retirement coordinator and recovery registry.
+The controlled node fixture writes distinct domains, cold-reopens the service and
+verifies the complete catalogue roster; it passed with the focused integration
+selection in `/tmp/rockserver-multi-domain-cohort-focused-repair-gate.log`.
+Native aggregate bootstrap, operator evolution and cold metadata recovery passed
+31 unique cases in `/tmp/rockserver-multi-domain-cohort-backup-repair-gate.log`.
+The native preflight reads default and STATE with strict WAL recovery, retaining
+full live-CF birth/operator validation without requiring USER merge callbacks.
 
 Relocation source transfer now retains the exact prepared native image across
 restart and forces request-bound release receipts before artifact cleanup. The
@@ -912,22 +920,36 @@ and CAS call ownership passed the 59-case repair gate plus seven host cases in
 joint memberships now recover without weakening peer
 identity checks. Historical COMPLETE retries preserve newer routing. Current
 completion also refreshes the local schema/topology replica role while in-flight
-schema jobs retain their captured context. Removal/replacement and newer-schema
-adapter recovery remain incomplete.
+schema jobs retain their captured context. The registered receiver recovery
+controller now retains the exact later image through unknown preparation replies,
+transfer, native import, joint/stable membership and five-voter replacement. Its
+controlled workflow passed in the focused integration selection above; direct
+node-dispatcher acceptance for semantic 109 remains pending.
 
 Native learners retain their original image evidence and can install an explicitly
 authorized later image without rolling back a completed tail. Receiver preparation
 can create its own operator/CF generation for a newer-schema
 image without claiming historical participation. The 49-case native gate passed
 in `/tmp/rockserver-behind-schema-native-gate.log`, including 13 learner cases.
-Its complete remote adapter path remains under implementation.
+The registered-receiver client/controller adapter is implemented and exercised
+with controlled transport and actual native preparation/import. This does not
+establish a running endpoint or independent-node/quorum recovery.
 
 Snapshot coordination can stop with all gates READY, or all captures reported
 while HOME remains INSTALLING. The six coordinator cases passed after repair in
 `/tmp/rockserver-held-barrier-host-fixture-repair-gate.log` (the separate host case
-in that run failed and passed in the later source-transfer gate above). Complete
-database backup still requires global barrier orchestration and remote cohort
-ownership. Native pool cohorts now share one physical snapshot and admission charge;
+in that run failed and passed in the later source-transfer gate above). The
+global driver/journal and runtime cohort service/client now enforce original
+process/pool/member identities, all-gates-before-capture, one physical pool cut,
+global-vector force before HOME reports, finite original deadlines and actual
+cleanup settlement. Controlled service/client and driver fixtures passed in the
+focused integration selection, including 65 groups across two native pools.
+The owned public backup factory and its complete runtime integration remain pending.
+The affected consumer adapters passed their selections in
+`/tmp/rockserver-multi-domain-consumer-adaptation-gate.log`; topology fixtures
+were then corrected to declare their actual four-group scope. The final 28-case
+selection in `/tmp/rockserver-multi-domain-topology-capacity-gate.log` passed,
+including rejection before native birth when local capacity is exhausted. Native pool cohorts now share one physical snapshot and admission charge;
 45 native cases passed, including 65 groups, in
 `/tmp/rockserver-cohort-relocation-backup-combined-gate.log`. Copied archive assets
 and fresh-cluster restore planning passed their ten cases in
@@ -937,8 +959,10 @@ remains incomplete. READ_ONLY capture requests now permit a finite maximum of
 60 seconds. WRITE_CERTIFIED stays capped at 60 seconds. Retries retain their
 original deadline. The 119-case controlled adapter selection passed in
 `/tmp/rockserver-retention-backup-export-api-repair-gate.log`, covering retention
-validation, cold journal reopen, and role rebind. The unfinished global driver
-still needs validation of its persisted deadline and complete materialization acceptance.
+validation, cold journal reopen, and role rebind. The global driver now passes copied-graph completion after pin expiry, uncertain
+force/reopen, exact archive qualification and repeated terminal cleanup fixtures.
+These fixtures use controlled HOME/subjournal adapters; full runtime backup and
+restore execution remain incomplete.
 
 SST imports now freeze declared count, byte, metadata and JNI batch limits in the
 current manifest. The 34-case native selection passed in

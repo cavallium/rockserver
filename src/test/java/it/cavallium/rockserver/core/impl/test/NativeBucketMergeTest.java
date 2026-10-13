@@ -39,7 +39,7 @@ class NativeBucketMergeTest {
             var shape=new ColumnSchema(IntArrayList.of(1,1),ObjectArrayList.of(ColumnHashType.ALLSAME8),true,operator.name(),operator.version(),operator.className());
             schema=new DistributedSchema(cluster,database,domain,1,0,List.of(new DistributedSchema.Column(1,column,"bucket",shape,operator)));
             DistributedStoragePool.stageOperator(path,operator,new MergeOperatorRegistry.DeterministicContract("key-append",1,true),jar);
-            pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),schema,Map.of(column,"bucket"),Map.of());
+            pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(schema),Map.of(column,"bucket"),Map.of());
             store=pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(domain,schema.columnIds(),null,null),schema.digest(),Map.of(column,"bucket"),Set.of(column)); store.enableLogicalSchema(schema);
             if(tracked) { store.initializeConfiguration(new byte[]{1}); store.enableScopedHistory(RangeMutationHistory.Limits.defaults()); }
         }

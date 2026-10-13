@@ -127,7 +127,7 @@ class RatisAtomicClientTest {
                 var binding=catalogue.epochs.prepareSessionBinding(source,descriptor.groupId(),new OperationId(admin,1,source==directory ? groups.indexOf(descriptor.groupId()) : source==homeDirectory ? 2 : 3),grant,snapshotHome ? 2048 : 1024,-1);
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(append(descriptor,DistributedCommandCodec.encode(binding))).status());
             }
-            if (snapshotHome) snapshotRecoveries=new RatisParticipantRecoveryRegistry(Files.createDirectory(root.resolve("snapshot-recovery")),homes,data,false,Set.copyOf(groups),RatisParticipantRecoveryRegistry.Limits.defaults());
+            if (snapshotHome) snapshotRecoveries=new RatisParticipantRecoveryRegistry(Files.createDirectory(root.resolve("snapshot-recovery")), homes, Map.of(data.directory().domainId(), data), group -> data.directory(), false, Set.copyOf(groups), RatisParticipantRecoveryRegistry.Limits.defaults());
             } catch (Exception | Error failure) {
                 try { close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
                 throw failure;

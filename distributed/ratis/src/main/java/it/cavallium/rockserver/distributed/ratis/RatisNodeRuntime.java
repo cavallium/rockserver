@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
+import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
+
 import it.cavallium.rockserver.core.config.DatabaseConfig;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologySeed;
@@ -77,9 +79,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (period.isNegative() || period.isZero() || period.compareTo(Duration.ofMinutes(1))>0 || visits<1 || visits>32) throw new IllegalArgumentException("Invalid participant recovery settings");
         }
     }
-    private final RatisNodePlan plan; private final DistributedSchema logicalSchema; private final Path root; private final Settings settings;
+    private final RatisNodePlan plan; private final Map<UUID,DistributedSchema> logicalSchemas; private final Path root; private final Settings settings;
     private final SchemaReplicaConfig schemaReplicaConfig;
-    private final RatisSessionEpochs epochs; private final RatisRoutedClient routed; private final RatisSnapshotFences snapshotHomes;
+    private final RatisSessionEpochs epochs; private final Map<UUID,RatisRoutedClient> routedClients; private final RatisSnapshotFences snapshotHomes;
     private final RWScheduler scheduler; private final Scheduler timer; private final LongSupplier time;
     private final Map<RaftGroupId,RatisRangeStateMachine> machines=new ConcurrentHashMap<>();
     private final Map<UUID,ReplicatedRangeStore> stores=new ConcurrentHashMap<>();
@@ -107,8 +109,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private long groupManagementCall;
     private final Set<UUID> virginSeedAdds=new HashSet<>();
     private DistributedStoragePool pool; private RaftServer server; private RatisCatalogueClock clock;
-    private RangeDirectory startupDirectory;
-    private RatisSessionPropagation propagation; private RatisSessionClockService service;
+    private final Map<UUID,RangeDirectory> startupDirectories=new HashMap<>();
+    private final Map<UUID,RatisSessionPropagation> dataPropagations=new HashMap<>(); private RatisSessionClockService service;
     private final List<RatisSessionPropagation> propagations=new ArrayList<>();
     private final Map<RatisNodePlan.Role,RatisRoutedClient> homeClients=new EnumMap<>(RatisNodePlan.Role.class);
     private RatisTransactionExpiryService transactionExpiry;
@@ -128,6 +130,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final Map<UUID,RatisReferencedFiles> importFiles=new LinkedHashMap<>();
     private ThreadPoolExecutor importFileIo;
     private RatisExportSourceService exportSources;
+    private RatisSnapshotCohortService snapshotCohorts;
+    private final UUID snapshotProcessIncarnation=UUID.randomUUID(),snapshotPoolId=UUID.randomUUID();
     private RatisSchemaReplicaService schemaReplicas;
     private RatisSchemaReplicaClient schemaFencingReplicas;
     private RatisRangeImportOwnerClient importOwners;
@@ -138,84 +142,89 @@ public final class RatisNodeRuntime implements AutoCloseable {
 
     /** Fresh placement is an explicit trusted bootstrap assertion, never inferred from the directory. Borrowed clients/schedulers remain caller-owned. */
     public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup) throws IOException {
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup) throws IOException {
         return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,null,null);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory) throws IOException {
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory) throws IOException {
         return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,null,null);
     }
     public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schema,null);
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,Collection<DistributedSchema> schemas) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schemas,null);
     }
     /** Operator-qualified home readers are fixed on DATA state machines before the server factory may initialize them. */
     public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema,RatisSnapshotFences snapshotHomes) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schema,snapshotHomes);
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schemas,snapshotHomes);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,null);
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schemas,null);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,null);
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schemas,snapshotHomes,null);
     }
     public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schema,snapshotHomes,recoveries);
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schemas,snapshotHomes,recoveries);
     }
     public static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,SchemaReplicaConfig replicas) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schema,snapshotHomes,recoveries,RatisRoutedClient::connect,replicas);
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,SchemaReplicaConfig replicas) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,DEFAULT_SERVER_FACTORY,schemas,snapshotHomes,recoveries,RatisRoutedClient::connect,replicas);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,recoveries,RatisRoutedClient::connect);
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schemas,snapshotHomes,recoveries,RatisRoutedClient::connect);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,recoveries,homeFactory,SchemaReplicaConfig.defaults());
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schemas,snapshotHomes,recoveries,homeFactory,SchemaReplicaConfig.defaults());
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schema,snapshotHomes,recoveries,homeFactory,replicas,() -> new RatisSchemaReplicaClient(RatisSchemaReplicaClient.MAX_CALLS));
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas) throws IOException {
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schemas,snapshotHomes,recoveries,homeFactory,replicas,() -> new RatisSchemaReplicaClient(RatisSchemaReplicaClient.MAX_CALLS));
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            RatisRoutedClient routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas,SchemaReplicaClientFactory replicaFactory) throws IOException {
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas,SchemaReplicaClientFactory replicaFactory) throws IOException {
         if(factory==DEFAULT_SERVER_FACTORY)RatisStreamingTransport.server(plan,new RaftProperties());
-        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schema,snapshotHomes,recoveries,replicas);
+        var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schemas,snapshotHomes,recoveries,replicas);
         try { node.initialize(config,startup,factory,homeFactory,replicaFactory); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
         }
     }
-    private RatisNodeRuntime(RatisNodePlan plan,Path root,RatisSessionEpochs epochs,RatisRoutedClient routed,
-            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,DistributedSchema schema,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,SchemaReplicaConfig replicas) {
+    private RatisNodeRuntime(RatisNodePlan plan,Path root,RatisSessionEpochs epochs,Map<UUID,RatisRoutedClient> routed,
+            RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,SchemaReplicaConfig replicas) {
         this.plan=Objects.requireNonNull(plan);groups=new RatisRuntimeGroups(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
-        this.routed=Objects.requireNonNull(routed);seedAuthority=epochs.topologyAuthority()::read;joinAuthority=epochs.topologyJoinAuthority()::read; this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
-        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); schemaReplicaConfig=Objects.requireNonNull(replicas); logicalSchema=schema; this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
-        if (!plan.imports().isEmpty() && schema==null) throw new IllegalArgumentException("Planned native imports require their qualified logical schema");
+        this.routedClients=Map.copyOf(routed);seedAuthority=epochs.topologyAuthority()::read;joinAuthority=epochs.topologyJoinAuthority()::read; this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
+        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); schemaReplicaConfig=Objects.requireNonNull(replicas); var qualified=new HashMap<UUID,DistributedSchema>();if(schemas!=null)for(var schema:schemas)if(qualified.putIfAbsent(schema.domainId(),schema)!=null)throw new IllegalArgumentException("Duplicate node schema domain");logicalSchemas=Map.copyOf(qualified); this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
+        if (!plan.imports().isEmpty() && logicalSchemas.isEmpty()) throw new IllegalArgumentException("Planned native imports require their qualified logical schemas");
         if (recoveries!=null) {
-            recoveries.homes().requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
+            recoveries.homes().requireDatabaseBinding(plan.clusterId(),plan.databaseId());
             var home=plan.home(RatisNodePlan.Role.TRANSACTION_HOME); if (home!=null) recoveries.homes().requireDirectoryBinding(home.directory());
         }
         if (snapshotHomes!=null) {
-            snapshotHomes.requireDatabaseBinding(plan.directory().clusterId(),plan.directory().databaseId());
+            snapshotHomes.requireDatabaseBinding(plan.clusterId(),plan.databaseId());
             var home=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME); if (home!=null) snapshotHomes.requireDirectoryBinding(home.directory());
         }
-        if (schema!=null) {
-            schema.requireMatches(plan.directory());
-            var merges=new HashSet<UUID>();
-            for (var column:schema.columns()) if (column.operator()!=null) merges.add(column.columnId());
-            if (!plan.merges().equals(merges)) throw new IllegalArgumentException("Node merge bindings differ from qualified schema");
-        } else if (!plan.merges().isEmpty()) throw new IllegalArgumentException("Node merge bindings require a qualified schema");
+        var domains=plan.domains().stream().map(domain->domain.directory().domainId()).collect(java.util.stream.Collectors.toSet());
+        if(!routedClients.keySet().equals(domains) || !logicalSchemas.isEmpty() && !logicalSchemas.keySet().equals(domains))throw new IllegalArgumentException("Node DATA domain coverage differs");
+        var merges=new HashSet<UUID>();for(var schema:logicalSchemas.values()){schema.requireMatches(plan.directory(schema.domainId()));for(var column:schema.columns())if(column.operator()!=null)merges.add(column.columnId());}
+        if(!plan.merges().equals(merges))throw new IllegalArgumentException("Node merge bindings differ from qualified schemas");
         if (groups.raftGroups().stream().anyMatch(group -> group.getGroupId().getUuid().equals(plan.catalogue().groupId()))
-                && plan.directory().ranges().size()+plan.homes().stream().mapToInt(home -> home.directory().ranges().size()).sum()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
-        var catalogue=plan.catalogue(); epochs.requireCatalogueBinding(plan.directory().clusterId(),plan.directory().databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
-        if (!Arrays.equals(routed.bootstrapDirectory().payloadDigest(),plan.directory().payloadDigest())) throw new IllegalArgumentException("Node routed bootstrap directory differs from placement plan");
+                && plan.domains().stream().mapToInt(domain->domain.directory().ranges().size()).sum()+plan.homes().stream().mapToInt(home -> home.directory().ranges().size()).sum()>settings.maxPropagationRanges()) throw new IllegalArgumentException("Node clock propagation scope exceeds configured range budget");
+        var catalogue=plan.catalogue(); epochs.requireCatalogueBinding(plan.clusterId(),plan.databaseId(),catalogue.groupId(),catalogue.epoch(),catalogue.schemaDigest(),catalogue.sessionsColumn());
+        for(var entry:routedClients.entrySet())if(!entry.getKey().equals(entry.getValue().directory().domainId()) || !Arrays.equals(entry.getValue().bootstrapDirectory().payloadDigest(),plan.directory(entry.getKey()).payloadDigest()))throw new IllegalArgumentException("Node routed bootstrap directory differs from placement plan");
+    }
+    private RatisRoutedClient data(UUID domain){var client=routedClients.get(domain);if(client==null)throw new IllegalArgumentException("DATA domain is not configured");return client;}
+    private void freezeStartupDirectories(){startupDirectories.clear();routedClients.forEach((domain,client)->startupDirectories.put(domain,client.directory()));}
+    private void requirePropagationCoverage(UUID domain,RangeDirectory target){
+        if(plan.localGroups().stream().noneMatch(group->group.getGroupId().getUuid().equals(plan.catalogue().groupId())))return;
+        long ranges=plan.homes().stream().mapToLong(home->home.directory().ranges().size()).sum();for(var entry:routedClients.entrySet())ranges+=entry.getKey().equals(domain)?target.ranges().size():entry.getValue().directory().ranges().size();
+        if(ranges>settings.maxPropagationRanges())throw new IllegalArgumentException("Aggregate clock propagation capacity exhausted");
     }
     private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory,SchemaReplicaClientFactory replicaFactory) throws IOException {
         Objects.requireNonNull(startup); Objects.requireNonNull(factory);
@@ -255,7 +264,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (snapshotPlan!=null) {
             if (captureHomes==null) captureHomes=new RatisSnapshotFences(homeClients.get(snapshotPlan.role()),snapshotPlan.column());
         }
-        proofQueries=new RatisProofQueryService();importPreflightQueries=RatisProofQueryService.importPreflightLane();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();topologyImageQueries=RatisProofQueryService.topologyImageLane();relocationOwnerQueries=RatisProofQueryService.relocationOwnerLane();relocationClients=new RatisRelocationDataClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
+        proofQueries=new RatisProofQueryService();importPreflightQueries=RatisProofQueryService.importPreflightLane();sourceOutcomeQueries=RatisProofQueryService.sourceOutcomeLane();topologyImageQueries=RatisProofQueryService.topologyImageLane();relocationOwnerQueries=RatisProofQueryService.relocationOwnerLane();relocationClients=new RatisRelocationDataClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId());
         if(groups.raftGroups().stream().anyMatch(group->groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.TRANSACTION_HOME))
             operationRerouteQueries=RatisProofQueryService.operationRerouteLane();
         if (groups.raftGroups().stream().anyMatch(group -> groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.CATALOGUE)) {
@@ -274,9 +283,18 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 var home=plan.home(group.getGroupId().getUuid()); metadataBindings.put(home.column(),home.physicalName());
             }
         }
-        pool=logicalSchema==null ? DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class))
-                : DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class),logicalSchema,plan.columns(),metadataBindings);
+        pool=logicalSchemas.isEmpty() ? DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class))
+                : DistributedStoragePool.open(nativePath,config,LoggerFactory.getLogger(RatisNodeRuntime.class),logicalSchemas.values(),plan.columns(),metadataBindings);
         pool.configureSnapshotAdmission(settings.exports().pins());
+        snapshotCohorts=new RatisSnapshotCohortService(new RatisSnapshotCohortService.Host(){
+            public UUID nodeId(){return plan.nodeId();}public UUID nodeIncarnation(){return plan.nodeIncarnation();}public UUID processIncarnation(){return snapshotProcessIncarnation;}public UUID poolId(){return snapshotPoolId;}
+            public DistributedStoragePool pool(){return pool;}public PoolSnapshotAdmission.Limits poolLimits(){return settings.exports().pins();}
+            public RatisSnapshotCohortService.Member member(UUID group,SnapshotFence fence,boolean ready)throws Exception{
+                synchronized(RatisNodeRuntime.this){if(!started || closeRequested || closing || closed)throw new IOException("Cohort node owner unavailable");}
+                var entry=groups.require(group);var machine=machines.get(RaftGroupId.valueOf(group));if(entry.role()!=RatisNodePlan.Role.DATA || entry.retired() || machine==null || stores.get(group)==null)throw new IOException("Cohort has no actual local DATA owner");
+                return machine.snapshotCohortMember(fence,ready,entry.descriptor(),ownReplica(entry.descriptor()));
+            }
+        },scheduler,RatisSnapshotCohortService.Limits.defaults(),System::nanoTime);
         sourceArtifacts=new RatisTopologySourceSnapshotArtifacts(Files.createDirectories(root.resolve("topology-source-artifacts")),settings.images(),Math.multiplyExact(8,settings.images().maxImageBytes()),RatisTopologySourceSnapshotService.MAX_METADATA_BYTES,4);
         sourceSnapshots=new RatisTopologySourceSnapshotService(sourceSnapshotHost(),RatisTopologySourceSnapshotService.Limits.defaults(settings.images().maxImageBytes()));
 
@@ -296,8 +314,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
             schemaReplicas=new RatisSchemaReplicaService(nativePath,root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());
         if (groups.raftGroups().stream().anyMatch(group -> groups.require(group.getGroupId().getUuid()).role()==RatisNodePlan.Role.CATALOGUE)) {
             schemaFencingReplicas=Objects.requireNonNull(replicaFactory.create());
-            topologyOwners=new RatisTopologyOwnerClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
-            importOwners=new RatisRangeImportOwnerClient(plan.directory().clusterId(),plan.directory().databaseId(),plan.catalogue().groupId());
+            topologyOwners=new RatisTopologyOwnerClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId());
+            importOwners=new RatisRangeImportOwnerClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId());
         }
         if (plan.localGroups().stream().anyMatch(group -> plan.importDefinition(group.getGroupId().getUuid())!=null))
             importFileIo=new ThreadPoolExecutor(2,2,0L,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(32),
@@ -312,10 +330,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
                             c.schemaDigest(),Map.of(c.directoryColumn(),"catalogue-directory",c.sessionsColumn(),"catalogue-sessions"),Set.of());
                     stores.put(id,store);
                     var operatorLimits=new RatisOperatorCatalogue.Limits(schemaReplicaConfig.limits().maximumUploads(),schemaReplicaConfig.limits().maximumDiskBytes());
-                    var operators=RatisOperatorCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),operatorLimits,this::requireOperatorAdmission,key -> committedCatalogueValue(store,c.directoryColumn(),key));
-                    machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn(),operators,key -> committedCatalogueValue(store,c.directoryColumn(),key)));
+                    var operators=RatisOperatorCatalogue.validator(plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),operatorLimits,this::requireOperatorAdmission,key -> committedCatalogueValue(store,c.directoryColumn(),key));
+                    machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn(),operators,key -> committedCatalogueValue(store,c.directoryColumn(),key)));
                     machine.role(role);
-                    machine.schemaCatalogue(plan.directory().clusterId(),plan.directory().databaseId(),c.directoryColumn());
+                    machine.schemaCatalogue(plan.clusterId(),plan.databaseId(),c.directoryColumn());
                     machine.schemaFencingReplicaClient(schemaFencingReplicas);
                     machine.schemaAuthorityQueries(authorityQueries);
                     machine.importPublicationQueries(importPublicationQueries);
@@ -325,33 +343,33 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     RatisCdcDeliveryAuthority.DefinitionReader cdcDefinitions=header->RatisCdcLineageDirectory.readDefinition(store,c.directoryColumn(),header);
                     var cdcLineages=new RatisCdcLineageDirectory(cdcDirectories,()->RatisCdcLineageDirectory.readStates(store,c.directoryColumn()),cdcDefinitions);
                     RatisTopologyCatalogue.OwnerProofReader cdcOwners=(definition,expected)->{var range=(expected.stage()==TopologyChange.Stage.FREEZE ? definition.parents() : definition.targets()).stream().filter(candidate->candidate.groupId().equals(expected.groupId())).findFirst().orElseThrow();var owner=range.replicas().stream().filter(candidate->candidate.replicaId().equals(expected.owner().replicaId())).findFirst().orElseThrow();var evidence=topologyOwners.read(definition,expected.stage(),range,owner);return new RatisTopologyCatalogue.QualifiedOwner(evidence.proof(),evidence.completedCut());};
-                    var cdcAuthority=new RatisCdcDeliveryAuthority(routed,cdcDirectories,cdcLineages::read,cdcOwners,cdcDefinitions);
+                    var cdcAuthority=new RatisCdcDeliveryAuthority(routedClients,cdcDirectories,cdcLineages::read,cdcOwners,cdcDefinitions);
                     machine.cdcDeliveryAdmission(cdcAuthority::validate);
-                    machine.topologyExecutionAdmission(command->{if(RatisTopologyCatalogue.relocationExecution(command)){RatisTopologyCatalogue.admitRelocation(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),this::qualifyRelocationPublication);return;}RatisTopologyCatalogue.admitExecution(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),(definition,expected)->{
+                    machine.topologyExecutionAdmission(command->{if(RatisTopologyCatalogue.relocationExecution(command)){RatisTopologyCatalogue.admitRelocation(command,plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),this::qualifyRelocationPublication);return;}RatisTopologyCatalogue.admitExecution(command,plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),(definition,expected)->{
                         var range=(expected.stage()==TopologyChange.Stage.FREEZE ? definition.parents() : definition.targets()).stream().filter(candidate->candidate.groupId().equals(expected.groupId())).findFirst().orElseThrow();var owner=range.replicas().stream().filter(candidate->candidate.replicaId().equals(expected.owner().replicaId())).findFirst().orElseThrow();var evidence=topologyOwners.read(definition,expected.stage(),range,owner);if(expected.stage()==TopologyChange.Stage.ACTIVATE){var activation=NativeTopologyActivation.decode(evidence.artifact());activation.requireCut(evidence.completedCut());if(!Arrays.equals(activation.proof().encode(),evidence.proof().encode()))throw new IOException("Clock witness differs from genuine owner activation proof");qualifyTopologyActivation(definition,activation);}return new RatisTopologyCatalogue.QualifiedOwner(evidence.proof(),evidence.completedCut());
                     });});
                     machine.importPublicationAdmission(command->{
-                        if(RatisRangeImportCatalogue.isPublication(command))RatisRangeImportCatalogue.admitPublication(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::receipt);
-                        else RatisRangeImportCatalogue.admitCompletion(command,plan.directory().clusterId(),plan.directory().databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::activation);
+                        if(RatisRangeImportCatalogue.isPublication(command))RatisRangeImportCatalogue.admitPublication(command,plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::receipt);
+                        else RatisRangeImportCatalogue.admitCompletion(command,plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),key->committedCatalogueValue(store,c.directoryColumn(),key),importOwners::activation);
                     });
                 } else {
                     var registration=groups.require(id);var directory=registration.directory();var descriptor=registration.descriptor();var home=registration.seed()==null && registration.learner()==null ? plan.home(id) : null;
                     var recipe=registration.retired() ? groups.retirement(id) : registration.seed();
-                    var bindings=registration.learner()!=null ? registration.learner().physicalNames() : recipe!=null ? recipe.physicalNames() : home==null ? plan.columns() : Map.of(home.column(),home.physicalName());
+                    var bindings=registration.learner()!=null ? registration.learner().physicalNames() : recipe!=null ? recipe.physicalNames() : home==null ? plan.domain(directory.domainId()).columns() : Map.of(home.column(),home.physicalName());
                     var importDefinition=registration.seed()==null && registration.learner()==null ? plan.importDefinition(id) : null;
                     if(importDefinition!=null){var manifest=importDefinition.manifest(id);RatisRangeImportRecord.requirePolicy(manifest);if(manifest.columns().size()>settings.images().maxColumns() || (long)manifest.encode().length+17>settings.images().maxRowBytes() || (long)manifest.encode().length+17>settings.images().maxImageBytes())throw new IOException("Imported manifest exceeds configured native image row budget");}
                     var store=registration.learner()!=null ? pool.openTopologyLearner(registration.learner()) : registration.retired() ? pool.openRetiredTopologyRange(id) : registration.seed()!=null ? pool.reopenTopologyRange(registration.seed().birth(id),seedSchema(registration.seed())) : importDefinition==null ? pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
-                            directory.schemaDigest(),bindings,recipe!=null ? recipe.mergeColumns() : home==null ? plan.merges() : Set.of())
-                            : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchema)
-                            : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchema);
+                            directory.schemaDigest(),bindings,recipe!=null ? recipe.mergeColumns() : home==null ? plan.domain(directory.domainId()).merges() : Set.of())
+                            : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchemas.get(directory.domainId()))
+                            : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchemas.get(directory.domainId()));
                     if(registration.relocation()!=null){var configuration=store.configuration();var cut=store.applied();if(configuration==null || cut==null || configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term())throw new IOException("Relocation cold configuration lacks completed native prefix");group=groups.reconcileRelocationConfiguration(id,configuration.data());}
                     stores.put(id,store);
                     java.util.function.Consumer<it.cavallium.rockserver.core.common.distributed.DistributedCommand> validator=command -> {};
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) validator=RatisTransactionStatuses.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) validator=RatisSnapshotFences.validator(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),directory.schemaDigest(),home.column());
-                    if (role==RatisNodePlan.Role.DATA && registration.learner()==null && !registration.retired() && (logicalSchema!=null || registration.seed()!=null)) {
+                    if (role==RatisNodePlan.Role.DATA && registration.learner()==null && !registration.retired() && (logicalSchemas.containsKey(directory.domainId()) || registration.seed()!=null)) {
                         var effectiveSchema=store.installedSchema();
-                        store.enableLogicalSchema(effectiveSchema==null ? logicalSchema : effectiveSchema);
+                        store.enableLogicalSchema(effectiveSchema==null ? logicalSchemas.get(directory.domainId()) : effectiveSchema);
                     }
                     var effectiveDirectory=role==RatisNodePlan.Role.DATA && store.schemaInstallation()!=null
                             ? store.schemaInstallation().definition().targetDirectory()
@@ -361,19 +379,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),validator,epochs,effectiveDirectory,settings.retention());
                     if (role==RatisNodePlan.Role.TRANSACTION_HOME) {
                         machine.role(role,(key,value) -> RatisTransactionStatuses.validateRecord(directory.clusterId(),directory.databaseId(),key,value));
-                        machine.homeRecoveryData(routed); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
+                        machine.homeRecoveryProofs(recovery->data(recovery.before().domainId()).finalizedParticipant(recovery.proof().participant(),recovery.before().transactionId()));machine.homeRecoveryFences(participantIdentity->data(participantIdentity.definition().domainId()).participantFence(participantIdentity)); machine.homeRecoveryReservations(directory.clusterId(),directory.databaseId(),home.column());
                         machine.operationRerouteQueries(operationRerouteQueries);
                         var rerouteAuthority=new RatisOperationRerouteAdmission(new RatisOperationRerouteAdmission.Authority(){
                             public it.cavallium.rockserver.core.common.distributed.TopologyChange.State intent(UUID intent)throws IOException{return epochs.topologyCatalogue(plan.catalogue().directoryColumn()).readIntent(intent);}
                             public it.cavallium.rockserver.core.common.distributed.TopologyChange.Definition definition(byte[] digest)throws IOException{return epochs.topologyCatalogue(plan.catalogue().directoryColumn()).readDefinition(digest);}
                             public RangeDirectory directory(UUID domain)throws IOException{return epochs.catalogue(plan.catalogue().directoryColumn()).read(domain);}
-                            public RatisTopologyOperationOutcomeRpc.Reply outcome(RangeDirectory source,RangeDescriptor descriptor,it.cavallium.rockserver.core.common.distributed.DistributedCommand original)throws IOException{return routed.operationOutcome(routed.restoreSessionCommand(source,original,descriptor));}
+                            public RatisTopologyOperationOutcomeRpc.Reply outcome(RangeDirectory source,RangeDescriptor descriptor,it.cavallium.rockserver.core.common.distributed.DistributedCommand original)throws IOException{var client=data(source.domainId());return client.operationOutcome(client.restoreSessionCommand(source,original,descriptor));}
                         },plan.catalogue().groupId());
                         machine.operationRerouteProofAdmission(rerouteAuthority::validate);
                     }
                     else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) {
                         machine.role(role,(key,value) -> RatisSnapshotFences.validateRecord(directory.clusterId(),directory.databaseId(),id,descriptor.rangeEpoch(),key,value));
-                        machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeData(routed);
+                        machine.snapshotHomeStorage(directory.clusterId(),directory.databaseId(),home.column()); machine.snapshotHomeProofs((fence,participantGroup)->data(fence.domainId()).snapshotFence(fence,participantGroup));
                     }
                     else { configureDataMachine(machine,effectiveDirectory,descriptor); }
                     if (importDefinition!=null) {
@@ -386,12 +404,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         machine.importPreflightQueries(importPreflightQueries);machine.rangeImportApply(new RatisRangeImportApply(pool,store,files,importDefinition),epochs.importAuthority(),ownReplica(descriptor));
                     }
                 }
-                machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.proofQueries(proofQueries);
+                machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);
                 machines.put(group.getGroupId(),machine);
             }
             for (var entry:machines.entrySet()) if (groups.require(entry.getKey().getUuid()).role()==RatisNodePlan.Role.DATA)
                 for (var schema:entry.getValue().schemaRoutingHistory()) observeSchemaActivation(schema.definition(),schema.proof());
-            startupDirectory=routed.directory();
+            freezeStartupDirectories();
         } catch (org.rocksdb.RocksDBException failure) { throw new IOException("Native node groups could not open",failure); }
         exportSources=new RatisExportSourceService(root.resolve("exports"),settings.exports().sources(),settings.exports().io(),
                 new RatisExportSourceRegistry.NativeBuilder() {
@@ -425,7 +443,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             } else if (role==RatisNodePlan.Role.SNAPSHOT_HOME) retirementSources.add(new RatisRetirementCoordinator.Source(id.getUuid(),RatisRetirementCoordinator.Mode.SNAPSHOT,(after,scans) -> machine.retirementCandidates(false,after,scans)));
         }
         if (!retirementSources.isEmpty()) {
-            retirementCoordinator=new RatisRetirementCoordinator(root.resolve("retirement"),transactionHomes,captureHomes,routed,retirementSources,RatisRetirementJournal.Limits.defaults());
+            retirementCoordinator=new RatisRetirementCoordinator(root.resolve("retirement"),transactionHomes,captureHomes,routedClients,retirementSources,RatisRetirementJournal.Limits.defaults());
             retirementService=new RatisTransactionRecoveryService(scheduler,() -> retirementCoordinator.cycle(4));
         }
         validateSeedExposures();
@@ -435,7 +453,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         transactionExpiry=new RatisTransactionExpiryService(scheduler,this::expiryMachines,32);
         var local=new HashSet<UUID>(); for (var id:machines.keySet()) if (groups.require(id.getUuid()).role()==RatisNodePlan.Role.DATA) local.add(id.getUuid());
         if (recoverySettings!=null && !local.isEmpty()) {
-            participantRecoveries=new RatisParticipantRecoveryRegistry(root.resolve("recovery"),recoverySettings.homes(),routed,recoverySettings.takeover(),groups::dataGroups,recoverySettings.limits());
+            participantRecoveries=new RatisParticipantRecoveryRegistry(root.resolve("recovery"),recoverySettings.homes(),routedClients,group->groups.require(group).directory(),recoverySettings.takeover(),groups::dataGroups,recoverySettings.limits());
             var sources=new ArrayList<RatisNativeParticipantDiscovery.Source>();
             for (var group:local.stream().sorted().toList()) sources.add(new RatisNativeParticipantDiscovery.Source(group,machines.get(RaftGroupId.valueOf(group))::preparedRecoveries));
             nativeParticipantDiscovery=new RatisNativeParticipantDiscovery(participantRecoveries,this::recoverySources);
@@ -445,17 +463,17 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         if (!machines.containsKey(RaftGroupId.valueOf(plan.catalogue().groupId()))) return;
         clock=new RatisCatalogueClock(root.resolve("sessions/catalogue-clock.bin"),epochs);
-        propagation=new RatisSessionPropagation(root.resolve("sessions"),epochs,routed,settings.maxPropagationRanges()); propagations.add(propagation);
+        for(var domain:routedClients.keySet().stream().sorted(RangeDirectoryCodec.UUID_ORDER).toList()){Path scope=Files.createDirectories(root.resolve("sessions/data").resolve(domain.toString()));SessionJournalFiles.force(scope);SessionJournalFiles.force(scope.getParent());var propagation=new RatisSessionPropagation(scope,epochs,data(domain),settings.maxPropagationRanges());dataPropagations.put(domain,propagation);propagations.add(propagation);}
         for (var home:plan.homes()) {
             Path scope=Files.createDirectories(root.resolve("sessions").resolve(home.role().name().toLowerCase(Locale.ROOT))); SessionJournalFiles.force(scope); SessionJournalFiles.force(scope.getParent());
             propagations.add(new RatisSessionPropagation(scope,epochs,homeClients.get(home.role()),settings.maxPropagationRanges()));
         }
         for(var seed:pool.topologySeeds())for(var target:seed.definition().targets()){var store=stores.get(target.groupId());var activation=store==null ? null : store.topologyActivation();if(activation!=null)observeTopologyActivation(seed.definition(),activation);}
-        startupDirectory=routed.directory();
+        freezeStartupDirectories();
         service=new RatisSessionClockService(scheduler,clock,propagations,time,settings.propagationVisits(),this::clockOwnerReady);
     }
     private DistributedSchema seedSchema(NativeTopologySeed seed)throws IOException{
-        if(logicalSchema!=null && Arrays.equals(logicalSchema.digest(),seed.definition().targetDirectory().schemaDigest())){logicalSchema.requireMatches(seed.definition().targetDirectory());return logicalSchema;}
+        var logicalSchema=logicalSchemas.get(seed.definition().header().domainId());if(logicalSchema!=null && Arrays.equals(logicalSchema.digest(),seed.definition().targetDirectory().schemaDigest())){logicalSchema.requireMatches(seed.definition().targetDirectory());return logicalSchema;}
         for(var parent:seed.definition().parents()){var store=stores.get(parent.groupId());var schema=store==null ? null : store.installedSchema();if(schema!=null){schema.requireMatches(seed.definition().targetDirectory());return schema;}}
         throw new IOException("Forced topology seed has no qualified local native source schema");
     }
@@ -470,20 +488,36 @@ public final class RatisNodeRuntime implements AutoCloseable {
         return new RatisTopologyCatalogue.QualifiedRelocation(expected,actual.completedCut());
     }
     private void configureDataMachine(RatisRangeStateMachine machine,RangeDirectory directory,it.cavallium.rockserver.core.common.distributed.RangeDescriptor descriptor){
-        machine.role(RatisNodePlan.Role.DATA);machine.snapshotReadOnlyMaximumTtl(Duration.ofMillis(Math.min(settings.exports().pins().maximumAge().toMillis(),RatisSnapshotCaptureRequest.maximumTtl(RatisSnapshotCaptureRequest.Mode.READ_ONLY).toMillis())));machine.relocationOwnerQueries(relocationOwnerQueries);machine.sourceSnapshots(topologyImageQueries,sourceSnapshots);machine.relocationObserver(new RatisRangeStateMachine.RelocationObserver(){public void persist(RatisTopologyRelocationRecord record,ApplyPosition position)throws IOException{persistRelocation(record,position);}public boolean saved(RatisTopologyRelocationRecord record)throws IOException{return savedRelocation(record);}});machine.relocationAuthority(epochs.topologyJoinAuthority()::read);machine.sourceOutcomeQueries(sourceOutcomeQueries);machine.cdcBinding(directory.clusterId(),directory.databaseId(),descriptor.rangeId());machine.schemaStorage(pool);machine.schemaActivated(this::observeSchemaActivation);
+        machine.role(RatisNodePlan.Role.DATA);machine.snapshotCohorts(snapshotCohorts);machine.snapshotReadOnlyMaximumTtl(Duration.ofMillis(Math.min(settings.exports().pins().maximumAge().toMillis(),RatisSnapshotCaptureRequest.maximumTtl(RatisSnapshotCaptureRequest.Mode.READ_ONLY).toMillis())));machine.relocationOwnerQueries(relocationOwnerQueries);machine.sourceSnapshots(topologyImageQueries,sourceSnapshots);machine.relocationObserver(new RatisRangeStateMachine.RelocationObserver(){public void persist(RatisTopologyRelocationRecord record,ApplyPosition position)throws IOException{persistRelocation(record,position);}public boolean saved(RatisTopologyRelocationRecord record)throws IOException{return savedRelocation(record);}});machine.relocationAuthority(epochs.topologyJoinAuthority()::read);machine.sourceOutcomeQueries(sourceOutcomeQueries);machine.cdcBinding(directory.clusterId(),directory.databaseId(),descriptor.rangeId());machine.schemaStorage(pool);machine.schemaActivated(this::observeSchemaActivation);
         var authority=epochs.schemaAuthority();machine.schemaAuthority((header,digest)->readSchemaAuthority(authority,header,digest),directory);machine.schemaReplicas(schemaReplicas,ownReplica(descriptor));machine.topologyAuthority(epochs.topologyAuthority()::read,directory,ownReplica(descriptor),pool);machine.topologySeedInstaller(this::seedTopology);machine.topologyActivated(this::observeTopologyActivation);
         if(transactionHomes!=null)machine.sourceOutcomeAdmission(new RatisSourceOutcomeAdmission(new RatisSourceOutcomeAdmission.Authority(){
             public it.cavallium.rockserver.core.common.distributed.TransactionStatus home(it.cavallium.rockserver.core.common.distributed.HomeIdentity original)throws IOException{var configured=plan.home(RatisNodePlan.Role.TRANSACTION_HOME);if(configured==null || !configured.column().equals(original.columnId()))throw new IOException("Source proof HOME column is not configured");var read=transactionHomes.readRegistration(original.transactionId());if(!read.descriptor().groupId().equals(original.groupId()) || read.descriptor().rangeEpoch()!=original.rangeEpoch() || !Arrays.equals(configured.directory().schemaDigest(),original.schemaDigest()))throw new IOException("Source proof changed exact HOME placement");return read.status();}
-            public it.cavallium.rockserver.core.common.distributed.ParticipantOutcome outcome(RangeDirectory frozen,RangeDescriptor route,UUID transaction)throws IOException{return routed.finalizedParticipant(frozen,route,transaction);}
-            public it.cavallium.rockserver.core.common.distributed.ParticipantFenceProof fence(RangeDirectory frozen,RangeDescriptor route,it.cavallium.rockserver.core.common.distributed.ParticipantIdentity identity)throws IOException{return routed.participantFence(frozen,route,identity);}
+            public it.cavallium.rockserver.core.common.distributed.ParticipantOutcome outcome(RangeDirectory frozen,RangeDescriptor route,UUID transaction)throws IOException{return data(frozen.domainId()).finalizedParticipant(frozen,route,transaction);}
+            public it.cavallium.rockserver.core.common.distributed.ParticipantFenceProof fence(RangeDirectory frozen,RangeDescriptor route,it.cavallium.rockserver.core.common.distributed.ParticipantIdentity identity)throws IOException{return data(frozen.domainId()).participantFence(frozen,route,identity);}
         })::qualify);
         if(captureHomes!=null)machine.snapshotHomes(captureHomes);if(transactionHomes!=null){machine.transactionHomes(transactionHomes);machine.snapshotRecovery(this::recoverParticipant,snapshotHelp);}
     }
-    static RatisTopologySourceSnapshotRpc.Request sourceRequest(TopologyChange.Definition definition,UUID catalogue,ReplicaDescriptor receiver){var bytes=ByteBuffer.allocate(64).put(definition.digest()).putLong(catalogue.getMostSignificantBits()).putLong(catalogue.getLeastSignificantBits()).putLong(receiver.replicaId().getMostSignificantBits()).putLong(receiver.replicaId().getLeastSignificantBits());return new RatisTopologySourceSnapshotRpc.Request(UUID.nameUUIDFromBytes(bytes.array()),definition.header(),catalogue,receiver);}
-    private LearnerSourceEvidence loadLearnerSource(RatisTopologyJoinAuthority.View view,ReplicaDescriptor receiver)throws IOException{if(view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Production learner bootstrap requires irreversible JOINING");var prepared=relocationClients.prepare(sourceRequest(view.definition(),view.catalogue(),receiver),view.definition());if(!plan.columns().keySet().equals(prepared.schema().columnIds()))throw new IOException("Receiver has no configured physical bindings for source schema");return new LearnerSourceEvidence(prepared.image(),prepared.schema(),prepared.sourceOwner(),prepared.sourceCfg(),prepared.image().position(),plan.columns(),plan.merges(),prepared.schemaRows());}
-    private RatisTopologyJoinAuthority.View sourceView(RatisTopologySourceSnapshotRpc.Request request)throws IOException{var query=RatisTopologyJoinAuthority.Request.of(request.header(),request.receiver().replicaId(),RatisTopologyJoinAuthority.Purpose.REGISTER);var view=joinAuthority.read(query);view.require(query);if(!view.catalogue().equals(plan.catalogue().groupId()) || !view.catalogue().equals(request.catalogue()) || view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Source image requires exact irreversible JOINING");return view;}
+    static RatisTopologySourceSnapshotRpc.Request sourceRequest(TopologyChange.Definition definition,UUID catalogue,ReplicaDescriptor receiver){var purpose=definition.parents().getFirst().replicas().stream().anyMatch(r->r.replicaId().equals(receiver.replicaId()))?RatisTopologySourceSnapshotRpc.Purpose.RECOVERY:RatisTopologySourceSnapshotRpc.Purpose.BOOTSTRAP;var bytes=ByteBuffer.allocate(65).put(definition.digest()).putLong(catalogue.getMostSignificantBits()).putLong(catalogue.getLeastSignificantBits()).putLong(receiver.replicaId().getMostSignificantBits()).putLong(receiver.replicaId().getLeastSignificantBits()).put((byte)purpose.ordinal());return new RatisTopologySourceSnapshotRpc.Request(UUID.nameUUIDFromBytes(bytes.array()),definition.header(),catalogue,receiver,purpose);}
+    private RatisTopologySourceSnapshotRpc.Prepared prepareLearnerRecovery(RatisTopologySourceSnapshotRpc.Request request)throws Exception{
+        synchronized(this){if(!started || closing || closeRequested || installing)throw new IOException("Learner recovery node owner is unavailable");installing=true;}
+        try{
+            if(request.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.RECOVERY)throw new IOException("Registered image recovery purpose required");var receiver=request.receiver();if(!receiver.nodeId().equals(plan.nodeId()) || !receiver.nodeIncarnation().equals(plan.nodeIncarnation()) || !receiver.peerId().equals(plan.peerId()) || !receiver.address().equals(plan.address()))throw new IOException("Recovery receiver changed local node identity");
+            var view=sourceView(request);var definition=view.definition();var store=stores.get(definition.parents().getFirst().groupId());if(store==null)throw new IOException("No registered local recovery store");var registration=store.topologyLearnerRegistration();if(registration==null || !sameLearnerIdentity(registration.receiver(),receiver))throw new IOException("Recovery lacks original receiver registration");
+            var prepared=relocationClients.prepare(request,definition);var names=new HashMap<UUID,String>();for(var local:stores.values())names.putAll(pool.schemaPhysicalNames(local));var permission=recoveryPermission(store,view,prepared,names);
+            var saved=store.topologyLearnerImagePermission();if(saved!=null && Arrays.equals(saved.encode(),permission.encode()))return prepared;
+            var after=sourceView(request);if(!Arrays.equals(after.definition().encode(),definition.encode()) || !RatisRelocationOwnerRpc.covers(after.cut(),view.cut()))throw new IOException("Recovery catalogue witness changed");pool.prepareTopologyLearnerImage(store,permission);return prepared;
+        }finally{synchronized(this){installing=false;}}
+    }
+    static it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerImagePermission recoveryPermission(ReplicatedRangeStore store,RatisTopologyJoinAuthority.View view,RatisTopologySourceSnapshotRpc.Prepared prepared,Map<UUID,String> receiverBindings)throws IOException{
+        var request=prepared.request();request.header().requireDefinition(view.definition());if(request.purpose()!=RatisTopologySourceSnapshotRpc.Purpose.RECOVERY || !request.catalogue().equals(view.catalogue()) || view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Recovery image lacks current irreversible catalogue qualification");var registration=store.topologyLearnerRegistration();if(registration==null || !sameLearnerIdentity(registration.receiver(),request.receiver()))throw new IOException("Recovery changed registered receiver identity");
+        var definition=view.definition();RatisRangeStateMachine.requireSchemaMembership(definition.parents().getFirst(),prepared.sourceCfg().data());prepared.schema().requireMatches(definition.sourceDirectory());prepared.schema().requireMatches(definition.targetDirectory());var own=new HashMap<UUID,String>();var merges=new HashSet<UUID>();for(var column:prepared.schema().columns()){own.put(column.columnId(),receiverBindings.getOrDefault(column.columnId(),"relocation-"+column.columnId()));if(column.operator()!=null)merges.add(column.columnId());}
+        return new it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerImagePermission(registration,definition,view.catalogue(),view.cut(),prepared.image().topologyOrigin(),prepared.schema(),prepared.image().position(),prepared.image().sha256(),prepared.sourceCfg().data(),own,merges,prepared.schemaRows());
+    }
+    private static boolean sameLearnerIdentity(ReplicaDescriptor before,ReplicaDescriptor after){return before.nodeId().equals(after.nodeId()) && before.nodeIncarnation().equals(after.nodeIncarnation()) && before.replicaId().equals(after.replicaId()) && before.peerId().equals(after.peerId()) && before.address().equals(after.address());}
+    private LearnerSourceEvidence loadLearnerSource(RatisTopologyJoinAuthority.View view,ReplicaDescriptor receiver)throws IOException{if(view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Production learner bootstrap requires irreversible JOINING");var prepared=relocationClients.prepare(sourceRequest(view.definition(),view.catalogue(),receiver),view.definition());var bindings=plan.domain(prepared.schema().domainId());if(!bindings.columns().keySet().equals(prepared.schema().columnIds()))throw new IOException("Receiver has no configured physical bindings for source schema");return new LearnerSourceEvidence(prepared.image(),prepared.schema(),prepared.sourceOwner(),prepared.sourceCfg(),prepared.image().position(),bindings.columns(),bindings.merges(),prepared.schemaRows());}
+    private RatisTopologyJoinAuthority.View sourceView(RatisTopologySourceSnapshotRpc.Request request)throws IOException{var query=RatisTopologyJoinAuthority.Request.of(request.header(),request.receiver().replicaId(),request.purpose()==RatisTopologySourceSnapshotRpc.Purpose.BOOTSTRAP?RatisTopologyJoinAuthority.Purpose.REGISTER:RatisTopologyJoinAuthority.Purpose.CONFIGURATION);var view=joinAuthority.read(query);view.require(query);if(!view.catalogue().equals(plan.catalogue().groupId()) || !view.catalogue().equals(request.catalogue()) || view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Source image requires exact irreversible JOINING");return view;}
     private RatisTopologySourceSnapshotService.Host sourceSnapshotHost(){return new RatisTopologySourceSnapshotService.Host(){
-        public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request)throws Exception{var view=sourceView(request);var machine=machines.get(RaftGroupId.valueOf(view.definition().parents().getFirst().groupId()));if(machine==null)throw new IOException("Source snapshot has no local actual source owner");return machine.captureSourceSnapshot(request,view.definition(),logicalSchema,sourceArtifacts);}
+        public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request)throws Exception{var view=sourceView(request);var machine=machines.get(RaftGroupId.valueOf(view.definition().parents().getFirst().groupId()));if(machine==null)throw new IOException("Source snapshot has no local actual source owner");return machine.captureSourceSnapshot(request,view.definition(),logicalSchemas.get(request.header().domainId()),sourceArtifacts);}
         public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{var view=sourceView(lease.prepared().request());var machine=machines.get(RaftGroupId.valueOf(view.definition().parents().getFirst().groupId()));if(machine==null || lease.source().getStateMachine()!=machine)throw new IOException("Source snapshot division changed");var evidence=machine.relocationEvidence(new RatisRelocationOwnerRpc.Request(view.definition(),null,RatisRelocationOwnerRpc.Expected.SOURCE,null,null));if(!evidence.owner().replicaId().equals(lease.prepared().sourceOwner().replicaId()) || !RatisRelocationOwnerRpc.covers(evidence.completedCut(),lease.prepared().image().position()) || !Arrays.equals(evidence.configuration().data(),lease.prepared().sourceCfg().data()))throw new IOException("Retained source image lost actual native owner/configuration");}
         public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{var view=sourceView(lease.prepared().request());var image=lease.prepared().image();var evidence=relocationClients.read(new RatisRelocationOwnerRpc.Request(view.definition(),lease.prepared().request().receiver().replicaId(),RatisRelocationOwnerRpc.Expected.IMAGE,image.position(),image.sha256()));if(!evidence.imageInstalled())throw new IOException("Receiver has not forced the exact native image");}
         public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{sourceArtifacts.released(lease.prepared().request());}
@@ -506,7 +540,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if(Files.exists(path)){var original=SessionJournalFiles.read(path,RatisTopologyRelocationRecord.MAX_BYTES+16);if(original.length<16 || !Arrays.equals(Arrays.copyOfRange(original,16,original.length),encoded))throw new IOException("Relocation journal changed original committed record");relocationJournalIo.force(path);}
         else{int count=0;long bytes=0;try(var files=Files.list(directory)){for(var file:files.toList())if(Files.isRegularFile(file)){count++;bytes+=Files.size(file);}}if(count>=128 || bytes+encoded.length+16>64L*1024*1024)throw new IOException("Node relocation history budget exhausted");var out=ByteBuffer.allocate(16+encoded.length).putLong(position.term()).putLong(position.index()).put(encoded);relocationJournalIo.write(path,out.array(),RatisTopologyRelocationRecord.MAX_BYTES+16);relocationJournalIo.force(path);}
         groups.relocation(record);
-        if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && routed.directory().domainId().equals(record.definition().header().domainId()) && routed.directory().generation()<=record.definition().targetDirectory().generation())routed.refresh(record.definition().targetDirectory());
+        var routed=data(record.definition().header().domainId());if(record.action()==RatisTopologyRelocationRecord.Action.COMPLETE && routed.directory().domainId().equals(record.definition().header().domainId()) && routed.directory().generation()<=record.definition().targetDirectory().generation())routed.refresh(record.definition().targetDirectory());
     }
     private boolean savedRelocation(RatisTopologyRelocationRecord record)throws IOException{
         var path=relocationPath(record);if(!Files.exists(path))return false;var bytes=SessionJournalFiles.read(path,RatisTopologyRelocationRecord.MAX_BYTES+16);if(bytes.length<16 || !Arrays.equals(Arrays.copyOfRange(bytes,16,bytes.length),record.encode()))throw new IOException("Relocation saved record differs");relocationJournalIo.force(path);var in=ByteBuffer.wrap(bytes);var position=new ApplyPosition(in.getLong(),in.getLong());var store=stores.get(record.definition().parents().getFirst().groupId());return store!=null && store.applied()!=null && RatisRelocationOwnerRpc.covers(store.applied(),position);
@@ -515,7 +549,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         try(var files=Files.list(directory)){for(var pending:files.filter(p->p.getFileName().toString().endsWith(".pending")).sorted().toList()){
             if(!Files.isRegularFile(pending,LinkOption.NOFOLLOW_LINKS))throw new IOException("Relocation sidecar is not an owned regular file");
             var body=SessionJournalFiles.read(pending,RatisTopologyRelocationRecord.MAX_BYTES+16);if(body.length<16)throw new IOException("Truncated relocation sidecar");var in=ByteBuffer.wrap(body);new ApplyPosition(in.getLong(),in.getLong());var record=RatisTopologyRelocationRecord.decode(Arrays.copyOfRange(body,16,body.length));var original=relocationPath(record);
-            if(!pending.equals(original.resolveSibling(original.getFileName()+".pending")) || !record.catalogue().equals(plan.catalogue().groupId()) || !record.definition().header().clusterId().equals(plan.directory().clusterId()) || !record.definition().header().databaseId().equals(plan.directory().databaseId()))throw new IOException("Foreign relocation sidecar");
+            if(!pending.equals(original.resolveSibling(original.getFileName()+".pending")) || !record.catalogue().equals(plan.catalogue().groupId()) || !record.definition().header().clusterId().equals(plan.clusterId()) || !record.definition().header().databaseId().equals(plan.databaseId()))throw new IOException("Foreign relocation sidecar");
             if(Files.exists(original,LinkOption.NOFOLLOW_LINKS)){if(!Arrays.equals(body,SessionJournalFiles.read(original,RatisTopologyRelocationRecord.MAX_BYTES+16)))throw new IOException("Relocation sidecar changed original intent");relocationJournalIo.force(original);Files.delete(pending);SessionJournalFiles.force(directory);}
             else{Files.move(pending,original,StandardCopyOption.ATOMIC_MOVE);relocationJournalIo.force(original);}
         }}
@@ -570,7 +604,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for(var target:forced.definition().targets()){
                 var id=RaftGroupId.valueOf(target.groupId());if(machines.containsKey(id))continue;var entry=groups.require(target.groupId());var store=pool.reopenTopologyRange(forced.birth(target.groupId()),seedSchema(forced));
                 var directory=store.schemaInstallation()==null ? entry.directory() : store.schemaInstallation().definition().targetDirectory();
-                var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,directory,settings.retention());configureDataMachine(machine,directory,target);machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(target.groupId(),store);machines.put(id,machine);
+                var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,directory,settings.retention());configureDataMachine(machine,directory,target);machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(target.groupId(),store);machines.put(id,machine);
             }
             // Every machine and borrowed node service is configured before any target can vote.
             for(var target:forced.definition().targets())requireSeedStorage(groups.require(target.groupId()));
@@ -601,18 +635,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }catch(org.rocksdb.RocksDBException|IllegalArgumentException|IllegalStateException failure){throw new IOException("Learner force/register failed",failure);}finally{endSeedLifecycle();}
     }
     private void requireLearnerReceiver(RatisTopologyJoinAuthority.View view,ReplicaDescriptor receiver)throws IOException{
+        requirePropagationCoverage(view.definition().header().domainId(),view.definition().targetDirectory());groups.requireCapacity(view.definition().targets().stream().map(RangeDescriptor::groupId).toList());
         var source=view.definition().sourceDirectory();if(!view.catalogue().equals(plan.catalogue().groupId()) || !receiver.nodeId().equals(plan.nodeId()) || !receiver.nodeIncarnation().equals(plan.nodeIncarnation()) || !receiver.peerId().equals(plan.peerId()) || !receiver.address().equals(plan.address())
-                || !source.clusterId().equals(plan.directory().clusterId()) || !source.databaseId().equals(plan.directory().databaseId()) || !source.domainId().equals(plan.directory().domainId()))throw new IOException("Learner receiver/catalogue/bootstrap identity differs");
+                || !source.clusterId().equals(plan.clusterId()) || !source.databaseId().equals(plan.databaseId()) || !plan.directory(source.domainId()).domainId().equals(source.domainId()))throw new IOException("Learner receiver/catalogue/bootstrap identity differs");
     }
     private void installTopologyLearnerOwned(NativeTopologyLearnerRegistration registration)throws IOException,org.rocksdb.RocksDBException{
         var forced=pool.topologyLearners().stream().filter(registration::equals).findFirst().orElseThrow(()->new IOException("Learner is not exact forced native history"));groups.register(forced);var id=RaftGroupId.valueOf(forced.definition().targets().getFirst().groupId());var entry=groups.require(id.getUuid());
-        if(!machines.containsKey(id)){if(schemaReplicas==null)schemaReplicas=new RatisSchemaReplicaService(root.resolve("native"),root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());var store=pool.openTopologyLearner(forced);var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,entry.directory(),settings.retention());configureDataMachine(machine,entry.directory(),entry.descriptor());machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(id.getUuid(),store);machines.put(id,machine);}
+        if(!machines.containsKey(id)){if(schemaReplicas==null)schemaReplicas=new RatisSchemaReplicaService(root.resolve("native"),root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());var store=pool.openTopologyLearner(forced);var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,entry.directory(),settings.retention());configureDataMachine(machine,entry.directory(),entry.descriptor());machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(id.getUuid(),store);machines.put(id,machine);}
         requireSeedStorage(entry);markSeedExposure(entry);var actual=new HashSet<RaftGroupId>();server.getGroupIds().forEach(actual::add);if(!actual.contains(id))addGroup(entry.group());else verify(entry.group());
     }
     private List<ReplicatedRangeStore> requireSeedParents(RatisTopologySeedRpc.Request request,boolean fresh)throws IOException,org.rocksdb.RocksDBException{
         var definition=request.definition();var directory=definition.sourceDirectory();var anchor=groups.require(request.anchorGroup());
         if(!started || server==null || !server.getId().toString().equals(plan.peerId()) || !request.catalogue().equals(plan.catalogue().groupId()) || anchor.role()!=RatisNodePlan.Role.DATA || !anchor.descriptor().equals(request.range())
-                || !directory.clusterId().equals(plan.directory().clusterId()) || !directory.databaseId().equals(plan.directory().databaseId()) || !directory.domainId().equals(plan.directory().domainId()) || !ownReplica(request.range()).equals(request.owner()))throw new IOException("SEED anchor/local identity/catalogue differs from runtime");
+                || !directory.clusterId().equals(plan.clusterId()) || !directory.databaseId().equals(plan.databaseId()) || !plan.directory(directory.domainId()).domainId().equals(directory.domainId()) || !ownReplica(request.range()).equals(request.owner()))throw new IOException("SEED anchor/local identity/catalogue differs from runtime");
         var parents=new ArrayList<ReplicatedRangeStore>();
         for(var range:definition.parents()){
             var entry=groups.require(range.groupId());var id=RaftGroupId.valueOf(range.groupId());var store=stores.get(range.groupId());var division=server.getDivision(id);
@@ -629,7 +664,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     /** Executable local mutation, addressed through an original parent. Returns only the forced local recipe. */
     public NativeTopologySeed seedTopology(RatisTopologySeedRpc.Request request)throws IOException{
         beginSeedLifecycle();try{
-            Objects.requireNonNull(request);var saved=pool.topologySeed(request.definition().intentId());var parents=requireSeedParents(request,saved==null);
+            Objects.requireNonNull(request);requirePropagationCoverage(request.definition().header().domainId(),request.definition().targetDirectory());groups.requireCapacity(request.definition().targets().stream().map(RangeDescriptor::groupId).toList());var saved=pool.topologySeed(request.definition().intentId());var parents=requireSeedParents(request,saved==null);
             if(saved!=null){request.requireSeed(saved);installTopologySeedOwned(saved);return saved;}
             var attempt=seedAttempt;if(attempt!=null && (!Arrays.equals(attempt.definition().encode(),request.definition().encode()) || !attempt.local().equals(request.owner())))throw new IOException("Unknown SEED force requires exact original definition/local retry");
             if(attempt==null){var view=seedAuthority.read(request.definition().header(),TopologyChange.Stage.SEED);view.require(RatisTopologyAuthority.Request.of(request.definition().header(),TopologyChange.Stage.SEED));if(!view.catalogue().equals(request.catalogue()) || !Arrays.equals(view.definition().encode(),request.definition().encode()) || !Arrays.equals(view.admissionDigest(),request.originalAdmissionDigest()))throw new IOException("Fresh SEED authority changed original definition/catalogue");parents=requireSeedParents(request,true);attempt=new SeedAttempt(request.definition(),view.state(),request.owner());seedAttempt=attempt;}
@@ -640,17 +675,17 @@ public final class RatisNodeRuntime implements AutoCloseable {
         var seed=pool.topologySeed(definition.intentId());if(seed==null || !activation.catalogueGroup().equals(plan.catalogue().groupId()))throw new IllegalStateException("Native topology activation has no configured catalogue/forced seed");activation.requireSeed(seed);definition.header().requireDefinition(seed.definition());var store=stores.get(activation.birth().groupId());if(store==null || store.topologyActivation()==null || !Arrays.equals(store.topologyActivation().encode(),activation.encode()))throw new IllegalArgumentException("Topology observer lacks original committed local native activation");activation.requireCut(store.applied());groups.topologyActivated(definition,activation);try{qualifyTopologyActivation(definition,activation);}catch(IOException failure){throw new IllegalStateException("Committed topology clock witness could not persist",failure);}
     }
     private void qualifyTopologyActivation(TopologyChange.Definition definition,NativeTopologyActivation activation)throws IOException{
-        activation.header().requireDefinition(definition);if(!activation.catalogueGroup().equals(plan.catalogue().groupId()))throw new IOException("Topology clock witness catalogue changed");var source=definition.sourceDirectory();var target=definition.targetDirectory();var current=routed.directory();
+        activation.header().requireDefinition(definition);requirePropagationCoverage(definition.header().domainId(),definition.targetDirectory());if(!activation.catalogueGroup().equals(plan.catalogue().groupId()))throw new IOException("Topology clock witness catalogue changed");var source=definition.sourceDirectory();var target=definition.targetDirectory();var routed=data(source.domainId());var current=routed.directory();
         if(!current.clusterId().equals(source.clusterId()) || !current.databaseId().equals(source.databaseId()) || !current.domainId().equals(source.domainId()))throw new IOException("Topology clock witness namespace changed");
         if(current.generation()<=target.generation() && !Arrays.equals(current.payloadDigest(),source.payloadDigest()) && !Arrays.equals(current.payloadDigest(),target.payloadDigest()))throw new IOException("Topology clock witness does not follow qualified current source/target");
-        if(propagation!=null)propagation.qualifyTopology(definition,activation);if(current.generation()<=target.generation())routed.refresh(target);
+        var propagation=dataPropagations.get(source.domainId());if(propagation!=null)propagation.qualifyTopology(definition,activation);if(current.generation()<=target.generation())routed.refresh(target);
     }
     public void start() throws IOException {
         synchronized (this) {
             if (installing || starting || started || closeRequested || closed) throw new IllegalStateException("Node cannot start"); starting=true;
         }
         try {
-            if (!Arrays.equals(routed.directory().payloadDigest(),startupDirectory.payloadDigest())) throw new IOException("Node placement changed before start");
+            for(var entry:routedClients.entrySet())if(!Arrays.equals(entry.getValue().directory().payloadDigest(),startupDirectories.get(entry.getKey()).payloadDigest()))throw new IOException("Node placement changed before start");
             // Persist before the first possible network/voting exposure, including a start attempt that later fails.
             SessionJournalFiles.write(root.resolve("node.identity"),identity(true),128);
             server.start(); var existing=new HashSet<RaftGroupId>(); server.getGroupIds().forEach(existing::add);
@@ -703,7 +738,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         return ByteBuffer.allocate(33).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
     }
     private void observeSchemaActivation(SchemaChange.Definition definition,NativeSchemaActivationProof proof) {
-        groups.schemaActivated(definition,proof);routed.refreshSchema(definition,proof);
+        groups.schemaActivated(definition,proof);data(definition.header().domainId()).refreshSchema(definition,proof);
     }
     private boolean identityExposed(byte[] bytes) throws IOException {
         if (bytes.length!=33) throw new IOException("Invalid node identity shape");
@@ -806,6 +841,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Export source drain interrupted",interrupted); }
                 catch (ExecutionException | TimeoutException failure) { throw new IOException("Export sources did not drain",failure); }
             }
+            if(snapshotCohorts!=null)try{snapshotCohorts.close();}catch(Exception failure){throw new IOException("Cohort owners did not drain",failure);}
             if (retirementService!=null) {
                 try { retirementService.stop().get(settings.shutdownTimeout().toNanos(),TimeUnit.NANOSECONDS); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException("Retirement drain interrupted",interrupted); }

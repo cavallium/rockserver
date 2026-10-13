@@ -26,22 +26,26 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
     private RatisRetirementJournal journal;
     private final RatisTransactionStatuses homes;
     private final RatisSnapshotFences snapshots;
-    private final RatisRoutedClient data;
+    private final Map<UUID,RatisRoutedClient> data;
     private final List<Scan> scans;
     private final ArrayDeque<UUID> retries=new ArrayDeque<>();
     private int cursor;
     private boolean retryTurn,active,closed;
     private volatile Throwable lastFailure;
 
-    public RatisRetirementCoordinator(Path directory,RatisTransactionStatuses homes,RatisSnapshotFences snapshots,RatisRoutedClient data,List<Source> sources,RatisRetirementJournal.Limits limits) throws IOException {
-        this.directory=Objects.requireNonNull(directory); this.homes=homes; this.snapshots=snapshots; this.data=Objects.requireNonNull(data); this.limits=Objects.requireNonNull(limits);
+    public RatisRetirementCoordinator(Path directory,RatisTransactionStatuses homes,RatisSnapshotFences snapshots,Map<UUID,RatisRoutedClient> data,List<Source> sources,RatisRetirementJournal.Limits limits) throws IOException {
+        this.directory=Objects.requireNonNull(directory); this.homes=homes; this.snapshots=snapshots; this.data=Map.copyOf(data); this.limits=Objects.requireNonNull(limits);
         Objects.requireNonNull(sources); if (sources.size()>MAX_SOURCES) throw new IllegalArgumentException("Too many retirement sources");
         var keys=new HashSet<String>();
         for (var source:sources) {
             if (!keys.add(source.group()+":"+source.mode()) || source.mode()==Mode.SNAPSHOT && snapshots==null || source.mode()!=Mode.SNAPSHOT && homes==null) throw new IllegalArgumentException("Invalid retirement source/client binding");
         }
         scans=sources.stream().map(Scan::new).toList();
-        var bytes=ByteBuffer.allocate(98).put(data.sessionIdentityDigest()).put((byte)(homes==null ? 0 : 1)).put(homes==null ? new byte[32] : homes.identityDigest())
+        if(this.data.isEmpty() || this.data.size()>DatabaseDomainRoster.MAX_DOMAINS)throw new IllegalArgumentException("Invalid retirement DATA domain scope");
+        var bytes=ByteBuffer.allocate(70+48*this.data.size()).putInt(this.data.size());
+        UUID cluster=null,database=null;
+        for(var domain:this.data.keySet().stream().sorted(RangeDirectoryCodec.UUID_ORDER).toList()){var client=this.data.get(domain);var route=client.directory();if(!domain.equals(route.domainId()) || cluster!=null && (!cluster.equals(route.clusterId()) || !database.equals(route.databaseId())))throw new IllegalArgumentException("Retirement DATA database/domain differs");cluster=route.clusterId();database=route.databaseId();bytes.putLong(domain.getMostSignificantBits()).putLong(domain.getLeastSignificantBits()).put(client.sessionIdentityDigest());}
+        bytes.put((byte)(homes==null ? 0 : 1)).put(homes==null ? new byte[32] : homes.identityDigest())
                 .put((byte)(snapshots==null ? 0 : 1)).put(snapshots==null ? new byte[32] : snapshots.identityDigest());
         try { binding=MessageDigest.getInstance("SHA-256").digest(bytes.array()); } catch (NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
         journal=RatisRetirementJournal.open(directory,binding,limits); resetRetries();
@@ -84,11 +88,11 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
     }
     private void execute(RatisRetirementOperation operation) throws IOException {
         switch (operation.type()) {
-            case PARTICIPANT -> data.retireParticipant(operation.participant());
+            case PARTICIPANT -> data(operation.participant().consumed().domainId()).retireParticipant(operation.participant());
             case HOME -> { if (homes==null) throw new IOException("Transaction HOME client missing"); homes.retire(operation.home()); }
-            case SNAPSHOT_GATE -> data.retireSnapshotGate(operation.snapshotGate());
+            case SNAPSHOT_GATE -> data(operation.snapshotGate().consumed().fence().domainId()).retireSnapshotGate(operation.snapshotGate());
             case SNAPSHOT_HOME -> { if (snapshots==null) throw new IOException("Snapshot HOME client missing"); snapshots.retire(operation.snapshotHome()); }
-            case RELEASE -> data.executeSnapshotGate(data.prepareSnapshotGate(operation.release()));
+            case RELEASE -> {var client=data(operation.release().fence().domainId());client.executeSnapshotGate(client.prepareSnapshotGate(operation.release()));}
         }
     }
     private boolean discoverOne() throws IOException {
@@ -110,6 +114,7 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
         if (orphan) return submit(RatisRetirementOperation.home(new HomeRetirement(identity,null,List.of())));
         var participants=status.participants(); int start=(Math.floorMod(status.transactionId().hashCode(),participants.size())+round)%participants.size();
         var participant=participants.get(start); var original=new ParticipantIdentity(page.groupId(),page.rangeEpoch(),participant.groupId(),status);
+        var data=data(status.domainId());
         var proof=data.participantFence(original);
         if (proof==null) {
             if (data.stateView(participant.groupId()).minimumSessionEpoch()<=status.operation().epoch()) return false;
@@ -128,6 +133,7 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
     }
     private boolean snapshot(ReplicatedRangeStore.RetirementPage page,SnapshotFenceStatus status,int round) throws IOException {
         var fence=status.fence(); var participants=fence.participants(); int start=(Math.floorMod(fence.fenceId().hashCode(),participants.size())+round)%participants.size(); UUID group=participants.get(start).groupId();
+        var data=data(fence.domainId());
         var proof=data.snapshotFence(fence,group);
         if (proof==null) {
             if (data.stateView(group).minimumSessionEpoch()<=fence.operation().epoch()) return false;
@@ -146,10 +152,11 @@ public final class RatisRetirementCoordinator implements AutoCloseable {
         var fence=status.fence(); if (page.minimumEpoch()<=fence.operation().epoch()) return false;
         var proofs=new ArrayList<SnapshotFenceProof>(fence.participants().size());
         for (int n=0;n<fence.participants().size();n++) {
-            UUID group=fence.participants().get(n).groupId(); var actual=n==start ? proof : data.snapshotFence(fence,group); if (actual==null) return false; proofs.add(actual);
+            UUID group=fence.participants().get(n).groupId(); var actual=n==start ? proof : data(fence.domainId()).snapshotFence(fence,group); if (actual==null) return false; proofs.add(actual);
         }
         var identity=new SnapshotHomeIdentity(page.groupId(),page.rangeEpoch(),page.schemaDigest(),page.columnId(),fence);
         return submit(RatisRetirementOperation.snapshotHome(new SnapshotHomeRetirement(identity,status,proofs)));
     }
+    private RatisRoutedClient data(UUID domain)throws IOException{var client=data.get(domain);if(client==null)throw new IOException("Retirement participant domain is not configured");return client;}
     @Override public synchronized void close() throws IOException { if (closed) return; if (active) throw new IOException("Retirement quantum active; ownership retained"); journal.close(); closed=true; }
 }

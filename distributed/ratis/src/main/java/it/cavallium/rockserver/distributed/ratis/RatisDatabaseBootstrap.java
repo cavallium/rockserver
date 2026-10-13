@@ -16,9 +16,10 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
         public Domain {
             Objects.requireNonNull(plan);Objects.requireNonNull(routed);
             if(schema==null && allocationWitness!=null)throw new IllegalArgumentException("Allocation witness requires schema content");
-            RatisColumnAllocation.counter(allocationWitness);if(schema!=null)schema.requireMatches(plan.directory());
+            RatisColumnAllocation.counter(allocationWitness);var directory=routed.directory();if(!Arrays.equals(plan.directory(directory.domainId()).payloadDigest(),directory.payloadDigest()))throw new IllegalArgumentException("Bootstrap domain differs from node plan");if(schema!=null)schema.requireMatches(directory);
             allocationWitness=allocationWitness==null ? null : allocationWitness.clone();
         }
+        public RangeDirectory directory(){return routed.directory();}
         @Override public byte[] allocationWitness(){return allocationWitness==null ? null : allocationWitness.clone();}
     }
     public record Progress(Phase phase,String directoryDigest,SessionAuthority target,int checked,int total,Map<UUID,String> failures) {
@@ -27,9 +28,9 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
     private static final class DomainWork implements AutoCloseable {
         final Domain input;final byte[] scope;final RatisCatalogue catalogue;final RatisSchemaCatalogue schemas;
         RatisSchemaPublication publication;RatisCatalogueGenesis genesis;RatisSessionPropagation propagation;
-        DomainWork(Domain input,RaftClient client){this.input=input;scope=input.plan().directory().payloadDigest();var p=input.plan();var c=p.catalogue();
-            catalogue=new RatisCatalogue(client,p.directory().clusterId(),p.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
-            schemas=input.schema()==null ? null : new RatisSchemaCatalogue(client,p.directory().clusterId(),p.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());}
+        DomainWork(Domain input,RaftClient client){this.input=input;scope=input.directory().payloadDigest();var p=input.plan();var c=p.catalogue();
+            catalogue=new RatisCatalogue(client,p.clusterId(),p.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
+            schemas=input.schema()==null ? null : new RatisSchemaCatalogue(client,p.clusterId(),p.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());}
         @Override public void close()throws IOException {if(propagation!=null)propagation.close();if(genesis!=null)genesis.close();if(publication!=null)publication.close();}
     }
     private record RangeWork(DomainWork domain,RangeDescriptor range) {}
@@ -44,13 +45,13 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
                                   long initialTime,LongSupplier time,int maxRanges)throws IOException {
         Objects.requireNonNull(client);this.time=Objects.requireNonNull(time);inputs=List.copyOf(inputs);
         if(inputs.isEmpty() || inputs.size()>MAX_DOMAINS || initialTime<0 || maxRanges<1 || maxRanges>RangeDirectoryCodec.MAX_RANGES)throw new IllegalArgumentException("Invalid database bootstrap scope/budget");
-        var first=inputs.getFirst().plan();var directory=first.directory();var c=first.catalogue();
+        var first=inputs.getFirst().plan();var directory=inputs.getFirst().directory();var c=first.catalogue();
         if(!client.getGroupId().getUuid().equals(c.groupId()) || existingLedger!=null && (!existingLedger.clusterId().equals(directory.clusterId()) || !existingLedger.databaseId().equals(directory.databaseId())))throw new IllegalArgumentException("Wrong shared catalogue/ledger identity");
         var domainIds=new HashSet<UUID>();var groups=new HashSet<UUID>();var rangeIds=new HashSet<UUID>();var columns=new HashSet<UUID>();var names=new HashSet<String>();var apiIds=new HashSet<Long>();
         var metadataGroups=new HashSet<UUID>();metadataGroups.add(c.groupId());var metadataColumns=new HashSet<UUID>(List.of(c.directoryColumn(),c.sessionsColumn()));
         for(var home:first.homes()){metadataColumns.add(home.column());for(var range:home.directory().ranges())metadataGroups.add(range.groupId());}
         long bytes=0;byte[] nextAllocation=null;boolean hasSchema=false;var work=new ArrayList<DomainWork>();var allRanges=new ArrayList<RangeWork>();
-        for(var input:inputs){var p=input.plan();var d=p.directory();var pc=p.catalogue();
+        for(var input:inputs){var p=input.plan();var d=input.directory();var pc=p.catalogue();
             if(d.generation()!=0 || !d.clusterId().equals(directory.clusterId()) || !d.databaseId().equals(directory.databaseId())
                     || !p.nodeId().equals(first.nodeId()) || !p.nodeIncarnation().equals(first.nodeIncarnation())
                     || !pc.groupId().equals(c.groupId()) || pc.epoch()!=c.epoch() || !Arrays.equals(pc.schemaDigest(),c.schemaDigest())
@@ -77,9 +78,9 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             var identity=path.resolve("bootstrap.identity");if(Files.exists(identity)){if(!Arrays.equals(scope,SessionJournalFiles.read(identity,64)))throw new IOException("Frozen bootstrap domains changed");}else SessionJournalFiles.write(identity,scope,64);
             var parent=Files.createDirectories(path.resolve("domains"));SessionJournalFiles.force(parent);SessionJournalFiles.force(path);
             var ledger=existingLedger==null ? SessionEpochLedger.initial(directory.clusterId(),directory.databaseId(),initialTime) : existingLedger;
-            for(int i=0;i<domains.size();i++){var domain=domains.get(i);var input=domain.input;var journals=Files.createDirectories(parent.resolve(input.plan().directory().domainId().toString()));SessionJournalFiles.force(journals);SessionJournalFiles.force(parent);
+            for(int i=0;i<domains.size();i++){var domain=domains.get(i);var input=domain.input;var journals=Files.createDirectories(parent.resolve(input.directory().domainId().toString()));SessionJournalFiles.force(journals);SessionJournalFiles.force(parent);
                 if(input.schema()!=null)domain.publication=new RatisSchemaPublication(journals.resolve("schema.bin"),client,input.plan(),input.schema(),input.allocationWitness(),Map.of(),Map.of(),Map.of());
-                domain.genesis=new RatisCatalogueGenesis(journals.resolve("genesis.bin"),client,input.plan(),initialTime,i==0 && existingLedger==null ? null : ledger,i==0 ? beforeRoster : afterRoster,afterRoster);
+                domain.genesis=new RatisCatalogueGenesis(journals.resolve("genesis.bin"),client,input.plan(),input.directory().domainId(),initialTime,i==0 && existingLedger==null ? null : ledger,i==0 ? beforeRoster : afterRoster,afterRoster);
                 var clocks=Files.createDirectories(journals.resolve("ranges"));SessionJournalFiles.force(clocks);SessionJournalFiles.force(journals);domain.propagation=new RatisSessionPropagation(clocks,epochs,input.routed(),maxRanges);
             }
             clock=new RatisCatalogueClock(path.resolve("clock.bin"),epochs);
@@ -91,7 +92,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
     }
     private static byte[] binding(List<Domain> domains,SessionEpochLedger ledger,long initialTime,DatabaseDomainRoster beforeRoster,DatabaseDomainRoster afterRoster)throws IOException {
         var bytes=new ByteArrayOutputStream();var out=new DataOutputStream(bytes);out.writeLong(ledger==null ? initialTime : 0);out.writeInt(domains.size());
-        for(var domain:domains){out.write(domain.plan().identityDigest());out.write(domain.plan().directory().payloadDigest());out.write(domain.schema()==null ? new byte[32] : domain.schema().digest());var witness=domain.allocationWitness();out.writeInt(witness==null ? -1 : witness.length);if(witness!=null)out.write(witness);}
+        for(var domain:domains){out.write(domain.plan().identityDigest());out.write(domain.directory().payloadDigest());out.write(domain.schema()==null ? new byte[32] : domain.schema().digest());var witness=domain.allocationWitness();out.writeInt(witness==null ? -1 : witness.length);if(witness!=null)out.write(witness);}
         if(ledger!=null)out.write(ledger.encode());out.writeInt(beforeRoster==null ? -1 : beforeRoster.encode().length);if(beforeRoster!=null)out.write(beforeRoster.encode());out.write(afterRoster.encode());return OperatorUpload.sha256(bytes.toByteArray());
     }
     public synchronized Progress progress(){return progress(state,Map.of());}
@@ -103,7 +104,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
             if(phase==Phase.CONFLICT || phase==Phase.EXPIRED)return progress(before,failures);
             if(phase!=Phase.PREFLIGHT && phase!=Phase.SCHEMA && phase!=Phase.GENESIS)requirePublishedScope();
             switch(phase){
-                case PREFLIGHT,VERIFY -> {int visits=0,work=0;while(visits++<ranges.size() && work<budget){int next=cursor;cursor=(cursor+1)%ranges.size();if(checked.get(next))continue;work++;var entry=ranges.get(next);try{var view=entry.domain.input.routed().stateView(entry.range.groupId());view.requireMatches(entry.domain.input.plan().directory(),entry.range);if(view.applied()==null || view.applied().term()==0)throw new IllegalStateException("Current-term native apply is absent");if(phase==Phase.VERIFY)view.requireServing(target);checked.set(next);}catch(IOException|IllegalStateException|IllegalArgumentException failure){var message=String.valueOf(failure.getMessage());failures.put(entry.range.groupId(),message.substring(0,Math.min(512,message.length())));}}
+                case PREFLIGHT,VERIFY -> {int visits=0,work=0;while(visits++<ranges.size() && work<budget){int next=cursor;cursor=(cursor+1)%ranges.size();if(checked.get(next))continue;work++;var entry=ranges.get(next);try{var view=entry.domain.input.routed().stateView(entry.range.groupId());view.requireMatches(entry.domain.input.directory(),entry.range);if(view.applied()==null || view.applied().term()==0)throw new IllegalStateException("Current-term native apply is absent");if(phase==Phase.VERIFY)view.requireServing(target);checked.set(next);}catch(IOException|IllegalStateException|IllegalArgumentException failure){var message=String.valueOf(failure.getMessage());failures.put(entry.range.groupId(),message.substring(0,Math.min(512,message.length())));}}
                     if(checked.cardinality()==ranges.size()){if(phase==Phase.PREFLIGHT){phase=domains.stream().anyMatch(d->d.publication!=null) ? Phase.SCHEMA : Phase.GENESIS;index=0;}else{requirePublishedScope();phase=Phase.READY;}}}
                 case SCHEMA -> {while(index<domains.size() && domains.get(index).publication==null)index++;var domain=domains.get(index);var outcome=domain.publication.execute();if(outcome.status()==CommandResult.Status.SUCCESS || outcome.status()==CommandResult.Status.CONFLICT){requirePublishedSchema(domain);index++;while(index<domains.size() && domains.get(index).publication==null)index++;if(index==domains.size()){phase=Phase.GENESIS;index=0;}}else phase=Phase.EXPIRED;}
                 case GENESIS -> {var domain=domains.get(index);requirePublishedSchema(domain);var outcome=domain.genesis.execute();if(outcome.status()==CommandResult.Status.SUCCESS){if(++index==domains.size()){phase=Phase.CLOCK;index=0;}}else phase=outcome.status()==CommandResult.Status.CONFLICT ? Phase.CONFLICT : Phase.EXPIRED;}
@@ -115,7 +116,7 @@ public final class RatisDatabaseBootstrap implements AutoCloseable {
         }finally{synchronized(this){busy=false;}}
     }
     private void requireCachedScope()throws IOException {for(var domain:domains)if(!Arrays.equals(domain.scope,domain.input.routed().directory().payloadDigest()))throw new IOException("Bootstrap routed directory changed; frozen intent cannot be rebased");}
-    private void requirePublishedScope()throws IOException {var view=rosters.readComplete();if(!view.roster().equals(afterRoster))throw new IOException("Published database roster differs from frozen bootstrap scope");for(var domain:domains){var current=RatisRoutedClient.rpc(()->domain.catalogue.read(domain.input.plan().directory().domainId()));if(current==null || !Arrays.equals(domain.scope,current.payloadDigest()))throw new IOException("Published directory differs from frozen bootstrap scope");requirePublishedSchema(domain);}}
+    private void requirePublishedScope()throws IOException {var view=rosters.readComplete();if(!view.roster().equals(afterRoster))throw new IOException("Published database roster differs from frozen bootstrap scope");for(var domain:domains){var current=RatisRoutedClient.rpc(()->domain.catalogue.read(domain.input.directory().domainId()));if(current==null || !Arrays.equals(domain.scope,current.payloadDigest()))throw new IOException("Published directory differs from frozen bootstrap scope");requirePublishedSchema(domain);}}
     private void requirePublishedSchema(DomainWork domain)throws IOException {if(domain.schemas==null)return;var schema=domain.input.schema();var current=RatisRoutedClient.rpc(()->domain.schemas.read(schema.digest()));if(current==null || !Arrays.equals(DistributedSchemaCodec.encode(schema),DistributedSchemaCodec.encode(current)))throw new IOException("Published schema differs from frozen bootstrap content");}
     private Progress progress(State state,Map<UUID,String> failures){return new Progress(state.phase(),HexFormat.of().formatHex(scope),state.target(),state.checked().cardinality(),ranges.size(),failures);}
     @Override public synchronized void close()throws IOException {if(closed)return;if(busy)throw new IOException("Bootstrap work is active");closing=true;for(var domain:domains)domain.close();if(clock!=null)clock.close();try{if(lock.isValid())lock.release();}finally{lockChannel.close();}closed=true;}

@@ -80,7 +80,7 @@ class RatisSchemaReplicaServiceTest {
             upload=OperatorUpload.create(id(30),id(1),id(2),operator,jar); status=new AtomicReference<>(SchemaChange.Status.begin(definition.header()));
             policy=ignored -> new MergeOperatorRegistry.DeterministicContract("append-contract",1,true);
             poolPath=path.resolve("native"); stagePath=path.resolve("staging");
-            pool=DistributedStoragePool.open(poolPath,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),source,Map.of(),Map.of());
+            pool=DistributedStoragePool.open(poolPath,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(source),Map.of(),Map.of());
             store=pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(id(3),Set.of(),null,null),source.digest(),Map.of(),Set.of()); store.enableLogicalSchema(source);
             storage=RaftStorage.newBuilder().setDirectory(path.resolve("raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build(); storage.initialize();
             var voterPeer=RaftPeer.newBuilder().setId(voter.peerId()).setAddress(voter.address()).build();

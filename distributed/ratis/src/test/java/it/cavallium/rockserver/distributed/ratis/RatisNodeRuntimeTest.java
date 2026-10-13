@@ -51,17 +51,17 @@ class RatisNodeRuntimeTest {
             assertFalse(unqualified.created); assertFalse(Files.exists(env.nodeRoot.resolve("node.identity")));
             DistributedStoragePool.stageOperator(env.nodeRoot.resolve("native"),operator,new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true),artifact);
             var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
-            var group=RaftGroupId.valueOf(env.plan.directory().ranges().getFirst().groupId());
+            var group=RaftGroupId.valueOf(env.plan.domains().getFirst().directory().ranges().getFirst().groupId());
             var command=new DistributedCommand(group.getUuid(),1,schema.digest(),new OperationId(new UUID(58,1),1,0),List.of(new Mutation(Mutation.Kind.MERGE,column,new byte[]{1},new byte[]{7})));
             var first=new FakeServer();
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first::create,schema)) {
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, first::create, List.of(schema))) {
                 node.start(); var store=(ReplicatedRangeStore)storeField.get(first.machines.get(group));
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,1),command)).status());
                 assertArrayEquals(new byte[]{7},store.readCurrentPoint(column,new byte[]{1}));
             }
             byte[] identity=Files.readAllBytes(env.nodeRoot.resolve("node.identity"));
             var recovered=new FakeServer();
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.RECOVER,recovered::create,schema)) {
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.RECOVER, recovered::create, List.of(schema))) {
                 node.start(); var store=(ReplicatedRangeStore)storeField.get(recovered.machines.get(group));
                 assertArrayEquals(new byte[]{7},store.readCurrentPoint(column,new byte[]{1}));
                 var next=new DistributedCommand(group.getUuid(),1,schema.digest(),new OperationId(new UUID(58,1),1,1),List.of(new Mutation(Mutation.Kind.MERGE,column,new byte[]{1},new byte[]{9})));
@@ -88,11 +88,11 @@ class RatisNodeRuntimeTest {
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) { throw new AssertionError("Maintenance timer has not fired"); }
             });
             DistributedStoragePool.stageOperator(env.nodeRoot.resolve("native"),operator,new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true),artifact);
-            var definition=new SchemaChange.Definition(new UUID(59,1),new OperationId(new UUID(59,2),1,0),plan.directory(),source,target);
+            var definition=new SchemaChange.Definition(new UUID(59,1),new OperationId(new UUID(59,2),1,0),plan.domains().getFirst().directory(),source,target);
             var poolField=RatisNodeRuntime.class.getDeclaredField("pool"); poolField.setAccessible(true);
             var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
             var first=new FakeServer(); NativeSchemaActivationProof activation=null;
-            try (var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first::create,source,null,null,homes)) {
+            try (var node=RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, settings, RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, first::create, List.of(source), null, null, homes)) {
                 node.start(); assertEquals(5,first.machines.size()); var pool=(DistributedStoragePool)poolField.get(node);
                 var data=new LinkedHashMap<UUID,ReplicatedRangeStore>();
                 for (var entry:first.machines.entrySet()) {
@@ -112,7 +112,7 @@ class RatisNodeRuntimeTest {
                 env.routed.refreshSchema(definition,activation);
             }
             byte[] identity=Files.readAllBytes(env.nodeRoot.resolve("node.identity")); var recovered=new FakeServer();
-            try (var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.RECOVER,recovered::create,source,null,null,homes)) {
+            try (var node=RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, settings, RatisNodeRuntime.Startup.RECOVER, recovered::create, List.of(source), null, null, homes)) {
                 node.start(); assertEquals(5,recovered.machines.size());
                 for (var entry:recovered.machines.entrySet()) {
                     var store=(ReplicatedRangeStore)storeField.get(entry.getValue());
@@ -139,7 +139,7 @@ class RatisNodeRuntimeTest {
             UUID recreatedColumn=new UUID(2,4);
             var recreated=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),3,0,List.of(
                     new DistributedSchema.Column(2,recreatedColumn,"data",source.columns().getFirst().schema(),null)));
-            var deletion=new SchemaChange.Definition(new UUID(56,1),new OperationId(new UUID(56,2),1,0),env.plan.directory(),source,empty);
+            var deletion=new SchemaChange.Definition(new UUID(56,1),new OperationId(new UUID(56,2),1,0),env.plan.domains().getFirst().directory(),source,empty);
             var creation=new SchemaChange.Definition(new UUID(56,3),new OperationId(new UUID(56,2),1,1),deletion.targetDirectory(),empty,recreated);
             var poolField=RatisNodeRuntime.class.getDeclaredField("pool"); poolField.setAccessible(true);
             var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true);
@@ -183,7 +183,7 @@ class RatisNodeRuntimeTest {
                         it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
         try (var env=new Env(root,false,schema.digest())) {
             var target=new DistributedSchema(schema.clusterId(),schema.databaseId(),schema.domainId(),2,0,List.of());
-            var definition=new SchemaChange.Definition(new UUID(55,1),new OperationId(new UUID(55,2),1,0),env.plan.directory(),schema,target);
+            var definition=new SchemaChange.Definition(new UUID(55,1),new OperationId(new UUID(55,2),1,0),env.plan.domains().getFirst().directory(),schema,target);
             var first=new FakeServer();
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,first)) {
                 node.start();
@@ -223,23 +223,23 @@ class RatisNodeRuntimeTest {
                 } catch (ReflectiveOperationException failure) { throw new IOException(failure); }
                 return fake.create(plan,logs,machines);
             };
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,bound,null,null,recovery)) {
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, bound, null, null, recovery)) {
                 assertEquals(0,node.participantRecoveryStatus().openWorkers()); node.start(); assertEquals(2,env.timer.activePeriods());
                 env.timer.fire(); RatisTransactionRecoveryServiceTest.idle(env.scheduler); assertNull(node.participantRecoveryFailure()); assertEquals(0,node.participantRecoveryStatus().persistedFiles());
             }
             assertEquals(0,env.timer.activePeriods()); assertEquals(0,homes.closes);
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.RECOVER,new FakeServer()::create,null,null,recovery)) { node.start(); env.timer.fire(); RatisTransactionRecoveryServiceTest.idle(env.scheduler); assertNull(node.participantRecoveryFailure()); }
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.RECOVER, new FakeServer()::create, null, null, recovery)) { node.start(); env.timer.fire(); RatisTransactionRecoveryServiceTest.idle(env.scheduler); assertNull(node.participantRecoveryFailure()); }
             assertEquals(0,homes.closes);
         }
     }
     @Test void nodeCloseRetainsActualHelpOwnershipAfterCancelledReplyView() throws Exception {
         try (var env=new Env(root); var homes=new TransactionHomeReader(env,env.outer.cluster)) {
             var settings=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofSeconds(1),1); var fake=new FakeServer();
-            var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,null,null,settings);
+            var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, null, null, settings);
             var entered=new java.util.concurrent.CountDownLatch(1); var release=new java.util.concurrent.CountDownLatch(1);
             try {
                 node.start(); var field=RatisNodeRuntime.class.getDeclaredField("snapshotHelp"); field.setAccessible(true); var help=(RatisSnapshotHelpService)field.get(node);
-                var directory=env.plan.directory(); var route=directory.ranges().getFirst();
+                var directory=env.plan.domains().getFirst().directory(); var route=directory.ranges().getFirst();
                 var fence=new SnapshotFence(directory.clusterId(),directory.databaseId(),directory.domainId(),new UUID(13,1),new UUID(13,2),1,new OperationId(new UUID(13,1),1,0),directory.generation(),directory.schemaEpoch(),directory.schemaDigest(),List.of(
                         new SnapshotFence.Participant(route.rangeId(),route.groupId(),route.rangeEpoch(),directory.schemaDigest(),new OperationId(new UUID(13,3),0,0),new OperationId(new UUID(13,3),0,1),new TransactionScope(List.of(TransactionScope.Span.point(env.outer.data,new byte[]{1}))))));
                 var view=help.submit(route.groupId(),ScopedTransactionRpc.SnapshotBinding.of(fence),() -> { entered.countDown(); if (!release.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Fixture timeout"); return true; });
@@ -255,7 +255,7 @@ class RatisNodeRuntimeTest {
         try (var f=helper.new Fixture("automatic-retirement")) {
             var home=f.plan.home(RatisNodePlan.Role.TRANSACTION_HOME);
             var homes=new RatisTransactionStatuses(f.clients.get(home.role()),home.column());
-            var initial=f.transaction(); var participant=f.plan.directory().ranges().getFirst();
+            var initial=f.transaction(); var participant=f.plan.domains().getFirst().directory().ranges().getFirst();
             assertEquals(CommandResult.Status.SUCCESS,homes.execute(homes.prepare(new OperationId(helper.session,1,0),null,initial)).status());
             var aborted=initial.decide(TransactionStatus.Phase.ABORT);
             homes.execute(homes.prepare(new OperationId(helper.session,1,1),initial,aborted));
@@ -270,7 +270,7 @@ class RatisNodeRuntimeTest {
             assertEquals(3,f.env.timer.activePeriods(),"DATA expiry, participant recovery and local HOME retirement timers are activated");
             var live=f.env.catalogue.epochs.read(); var expired=live.advanceTime(100);
             f.env.catalogue.epochs.execute(f.env.catalogue.epochs.prepare(f.env.outer.operation(2),live,expired));
-            for (var directory:List.of(f.plan.directory(),home.directory())) {
+            for (var directory:List.of(f.plan.domains().getFirst().directory(),home.directory())) {
                 var route=directory.ranges().getFirst();
                 var advance=f.env.catalogue.epochs.prepareAuthorityAdvance(directory,route.groupId(),new OperationId(helper.admin,2,100),-1);
                 f.append(route.groupId(),DistributedCommandCodec.encode(advance));
@@ -305,8 +305,7 @@ class RatisNodeRuntimeTest {
             f.server.storages.clear();
             var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),
                     f.env.settings().retention(),f.env.settings().clockPeriod(),1,4,f.env.settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
-            try (var reopened=RatisNodeRuntime.open(f.plan,f.env.nodeRoot,ConfigParser.parseDefault(),f.env.catalogue.epochs,f.data,
-                    f.env.scheduler,f.env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.RECOVER,f.server::create,null,null,null,f::client)) {
+            try (var reopened=RatisNodeRuntime.open(f.plan, f.env.nodeRoot, ConfigParser.parseDefault(), f.env.catalogue.epochs, Map.of(f.data.directory().domainId(), f.data), f.env.scheduler, f.env.timer, () -> 20L, settings, RatisNodeRuntime.Startup.RECOVER, f.server::create, null, null, null, f::client)) {
                 assertEquals(0,reopened.pendingRetirements()); reopened.start(); assertEquals(3,f.env.timer.activePeriods());
                 f.env.timer.fire(); retirementService(reopened).tick().get(5,java.util.concurrent.TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler);
                 assertNull(reopened.retirementFailure()); assertEquals(0,reopened.pendingRetirements());
@@ -324,14 +323,14 @@ class RatisNodeRuntimeTest {
         try (var env=new Env(root); var homes=new TransactionHomeReader(env,UUID.randomUUID())) {
             var recovery=new RatisNodeRuntime.RecoverySettings(homes.homes,false,new RatisParticipantRecoveryRegistry.Limits(1,4,64L*1024*1024),Duration.ofMillis(100),1);
             var fake=new FakeServer();
-            assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,null,null,recovery));
+            assertThrows(IllegalArgumentException.class,() -> RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, null, null, recovery));
             assertFalse(fake.created); try (var files=Files.list(env.nodeRoot)) { assertTrue(files.findAny().isEmpty()); }
         }
     }
     static final class TransactionHomeReader implements AutoCloseable {
         final RatisRoutedClient routed; final RatisTransactionStatuses homes; int closes;
         TransactionHomeReader(Env env,UUID cluster) {
-            UUID column=new UUID(12,1),group=new UUID(12,2); var peer=env.plan.directory().ranges().getFirst().replicas().getFirst();
+            UUID column=new UUID(12,1),group=new UUID(12,2); var peer=env.plan.domains().getFirst().directory().ranges().getFirst().replicas().getFirst();
             var route=new RangeDescriptor(group,group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(peer));
             var directory=new RangeDirectory(cluster,env.outer.database,new UUID(12,3),1,new byte[32],0,Set.of(column),0,List.of(route));
             routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
@@ -387,7 +386,7 @@ class RatisNodeRuntimeTest {
         try (var env=new Env(root)) {
             var fake=new FakeServer(); var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake); node.start();
             var field=RatisRangeStateMachine.class.getDeclaredField("store"); field.setAccessible(true);
-            var store=(ReplicatedRangeStore)field.get(fake.machines.get(RaftGroupId.valueOf(env.plan.directory().ranges().getFirst().groupId())));
+            var store=(ReplicatedRangeStore)field.get(fake.machines.get(RaftGroupId.valueOf(env.plan.domains().getFirst().directory().ranges().getFirst().groupId())));
             try (var pin=store.capture()) {
                 assertThrows(IOException.class,node::close); assertFalse(node.started()); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(1,fake.closes);
                 assertNull(pin.get(env.outer.data,new byte[]{1}),"Native handles stay valid while the old reader owns them");
@@ -400,7 +399,7 @@ class RatisNodeRuntimeTest {
     @Test void changedLocalEpochIntervalOrReplicaCannotAdoptOldNativeStateUnderSameGroup() throws Exception {
         try (var env=new Env(root)) {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
-            var directory=env.plan.directory(); var a=directory.ranges().getFirst(); var b=directory.ranges().getLast();
+            var directory=env.plan.domains().getFirst().directory(); var a=directory.ranges().getFirst(); var b=directory.ranges().getLast();
             var changedReplica=a.replicas().stream().map(replica -> replica.nodeId().equals(env.plan.nodeId())
                     ? new ReplicaDescriptor(replica.nodeId(),replica.nodeIncarnation(),UUID.randomUUID(),replica.peerId(),replica.address(),replica.role()) : replica).toList();
             var variants=List.of(
@@ -410,14 +409,14 @@ class RatisNodeRuntimeTest {
                     List.of(new RangeDescriptor(a.rangeId(),a.groupId(),1,0,a.lowerInclusive(),a.upperExclusive(),a.topologyState(),changedReplica),b));
             for (var ranges:variants) {
                 var changed=new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),2,directory.columns(),directory.routingPrefixBytes(),ranges);
-                var plan=new RatisNodePlan(env.plan.nodeId(),env.plan.nodeIncarnation(),changed,env.plan.catalogue(),env.plan.columns(),env.plan.merges(),2);
+                var plan=new RatisNodePlan(env.plan.nodeId(), env.plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(changed, env.plan.columns(), env.plan.merges())), env.plan.catalogue(), List.of(), List.of(), Map.of(), 2);
                 try (var routed=new RatisRoutedClient(changed,new RatisRoutedClient.Transport() {
                     public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { throw new AssertionError(); }
                     public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { throw new AssertionError(); }
                 })) {
                     var settings=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),RatisRangeStateMachine.RetentionLimits.defaults(),Duration.ofSeconds(1),1,2,Duration.ofMillis(100),RatisNodeRuntime.ExportResources.defaults());
                     var fake=new FakeServer();
-                    assertThrows(IOException.class,() -> RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routed,env.scheduler,env.timer,() -> 20L,settings,RatisNodeRuntime.Startup.RECOVER,fake::create));
+                    assertThrows(IOException.class,() -> RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(routed.directory().domainId(), routed), env.scheduler, env.timer, () -> 20L, settings, RatisNodeRuntime.Startup.RECOVER, fake::create));
                     assertFalse(fake.created);
                 }
             }
@@ -510,7 +509,7 @@ class RatisNodeRuntimeTest {
         assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
     }
     @Test void trustedSnapshotHomeReaderIsBoundBeforeEagerStateMachineInitializationOnlyOnDataGroups() throws Exception {
-        try (var env=new Env(root,true); var reader=new SnapshotReader(env.plan.directory(),env.outer.cluster,env.outer.database)) {
+        try (var env=new Env(root,true); var reader=new SnapshotReader(env.plan.domains().getFirst().directory(),env.outer.cluster,env.outer.database)) {
             var fake=new FakeServer(); var checked=new java.util.concurrent.atomic.AtomicInteger();
             RatisNodeRuntime.ServerFactory eager=(plan,logs,machines) -> {
                 try {
@@ -524,7 +523,7 @@ class RatisNodeRuntimeTest {
                     return server;
                 } catch (Exception failure) { throw new IOException(failure); }
             };
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,eager,null,reader.homes)) {
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, eager, null, reader.homes)) {
                 assertEquals(3,checked.get()); assertEquals(3,fake.storages.size()); assertEquals(0,fake.starts);
                 var data=fake.machines.entrySet().stream().filter(e -> !e.getKey().getUuid().equals(env.plan.catalogue().groupId())).findFirst().orElseThrow().getValue();
                 assertSame(reader.homes,snapshotHomes(data)); assertThrows(IllegalStateException.class,() -> data.snapshotHomes(reader.homes));
@@ -536,7 +535,7 @@ class RatisNodeRuntimeTest {
     }
     @Test void wrongSnapshotHomeClusterOrDatabaseFailsBeforeAnyNodeBootstrapWrite() throws Exception {
         try (var env=new Env(root)) {
-            for (boolean cluster:new boolean[]{false,true}) try (var reader=new SnapshotReader(env.plan.directory(),cluster ? new UUID(0,3101) : env.outer.cluster,cluster ? env.outer.database : new UUID(0,3102))) {
+            for (boolean cluster:new boolean[]{false,true}) try (var reader=new SnapshotReader(env.plan.domains().getFirst().directory(),cluster ? new UUID(0,3101) : env.outer.cluster,cluster ? env.outer.database : new UUID(0,3102))) {
                 var fake=new FakeServer();
                 assertThrows(IllegalArgumentException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake,reader.homes));
                 assertFalse(fake.created); assertEquals(0,reader.closes); assertNull(reader.homes.read(new UUID(0,3100)));
@@ -570,9 +569,9 @@ class RatisNodeRuntimeTest {
                     var server=fake.create(plan,logs,machines); for (var group:plan.localGroups()) fake.initialize(group); return server;
                 } catch (Exception failure) { throw new IOException(failure); }
             };
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,eager)) {
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, eager)) {
                 assertEquals(2,groups.get()); assertEquals(0,fake.starts); node.start(); assertTrue(node.started());
-                var listener=env.plan.directory().ranges().stream().filter(range -> range.replicas().stream().anyMatch(replica -> replica.nodeId().equals(env.plan.nodeId()) && replica.role()==ReplicaDescriptor.Role.LISTENER)).findFirst().orElseThrow();
+                var listener=env.plan.domains().getFirst().directory().ranges().stream().filter(range -> range.replicas().stream().anyMatch(replica -> replica.nodeId().equals(env.plan.nodeId()) && replica.role()==ReplicaDescriptor.Role.LISTENER)).findFirst().orElseThrow();
                 var machine=fake.machines.get(RaftGroupId.valueOf(listener.groupId())); var own=listener.replicas().stream().filter(replica -> replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow();
                 assertThrows(IllegalStateException.class,() -> machine.schemaReplicas((RatisSchemaReplicaService)owned.get(),own));
             }
@@ -589,10 +588,10 @@ class RatisNodeRuntimeTest {
         try (var env=new Env(root,false,source.digest())) {
             var fake=new FakeServer(); var contract=new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract("pure-append",1,true);
             var config=new RatisNodeRuntime.SchemaReplicaConfig(new RatisSchemaReplicaService.Limits(4,64L*1024*1024,64L*1024*1024,4,4,0),descriptor -> { assertEquals(operator,descriptor); entered.countDown(); if (!unblock.await(5,java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("Policy fixture timeout"); return contract; });
-            var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,source,null,null,RatisRoutedClient::connect,config);
+            var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, List.of(source), null, null, RatisRoutedClient::connect, config);
             try {
-                node.start(); var route=env.plan.directory().ranges().getLast(); var own=route.replicas().stream().filter(replica -> replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow(); assertEquals(ReplicaDescriptor.Role.LISTENER,own.role());
-                var definition=new SchemaChange.Definition(new UUID(77,2),new OperationId(new UUID(77,3),1,0),env.plan.directory(),source,target);
+                node.start(); var route=env.plan.domains().getFirst().directory().ranges().getLast(); var own=route.replicas().stream().filter(replica -> replica.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow(); assertEquals(ReplicaDescriptor.Role.LISTENER,own.role());
+                var definition=new SchemaChange.Definition(new UUID(77,2),new OperationId(new UUID(77,3),1,0),env.plan.domains().getFirst().directory(),source,target);
                 var upload=OperatorUpload.create(new UUID(77,4),source.clusterId(),source.databaseId(),operator,jar);
                 var request=new RatisSchemaReplicaRpc.Request(ScopedTransactionRpc.SCHEMA_ARTIFACT_STATE,new RatisSchemaReplicaRpc.Target(new RatisSchemaReplicaRpc.Binding(definition,route.groupId(),"added",true),own),upload,-1,null);
                 var service=(RatisSchemaReplicaService)schemaReplicaService(fake.machines.get(RaftGroupId.valueOf(route.groupId())));
@@ -614,12 +613,12 @@ class RatisNodeRuntimeTest {
         var policy=new java.util.concurrent.atomic.AtomicReference<it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract>();
         try (var env=new Env(root,true,source.digest())) {
             var config=new RatisNodeRuntime.SchemaReplicaConfig(RatisSchemaReplicaService.Limits.defaults(),operator -> { assertEquals(descriptor,operator); return policy.get(); }); var fake=new FakeServer();
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,source,null,null,RatisRoutedClient::connect,config)) {
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, List.of(source), null, null, RatisRoutedClient::connect, config)) {
                 node.start(); var c=env.plan.catalogue(); var machine=fake.machines.get(RaftGroupId.valueOf(c.groupId()));
                 var validatorField=RatisRangeStateMachine.class.getDeclaredField("commandValidator"); validatorField.setAccessible(true);
                 @SuppressWarnings("unchecked") var validator=(java.util.function.Consumer<DistributedCommand>)validatorField.get(machine);
                 var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true); var store=(ReplicatedRangeStore)storeField.get(machine);
-                var definition=new SchemaChange.Definition(new UUID(88,1),env.outer.operation(100),env.plan.directory(),source,target);
+                var definition=new SchemaChange.Definition(new UUID(88,1),env.outer.operation(100),env.plan.domains().getFirst().directory(),source,target);
                 var administration=new RatisSchemaAdministration(env.catalogue.client,source.clusterId(),source.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
                 var begin=administration.prepareBegin(definition,null,null,null);
                 assertThrows(IllegalArgumentException.class,() -> validator.accept(begin));
@@ -665,11 +664,11 @@ class RatisNodeRuntimeTest {
                 try { for (var entry:machines.entrySet()) { assertEquals("NEW",entry.getValue().getLifeCycleState().name()); assertSame(plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE ? clients : null,schemaFencingClient(entry.getValue())); assertEquals(plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.DATA,topologyAuthority(entry.getValue())!=null); var authority=proofLane(entry.getValue(),"schemaAuthorityQueries"); if (plan.role(entry.getKey().getUuid())==RatisNodePlan.Role.CATALOGUE) { assertNotNull(authority); assertEquals(1,configuredProofThreads(authority)); assertNotSame(proofLane(entry.getValue(),"proofQueries"),authority); } else assertNull(authority); } return fake.create(plan,logs,machines); }
                 catch (ReflectiveOperationException failure) { throw new IOException(failure); }
             };
-            var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,factory,null,null,null,RatisRoutedClient::connect,RatisNodeRuntime.SchemaReplicaConfig.defaults(),() -> clients);
+            var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, factory, null, null, null, RatisRoutedClient::connect, RatisNodeRuntime.SchemaReplicaConfig.defaults(), () -> clients);
             try {
                 assertEquals(0,connections.get()); node.start(); assertEquals(0,connections.get());
                 var source=new DistributedSchema(env.outer.cluster,env.outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,env.outer.data,"data",it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
-                var directory=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),1,source.digest(),1,source.columnIds(),0,env.plan.directory().ranges()); var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());
+                var directory=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),1,source.digest(),1,source.columnIds(),0,env.plan.domains().getFirst().directory().ranges()); var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),2,0,List.of());
                 var definition=new SchemaChange.Definition(new UUID(89,1),env.outer.operation(100),directory,source,target); var route=directory.ranges().getLast(); var binding=new RatisSchemaReplicaRpc.Binding(definition,route.groupId(),null,false); var owner=route.replicas().stream().filter(replica -> replica.role()==ReplicaDescriptor.Role.LISTENER).findFirst().orElseThrow(); var request=RatisSchemaReplicaClient.capacity(ScopedTransactionRpc.SCHEMA_CAPACITY_STATE,new RatisSchemaReplicaRpc.Target(binding,owner));
                 var actual=executor.submit(() -> clients.execute(request)); assertTrue(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)); assertThrows(IOException.class,node::close); assertEquals(RatisNodeRuntime.State.STOPPING,node.state()); assertEquals(0,closes.get());
                 try (var ownerLock=java.nio.channels.FileChannel.open(env.nodeRoot.resolve("node.lock"),StandardOpenOption.WRITE)) { assertThrows(java.nio.channels.OverlappingFileLockException.class,ownerLock::tryLock); }
@@ -677,7 +676,7 @@ class RatisNodeRuntimeTest {
             } finally { unblock.countDown(); node.close(); }
         }
         try (var env=new Env(root.resolve("data-only"))) {
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()::create,null,null,null,RatisRoutedClient::connect,RatisNodeRuntime.SchemaReplicaConfig.defaults(),() -> { throw new AssertionError("DATA-only node must not allocate catalogue outbound clients"); })) { assertEquals(RatisNodeRuntime.State.OPEN,node.state()); }
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, new FakeServer()::create, null, null, null, RatisRoutedClient::connect, RatisNodeRuntime.SchemaReplicaConfig.defaults(), () -> { throw new AssertionError("DATA-only node must not allocate catalogue outbound clients"); })) { assertEquals(RatisNodeRuntime.State.OPEN,node.state()); }
         }
     }
     @Test void ordinaryProofDrainKeepsCatalogueAuthorityAliveForItsRunningNestedDependency() throws Exception {
@@ -723,9 +722,9 @@ class RatisNodeRuntimeTest {
     @Test void importImageColumnLimitRejectsBeforePermanentNativeRangeBirth()throws Exception{
         var outer=new RatisSessionEpochsTest();var second=new UUID(6,99);var shape=it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true);var schema=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",shape,null),new DistributedSchema.Column(72,second,"second",shape,null)));
         try(var env=new Env(root,false,schema.digest())){
-            var original=env.plan.directory();var target=original.ranges().getFirst();var ranges=new ArrayList<>(original.ranges());ranges.set(0,new RangeDescriptor(target.rangeId(),target.groupId(),target.rangeEpoch(),target.configurationVersion(),target.lowerInclusive(),target.upperExclusive(),RangeDescriptor.TopologyState.FENCED,target.replicas()));var directory=new RangeDirectory(original.clusterId(),original.databaseId(),original.domainId(),original.schemaEpoch(),schema.digest(),original.generation(),Set.of(outer.data,second),original.routingPrefixBytes(),ranges);var manifest=new NativeSstImportManifest(UUID.randomUUID(),target.groupId(),target.rangeEpoch(),directory.domainId(),schema.digest(),target.lowerInclusive(),target.upperExclusive(),List.of(new NativeSstImportManifest.Column(outer.data,"data",false,List.of()),new NativeSstImportManifest.Column(second,"second",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS);var definition=new RangeImportDefinition(manifest.importId(),new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));var plan=new RatisNodePlan(env.plan.nodeId(),env.plan.nodeIncarnation(),directory,env.plan.catalogue(),Map.of(outer.data,"data",second,"second"),Set.of(),List.of(),List.of(definition),2);var base=env.settings();var images=new NativeRangeImage.Limits(base.images().maxRowBytes(),base.images().maxImageBytes(),1);var settings=new RatisNodeRuntime.Settings(images,base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports());var fake=new FakeServer();
+            var original=env.plan.domains().getFirst().directory();var target=original.ranges().getFirst();var ranges=new ArrayList<>(original.ranges());ranges.set(0,new RangeDescriptor(target.rangeId(),target.groupId(),target.rangeEpoch(),target.configurationVersion(),target.lowerInclusive(),target.upperExclusive(),RangeDescriptor.TopologyState.FENCED,target.replicas()));var directory=new RangeDirectory(original.clusterId(),original.databaseId(),original.domainId(),original.schemaEpoch(),schema.digest(),original.generation(),Set.of(outer.data,second),original.routingPrefixBytes(),ranges);var manifest=new NativeSstImportManifest(UUID.randomUUID(),target.groupId(),target.rangeEpoch(),directory.domainId(),schema.digest(),target.lowerInclusive(),target.upperExclusive(),List.of(new NativeSstImportManifest.Column(outer.data,"data",false,List.of()),new NativeSstImportManifest.Column(second,"second",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS);var definition=new RangeImportDefinition(manifest.importId(),new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));var plan=new RatisNodePlan(env.plan.nodeId(), env.plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data",second,"second"), Set.of())), env.plan.catalogue(), List.of(), List.of(definition), Map.of(), 2);var base=env.settings();var images=new NativeRangeImage.Limits(base.images().maxRowBytes(),base.images().maxImageBytes(),1);var settings=new RatisNodeRuntime.Settings(images,base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports());var fake=new FakeServer();
             try(var routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor range,UUID column,byte[] key){throw new AssertionError();}public CommandResult command(RangeDescriptor range,DistributedCommand command){throw new AssertionError();}})){
-                assertThrows(IOException.class,()->RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routed,env.scheduler,env.timer,()->20L,settings,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,schema,null));assertNull(fake.server,"Import image preflight must reject before Ratis server creation");
+                assertThrows(IOException.class,()->RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(routed.directory().domainId(), routed), env.scheduler, env.timer, ()->20L, settings, RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, List.of(schema), null));assertNull(fake.server,"Import image preflight must reject before Ratis server creation");
             }
             try(var pool=DistributedStoragePool.open(env.nodeRoot.resolve("native"),ConfigParser.parseDefault(),org.slf4j.LoggerFactory.getLogger(getClass()))){var field=DistributedStoragePool.class.getDeclaredField("ownershipHistory");field.setAccessible(true);for(var history:(List<?>)field.get(pool)){var owner=history.getClass().getDeclaredMethod("owner");owner.setAccessible(true);assertNotEquals(target.groupId(),((RangeOwnership.Owner)owner.invoke(history)).groupId(),"Rejected image geometry must not permanently reserve the imported native group");}}
         }
@@ -734,19 +733,19 @@ class RatisNodeRuntimeTest {
         var outer=new RatisSessionEpochsTest();
         var schema=new DistributedSchema(outer.cluster,outer.database,new UUID(6,1),1,0,List.of(new DistributedSchema.Column(71,outer.data,"data",it.cavallium.rockserver.core.common.ColumnSchema.of(it.unimi.dsi.fastutil.ints.IntArrayList.of(1),it.unimi.dsi.fastutil.objects.ObjectArrayList.of(),true),null)));
         try (var env=new Env(root,false,schema.digest())) {
-            var original=env.plan.directory(); var target=original.ranges().getFirst(); var ranges=new ArrayList<>(original.ranges());
+            var original=env.plan.domains().getFirst().directory(); var target=original.ranges().getFirst(); var ranges=new ArrayList<>(original.ranges());
             ranges.set(0,new RangeDescriptor(target.rangeId(),target.groupId(),target.rangeEpoch(),target.configurationVersion(),target.lowerInclusive(),target.upperExclusive(),RangeDescriptor.TopologyState.FENCED,target.replicas()));
             var directory=new RangeDirectory(original.clusterId(),original.databaseId(),original.domainId(),original.schemaEpoch(),original.schemaDigest(),original.generation(),original.columns(),original.routingPrefixBytes(),ranges);
             var manifest=new NativeSstImportManifest(UUID.randomUUID(),target.groupId(),target.rangeEpoch(),directory.domainId(),schema.digest(),target.lowerInclusive(),target.upperExclusive(),List.of(new NativeSstImportManifest.Column(outer.data,"data",false,List.of())),RatisRangeImportRecord.DISTRIBUTED_LIMITS);
             var definition=new RangeImportDefinition(manifest.importId(),new OperationId(UUID.randomUUID(),1,0),directory,List.of(manifest));
-            var plan=new RatisNodePlan(env.plan.nodeId(),env.plan.nodeIncarnation(),directory,env.plan.catalogue(),env.plan.columns(),env.plan.merges(),List.of(),List.of(definition),2);
+            var plan=new RatisNodePlan(env.plan.nodeId(), env.plan.nodeIncarnation(), List.of(new RatisNodePlan.Domain(directory, env.plan.columns(), env.plan.merges())), env.plan.catalogue(), List.of(), List.of(definition), Map.of(), 2);
             try (var routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor range,UUID column,byte[] key) { throw new AssertionError(); }
                 public CommandResult command(RangeDescriptor range,DistributedCommand command) { throw new AssertionError(); }
                 public void close() {}
             })) {
                 var fake=new FakeServer(); var field=RatisRangeStateMachine.class.getDeclaredField("store"); field.setAccessible(true);
-                var node=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,schema,null);
+                var node=RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(routed.directory().domainId(), routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, List.of(schema), null);
                 RatisReferencedFiles.Reader retained=null;
                 try {
                     var machine=fake.machines.get(RaftGroupId.valueOf(target.groupId())); var store=(ReplicatedRangeStore)field.get(machine);
@@ -759,7 +758,7 @@ class RatisNodeRuntimeTest {
                     retained.close(); retained=null; node.close(); assertEquals(RatisNodeRuntime.State.CLOSED,node.state());
                 } finally { if(retained!=null)retained.close(); node.close(); }
                 fake.storages.clear();
-                try (var recovered=RatisNodeRuntime.open(plan,env.nodeRoot,ConfigParser.parseDefault(),env.catalogue.epochs,routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.RECOVER,fake::create,schema,null)) {
+                try (var recovered=RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(routed.directory().domainId(), routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.RECOVER, fake::create, List.of(schema), null)) {
                     recovered.start(); var machine=fake.machines.get(RaftGroupId.valueOf(target.groupId())); var store=(ReplicatedRangeStore)field.get(machine);
                     assertTrue(store.importPending()); assertEquals(RangeOwnership.State.FENCED,store.ownership().state());
                     var files=(RatisReferencedFiles)machine.data(); try(var reader=files.pin(files.reference(1,1))) { assertArrayEquals(manifest.encode(),reader.read().toByteArray()); }
@@ -784,21 +783,21 @@ class RatisNodeRuntimeTest {
             });
             var client=(org.apache.ratis.client.RaftClient)Proxy.newProxyInstance(org.apache.ratis.client.RaftClient.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.RaftClient.class},(proxy,method,args) -> switch (method.getName()) { case "getGroupId" -> RaftGroupId.valueOf(c.groupId()); case "io" -> io; default -> throw new AssertionError(method); });
             var epochs=new RatisSessionEpochs(client,source.clusterId(),source.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
-            try (var node=RatisNodeRuntime.open(env.plan,env.nodeRoot,ConfigParser.parseDefault(),epochs,env.routed,env.scheduler,env.timer,() -> 20L,env.settings(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,source)) {
-                node.start(); var old=new SchemaChange.Definition(new UUID(90,1),env.outer.operation(100),env.plan.directory(),source,target); var newer=new SchemaChange.Definition(new UUID(90,2),env.outer.operation(101),env.plan.directory(),source,target);
+            try (var node=RatisNodeRuntime.open(env.plan, env.nodeRoot, ConfigParser.parseDefault(), epochs, Map.of(env.routed.directory().domainId(), env.routed), env.scheduler, env.timer, () -> 20L, env.settings(), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, fake::create, List.of(source))) {
+                node.start(); var old=new SchemaChange.Definition(new UUID(90,1),env.outer.operation(100),env.plan.domains().getFirst().directory(),source,target); var newer=new SchemaChange.Definition(new UUID(90,2),env.outer.operation(101),env.plan.domains().getFirst().directory(),source,target);
                 var aborted=new RatisSchemaAdministration.Head(SchemaChange.Status.begin(old.header()).abort(),71); var current=new RatisSchemaAdministration.Head(SchemaChange.Status.begin(newer.header()),71);
                 var catalogue=fake.machines.get(RaftGroupId.valueOf(c.groupId())); var storeField=RatisRangeStateMachine.class.getDeclaredField("store"); storeField.setAccessible(true); var store=(ReplicatedRangeStore)storeField.get(catalogue);
                 var committed=new DistributedCommand(c.groupId(),c.epoch(),c.schemaDigest(),env.outer.operation(102),List.of(
-                        new Mutation(Mutation.Kind.PUT,c.directoryColumn(),java.nio.ByteBuffer.allocate(16).putLong(source.domainId().getMostSignificantBits()).putLong(source.domainId().getLeastSignificantBits()).array(),RangeDirectoryCodec.encode(env.plan.directory())),
+                        new Mutation(Mutation.Kind.PUT,c.directoryColumn(),java.nio.ByteBuffer.allocate(16).putLong(source.domainId().getMostSignificantBits()).putLong(source.domainId().getLeastSignificantBits()).array(),RangeDirectoryCodec.encode(env.plan.domains().getFirst().directory())),
                         new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.definitionKey(old.digest()),old.encode()),
                         new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.definitionKey(newer.digest()),newer.encode()),
                         new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.outcomeKey(old.digest()),aborted.encode()),
                         new Mutation(Mutation.Kind.PUT,c.directoryColumn(),RatisSchemaAdministration.headKey(source.domainId()),current.encode())));
                 assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(store.apply(new ApplyPosition(1,1),committed)).status()); catalogue.notifyTermIndexUpdated(1,1);
-                var data=fake.machines.get(RaftGroupId.valueOf(env.plan.directory().ranges().getFirst().groupId())); var field=RatisRangeStateMachine.class.getDeclaredField("schemaAuthority"); field.setAccessible(true); var reader=(RatisRangeStateMachine.SchemaAuthorityReader)field.get(data);
+                var data=fake.machines.get(RaftGroupId.valueOf(env.plan.domains().getFirst().directory().ranges().getFirst().groupId())); var field=RatisRangeStateMachine.class.getDeclaredField("schemaAuthority"); field.setAccessible(true); var reader=(RatisRangeStateMachine.SchemaAuthorityReader)field.get(data);
                 var observed=reader.read(old.header(),null); assertEquals(SchemaChange.Phase.ABORTED,observed.head().status().phase()); assertArrayEquals(old.header().encode(),observed.head().status().header().encode());
                 assertEquals(2,reads.size()); assertFalse(reads.get(0).outcome()); assertTrue(reads.get(1).outcome()); for (var request:reads) { assertArrayEquals(old.header().encode(),request.expectedHeader().encode()); assertNull(request.admissionDigest()); }
-                var missing=new SchemaChange.Definition(new UUID(90,3),env.outer.operation(103),env.plan.directory(),source,target);
+                var missing=new SchemaChange.Definition(new UUID(90,3),env.outer.operation(103),env.plan.domains().getFirst().directory(),source,target);
                 var failure=assertThrows(IOException.class,() -> reader.read(missing.header(),null)); assertEquals(1,failure.getSuppressed().length);
             }
         }
@@ -860,7 +859,7 @@ class RatisNodeRuntimeTest {
             }
             var directory=new RangeDirectory(outer.cluster,outer.database,new UUID(6,1),1,schemaDigest,1,Set.of(outer.data),0,ranges);
             var remote=new ReplicaDescriptor(new UUID(8,1),new UUID(8,2),new UUID(8,8),"node8","127.0.0.1:4511",ReplicaDescriptor.Role.VOTER);
-            plan=new RatisNodePlan(local,incarnation,directory,new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,localCatalogue ? List.of(remote,new ReplicaDescriptor(local,incarnation,new UUID(9,8),"node9","127.0.0.1:4512",ReplicaDescriptor.Role.VOTER)) : List.of(remote)),Map.of(outer.data,"data"),merges,localCatalogue ? 3 : 2);
+            plan=new RatisNodePlan(local, incarnation, List.of(new RatisNodePlan.Domain(directory, Map.of(outer.data,"data"), merges)), new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,localCatalogue ? List.of(remote,new ReplicaDescriptor(local,incarnation,new UUID(9,8),"node9","127.0.0.1:4512",ReplicaDescriptor.Role.VOTER)) : List.of(remote)), List.of(), List.of(), Map.of(), localCatalogue ? 3 : 2);
             routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) { throw new AssertionError(); }
                 public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) { throw new AssertionError("Timer has not fired"); }
@@ -874,7 +873,7 @@ class RatisNodeRuntimeTest {
         }
         RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake) throws IOException { return open(startup,fake,null); }
         RatisNodeRuntime open(RatisNodeRuntime.Startup startup,FakeServer fake,RatisSnapshotFences snapshotHomes) throws IOException {
-            return RatisNodeRuntime.open(plan,nodeRoot,ConfigParser.parseDefault(),catalogue.epochs,routed,scheduler,timer,() -> 20L,settings(),startup,fake::create,null,snapshotHomes);
+            return RatisNodeRuntime.open(plan, nodeRoot, ConfigParser.parseDefault(), catalogue.epochs, Map.of(routed.directory().domainId(), routed), scheduler, timer, () -> 20L, settings(), startup, fake::create, null, snapshotHomes);
         }
         public void close() throws Exception {
             if (resourcesTransferred) catalogue.pool.close();
@@ -908,6 +907,7 @@ class RatisNodeRuntimeTest {
         RatisNodePlan plan; Path logs; Map<RaftGroupId,RatisRangeStateMachine> machines; RaftServer server;
         final Map<RaftGroupId,RaftStorage> storages=new LinkedHashMap<>();
         final Map<RaftGroupId,RaftGroup> actualGroups=new LinkedHashMap<>();
+        final Map<RaftGroupId,org.apache.ratis.server.raftlog.RaftLog> actualLogs=new LinkedHashMap<>();
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException {
             created=true; if (failCreate) throw new IOException("fixture build failure"); this.plan=plan; this.logs=logs; this.machines=machines;
             server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args) -> switch (method.getName()) {
@@ -950,8 +950,9 @@ class RatisNodeRuntimeTest {
             });
             return (RaftServer.Division)Proxy.newProxyInstance(RaftServer.Division.class.getClassLoader(),new Class<?>[]{RaftServer.Division.class},(proxy,method,args) -> switch (method.getName()) {
                 case "getRaftConf" -> configuration; case "getStateMachine" -> machines.get(id);
+                case "getRaftLog" -> actualLogs.computeIfAbsent(id,key->{var log=org.mockito.Mockito.mock(org.apache.ratis.server.raftlog.RaftLog.class);org.mockito.Mockito.when(log.getLastCommittedIndex()).thenAnswer(invocation->machines.get(key).getLastAppliedTermIndex().getIndex());return log;});
                 case "getInfo" -> Proxy.newProxyInstance(DivisionInfo.class.getClassLoader(),new Class<?>[]{DivisionInfo.class},(p,m,a) -> switch (m.getName()) {
-                    case "isLeader" -> leader; case "isLeaderReady" -> ready; case "getCurrentTerm" -> term;case "isAlive" -> true;case "getLifeCycleState" -> org.apache.ratis.util.LifeCycle.State.RUNNING; default -> throw new AssertionError(m);
+                    case "isLeader" -> leader; case "isLeaderReady" -> ready; case "getCurrentTerm" -> term;case "getLastAppliedIndex" -> machines.get(id).getLastAppliedTermIndex().getIndex();case "isAlive" -> true;case "getLifeCycleState" -> org.apache.ratis.util.LifeCycle.State.RUNNING; default -> throw new AssertionError(m);
                 }); default -> throw new AssertionError(method);
             });
         }

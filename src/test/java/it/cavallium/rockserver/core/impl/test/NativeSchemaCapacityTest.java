@@ -30,7 +30,7 @@ class NativeSchemaCapacityTest {
         store.enableLogicalSchema(store.installedSchema()==null ? original : store.installedSchema()); return store;
     }
     RocksDBLoader.LoadedDb loaded(DistributedStoragePool pool) throws Exception { var field=DistributedStoragePool.class.getDeclaredField("loaded"); field.setAccessible(true); return (RocksDBLoader.LoadedDb)field.get(pool); }
-    DistributedStoragePool qualified(Path path,DistributedSchema original,Map<UUID,String> plain) { return DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),original,Map.of(),plain); }
+    DistributedStoragePool qualified(Path path,DistributedSchema original,Map<UUID,String> plain) { return DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(original),Map.of(),plain); }
     SchemaChange.Definition change(DistributedSchema source,DistributedSchema target,UUID group) {
         var directory=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.digest(),0,source.columnIds(),source.routingPrefixBytes(),List.of(fixture.descriptor(group,null,null)));
         return new SchemaChange.Definition(UUID.randomUUID(),new OperationId(UUID.randomUUID(),1,0),directory,source,target);

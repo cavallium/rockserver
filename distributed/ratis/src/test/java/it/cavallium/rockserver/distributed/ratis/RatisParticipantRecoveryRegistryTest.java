@@ -14,7 +14,7 @@ class RatisParticipantRecoveryRegistryTest {
     final RatisSnapshotCoordinatorTest helper=new RatisSnapshotCoordinatorTest();
     RatisSnapshotCoordinatorTest.Fixture fixture(String name) throws Exception { helper.root=root; return helper.new Fixture(name); }
     RatisParticipantRecoveryRegistry registry(Path path,RatisSnapshotCoordinatorTest.Fixture f,boolean takeover,RatisParticipantRecoveryRegistry.Limits limits) throws Exception {
-        return new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,f.data,takeover,Set.of(f.left.f.groupId,f.right.f.groupId),limits);
+        return new RatisParticipantRecoveryRegistry(path, f.transactions.statuses, Map.of(f.data.directory().domainId(), f.data), group -> f.data.directory(), takeover, Set.of(f.left.f.groupId,f.right.f.groupId), limits);
     }
     @Test void helperCreatesDurableWorkerAndRestartRetainsCompletedProofWithoutPolling() throws Exception {
         Path path=Files.createDirectory(root.resolve("completed"));
@@ -96,7 +96,7 @@ class RatisParticipantRecoveryRegistryTest {
         Path path=Files.createDirectory(root.resolve("unpublished"));
         try (var f=fixture("unpublished")) {
             f.committedTransactionWithRightStillPrepared(); UUID other=f.anotherPreparedRight();
-            try (var registry=new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,f.data,false,Set.of(f.right.f.groupId),new RatisParticipantRecoveryRegistry.Limits(1,1,RatisDurableParticipantRecovery.MAX_BYTES))) {
+            try (var registry=new RatisParticipantRecoveryRegistry(path, f.transactions.statuses, Map.of(f.data.directory().domainId(), f.data), group -> f.data.directory(), false, Set.of(f.right.f.groupId), new RatisParticipantRecoveryRegistry.Limits(1,1,RatisDurableParticipantRecovery.MAX_BYTES))) {
                 f.transactions.wire.readFailure=new IOException("Qualified HOME read unavailable");
                 long before=f.writes(); assertThrows(IOException.class,() -> registry.step(f.right.f.groupId,f.data.preparedParticipant(f.right.f.groupId,helper.tx)));
                 f.transactions.wire.readFailure=null;

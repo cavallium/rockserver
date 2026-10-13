@@ -34,8 +34,8 @@ public final class RatisSchemaPublication implements AutoCloseable {
         this.allocationWitness=allocationWitness==null ? null : allocationWitness.clone(); this.reservations=Map.copyOf(reservations);
         this.columnWitnesses=freeze(columnWitnesses); this.apiWitnesses=freeze(apiWitnesses);
         this.journal=journal.toAbsolutePath(); this.schema=Objects.requireNonNull(schema); Objects.requireNonNull(plan);
-        schema.requireMatches(plan.directory()); var c=plan.catalogue();
-        catalogue=new RatisSchemaCatalogue(client,plan.directory().clusterId(),plan.directory().databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
+        schema.requireMatches(plan.directory(schema.domainId())); var c=plan.catalogue();
+        catalogue=new RatisSchemaCatalogue(client,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
         byte[] normalized=catalogue.prepare(new OperationId(new UUID(0,0),0,0),schema,this.allocationWitness,this.columnWitnesses,this.apiWitnesses,this.reservations).payloadDigest();
         try {
             intent=MessageDigest.getInstance("SHA-256").digest(ByteBuffer.allocate(48).put(normalized)

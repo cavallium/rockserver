@@ -102,7 +102,7 @@ class RatisNativeParticipantDiscoveryTest {
                     return f.node(route.groupId()).wire.transaction(route,bytes,fresh);
                 }
             };
-            try (var data=new RatisRoutedClient(f.directory,transport); var registry=new RatisParticipantRecoveryRegistry(path,f.transactions.statuses,data,false,Set.of(f.left.f.groupId,f.right.f.groupId),limits)) {
+            try (var data=new RatisRoutedClient(f.directory,transport); var registry=new RatisParticipantRecoveryRegistry(path, f.transactions.statuses, Map.of(data.directory().domainId(), data), group -> data.directory(), false, Set.of(f.left.f.groupId,f.right.f.groupId), limits)) {
                 var discovery=new RatisNativeParticipantDiscovery(registry,List.of(new RatisNativeParticipantDiscovery.Source(f.right.f.groupId,f.right.f.machine::preparedRecoveries)));
                 for (int n=0;n<12;n++) { long before=f.writes(); try { discovery.cycle(1); } catch (IOException expected) { assertEquals("Persisted worker DATA unavailable",expected.getMessage()); } assertTrue(f.writes()-before<=1); }
                 var home=f.transactions.statuses.read(helper.tx); assertFalse(home.fullyFinalized()); assertTrue(home.participants().stream().filter(p -> p.groupId().equals(f.right.f.groupId)).findFirst().orElseThrow().finalized());

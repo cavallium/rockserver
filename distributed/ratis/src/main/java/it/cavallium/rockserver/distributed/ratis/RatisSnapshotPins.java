@@ -274,6 +274,9 @@ final class RatisSnapshotPins implements AutoCloseable {
         synchronized (this) { for (var entry:entries.values()) { entry.permanent=true; entry.closed=true; } }
         cleanup();
     }
+    Limits limits(){return limits;}
+    Captured externalLive(ExternalReservation reservation)throws Exception {final Entry entry;synchronized(this){entry=external(reservation);}return retry(entry,entry.snapshotId,entry.ttl,entry.digest,entry.mode);}
+    synchronized boolean externalSettled(ExternalReservation reservation)throws IOException {var entry=reservation.entry;return !entry.busy && !entry.cleaning && entry.pin==null && entry.handle==null && entry.closed;}
     synchronized Stats stats() { return new Stats(entries.size(),pins,chargedBytes); }
     private Entry begin(SnapshotFenceStatus.Capture token) throws Exception {
         requireOwner(Objects.requireNonNull(token).ownerIncarnation()); expire();

@@ -29,7 +29,7 @@ class NativeOperatorInstallationTest {
         var operator=new DistributedSchema.Operator("append",1,AppendOperator.class.getName(),MessageDigest.getInstance("SHA-256").digest(jar),1,1,"append-contract",1);
         return new DistributedSchema(fixture.cluster,fixture.database,fixture.domain,1,0,List.of(new DistributedSchema.Column(column.apiId(),column.columnId(),column.name(),new it.cavallium.rockserver.core.common.ColumnSchema(column.schema().keys(),column.schema().variableTailKeys(),column.schema().hasValue(),operator.name(),operator.version(),operator.className()),operator)));
     }
-    DistributedStoragePool open(Path path,DistributedSchema original) { return DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),original,Map.of(),Map.of()); }
+    DistributedStoragePool open(Path path,DistributedSchema original) { return DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(original),Map.of(),Map.of()); }
     ReplicatedRangeStore range(DistributedStoragePool pool,DistributedSchema original) throws Exception {
         return pool.openRange(new RangeOwnership.Owner(fixture.group,1),new RangeOwnership.Interval(fixture.domain,Set.of(),null,null),original.digest(),Map.of(),Set.of());
     }
@@ -91,7 +91,7 @@ class NativeOperatorInstallationTest {
         try(var pool=open(path,source)) { range(pool,source).enableLogicalSchema(source); }
         var index=path.resolveSibling(path.getFileName()+".operators").resolve("bindings"); byte[] original=Files.readAllBytes(index);
         Files.delete(path.resolve("CURRENT"));
-        assertThrows(IllegalStateException.class,() -> DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),fixture.source(),Map.of(fixture.column,"new"),Map.of()));
+        assertThrows(IllegalStateException.class,() -> DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(fixture.source()),Map.of(fixture.column,"new"),Map.of()));
         assertArrayEquals(original,Files.readAllBytes(index));
         assertFalse(Files.exists(path.resolve("CURRENT")));
     }
@@ -147,14 +147,14 @@ class NativeOperatorInstallationTest {
     @Test void allPlainMetadataBindingsReopenAndChangedOriginalFingerprintFails() throws Exception {
         var source=empty(0); var path=root.resolve("metadata"); var names=new HashMap<UUID,String>();
         for(var name:List.of("catalogue","sessions","home-a","home-b")) names.put(UUID.randomUUID(),name);
-        try(var pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),source,Map.of(),names)) {
+        try(var pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(source),Map.of(),names)) {
             for(var entry:names.entrySet()) pool.openRange(new RangeOwnership.Owner(UUID.randomUUID(),1),new RangeOwnership.Interval(UUID.randomUUID(),Set.of(entry.getKey()),null,null),source.digest(),Map.of(entry.getKey(),entry.getValue()),Set.of()).applyNoop(new ApplyPosition(1,0));
             for(var name:names.values()) assertNull(loaded(pool).mergeOperators().get(name));
         }
-        try(var pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),source,Map.of(),names)) { assertTrue(loaded(pool).definitiveColumnFamilyOptionsMap().keySet().containsAll(names.values())); }
+        try(var pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(source),Map.of(),names)) { assertTrue(loaded(pool).definitiveColumnFamilyOptionsMap().keySet().containsAll(names.values())); }
         var changed=new HashMap<>(names); changed.put(names.keySet().iterator().next(),"different");
-        assertThrows(IllegalStateException.class,() -> DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),source,Map.of(),changed));
-        assertThrows(IllegalStateException.class,() -> DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),empty(1),Map.of(),names));
+        assertThrows(IllegalStateException.class,() -> DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(source),Map.of(),changed));
+        assertThrows(IllegalStateException.class,() -> DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(empty(1)),Map.of(),names));
     }
     @Test void foreignCacheWithSameOriginalBootstrapCannotAttachDifferentInstalledOperator() throws Exception {
         var source=empty(0); byte[] jar=DistributedMergeOperatorRegistryTest.classes(AppendOperator.class); var target=target(jar);
@@ -225,7 +225,7 @@ class NativeOperatorInstallationTest {
         byte[] jar=DistributedMergeOperatorRegistryTest.classes(AppendOperator.class); var schema=bucketTarget(jar); var operator=schema.column(fixture.column).operator(); Path path=root.resolve("bucket-bootstrap"),image=root.resolve("bucket-bootstrap.image");
         var names=Map.of(fixture.column,"bucket"); var limits=new NativeRangeImage.Limits(3*1024*1024,32*1024*1024,256);
         DistributedStoragePool.stageOperator(path,operator,new MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
-        for(int round=0;round<2;round++) try(var pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),schema,names,Map.of())) {
+        for(int round=0;round<2;round++) try(var pool=DistributedStoragePool.open(path,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(schema),names,Map.of())) {
             var store=pool.openRange(new RangeOwnership.Owner(fixture.group,1),new RangeOwnership.Interval(fixture.domain,schema.columnIds(),null,null),schema.digest(),names,Set.of(fixture.column)); store.enableLogicalSchema(schema);
             assertInstanceOf(DistributedBucketMergeOperator.class,loaded(pool).mergeOperators().get("bucket"));
             if(round==0) {
@@ -240,7 +240,7 @@ class NativeOperatorInstallationTest {
             if(round==1) NativeRangeImage.write(image,store,limits);
         }
         Path target=root.resolve("bucket-import"); DistributedStoragePool.stageOperator(target,operator,new MergeOperatorRegistry.DeterministicContract("append-contract",1,true),jar);
-        try(var pool=DistributedStoragePool.open(target,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),schema,names,Map.of())) {
+        try(var pool=DistributedStoragePool.open(target,ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()),List.of(schema),names,Map.of())) {
             var store=pool.openRange(new RangeOwnership.Owner(fixture.group,1),new RangeOwnership.Interval(fixture.domain,schema.columnIds(),null,null),schema.digest(),names,Set.of(fixture.column)); store.enableLogicalSchema(schema); store.fence(); store.installSnapshot(image,limits); store.activate();
             assertInstanceOf(DistributedBucketMergeOperator.class,loaded(pool).mergeOperators().get("bucket"));
             var merge=DistributedCommand.bucketData(fixture.group,1,schema.digest(),new OperationId(UUID.randomUUID(),1,0),List.of(Mutation.bucketMerge(fixture.column,new byte[]{7,0},List.of(new byte[]{2}),new byte[]{21},Mutation.ReturnMode.CURRENT)),List.of(),-1);

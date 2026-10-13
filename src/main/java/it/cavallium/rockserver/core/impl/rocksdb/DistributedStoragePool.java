@@ -404,8 +404,11 @@ public final class DistributedStoragePool implements AutoCloseable {
         boolean hasState=names.stream().anyMatch(name -> Arrays.equals(name,STATE_COLUMN.getBytes(StandardCharsets.US_ASCII)));
         if(!hasState) { if(artifacts.qualified()) throw new IOException("Qualified native pool lacks STATE"); return; }
         try(var refs=new RocksDBObjects(); var dbOptions=RocksDBLoader.readOnlyOptions(path,config)) {
+            dbOptions.setWalRecoveryMode(org.rocksdb.WALRecoveryMode.AbsoluteConsistency);
             var descriptors=new ArrayList<ColumnFamilyDescriptor>(); var nativeHandles=new ArrayList<ColumnFamilyHandle>();
-            for(var name:names) descriptors.add(new ColumnFamilyDescriptor(name,RocksDBLoader.readOnlyColumnOptions(new String(name,StandardCharsets.US_ASCII),path,config,refs)));
+            // Read-only subsets replay only the opened metadata families, avoiding USER MERGE callbacks.
+            // The complete on-disk listing still drives exact live-CF birth/operator coverage below.
+            for(var name:names){String physical=new String(name,StandardCharsets.US_ASCII);if(physical.equals("default") || physical.equals(STATE_COLUMN))descriptors.add(new ColumnFamilyDescriptor(name,RocksDBLoader.readOnlyColumnOptions(physical,path,config,refs)));}
             try(var db=org.rocksdb.RocksDB.openReadOnly(dbOptions,path.toString(),descriptors,nativeHandles)) {
                 try {
                     ColumnFamilyHandle state=null; for(var handle:nativeHandles) if(Arrays.equals(handle.getName(),STATE_COLUMN.getBytes(StandardCharsets.US_ASCII))) state=handle;
@@ -461,7 +464,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                     }
                     if(artifacts.qualified()) for(var name:names) {
                         String physical=new String(name,StandardCharsets.US_ASCII); if(RESERVED_COLUMNS.contains(physical)) continue;
-                        if(!artifacts.contains(physical) || births.values().stream().noneMatch(birth -> birth.name().equals(physical))) throw new IOException("Live native CF lacks exact birth binding");
+                        if(!artifacts.contains(physical) || births.values().stream().noneMatch(birth -> birth.name().equals(physical))) throw new IOException("Live native CF lacks exact birth binding: "+physical+" (artifact="+artifacts.contains(physical)+", birth="+births.values().stream().anyMatch(birth->birth.name().equals(physical))+")");
                     }
                 } finally { nativeHandles.forEach(ColumnFamilyHandle::close); }
             }
@@ -780,10 +783,11 @@ public final class DistributedStoragePool implements AutoCloseable {
         return open(persistentPath,config,logger,null,null,Map.of());
     }
     public static DistributedStoragePool open(Path persistentPath, DatabaseConfig config, Logger logger,
-            DistributedSchema bootstrap,Map<UUID,String> bootstrapPhysicalColumns,Map<UUID,String> nonDATAPlainBindings) {
+            java.util.Collection<DistributedSchema> bootstrapSchemas,Map<UUID,String> bootstrapPhysicalColumns,Map<UUID,String> nonDATAPlainBindings) {
         Objects.requireNonNull(persistentPath, "persistentPath");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(logger, "logger");
+        if(bootstrapSchemas!=null){bootstrapSchemas=List.copyOf(bootstrapSchemas);bootstrapPhysicalColumns=Map.copyOf(bootstrapPhysicalColumns);nonDATAPlainBindings=Map.copyOf(nonDATAPlainBindings);}
         final GlobalDatabaseConfig globalConfig;
         try {
             globalConfig = config.global();
@@ -798,14 +802,14 @@ public final class DistributedStoragePool implements AutoCloseable {
         final DistributedOperatorArtifacts artifacts;
         try {
             artifacts=new DistributedOperatorArtifacts(persistentPath);
-            if(bootstrap!=null && !Files.exists(persistentPath.resolve("CURRENT"))) {
+            if(bootstrapSchemas!=null && !Files.exists(persistentPath.resolve("CURRENT"))) {
                 if(Files.exists(persistentPath)) {
                     if(!Files.isDirectory(persistentPath)) throw new IOException("Native pool path is not a directory");
                     try(var entries=Files.newDirectoryStream(persistentPath)) { if(entries.iterator().hasNext()) throw new IOException("Unidentified nonempty native pool cannot authorize bootstrap"); }
                 }
-                artifacts.qualifyBootstrap(bootstrap,Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),true);
+                artifacts.qualifyBootstrap(List.copyOf(bootstrapSchemas),Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),true);
             }
-            if(bootstrap!=null && Files.exists(persistentPath.resolve("CURRENT"))) artifacts.qualifyBootstrap(bootstrap,Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),false);
+            if(bootstrapSchemas!=null && Files.exists(persistentPath.resolve("CURRENT"))) artifacts.qualifyBootstrap(List.copyOf(bootstrapSchemas),Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),false);
             if(Files.exists(persistentPath.resolve("CURRENT"))) preflightNativeBindings(persistentPath,config,artifacts);
         } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot qualify native operator bindings",failure); }
         RocksDBLoader.OperatorResolver resolver=artifacts.qualified() ? name -> RESERVED_COLUMNS.contains(name) ? null : artifacts.resolve(name) : null;
@@ -882,6 +886,16 @@ public final class DistributedStoragePool implements AutoCloseable {
     public PoolSnapshotAdmission.Stats snapshotAdmissionStats() {
         var guard = snapshotAdmission;
         return guard == null ? new PoolSnapshotAdmission.Stats(0, 0, Duration.ZERO) : guard.stats();
+    }
+
+    /** Fresh observation only; later capture admission remains authoritative under concurrent load. */
+    public record SnapshotPressure(long estimatedBytes,long freeBytes,int pinReservations) {}
+    public SnapshotPressure currentSnapshotPressure() throws IOException,RocksDBException {
+        nativeMutation.acquireUninterruptibly();try {
+            synchronized(admission){if(closing || closed)throw new IllegalStateException("Pool is closing");}
+            var guard=Objects.requireNonNull(snapshotAdmission,"Pressure probe requires configured pool snapshot admission");if(guard.releaseFailure()!=null)throw new IllegalStateException("Native snapshot release outcome unknown; pool retained",guard.releaseFailure());
+            var sample=sampleSnapshotPressure();long age=System.nanoTime()-sample.sampledAtNanos();if(sample.estimatedBytes()<0 || sample.minimumFreeBytes()<0 || age<0 || age>Duration.ofSeconds(5).toNanos())throw new IOException("Pool snapshot pressure metrics invalid or stale");return new SnapshotPressure(sample.estimatedBytes(),sample.minimumFreeBytes(),guard.stats().pins());
+        } finally {nativeMutation.release();}
     }
 
     private PoolSnapshotAdmission.Sample sampleSnapshotPressure() throws IOException, RocksDBException {

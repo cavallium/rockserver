@@ -115,15 +115,23 @@ final class DistributedOperatorArtifacts {
         for(var column:schema.columns()) if(column.operator()!=null) require(column.operator());
         encodedBindings(next,bootstrap); return Map.copyOf(next);
     }
-    void qualifyBootstrap(DistributedSchema schema,Map<UUID,String> names,Map<UUID,String> plain,boolean virgin) throws IOException {
-        byte[] identity=bootstrapIdentity(schema,names,plain);
+    private static List<DistributedSchema> canonicalBootstrap(Collection<DistributedSchema> schemas,Map<UUID,String> names,Map<UUID,String> plain) {
+        Objects.requireNonNull(schemas);Objects.requireNonNull(names);Objects.requireNonNull(plain);if(schemas.isEmpty() || schemas.size()>MAX_BINDINGS)throw new IllegalArgumentException("Invalid qualified bootstrap schema count");
+        var ordered=schemas.stream().map(Objects::requireNonNull).sorted(Comparator.comparing(schema->schema.domainId().toString())).toList();var first=ordered.getFirst();var domains=new HashSet<UUID>();var columns=new HashSet<UUID>();var apiIds=new HashSet<Long>();var logicalNames=new HashSet<String>();
+        for(var schema:ordered){if(!first.clusterId().equals(schema.clusterId()) || !first.databaseId().equals(schema.databaseId()) || !domains.add(schema.domainId()))throw new IllegalArgumentException("Bootstrap domain/database identity collision");for(var column:schema.columns())if(!columns.add(column.columnId()) || !apiIds.add(column.apiId()) || !logicalNames.add(column.name()))throw new IllegalArgumentException("Bootstrap column UUID/API ID/name collision");}
+        if(!columns.equals(names.keySet()) || !Collections.disjoint(columns,plain.keySet()) || columns.size()+(long)plain.size()>MAX_BINDINGS)throw new IllegalArgumentException("Aggregate bootstrap schema/CF coverage mismatch");var physical=new HashSet<String>();for(var mapping:List.of(names,plain))for(var name:mapping.values())if(name==null || name.isEmpty() || name.length()>4096 || name.indexOf('\0')>=0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name) || DistributedStoragePool.isReservedColumn(name) || !physical.add(name))throw new IllegalArgumentException("Aggregate bootstrap physical-name collision");
+        return ordered;
+    }
+    void qualifyBootstrap(Collection<DistributedSchema> schemas,Map<UUID,String> names,Map<UUID,String> plain,boolean virgin) throws IOException {
+        names=Map.copyOf(names);plain=Map.copyOf(plain);var ordered=canonicalBootstrap(List.copyOf(schemas),names,plain);byte[] identity=bootstrapIdentity(ordered,names,plain);
         if(!virgin) {
-            if(bootstrap==null || !Arrays.equals(bootstrap,identity)) throw new IOException("Original qualified bootstrap identity changed");
-            requireSchemaBindings(schema,names); for(var entry:plain.entrySet()) requireBirth(entry.getKey(),entry.getValue(),false);
-            return;
+            if(bootstrap==null || !Arrays.equals(bootstrap,identity))throw new IOException("Original qualified aggregate bootstrap identity changed");
+            for(var schema:ordered){var domainNames=new HashMap<UUID,String>();for(var column:schema.columnIds())domainNames.put(column,names.get(column));requireSchemaBindings(schema,domainNames);}for(var entry:plain.entrySet())requireBirth(entry.getKey(),entry.getValue(),false);return;
         }
-        if(bootstrap!=null && !Arrays.equals(bootstrap,identity)) throw new IOException("Original qualified bootstrap identity changed");
-        var next=proposed(schema,names,plain); bootstrap=identity; bindings=next; dirty=true; forceBindings();
+        if(bootstrap!=null && !Arrays.equals(bootstrap,identity))throw new IOException("Original qualified aggregate bootstrap identity changed");
+        var next=new HashMap<>(bindings);
+        for(var schema:ordered)for(var column:schema.columns())add(next,column.columnId(),names.get(column.columnId()),column.operator()==null ? null : descriptor(column.operator(),new DeterministicContract(column.operator().deterministicContract(),column.operator().deterministicContractVersion(),true)),bucketShape(column));for(var entry:plain.entrySet())add(next,entry.getKey(),entry.getValue(),null);
+        for(var schema:ordered)for(var column:schema.columns())if(column.operator()!=null)require(column.operator());encodedBindings(next,identity);bootstrap=identity;bindings=Map.copyOf(next);dirty=true;forceBindings();
     }
     void validate(DistributedSchema schema,Map<UUID,String> names) throws IOException { proposed(schema,names,Map.of()); }
     void validateCapacity(Collection<SchemaCapacityClaims.Claim> claims,Map<UUID,String> permanentPlainBirths) throws IOException {
@@ -215,8 +223,8 @@ final class DistributedOperatorArtifacts {
         }
         if(in.available()!=0) throw new IOException("Trailing qualified binding bytes"); return Map.copyOf(result);
     }
-    private static byte[] bootstrapIdentity(DistributedSchema schema,Map<UUID,String> names,Map<UUID,String> plain) throws IOException {
-        var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.write(schema.digest());
+    private static byte[] bootstrapIdentity(List<DistributedSchema> schemas,Map<UUID,String> names,Map<UUID,String> plain) throws IOException {
+        var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(schemas.size());for(var schema:schemas)out.write(schema.digest());
         for(var mapping:List.of(names,plain)) {
             out.writeInt(mapping.size()); for(var id:mapping.keySet().stream().sorted().toList()) { out.writeLong(id.getMostSignificantBits()); out.writeLong(id.getLeastSignificantBits()); out.writeUTF(mapping.get(id)); }
         }

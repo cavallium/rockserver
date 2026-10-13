@@ -41,24 +41,26 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
     volatile CountDownLatch entered,unblock;
     volatile boolean failFirst,unknownReply,alreadyInstalled,installed=true,owner=true,failRelease;
     RatisTopologySourceSnapshotFixture(Path root)throws Exception {this(root,false);}
-    RatisTopologySourceSnapshotFixture(Path root,boolean bootstrap)throws Exception {
+    RatisTopologySourceSnapshotFixture(Path root,boolean bootstrap)throws Exception {this(root,bootstrap,1);}
+    RatisTopologySourceSnapshotFixture(Path root,boolean bootstrap,int voters)throws Exception {
         this.root=root;Files.createDirectories(root.resolve("snapshots"));image=root.resolve("snapshots/native.image");
-        var parent=new RangeDescriptor(id(6),group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(donor));
-        var target=new RangeDescriptor(parent.rangeId(),group,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(donor,receiver));
+        var members=new ArrayList<ReplicaDescriptor>();members.add(donor);for(int n=1;n<voters;n++)members.add(new ReplicaDescriptor(id(60+n),id(70+n),id(80+n),"donor"+n,"127.0.0.1:"+(7010+n),ReplicaDescriptor.Role.VOTER));
+        var parent=new RangeDescriptor(id(6),group,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,members);var joined=new ArrayList<>(members);joined.add(receiver);
+        var target=new RangeDescriptor(parent.rangeId(),group,1,1,null,null,RangeDescriptor.TopologyState.ACTIVE,joined);
         var source=new RangeDirectory(id(1),id(2),id(3),0,schema.digest(),0,Set.of(column),1,List.of(parent));
         var next=new RangeDirectory(id(1),id(2),id(3),0,schema.digest(),1,Set.of(column),1,List.of(target));
         definition=new TopologyChange.Definition(id(30),source,next);
         pool=DistributedStoragePool.open(root.resolve("pool"),ConfigParser.parseDefault(),LoggerFactory.getLogger(getClass()));
         store=pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(id(3),Set.of(column),null,null),schema.digest(),Map.of(column,"data"),Set.of());store.enableLogicalSchema(schema);
         var peer=RaftPeer.newBuilder().setId(donor.peerId()).setAddress(donor.address()).build();
-        var configuration=RaftConfigurationProto.newBuilder().addPeers(peer.getRaftPeerProto()).build();if(bootstrap){store.initializeConfiguration(configuration.toByteArray());store.applyNoop(new ApplyPosition(1,0));}else store.applyNoop(new ApplyPosition(1,0),configuration.toByteArray());
+        var peers=members.stream().map(r->RaftPeer.newBuilder().setId(r.peerId()).setAddress(r.address()).build()).toList();var builder=RaftConfigurationProto.newBuilder();peers.forEach(p->builder.addPeers(p.getRaftPeerProto()));var configuration=builder.build();if(bootstrap){store.initializeConfiguration(configuration.toByteArray());store.applyNoop(new ApplyPosition(1,0));}else store.applyNoop(new ApplyPosition(1,0),configuration.toByteArray());
         byte[] value=new byte[2*1024*1024-512];for(int n=0;n<value.length;n++)value[n]=(byte)n;
         store.apply(new ApplyPosition(1,1),new DistributedCommand(group,1,schema.digest(),new OperationId(id(31),1,0),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{1},value))));
         when(division.getMemberId()).thenReturn(RaftGroupMemberId.valueOf(RaftPeerId.valueOf(donor.peerId()),RaftGroupId.valueOf(group)));when(division.getId()).thenReturn(RaftPeerId.valueOf(donor.peerId()));when(division.getInfo()).thenReturn(info);when(info.getCurrentTerm()).thenReturn(1L);
-        var conf=mock(RaftConfiguration.class);when(conf.getLogEntryIndex()).thenReturn(0L);when(conf.getCurrentPeers()).thenReturn(List.of(peer));when(conf.getPreviousPeers()).thenReturn(List.of());when(conf.getCurrentPeers(RaftPeerRole.FOLLOWER)).thenReturn(List.of(peer));when(conf.getCurrentPeers(RaftPeerRole.LISTENER)).thenReturn(List.of());when(conf.getPreviousPeers(RaftPeerRole.FOLLOWER)).thenReturn(List.of());when(conf.getPreviousPeers(RaftPeerRole.LISTENER)).thenReturn(List.of());when(division.getRaftConf()).thenReturn(conf);
+        var conf=mock(RaftConfiguration.class);when(conf.getLogEntryIndex()).thenReturn(0L);when(conf.getCurrentPeers()).thenReturn(peers);when(conf.getPreviousPeers()).thenReturn(List.of());when(conf.getCurrentPeers(RaftPeerRole.FOLLOWER)).thenReturn(peers);when(conf.getCurrentPeers(RaftPeerRole.LISTENER)).thenReturn(List.of());when(conf.getPreviousPeers(RaftPeerRole.FOLLOWER)).thenReturn(List.of());when(conf.getPreviousPeers(RaftPeerRole.LISTENER)).thenReturn(List.of());when(division.getRaftConf()).thenReturn(conf);
         var machine=mock(StateMachine.class);var storage=mock(StateMachineStorage.class);when(storage.getSnapshotDir()).thenReturn(image.getParent().toFile());when(machine.getStateMachineStorage()).thenReturn(storage);when(division.getStateMachine()).thenReturn(machine);
     }
-    RatisTopologySourceSnapshotRpc.Request request(int n){return new RatisTopologySourceSnapshotRpc.Request(id(n),definition.header(),id(40),receiver);}
+    RatisTopologySourceSnapshotRpc.Request request(int n){return new RatisTopologySourceSnapshotRpc.Request(id(n),definition.header(),id(40),receiver,RatisTopologySourceSnapshotRpc.Purpose.BOOTSTRAP);}
     @Override public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request)throws Exception {
         captures.incrementAndGet();var pin=store.capture();boolean adopted=false;
         try {

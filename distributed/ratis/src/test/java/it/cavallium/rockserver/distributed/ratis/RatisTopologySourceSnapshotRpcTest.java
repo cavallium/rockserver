@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
 import java.nio.ByteBuffer;
+import it.cavallium.rockserver.core.common.distributed.*;
 import java.nio.file.Path;
 import java.util.*;
 import org.junit.jupiter.api.Test;
@@ -23,11 +24,31 @@ class RatisTopologySourceSnapshotRpcTest {
     }
     @Test void malformedRequestLengthsAndKindsAreRejectedBeforeHostWork()throws Exception {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root)){
-            byte[] bytes=request(PREPARE,fixture.request(50));var oversized=bytes.clone();ByteBuffer.wrap(oversized).putInt(ScopedTransactionRpc.HEADER_BYTES+32,Integer.MAX_VALUE);
+            byte[] bytes=request(PREPARE,fixture.request(50));var oversized=bytes.clone();ByteBuffer.wrap(oversized).putInt(ScopedTransactionRpc.HEADER_BYTES+33,Integer.MAX_VALUE);
             assertThrows(IllegalArgumentException.class,()->request(oversized));assertThrows(IllegalArgumentException.class,()->request(Arrays.copyOf(bytes,bytes.length-1)));
             assertThrows(IllegalArgumentException.class,()->request(108,fixture.request(50)));assertEquals(0,fixture.captures.get());
         }
     }
+    @Test void registeredRecoveryHasExactCurrentPurposeAndReceiverBinding()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+            var initial=service.prepare(fixture.request(50));var source=fixture.definition.targetDirectory();var before=source.ranges().getFirst();var listener=fixture.receiver;
+            var voter=new ReplicaDescriptor(listener.nodeId(),listener.nodeIncarnation(),listener.replicaId(),listener.peerId(),listener.address(),ReplicaDescriptor.Role.VOTER);
+            var targetRange=new RangeDescriptor(before.rangeId(),before.groupId(),before.rangeEpoch(),before.configurationVersion()+1,before.lowerInclusive(),before.upperExclusive(),before.topologyState(),List.of(fixture.donor,voter));
+            var target=new RangeDirectory(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch(),source.schemaDigest(),source.generation()+1,source.columns(),source.routingPrefixBytes(),List.of(targetRange));
+            var definition=new TopologyChange.Definition(new UUID(94,1),source,target);
+            var recovery=new Request(new UUID(94,2),definition.header(),initial.request().catalogue(),voter,Purpose.RECOVERY);
+            assertEquals(Purpose.RECOVERY,request(request(PREPARE,recovery)).purpose());
+            assertArrayEquals(RatisTopologyLearnerRecoveryRpc.request(recovery),RatisTopologyLearnerRecoveryRpc.request(RatisTopologyLearnerRecoveryRpc.decode(RatisTopologyLearnerRecoveryRpc.request(recovery))));
+            var prepared=new Prepared(recovery,initial.image(),initial.schema(),initial.sourceOwner(),initial.sourceCfg(),initial.schemaRows());
+            var encoded=RatisTopologyLearnerRecoveryRpc.reply(prepared);assertArrayEquals(encoded,RatisTopologyLearnerRecoveryRpc.reply(RatisTopologyLearnerRecoveryRpc.reply(encoded,recovery)));
+            assertThrows(IllegalArgumentException.class,()->new Request(recovery.transferId(),definition.header(),recovery.catalogue(),voter,Purpose.BOOTSTRAP));
+            assertThrows(IllegalArgumentException.class,()->RatisTopologyLearnerRecoveryRpc.request(initial.request()));
+            assertThrows(IllegalArgumentException.class,()->RatisTopologyLearnerRecoveryRpc.reply(encoded,fixture.request(51)));
+            var unknown=request(PREPARE,recovery);unknown[ScopedTransactionRpc.HEADER_BYTES]=(byte)127;assertThrows(IllegalArgumentException.class,()->request(unknown));
+            assertEquals(1,fixture.captures.get());
+        }
+    }
+
     @Test void actualBootstrapSourceConfigurationRoundtripsWithoutInventingACommittedIndex()throws Exception {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root,true);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
             var request=fixture.request(50);var prepared=service.prepare(request);assertEquals(0,fixture.store.configuration().term());assertEquals(-1,fixture.store.configuration().index());

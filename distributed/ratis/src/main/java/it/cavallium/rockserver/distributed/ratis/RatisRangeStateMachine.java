@@ -575,6 +575,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     private RatisScopedTransactions scopedTransactions;
     private RatisSnapshotPins capturedSnapshots;
+    private RatisSnapshotCohortService snapshotCohorts;
+    void snapshotCohorts(RatisSnapshotCohortService service){requireDataRole();if(getLifeCycleState()!=LifeCycle.State.NEW || snapshotCohorts!=null)throw new IllegalStateException("Cohort owner fixed before initialization");snapshotCohorts=java.util.Objects.requireNonNull(service);}
     private RatisSnapshotPins.Limits snapshotPinLimits=RatisSnapshotPins.Limits.defaults();
     private java.util.function.LongSupplier snapshotPinClock=System::nanoTime;
     private boolean snapshotTtlConfigured;
@@ -738,6 +740,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }finally{if(!returned)pin.close();}
     }
     @FunctionalInterface interface LearnerInstaller {it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration install(RatisTopologyJoinAuthority.Request request)throws IOException;}
+    @FunctionalInterface interface LearnerRecoveryInstaller {RatisTopologySourceSnapshotRpc.Prepared prepare(RatisTopologySourceSnapshotRpc.Request request)throws Exception;}
+    private LearnerRecoveryInstaller learnerRecoveryInstaller;
+    void learnerRecoveryInstaller(LearnerRecoveryInstaller installer){if(getLifeCycleState()!=LifeCycle.State.NEW || learnerRecoveryInstaller!=null)throw new IllegalStateException("Learner recovery owner fixed before initialization");learnerRecoveryInstaller=java.util.Objects.requireNonNull(installer);}
     private LearnerInstaller learnerInstaller;
     void learnerInstaller(ProofQueryExecutor executor,LearnerInstaller installer){if(getLifeCycleState()!=LifeCycle.State.NEW || learnerInstaller!=null)throw new IllegalStateException("Learner bootstrap fixed before initialization");if(topologyImageQueries!=null && topologyImageQueries!=executor)throw new IllegalStateException("Conflicting topology image dispatcher");topologyImageQueries=java.util.Objects.requireNonNull(executor);learnerInstaller=java.util.Objects.requireNonNull(installer);}
     private ProofQueryExecutor topologyImageQueries;private RatisTopologySourceSnapshotService sourceSnapshots;
@@ -1467,6 +1472,21 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
     public void releaseSnapshotPin(SnapshotFenceStatus.Capture token) throws Exception { requireDataRole(); capturedSnapshots.release(token); }
     RatisSnapshotPins.Stats snapshotPinStats() { return capturedSnapshots.stats(); }
+    RatisSnapshotCohortService.Member snapshotCohortMember(SnapshotFence fence,boolean ready,RangeDescriptor descriptor,ReplicaDescriptor replica)throws Exception {
+        checkTransactionOwner();long generation=admissionGeneration.get();final long stamp;synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Cohort configuration apply pending");stamp=schemaConfigurationStamp;}
+        var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(replica.peerId()))throw new IOException("Cohort peer identity differs");var division=server.getDivision(getGroupId());var info=division.getInfo();long term=info.getCurrentTerm();
+        if(division.getStateMachine()!=this || getLifeCycleState()!=LifeCycle.State.RUNNING || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING || !info.isLeader() || !info.isLeaderReady() || replica.role()!=ReplicaDescriptor.Role.VOTER)throw new IOException("Cohort lacks actual running leader");
+        var view=store.metadataOutcomeState();var cfg=store.configuration();var cut=view.applied();var log=division.getRaftLog();
+        if(cut==null || cut.term()!=term || cfg==null || cfg.term()>cut.term() || cfg.index()>cut.index() || cfg.index()==cut.index() && cfg.term()!=cut.term() || info.getLastAppliedIndex()>cut.index() || log==null || log.getLastCommittedIndex()>cut.index())throw new IOException("Cohort native cut does not cover actual committed prefix");
+        requireSchemaMembership(descriptor,cfg.data());requireActualMembership(division.getRaftConf(),descriptor);
+        if(division.getRaftConf().getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && division.getRaftConf().getLogEntryIndex()<=0))throw new IOException("Cohort actual/native configuration positions differ");
+        if(fence!=null){var participant=fence.participant(view.groupId());if(participant.rangeEpoch()!=view.rangeEpoch() || !java.util.Arrays.equals(participant.schemaDigest(),view.schemaDigest()) || !fence.domainId().equals(view.domainId()))throw new IOException("Cohort fence changed native schema/epoch/domain");}
+        if(ready){if(fence==null || snapshotHomes==null)throw new IOException("Cohort HOME readiness is unavailable");var status=snapshotHomes.readRegistration(fence.fenceId()).status();var gate=store.snapshotGate(fence.fenceId());if(status==null || !status.fence().equals(fence) || status.phase()!=SnapshotFenceStatus.Phase.INSTALLING || !status.allReady() || gate==null || !gate.active() || !gate.fence().equals(fence) || !gate.installed().equals(status.progress(view.groupId()).ready()) || !snapshotGateReady(fence))throw new IOException("Cohort HOME/native gate is not exactly READY");}
+        checkTransactionOwner();synchronized(admissions){if(generation!=admissionGeneration.get() || stamp!=schemaConfigurationStamp || schemaConfigurationPending || division.getInfo().getCurrentTerm()!=term)throw new IOException("Cohort qualification changed owner/configuration");}
+        var owner=new RatisSnapshotOwner(view.groupId(),view.rangeEpoch(),view.schemaDigest(),transactionIncarnation,replica.peerId(),null);
+        return new RatisSnapshotCohortService.Member(store,capturedSnapshots,owner,replica,generation,term,OperatorUpload.sha256(cfg.data()),cut);
+    }
+
 
     private static final class Admission {
         final OperationId id;
@@ -1815,7 +1835,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         };
         var manifest=homeReservations ? NativeRangeImage.visitHomeRecoveryReservations(image,limits,homeCluster,homeDatabase,homeColumn,visitor) : NativeRangeImage.visit(image,limits,visitor);
         if(manifest.topologyOrigin()!=null && role!=RatisNodePlan.Role.DATA)throw new IOException("Non-DATA image contains topology provenance");
-        if(manifest.topologyOrigin()!=null || store.topologyBirth()!=null) {
+        var learner=store.topologyLearnerRegistration();
+        if(learner!=null){
+            var server=getServer().getNow(null);if(topologyStorage==null || topologyLocalReplica==null || !sameReplicaIdentity(learner.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(learner.receiver().peerId()))throw new IOException("Learner image target identity changed");
+            var permission=store.topologyLearnerImagePermission();boolean initial=manifest.position().equals(learner.imageCut()) && Arrays.equals(manifest.sha256(),learner.imageHash()) && cutConfiguration[0]!=null && Arrays.equals(cutConfiguration[0].data(),learner.sourceConfiguration());boolean authorized=permission!=null && manifest.position().equals(permission.imageCut()) && Arrays.equals(manifest.sha256(),permission.imageHash()) && cutConfiguration[0]!=null && Arrays.equals(cutConfiguration[0].data(),permission.sourceConfiguration());
+            if(!initial && !authorized)throw new IOException("Learner image lacks exact forced registration/recovery permission");
+            try{store.validateTopologyImageOrigin(manifest.topologyOrigin());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify admitted learner provenance",invalid);}
+        }else if(manifest.topologyOrigin()!=null || store.topologyBirth()!=null) {
             var birth=store.topologyBirth();
             if(birth==null || topologyStorage==null || topologyLocalReplica==null)throw new IOException("Topology snapshot target has no configured local birth");
             var seed=topologyStorage.topologySeed(birth.intentId());
@@ -4035,8 +4061,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
         try {
-            int kind=ScopedTransactionRpc.kind(request.getContent().toByteArray(),ScopedTransactionRpc.MAX_REQUEST_BYTES);
-            if (ScopedTransactionRpc.ownerSnapshot(kind) || ScopedTransactionRpc.ownerExport(kind)) {
+            int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);
+            if (ScopedTransactionRpc.ownerSnapshot(kind) || ScopedTransactionRpc.ownerExport(kind) || kind>=RatisSnapshotCohortRpc.CAPTURE && kind<=RatisSnapshotCohortRpc.CANCEL) {
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
@@ -4056,9 +4082,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> queryLinearizable(Message request) { return query(request,true); }
     private CompletableFuture<Message> query(Message request,boolean freshBarrier) {
         try {
-            int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),Math.max(RatisOperationRerouteAdmissionRpc.MAX_BYTES,RatisSourceOutcomeRpc.MAX_REQUEST_BYTES));
+            int kind=ScopedTransactionRpc.kind(request.getContent().asReadOnlyByteBuffer(),Math.max(RatisSnapshotCohortRpc.MAX_REQUEST_BYTES,Math.max(RatisOperationRerouteAdmissionRpc.MAX_BYTES,RatisSourceOutcomeRpc.MAX_REQUEST_BYTES)));
             byte[] encoded = request.getContent().toByteArray();
-            if (!ScopedTransactionRpc.ownerSnapshot(kind) && !ScopedTransactionRpc.ownerExport(kind)) requireHealthy();
+            if (!ScopedTransactionRpc.ownerSnapshot(kind) && !ScopedTransactionRpc.ownerExport(kind) && !(kind>=RatisSnapshotCohortRpc.OWNER && kind<=RatisSnapshotCohortRpc.CANCEL)) requireHealthy();
             if (ScopedTransactionRpc.schemaReplica(kind)) {
                 requireDataRole(); var replicas=schemaReplicas;
                 if (replicas==null) throw new IOException("Schema replica preparation is not configured");
@@ -4176,6 +4202,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                     prepareImportApply(RatisRangeImportRpc.proposal(owned),generation);return Message.valueOf(ByteString.copyFrom(owned));
                 });
             }
+            if(kind>=RatisSnapshotCohortRpc.OWNER && kind<=RatisSnapshotCohortRpc.CANCEL){requireDataRole();if(snapshotCohorts==null)throw new IOException("Cohort capture is not configured");if(kind==RatisSnapshotCohortRpc.OWNER && !freshBarrier)throw new IOException("Cohort owner qualification requires fresh barrier");var packet=ScopedTransactionRpc.parse(encoded,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);return snapshotCohorts.query(store.ownership().owner().groupId(),kind,packet.body()).thenApply(bytes->Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,bytes))));}
+            if(kind==RatisTopologyLearnerRecoveryRpc.KIND){if(topologyImageQueries==null || learnerRecoveryInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Learner recovery dispatcher unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerRecoveryRpc.MAX_REPLY_BYTES,false,owned->Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerRecoveryRpc.reply(learnerRecoveryInstaller.prepare(RatisTopologyLearnerRecoveryRpc.decode(owned))))));}
             if(kind==RatisTopologyLearnerJoinRpc.KIND){if(topologyImageQueries==null || learnerInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Node learner bootstrap unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerJoinRpc.MAX_REPLY_BYTES,false,owned->{var join=RatisTopologyLearnerJoinRpc.decode(owned);var registration=learnerInstaller.install(join);return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerJoinRpc.reply(join,registration)));});}
             if(RatisTopologySourceSnapshotRpc.kind(kind)){requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source snapshot dispatcher unavailable");var sourceRequest=RatisTopologySourceSnapshotRpc.request(encoded);if(!sourceRequest.header().parents().getFirst().groupId().equals(store.ownership().owner().groupId()))throw new IOException("Source snapshot crossed group");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologySourceSnapshotRpc.MAX_REPLY_BYTES,false,owned->{var input=RatisTopologySourceSnapshotRpc.request(owned);if(kind==RatisTopologySourceSnapshotRpc.RELEASE){sourceSnapshots.release(input);return Message.valueOf(ByteString.copyFrom(owned));}var prepared=kind==RatisTopologySourceSnapshotRpc.PREPARE?sourceSnapshots.prepare(input):sourceSnapshots.transfer(input);return Message.valueOf(ByteString.copyFrom(RatisTopologySourceSnapshotRpc.reply(kind,prepared)));});}
             if(RatisRelocationAdmissionRpc.kind(kind)){if(role!=RatisNodePlan.Role.DATA || proofQueries==null)throw new IOException("Relocation dispatcher unavailable");var record=RatisRelocationAdmissionRpc.decode(encoded);if(kind==RatisRelocationAdmissionRpc.CANCEL){synchronized(admissions){if(relocationHold!=null && relocationHold.record.equals(record) && !relocationHold.submitted)releaseRelocation(relocationHold);}return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFrom(encoded)));}if(!freshBarrier)throw new IOException("Relocation preparation needs fresh leader barrier");return proofQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{prepareRelocation(RatisRelocationAdmissionRpc.decode(owned));return Message.valueOf(ByteString.copyFrom(owned));});}
@@ -4580,7 +4608,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (!freshBarrier) throw new IOException("Snapshot owner discovery requires a fresh linearizable barrier");
                 end(input); checkTransactionOwner(); var server=getServer().getNow(null);
                 if (server==null) throw new IOException("Snapshot peer is not initialized");
-                try (var pin=store.capture()) { reply=new RatisSnapshotOwner(pin.groupId(),pin.rangeEpoch(),pin.schemaDigest(),snapshotCaptureOwner(),server.getId().toString()).encode(); }
+                var view=store.metadataOutcomeState();reply=new RatisSnapshotOwner(view.groupId(),view.rangeEpoch(),view.schemaDigest(),snapshotCaptureOwner(),server.getId().toString(),snapshotCohorts==null ? null : snapshotCohorts.capabilities(view.groupId())).encode();
             }
             case ScopedTransactionRpc.SNAPSHOT_READY -> {
                 if (!freshBarrier) throw new IOException("Snapshot readiness requires a fresh linearizable barrier");
