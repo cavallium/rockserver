@@ -67,19 +67,7 @@ final class StartupIoController implements AutoCloseable {
                                 .sample(entry.getValue(), now));
                     }
                     for (var entry : budgets.entrySet()) {
-                        Set<String> groups = storageWorkloads.get(entry.getKey());
-                        if (groups == null || groups.isEmpty()) groups = samples.keySet();
-                        boolean hasUsers = groups.stream().anyMatch(group -> !group.equals(":shared"));
-                        int mask = hasUsers ? 0 : StartupIoPolicy.UNKNOWN;
-                        for (var group : groups) {
-                            var decision = decisions.get(group);
-                            // The optional cross-column cohort has no scheduler demand.
-                            // Its valid idle window is neutral to the actual storage users.
-                            if (group.equals(":shared") && decision != null
-                                    && decision.pressureMask() == StartupIoPolicy.UNKNOWN && !decision.capturePressure()) continue;
-                            mask |= decision == null ? StartupIoPolicy.UNKNOWN | StartupIoPolicy.FOREGROUND
-                                    : decision.pressureMask();
-                        }
+                        int mask = storagePressureMask(storageWorkloads.getOrDefault(entry.getKey(), Set.of()), decisions);
                         entry.getValue().feedback(mask, epoch);
                         statistics.get(entry.getKey()).set(entry.getValue().snapshot());
                     }
@@ -110,6 +98,27 @@ final class StartupIoController implements AutoCloseable {
             executor.scheduleWithFixedDelay(poll, 0, 1, TimeUnit.SECONDS);
         }
         catch (RuntimeException | Error failure) { close(); throw failure; }
+    }
+
+    /** Idle owners are neutral peers; only measured healthy owners can qualify this DB's growth. */
+    static int storagePressureMask(Set<String> owners, Map<String, StartupIoPolicy.Decision> decisions) {
+        if (owners.isEmpty()) return StartupIoPolicy.UNKNOWN | StartupIoPolicy.FOREGROUND;
+        int mask = 0;
+        boolean qualifiedOwner = false, allNeutral = true;
+        for (String owner : owners) {
+            var decision = decisions.get(owner);
+            if (decision != null && decision.idleNeutral()) continue;
+            allNeutral = false;
+            if (decision == null) {
+                mask |= StartupIoPolicy.UNKNOWN | StartupIoPolicy.FOREGROUND;
+            } else {
+                mask |= decision.pressureMask();
+                qualifiedOwner |= !owner.equals(":shared") && decision.qualifiedHealthy();
+            }
+        }
+        if (mask != 0) return mask;
+        if (qualifiedOwner) return 0;
+        return allNeutral ? StartupIoPolicy.IDLE_NEUTRAL : StartupIoPolicy.UNKNOWN;
     }
 
     private void registerCacheGauges(String name, String role, Map<String, org.rocksdb.Cache> caches,

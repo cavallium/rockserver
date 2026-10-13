@@ -2,7 +2,7 @@ package it.cavallium.rockserver.core.impl;
 
 /** Single-publisher policy. Latencies describe completed native calls, not scheduler queue residence. */
 public final class StartupIoPolicy {
-    public static final int FOREGROUND = 1, URGENT = 2, UNKNOWN = 4;
+    public static final int FOREGROUND = 1, URGENT = 2, UNKNOWN = 4, IDLE_NEUTRAL = 8;
     public static final long MAX_SAMPLE_AGE_NANOS = 2_000_000_000L;
     public static final int CALIBRATION_WINDOWS = 3, RECOVERY_WINDOWS = 3;
     private final Baseline point = new Baseline(), bulk = new Baseline();
@@ -19,9 +19,10 @@ public final class StartupIoPolicy {
                               int workers, int active, int queued, long accepted, long terminal,
                               boolean urgentRecovery, StartupReadCompletions.Snapshot reads) {}
     /** A zero mask permits admission growth only when qualifiedHealthy is also true.
-     * Capture uses its own pressure flag so a valid idle group need not fabricate healthy feedback.
+     * idleNeutral identifies fresh, valid, conserved idle windows after recovery, never completed-but-uncalibrated work.
+     * Capture uses its own pressure flag so idle need not fabricate healthy feedback.
      */
-    public record Decision(int pressureMask, boolean capturePressure, boolean qualifiedHealthy) {}
+    public record Decision(int pressureMask, boolean capturePressure, boolean qualifiedHealthy, boolean idleNeutral) {}
 
     /** Fresh idle recovery windows permit capture again, without qualifying admission growth. */
     public Decision sample(InputSample input, long nowNanos) {
@@ -30,7 +31,7 @@ public final class StartupIoPolicy {
         if (previous != null && input.epoch() == previous.epoch()) {
             if (input.equals(previous) && fresh(input, nowNanos)) return last;
             recovering = true; goodWindows = 0;
-            return last = new Decision(UNKNOWN | FOREGROUND | (input.urgentRecovery() ? URGENT : 0), true, false);
+            return last = new Decision(UNKNOWN | FOREGROUND | (input.urgentRecovery() ? URGENT : 0), true, false, false);
         }
         boolean reset = previous != null && (input.epoch() < previous.epoch()
                 || input.sampledNanos() <= previous.sampledNanos()
@@ -44,7 +45,7 @@ public final class StartupIoPolicy {
         previous = input;
         if (input.urgentRecovery()) {
             recovering = true; goodWindows = 0;
-            return last = new Decision(URGENT | (valid ? 0 : UNKNOWN), true, false);
+            return last = new Decision(URGENT | (valid ? 0 : UNKNOWN), true, false, false);
         }
         if (!valid) { recovering = true; return last = unknown(true); }
         var reads = input.reads();
@@ -55,25 +56,25 @@ public final class StartupIoPolicy {
                 || point.slow(reads.point()) || bulk.slow(reads.bulk());
         if (pressure) {
             recovering = true; goodWindows = 0;
-            return last = new Decision(FOREGROUND, true, false);
+            return last = new Decision(FOREGROUND, true, false, false);
         }
         if (!completed) {
             if (!busy && recovering) {
                 if (++goodWindows >= RECOVERY_WINDOWS) { recovering = false; goodWindows = 0; }
-                return last = new Decision(UNKNOWN | (recovering ? FOREGROUND : 0), recovering, false);
+                return last = new Decision(UNKNOWN | (recovering ? FOREGROUND : 0), recovering, false, !recovering);
             }
             goodWindows = 0;
             return last = new Decision(UNKNOWN | (busy || recovering ? FOREGROUND : 0),
-                    busy || recovering, false);
+                    busy || recovering, false, !busy && !recovering);
         }
         point.observe(reads.point()); bulk.observe(reads.bulk());
         boolean calibrated = (reads.point().count() == 0 || point.ready())
                 && (reads.bulk().count() == 0 || bulk.ready());
         if (!calibrated) return last = unknown(busy || recovering);
         if (recovering && ++goodWindows < RECOVERY_WINDOWS)
-            return last = new Decision(UNKNOWN, true, false);
+            return last = new Decision(UNKNOWN, true, false, false);
         recovering = false; goodWindows = 0;
-        return last = new Decision(0, false, true);
+        return last = new Decision(0, false, true, false);
     }
 
     private boolean conserved(InputSample input) {
@@ -85,7 +86,7 @@ public final class StartupIoPolicy {
 
     private Decision unknown(boolean capturePressure) {
         goodWindows = 0;
-        return new Decision(UNKNOWN | (capturePressure ? FOREGROUND : 0), capturePressure, false);
+        return new Decision(UNKNOWN | (capturePressure ? FOREGROUND : 0), capturePressure, false, false);
     }
     private static boolean fresh(InputSample input, long now) {
         long age = now - input.sampledNanos();
