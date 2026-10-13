@@ -32,6 +32,10 @@ This section and the remaining gates at the end describe the current branch.
   MERGE after restore; cold target reopening retains that value and requalifies
   serving routes. An actual native 65-group restore also passed two import batches
   (64+1), data in the second batch and qualification of every serving owner.
+  Two additional actual native cases restore into separate declared pools: metadata
+  refusal occurs before native ownership and the exact frozen plan resumes after
+  capacity increases; an unknown synced catalogue write retains claims and locks,
+  then cold recovery completes without replacement authority or duplicate effects.
 - The owned backup factory passed actual native catalogue grant issuance and
   HOME/DATA bindings, whole-cohort capture/export, completion, resource drain and
   same-root reopening. Gone-owner cleanup relies on the exclusive established

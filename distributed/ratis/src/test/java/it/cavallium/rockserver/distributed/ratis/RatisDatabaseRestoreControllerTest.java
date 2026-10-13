@@ -31,20 +31,21 @@ class RatisDatabaseRestoreControllerTest {
         RatisNodeRuntimeTest.FakeServer fake=new RatisNodeRuntimeTest.FakeServer();
         final Map<UUID,RatisRoutedClient> routes=new HashMap<>();
         RatisNodeRuntime node;RatisNodePlan plan;RaftClient client;RatisDatabaseRestorePlanner.Plan frozen;
-        boolean loseGrant,loseInstall,recovering;
+        boolean loseGrant,loseInstall,recovering,separatePools;
+        RatisNodeRuntime.ResourceLimits runtimeResources=RatisNodeRuntime.ResourceLimits.defaults();
         Target()throws Exception{resources=new RatisNodeRuntimeTest.Env(root.resolve("resources"),false);}
         public RatisDatabaseRestoreController.Execution provision(RatisDatabaseRestorePlanner.Plan restored,Map<UUID,Path> operators)throws IOException{
             try {
                 if(node!=null){assertArrayEquals(frozen.encode(),restored.encode());return new RatisDatabaseRestoreController.Execution(plan,client,routes,this);} frozen=restored;var owner=restored.catalogue().replicas().getFirst();
                 var base=resources.settings();int columns=Math.max(2,restored.domains().stream().mapToInt(d->d.schema().columnIds().size()).max().orElse(0));var limits=new NativeRangeImage.Limits(base.images().maxRowBytes(),base.images().maxImageBytes(),columns);
-                UUID poolId=UUID.nameUUIDFromBytes((restored.archiveId()+":"+owner.nodeIncarnation()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                var pool=new RatisNativePoolSpec(poolId,("database="+ConfigPrinter.stringify(ConfigParser.parseDefault())).getBytes(java.nio.charset.StandardCharsets.UTF_8),RatisNodePlan.MAX_DATA_GROUPS+1,limits,base.retention(),base.exports().pins(),RatisSchemaReplicaService.Limits.defaults(),base.resources().pool(),256L<<30);
-                var placements=new HashMap<UUID,UUID>();for(var domain:restored.domains())placements.put(domain.schema().domainId(),poolId);
-                plan=restored.nodePlan(owner,Map.of(),List.of(pool),placements,Map.of(restored.catalogue().groupId(),poolId));
+                var pools=new ArrayList<RatisNativePoolSpec>();var placements=new HashMap<UUID,UUID>();
+                for(var domain:restored.domains()){UUID poolId=UUID.nameUUIDFromBytes((restored.archiveId()+":"+owner.nodeIncarnation()+(separatePools ? ":"+domain.schema().domainId() : "")).getBytes(java.nio.charset.StandardCharsets.UTF_8));placements.put(domain.schema().domainId(),poolId);if(pools.stream().noneMatch(p->p.id().equals(poolId)))pools.add(new RatisNativePoolSpec(poolId,("database="+ConfigPrinter.stringify(ConfigParser.parseDefault())).getBytes(java.nio.charset.StandardCharsets.UTF_8),RatisNodePlan.MAX_DATA_GROUPS+1,limits,base.retention(),base.exports().pins(),RatisSchemaReplicaService.Limits.defaults(),base.resources().pool(),256L<<30));}
+                plan=restored.nodePlan(owner,Map.of(),pools,placements,Map.of(restored.catalogue().groupId(),pools.getFirst().id()));
                 var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
-                    var wire=(Message)args[0];var machine=machine(plan.catalogue().groupId());
+                    try {var wire=(Message)args[0];var machine=machine(plan.catalogue().groupId());
                     if(method.getName().equals("sendReadOnly"))return reply(plan.catalogue().groupId(),machine.queryLinearizable(wire).get(10,TimeUnit.SECONDS).getContent().toByteArray());
                     if(!method.getName().equals("send"))throw new AssertionError(method);var result=append(plan.catalogue().groupId(),wire);var command=DistributedCommandCodec.decode(wire.getContent().toByteArray());if(loseGrant && command.mutations().stream().anyMatch(m->m.columnId().equals(plan.catalogue().sessionsColumn()) && m.value()!=null && SessionEpochLedger.decode(m.value()).grants().size()==1)){loseGrant=false;throw new IOException("Lost actual fresh grant reply");}return reply(plan.catalogue().groupId(),result);
+                    }catch(IOException failure){throw failure;}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new IOException("Controlled catalogue transport interrupted",failure);}catch(Exception failure){throw new IOException("Controlled catalogue transport failed",failure);}
                 });
                 client=(RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)->switch(method.getName()){case "getGroupId"->RaftGroupId.valueOf(plan.catalogue().groupId());case "io"->io;default->throw new AssertionError(method);});
                 for(var domain:restored.domains())routes.put(domain.schema().domainId(),new RatisRoutedClient(domain.initialDirectory(),new RatisRoutedClient.Transport(){
@@ -55,9 +56,8 @@ class RatisDatabaseRestoreControllerTest {
                 }));
                 var c=plan.catalogue();var epochs=new RatisSessionEpochs(client,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
                 Path targetRoot=Files.createDirectories(root.resolve("fresh-node"));SessionJournalFiles.force(targetRoot);SessionJournalFiles.force(root);
-                var descriptors=restored.domains().stream().flatMap(d->d.schema().columns().stream()).map(DistributedSchema.Column::operator).filter(Objects::nonNull).distinct().toList();
-                for(var descriptor:descriptors){Path asset=null;for(var candidate:operators.values())if(Arrays.equals(descriptor.artifactSha256(),RangeImportAdmission.sha256(Files.readAllBytes(candidate)))){asset=candidate;break;}if(asset==null)throw new IOException("Missing independently archived operator");if(!recovering)DistributedStoragePool.stageOperator(pool.nativePath(targetRoot),descriptor,new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract(descriptor.deterministicContract(),descriptor.deterministicContractVersion(),true),Files.readAllBytes(asset));}
-                var settings=new RatisNodeRuntime.Settings(limits,base.retention(),base.clockPeriod(),base.propagationVisits(),Math.max(base.maxPropagationRanges(),restored.domains().stream().mapToInt(d->d.initialDirectory().ranges().size()).sum()),base.shutdownTimeout(),base.exports(),RatisNodeRuntime.ResourceLimits.defaults());
+                for(var domain:restored.domains())for(var descriptor:domain.schema().columns().stream().map(DistributedSchema.Column::operator).filter(Objects::nonNull).distinct().toList()){Path asset=null;for(var candidate:operators.values())if(Arrays.equals(descriptor.artifactSha256(),RangeImportAdmission.sha256(Files.readAllBytes(candidate)))){asset=candidate;break;}if(asset==null)throw new IOException("Missing independently archived operator");if(!recovering)DistributedStoragePool.stageOperator(plan.pools().get(placements.get(domain.schema().domainId())).nativePath(targetRoot),descriptor,new it.cavallium.rockserver.core.impl.MergeOperatorRegistry.DeterministicContract(descriptor.deterministicContract(),descriptor.deterministicContractVersion(),true),Files.readAllBytes(asset));}
+                var settings=new RatisNodeRuntime.Settings(limits,base.retention(),base.clockPeriod(),base.propagationVisits(),Math.max(base.maxPropagationRanges(),restored.domains().stream().mapToInt(d->d.initialDirectory().ranges().size()).sum()),base.shutdownTimeout(),base.exports(),runtimeResources);
                 node=RatisNodeRuntime.open(plan,targetRoot,ConfigParser.parseDefault(),epochs,routes,resources.scheduler,resources.timer,()->restored.authority().logicalTimeMillis(),settings,recovering ? RatisNodeRuntime.Startup.RECOVER : RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,fake::create,restored.domains().stream().map(RatisDatabaseRestorePlanner.Domain::schema).toList());
                 // Replace only network transport lookup with actual local native owner replies at the same admission boundary.
                 RatisTopologySeedRuntimeTest.field(machine(c.groupId()),"importPublicationAdmission",(RatisRangeStateMachine.ImportPublicationAdmission)command->{
@@ -65,8 +65,9 @@ class RatisDatabaseRestoreControllerTest {
                     if(RatisRangeImportCatalogue.isPublication(command))RatisRangeImportCatalogue.admitPublication(command,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn(),read,this::receipt);
                     else RatisRangeImportCatalogue.admitCompletion(command,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn(),read,this::activation);
                 });node.start();return new RatisDatabaseRestoreController.Execution(plan,client,routes,this);
-            }catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException(failure);}
+            }catch(IOException failure){discardFailedRoutes(failure);throw failure;}catch(Exception failure){discardFailedRoutes(failure);throw new IOException(failure);}
         }
+        private void discardFailedRoutes(Throwable failure){if(node==null){for(var route:routes.values())try{route.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}routes.clear();}}
         RatisRangeStateMachine machine(UUID group){return fake.machines.get(RaftGroupId.valueOf(group));}
         ReplicatedRangeStore store(UUID group)throws Exception{return RatisTopologySeedRuntimeTest.field(machine(group),"store",ReplicatedRangeStore.class);}
         RaftClientReply reply(UUID group,byte[] bytes){return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(group)).setCallId(1).setSuccess(true).setMessage(message(bytes)).build();}
