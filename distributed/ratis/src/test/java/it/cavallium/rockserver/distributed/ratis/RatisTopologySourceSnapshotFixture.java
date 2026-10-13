@@ -25,6 +25,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** Real native image and released chunk producer; only the division/receiver transport is controlled. */
 final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSnapshotService.Host,AutoCloseable {
+    final it.cavallium.rockserver.core.impl.RWScheduler scheduler=it.cavallium.rockserver.core.impl.RWScheduler.forTesting(4,1,1,16,16,"source-snapshot-fixture");
+    final RatisNodeResourceBudget graph=new RatisNodeResourceBudget(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L<<20,16),new RatisNodeResourceBudget.Lane(256L<<20,16)),Map.of(new UUID(0,100),new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L<<20,16),new RatisNodeResourceBudget.Lane(256L<<20,16))));
+    RatisTopologySourceSnapshotService.ResourceAdmission transferAdmission(){return bytes->{var lease=graph.reserve(new UUID(0,100),RatisNodeResourceBudget.Kind.ORDINARY,bytes,1);return lease::close;};}
     static UUID id(int n){return new UUID(0,n);}
     final UUID group=id(4),column=id(5);
     final ReplicaDescriptor donor=new ReplicaDescriptor(id(10),id(11),id(12),"donor","127.0.0.1:7001",ReplicaDescriptor.Role.VOTER);
@@ -64,16 +67,16 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request){return null;}
     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws IOException{throw new IOException("Fixture has no source publication abandonment authority");}
     @Override public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request)throws Exception {
-        captures.incrementAndGet();var pin=store.capture();boolean adopted=false;
+        captures.incrementAndGet();var captureImage=request.transferId().equals(id(50))?image:image.resolveSibling("native-"+request.transferId()+".image");var pin=store.capture();boolean adopted=false;
         try {
-            var manifest=NativeRangeImage.write(image,pin,pin.interval(),new NativeRangeImage.Limits(4*1024*1024,8*1024*1024,16));
+            var manifest=NativeRangeImage.write(captureImage,pin,pin.interval(),new NativeRangeImage.Limits(4*1024*1024,8*1024*1024,16));
             var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,manifest,schema,donor,pin.configuration(),Map.of());
-            var snapshot=new SingleFileSnapshotInfo(new FileInfo(image,MD5Hash.newInstance(MessageDigest.getInstance("MD5").digest(Files.readAllBytes(image)))),manifest.position().term(),manifest.position().index());
+            var snapshot=new SingleFileSnapshotInfo(new FileInfo(captureImage,MD5Hash.newInstance(MessageDigest.getInstance("MD5").digest(Files.readAllBytes(captureImage)))),manifest.position().term(),manifest.position().index());
             var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,snapshot,()->{pin.close();pinCloses.incrementAndGet();});adopted=true;return lease;
         }finally{if(!adopted)pin.close();}
     }
     @Override public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception {if(!owner)throw new IOException("controlled owner loss");assertEquals(store.applied(),lease.prepared().image().position());assertEquals(store.configuration().term(),lease.prepared().sourceCfg().term());assertEquals(store.configuration().index(),lease.prepared().sourceCfg().index());assertArrayEquals(store.configuration().data(),lease.prepared().sourceCfg().data());}
-    @Override public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception {proofs.incrementAndGet();if(!installed || !Arrays.equals(MessageDigest.getInstance("SHA-256").digest(received.toByteArray()),lease.prepared().image().sha256()))throw new IOException("Receiver has not qualified the exact installed image");}
+    @Override public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception {proofs.incrementAndGet();assertEquals(0,imageDescriptors(),"File reader closes before native qualification");if(!installed || !Arrays.equals(MessageDigest.getInstance("SHA-256").digest(received.toByteArray()),lease.prepared().image().sha256()))throw new IOException("Receiver has not qualified the exact installed image");}
     @Override public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request){releaseLookups.incrementAndGet();return false;}
     @Override public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{durableReleases.incrementAndGet();if(failRelease)throw new IOException("controlled durable release failure");}
     @Override public InstallSnapshotReplyProto send(InstallSnapshotRequestProto request)throws IOException {
@@ -83,6 +86,6 @@ final class RatisTopologySourceSnapshotFixture implements RatisTopologySourceSna
         var chunk=request.getSnapshotChunk();if(!alreadyInstalled){if(chunk.getRequestIndex()==0)received.reset();for(var file:chunk.getFileChunksList())file.getData().writeTo(received);}
         var rpc=request.getServerRequest();return InstallSnapshotReplyProto.newBuilder().setServerReply(RaftRpcReplyProto.newBuilder().setRequestorId(rpc.getRequestorId()).setReplyId(rpc.getReplyId()).setRaftGroupId(rpc.getRaftGroupId()).setSuccess(true)).setTerm(request.getLeaderTerm()).setRequestIndex(chunk.getRequestIndex()).setResult(alreadyInstalled?InstallSnapshotResult.ALREADY_INSTALLED:InstallSnapshotResult.SUCCESS).build();
     }
-    int imageDescriptors()throws IOException {var proc=Path.of("/proc/self/fd");if(!Files.isDirectory(proc))return 0;try(var paths=Files.list(proc)){int count=0;for(var path:paths.toList())try{if(Files.readSymbolicLink(path).equals(image))count++;}catch(IOException ignored){}return count;}}
-    @Override public void close()throws Exception{pool.close();}
+    int imageDescriptors()throws IOException {var proc=Path.of("/proc/self/fd");if(!Files.isDirectory(proc))return 0;try(var paths=Files.list(proc)){int count=0;for(var path:paths.toList())try{if(image.getParent().equals(Files.readSymbolicLink(path).getParent()))count++;}catch(IOException ignored){}return count;}}
+    @Override public void close()throws Exception{scheduler.dispose();pool.close();}
 }

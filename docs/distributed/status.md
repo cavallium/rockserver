@@ -1088,6 +1088,18 @@ transfer, native import, joint/stable membership and five-voter replacement. Its
 controlled workflow passed in the focused integration selection above; direct
 node-dispatcher acceptance for semantic 109 remains pending.
 
+Source TRANSFER now runs through the existing cooperative BATCH scheduler,
+sending one 1 MiB chunk per quantum under storage pressure. Ordinary node/pool
+charges, the original image pin and the reader remain owned until actual work
+drains, including observer cancellation and retryable reader-close failure.
+TRANSFER does not occupy the single topology proof worker; another settled
+RELEASE can progress while a send is blocked. Runtime drains these owners before
+closing source artifacts and native pools. Independent review found no scoped
+blocker; 65 distinct controlled cases passed in
+`/tmp/rockserver-cooperative-source-transfer-fixture-final.log` and
+`/tmp/rockserver-cooperative-source-transfer-runtime-regression.log`. These results
+do not establish network throughput or independent quorum acceptance.
+
 Native learners retain their original image evidence and can install an explicitly
 authorized later image without rolling back a completed tail. Receiver preparation
 can create its own operator/CF generation for a newer-schema

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed.ratis;
 
+import java.util.concurrent.TimeUnit;
 import java.nio.ByteBuffer;
 import it.cavallium.rockserver.core.common.distributed.*;
 import java.nio.file.Path;
@@ -12,7 +13,7 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 class RatisTopologySourceSnapshotRpcTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     @Test void canonicalImageMetadataRoundtripNeverCarriesAHostPath()throws Exception {
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
             var request=fixture.request(50);var prepared=service.prepare(request);
             for(int kind:new int[]{PREPARE,TRANSFER,RELEASE})assertArrayEquals(request(kind,request),request(kind,request(request(kind,request))));
             var bytes=reply(PREPARE,prepared);var decoded=reply(bytes,PREPARE,request);
@@ -30,7 +31,7 @@ class RatisTopologySourceSnapshotRpcTest {
         }
     }
     @Test void registeredRecoveryHasExactCurrentPurposeAndReceiverBinding()throws Exception {
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
             var initial=service.prepare(fixture.request(50));var source=fixture.definition.targetDirectory();var before=source.ranges().getFirst();var listener=fixture.receiver;
             var voter=new ReplicaDescriptor(listener.nodeId(),listener.nodeIncarnation(),listener.replicaId(),listener.peerId(),listener.address(),ReplicaDescriptor.Role.VOTER);
             var targetRange=new RangeDescriptor(before.rangeId(),before.groupId(),before.rangeEpoch(),before.configurationVersion()+1,before.lowerInclusive(),before.upperExclusive(),before.topologyState(),List.of(fixture.donor,voter));
@@ -50,10 +51,10 @@ class RatisTopologySourceSnapshotRpcTest {
     }
 
     @Test void actualBootstrapSourceConfigurationRoundtripsWithoutInventingACommittedIndex()throws Exception {
-        try(var fixture=new RatisTopologySourceSnapshotFixture(root,true);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024))){
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root,true);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
             var request=fixture.request(50);var prepared=service.prepare(request);assertEquals(0,fixture.store.configuration().term());assertEquals(-1,fixture.store.configuration().index());
             var decoded=reply(reply(PREPARE,prepared),PREPARE,request);assertEquals(0,decoded.sourceCfg().term());assertEquals(-1,decoded.sourceCfg().index());assertTrue(decoded.image().position().term()>0);
-            assertSame(prepared,service.transfer(request));service.release(request);
+            assertSame(prepared,service.transfer(request).get(5,TimeUnit.SECONDS));service.release(request);
             byte[] data=prepared.sourceCfg().data();
             for(var config:List.of(new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(0,0,data),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(2,0,data),new it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.Configuration(1,2,data)))
                 assertThrows(IllegalArgumentException.class,()->new Prepared(request,prepared.image(),prepared.schema(),prepared.sourceOwner(),config,prepared.schemaRows()));
