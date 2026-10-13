@@ -119,7 +119,7 @@ class RatisNegativeParticipantProtocolTest {
     }
     // Locate the single participant's documented current state-kind byte without relying on random body matches.
     private int preparationKind(byte[] body) throws IOException {
-        var b=ByteBuffer.wrap(body); b.position(68); skipBlob(b); SessionWindowJournal.route(b); b.position(b.position()+32+24); skipBlob(b);
+        var b=ByteBuffer.wrap(body); b.position(68); skipBlob(b); skipBlob(b); SessionWindowJournal.route(b); b.position(b.position()+32+24); skipBlob(b);
         assertEquals(1,b.get()); skipBlob(b); SessionWindowJournal.route(b); assertEquals(0,b.get()); skipBlob(b); b.get(); skipBlob(b); assertEquals(1,b.getInt());
         SessionWindowJournal.route(b); skipBlob(b); b.position(b.position()+64); int slots=b.getInt(); b.position(b.position()+4*slots);
         int captured=b.get()&255; assertTrue(captured<=1); if (captured==1) b.position(b.position()+16);

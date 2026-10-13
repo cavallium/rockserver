@@ -150,7 +150,7 @@ class RatisHomeJournalRetirementTest {
             var progress=f.journal.snapshot().participant(f.data.f.groupId); assertNotNull(progress.retirementProof()); assertNull(progress.outcome());
             var expected=f.journal.result().encode(); assertEquals(CommandResult.Status.CONFLICT,f.journal.result().status());
             var acknowledged=f.journal.snapshot().observedHome(); var consumed=acknowledged.consume();
-            f.journal.queueHome(f.home.statuses.prepare(RatisTransactionRecoveryTest.next(f.journal.snapshot().lastHome()),acknowledged,consumed)); f.journal.executeHome();
+            f.journal.queueRecovery(consumed); f.journal.executeHome();
             var route=f.plan.registration().descriptor();
             f.home.wire.command(route,DistributedCommand.advanceSessionEpochFloor(f.home.f.groupId,1,new byte[32],new OperationId(f.home.f.admin,2,0),2));
             f.home.statuses.retire(new HomeRetirement(f.home.statuses.identity(f.plan.initial(),route),consumed,List.of(progress.retirementProof())));

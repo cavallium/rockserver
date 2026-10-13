@@ -35,7 +35,7 @@ class RatisNodeMultiDomainTest {
             secondClient=new RatisRoutedClient(secondDirectory,new RatisRoutedClient.Transport(){public byte[] read(RangeDescriptor r,UUID c,byte[] k){throw new AssertionError("Unexpected read");}public CommandResult command(RangeDescriptor r,DistributedCommand c){throw new AssertionError("Timer has not fired");}});
             clients=Map.of(first.domainId(),env.routed,domain,secondClient);schemas=List.of(second,first);
         }
-        RatisNodeRuntime.Settings settings(){var s=env.settings();return new RatisNodeRuntime.Settings(s.images(),s.retention(),s.clockPeriod(),s.propagationVisits(),3,s.shutdownTimeout(),s.exports());}
+        RatisNodeRuntime.Settings settings(){var s=env.settings();return new RatisNodeRuntime.Settings(s.images(),s.retention(),s.clockPeriod(),s.propagationVisits(),3,s.shutdownTimeout(),s.exports(),RatisNodeRuntime.ResourceLimits.defaults());}
         RatisNodeManifest manifest(){return new RatisNodeManifest(schemas,plan,settings(),3,3);}
         ReplicatedRangeStore store(RatisNodeRuntimeTest.FakeServer server,UUID group)throws Exception{return RatisTopologySeedRuntimeTest.field(server.machines.get(RaftGroupId.valueOf(group)),"store",ReplicatedRangeStore.class);}
         void publish()throws Exception {

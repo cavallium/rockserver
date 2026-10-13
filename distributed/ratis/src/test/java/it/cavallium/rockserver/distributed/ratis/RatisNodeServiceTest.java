@@ -23,7 +23,7 @@ class RatisNodeServiceTest {
     }
     RatisNodeManifest manifest(RatisNodeRuntimeTest.Env env,DistributedSchema schema) {
         return new RatisNodeManifest(List.of(schema),env.plan,new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,16*1024*1024,1),
-                RatisRangeStateMachine.RetentionLimits.defaults(),Duration.ofSeconds(1),1,2,Duration.ofMillis(100),RatisNodeRuntime.ExportResources.defaults()),3,3);
+                RatisRangeStateMachine.RetentionLimits.defaults(),Duration.ofSeconds(1),1,2,Duration.ofMillis(100),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults()),3,3);
     }
     RatisNodeService.Resources resources(RatisNodeRuntimeTest.Env env) {
         env.resourcesTransferred=true; return new RatisNodeService.Resources(env.catalogue.client,Map.of(env.routed.directory().domainId(),env.routed),env.scheduler,env.timer);

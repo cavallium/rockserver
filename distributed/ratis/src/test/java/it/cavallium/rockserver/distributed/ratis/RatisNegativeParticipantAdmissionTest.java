@@ -33,7 +33,7 @@ class RatisNegativeParticipantAdmissionTest {
                 assertNotNull(data.wire.propose(RatisParticipantRecord.encode(raw,true)).getException(),"Encoding cannot invent negative authority");
                 try (var negative=data.f.machine.prepareParticipant(pin,business,helper.control(0),home.statuses,registration.transactionId())) {
                     assertTrue(negative.negative()); assertTrue(RatisParticipantRecord.isNegative(negative.bytes())); assertEquals(0,data.f.machine.proposalFootprintStats().candidates());
-                    assertEquals(16134,data.f.machine.reservedParticipantBytes());
+                    assertEquals(it.cavallium.rockserver.core.impl.rocksdb.ReplicatedRangeStore.FINALIZATION_RESERVATION,data.f.machine.reservedParticipantBytes());
                     var operation=data.routed.prepareParticipant(negative.preparation(),negative.negative());
                     assertEquals(ParticipantVote.negative(),data.routed.executeParticipant(operation)); assertNull(data.f.store.preparedParticipant(registration.transactionId()));
                     assertFalse(gate.drained()); data.f.machine.cancelTransaction(old); assertTrue(gate.drained());

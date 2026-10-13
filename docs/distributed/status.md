@@ -19,13 +19,19 @@ This section and the remaining gates at the end describe the current branch.
 - The aggregate common connection routes the complete database domain roster,
   retains schema generations and uses durable point/bulk grants and rotating
   transaction allocations. The actual native two-domain factory workflow passed
-  point/bulk writes, owned close and exact cold reopen. Launcher ownership tests
+  point/bulk writes, owned close and exact cold reopen. Factory-issued allocation
+  also passed real snapshot capture, a cross-column transaction spanning two DATA
+  groups, pin cleanup, connection-journal reopening without replacement grants and
+  a subsequent captured abort; native stores stayed live in that reopen check.
+  Launcher ownership tests
   passed with controlled listeners; real gRPC/Thrift listeners were not started.
 - The fresh-cluster restore controller passed actual native import, catalogue
   activation, logical qualification and restoration without the original source
   directories, including sparse interleaved API IDs and an empty column across
-  two domains. Operator assets, larger batched restores and cold target reopen
-  still need composed acceptance.
+  two domains. Independently archived operator bytes are staged and execute a real
+  MERGE after restore; cold target reopening retains that value and requalifies
+  serving routes. An actual native 65-group restore also passed two import batches
+  (64+1), data in the second batch and qualification of every serving owner.
 - The owned backup factory passed actual native catalogue grant issuance and
   HOME/DATA bindings, whole-cohort capture/export, completion, resource drain and
   same-root reopening. Gone-owner cleanup relies on the exclusive established
@@ -37,6 +43,12 @@ This section and the remaining gates at the end describe the current branch.
 - Native pool pressure now feeds shared background admission. Fresh native
   sampling, stale/failing signal handling, actual sampler drain and node lifecycle
   checks passed. This does not establish a complete node/pool resource envelope.
+- Current node settings and the manifest directly declare ordinary and protected
+  node/pool byte and owner limits. Proposal input and scoped-handle leases pass
+  controlled accounting checks; manifest validation and HOME lifecycle fixtures
+  pass together. Native staging and participant preparation now retain shared
+  charges through actual drain, including cancellation. Other custom-record holds
+  and retained buffers still need charges; the full volatile envelope remains open.
 - Replica-local maintenance passed actual flush/SST preview/execution/property
   checks, stale target rejection, cancellation with retained JNI ownership and
   node-owned shutdown. It requires explicit policy and process/pool/CF identities.
@@ -1050,7 +1062,7 @@ Relocation currently admits preparation/abort while its source stays writable.
 
 ## Remaining architecture gates
 
-- Complete composed operator/batched/cold restore acceptance and public backend
+- Complete restore quota/unknown-force acceptance, plus public backend
   capture/transaction/export workflows.
 - Declare and implement explicit pool/SLO placement. Reserve configured durable
   replica ceilings before opening/voting, reconstruct retained claims on recovery,

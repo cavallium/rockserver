@@ -17,6 +17,16 @@ import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class RatisNodeManifestTest {
+    @Test void currentManifestPreservesExplicitNodeAndPoolAdmissionLimits() {
+        var original=manifest(false);var base=original.settings();
+        var node=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,64),new RatisNodeResourceBudget.Lane(64L*1024*1024,32));
+        var pool=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(32L*1024*1024,16),new RatisNodeResourceBudget.Lane(16L*1024*1024,8));
+        var limits=new RatisNodeRuntime.ResourceLimits(node,pool);
+        var settings=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports(),limits);
+        var value=new RatisNodeManifest(original.schemas().values(),original.plan(),settings,original.readThreads(),original.writeThreads());
+        var cold=RatisNodeManifest.decode(RatisNodeManifest.encode(value));assertEquals(limits,cold.settings().resources());
+        assertArrayEquals(RatisNodeManifest.encode(value),RatisNodeManifest.encode(cold));
+    }
     @Test void explicitStreamEndpointSurvivesManifestAndConfiguresFiniteProviderWithoutStartingIt() throws Exception {
         var original=manifest(false); var base=original.plan(); var addresses=Map.of("local","127.0.0.1:9101");
         var plan=new RatisNodePlan(base.nodeId(),base.nodeIncarnation(),List.of(new RatisNodePlan.Domain(base.directory(DOMAIN),base.columns(),base.merges())),base.catalogue(),base.homes(),base.imports(),addresses,base.localGroups().size());
@@ -55,7 +65,7 @@ class RatisNodeManifestTest {
     }
     private static RatisNodeRuntime.Settings settings() {
         return new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4*1024*1024,8L*1024*1024,2),
-                new RatisRangeStateMachine.RetentionLimits(4096,16L*1024*1024,16,64*1024),Duration.ofMillis(1500),3,17,Duration.ofSeconds(25),RatisNodeRuntime.ExportResources.defaults());
+                new RatisRangeStateMachine.RetentionLimits(4096,16L*1024*1024,16,64*1024),Duration.ofMillis(1500),3,17,Duration.ofSeconds(25),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults());
     }
     private static RatisNodeManifest manifest(boolean bucket) {
         var schema=schema(bucket,false); var bindings=new LinkedHashMap<UUID,String>(); bindings.put(B,"physical-beta"); bindings.put(A,"physical-alpha");
@@ -85,7 +95,7 @@ class RatisNodeManifestTest {
                 new RatisExportSourceRegistry.Budgets(8,64,16L*1024*1024,16L*1024*1024,8L*1024*1024,1),
                 new RatisExportSourceService.IoLimits(8192,1024*1024,1024*1024));
         var configured=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),
-                base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),resources);
+                base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),resources,RatisNodeRuntime.ResourceLimits.defaults());
         var manifest=new RatisNodeManifest(List.of(original.schema(DOMAIN)),original.plan(),configured,3,5);
         byte[] encoded=RatisNodeManifest.encode(manifest); var reopened=RatisNodeManifest.decode(encoded);
         assertEquals(resources,reopened.settings().exports()); assertArrayEquals(encoded,RatisNodeManifest.encode(reopened));
@@ -149,7 +159,7 @@ class RatisNodeManifestTest {
         }
         var oneColumn=new DistributedSchema(CLUSTER,DATABASE,DOMAIN,1,0,List.of(plain.schema(DOMAIN).columns().getFirst()));
         var oneImageColumn=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,1),settings().retention(),
-                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
+                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults());
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(List.of(oneColumn),plan(oneColumn,Map.of(A,"a"),Set.of()),oneImageColumn,3,3),
                 "A local catalogue needs two snapshot columns even when data has one");
         var threeColumns=new ArrayList<>(plain.schema(DOMAIN).columns()); UUID third=new UUID(9,9);
@@ -159,9 +169,9 @@ class RatisNodeManifestTest {
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(List.of(wider),widerPlan,settings(),3,3),
                 "A local data group needs its complete logical-column snapshot scope");
         var threeImageColumns=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,3),settings().retention(),
-                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
+                settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults());
         assertDoesNotThrow(() -> new RatisNodeManifest(List.of(wider),widerPlan,threeImageColumns,3,3));
-        var tooLong=new RatisNodeRuntime.Settings(settings().images(),settings().retention(),Duration.ofSeconds(Long.MAX_VALUE),1,1,Duration.ofSeconds(1),RatisNodeRuntime.ExportResources.defaults());
+        var tooLong=new RatisNodeRuntime.Settings(settings().images(),settings().retention(),Duration.ofSeconds(Long.MAX_VALUE),1,1,Duration.ofSeconds(1),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults());
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(List.of(plain.schema(DOMAIN)),plain.plan(),tooLong,3,3));
         assertThrows(IllegalArgumentException.class,() -> new RatisNodeManifest(List.of(plain.schema(DOMAIN)),plan(plain.schema(DOMAIN),Map.of(A,"a".repeat(4097),B,"b"),Set.of()),settings(),3,3));
     }
@@ -181,9 +191,20 @@ class RatisNodeManifestTest {
         byte[] reversed=valid.clone(); System.arraycopy(valid,bindings,reversed,second,16); System.arraycopy(valid,second,reversed,bindings,16);
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(reversed));
         byte[] groupBudget=valid.clone(); ByteBuffer.wrap(groupBudget).putInt(tail+64,1); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(groupBudget));
-        int settingsStart=valid.length-200;
+        int settingsStart=valid.length-248;
         for (int offset:new int[] {settingsStart+72,settingsStart+76}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }
         byte[] duration=valid.clone(); ByteBuffer.wrap(duration).putLong(settingsStart+48,0); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(duration));
+        for (int lane=0;lane<4;lane++) {
+            int offset=settingsStart+200+12*lane;
+            for (long bytes:new long[]{0,RatisNodeResourceBudget.MAX_BYTES+1}) {
+                byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putLong(offset,bytes);
+                assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad));
+            }
+            for (int owners:new int[]{0,RatisNodeResourceBudget.MAX_OWNERS+1}) {
+                byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset+8,owners);
+                assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad));
+            }
+        }
     }
 
     @Test void syntheticCatalogueMustRemainExactlyTheDeclaredMetadataRange() {
@@ -252,7 +273,7 @@ class RatisNodeManifestTest {
         var data=new RangeDirectory(CLUSTER,DATABASE,DOMAIN,1,original.schema(DOMAIN).digest(),5,original.schema(DOMAIN).columnIds(),0,List.of(range));
         var catalogue=new RatisNodePlan.Catalogue(CATALOGUE,2,new byte[32],DIRECTORY_COLUMN,SESSIONS_COLUMN,List.of(remote));
         var plan=new RatisNodePlan(NODE,INCARNATION,List.of(new RatisNodePlan.Domain(data,base.columns(),Set.of())),catalogue,List.of(home(RatisNodePlan.Role.TRANSACTION_HOME,1)),List.of(),Map.of(),1);
-        var one=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,1),settings().retention(),settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults());
+        var one=new RatisNodeRuntime.Settings(new NativeRangeImage.Limits(4096,1024*1024,1),settings().retention(),settings().clockPeriod(),settings().propagationVisits(),settings().maxPropagationRanges(),settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults());
         var manifest=new RatisNodeManifest(List.of(original.schema(DOMAIN)),plan,one,3,5); assertEquals(1,manifest.plan().localGroups().size());
         assertEquals(RatisNodePlan.Role.TRANSACTION_HOME,plan.role(plan.localGroups().getFirst().getGroupId().getUuid()));
         assertArrayEquals(RatisNodeManifest.encode(manifest),RatisNodeManifest.encode(RatisNodeManifest.decode(RatisNodeManifest.encode(manifest))));

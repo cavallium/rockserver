@@ -97,4 +97,72 @@ class RatisDatabaseBackendFactoryTest {
             assertEquals(4,fixture.transportCloses.get());for(var data:fixture.nativeDomains.data)assertArrayEquals(new byte[]{(byte)(10+fixture.nativeDomains.data.indexOf(data))},data.routed.read(data.column,new byte[]{7}));
         }
     }
+    /** Connection journals reopen while native stores stay live. The extra domain shares the actual capture fixture catalogue. */
+    final class TransactionFixture implements AutoCloseable {
+        final RatisAtomicClientTest.Fixture nativeState;
+        final UUID extraDomain=new UUID(910,1),extraColumn=new UUID(910,2),extraGroup=new UUID(910,3);
+        final DistributedSchema extraSchema;final RangeDirectory extraDirectory;final RatisRoutedClient extra;
+        final RatisNodePlan plan;final Map<UUID,RatisRoutedClient> routes;
+        final AtomicInteger ownedHomeCloses=new AtomicInteger();
+        TransactionFixture()throws Exception {
+            nativeState=new RatisAtomicClientTest.Fixture(root.resolve("transaction-native"),true);
+            var f=nativeState;var replica=f.directory.ranges().getFirst().replicas().getFirst();
+            extraSchema=new DistributedSchema(f.outer.cluster,f.outer.database,extraDomain,1,1,List.of(new DistributedSchema.Column(75,extraColumn,"second-domain",f.schema.column(71).schema(),null)));
+            var descriptor=new RangeDescriptor(new UUID(910,4),extraGroup,1,0,null,null,RangeDescriptor.TopologyState.ACTIVE,List.of(replica));
+            extraDirectory=new RangeDirectory(f.outer.cluster,f.outer.database,extraDomain,1,extraSchema.digest(),0,Set.of(extraColumn),1,List.of(descriptor));
+            var store=f.catalogue.pool.openRange(new RangeOwnership.Owner(extraGroup,1),new RangeOwnership.Interval(extraDomain,Set.of(extraColumn),null,null),extraSchema.digest(),Map.of(extraColumn,"second-domain"),Set.of());store.enableLogicalSchema(extraSchema);f.stores.put(extraGroup,store);
+            var raft=RaftGroup.valueOf(RaftGroupId.valueOf(extraGroup),RaftPeer.newBuilder().setId(replica.peerId()).build());f.raftGroups.put(extraGroup,raft);
+            var machine=RatisRangeStateMachine.withSessions(store,raft,RatisSessionBindingTest.Fixture.LIMITS,command->{},f.catalogue.epochs,extraDirectory,RatisRangeStateMachine.RetentionLimits.defaults(),()->new RatisRangeStateMachine.Leadership(1,true));
+            machine.transactionHomes(f.homes);machine.snapshotHomes(f.snapshots);f.machines.put(extraGroup,machine);
+            var storage=RaftStorage.newBuilder().setDirectory(root.resolve("extra-raft").toFile()).setOption(RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).setLogCorruptionPolicy(org.apache.ratis.server.RaftServerConfigKeys.Log.CorruptionPolicy.EXCEPTION).build();storage.initialize();f.storages.add(storage);
+            var server=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args)->switch(method.getName()){case "getId"->raft.getPeers().iterator().next().getId();case "toString"->"backend-extra-native";default->throw new AssertionError(method);});machine.initialize(server,raft.getGroupId(),storage);machine.notifyTermIndexUpdated(1,0);
+            extra=new RatisRoutedClient(extraDirectory,f.transport());routes=Map.of(f.schema.domainId(),f.data,extraDomain,extra);
+            var bindings=new LinkedHashMap<UUID,String>();for(var column:f.schema.columns())bindings.put(column.columnId(),column.name());
+            var catalogue=new RatisNodePlan.Catalogue(f.outer.catalogue,1,new byte[32],f.outer.directoryColumn,f.outer.sessions,List.of(replica));
+            plan=new RatisNodePlan(replica.nodeId(),replica.nodeIncarnation(),List.of(new RatisNodePlan.Domain(f.directory,bindings,Set.of()),new RatisNodePlan.Domain(extraDirectory,Map.of(extraColumn,"second-domain"),Set.of())),catalogue,List.of(new RatisNodePlan.Home(RatisNodePlan.Role.SNAPSHOT_HOME,f.snapshotDirectory,f.snapshotColumn,"snapshot-home"),new RatisNodePlan.Home(RatisNodePlan.Role.TRANSACTION_HOME,f.homeDirectory,f.homeColumn,"atomic-home")),List.of(),Map.of(),6);
+            var domains=List.of(new RatisDatabaseBootstrap.Domain(plan,f.data,f.schema,null),new RatisDatabaseBootstrap.Domain(plan,extra,extraSchema,RatisColumnAllocation.counterValue(74)));
+            try(var bootstrap=new RatisDatabaseBootstrap(Files.createDirectory(root.resolve("transaction-bootstrap")),domains,f.catalogue.client,f.catalogue.epochs.read(),null,10,()->10L,3)){
+                for(int n=0;n<40 && bootstrap.progress().phase()!=RatisDatabaseBootstrap.Phase.READY;n++)bootstrap.step(3);assertEquals(RatisDatabaseBootstrap.Phase.READY,bootstrap.progress().phase());
+            }
+        }
+        RatisDatabaseBackendFactory factory(Path owned)throws IOException {
+            var f=nativeState;
+            return new RatisDatabaseBackendFactory(owned,plan,f.catalogue.client,routes,f.scheduler,(name,shape)->name.equals("second-domain")?extraDomain:f.schema.domainId(),(name,type,hash,revision)->{throw new IOException("No operator upload in this fixture");},RatisDatabaseBackendFactory.Policy.defaults(),directory->new RatisRoutedClient(directory,new RatisRoutedClient.Transport(){
+                final RatisRoutedClient.Transport transport=f.transport();
+                public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{return transport.command(route,command);}
+                public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{return transport.read(route,column,key);}
+                public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh)throws IOException{return transport.transaction(route,request,fresh);}
+                public byte[] participant(RangeDescriptor route,byte[] record)throws IOException{return transport.participant(route,record);}
+                public byte[] snapshot(RangeDescriptor route,ReplicaDescriptor owner,byte[] request)throws IOException{return transport.snapshot(route,owner,request);}
+                public RangeStateView stateView(RangeDescriptor route)throws IOException{return transport.stateView(route);}
+                public void close(){ownedHomeCloses.incrementAndGet();}
+            }),new RatisSchemaReplicaClient(1));
+        }
+        public void close()throws Exception{extra.close();nativeState.close();}
+    }
+    @Test void factoryIssuedAllocationCapturesAndCommitsAcrossColumnsThenReopensWithoutNewGrants()throws Exception {
+        try(var fixture=new TransactionFixture()){
+            var f=fixture.nativeState;Path owned=root.resolve("transaction-backend");long issued;
+            long firstTransaction;
+            try(var factory=fixture.factory(owned)){
+                var connection=factory.open(URI.create("ratis://controlled/transaction-backend"));var api=connection.getAsyncApi(RequestContext.batch());assertEquals(5,await(api.getAllColumnDefinitionsAsync()).size());
+                await(api.putAsync(0,75,key(7),value(55),RequestType.none()));int captures=f.captureRequests.get();
+                firstTransaction=await(api.openTransactionAsync(Duration.ofSeconds(30)));assertEquals(captures,f.captureRequests.get());
+                await(api.putAsync(firstTransaction,71,key(2),value(41),RequestType.none()));await(api.putAsync(firstTransaction,72,key(200),value(42),RequestType.none()));
+                assertTrue(f.captureRequests.get()>captures,"Factory durable allocation must drive real native captures");assertArrayEquals(new byte[]{41},await(api.getAsync(firstTransaction,71,key(2),RequestType.<Buf>current())).toByteArray());
+                assertNull(await(api.getAsync(0,71,key(2),RequestType.<Buf>current())),"Uncommitted cross-column state remains private");
+                assertTrue(await(api.closeTransactionAsync(firstTransaction,true)));assertArrayEquals(new byte[]{41},await(api.getAsync(0,71,key(2),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{42},await(api.getAsync(0,72,key(200),RequestType.<Buf>current())).toByteArray());
+                for(var store:f.stores.values())assertEquals(0,store.activeSnapshotPins());issued=f.catalogue.epochs.read().nextEpoch();
+                var retainedGrant=f.catalogue.epochs.read().grants().stream().filter(grant->!grant.sessionId().equals(f.session)).toList();assertEquals(6,retainedGrant.size());assertEquals(6,retainedGrant.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
+            }
+            assertEquals(2,fixture.ownedHomeCloses.get());int captures=f.captureRequests.get();
+            try(var factory=fixture.factory(owned)){
+                var connection=factory.open(URI.create("ratis://controlled/transaction-backend"));var api=connection.getAsyncApi(RequestContext.batch());assertArrayEquals(new byte[]{41},await(api.getAsync(0,71,key(2),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{42},await(api.getAsync(0,72,key(200),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{55},await(api.getAsync(0,75,key(7),RequestType.<Buf>current())).toByteArray());
+                long transaction=await(api.openTransactionAsync(Duration.ofSeconds(30)));assertTrue(transaction>firstTransaction);await(api.putAsync(transaction,71,key(3),value(99),RequestType.none()));assertTrue(f.captureRequests.get()>captures);assertTrue(await(api.closeTransactionAsync(transaction,false)));assertNull(await(api.getAsync(0,71,key(3),RequestType.<Buf>current())));assertEquals(issued,f.catalogue.epochs.read().nextEpoch());
+                for(var store:f.stores.values())assertEquals(0,store.activeSnapshotPins());
+            }
+            assertEquals(4,fixture.ownedHomeCloses.get());assertArrayEquals(new byte[]{41},f.get(71,key(2)));assertArrayEquals(new byte[]{55},fixture.extra.read(fixture.extraColumn,new byte[]{7}));
+        }
+    }
+
 }

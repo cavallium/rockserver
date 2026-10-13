@@ -43,7 +43,7 @@ class RatisHomeRolesTest {
         Fixture(String name,boolean catalogue) throws Exception {
             env=new RatisNodeRuntimeTest.Env(Files.createDirectory(root.resolve(name)),catalogue);
             plan=plan(env); data=client(plan.domains().getFirst().directory());
-            node=RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(data.directory().domainId(), data), env.scheduler, env.timer, () -> 20L, new RatisNodeRuntime.Settings(new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),env.settings().retention(),env.settings().clockPeriod(),1,4,env.settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults()), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, server::create, null, null, null, this::client);
+            node=RatisNodeRuntime.open(plan, env.nodeRoot, ConfigParser.parseDefault(), env.catalogue.epochs, Map.of(data.directory().domainId(), data), env.scheduler, env.timer, () -> 20L, new RatisNodeRuntime.Settings(new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.Limits(4*1024*1024,16*1024*1024,2),env.settings().retention(),env.settings().clockPeriod(),1,4,env.settings().shutdownTimeout(),RatisNodeRuntime.ExportResources.defaults(),RatisNodeRuntime.ResourceLimits.defaults()), RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT, server::create, null, null, null, this::client);
             try {
             node.start(); var before=env.catalogue.epochs.read(); var live=before.issue(session,100); env.catalogue.epochs.execute(env.catalogue.epochs.prepare(env.outer.operation(1),before,live));
             for (var home:plan.homes()) {
@@ -129,7 +129,7 @@ class RatisHomeRolesTest {
             }
             assertEquals(initial.transactionId(),machine.preparedRecoveries(null,1).records().getFirst().preparation().transactionId());
             var serviceField=RatisNodeRuntime.class.getDeclaredField("participantRecoveryService"); serviceField.setAccessible(true); var background=(RatisTransactionRecoveryService)serviceField.get(f.node);
-            assertEquals(3,f.env.timer.activePeriods()); assertEquals(0,f.node.participantRecoveryStatus().persistedFiles());
+            assertEquals(4,f.env.timer.activePeriods()); assertEquals(0,f.node.participantRecoveryStatus().persistedFiles());
             for (int n=0;n<4;n++) { f.env.timer.fire(); background.tick().get(5,TimeUnit.SECONDS); RatisTransactionRecoveryServiceTest.idle(f.env.scheduler); }
             assertNull(f.node.participantRecoveryFailure()); assertEquals(TransactionStatus.Phase.PREPARING,homes.read(initial.transactionId()).phase()); assertNull(store.finalizedParticipant(initial.transactionId())); assertEquals(1,f.node.participantRecoveryStatus().persistedFiles());
             var ready=initial.prepared(route.groupId(),initial.participants().getFirst().planDigest(),vote.position()); homes.execute(homes.prepare(new OperationId(session,1,4),initial,ready));

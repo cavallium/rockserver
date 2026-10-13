@@ -35,6 +35,8 @@ final class RatisScopedTransactions implements AutoCloseable {
     private boolean closed;
     private static final class Entry {
         final UUID id,leaseId=UUID.randomUUID(); final long generation,opened,ttl,scopeBytes; final TransactionScope scope; final SnapshotFence snapshotFence;
+        RatisNodeResourceBudget.Lease scopeLease,stagingLease,planLease;
+        final List<StagingDebris> stagingDebris=new ArrayList<>();
         ReplicatedRangeStore.ScopedHistoryPin pin;
         ScopedTransactionRpc.Handle handle;
         RatisRangeStateMachine.ScopedCommit plan;
@@ -49,6 +51,7 @@ final class RatisScopedTransactions implements AutoCloseable {
             this.id=id; this.generation=generation; this.opened=opened; this.ttl=ttl; this.scopeBytes=scopeBytes; this.scope=scope; this.snapshotFence=snapshotFence;
         }
     }
+    private record StagingDebris(ReplicatedRangeStore.ScopedStaging view,RatisNodeResourceBudget.Lease lease,long bytes) {}
     RatisScopedTransactions(RatisRangeStateMachine machine,Limits limits,LongSupplier nanos) {
         this(machine,limits,nanos,machine::prepareScopedCommit);
     }
@@ -102,8 +105,9 @@ final class RatisScopedTransactions implements AutoCloseable {
                 }
                 long bytes=RangeMutationHistory.accountedScopeBytes(scope)+(fence==null ? 0 : fence.encode().length);
                 if (chargedHandles>=limits.handles() || bytes>limits.scopeBytes()-scopeBytes) throw new IOException("Transaction handle/scope admission exhausted");
+                var scopeLease=machine.reserveNodeResources(RatisNodeResourceBudget.Kind.ORDINARY,256L+2L*bytes,1);
                 entry=new Entry(id,generation,fence==null ? nanos.getAsLong() : opened,duration,bytes,scope,fence); entry.busy=true;
-                entries.put(id,entry); chargedHandles++; scopeBytes+=bytes;
+                entry.scopeLease=scopeLease; entries.put(id,entry); chargedHandles++; scopeBytes+=bytes;
             }
         }
         if (replay!=null) { if (ownership!=null) ownership.accept(replay); return replay; }
@@ -144,6 +148,7 @@ final class RatisScopedTransactions implements AutoCloseable {
     }
     CommandResult stage(ScopedTransactionRpc.Handle handle,DistributedCommand command) throws Exception {
         var entry=begin(handle,false); long reserved=0; ReplicatedRangeStore.ScopedStaging replacement=null;
+        RatisNodeResourceBudget.Lease buildLease=null;
         try {
             if (command.kind()!=DistributedCommand.Kind.DATA || command.acknowledgedThrough()!=-1
                     || !command.operationId().equals(new OperationId(handle.id(),0,0))) throw new IllegalArgumentException("Staging has no durable operation identity or ACK");
@@ -153,6 +158,7 @@ final class RatisScopedTransactions implements AutoCloseable {
             }
             synchronized (this) {
                 if (STAGING_BUILD_BYTES>limits.stagingBytes()-stagingBytes) throw new IOException("Transaction staging admission exhausted");
+                buildLease=machine.reserveNodeResources(RatisNodeResourceBudget.Kind.ORDINARY,STAGING_BUILD_BYTES,1);
                 stagingBytes+=STAGING_BUILD_BYTES; entry.stagingBytes+=STAGING_BUILD_BYTES; reserved=STAGING_BUILD_BYTES;
             }
             replacement=stager.stage(entry.pin,command); checked(entry);
@@ -160,16 +166,24 @@ final class RatisScopedTransactions implements AutoCloseable {
             if (retained>STAGING_RETAINED_BYTES) throw new IOException("Staging accounting exceeds retained bound");
             // Entry.busy excludes readers/planners; close the previous JNI owner before donating its charge.
             if (entry.staging!=null) entry.staging.close();
+            if (entry.stagingLease!=null) { entry.stagingLease.close(); entry.stagingLease=null; }
             synchronized (this) {
                 ensureLive(entry);
                 stagingBytes+=retained-entry.stagingBytes;
                 entry.stagingBytes=retained;
+                if (buildLease!=null) buildLease.shrinkTo(retained,1);
+                entry.stagingLease=buildLease; buildLease=null;
                 entry.staging=replacement; entry.stagedCommand=command; replacement=null; reserved=0;
             }
             return entry.staging.result();
         } finally {
             try { if (replacement!=null) replacement.close(); }
+            catch (Throwable failure) {
+                synchronized(this) { entry.stagingDebris.add(new StagingDebris(replacement,buildLease,reserved)); }
+                buildLease=null; reserved=0; throw failure;
+            }
             finally {
+                if (buildLease!=null) buildLease.close();
                 synchronized (this) { stagingBytes-=reserved; entry.stagingBytes-=reserved; }
                 finish(entry,false);
             }
@@ -185,8 +199,14 @@ final class RatisScopedTransactions implements AutoCloseable {
         return extendsPrefix(staged,intent) && staged.mutations().equals(intent.mutations()) && staged.predicates().equals(intent.predicates());
     }
     private void releaseStaging(Entry entry) {
+        for (var debris:List.copyOf(entry.stagingDebris)) {
+            debris.view().close();
+            if (debris.lease()!=null) debris.lease().close();
+            synchronized(this) { entry.stagingDebris.remove(debris); stagingBytes-=debris.bytes(); entry.stagingBytes-=debris.bytes(); }
+        }
         if (entry.staging==null) return;
         entry.staging.close();
+        if (entry.stagingLease!=null) { entry.stagingLease.close(); entry.stagingLease=null; }
         synchronized (this) { entry.staging=null; entry.stagedCommand=null; stagingBytes-=entry.stagingBytes; entry.stagingBytes=0; }
     }
     DistributedCommand plan(ScopedTransactionRpc.Handle handle,DistributedCommand command) throws Exception {
@@ -204,12 +224,13 @@ final class RatisScopedTransactions implements AutoCloseable {
             releaseStaging(entry);
             synchronized (this) {
                 if (DistributedCommandCodec.MAX_ENCODED_BYTES>limits.planBytes()-planBytes) throw new IOException("Transaction retained-plan admission exhausted");
+                entry.planLease=machine.reserveNodeResources(RatisNodeResourceBudget.Kind.ORDINARY,4L*DistributedCommandCodec.MAX_ENCODED_BYTES,1);
                 entry.planBytes=DistributedCommandCodec.MAX_ENCODED_BYTES; planBytes+=entry.planBytes;
                 entry.planning=true;
             }
             entry.plan=planner.prepare(entry.pin,command,new RatisRangeStateMachine.ProposalDeadline(nanos,entry.opened,entry.ttl)); entry.baseDigest=command.payloadDigest();
             int actual=DistributedCommandCodec.encodedSize(entry.plan.command());
-            synchronized (this) { planBytes+=actual-entry.planBytes; entry.planBytes=actual; ensureLive(entry); }
+            synchronized (this) { if (entry.planLease!=null) entry.planLease.shrinkTo(4L*actual,1); planBytes+=actual-entry.planBytes; entry.planBytes=actual; ensureLive(entry); }
             success=true; return entry.plan.command();
         } finally { finish(entry,!success); }
     }
@@ -311,7 +332,7 @@ final class RatisScopedTransactions implements AutoCloseable {
             finally {
                 synchronized (this) {
                     entry.cleaning=false;
-                    if (success && retired.remove(entry)) { chargedHandles--; scopeBytes-=entry.scopeBytes; planBytes-=entry.planBytes; }
+                    if (success && retired.remove(entry)) { if (entry.scopeLease!=null) entry.scopeLease.close(); if (entry.planLease!=null) entry.planLease.close(); chargedHandles--; scopeBytes-=entry.scopeBytes; planBytes-=entry.planBytes; }
                 }
             }
         }

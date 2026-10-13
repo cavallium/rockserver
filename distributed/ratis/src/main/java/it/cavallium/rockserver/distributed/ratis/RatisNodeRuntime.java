@@ -46,11 +46,18 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private static final ServerFactory DEFAULT_SERVER_FACTORY=RatisNodeRuntime::buildServer;
     @FunctionalInterface interface SchemaReplicaClientFactory { RatisSchemaReplicaClient create() throws IOException; }
     @FunctionalInterface interface HomeClientFactory { RatisRoutedClient connect(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) throws IOException; }
+    public record ResourceLimits(RatisNodeResourceBudget.Limits node,RatisNodeResourceBudget.Limits pool) {
+        public ResourceLimits {Objects.requireNonNull(node);Objects.requireNonNull(pool);}
+        public static ResourceLimits defaults() {
+            return new ResourceLimits(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L*1024*1024,1024),new RatisNodeResourceBudget.Lane(128L*1024*1024,256)),
+                    new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,512),new RatisNodeResourceBudget.Lane(64L*1024*1024,128)));
+        }
+    }
     public record Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,
                            Duration clockPeriod,int propagationVisits,int maxPropagationRanges,Duration shutdownTimeout,
-                           ExportResources exports) {
+                           ExportResources exports,ResourceLimits resources) {
         public Settings {
-            Objects.requireNonNull(images); Objects.requireNonNull(retention); Objects.requireNonNull(clockPeriod); Objects.requireNonNull(shutdownTimeout); Objects.requireNonNull(exports);
+            Objects.requireNonNull(images); Objects.requireNonNull(retention); Objects.requireNonNull(clockPeriod); Objects.requireNonNull(shutdownTimeout); Objects.requireNonNull(exports);Objects.requireNonNull(resources);
             if (clockPeriod.isNegative() || clockPeriod.isZero() || propagationVisits<1 || propagationVisits>32
                     || maxPropagationRanges<1 || maxPropagationRanges>1024 || shutdownTimeout.isNegative() || shutdownTimeout.isZero()
                     || shutdownTimeout.compareTo(Duration.ofMinutes(1))>0) throw new IllegalArgumentException("Invalid node resource/lifecycle settings");
@@ -79,6 +86,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (period.isNegative() || period.isZero() || period.compareTo(Duration.ofMinutes(1))>0 || visits<1 || visits>32) throw new IllegalArgumentException("Invalid participant recovery settings");
         }
     }
+    private final RatisNodeResourceBudget resources;
     private final RatisNodePlan plan; private final Map<UUID,DistributedSchema> logicalSchemas; private final Path root; private final Settings settings;
     private final SchemaReplicaConfig schemaReplicaConfig;
     private final RatisSessionEpochs epochs; private final Map<UUID,RatisRoutedClient> routedClients; private final RatisSnapshotFences snapshotHomes;
@@ -206,7 +214,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,SchemaReplicaConfig replicas) {
         this.plan=Objects.requireNonNull(plan);groups=new RatisRuntimeGroups(plan); this.root=root.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs);
         this.routedClients=Map.copyOf(routed);seedAuthority=epochs.topologyAuthority()::read;joinAuthority=epochs.topologyJoinAuthority()::read; this.scheduler=Objects.requireNonNull(scheduler); this.timer=Objects.requireNonNull(timer);
-        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings); schemaReplicaConfig=Objects.requireNonNull(replicas); var qualified=new HashMap<UUID,DistributedSchema>();if(schemas!=null)for(var schema:schemas)if(qualified.putIfAbsent(schema.domainId(),schema)!=null)throw new IllegalArgumentException("Duplicate node schema domain");logicalSchemas=Map.copyOf(qualified); this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
+        this.time=Objects.requireNonNull(time); this.settings=Objects.requireNonNull(settings);resources=new RatisNodeResourceBudget(settings.resources().node(),Map.of(snapshotPoolId,settings.resources().pool())); schemaReplicaConfig=Objects.requireNonNull(replicas); var qualified=new HashMap<UUID,DistributedSchema>();if(schemas!=null)for(var schema:schemas)if(qualified.putIfAbsent(schema.domainId(),schema)!=null)throw new IllegalArgumentException("Duplicate node schema domain");logicalSchemas=Map.copyOf(qualified); this.snapshotHomes=snapshotHomes; recoverySettings=recoveries;
         if (!plan.imports().isEmpty() && logicalSchemas.isEmpty()) throw new IllegalArgumentException("Planned native imports require their qualified logical schemas");
         if (recoveries!=null) {
             recoveries.homes().requireDatabaseBinding(plan.clusterId(),plan.databaseId());
@@ -344,7 +352,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     stores.put(id,store);
                     var operatorLimits=new RatisOperatorCatalogue.Limits(schemaReplicaConfig.limits().maximumUploads(),schemaReplicaConfig.limits().maximumDiskBytes());
                     var operators=RatisOperatorCatalogue.validator(plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),operatorLimits,this::requireOperatorAdmission,key -> committedCatalogueValue(store,c.directoryColumn(),key));
-                    machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn(),operators,key -> committedCatalogueValue(store,c.directoryColumn(),key)));
+                    machine=new RatisRangeStateMachine(store,group,settings.images(),RatisCatalogue.validator(plan.clusterId(),plan.databaseId(),id,c.epoch(),c.schemaDigest(),c.directoryColumn(),c.sessionsColumn(),operators,key -> committedCatalogueValue(store,c.directoryColumn(),key)),
+                            command -> {throw new IllegalStateException("Session epoch floors require catalogue lifetime authority");},settings.retention());
                     machine.role(role);
                     machine.schemaCatalogue(plan.clusterId(),plan.databaseId(),c.directoryColumn());
                     machine.schemaFencingReplicaClient(schemaFencingReplicas);
@@ -421,7 +430,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     }
                 }
                 machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);
-                machines.put(group.getGroupId(),machine);
+                machine.nodeResources(resources,snapshotPoolId);machines.put(group.getGroupId(),machine);
             }
             for (var entry:machines.entrySet()) if (groups.require(entry.getKey().getUuid()).role()==RatisNodePlan.Role.DATA)
                 for (var schema:entry.getValue().schemaRoutingHistory()) observeSchemaActivation(schema.definition(),schema.proof());
@@ -621,7 +630,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             for(var target:forced.definition().targets()){
                 var id=RaftGroupId.valueOf(target.groupId());if(machines.containsKey(id))continue;var entry=groups.require(target.groupId());var store=pool.reopenTopologyRange(forced.birth(target.groupId()),seedSchema(forced));
                 var directory=store.schemaInstallation()==null ? entry.directory() : store.schemaInstallation().definition().targetDirectory();
-                var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,directory,settings.retention());configureDataMachine(machine,directory,target);machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(target.groupId(),store);machines.put(id,machine);
+                var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,directory,settings.retention());machine.nodeResources(resources,snapshotPoolId);configureDataMachine(machine,directory,target);machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(target.groupId(),store);machines.put(id,machine);
             }
             // Every machine and borrowed node service is configured before any target can vote.
             for(var target:forced.definition().targets())requireSeedStorage(groups.require(target.groupId()));
@@ -658,7 +667,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     private void installTopologyLearnerOwned(NativeTopologyLearnerRegistration registration)throws IOException,org.rocksdb.RocksDBException{
         var forced=pool.topologyLearners().stream().filter(registration::equals).findFirst().orElseThrow(()->new IOException("Learner is not exact forced native history"));groups.register(forced);var id=RaftGroupId.valueOf(forced.definition().targets().getFirst().groupId());var entry=groups.require(id.getUuid());
-        if(!machines.containsKey(id)){if(schemaReplicas==null)schemaReplicas=new RatisSchemaReplicaService(root.resolve("native"),root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());var store=pool.openTopologyLearner(forced);var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,entry.directory(),settings.retention());configureDataMachine(machine,entry.directory(),entry.descriptor());machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(id.getUuid(),store);machines.put(id,machine);}
+        if(!machines.containsKey(id)){if(schemaReplicas==null)schemaReplicas=new RatisSchemaReplicaService(root.resolve("native"),root.resolve("schema-replicas"),pool,scheduler,schemaReplicaConfig.policy(),schemaReplicaConfig.limits());var store=pool.openTopologyLearner(forced);var machine=RatisRangeStateMachine.withSessions(store,entry.group(),settings.images(),command->{},epochs,entry.directory(),settings.retention());machine.nodeResources(resources,snapshotPoolId);configureDataMachine(machine,entry.directory(),entry.descriptor());machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(id.getUuid(),store);machines.put(id,machine);}
         requireSeedStorage(entry);markSeedExposure(entry);var actual=new HashSet<RaftGroupId>();server.getGroupIds().forEach(actual::add);if(!actual.contains(id))addGroup(entry.group());else verify(entry.group());
     }
     private List<ReplicatedRangeStore> requireSeedParents(RatisTopologySeedRpc.Request request,boolean fresh)throws IOException,org.rocksdb.RocksDBException{
