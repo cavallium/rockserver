@@ -143,6 +143,7 @@ def main():
                                                    for k in ("data_hits", "index_hits", "filter_hits", "dictionary_hits"))
         report["periodic_published_snapshots_during_foreground"] = {role: counter["snapshots"] - start_counters[role]["snapshots"] for role, counter in end_counters.items()}
         report["foreground_find_table_calls_including_hits"] = report.get("admission_at_foreground_end", {}).get("completed_find_table", 0) - report.get("admission_at_foreground_start", {}).get("completed_find_table", 0)
+        report["foreground_owned_successful_file_opens"] = report.get("admission_at_foreground_end", {}).get("owned_successful_file_opens", 0) - report.get("admission_at_foreground_start", {}).get("owned_successful_file_opens", 0)
         report["cache_directory_bytes"] = sum(v.stat().st_size for v in cache.rglob("*") if v.is_file()) if cache.exists() else 0
         if report["cache_directory_bytes"] > 48 * 1024**2:
             raise RuntimeError(f"{label}: native disk budget exceeded")
