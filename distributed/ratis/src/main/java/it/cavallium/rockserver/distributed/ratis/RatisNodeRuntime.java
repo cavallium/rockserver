@@ -101,6 +101,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     private LearnerSourceReader learnerSource=this::loadLearnerSource;
     private NativeTopologyLearnerRegistration learnerAttempt;
+    synchronized void relocationTransport(RatisClientPool.Factory leaders,RatisClientPool.OwnerFactory owners)throws IOException{
+        if(started || starting || installing || closeRequested || closing || closed)throw new IllegalStateException("Relocation transport fixed before start");var replacement=new RatisRelocationDataClient(plan.clusterId(),plan.databaseId(),plan.catalogue().groupId(),leaders,owners);try{relocationClients.close();}catch(IOException|RuntimeException failed){try{replacement.close();}catch(IOException cleanup){failed.addSuppressed(cleanup);}throw failed;}relocationClients=replacement;
+    }
     public synchronized void learnerSource(LearnerSourceReader reader){if(started || starting || installing || closeRequested)throw new IllegalStateException("Learner source policy is fixed before start");learnerSource=Objects.requireNonNull(reader);}
 
     private record SeedAttempt(TopologyChange.Definition definition,TopologyChange.State authority,ReplicaDescriptor local) {}
@@ -374,6 +377,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     var effectiveDirectory=role==RatisNodePlan.Role.DATA && store.schemaInstallation()!=null
                             ? store.schemaInstallation().definition().targetDirectory()
                             : importDefinition==null ? directory : importDefinition.targetDirectory();
+                    if(role==RatisNodePlan.Role.DATA && registration.learner()!=null && !Arrays.equals(effectiveDirectory.schemaDigest(),store.schemaDigest())){
+                        var permission=store.topologyLearnerImagePermission();if(permission!=null && Arrays.equals(permission.schema().digest(),store.schemaDigest())){permission.requireRegistration(registration.learner());effectiveDirectory=permission.definition().sourceDirectory();}
+                    }
                     // Bind future session controls to the frozen published placement; the native import fence
                     // still rejects DATA/control admission until the exact catalogue activation is applied.
                     machine=RatisRangeStateMachine.withSessions(store,group,settings.images(),validator,epochs,effectiveDirectory,settings.retention());
@@ -622,7 +628,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             var view=joinAuthority.read(request);var receiver=view.require(request);requireLearnerReceiver(view,receiver);
             var evidence=learnerSource.read(view,receiver);var source=view.definition().parents().getFirst();evidence.schema().requireMatches(view.definition().sourceDirectory());
             var image=evidence.image();var cfg=evidence.configuration();var cut=evidence.completedCut();
-            if(image.topologyOrigin()==null || source.replicas().stream().noneMatch(evidence.sourceOwner()::equals) || !image.owner().equals(new RangeOwnership.Owner(source.groupId(),source.rangeEpoch()))
+            if(source.replicas().stream().noneMatch(evidence.sourceOwner()::equals) || !image.owner().equals(new RangeOwnership.Owner(source.groupId(),source.rangeEpoch()))
                     || !image.interval().equals(new RangeOwnership.Interval(view.definition().sourceDirectory().domainId(),view.definition().sourceDirectory().columns(),source.lowerInclusive(),source.upperExclusive()))
                     || !Arrays.equals(image.schemaDigest(),evidence.schema().digest()) || cut.term()<1 || cut.index()<image.position().index() || cut.term()<image.position().term() || cut.index()==image.position().index() && cut.term()!=image.position().term()
                     || cfg.term()>image.position().term() || cfg.index()>image.position().index() || cfg.index()==image.position().index() && cfg.term()!=image.position().term())throw new IOException("Source image/native owner/configuration evidence differs from relocation");
