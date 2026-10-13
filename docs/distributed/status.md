@@ -106,6 +106,13 @@ This section and the remaining gates at the end describe the current branch.
   before ACK, discarded replies, exact connection-journal reopening and public
   RELEASE pin drain. Native source stores stayed live during journal reopening;
   no network listener, quorum or external-consumer adoption is established.
+- Logical export migration passed an actual collision-bucket workflow under an
+  explicitly immutable source schema. Common destination transactions validate the
+  epoch/owner fence, write both logical members and the full chunk checkpoint
+  atomically before ACK, preserve an existing collision member and reject a competing
+  fence update without data/checkpoint/ACK. Connection-journal reopening skips the
+  committed chunk and retries a lost ACK exactly; native stores remain live. This
+  does not establish general public schema witnessing or external Yotsuba adoption.
 - Replica-local maintenance passed actual flush/SST preview/execution/property
   checks, stale target rejection, cancellation with retained JNI ownership and
   node-owned shutdown. It requires explicit policy and process/pool/CF identities.
