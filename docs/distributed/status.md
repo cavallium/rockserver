@@ -49,6 +49,12 @@ This section and the remaining gates at the end describe the current branch.
   pass together. Native staging and participant preparation now retain shared
   charges through actual drain, including cancellation. Other custom-record holds
   and retained buffers still need charges; the full volatile envelope remains open.
+- HOME USER status rows now reserve their complete terminal growth within 1,024
+  rows and 16 MiB, independently of protected recovery credits. Consumed rows stay
+  charged until retirement. Native checks passed racing registration rejection as
+  a saved no-effects conflict, protected completion at full capacity, cold/image
+  reconstruction and exact retry after an unknown native write. This bounds HOME
+  status metadata; other catalogue and per-role durable ceilings remain open.
 - Replica-local maintenance passed actual flush/SST preview/execution/property
   checks, stale target rejection, cancellation with retained JNI ownership and
   node-owned shutdown. It requires explicit policy and process/pool/CF identities.
