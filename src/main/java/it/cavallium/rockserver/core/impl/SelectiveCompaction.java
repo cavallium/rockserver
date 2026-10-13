@@ -20,39 +20,47 @@ public final class SelectiveCompaction {
         return boundedMetadata(db,column,configuredPaths,session,columnId,level,SstMaintenance.MAX_INPUT_FILES,SstMaintenance.MAX_METADATA_RESPONSE_BYTES);
     }
 
-    /** The native metadata call eagerly owns its inventory; bounds precede Java response copies. */
+    /** Called with DB/CF leases retained; native admission precedes inventory copies. */
     public static SstMaintenance.Metadata boundedMetadata(RocksDB db,ColumnFamilyHandle column,
             List<String> configuredPaths,String session,long columnId,int level,int maxFiles,long maxBytes)
             throws org.rocksdb.RocksDBException {
         if(maxFiles<1 || maxFiles>SstMaintenance.MAX_INPUT_FILES || maxBytes<1 || maxBytes>SstMaintenance.MAX_METADATA_RESPONSE_BYTES)throw SstMaintenance.invalid("Invalid physical metadata limits");
         if(level < -1)throw SstMaintenance.invalid("Invalid level");
-        if(level>=0){var observed=db.getProperty(column,"rocksdb.num-files-at-level"+level);if(observed!=null){long count=Long.parseLong(observed);if(count<0 || count>maxFiles)throw SstMaintenance.invalid("Physical SST inventory exceeds response limit");}}
-        var meta = db.getColumnFamilyMetaData(column);
-        if (level < -1 || level >= meta.levels().size()) throw SstMaintenance.invalid("Invalid level");
-        var paths = configuredPaths;
-        if (paths.isEmpty()) paths = List.of(Path.of(db.getName()).toAbsolutePath().normalize().toString());
-        long bytes=128L+2L*(session.length()+meta.name().length);
-        for(var path:paths)bytes=Math.addExact(bytes,2L*path.length());
+        // Reserve response-only identity/path strings before requesting native
+        // inventory. The remainder also covers JNI arrays, defensive key/name
+        // copies, UTF-16 hex (four bytes per raw byte), and retained native fields.
+        long bytes=128L+2L*session.length();
+        for(var path:configuredPaths){bytes=Math.addExact(bytes,2L*path.length());if(bytes>=maxBytes)throw SstMaintenance.invalid("Physical metadata exceeds response limit");}
+        if(bytes>=maxBytes)throw SstMaintenance.invalid("Physical metadata exceeds response limit");
+        var paths=configuredPaths;
+        if(paths.isEmpty()) {
+            paths=List.of(Path.of(db.getName()).toAbsolutePath().normalize().toString());
+            bytes=Math.addExact(bytes,2L*paths.getFirst().length());
+        }
+        long nativeBytes=(maxBytes-bytes)/8;
+        if(nativeBytes<1)throw SstMaintenance.invalid("Physical metadata exceeds response limit");
+        var meta=db.getBoundedColumnFamilyInventory(column,level,maxFiles,nativeBytes);
+        if(level>=meta.numberLevels)throw SstMaintenance.invalid("Invalid level");
+        byte[] columnName=meta.name();
+        bytes=Math.addExact(bytes,2L*columnName.length);
         if(bytes>maxBytes)throw SstMaintenance.invalid("Physical metadata exceeds response limit");
-        var files = new ArrayList<SstMaintenance.File>();
-        var hex = HexFormat.of();
-        for (var l : meta.levels()) {
-            if (level != -1 && l.level() != level) continue;
-            for (var f : l.files()) {
-                if(files.size()>=maxFiles)throw SstMaintenance.invalid("Physical SST inventory exceeds response limit");
-                bytes=Math.addExact(bytes,96L+2L*f.fileName().length()+4L*(f.smallestKey().length+f.largestKey().length));
-                if(bytes>maxBytes)throw SstMaintenance.invalid("Physical metadata exceeds response limit");
-                int pathId = paths.indexOf(Path.of(f.path()).toAbsolutePath().normalize().toString());
-                if (pathId < 0) throw SstMaintenance.invalid("SST path is absent from configured CF paths");
-                files.add(new SstMaintenance.File(basename(f.fileName()), l.level(), pathId, f.size(),
-                        hex.formatHex(f.smallestKey()), hex.formatHex(f.largestKey()), f.beingCompacted()));
-            }
+        var files=new ArrayList<SstMaintenance.File>(meta.files.size());
+        var hex=HexFormat.of();
+        for(var file:meta.files) {
+            if(file.level<0 || file.level>=meta.numberLevels || level!=-1 && file.level!=level)throw SstMaintenance.invalid("Native SST level differs from selected inventory");
+            byte[] smallest=file.smallestKey(),largest=file.largestKey();
+            bytes=Math.addExact(bytes,96L+2L*file.name.length()+4L*(smallest.length+(long)largest.length));
+            if(bytes>maxBytes)throw SstMaintenance.invalid("Physical metadata exceeds response limit");
+            int pathId=paths.indexOf(Path.of(file.directory).toAbsolutePath().normalize().toString());
+            if(pathId<0 || file.pathId!=pathId)throw SstMaintenance.invalid("SST path is absent from configured CF paths");
+            files.add(new SstMaintenance.File(basename(file.name),file.level,pathId,file.size,
+                    hex.formatHex(smallest),hex.formatHex(largest),file.beingCompacted));
         }
         files.sort(Comparator.comparingInt(SstMaintenance.File::level)
                 .thenComparing(SstMaintenance.File::smallestKeyHex).thenComparing(SstMaintenance.File::name));
-        return new SstMaintenance.Metadata(session, columnId,
-                new String(meta.name(), java.nio.charset.StandardCharsets.UTF_8), meta.levels().size(),
-                (int) db.getLongProperty(column, "rocksdb.base-level"), paths, files);
+        return new SstMaintenance.Metadata(session,columnId,
+                new String(columnName,java.nio.charset.StandardCharsets.UTF_8),meta.numberLevels,
+                meta.baseLevel,paths,files);
     }
 
     @org.jetbrains.annotations.VisibleForTesting

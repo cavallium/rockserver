@@ -75,4 +75,21 @@ class RatisDatabaseBackupArchiveTest {
         }
     }
 
+    @Test void boundedScalarArchiveRejectsMergeAndOversizedPublicRowsWithoutComplete() throws Exception {
+        for(boolean merge:new boolean[]{true,false}) {
+            var fixture=new RatisDatabaseBackupFixture(1,8*1024*1024);Path source=root.resolve("invalid-"+merge+".sst");
+            int valueBytes=merge?1:DistributedCommandCodec.MAX_ENCODED_BYTES+1;
+            try(var env=new EnvOptions();var operator=new StringAppendOperator();var options=new Options().setMergeOperator(operator);var writer=new SstFileWriter(env,options)) {
+                writer.open(source.toString());if(merge)writer.merge(new byte[]{1},new byte[]{2});else writer.put(new byte[]{1},new byte[valueBytes]);writer.finish();
+            }
+            var range=fixture.directory.ranges().getFirst();
+            var manifest=new NativeRangeSstExport.Manifest(range.groupId(),range.rangeEpoch(),fixture.column,fixture.schema.digest(),fixture.cut,null,null,1,valueBytes+1L,Files.size(source),java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(source)),source);
+            Path destination=root.resolve("invalid-archive-"+merge);
+            try(var archive=new RatisDatabaseBackupArchive(destination,fixture.definition,fixture.destination)) {
+                assertThrows(IOException.class,()->archive.copy(fixture.domain,0,UUID.randomUUID(),manifest));
+                assertFalse(Files.exists(destination.resolve("COMPLETE")));
+            }
+        }
+    }
+
 }

@@ -120,7 +120,7 @@ public final class ReplicatedRangeStore {
         try {
             var lineage=new it.cavallium.rockserver.core.common.distributed.DistributedCdcCheckpoint.Lineage(rangeId,groupId,rangeEpoch);
             if(cdc!=null) { if(!cdc.lineage().equals(lineage)) throw new IllegalStateException("CDC lineage changed"); return; }
-            var candidate=new NativeRangeCdc(db,state,lineage);
+            var candidate=new NativeRangeCdc(databaseOwner,state,lineage);
             if(pendingInstallation==null) candidate.recover(applied,cdcAuthorityTime());
             cdc=candidate;
         } finally { applyLane.unlock(); leaveNative(); }
@@ -286,7 +286,7 @@ public final class ReplicatedRangeStore {
     private static byte[] sourceOutcomeHash(byte[] value) { try { return java.security.MessageDigest.getInstance("SHA-256").digest(value); } catch(java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); } }
     private void recoverSourceOutcomes(ApplyPosition cut) throws RocksDBException {
         var credits=new HashMap<OperationId,NativeSourceOutcomeCredit>();var publications=new HashMap<OperationId,NativeSourceOutcomePublication>();long bytes=0;
-        for(int tag:List.of(0x65,0x66))try(var iterator=db.newIterator(state)) {
+        for(int tag:List.of(0x65,0x66))try(var iterator=databaseOwner.newIterator(state)) {
             byte[] prefix=ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array();iterator.seek(prefix);byte[] sizing=new byte[0];
             while(iterator.isValid()) { byte[] key=iterator.key();if(key.length<17 || !Arrays.equals(key,0,17,prefix,0,17))break;int size=iterator.value(sizing);if(key.length!=49 || size>(tag==0x65?NativeSourceOutcomeCredit.MAX_BYTES:NativeSourceOutcomePublication.BYTES) || (bytes+=49L+size)>NativeSourceOutcomeCredit.MAX_METADATA_BYTES)throw new IllegalStateException("Source outcome metadata exceeds bound");
                 if(tag==0x65) { var credit=NativeSourceOutcomeCredit.decode(iterator.value());credit.requireCut(cut);var id=credit.request().original().operationId();if(!groupId.equals(credit.request().original().groupId()) || !Arrays.equals(key,sourceOutcomeKey(tag,id)) || credits.size()>=NativeSourceOutcomeCredit.MAX_CREDITS || credits.put(id,credit)!=null)throw new IllegalStateException("Source credit identity/capacity changed"); }
@@ -370,7 +370,7 @@ public final class ReplicatedRangeStore {
     }
     private HomeStatusCapacity scanHomeStatusCapacity(HomeRecoveryContext context,boolean snapshots,Snapshot snapshot) throws RocksDBException {
         int rows=0;long bytes=0;
-        try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false);var iterator=db.newIterator(columns.get(context.column()),options)) {
+        try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false);var iterator=databaseOwner.newIterator(columns.get(context.column()),options)) {
             if(interval.lowerInclusive()==null)iterator.seekToFirst();else iterator.seek(interval.lowerInclusive());var sizing=new byte[0];
             while(iterator.isValid() && contains(iterator.key())) {
                 if(iterator.key(sizing)!=16 || iterator.value(sizing)>(snapshots ? SnapshotFenceStatus.MAX_BYTES : TransactionStatus.MAX_BYTES))throw new IllegalArgumentException("Invalid HOME USER status row shape");
@@ -509,7 +509,7 @@ public final class ReplicatedRangeStore {
         var pending=pendingBytes==null ? null : NativeSchemaFence.decode(pendingBytes);
         var records=new ArrayList<NativeSchemaInstallation>(); var activations=new HashMap<UUID,NativeSchemaActivationProof>();
         long bytes=(currentBytes==null ? 0 : currentBytes.length)+(activationBytes==null ? 0 : activationBytes.length);
-        for(int tag:List.of(0x2a,0x2b)) try(var iterator=db.newIterator(state)) {
+        for(int tag:List.of(0x2a,0x2b)) try(var iterator=databaseOwner.newIterator(state)) {
             var prefix=schemaStateKey(tag); iterator.seek(prefix);
             while(iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length)) {
                 byte[] value=iterator.value(); if((bytes+=value.length)>16L*1024*1024) throw new IllegalStateException("Schema lifecycle metadata exceeds retention budget");
@@ -613,11 +613,11 @@ public final class ReplicatedRangeStore {
         try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false)) {
             stored=db.get(state,options,catalogueHistoryKey(CatalogueHistory.stateKey()));
             if(stored!=null){actualBytes=17L+stored.length;actualRows=1;}
-            var sizing=new byte[0];try(var rows=db.newIterator(columns.get(catalogueHistoryColumn),options)) {
+            var sizing=new byte[0];try(var rows=databaseOwner.newIterator(columns.get(catalogueHistoryColumn),options)) {
                 if(interval.lowerInclusive()==null)rows.seekToFirst();else rows.seek(interval.lowerInclusive());
                 for(;rows.isValid() && contains(rows.key());rows.next()){byte[] key=rows.key();if(key.length==16){if(++directorySlots>DatabaseDomainRoster.MAX_DOMAINS || rows.value(sizing)>RangeDirectoryCodec.MAX_ENCODED_BYTES)throw new IllegalStateException("Catalogue directory reservation bound exceeded");requireCatalogueDirectory(key,rows.value());}if(!catalogueHistoryKeys.test(key))continue;actualBytes=Math.addExact(actualBytes,key.length+(long)rows.value(sizing));actualRows++;if(actualBytes>CatalogueHistory.MAX_BYTES || actualRows>CatalogueHistory.MAX_ROWS)throw new IllegalStateException("Catalogue history native inventory exceeds capacity");}rows.status();
             }
-            byte[] prefix=catalogueHistoryKey(new byte[]{0x79});try(var rows=db.newIterator(state,options)) {
+            byte[] prefix=catalogueHistoryKey(new byte[]{0x79});try(var rows=databaseOwner.newIterator(state,options)) {
                 rows.seek(prefix);for(;rows.isValid() && rows.key().length>=prefix.length && Arrays.equals(rows.key(),0,prefix.length,prefix,0,prefix.length);rows.next()){if(rows.key(sizing)!=49 || rows.value(sizing)!=CatalogueHistory.CREDIT_BYTES)throw new IllegalStateException("Invalid catalogue history credit shape");var credit=CatalogueHistory.Credit.decode(rows.value());if(!Arrays.equals(Arrays.copyOfRange(rows.key(),17,49),credit.definition()))throw new IllegalStateException("Catalogue history credit identity changed");actualBytes=Math.addExact(actualBytes,49L+CatalogueHistory.CREDIT_BYTES);actualRows++;promisedBytes=Math.addExact(promisedBytes,credit.bytes());promisedRows=Math.addExact(promisedRows,credit.rows());}rows.status();
             }
         }
@@ -661,6 +661,8 @@ public final class ReplicatedRangeStore {
     private final Map<RangeMutationHistory.Pin,ScopedHistoryPin> scopedPins=new IdentityHashMap<>();
     private final ConcurrentLinkedQueue<ScopedSnapshot> scopedReleases=new ConcurrentLinkedQueue<>();
     private volatile Object scopedGeneration=new Object();
+    // Atomic DELETE_RANGE batches require the base DB; iterator parents must
+    // be the owning wrapper so JNI disposes them while pool leases are held.
     private final RocksDB db;
     // getBaseDB() is borrowed and does not retain its original Java/native owner.
     private final RocksDB databaseOwner;
@@ -1090,7 +1092,7 @@ public final class ReplicatedRangeStore {
     private byte[] relocationCompletionKey(UUID intent) {return ByteBuffer.allocate(33).put(markerKey).put((byte)0x68).putLong(intent.getMostSignificantBits()).putLong(intent.getLeastSignificantBits()).array();}
     private void recoverRelocationCompletions() throws RocksDBException {
         var found=new HashMap<UUID,NativeTopologyRelocationCompletion>();NativeTopologyRelocationCompletion latest=null;long bytes=0;
-        try(var iterator=db.newIterator(state)){byte[] prefix=ByteBuffer.allocate(17).put(markerKey).put((byte)0x68).array();iterator.seek(prefix);while(iterator.isValid()){byte[] key=iterator.key();if(key.length<17 || !Arrays.equals(key,0,17,prefix,0,17))break;int size=iterator.value(new byte[0]);if(key.length!=33 || size>NativeTopologyRelocationCompletion.MAX_BYTES || (bytes+=size)>16*1024*1024 || found.size()>=64 || topologyLearner==null)throw new IllegalStateException("Relocation completion history exceeds qualified bounds");var receipt=NativeTopologyRelocationCompletion.decode(iterator.value());receipt.requireRegistration(topologyLearner);receipt.requireCut(topologyRecoveryCut());if(!Arrays.equals(key,relocationCompletionKey(receipt.definition().intentId())) || found.put(receipt.definition().intentId(),receipt)!=null)throw new IllegalStateException("Relocation completion history identity changed");if(latest==null || receipt.position().index()>latest.position().index())latest=receipt;iterator.next();}iterator.status();}
+        try(var iterator=databaseOwner.newIterator(state)){byte[] prefix=ByteBuffer.allocate(17).put(markerKey).put((byte)0x68).array();iterator.seek(prefix);while(iterator.isValid()){byte[] key=iterator.key();if(key.length<17 || !Arrays.equals(key,0,17,prefix,0,17))break;int size=iterator.value(new byte[0]);if(key.length!=33 || size>NativeTopologyRelocationCompletion.MAX_BYTES || (bytes+=size)>16*1024*1024 || found.size()>=64 || topologyLearner==null)throw new IllegalStateException("Relocation completion history exceeds qualified bounds");var receipt=NativeTopologyRelocationCompletion.decode(iterator.value());receipt.requireRegistration(topologyLearner);receipt.requireCut(topologyRecoveryCut());if(!Arrays.equals(key,relocationCompletionKey(receipt.definition().intentId())) || found.put(receipt.definition().intentId(),receipt)!=null)throw new IllegalStateException("Relocation completion history identity changed");if(latest==null || receipt.position().index()>latest.position().index())latest=receipt;iterator.next();}iterator.status();}
         relocationCompletions=Map.copyOf(found);relocationCompletion=latest;qualifyLearnerServing();
     }
     private void qualifyLearnerServing() throws RocksDBException {
@@ -1145,7 +1147,7 @@ public final class ReplicatedRangeStore {
     private NativeTopologyFreeze loadTopologyFreeze(ApplyPosition cut) { return loadTopologyFreeze(cut,true); }
     private NativeTopologyFreeze loadTopologyFreeze(ApplyPosition cut,boolean checkWork) {
         NativeTopologyFreeze freeze=null; byte[] high=topologyFreezeKey(); high[16]=0x61;
-        try(var lower=new org.rocksdb.Slice(topologyFreezeKey());var upper=new org.rocksdb.Slice(high);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);var iterator=db.newIterator(state,options)) {
+        try(var lower=new org.rocksdb.Slice(topologyFreezeKey());var upper=new org.rocksdb.Slice(high);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); var sizing=new byte[0];
             while(iterator.isValid()) { if(iterator.key(sizing)!=17 || iterator.value(sizing)>NativeTopologyFreeze.MAX_BYTES || freeze!=null) throw new IllegalArgumentException("Invalid native topology FREEZE namespace/count/budget"); freeze=NativeTopologyFreeze.decode(iterator.value()); iterator.next(); }
             iterator.status();
@@ -1310,7 +1312,7 @@ public final class ReplicatedRangeStore {
         if(schemaPreparationPool!=null) for(var reserved:schemaPreparationPool.outstandingCapacity(groupId,except)) { count++; bytes=Math.addExact(bytes,reserved.historyBytes()); }
         var current=db.get(state,schemaStateKey(0x28)); if(current!=null) bytes+=current.length;
         var activation=db.get(state,schemaStateKey(0x2c)); if(activation!=null) bytes+=activation.length;
-        for(int tag:List.of(0x2a,0x2b)) try(var iterator=db.newIterator(state)) {
+        for(int tag:List.of(0x2a,0x2b)) try(var iterator=databaseOwner.newIterator(state)) {
             var prefix=schemaStateKey(tag); iterator.seek(prefix);
             while(iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length)) {
                 if(tag==0x2a) count++; bytes=Math.addExact(bytes,iterator.value().length); iterator.next();
@@ -1701,7 +1703,7 @@ public final class ReplicatedRangeStore {
             long floor=minimumSessionEpoch(null); byte[] lower=orphans ? ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array() : interval.lowerInclusive();
             byte[] upper=orphans ? ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array() : interval.upperExclusive();
             try (var low=lower==null ? null : new org.rocksdb.Slice(lower); var high=upper==null ? null : new org.rocksdb.Slice(upper);
-                 var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(orphans ? state : columns.get(context.column()),options)) {
+                 var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(orphans ? state : columns.get(context.column()),options)) {
                 byte[] seek=cursor==null ? lower : orphans ? ByteBuffer.allocate(49).put(lower).put(cursor).array() : cursor;
                 if (seek==null) iterator.seekToFirst(); else { iterator.seek(seek); if (cursor!=null && iterator.isValid() && Arrays.equals(iterator.key(),seek)) iterator.next(); }
                 byte[] next=null; RetirementCandidate candidate=null; long bytes=0; int visited=0; var sizing=new byte[0];
@@ -1961,7 +1963,7 @@ public final class ReplicatedRangeStore {
     private void validateSnapshotHomeUsers(Snapshot snapshot,HomeRecoveryContext context) throws RocksDBException {
         if (context==null) return;
         scanHomeStatusCapacity(context,true,snapshot);
-        try (var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false); var iterator=db.newIterator(columns.get(context.column()),options)) {
+        try (var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false); var iterator=databaseOwner.newIterator(columns.get(context.column()),options)) {
             var authority=sessionAuthority(options);
             if (authority!=null && (!authority.clusterId().equals(context.cluster()) || !authority.databaseId().equals(context.database()))) throw new IllegalArgumentException("Snapshot HOME session authority differs");
             if (interval.lowerInclusive()==null) iterator.seekToFirst(); else iterator.seek(interval.lowerInclusive());
@@ -2077,7 +2079,7 @@ public final class ReplicatedRangeStore {
         }
         int count=0; long bytes=0;
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array()); var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array());
-             var options=(source==null ? new ReadOptions() : new ReadOptions(source)).setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+             var options=(source==null ? new ReadOptions() : new ReadOptions(source)).setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); var sizing=new byte[0];
             while (iterator.isValid()) {
                 if (++count>MAX_HOME_RECOVERIES || iterator.key(sizing)!=49 || iterator.value(sizing)>HomeRecoveryReceipt.MAX_BYTES) throw new IllegalStateException("HOME recovery scan bound exceeded");
@@ -2154,7 +2156,7 @@ public final class ReplicatedRangeStore {
         var records=new HashMap<OperationId,HomeRecoveryReceipt>(); long bytes=0;
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array());
              var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array());
-             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); var sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_HOME_RECOVERIES || iterator.key(sizing)!=49 || iterator.value(sizing)>HomeRecoveryReceipt.MAX_BYTES) throw new IllegalStateException("HOME recovery receipt bound exceeded");
@@ -2169,7 +2171,7 @@ public final class ReplicatedRangeStore {
     private Map<UUID,HomeRecoveryCredit> loadHomeCredits(ApplyPosition cut,HomeRecoveryContext required) {
         var records=new HashMap<UUID,HomeRecoveryCredit>(); int count=0; long bytes=0; HomeRecoveryContext context=null;
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x26).array()); var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x27).array());
-             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); var sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_HOME_RECOVERIES || iterator.key(sizing)!=33 || iterator.value(sizing)>HomeRecoveryCredit.MAX_BYTES) throw new IllegalStateException("HOME promise recovery bound exceeded");
@@ -2191,7 +2193,7 @@ public final class ReplicatedRangeStore {
              var high=interval.upperExclusive()==null ? null : new org.rocksdb.Slice(interval.upperExclusive()); var options=new ReadOptions().setFillCache(false)) {
             if (snapshot!=null) options.setSnapshot(snapshot);
             if (low!=null) options.setIterateLowerBound(low); if (high!=null) options.setIterateUpperBound(high);
-            try (var iterator=db.newIterator(columns.get(context.column()),options)) {
+            try (var iterator=databaseOwner.newIterator(columns.get(context.column()),options)) {
                 iterator.seekToFirst(); var sizing=new byte[0];
                 while (iterator.isValid()) {
                     if (iterator.key(sizing)!=16 || iterator.value(sizing)>TransactionStatus.MAX_BYTES) throw new IllegalStateException("Invalid HOME user row shape");
@@ -2392,7 +2394,7 @@ public final class ReplicatedRangeStore {
         var records=new HashMap<UUID,CommittedParticipant>();
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x22).array());
              var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x23).array());
-             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); byte[] sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_PREPARED_PARTICIPANTS || iterator.key(sizing)!=33 || iterator.value(sizing)>CommittedParticipant.MAX_BYTES) throw new IllegalStateException("COMMIT recovery bound exceeded");
@@ -2501,7 +2503,7 @@ public final class ReplicatedRangeStore {
         var records=new HashMap<UUID,SnapshotGate>();
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x24).array());
              var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x25).array());
-             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); byte[] sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_SNAPSHOT_GATES || iterator.key(sizing)!=33 || iterator.value(sizing)>SnapshotGate.MAX_BYTES) throw new IllegalStateException("Snapshot gate recovery bound exceeded");
@@ -2802,7 +2804,7 @@ public final class ReplicatedRangeStore {
         var records=new HashMap<UUID,RejectedParticipant>();
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x23).array());
              var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x24).array());
-             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); byte[] sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_PREPARED_PARTICIPANTS || iterator.key(sizing)!=33 || iterator.value(sizing)>RejectedParticipant.MAX_BYTES) throw new IllegalStateException("Rejected preparation recovery bound exceeded");
@@ -2889,7 +2891,7 @@ public final class ReplicatedRangeStore {
         var records=new HashMap<UUID,AbortedParticipant>();
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x21).array());
              var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x22).array());
-             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=db.newIterator(state,options)) {
+             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high); var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); byte[] sizing=new byte[0];
             while (iterator.isValid()) {
                 if (records.size()>=MAX_PREPARED_PARTICIPANTS || iterator.key(sizing)!=33 || iterator.value(sizing)>AbortedParticipant.MAX_BYTES) throw new IllegalStateException("ABORT recovery bound exceeded");
@@ -2997,7 +2999,7 @@ public final class ReplicatedRangeStore {
         try (var low=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x20).array());
              var high=new org.rocksdb.Slice(ByteBuffer.allocate(17).put(markerKey).put((byte)0x21).array());
              var options=new ReadOptions().setFillCache(false).setIterateLowerBound(low).setIterateUpperBound(high);
-             var iterator=db.newIterator(state,options)) {
+             var iterator=databaseOwner.newIterator(state,options)) {
             iterator.seekToFirst(); var sizing=new byte[0];
             while (iterator.isValid()) {
                 if (iterator.key(sizing)!=33 || iterator.value(sizing)>16+PreparedParticipant.Preparation.MAX_BYTES) throw new IllegalStateException("Prepared record exceeds native recovery bounds");
@@ -3211,7 +3213,7 @@ public final class ReplicatedRangeStore {
             requireActive();if(!catalogueScopeCompaction || !columns.containsKey(column))throw new IllegalStateException("Topology prefix inventory requires active CATALOGUE column");ensureReceiptUsage();
             byte[] marker=db.get(state,markerKey);var cut=marker==null ? null : decodePosition(marker);if(cut==null || !cut.equals(applied))throw new IllegalStateException("Catalogue prefix marker differs from completed apply");
             var entries=new ArrayList<MetadataEntry>();long bytes=0;byte[] sizing=new byte[0],high={(byte)0x83};
-            try(var lower=new org.rocksdb.Slice(low);var upper=new org.rocksdb.Slice(high);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);var iterator=db.newIterator(columns.get(column),options)) {
+            try(var lower=new org.rocksdb.Slice(low);var upper=new org.rocksdb.Slice(high);var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);var iterator=databaseOwner.newIterator(columns.get(column),options)) {
                 iterator.seekToFirst();
                 while(iterator.isValid()) {
                     int keyBytes=iterator.key(sizing);
@@ -3522,7 +3524,7 @@ public final class ReplicatedRangeStore {
                     byte[] prefix=bindingPrefix(), end=prefixEnd(prefix);
                     try (var lower=new org.rocksdb.Slice(prefix); var upper=new org.rocksdb.Slice(end);
                             var options=new ReadOptions().setFillCache(false).setIterateLowerBound(lower).setIterateUpperBound(upper);
-                            var iterator=db.newIterator(state,options)) {
+                            var iterator=databaseOwner.newIterator(state,options)) {
                         iterator.seek(bindingKey(Math.max(minimumSessionEpoch(null),control.authority().minimumEpoch())));
                         while (iterator.isValid()) {
                             if (++count>=SessionEpochLedger.MAX_GRANTS) return CommandResult.Status.CONFLICT;
@@ -3778,7 +3780,7 @@ public final class ReplicatedRangeStore {
     private static boolean topologySchemaRow(byte[] key) { return key.length>16 && (key[16]==0x27 || key[16]==0x28 || key[16]==0x2a || key[16]==0x2b || key[16]==0x2c); }
     private Map<String,byte[]> topologySchemaRows() throws RocksDBException {
         var rows=new HashMap<String,byte[]>();long bytes=0;
-        try(var iterator=db.newIterator(state)) {
+        try(var iterator=databaseOwner.newIterator(state)) {
             iterator.seek(markerKey);
             while(iterator.isValid()) {
                 byte[] key=iterator.key();if(key.length<16 || !Arrays.equals(key,0,16,markerKey,0,16))break;
@@ -3982,7 +3984,7 @@ public final class ReplicatedRangeStore {
 
     private void clearForInstall(ColumnFamilyHandle cf, byte[] lower, byte[] upper, byte[] prefix, InstallWriter writer)
             throws IOException, RocksDBException {
-        try (var options = new ReadOptions().setFillCache(false); var iterator = db.newIterator(cf, options)) {
+        try (var options = new ReadOptions().setFillCache(false); var iterator = databaseOwner.newIterator(cf, options)) {
             if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
             while (iterator.isValid()) {
                 byte[] key = iterator.key();
@@ -4265,7 +4267,7 @@ public final class ReplicatedRangeStore {
                  var high=upper==null ? null : new org.rocksdb.Slice(upper);
                  var options=new ReadOptions().setSnapshot(parent.snapshot.pin.snapshot).setFillCache(false)) {
                 if (low!=null) options.setIterateLowerBound(low); if (high!=null) options.setIterateUpperBound(high);
-                try (var base=db.newIterator(columns.get(column),options);
+                try (var base=databaseOwner.newIterator(columns.get(column),options);
                      var iterator=overlay.newIteratorWithBase(columns.get(column),base,options)) {
                     return readPage(iterator,lower,upper,reverse,resume,items,bytes,true,visibility,column);
                 }
@@ -4680,7 +4682,7 @@ public final class ReplicatedRangeStore {
                     var options = new ReadOptions().setSnapshot(snapshot).setFillCache(false)) {
                 if (lowerBound != null) options.setIterateLowerBound(lowerBound);
                 if (upperBound != null) options.setIterateUpperBound(upperBound);
-                try (var iterator = db.newIterator(cf, options)) {
+                try (var iterator = databaseOwner.newIterator(cf, options)) {
                     return readPage(iterator,lower,upper,reverse,resume,itemLimit,byteLimit,false,null,null);
                 }
             } finally { releaseUse(); }
@@ -4718,7 +4720,7 @@ public final class ReplicatedRangeStore {
             }
             acquireUse();
             try (var options = new ReadOptions().setSnapshot(snapshot).setFillCache(false);
-                    var iterator = db.newIterator(cf, options)) {
+                    var iterator = databaseOwner.newIterator(cf, options)) {
                 if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
                 while (iterator.isValid()) {
                     byte[] key = iterator.key();
@@ -4871,7 +4873,7 @@ public final class ReplicatedRangeStore {
                     try (var lower = new org.rocksdb.Slice(prefix); var upper = end == null ? null : new org.rocksdb.Slice(end);
                             var options = new ReadOptions().setFillCache(false).setIterateLowerBound(lower)) {
                         if (upper != null) options.setIterateUpperBound(upper);
-                        try (var iterator = db.newIterator(cf,options)) {
+                        try (var iterator = databaseOwner.newIterator(cf,options)) {
                             byte[] sizing = new byte[0];
                             if (after == null) iterator.seek(prefix);
                             else {
@@ -5022,7 +5024,7 @@ public final class ReplicatedRangeStore {
 
     private Usage scanUsage(ColumnFamilyHandle cf, byte[] lower, byte[] upper, boolean receiptRows) throws RocksDBException {
         Usage total = new Usage(0, 0);
-        try (var options = new ReadOptions().setFillCache(false); var iterator = db.newIterator(cf, options)) {
+        try (var options = new ReadOptions().setFillCache(false); var iterator = databaseOwner.newIterator(cf, options)) {
             for (iterator.seek(lower); iterator.isValid(); iterator.next()) {
                 byte[] key = iterator.key();
                 if (upper != null && Arrays.compareUnsigned(key, upper) >= 0) break;
@@ -5104,7 +5106,7 @@ public final class ReplicatedRangeStore {
     }
 
     private boolean hasRows(ColumnFamilyHandle cf,byte[] prefix) throws RocksDBException {
-        try (var options=new ReadOptions().setFillCache(false); var iterator=db.newIterator(cf,options)) {
+        try (var options=new ReadOptions().setFillCache(false); var iterator=databaseOwner.newIterator(cf,options)) {
             iterator.seek(prefix);
             byte[] key=iterator.isValid() ? iterator.key() : null;
             boolean present=key!=null && key.length>=prefix.length && Arrays.equals(key,0,prefix.length,prefix,0,prefix.length);
@@ -5117,7 +5119,7 @@ public final class ReplicatedRangeStore {
         Usage expected=decodeTotalUsage(db.get(state,usageKey),position), total=new Usage(0,0), bucket=new Usage(0,0);
         long minimum=minimumSessionEpoch(null), floor=-1, validatedBuckets=0;
         byte[] previousBucket=null;
-        try (var options=new ReadOptions().setFillCache(false); var iterator=db.newIterator(receipts,options)) {
+        try (var options=new ReadOptions().setFillCache(false); var iterator=databaseOwner.newIterator(receipts,options)) {
             byte[] end=prefixEnd(markerKey);
             for (iterator.seek(markerKey);iterator.isValid();iterator.next()) {
                 byte[] key=iterator.key();
@@ -5138,7 +5140,7 @@ public final class ReplicatedRangeStore {
         }
         if (previousBucket!=null && bucket.count!=0) { requireUsageBucket(previousBucket,bucket); validatedBuckets++; }
         Usage bucketTotal=new Usage(0,0); long buckets=0;
-        try (var options=new ReadOptions().setFillCache(false); var iterator=db.newIterator(state,options)) {
+        try (var options=new ReadOptions().setFillCache(false); var iterator=databaseOwner.newIterator(state,options)) {
             byte[] end=prefixEnd(usageBucketsPrefix);
             for (iterator.seek(usageBucketsPrefix);iterator.isValid();iterator.next()) {
                 byte[] key=iterator.key(); if (end!=null && Arrays.compareUnsigned(key,end)>=0) break;
@@ -5169,7 +5171,7 @@ public final class ReplicatedRangeStore {
     private byte[] sessionAckCountKey(){return ByteBuffer.allocate(17).put(markerKey).put((byte)0x15).array();}
     private int validateSessionMetadata(Snapshot snapshot) throws RocksDBException {
         int count=0;var epochs=new java.util.TreeMap<Long,Integer>();
-        try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false);var iterator=db.newIterator(state,options)) {
+        try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false);var iterator=databaseOwner.newIterator(state,options)) {
             long minimum=minimumSessionEpoch(options);byte[] prefix=sessionFloorPrefix();var sizing=new byte[0];iterator.seek(prefix);
             for(;iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length);iterator.next()) {
                 byte[] key=iterator.key();if(key.length!=41 || iterator.value(sizing)!=12)throw new IllegalStateException("Invalid session ACK namespace shape");long epoch=ByteBuffer.wrap(key,17,8).getLong();

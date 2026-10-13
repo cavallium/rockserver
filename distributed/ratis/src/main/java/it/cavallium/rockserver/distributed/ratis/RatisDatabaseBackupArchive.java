@@ -104,9 +104,12 @@ public final class RatisDatabaseBackupArchive implements AutoCloseable {
     }
     private static byte[][] inspect(Path path,DistributedSchema schema,UUID column,long rows,byte[] lower,byte[] upper) throws IOException,RocksDBException {
         try(var options=new Options();var reader=new SstFileReader(options);var read=new ReadOptions().setFillCache(false)){
-            reader.open(path.toString());reader.verifyChecksum();var props=reader.getTableProperties();
-            if(props.getNumEntries()!=rows || props.getNumDeletions()!=0 || props.getNumMergeOperands()!=0 || props.getNumRangeDeletions()!=0 || !"leveldb.BytewiseComparator".equals(props.getComparatorName()))throw new IOException("Archive requires materialized PUT-only tables");
-            byte[] first=null,last=null;long count=0;try(var iterator=reader.newIterator(read)){for(iterator.seekToFirst();iterator.isValid();iterator.next()){
+            var props=reader.openBounded(path.toString(),NativeRangeSstImport.MAX_TABLE_METADATA_BYTES,
+                    NativeRangeSstImport.MAX_TABLE_PROPERTY_ENTRIES,NativeRangeSstImport.MAX_TABLE_PROPERTY_STRING_BYTES);
+            reader.verifyChecksum();
+            if(props.numEntries!=rows || props.numDeletions!=0 || props.numMergeOperands!=0 || props.numRangeDeletions!=0 || !"leveldb.BytewiseComparator".equals(props.comparatorName))throw new IOException("Archive requires materialized PUT-only tables");
+            byte[] first=null,last=null;long count=0;var sizing=java.nio.ByteBuffer.allocate(0);try(var iterator=reader.newIterator(read)){for(iterator.seekToFirst();iterator.isValid();iterator.next()){
+                int keyBytes=iterator.key(sizing),valueBytes=iterator.value(sizing);if(keyBytes<0 || valueBytes<0 || keyBytes+(long)valueBytes>NativeRangeSstImport.MAX_ROW_BYTES || valueBytes>DistributedCommandCodec.MAX_ENCODED_BYTES)throw new IOException("Archive row exceeds bounded native/public value allocation");
                 byte[] key=iterator.key(),value=iterator.value();if((long)key.length+value.length>NativeRangeSstImport.MAX_ROW_BYTES || value.length>DistributedCommandCodec.MAX_ENCODED_BYTES || lower!=null && Arrays.compareUnsigned(key,lower)<0 || upper!=null && Arrays.compareUnsigned(key,upper)>=0 || last!=null && Arrays.compareUnsigned(last,key)>=0)throw new IOException("Archive row scope/order exceeds bounds");
                 try{var shape=schema.column(column).schema();if(shape.variableLengthKeysCount()!=0)schema.decodeBucket(column,key,value);else{schema.requireFixedKey(column,key);if(!shape.hasValue() && value.length!=0)throw new IllegalArgumentException("Key-only value");}}catch(IllegalArgumentException invalid){throw new IOException("Archive physical schema changed",invalid);}
                 if(first==null)first=key;last=key;if(++count>rows)throw new IOException("Archive rows exceed declaration");}iterator.status();}

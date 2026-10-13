@@ -53,6 +53,27 @@ class NativeRangeSstImportTest {
             assertThrows(IllegalStateException.class,()->pool.openNewFencedRange(manifest,schema));
         }
     }
+    @Test void owningIteratorCleanupPreservesAtomicRangeDeletesAndSnapshotCutsAcrossPoolReopen() throws Exception {
+        var schema=schema();Path source=root.resolve("iterator-owner.sst"),db=root.resolve("iterator-owner-db");
+        var file=file(source,false);var manifest=manifest(schema,file);var operationSession=UUID.randomUUID();
+        try(var pool=open(db)) {
+            var store=pool.openNewFencedRange(manifest,schema);
+            var receipt=pool.importSst(store,manifest,Map.of(file.fileId(),source),new ApplyPosition(1,0));
+            pool.activateImport(store,new NativeRangeSstImport.Activation(receipt,UUID.randomUUID(),new ApplyPosition(2,10),new byte[32],new ApplyPosition(1,1)));
+            store.apply(new ApplyPosition(1,2),new DistributedCommand(group,1,schema.digest(),new OperationId(operationSession,1,0),List.of(new Mutation(Mutation.Kind.DELETE_RANGE,column,new byte[]{2},new byte[]{4}))));
+            try(var historical=store.capture()) {
+                store.apply(new ApplyPosition(1,3),new DistributedCommand(group,1,schema.digest(),new OperationId(operationSession,1,1),List.of(new Mutation(Mutation.Kind.PUT,column,new byte[]{2},new byte[]{9}))));
+                var visited=new ArrayList<byte[]>();historical.visitColumn(column,new byte[]{1},new byte[]{5},(key,value)->visited.add(key));
+                assertTrue(visited.isEmpty());assertNull(historical.get(column,new byte[]{2}));
+            }
+            try(var latest=store.capture()) {assertArrayEquals(new byte[]{9},latest.get(column,new byte[]{2}));assertNull(latest.get(column,new byte[]{3}));}
+        }
+        try(var pool=open(db)) {
+            var store=pool.openRange(new RangeOwnership.Owner(group,1),new RangeOwnership.Interval(domain,schema.columnIds(),new byte[]{1},new byte[]{5}),schema.digest(),Map.of(column,"data"),Set.of());
+            store.enableLogicalSchema(schema);assertEquals(new ApplyPosition(1,3),store.applied());
+            try(var latest=store.capture()) {assertArrayEquals(new byte[]{9},latest.get(column,new byte[]{2}));assertNull(latest.get(column,new byte[]{3}));}
+        }
+    }
     @Test void interruptionAfterNativeIngestionReopensFencedAndReplaysOnlyOwnedUserInterval() throws Exception {
         var schema=schema(); Path source=root.resolve("retry.sst"),db=root.resolve("retry-db"); var file=file(source,false); var manifest=manifest(schema,file); UUID neighbourId=UUID.randomUUID();
         try(var pool=open(db)) {
@@ -75,6 +96,45 @@ class NativeRangeSstImportTest {
         var schema=schema(); Path source=root.resolve("delete.sst"); var file=file(source,true); var manifest=manifest(schema,file);
         try(var pool=open(root.resolve("reject-db"))) { var store=pool.openNewFencedRange(manifest,schema); assertThrows(IOException.class,()->pool.importSst(store,manifest,Map.of(file.fileId(),source),new ApplyPosition(1,0))); assertNull(store.applied()); assertNull(store.importReceipt()); }
         assertThrows(IllegalArgumentException.class,()->new NativeSstImportManifest(UUID.randomUUID(),group,1,domain,schema.digest(),new byte[]{3},new byte[]{5},manifest.columns(),NativeSstImportManifest.Limits.defaults()));
+    }
+    @Test void boundedScalarQualificationRejectsMergeAndRangeTombstonesBeforeIntent() throws Exception {
+        for(boolean merge:new boolean[]{true,false}) {
+            var schema=schema();Path source=root.resolve("non-put-"+merge+".sst");RocksDB.loadLibrary();
+            if(merge) {
+                try(var env=new EnvOptions();var operator=new StringAppendOperator();var options=new Options().setMergeOperator(operator);var writer=new SstFileWriter(env,options)) {
+                    writer.open(source.toString());writer.merge(new byte[]{2},new byte[]{7});writer.finish();
+                }
+            } else {
+                try(var options=new Options().setCreateIfMissing(true).setDisableAutoCompactions(true);
+                    var db=RocksDB.open(options,root.resolve("range-tombstone-source").toString());
+                    var flush=new FlushOptions().setWaitForFlush(true)) {
+                    db.put(new byte[]{2},new byte[]{7});
+                    db.deleteRange(new byte[]{3},new byte[]{4});db.flush(flush);
+                    var inventory=db.getBoundedColumnFamilyInventory(db.getDefaultColumnFamily(),0,1,1024*1024);
+                    assertEquals(1,inventory.files.size());var table=inventory.files.getFirst();
+                    Files.copy(Path.of(table.directory).resolve(Path.of(table.name).getFileName()),source);
+                }
+            }
+            long entries;
+            try(var options=new Options();var reader=new SstFileReader(options)) {
+                var properties=reader.openBounded(source.toString(),NativeRangeSstImport.MAX_TABLE_METADATA_BYTES,
+                        NativeRangeSstImport.MAX_TABLE_PROPERTY_ENTRIES,NativeRangeSstImport.MAX_TABLE_PROPERTY_STRING_BYTES);
+                reader.verifyChecksum();entries=properties.numEntries;
+                assertEquals("leveldb.BytewiseComparator",properties.comparatorName);
+                assertEquals(merge?1:0,properties.numMergeOperands);
+                assertEquals(merge?0:1,properties.numRangeDeletions);
+                // RocksDB also counts range tombstones in numDeletions.
+                assertEquals(merge?0:1,properties.numDeletions);
+            }
+            var file=new NativeSstImportManifest.File(UUID.randomUUID(),Files.size(source),MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(source)),entries,new byte[]{2},new byte[]{2});
+            var manifest=manifest(schema,file);
+            try(var pool=open(root.resolve("non-put-db-"+merge))) {
+                var store=pool.openNewFencedRange(manifest,schema);var stages=new ArrayList<NativeRangeSstImport.Stage>();
+                assertThrows(IOException.class,()->pool.importSst(store,manifest,Map.of(file.fileId(),source),new ApplyPosition(1,0),stages::add));
+                assertFalse(stages.contains(NativeRangeSstImport.Stage.INTENT_FORCED));
+                assertNull(store.applied());assertNull(store.importReceipt());assertTrue(store.importPending());
+            }
+        }
     }
     @Test void historicalEmptiedIntervalCannotBeAdoptedByDifferentGroupAfterReopen() throws Exception {
         var schema=schema(); Path db=root.resolve("historical"),source=root.resolve("historical.sst"); var file=file(source,false); var manifest=manifest(schema,file); UUID oldGroup=UUID.randomUUID();
