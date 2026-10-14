@@ -1547,9 +1547,20 @@ Expired identities cannot become fresh requests. Twelve ownership cases and one
 native bulk MERGE case pass, including 1,024 ordered MERGEs under one unchanged
 grant, lost replies/ACKs, uncertain force, cold recovery, expired prefixes and
 concurrent preparation (`restore-sequence-floor-current-gate.log`, `b372ab6`).
-Common/wire consumers still need conversion to these explicit APIs: tokenless
-distributed mutation paths currently refuse before effects. Native grant renewal,
-bulk ordinal reclamation and disjoint request pipelining remain unfinished.
+The common async lifecycle and Java gRPC/Thrift clients now expose owner discovery,
+caller-selected preparation, original-token execution/recovery, observational
+status, bounded saved-result pages and explicit ACK. Terminal outcomes distinguish
+SUCCESS, SESSION_EXPIRED, STALE_SCHEMA, CONFLICT and RESULT_TOO_LARGE; forgotten
+results do not masquerade as an expired native command. The common facade and
+native selection pass 22 cases; refined transport checks pass six gRPC and seven
+Thrift cases (`remote-common-transports-first-gate.log`,
+`remote-transports-refined-gate.log`). Rust provides the same explicit lifecycle,
+strict response validation, canonical batch digest and bounded typed result codec;
+its six new contract cases pass (`rust-remote-mutation-first-gate.log`). No socket
+or independent endpoint acceptance is established. Existing tokenless distributed
+mutation paths refuse before effects; their consumers/test workflows are being
+converted. Native grant renewal, bulk ordinal reclamation and disjoint request
+pipelining remain unfinished.
 
 Topology catalogue retirement now requires exact ACTIVE state and fresh committed
 ACTIVATE quorum evidence for every target. The controller retains the original
