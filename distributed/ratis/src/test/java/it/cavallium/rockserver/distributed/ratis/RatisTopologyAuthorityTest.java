@@ -92,7 +92,12 @@ class RatisTopologyAuthorityTest {
     @Test void purposesRequireLegitimatePhaseAndExactSourceOrTargetAtOneNativeCut() throws Exception {
         try(var f=new Fixture()) {
             var states=progression(f.definition); byte[] admission=new RatisTopologyAuthority.View(f.nativeOwner.outer.catalogue,new ApplyPosition(1,1),f.definition,states.get(TopologyChange.Phase.FENCING)).admissionDigest();
-            for(var phase:TopologyChange.Phase.values()) {
+            assertEquals(EnumSet.of(TopologyChange.Phase.PREPARED, TopologyChange.Phase.FENCING,
+                    TopologyChange.Phase.FENCED, TopologyChange.Phase.SEEDED, TopologyChange.Phase.PUBLISHED,
+                    TopologyChange.Phase.ACTIVE, TopologyChange.Phase.RETIRED, TopologyChange.Phase.ABORTED),
+                    states.keySet());
+            // JOINING and RECONFIGURED belong to relocation, not this split definition.
+            for(var phase:states.keySet()) {
                 var state=states.get(phase); assertNotNull(state);
                 boolean target=phase==TopologyChange.Phase.PUBLISHED || phase==TopologyChange.Phase.ACTIVE || phase==TopologyChange.Phase.RETIRED;
                 f.nativeAuthority(state,target ? f.definition.targetDirectory() : f.definition.sourceDirectory());
