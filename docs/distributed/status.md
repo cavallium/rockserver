@@ -1527,9 +1527,29 @@ the immutable validated import chain, including sources advanced by a preceding
 import. The bootstrap directory is no longer incorrectly required for every
 step. Two controlled data-client cases pass, including two successive imports,
 install/activation retry and wrong-definition/authority refusal
-(`topology-restore-chain-gate.log`, commit `a4533b9`). Actual restore service
-initialization, declared HOME/stream placement and final READY-route adoption
-remain under implementation.
+(`topology-restore-chain-gate.log`, commit `a4533b9`). Service-owned restore
+composition now forces the original plan/placement, stages bounded operators
+under the node lock, initializes declared HOME/stream/pool placement, and adopts
+only verified READY routes. A durable restore owner refuses ordinary recovery
+of partial restore state; cold operation reopen preserves the original identity
+and grant. Frontend closure precedes restore-data drain and retains dependencies
+on failure. The isolated 58-case check plus the final coupled check cover
+nonempty two-domain data, archived native MERGE execution, partial/cold recovery
+and close retries (`restore-isolated-current-gate.log`,
+`restore-sequence-floor-current-gate.log`, commit `e314185`). Transports remain
+controlled; independent endpoint/quorum acceptance is not established.
+
+Explicit point/range/bulk request ownership now binds the durable backend owner,
+epoch, caller UUID, public sequence and original namespace/schema/directory/input.
+Preparation forces full input and its outstanding slot before effects; result
+ACK advances one forced public retirement floor with bounded recent metadata.
+Expired identities cannot become fresh requests. Twelve ownership cases and one
+native bulk MERGE case pass, including 1,024 ordered MERGEs under one unchanged
+grant, lost replies/ACKs, uncertain force, cold recovery, expired prefixes and
+concurrent preparation (`restore-sequence-floor-current-gate.log`, `b372ab6`).
+Common/wire consumers still need conversion to these explicit APIs: tokenless
+distributed mutation paths currently refuse before effects. Native grant renewal,
+bulk ordinal reclamation and disjoint request pipelining remain unfinished.
 
 Topology catalogue retirement now requires exact ACTIVE state and fresh committed
 ACTIVATE quorum evidence for every target. The controller retains the original
