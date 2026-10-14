@@ -87,23 +87,28 @@ class RatisMergeFrontendTest {
         }
         @Override public void close() throws Exception { adapter.close(); if (!closedDirect) { direct.close(); session.close(); } routed.close(); transactions.close(); f.close(); }
     }
+    /** Test caller explicitly consumes bounded results and ACKs; production observer completion never does this. */
+    static Object callerWriteAndAcknowledge(Fixture x,long column,List<Keys> keys,List<Buf> values,RatisRocksDBDirect.WriteKind kind,RequestType.RequestTypeId callback,boolean multi)throws Exception {
+        var token=RatisRocksDBDirectTest.prepare(x.direct,column,keys,values,kind,callback,multi);var result=await(x.direct.execute(token,RequestContext.batch()));assertEquals(keys.size(),x.direct.resultPage(token,0,keys.size(),CommandResult.MAX_BYTES).size());x.direct.acknowledgeResult(token,x.direct.status(token).resultDigest());return result;
+    }
+    @SuppressWarnings("unchecked") static <R> R callerWriteAndAcknowledge(Fixture x,long column,Keys key,Buf value,RatisRocksDBDirect.WriteKind kind,RequestType<Buf,R> callback)throws Exception {return (R)callerWriteAndAcknowledge(x,column,List.of(key),kind==RatisRocksDBDirect.WriteKind.DELETE?List.of():Collections.singletonList(value),kind,callback.getRequestTypeId(),false);}
     @Test void qualifiedFixedAndCollisionBucketsSupportNativeMergedAndOrdinaryCallbacks() throws Exception {
         try (var x=new Fixture(root.resolve("direct"))) {
             var api=x.adapter.api(RequestContext.batch());
-            await(api.putAsync(0,75,key(2),value(1),RequestType.<Buf>none())); bytes(await(api.mergeAsync(0,75,key(2),value(2),RequestType.<Buf>merged())),1,2);
-            assertNull(await(api.mergeAsync(0,75,key(2),value(3),RequestType.<Buf>none()))); bytes(await(api.getAsync(0,75,key(2),RequestType.<Buf>current())),1,2,3);
-            var delta=await(api.putAsync(0,75,key(2),value(4),RequestType.<Buf>delta())); bytes(delta.previous(),1,2,3); bytes(delta.current(),4);
-            assertTrue(await(api.deleteAsync(0,75,key(2),RequestType.<Buf>previousPresence()))); assertNull(await(api.getAsync(0,75,key(2),RequestType.<Buf>current())));
-            var a=member(2,"alpha"); var b=member(2,"beta"); await(api.putAsync(0,76,a,value(5),RequestType.<Buf>none())); await(api.putAsync(0,76,b,value(9),RequestType.<Buf>none()));
-            var result=await(api.mergeMultiAsync(0,76,List.of(a,a),List.of(value(6),value(7)),RequestType.<Buf>merged())); bytes(result.get(0),5,6); bytes(result.get(1),5,6,7);
-            bytes(await(api.getAsync(0,76,b,RequestType.<Buf>current())),9); bytes(await(api.deleteAsync(0,76,a,RequestType.<Buf>previous())),5,6,7); bytes(await(api.getAsync(0,76,b,RequestType.<Buf>current())),9);
+            callerWriteAndAcknowledge(x,75,key(2),value(1),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none()); bytes(callerWriteAndAcknowledge(x,75,key(2),value(2),RatisRocksDBDirect.WriteKind.MERGE,RequestType.<Buf>merged()),1,2);
+            assertNull(callerWriteAndAcknowledge(x,75,key(2),value(3),RatisRocksDBDirect.WriteKind.MERGE,RequestType.<Buf>none())); bytes(await(api.getAsync(0,75,key(2),RequestType.<Buf>current())),1,2,3);
+            var delta=callerWriteAndAcknowledge(x,75,key(2),value(4),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>delta()); bytes(delta.previous(),1,2,3); bytes(delta.current(),4);
+            assertTrue(callerWriteAndAcknowledge(x,75,key(2),null,RatisRocksDBDirect.WriteKind.DELETE,RequestType.<Buf>previousPresence())); assertNull(await(api.getAsync(0,75,key(2),RequestType.<Buf>current())));
+            var a=member(2,"alpha"); var b=member(2,"beta"); callerWriteAndAcknowledge(x,76,a,value(5),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none()); callerWriteAndAcknowledge(x,76,b,value(9),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none());
+            var result=(List<Buf>)callerWriteAndAcknowledge(x,76,List.of(a,a),List.of(value(6),value(7)),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,true); bytes(result.get(0),5,6); bytes(result.get(1),5,6,7);
+            bytes(await(api.getAsync(0,76,b,RequestType.<Buf>current())),9); bytes(callerWriteAndAcknowledge(x,76,a,null,RatisRocksDBDirect.WriteKind.DELETE,RequestType.<Buf>previous()),5,6,7); bytes(await(api.getAsync(0,76,b,RequestType.<Buf>current())),9);
             assertTrue(x.sent.stream().anyMatch(command -> command.mutations().getFirst().kind()==Mutation.Kind.BUCKET_MERGE));
         }
     }
     @Test void fullStagedPrefixMergesOnceWithPutDeleteSnapshotRollbackAndCommit() throws Exception {
         try (var x=new Fixture(root.resolve("transaction"))) {
             var api=x.adapter.api(RequestContext.batch()); var a=member(2,"alpha"); var b=member(2,"beta");
-            await(api.putAsync(0,76,a,value(1),RequestType.<Buf>none())); await(api.putAsync(0,76,b,value(9),RequestType.<Buf>none()));
+            callerWriteAndAcknowledge(x,76,a,value(1),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none()); callerWriteAndAcknowledge(x,76,b,value(9),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none());
             long tx=await(api.openTransactionAsync(Duration.ofSeconds(30))); bytes(await(api.mergeAsync(tx,76,a,value(2),RequestType.<Buf>merged())),1,2);
             bytes(await(api.mergeAsync(tx,76,a,value(3),RequestType.<Buf>merged())),1,2,3); bytes(await(api.putAsync(tx,76,b,value(8),RequestType.<Buf>previous())),9);
             bytes(await(api.mergeAsync(tx,76,a,value(4),RequestType.<Buf>merged())),1,2,3,4); bytes(await(api.getAsync(tx,76,a,RequestType.<Buf>current())),1,2,3,4);
@@ -117,13 +122,13 @@ class RatisMergeFrontendTest {
     }
     @Test void unknownNativeMergeReopensExactOperandIdentityAndSavedMergedResult() throws Exception {
         try (var x=new Fixture(root.resolve("reopen"))) {
-            await(x.adapter.api(RequestContext.batch()).putAsync(0,75,key(2),value(1),RequestType.<Buf>none())); x.lose.set(true);
-            assertThrows(ExecutionException.class,() -> await(x.direct.write(75,key(2),value(2),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,RequestContext.batch())));
+            callerWriteAndAcknowledge(x,75,key(2),value(1),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none()); var token=RatisRocksDBDirectTest.prepare(x.direct,75,List.of(key(2)),List.of(value(2)),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,false);x.lose.set(true);
+            assertThrows(ExecutionException.class,() -> await(x.direct.execute(token,RequestContext.batch())));
             var pending=x.session.pending().getFirst(); byte[] original=DistributedCommandCodec.encode(pending.command()); assertEquals(RatisRocksDBDirect.RecoveryState.PENDING,x.direct.recoveryState());
             x.direct.close(); x.session.close(); x.closedDirect=true;
             try (var session=RatisDurableSessionClient.reopen(x.window,x.routed); var direct=new RatisRocksDBDirect(x.schema,x.routed,session,x.f.scheduler,x.journal)) {
-                assertThrows(ExecutionException.class,() -> await(direct.write(75,key(2),value(3),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,RequestContext.batch())));
-                bytes((Buf)await(direct.resumeRetained(RequestContext.batch())),1,2); assertTrue(session.pending().isEmpty()); assertEquals(RatisRocksDBDirect.RecoveryState.NONE,direct.recoveryState());
+                assertThrows(ExecutionException.class,() -> await(direct.prepareSequence(direct.owner(),token.requestId(),token.requestSequence(),75,List.of(key(2)),List.of(value(3)),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,false,RequestContext.batch())));
+                bytes((Buf)await(direct.execute(token,RequestContext.batch())),1,2);assertTrue(session.pending().isEmpty());assertEquals(RatisRocksDBDirect.RecoveryState.COMPLETE,direct.recoveryState());direct.acknowledgeResult(token,direct.status(token).resultDigest());assertEquals(RatisRocksDBDirect.RecoveryState.NONE,direct.recoveryState());
                 synchronized (x.sent) { var retry=x.sent.getLast(); assertArrayEquals(original,DistributedCommandCodec.encode(retry)); }
                 bytes((Buf)await(direct.get(75,key(2),RequestType.RequestTypeId.CURRENT,RequestContext.batch())),1,2);
             }
@@ -131,27 +136,18 @@ class RatisMergeFrontendTest {
     }
     @Test void advancedSchemaRejectsUnsubmittedRetainedSuffixWithoutNewIdentityOrLostPrefix() throws Exception {
         try (var x=new Fixture(root.resolve("unsubmitted"))) {
-            await(x.adapter.api(RequestContext.batch()).putAsync(0,75,key(2),value(1),RequestType.<Buf>none())); x.direct.close();
-            var original=x.routed.directory(x.schema); var items=new ArrayList<DistributedCommand>();
-            for (var key:List.of(key(2),key(200))) {
-                var logical=RatisLogicalClient.plan(x.schema,List.of(RatisLogicalClient.Change.merge(75,key,value(2),Mutation.ReturnMode.CURRENT)),List.of());
-                var route=original.route(logical.mutations().getFirst().columnId(),logical.mutations().getFirst().key());
-                items.add(new DistributedCommand(route.groupId(),route.rangeEpoch(),x.schema.digest(),new OperationId(x.grant.sessionId(),x.grant.epoch(),0),logical.mutations()));
-            }
+            callerWriteAndAcknowledge(x,75,key(2),value(1),RatisRocksDBDirect.WriteKind.PUT,RequestType.<Buf>none()); var token=RatisRocksDBDirectTest.prepare(x.direct,75,List.of(key(2),key(200)),List.of(value(2),value(2)),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,true);
+            x.direct.afterAcknowledgement(() -> {throw new IllegalStateException("Stop after the forced first prefix");});assertThrows(ExecutionException.class,() -> await(x.direct.execute(token,RequestContext.batch())));x.direct.afterAcknowledgement(null);x.direct.close();
             var digest=java.security.MessageDigest.getInstance("SHA-256"); digest.update(x.schema.digest()); digest.update(x.routed.sessionIdentityDigest());
             digest.update(java.nio.ByteBuffer.allocate(40).putLong(x.grant.sessionId().getMostSignificantBits()).putLong(x.grant.sessionId().getLeastSignificantBits()).putLong(x.grant.epoch()).putLong(x.grant.issuedAtMillis()).putLong(x.grant.expiresAtMillis()).array()); byte[] binding=digest.digest();
-            try (var journal=new RatisDirectRequestJournal(x.journal,binding)) {
-                journal.begin(new RatisDirectRequestJournal.Request(RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,true,items));
-                var pending=x.session.prepareAt(original,items.getFirst().mutations(),List.of()); journal.bind(pending.command().operationId()); journal.result(x.session.execute(pending)); x.session.acknowledge(pending); journal.acknowledged();
-            }
             assertTrue(x.session.pending().stream().allMatch(RatisDurableSessionClient.Pending::consumed)); x.session.close(); x.closedDirect=true;
             var operator=x.schema.column(75).operator(); x.install(x.schema,77,new UUID(310,77),"later-merge",operator,false); x.routed.refreshSchema(x.lastDefinition,x.lastActivation);
             int before=x.sent.size();
             try (var session=RatisDurableSessionClient.reopen(x.window,x.routed); var direct=new RatisRocksDBDirect(x.schema,x.routed,session,x.f.scheduler,x.journal)) {
                 assertEquals(RatisRocksDBDirect.RecoveryState.PENDING,direct.recoveryState());
-                var failure=assertThrows(ExecutionException.class,() -> await(direct.resumeRetained(RequestContext.batch())));
+                var failure=assertThrows(ExecutionException.class,() -> await(direct.execute(token,RequestContext.batch())));
                 assertEquals(RocksDBException.RocksDBErrorType.COMMIT_FAILED,assertInstanceOf(RocksDBException.class,failure.getCause()).getErrorUniqueId());
-                assertTrue(failure.getCause().getMessage().contains("1 applied prefix items")); assertEquals(before,x.sent.size()); assertEquals(RatisRocksDBDirect.RecoveryState.NONE,direct.recoveryState());
+                assertTrue(failure.getCause().getMessage().contains("1 applied prefix items")); assertEquals(before,x.sent.size());assertEquals(CommandResult.Status.STALE_SCHEMA,direct.status(token).outcome());assertEquals(RatisRocksDBDirect.RecoveryState.COMPLETE,direct.recoveryState());direct.acknowledgeResult(token,direct.status(token).resultDigest());assertEquals(RatisRocksDBDirect.RecoveryState.NONE,direct.recoveryState());
             }
             try (var journal=new RatisDirectRequestJournal(x.journal,binding)) {
                 assertEquals(CommandResult.Status.STALE_SCHEMA,journal.request().unsubmittedStatus); assertEquals(1,journal.request().cursor()); assertArrayEquals(new byte[]{1,2},journal.request().results.getFirst().value(0)); assertNull(journal.request().pending);

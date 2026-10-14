@@ -115,9 +115,6 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     private <T> CompletableFuture<T> rangeView(RatisRocksDBRanges.OwnedResult<T> owned) {
         track(owned.drained()); var tracker=tracking.get(); if (tracker!=null) tracker.cancel.add(owned.cancelObserver()); return owned.observer();
     }
-    private CompletableFuture<Void> batchView(CompletableFuture<Void> source) {
-        track(batches.actualCompletion(source)); var tracker=tracking.get(); if(tracker!=null) tracker.cancel.add(() -> source.cancel(false)); return source;
-    }
     private CompletableFuture<Object> directView(CompletableFuture<Object> source,java.util.function.Function<Object,Object> mapper) {
         var actual=direct.actualCompletion(source); track(actual); var view=source.thenApply(mapper); var tracker=tracking.get(); if (tracker!=null) tracker.cancel.add(() -> view.cancel(false));
         view.whenComplete((value,failure) -> { if (view.isCancelled()) source.cancel(false); }); return view;
@@ -140,9 +137,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     public synchronized Stats stats() { return new Stats(entries.size(),(int)entries.values().stream().filter(entry -> entry.acquiring).count()); }
     private CompletableFuture<?> dispatch(RocksDBAPICommand<?,?,?> request,Deadline deadline) throws Exception {
         synchronized (this) { if (closing) throw new IOException("Adapter closing"); }
-        if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange range){if(rangeDeletes==null)throw unsupported();var owned=rangeDeletes.delete(range.columnId(),range.startKeysInclusive(),range.endKeysExclusive(),deadline.remaining());track(owned.drained());var tracker=tracking.get();if(tracker!=null)tracker.cancel.add(owned.cancel());return owned.observer();}
-        if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch batch) { if(batches==null) throw unsupported(); return batchView(batches.putBatch(batch.columnId(),batch.batchPublisher(),batch.mode(),deadline.remaining())); }
-        if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch batch) { if(batches==null) throw unsupported(); return batchView(batches.mergeBatch(batch.columnId(),batch.batchPublisher(),batch.mode(),deadline.remaining())); }
+        if(request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.DeleteRange || request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch || request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch)throw explicitMutationRequired();
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.OpenTransaction open) return open(open.transactionLeaseTtl(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseTransaction close) return close(close.transactionId(),close.commit(),deadline);
         if (request instanceof RocksDBAPICommand.RocksDBAPICommandSingle.CloseFailedUpdate close) return closeFailedUpdate(close.updateId(),deadline);
@@ -376,6 +371,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
         });
     }
     private CompletableFuture<?> write(long id,long column,List<Keys> keys,List<Buf> values,RequestType.RequestTypeId type,RatisRocksDBDirect.WriteKind kind,boolean multi,Deadline deadline) throws Exception {
+        if(id==0)throw explicitMutationRequired();
         if (kind==RatisRocksDBDirect.WriteKind.MERGE ? type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.MERGED
                 : !(type==RequestType.RequestTypeId.NOTHING || type==RequestType.RequestTypeId.PREVIOUS || type==RequestType.RequestTypeId.PREVIOUS_PRESENCE || kind==RatisRocksDBDirect.WriteKind.PUT && (type==RequestType.RequestTypeId.DELTA || type==RequestType.RequestTypeId.CHANGED || type==RequestType.RequestTypeId.ENSURE))) throw unsupported();
         var shape=schema.column(column); if (values==null && !shape.schema().hasValue()) values=Collections.nCopies(keys.size(),null); if (keys.size()!=values.size()) throw new IllegalArgumentException("Keys and values differ in count");
@@ -391,7 +387,6 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
             if (kind==RatisRocksDBDirect.WriteKind.PUT && (shape.schema().hasValue() ? frozenValues.get(n)==null : frozenValues.get(n)!=null)) throw RocksDBException.of(shape.schema().hasValue() ? UNEXPECTED_NULL_VALUE : VALUE_MUST_BE_NULL,"Value differs from column shape");
         }
         boolean returns=type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE;
-        if (id==0 && direct!=null) return directView(direct.writeSequence(column,frozenKeys,frozenValues,kind,type,multi,deadline.remaining()),RatisRocksDBAdapter::expose);
         var entry=entry(id);
         final WriteCall request;
         synchronized (entry) {
@@ -514,6 +509,7 @@ public final class RatisRocksDBAdapter implements AutoCloseable {
     }
     private static Keys copy(Keys keys) { return keys==null ? null : new Keys(Arrays.stream(keys.keys()).map(value -> Buf.wrap(Objects.requireNonNull(value).toByteArray())).toArray(Buf[]::new)); }
     private static Throwable unwrap(Throwable failure) { while ((failure instanceof CompletionException || failure instanceof ExecutionException) && failure.getCause()!=null) failure=failure.getCause(); return failure; }
+    private static RocksDBException explicitMutationRequired(){return RocksDBException.of(NOT_IMPLEMENTED,"Distributed mutations require the explicit RemoteMutationAsyncAPI owner, request identity and result ACK");}
     private static RocksDBException unsupported() { return RocksDBException.of(NOT_IMPLEMENTED,"Distributed adapter operation is not implemented"); }
     @Override public void close() throws IOException {
         List<Entry> owners; synchronized (this) { closing=true; owners=List.copyOf(entries.values()); }

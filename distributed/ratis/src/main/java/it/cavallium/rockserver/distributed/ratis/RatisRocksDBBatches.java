@@ -10,7 +10,6 @@ import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
-import org.reactivestreams.*;
 
 /** One exclusive bulk session and bounded copied input. Group chunks are independently atomic, never a global prefix. */
 public final class RatisRocksDBBatches implements AutoCloseable {
@@ -39,16 +38,6 @@ public final class RatisRocksDBBatches implements AutoCloseable {
     boolean binds(DistributedSchema schema,RangeDirectory directory) { return Arrays.equals(this.schema.digest(),schema.digest()) && Arrays.equals(this.directory.payloadDigest(),directory.payloadDigest()); }
     void beforeAcknowledgementMarker(Runnable hook) { beforeAcknowledgementMarker=hook; }
     RatisDurableSessionClient ownedSession() { return session; }
-    public CompletableFuture<Void> putBatch(long column,Publisher<KVBatch> source,PutBatchMode mode,RequestContext context) {
-        if(mode!=PutBatchMode.WRITE_BATCH) return CompletableFuture.failedFuture(new UnsupportedOperationException("Unsupported distributed PUT batch mode: "+mode));
-        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(column,source,mode)); return CompletableFuture.failedFuture(new IOException("Distributed bulk mutation requires caller token and copied ordinal input")); }
-        catch(Exception failure) { return CompletableFuture.failedFuture(failure); }
-    }
-    public CompletableFuture<Void> mergeBatch(long column,Publisher<KVBatch> source,MergeBatchMode mode,RequestContext context) {
-        if(mode!=MergeBatchMode.MERGE_WRITE_BATCH) return CompletableFuture.failedFuture(new UnsupportedOperationException("Unsupported distributed MERGE batch mode: "+mode));
-        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch(column,source,mode)); return CompletableFuture.failedFuture(new IOException("Distributed bulk mutation requires caller token and copied ordinal input")); }
-        catch(Exception failure) { return CompletableFuture.failedFuture(failure); }
-    }
     public CompletableFuture<Progress> resumeRetained(RequestContext context) {
         try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(0,ignored -> {},PutBatchMode.WRITE_BATCH)); var task=reserve(context); task.schedule(() -> { Progress value; persistence.lock(); try { if(journal.request()==null || journal.request().resultAcknowledged) throw new IOException("No retained bulk input"); drain(task); value=snapshot(); } finally { persistence.unlock(); } task.settle(value,null); }); return task.view; }
         catch(Exception failure) { return CompletableFuture.failedFuture(failure); }

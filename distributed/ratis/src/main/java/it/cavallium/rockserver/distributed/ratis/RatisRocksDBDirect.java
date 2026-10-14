@@ -52,10 +52,6 @@ public final class RatisRocksDBDirect implements AutoCloseable {
             });
         } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
     }
-    public CompletableFuture<Object> write(long column,Keys keys,Buf value,WriteKind kind,RequestType.RequestTypeId type,RequestContext context) {
-        return writeSequence(column,List.of(keys),kind==WriteKind.DELETE ? List.of() : Collections.singletonList(value),kind,type,false,context);
-    }
-    public CompletableFuture<Object> writeSequence(long column,List<Keys> keys,List<Buf> values,WriteKind kind,RequestType.RequestTypeId type,boolean multi,RequestContext context) { return CompletableFuture.failedFuture(new IOException("Distributed mutation requires prepare and exact caller token")); }
     public CompletableFuture<RemoteMutationToken> prepareSequence(RemoteMutationOwner expectedOwner,UUID requestId,long requestSequence,long column,List<Keys> keys,List<Buf> values,WriteKind kind,RequestType.RequestTypeId type,boolean multi,RequestContext context) {
         final Task task;
         try { task=reserve(context,OperationFamily.MUTATION,true); } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
