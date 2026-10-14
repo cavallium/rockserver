@@ -112,6 +112,14 @@ import reactor.core.publisher.Mono;
 import reactor.util.context.ContextView;
 
 public class GrpcServer extends Server {
+    private static it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI remoteMutationBackend(RocksDBConnection client) {
+        if(client.getCapabilities().backendMode()!=it.cavallium.rockserver.core.common.RockserverCapabilities.BackendMode.DISTRIBUTED)return null;
+        try{return client.getRemoteMutationApi();}
+        catch(it.cavallium.rockserver.core.common.RocksDBException unavailable){
+            if(unavailable.getErrorUniqueId()!=it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED)throw unavailable;
+            return null;
+        }
+    }
 
 	private static final Logger LOG = LoggerFactory.getLogger(GrpcServer.class.getName());
 	private static final String GRPC_LATE_ERROR_HANDLER_CONTEXT_KEY
@@ -367,6 +375,7 @@ public class GrpcServer extends Server {
 				.addService(service)
 				.addService(new ExportGrpcService(exports).bindBoundedService())
                 .addService(new DistributedCdcGrpcService(client.getCapabilities().cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null).bindBoundedService())
+                .addService(new RemoteMutationGrpcService(remoteMutationBackend(client)).bindBoundedService())
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new AdaptiveCompressionInterceptor())

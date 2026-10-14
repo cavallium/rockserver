@@ -149,6 +149,7 @@ public final class GrpcConnection extends BaseConnection {
 		return delegate.getCapabilities();
 	}
     @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { return delegate.getDistributedCdcApi(); }
+    @Override public it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI getRemoteMutationApi() { return delegate.getRemoteMutationApi(); }
 
 	@Override
 	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
@@ -343,6 +344,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 	}
     @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() {
         capabilities.requireVectorCdc(); return new GrpcDistributedCdcClient(channel);
+    }
+    @Override public it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI getRemoteMutationApi() {
+        if(capabilities.backendMode()!=RockserverCapabilities.BackendMode.DISTRIBUTED) throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,"Explicit remote mutations require a distributed backend");
+        return new GrpcRemoteMutationClient(channel);
     }
 
 
