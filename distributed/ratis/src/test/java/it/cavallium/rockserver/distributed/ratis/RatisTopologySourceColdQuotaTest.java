@@ -43,7 +43,7 @@ class RatisTopologySourceColdQuotaTest {
             fresh=new RatisTopologySourceSnapshotRpc.Request(new UUID(160,6),definition.header(),request.catalogue(),receiver,request.purpose());
             var defaults=env.settings();var resources=defaults.resources();
             // Each declared pool receives exactly one worst-case pair of managed+artifact images.
-            var constrained=new RatisNodeRuntime.ResourceLimits(resources.node(),resources.pool(),Math.multiplyExact(2L*defaults.images().maxImageBytes(),env.plan.pools().size()),resources.maximumDurableMetadataBytes(),resources.maximumOperatorCacheBytes(),resources.maximumNativeCacheBytes(),RatisCommittedApplyDispatcher.Policy.defaults(),RatisDiskRunway.Policy.defaults(),RatisMigrationController.Policy.defaults());
+            var constrained=new RatisNodeRuntime.ResourceLimits(resources.node(),resources.pool(),Math.multiplyExact(2L*defaults.images().maxImageBytes(),env.plan.pools().size()),resources.maximumDurableMetadataBytes(),resources.maximumOperatorCacheBytes(),resources.maximumNativeCacheBytes(),RatisCommittedApplyDispatcher.Policy.defaults(),RatisDiskRunway.Policy.defaults(),RatisMigrationController.Policy.defaults(),resources.nativeExtents());
             settings=new RatisNodeRuntime.Settings(defaults.images(),defaults.retention(),defaults.clockPeriod(),defaults.propagationVisits(),defaults.maxPropagationRanges(),defaults.shutdownTimeout(),defaults.exports(),constrained);
         }
         Owned open(boolean recover)throws Exception {
@@ -104,7 +104,11 @@ class RatisTopologySourceColdQuotaTest {
         public void close()throws Exception {env.close();}
     }
     record Owned(RatisNodeRuntime node,RatisRangeStateMachine machine,ReplicatedRangeStore store,RatisTopologySourceSnapshotArtifacts artifacts) implements AutoCloseable {
-        byte[] action(int kind,RatisTopologySourceSnapshotRpc.Request request)throws Exception {return machine.queryLinearizable(RatisTopologySourceHostTest.message(RatisTopologySourceSnapshotRpc.request(kind,request))).get(5,TimeUnit.SECONDS).getContent().toByteArray();}
+        byte[] action(int kind,RatisTopologySourceSnapshotRpc.Request request)throws Exception {
+            // The borrowed manual timer does not tick the real sampler; refresh it before BATCH image IO.
+            RatisTopologySeedRuntimeTest.field(node,"poolPressure",RatisPoolPressureService.class).refresh().get(5,TimeUnit.SECONDS);
+            return machine.queryLinearizable(RatisTopologySourceHostTest.message(RatisTopologySourceSnapshotRpc.request(kind,request))).get(5,TimeUnit.SECONDS).getContent().toByteArray();
+        }
         public void close()throws Exception {node.close();}
     }
     @Test void coldOriginalClaimsDiskBeforeNewCaptureAndStillReplaysExactPreparedImage()throws Exception {

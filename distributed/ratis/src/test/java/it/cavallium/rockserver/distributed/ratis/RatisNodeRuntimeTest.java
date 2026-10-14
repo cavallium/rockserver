@@ -493,13 +493,13 @@ class RatisNodeRuntimeTest {
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed));
             assertEquals(0,failed.starts);
             byte[] identity=SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128);
-            assertEquals(33,identity.length); assertEquals(0,identity[0]);
+            assertEquals(89,identity.length); assertEquals(1,identity[0]);
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
             var resumed=new FakeServer();
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,resumed)) {
                 node.start(); assertTrue(resumed.exposedBeforeStart); assertTrue(node.started());
             }
-            assertEquals(1,SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128)[0]);
+            assertEquals(2,SessionJournalFiles.read(env.nodeRoot.resolve("node.identity"),128)[0]);
             try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
         }
     }
@@ -515,7 +515,7 @@ class RatisNodeRuntimeTest {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,failed)) {
                 assertThrows(IOException.class,node::start); assertTrue(failed.exposedBeforeStart);
             }
-            assertEquals(1,SessionJournalFiles.read(identity,128)[0]);
+            assertEquals(2,SessionJournalFiles.read(identity,128)[0]);
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer()));
             assertThrows(IOException.class,() -> env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer()));
         }
@@ -525,11 +525,11 @@ class RatisNodeRuntimeTest {
             try (var node=env.open(RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,new FakeServer())) { node.start(); }
             Path identity=env.nodeRoot.resolve("node.identity");
             byte[] canonical=SessionJournalFiles.read(identity,128);
-            assertEquals(33,canonical.length); assertEquals(1,canonical[0]);
+            assertEquals(89,canonical.length); assertEquals(2,canonical[0]);
             assertArrayEquals(env.plan.identityDigest(),Arrays.copyOfRange(canonical,1,33));
             for (int length=0;length<canonical.length;length++) assertIdentityRejected(env,Arrays.copyOf(canonical,length));
             assertIdentityRejected(env,Arrays.copyOf(canonical,canonical.length+1));
-            byte[] phase=canonical.clone(); phase[0]=2; assertIdentityRejected(env,phase);
+            byte[] phase=canonical.clone(); phase[0]=3; assertIdentityRejected(env,phase);
             byte[] binding=canonical.clone(); binding[1]^=1; assertIdentityRejected(env,binding);
             SessionJournalFiles.write(identity,canonical,128);
             try (var recovered=env.open(RatisNodeRuntime.Startup.RECOVER,new FakeServer())) { recovered.start(); }
@@ -954,7 +954,7 @@ class RatisNodeRuntimeTest {
                 case "getId" -> RaftPeerId.valueOf(plan.peerId()); case "toString" -> "controlled-node-server";
                 case "start" -> {
                     starts++; byte[] identity=SessionJournalFiles.read(logs.getParent().resolve("node.identity"),128);
-                    exposedBeforeStart=identity.length==33 && identity[0]==1;
+                    exposedBeforeStart=identity.length==89 && identity[0]==2;
                     if (failStart) throw new IOException("fixture start failure");
                     initialize(plan.localGroups().getFirst()); yield null;
                 }

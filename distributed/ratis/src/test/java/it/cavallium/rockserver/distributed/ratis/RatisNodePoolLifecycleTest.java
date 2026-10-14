@@ -46,7 +46,7 @@ class RatisNodePoolLifecycleTest {
                     var parentStore=f.store(server,parent.groupId());var otherGroup=f.secondDirectory.ranges().getFirst().groupId();var other=f.store(server,otherGroup);var otherColumn=f.second.columnIds().iterator().next();
                     var write=new DistributedCommand(otherGroup,1,f.second.digest(),new OperationId(new UUID(974,1),1,0),List.of(new Mutation(Mutation.Kind.PUT,otherColumn,new byte[]{7},new byte[]{99})));assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(other.apply(new ApplyPosition(1,other.applied().index()+1),write)).status());
                     var record=new RatisTopologyFreezeRecord(split,parent.groupId(),seedAuthority.read(split.header(),TopologyChange.Stage.FREEZE).admissionDigest());parentMachine.queryLinearizable(Message.valueOf(ByteString.copyFrom(RatisTopologyFreezeRpc.prepareRequest(record)))).get(5,TimeUnit.SECONDS);
-                    var tx=parentMachine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(parent.groupId())).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(Message.valueOf(ByteString.copyFrom(record.encode()))).build());assertNull(tx.getException());parentMachine.preAppendTransaction(tx);tx.initLogEntry(1,parentStore.applied().index()+1);var frozen=NativeTopologyFreeze.decode(parentMachine.applyTransaction(tx).get(5,TimeUnit.SECONDS).getContent().toByteArray());state[0]=state[0].frozen(frozen.proof(local.replicaId()));commit(f,split,state[0]);
+                    var tx=parentMachine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(plan.peerId())).setGroupId(RaftGroupId.valueOf(parent.groupId())).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(Message.valueOf(ByteString.copyFrom(record.encode()))).build());assertNull(tx.getException());parentMachine.preAppendTransaction(tx);tx.initLogEntry(1,parentStore.applied().index()+1);var frozen=NativeTopologyFreeze.decode(applyCommitted(parentMachine,tx).getContent().toByteArray());state[0]=state[0].frozen(frozen.proof(local.replicaId()));commit(f,split,state[0]);
                     var request=new RatisTopologySeedRpc.Request(split,plan.catalogue().groupId(),parent.groupId(),local.replicaId());var once=new AtomicBoolean(true);node.nativePool(fast).topologySeedForceObserver(after->{if(after && once.getAndSet(false))throw new org.rocksdb.RocksDBException("Unknown forced pool-A seed response");});
                     var active=node;assertThrows(IOException.class,()->active.seedTopology(request));assertNull(node.nativePool(fast).topologySeed(split.intentId()));assertNotNull(field(node,"seedAttempt",Object.class));int reads=authorityReads.get();
                     var blocked=assertThrows(IOException.class,()->active.joinTopologyLearner(joining));assertTrue(blocked.getMessage().contains("retained force attempt"));assertEquals(0,joinReads.get());assertTrue(node.nativePool(archive).topologyLearners().isEmpty());
@@ -56,6 +56,18 @@ class RatisNodePoolLifecycleTest {
                     assertArrayEquals(saved.encode(),node.seedTopology(request).encode());assertEquals(4,field(node,"groups",RatisRuntimeGroups.class).raftGroups().size());for(var child:split.targets())assertEquals(fast,node.poolId(child.groupId()));assertEquals(archive,node.poolId(otherGroup));assertEquals(1,node.nativePool(fast).topologySeeds().size());assertTrue(node.nativePool(archive).topologySeeds().isEmpty());assertTrue(node.nativePool(archive).topologyLearners().isEmpty());try(var pin=f.store(server,otherGroup).capture()){assertArrayEquals(new byte[]{99},pin.get(otherColumn,new byte[]{7}));}
                 }finally{node.close();}
             }
+        }
+    }
+    private static Message applyCommitted(RatisRangeStateMachine machine,org.apache.ratis.statemachine.TransactionContext transaction)throws Exception {
+        // This controlled server has no Ratis updater; preserve its real read/dispatch/native-pump ownership.
+        try(var updater=java.util.concurrent.Executors.newSingleThreadExecutor()){
+            return updater.submit(()->{
+                var admission=machine.committedApplyAdmission();org.apache.ratis.server.impl.CommittedApplyStateMachine.Descriptor descriptor;long index=transaction.getLogEntry().getIndex();
+                try(var read=admission.awaitRead(index)){descriptor=admission.describe(transaction.getLogEntry());}
+                var permit=admission.awaitDispatch(descriptor);admission.offer(descriptor,permit);java.util.concurrent.CompletableFuture<Message> result;
+                try{result=machine.applyTransaction(transaction);}finally{admission.withdraw(descriptor,permit);if(!permit.claimed())permit.close();}
+                try(var next=admission.awaitRead(index+1)){}return result.get(5,TimeUnit.SECONDS);
+            }).get(5,TimeUnit.SECONDS);
         }
     }
     static RatisNativePoolSpec limited(UUID id,int maximum){var original=RatisPoolFixtures.spec(id,false);return new RatisNativePoolSpec(id,original.configuration(),maximum,original.images(),original.retention(),original.pins(),original.replicas(),original.resources(),original.maximumDurableMetadataBytes());}

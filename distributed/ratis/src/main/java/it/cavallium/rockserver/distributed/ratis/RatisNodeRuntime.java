@@ -46,11 +46,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private static final ServerFactory DEFAULT_SERVER_FACTORY=RatisNodeRuntime::buildServer;
     @FunctionalInterface interface SchemaReplicaClientFactory { RatisSchemaReplicaClient create() throws IOException; }
     @FunctionalInterface interface HomeClientFactory { RatisRoutedClient connect(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) throws IOException; }
-    public record ResourceLimits(RatisNodeResourceBudget.Limits node,RatisNodeResourceBudget.Limits pool,long maximumSourceImageDiskBytes,long maximumDurableMetadataBytes,long maximumOperatorCacheBytes,long maximumNativeCacheBytes,RatisCommittedApplyDispatcher.Policy committedApply,RatisDiskRunway.Policy diskRunway,RatisMigrationController.Policy migration) {
-        public ResourceLimits {Objects.requireNonNull(migration);if(migration.burstBytes()<org.apache.ratis.server.leader.MigrationLogStateMachine.MAX_TAIL_BYTES || migration.poolRecoveryBytes()<RatisTopologySourceSnapshotService.TRANSFER_BYTES)throw new IllegalArgumentException("Migration policy cannot admit legal log heads/recovery bulk");Objects.requireNonNull(committedApply);Objects.requireNonNull(diskRunway);if(maximumNativeCacheBytes<1 || maximumNativeCacheBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node native cache/WBM ceiling");if(maximumOperatorCacheBytes<1 || maximumOperatorCacheBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node operator cache ceiling");if(maximumDurableMetadataBytes<1 || maximumDurableMetadataBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid canonical node metadata ceiling");Objects.requireNonNull(node);Objects.requireNonNull(pool);if(maximumSourceImageDiskBytes<1 || maximumSourceImageDiskBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node source image disk budget");}
+    public record ResourceLimits(RatisNodeResourceBudget.Limits node,RatisNodeResourceBudget.Limits pool,long maximumSourceImageDiskBytes,long maximumDurableMetadataBytes,long maximumOperatorCacheBytes,long maximumNativeCacheBytes,RatisCommittedApplyDispatcher.Policy committedApply,RatisDiskRunway.Policy diskRunway,RatisMigrationController.Policy migration,RatisNativeExtentPolicy nativeExtents) {
+        public ResourceLimits {Objects.requireNonNull(nativeExtents);Objects.requireNonNull(migration);if(migration.burstBytes()<org.apache.ratis.server.leader.MigrationLogStateMachine.MAX_TAIL_BYTES || migration.poolRecoveryBytes()<RatisTopologySourceSnapshotService.TRANSFER_BYTES)throw new IllegalArgumentException("Migration policy cannot admit legal log heads/recovery bulk");Objects.requireNonNull(committedApply);Objects.requireNonNull(diskRunway);if(maximumNativeCacheBytes<1 || maximumNativeCacheBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node native cache/WBM ceiling");if(maximumOperatorCacheBytes<1 || maximumOperatorCacheBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node operator cache ceiling");if(maximumDurableMetadataBytes<1 || maximumDurableMetadataBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid canonical node metadata ceiling");Objects.requireNonNull(node);Objects.requireNonNull(pool);if(maximumSourceImageDiskBytes<1 || maximumSourceImageDiskBytes>RatisNodeResourceBudget.MAX_BYTES)throw new IllegalArgumentException("Invalid node source image disk budget");}
         public static ResourceLimits defaults() {
             return new ResourceLimits(new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(256L*1024*1024,1024),new RatisNodeResourceBudget.Lane(1L<<30,256)),
-                    new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,512),new RatisNodeResourceBudget.Lane(512L<<20,128)),1L<<30,1L<<40,16L<<30,16L<<30,RatisCommittedApplyDispatcher.Policy.defaults(),RatisDiskRunway.Policy.defaults(),RatisMigrationController.Policy.defaults());
+                    new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,512),new RatisNodeResourceBudget.Lane(512L<<20,128)),1L<<30,1L<<40,16L<<30,16L<<30,RatisCommittedApplyDispatcher.Policy.defaults(),RatisDiskRunway.Policy.defaults(),RatisMigrationController.Policy.defaults(),RatisNativeExtentPolicy.defaults());
         }
     }
     public record Settings(NativeRangeImage.Limits images,RatisRangeStateMachine.RetentionLimits retention,
@@ -123,6 +123,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisTopologyOwnerClient topologyOwners;private boolean topologyOwnersClosed;
     private long groupManagementCall;
     private final Set<UUID> virginSeedAdds=new HashSet<>();
+    private org.rocksdb.NativeExtentEnv nativeExtentEnv;private boolean nativeExtentBound;
     private final Map<UUID,PoolOwner> pools=new LinkedHashMap<>();private final Map<UUID,UUID> groupPools=new ConcurrentHashMap<>(); private RaftServer server; private RatisCatalogueClock clock;
     static RatisNodeResourceBudget.Limits poolResources(RatisNodeResourceBudget.Limits spec,RatisNodeResourceBudget.Limits ceiling){return new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(Math.min(spec.ordinary().bytes(),ceiling.ordinary().bytes()),Math.min(spec.ordinary().owners(),ceiling.ordinary().owners())),new RatisNodeResourceBudget.Lane(Math.min(spec.protectedLane().bytes(),ceiling.protectedLane().bytes()),Math.min(spec.protectedLane().owners(),ceiling.protectedLane().owners())));}
     private RatisMetadataClaims metadataClaims;
@@ -329,6 +330,44 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }}
         }}
     }
+    private static final List<String> NODE_DIRECTORIES=List.of("raft","sessions","recovery","schema-replicas","referenced-files","topology-exposure","topology-source-artifacts","retirement","topology-relocations");
+    private static final List<String> NODE_FILES=List.of("node.identity","node.lock","metadata-claims","native-extents.journal");
+    private record NativeExtentLayout(List<Path> directories,List<Path> roots) {}
+    private NativeExtentLayout nativeExtentLayout()throws IOException {
+        Path journal=root.resolve("native-extents.journal").toAbsolutePath().normalize();Path exports=root.resolve("exports").toAbsolutePath().normalize();
+        var reserved=new ArrayList<Path>();for(var directory:NODE_DIRECTORIES)reserved.add(root.resolve(directory).toAbsolutePath().normalize());
+        for(var name:NODE_FILES)for(var suffix:List.of("",".pending",".lock"))reserved.add(root.resolve(name+suffix).toAbsolutePath().normalize());
+        for(var spec:plan.pools().values()){var nativePath=spec.nativePath(root);reserved.add(nativePath.resolveSibling(nativePath.getFileName()+".operators").toAbsolutePath().normalize());}
+        var directories=new LinkedHashSet<Path>();var managed=new LinkedHashMap<UUID,List<Path>>();
+        for(var spec:plan.pools().values()){
+            var paths=new ArrayList<Path>();for(var value:RocksDBLoader.nativeExtentDirectories(spec.nativePath(root),spec.config())){var path=value.toAbsolutePath().normalize();requireNoSymlinks(path);directories.add(path);paths.add(path);}
+            paths.sort(Comparator.comparingInt(Path::getNameCount).thenComparing(Path::toString));var roots=new ArrayList<Path>();for(var path:paths)if(roots.stream().noneMatch(path::startsWith))roots.add(path);managed.put(spec.id(),List.copyOf(roots));
+        }
+        var roots=new ArrayList<Path>();for(var entry:managed.entrySet())for(var path:entry.getValue()){
+            for(var other:roots)if(path.startsWith(other)||other.startsWith(path))throw new IOException("Native roots overlap across physical pools");
+            if(exports.startsWith(path)||path.startsWith(exports)||journal.startsWith(path)||path.startsWith(journal))throw new IOException("Native pool root overlaps export root or extent journal");
+            for(var owned:reserved)if(path.startsWith(owned)||owned.startsWith(path))throw new IOException("Native pool root overlaps reserved node namespace: "+owned);
+            roots.add(path);
+        }
+        requireNoSymlinks(exports);requireNoSymlinks(journal);directories.add(exports);roots.add(exports);
+        if(roots.size()>128)throw new IOException("Native extent root count exceeds SDK bound");roots.sort(Comparator.comparing(Path::toString));return new NativeExtentLayout(List.copyOf(directories),List.copyOf(roots));
+    }
+    private void initializeNativeExtentEnv(Path identity,NativeExtentLayout layout)throws IOException {
+        Path journal=root.resolve("native-extents.journal").toAbsolutePath().normalize();
+        if(nativeExtentBound && !Files.isRegularFile(journal,LinkOption.NOFOLLOW_LINKS))throw new IOException("Original native extent journal is missing");
+        for(var path:layout.directories()){if(nativeExtentBound && !Files.isDirectory(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Established native extent directory is missing: "+path);createAndForceNativeDirectory(path);}
+        SessionJournalFiles.force(root);
+        try{nativeExtentEnv=new org.rocksdb.NativeExtentEnv(journal.toString(),layout.roots().stream().map(Path::toString).toList(),settings.resources().nativeExtents().limits());}
+        catch(org.rocksdb.RocksDBException failure){throw new IOException("Cannot bind original shared native extent environment",failure);}
+        if(!nativeExtentBound){nativeExtentBound=true;SessionJournalFiles.write(identity,identity(false),128);}
+    }
+    private static void createAndForceNativeDirectory(Path path)throws IOException {
+        var missing=new ArrayList<Path>();for(Path current=path;current!=null && !Files.exists(current,LinkOption.NOFOLLOW_LINKS);current=current.getParent())missing.add(current);
+        Files.createDirectories(path);requireNoSymlinks(path);SessionJournalFiles.force(path);
+        for(var created:missing){SessionJournalFiles.force(created);Path parent=created.getParent();if(parent!=null)SessionJournalFiles.force(parent);}
+        if(missing.isEmpty() && path.getParent()!=null)SessionJournalFiles.force(path.getParent());
+    }
+    private static void requireNoSymlinks(Path path)throws IOException{for(Path current=path;current!=null;current=current.getParent())if(Files.isSymbolicLink(current))throw new IOException("Native extent path contains a symlink: "+current);}
     private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory,SchemaReplicaClientFactory replicaFactory) throws IOException {
         Objects.requireNonNull(startup); Objects.requireNonNull(factory);
         if (!Files.isDirectory(root)) throw new IOException("Node root must already exist on durable storage");
@@ -342,9 +381,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
         lockChannel=FileChannel.open(root.resolve("node.lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
         try { lock=lockChannel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Node root already owned",owned); }
         if (lock==null) throw new IOException("Node root already owned");
+        var extentLayout=nativeExtentLayout();
         Path identity=root.resolve("node.identity"), logs=root.resolve("raft"), nativePath=root.resolve("native");
-        if (Files.exists(identity)) {
-            boolean exposed=identityExposed(SessionJournalFiles.read(identity,128));
+        if (Files.exists(identity,LinkOption.NOFOLLOW_LINKS)) {
+            int phase=identityPhase(SessionJournalFiles.read(identity,128));nativeExtentBound=phase>=1;boolean exposed=phase==2;
             if (!exposed && startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Interrupted initial placement requires explicit authorization to resume");
             if (exposed) {
                 for(var spec:plan.pools().values())if(!Files.isRegularFile(spec.nativePath(root).resolve("CURRENT")))throw new IOException("Established native pool state is missing; refuse empty-voter recovery: "+spec.id());
@@ -354,8 +394,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
             }
         } else {
             if (startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Node identity is absent; explicit placement initialization is required");
+            if(Files.exists(root.resolve("exports"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Unidentified source export authority must not be adopted");
+            for(var name:NODE_FILES)for(var suffix:List.of("",".pending",".lock")){if(name.equals("node.lock") && suffix.isEmpty())continue;if(Files.exists(root.resolve(name+suffix),LinkOption.NOFOLLOW_LINKS))throw new IOException("Unidentified node authority must not be adopted: "+name+suffix);}
             if(Files.exists(root.resolve("metadata-claims"),LinkOption.NOFOLLOW_LINKS) || Files.exists(root.resolve("metadata-claims.pending"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Unidentified metadata claims must not be adopted");
-            for (String directory:List.of("native","raft","sessions","recovery","schema-replicas","referenced-files","topology-exposure")) {
+            for (String directory:java.util.stream.Stream.concat(java.util.stream.Stream.of("native"),NODE_DIRECTORIES.stream()).toList()) {
                 Path path=root.resolve(directory);
                 if(directory.equals("native")){requireInitialPoolStaging(path);continue;}
                 if (Files.exists(path)) try (var entries=Files.list(path)) { if (entries.findAny().isPresent()) throw new IOException("Unidentified node data must not be adopted"); }
@@ -364,6 +406,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         for (String directory:List.of("native","raft","sessions","recovery","schema-replicas")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
         SessionJournalFiles.force(root);
+        initializeNativeExtentEnv(identity,extentLayout);
         captureHomes=snapshotHomes;
         var snapshotPlan=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME);
         if (snapshotPlan!=null) {
@@ -402,7 +445,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         var initialClaims=new ArrayList<RatisMetadataClaims.Claim>();for(var group:groups.raftGroups()){var id=group.getGroupId().getUuid();initialClaims.add(metadataClaim(plan.pools().get(groupPools.get(id)),id,groups.require(id).role()));}metadataClaims.reserve(initialClaims);
         for(var spec:plan.pools().values()){
             var bindings=new HashMap<UUID,String>();var schemas=new ArrayList<DistributedSchema>();for(var domain:plan.domains())if(domain.directory().ranges().stream().anyMatch(range->spec.id().equals(plan.poolId(range.groupId())) && plan.localGroups().stream().anyMatch(group->group.getGroupId().getUuid().equals(range.groupId())))){bindings.putAll(domain.columns());var schema=logicalSchemas.get(domain.domainId());if(schema!=null)schemas.add(schema);}var metadata=new HashMap<UUID,String>();for(var group:groups.raftGroups())if(spec.id().equals(groupPools.get(group.getGroupId().getUuid())))switch(groups.require(group.getGroupId().getUuid()).role()){case DATA->{}case CATALOGUE->{metadata.put(plan.catalogue().directoryColumn(),"catalogue-directory");metadata.put(plan.catalogue().sessionsColumn(),"catalogue-sessions");}case TRANSACTION_HOME,SNAPSHOT_HOME->{var home=plan.home(group.getGroupId().getUuid());metadata.put(home.column(),home.physicalName());}}
-            var nativePool=schemas.isEmpty()?DistributedStoragePool.open(spec.nativePath(root),spec.config(),LoggerFactory.getLogger(RatisNodeRuntime.class)):DistributedStoragePool.open(spec.nativePath(root),spec.config(),LoggerFactory.getLogger(RatisNodeRuntime.class),schemas,bindings,metadata);var owner=new PoolOwner(spec,nativePool);pools.put(spec.id(),owner);nativePool.configureSnapshotAdmission(owner.pins(),sharedSnapshots);initializePoolServices(owner);
+            var nativePool=DistributedStoragePool.open(spec.nativePath(root),spec.config(),LoggerFactory.getLogger(RatisNodeRuntime.class),schemas.isEmpty()?null:schemas,schemas.isEmpty()?null:bindings,schemas.isEmpty()?Map.of():metadata,nativeExtentEnv);var owner=new PoolOwner(spec,nativePool);pools.put(spec.id(),owner);nativePool.configureSnapshotAdmission(owner.pins(),sharedSnapshots);initializePoolServices(owner);
         }
         // Discover every pool before creating any Raft group; a group cannot silently move between databases.
         var discovered=new ArrayList<NativeTopologySeed>();for(var owner:pools.values()){for(var seed:owner.pool.topologySeeds()){for(var parent:seed.definition().parents())assignPool(parent.groupId(),owner.spec.id());for(var target:seed.definition().targets())assignPool(target.groupId(),owner.spec.id());discovered.add(seed);}for(var learner:owner.pool.topologyLearners()){assignPool(learner.definition().targets().getFirst().groupId(),owner.spec.id());}}
@@ -883,19 +926,21 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 && replica.peerId().equals(plan.peerId()) && replica.address().equals(plan.address())).findFirst().orElseThrow(() -> new IllegalArgumentException("DATA placement lacks this durable node replica identity"));
     }
     private byte[] identity(boolean exposed) {
-        return ByteBuffer.allocate(33).put((byte)(exposed ? 1 : 0)).put(plan.identityDigest()).array();
+        return ByteBuffer.allocate(33+RatisNativeExtentPolicy.BYTES).put((byte)(exposed?2:nativeExtentBound?1:0)).put(plan.identityDigest()).put(settings.resources().nativeExtents().encode()).array();
     }
     private void observeSchemaActivation(SchemaChange.Definition definition,NativeSchemaActivationProof proof) {
         groups.schemaActivated(definition,proof);data(definition.header().domainId()).refreshSchema(definition,proof);
     }
-    private boolean identityExposed(byte[] bytes) throws IOException {
-        if (bytes.length!=33) throw new IOException("Invalid node identity shape");
+    private boolean identityExposed(byte[] bytes)throws IOException{return identityPhase(bytes)==2;}
+    private int identityPhase(byte[] bytes) throws IOException {
+        if (bytes.length!=33+RatisNativeExtentPolicy.BYTES) throw new IOException("Invalid node identity shape");
         var input=ByteBuffer.wrap(bytes);
         int phase=input.get()&255;
-        if (phase>1) throw new IOException("Invalid node exposure phase");
+        if (phase>2) throw new IOException("Invalid node exposure phase");
         byte[] digest=new byte[32]; input.get(digest);
         if (!Arrays.equals(digest,plan.identityDigest())) throw new IOException("Node identity/schema/placement binding changed");
-        return phase==1;
+        byte[] policy=new byte[RatisNativeExtentPolicy.BYTES];input.get(policy);if(!Arrays.equals(policy,settings.resources().nativeExtents().encode()))throw new IOException("Original native extent policy changed");
+        return phase;
     }
     private boolean clockOwnerReady() {
         synchronized (this) { if (closeRequested || closed || serverClosed) return false; }
@@ -1082,6 +1127,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (importOwners!=null && !importOwnersClosed) { importOwners.close(); importOwnersClosed=true; }
             for(var owner:pools.values())if(!owner.closed){owner.pool.close();owner.closed=true;}poolClosed=true;
             for (var client:homeClients.values()) client.close();
+            if(nativeExtentEnv!=null){nativeExtentEnv.close();nativeExtentEnv=null;}
             if (lock!=null && lock.isValid()) lock.release(); if (lockChannel!=null) lockChannel.close();
             synchronized (this) { closed=true; }
         } finally { synchronized (this) { closing=false; } }

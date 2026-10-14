@@ -28,7 +28,8 @@ This section and the remaining gates at the end describe the current branch.
   Evidence: `/tmp/rockserver-233-main-native-startup-repair-gate.log` and
   `/tmp/rockserver-233-main-lost-current-repair-gate.log`.
   Native Env ownership and ordinary allocation admission are qualified at the
-  JNI boundary; shared node wiring and protected completion remain pending.
+  JNI boundary; shared node wiring is described below and protected completion
+  remains pending.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
@@ -36,8 +37,23 @@ This section and the remaining gates at the end describe the current branch.
   native SST export and cold reopen. Qualified bootstrap rejects foreign files
   throughout its configured directory forest before writing operator authority.
   All 19 core pool/WAL/close cases pass in
-  `/tmp/rockserver-native-env-node-integrated-gate.log`. Node lifecycle acceptance
-  is still pending its new fixtures and one existing lifecycle timeout.
+  `/tmp/rockserver-native-env-node-integrated-gate.log`.
+- One node-owned NativeExtentEnv now spans all pools and the shared native SST
+  export directory. The current manifest declares its limits directly; node
+  identity binds the original policy and distinguishes unbound, bound and exposed
+  initialization. Established owners cannot recreate a missing extent journal.
+  Native directories are validated against reserved node namespaces before
+  identity or directory effects, and fresh roots refuse retained export/journal
+  authority. The Env closes after actual pool/Options/background drain and before
+  the node lock. Seventy-four distinct controlled Ratis cases pass across the
+  namespace/runtime/manifest, native non-capacity, quota and cold-source gates.
+  Evidence: `/tmp/rockserver-native-env-node-namespace-gate.log`,
+  `/tmp/rockserver-native-env-node-quota-consumers-gate.log` (17 pass, five fixture
+  timeouts), and `/tmp/rockserver-native-env-source-cold-pressure-gate.log` (five
+  repaired cases pass). The shared-capacity case still exposes native source
+  `233bc576` reconciliation failure; its stricter NoSpace/no-write-effect assertion
+  remains pending the separately reviewed native repair. This is ordinary native
+  admission, not protected native completion or a physical-block quota.
 
 - The aggregate common connection routes the complete database domain roster,
   retains schema generations and uses durable point/bulk grants and rotating
