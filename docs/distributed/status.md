@@ -69,8 +69,14 @@ This section and the remaining gates at the end describe the current branch.
   metadata installation without increasing quotas. The build passes 233 steps;
   evidence is `actual-prepaid-full-copy.log` in the same output directory.
   The run exposed and fixed a dropped completion claim in `FileOptions` copying.
-  Shutdown, atomic failure rollback and qualified cold-cohort resolution remain
-  open, and this native working tree has not replaced the private JNI.
+  The repaired connected checkpoint passes 94 cases: 25 completion, 32 extent,
+  17 raw-writer and 20 flush cases. They include atomic precreate admission,
+  denied reservation with no SST, unknown Ready reply ownership, actual two-flush
+  shutdown drain and live/lost issuer barriers. Evidence is
+  `actual-producer-repaired-{completion,extent,flush}.log` and
+  `root-raw-repaired-full.log` in that output directory. Qualified cold-cohort
+  resolution and complete shared replay RAM/count admission remain open; this
+  native working tree has not replaced the private JNI.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
