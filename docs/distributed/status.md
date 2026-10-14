@@ -84,8 +84,8 @@ This section and the remaining gates at the end describe the current branch.
   a fatal resource error rather than skipped corruption. Five codec, 251 log and
   19 raw cases pass; evidence is `charged-codec-reader-streaming_uncompress_budget_test.log`
   and `charged-codec-reader-final-{log_test,raw_flush_test}.log` in that native output
-  directory. Batch/protection rows and retained memtables remain unaccounted for;
-  this does not establish the complete replay memory envelope.
+  directory. That gate does not qualify batch/protection rows or retained memtables;
+  it does not establish the complete replay memory envelope.
 - Native checkpoint `0bf907d` qualifies cold raw receipts against the recovered
   MANIFEST and referenced SSTs before retirement. Interrupted raw output replays
   its original WAL and forces replacement metadata before admitting a new WAL;
@@ -102,6 +102,17 @@ This section and the remaining gates at the end describe the current branch.
   output, complete replay memory admission and Java/JNI runtime
   qualification of this checkpoint remain pending. The installed private JNI is
   unchanged.
+  Native checkpoint `038afa9` additionally admits fresh replay batch copies and
+  protection storage through that same RAM policy before allocation, retaining
+  the charge until batch destruction. Controls count toward replay work without
+  consuming protection rows. The current GCC/libstdc++ ABI1 profile is qualified;
+  other allocation profiles are refused before raw operation. The 25 raw and 33
+  completion cases passed before the additional foreign-WAL record guard in
+  `replay-batch-memory-protection-{raw,completion}.log`. Timed/wide-column records
+  are now rejected before copying, while standalone cold reopening still succeeds;
+  all 26 raw cases pass in `raw-unsupported-recovery-final-suite.log`. That run
+  included frozen recovery-SST primitives that are not yet wired or qualified.
+  Retained memtable admission and the full node memory envelope remain pending.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
