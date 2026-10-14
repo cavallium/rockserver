@@ -64,6 +64,13 @@ This section and the remaining gates at the end describe the current branch.
   lifetime and budget-denial cases; evidence is `helper-merge-tests.json` in that
   same output directory. Producer, installer and cold-resolution wiring remain
   incomplete; these tests qualify the helper and existing primitives.
+  The connected native working tree now passes one actual ordinary-full flush:
+  reservation is observed before SST creation, followed by protected SST and
+  metadata installation without increasing quotas. The build passes 233 steps;
+  evidence is `actual-prepaid-full-copy.log` in the same output directory.
+  The run exposed and fixed a dropped completion claim in `FileOptions` copying.
+  Shutdown, atomic failure rollback and qualified cold-cohort resolution remain
+  open, and this native working tree has not replaced the private JNI.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
