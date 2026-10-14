@@ -135,6 +135,22 @@ This section and the remaining gates at the end describe the current branch.
   geometry is now covered at the writer and replay boundaries; completion control
   and full node resource bounds, final private JNI/wrapper integration and the
   broader distributed acceptance gates remain unfinished.
+- Native checkpoint `a3766d3` admits merged WAL batch storage before append,
+  using a fresh exact-capacity string and reserved protection rows owned by the
+  group's raw plan. Actual batch destruction precedes credit return. Normal and
+  pipelined protected queued writes survive cold reopen; injected merge allocation
+  failure leaves WAL and sequence state unchanged, returns credits, clears sync
+  markers and permits retry. Zero-row controls and WAL termination prefixes do
+  not change data protection mode. The raw profile refuses unqualified retained
+  persistent-state caching; standalone merge behavior remains available.
+  Current Debug source passes 479 selected cases: four WAL storage, 32 planner,
+  ten workspace, two grouping, 35 raw, 251 log, 29 batch, five codec,
+  36 XFS completion, 32 XFS extent, eight memtable-list, 14 DB/memtable,
+  20 flush and one table/memtable. Evidence is `wal-scratch-final-*.log`.
+  Static audit still finds uncharged retained WAL/MANIFEST aligned buffers and
+  post-Ready ledger snapshot/candidate/encoded-image amplification. No ENOMEM
+  failure was reproduced in those paths. Their captured control-memory envelope,
+  full node bounds and final private JNI/wrapper integration remain open.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
