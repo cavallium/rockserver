@@ -64,11 +64,12 @@ final class StartupIoController implements AutoCloseable {
                     long now = System.nanoTime();
                     for (var entry : samples.entrySet()) {
                         decisions.put(entry.getKey(), policies.computeIfAbsent(entry.getKey(), _ -> new StartupIoPolicy())
-                                .sample(entry.getValue(), now));
+                                .sampleRecorded(name, entry.getKey(), epoch, entry.getValue(), now));
                     }
                     for (var entry : budgets.entrySet()) {
                         int mask = storagePressureMask(storageWorkloads.getOrDefault(entry.getKey(), Set.of()), decisions);
                         entry.getValue().feedback(mask, epoch);
+                        StartupIoJfr.storage(name, entry.getKey(), epoch, mask, false);
                         statistics.get(entry.getKey()).set(entry.getValue().snapshot());
                     }
                     // A shared cache is paused if any of its users reports pressure.
@@ -85,8 +86,11 @@ final class StartupIoController implements AutoCloseable {
                 } catch (Throwable failure) {
                     if (failures.getAndIncrement() == 0)
                         LOG.warn("Startup I/O feedback failed for database '{}'", name, failure);
-                    for (var budget : budgets.values()) {
-                        try { budget.feedback(StartupIoPolicy.UNKNOWN | StartupIoPolicy.FOREGROUND, epoch); }
+                    for (var entry : budgets.entrySet()) {
+                        try {
+                            entry.getValue().feedback(StartupIoPolicy.UNKNOWN | StartupIoPolicy.FOREGROUND, epoch);
+                            StartupIoJfr.storage(name, entry.getKey(), epoch, StartupIoPolicy.UNKNOWN | StartupIoPolicy.FOREGROUND, true);
+                        }
                         catch (RuntimeException | LinkageError ignored) { }
                     }
                     for (var caches : workloadCaches.values()) for (var cache : caches) {

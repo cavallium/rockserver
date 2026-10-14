@@ -1,4 +1,5 @@
 module rockserver.core {
+	requires jdk.jfr;
 	requires rocksdbjni;
 	requires net.sourceforge.argparse4j;
 	requires org.jetbrains.annotations;

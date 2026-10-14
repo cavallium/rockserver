@@ -1,4 +1,5 @@
 module rockserver.core.test {
+	requires jdk.jfr;
 	requires java.desktop;
 	requires org.mongodb.bson;
 	requires jazzer.api;
