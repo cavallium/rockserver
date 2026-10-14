@@ -1558,9 +1558,21 @@ Thrift cases (`remote-common-transports-first-gate.log`,
 strict response validation, canonical batch digest and bounded typed result codec;
 its six new contract cases pass (`rust-remote-mutation-first-gate.log`). No socket
 or independent endpoint acceptance is established. Existing tokenless distributed
-mutation paths refuse before effects; their consumers/test workflows are being
-converted. Native grant renewal, bulk ordinal reclamation and disjoint request
+mutation paths refuse before effects; obsolete actor entry points are removed.
+All 36 focused direct/bulk/range/native-MERGE/reroute consumer cases pass using
+prepared identities and explicit ACK (`consumer-physical-first-gate.log`,
+`4201d3a`). Native grant renewal, bulk ordinal reclamation and disjoint request
 pipelining remain unfinished.
+
+Node-owned physical discovery now returns bounded qualified targets and actual
+per-CF scalar/comparator observations, without synthesizing a logical estimate
+from shared CFs. Process/pool-session/native-CF checks and actual native lifetime
+leases qualify metadata, selected-file compaction and deduplicated local
+flush/compact work. Queued pressure-denied jobs can retire during shutdown while
+running JNI remains owned until return. Nineteen physical/multi-domain/service
+cases pass (`physical-queued-stop-gate.log`, `0d33e7f`). This is an explicit local
+operator API; physical wire consumers and bounded full portable table properties
+remain unfinished.
 
 Topology catalogue retirement now requires exact ACTIVE state and fresh committed
 ACTIVATE quorum evidence for every target. The controller retains the original
