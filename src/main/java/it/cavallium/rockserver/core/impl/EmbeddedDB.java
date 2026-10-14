@@ -10131,84 +10131,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
     private static ColumnTableProperties aggregateTableProperties(Collection<TableProperties> tables) {
-        long tableCount = 0;
-        long dataSize = 0;
-        long indexSize = 0;
-        long indexPartitions = 0;
-        long topLevelIndexSize = 0;
-        long filterSize = 0;
-        long rawKeySize = 0;
-        long rawValueSize = 0;
-        long numDataBlocks = 0;
-        long numEntries = 0;
-        long numDeletions = 0;
-        long numMergeOperands = 0;
-        long numRangeDeletions = 0;
-        long slowCompressionEstimatedDataSize = 0;
-        long fastCompressionEstimatedDataSize = 0;
-        long oldestCreationTime = 0;
-        long newestCreationTime = 0;
-        long oldestKeyTime = 0;
-        Map<Long, Long> formatVersions = new HashMap<>();
-        Map<Long, Long> fixedKeyLengths = new HashMap<>();
-        Map<Long, Long> indexKeysAreUserKeys = new HashMap<>();
-        Map<Long, Long> indexValuesAreDeltaEncoded = new HashMap<>();
-        Map<Long, Long> columnFamilyIds = new HashMap<>();
-        Map<String, Long> filterPolicies = new HashMap<>();
-        Map<String, Long> comparators = new HashMap<>();
-        Map<String, Long> mergeOperators = new HashMap<>();
-        Map<String, Long> prefixExtractors = new HashMap<>();
-        Map<String, Long> propertyCollectors = new HashMap<>();
-        Map<String, Long> compressions = new HashMap<>();
-        for (var p : tables) {
-            tableCount = Math.addExact(tableCount, 1);
-            dataSize = Math.addExact(dataSize, checkedTableProperty(p.getDataSize()));
-            indexSize = Math.addExact(indexSize, checkedTableProperty(p.getIndexSize()));
-            indexPartitions = Math.addExact(indexPartitions, checkedTableProperty(p.getIndexPartitions()));
-            topLevelIndexSize = Math.addExact(topLevelIndexSize, checkedTableProperty(p.getTopLevelIndexSize()));
-            filterSize = Math.addExact(filterSize, checkedTableProperty(p.getFilterSize()));
-            rawKeySize = Math.addExact(rawKeySize, checkedTableProperty(p.getRawKeySize()));
-            rawValueSize = Math.addExact(rawValueSize, checkedTableProperty(p.getRawValueSize()));
-            numDataBlocks = Math.addExact(numDataBlocks, checkedTableProperty(p.getNumDataBlocks()));
-            numEntries = Math.addExact(numEntries, checkedTableProperty(p.getNumEntries()));
-            numDeletions = Math.addExact(numDeletions, checkedTableProperty(p.getNumDeletions()));
-            numMergeOperands = Math.addExact(numMergeOperands, checkedTableProperty(p.getNumMergeOperands()));
-            numRangeDeletions = Math.addExact(numRangeDeletions, checkedTableProperty(p.getNumRangeDeletions()));
-            slowCompressionEstimatedDataSize = Math.addExact(slowCompressionEstimatedDataSize, checkedTableProperty(p.getSlowCompressionEstimatedDataSize()));
-            fastCompressionEstimatedDataSize = Math.addExact(fastCompressionEstimatedDataSize, checkedTableProperty(p.getFastCompressionEstimatedDataSize()));
-            oldestCreationTime = minimumKnownTableTime(oldestCreationTime, checkedTableProperty(p.getCreationTime()));
-            newestCreationTime = Math.max(newestCreationTime, checkedTableProperty(p.getCreationTime()));
-            oldestKeyTime = minimumKnownTableTime(oldestKeyTime, checkedTableProperty(p.getOldestKeyTime()));
-            formatVersions.merge(checkedTableProperty(p.getFormatVersion()), 1L, Math::addExact);
-            fixedKeyLengths.merge(checkedTableProperty(p.getFixedKeyLen()), 1L, Math::addExact);
-            indexKeysAreUserKeys.merge(checkedTableProperty(p.getIndexKeyIsUserKey()), 1L, Math::addExact);
-            indexValuesAreDeltaEncoded.merge(checkedTableProperty(p.getIndexValueIsDeltaEncoded()), 1L, Math::addExact);
-            columnFamilyIds.merge(checkedTableProperty(p.getColumnFamilyId()), 1L, Math::addExact);
-            filterPolicies.merge(p.getFilterPolicyName() == null ? "" : p.getFilterPolicyName(), 1L, Math::addExact);
-            comparators.merge(p.getComparatorName() == null ? "" : p.getComparatorName(), 1L, Math::addExact);
-            mergeOperators.merge(p.getMergeOperatorName() == null ? "" : p.getMergeOperatorName(), 1L, Math::addExact);
-            prefixExtractors.merge(p.getPrefixExtractorName() == null ? "" : p.getPrefixExtractorName(), 1L, Math::addExact);
-            propertyCollectors.merge(p.getPropertyCollectorsNames() == null ? "" : p.getPropertyCollectorsNames(), 1L, Math::addExact);
-            compressions.merge(p.getCompressionName() == null ? "" : p.getCompressionName(), 1L, Math::addExact);
-        }
-        return new ColumnTableProperties(
-                tableCount, dataSize, indexSize, indexPartitions,
-                topLevelIndexSize, filterSize, rawKeySize, rawValueSize,
-                numDataBlocks, numEntries, numDeletions, numMergeOperands,
-                numRangeDeletions, slowCompressionEstimatedDataSize, fastCompressionEstimatedDataSize, oldestCreationTime,
-                newestCreationTime, oldestKeyTime, formatVersions, fixedKeyLengths,
-                indexKeysAreUserKeys, indexValuesAreDeltaEncoded, columnFamilyIds, filterPolicies,
-                comparators, mergeOperators, prefixExtractors, propertyCollectors,
-                compressions);
-    }
-
-    private static long checkedTableProperty(long value) {
-        if (value < 0) throw new ArithmeticException("Unsigned table property exceeds signed long range");
-        return value;
-    }
-
-    private static long minimumKnownTableTime(long a, long b) {
-        return a == 0 ? b : b == 0 ? a : Math.min(a, b);
+        var accumulator = new TablePropertiesAccumulator();
+        for (var properties : tables) accumulator.add(properties);
+        return accumulator.result();
     }
 
     private Mono<Map<String, ColumnTableProperties>> collectTablePropertiesMetrics() {
