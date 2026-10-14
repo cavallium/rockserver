@@ -58,6 +58,12 @@ This section and the remaining gates at the end describe the current branch.
   orchestration, ordered installation, cold raw-cohort resolution and retained
   source-owner barriers remain pending. This candidate has not replaced the
   installed private JNI or established protected completion in the node.
+  The subsequent `de6ed23` candidate integrates sealed preparation before output,
+  source RAM admission before bundle allocation and cancellation drain outside
+  the DB mutex. Its combined build and 90 cases pass, including five new source
+  lifetime and budget-denial cases; evidence is `helper-merge-tests.json` in that
+  same output directory. Producer, installer and cold-resolution wiring remain
+  incomplete; these tests qualify the helper and existing primitives.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
