@@ -1522,14 +1522,27 @@ versions and contextual asynchronous client dispatch. Two binary protocol/server
 and shared ensure-policy cases pass (`thrift-operator-gate.log`, commit `1ab5bc1`).
 Concrete socket-bound client execution is not covered by that fixture.
 
+Production range-import data clients now qualify each exact definition against
+the immutable validated import chain, including sources advanced by a preceding
+import. The bootstrap directory is no longer incorrectly required for every
+step. Two controlled data-client cases pass, including two successive imports,
+install/activation retry and wrong-definition/authority refusal
+(`topology-restore-chain-gate.log`, commit `a4533b9`). Actual restore service
+initialization, declared HOME/stream placement and final READY-route adoption
+remain under implementation.
+
 Topology catalogue retirement now requires exact ACTIVE state and fresh committed
 ACTIVATE quorum evidence for every target. The controller retains the original
 retirement command and ACK across lost replies. Seven controlled cases pass,
 including split, lost retirement reply/reopen, then merge in the same catalogue;
 the original parent receipt, read pin and history survive subsequent child writes
-(`topology-retirement-pump-gate.log`). Review found that immediate quorum
-retirement removed the only unfinished-owner driver; its repair must preserve
-that progress before the patch is accepted. Quorum retirement with asynchronous
+(`topology-retirement-pump-gate.log`). Review corrected immediate quorum
+retirement: ACTIVE retains its unfinished-owner driver, and both the retirement
+producer and deterministic validator require every configured target owner's
+SEED and ACTIVATE proof. The final combined gate passes 37 cases across topology,
+authority, import clients, restore controller/planner and quotas, including
+unavailable listener recovery before retirement
+(`topology-restore-chain-bootstrap-gate.log`). Quorum retirement with asynchronous
 lineage-safe catch-up, physical parent cleanup and its recovery barriers remain
 unfinished.
 

@@ -93,12 +93,22 @@ class RatisTopologyCatalogueWorkflowTest {
             reads=f.reads.get(); assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(publication).status()); assertEquals(reads,f.reads.get());
             f.progress(TopologyChange.Stage.ACTIVATE); active=f.state(); assertEquals(TopologyChange.Phase.ACTIVE,active.phase());
             assertArrayEquals(f.definition.targetDirectory().payloadDigest(),f.directory().payloadDigest());
-            var header=active.header(); var retired=active.retire(); var column=f.nativeOwner.outer.directoryColumn;
-            var retire=new DistributedCommand(f.nativeOwner.outer.catalogue,1,new byte[32],f.operation(),List.of(new Mutation(Mutation.Kind.PUT,column,RatisTopologyCatalogue.stateKey(header.intentId()),retired.encode()),new Mutation(Mutation.Kind.PUT,column,RatisTopologyCatalogue.headKey(header.domainId()),retired.encode())),List.of(
-                    new KeyPredicate(column,RatisTopologyCatalogue.stateKey(header.intentId()),active.encode()),new KeyPredicate(column,RatisTopologyCatalogue.headKey(header.domainId()),active.encode()),
-                    new KeyPredicate(column,ByteBuffer.allocate(16).putLong(header.domainId().getMostSignificantBits()).putLong(header.domainId().getLeastSignificantBits()).array(),RangeDirectoryCodec.encode(f.definition.targetDirectory())),
-                    new KeyPredicate(column,RatisTopologyCatalogue.identityKey(header.intentId()),f.definition.digest()),new KeyPredicate(column,RatisSchemaAdministration.headKey(header.domainId()),null),new KeyPredicate(column,RatisRangeImportCatalogue.headKey(header.domainId()),null)));
-            assertThrows(IllegalArgumentException.class,()->f.catalogue.execute(retire)); assertEquals(active,f.state());
+            var retire=f.catalogue.prepareRetirement(f.operation(),f.definition,active,null,null);
+            assertEquals(2,retire.mutations().size()); assertEquals(6,retire.predicates().size());
+            assertDoesNotThrow(()->f.nativeOwner.pure.accept(retire));
+            f.actual.clear(); assertThrows(IOException.class,()->f.catalogue.execute(retire)); assertEquals(active,f.state());
+            var firstTarget=active.header().targets().getFirst().groupId();
+            for(var activationProof:active.activated().values()) if(activationProof.groupId().equals(firstTarget)) f.provide(activationProof,new ApplyPosition(1,5));
+            assertThrows(IOException.class,()->f.catalogue.execute(retire)); assertEquals(active,f.state());
+            f.actual.clear();
+            for(var activationProof:active.activated().values()) f.provide(activationProof,new ApplyPosition(0,0));
+            assertThrows(IOException.class,()->f.catalogue.execute(retire)); assertEquals(active,f.state());
+            for(var activationProof:active.activated().values()) f.provide(activationProof,new ApplyPosition(1,5));
+            f.loseReply=true; assertThrows(IOException.class,()->f.catalogue.execute(retire));
+            reads=f.reads.get(); f.actual.clear(); assertEquals(CommandResult.Status.SUCCESS,f.catalogue.execute(retire).status()); assertEquals(reads,f.reads.get());
+            active=active.retire(); assertEquals(active,f.state());
+            assertArrayEquals(f.definition.encode(),f.catalogue.readDefinition(f.definition.digest()).encode());
+
         }
         try(var reopened=new Fixture()) { assertEquals(active,reopened.state()); assertArrayEquals(reopened.definition.targetDirectory().payloadDigest(),reopened.directory().payloadDigest()); }
     }

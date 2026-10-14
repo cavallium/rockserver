@@ -16,7 +16,8 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 public final class RatisTopologyController implements AutoCloseable {
     public static final int MAX_JOBS=8,MAX_STEPS=128;
     public static final long MAX_METADATA_BYTES=64L*1024*1024;
-    public enum Phase { DEFINITION, BEGIN, FENCING, FREEZE, FREEZE_PROOFS, SEED, SEED_PROOFS, PUBLISH, ACTIVATE, ACTIVATE_PROOFS, ACTIVE, CONFLICT }
+    public enum Phase { DEFINITION, BEGIN, FENCING, FREEZE, FREEZE_PROOFS, SEED, SEED_PROOFS, PUBLISH, ACTIVATE, ACTIVATE_PROOFS, ACTIVE, RETIRED, CONFLICT }
+    /** Retirement completes catalogue administration; pending owners and physical parent retention remain independent. */
     public record Progress(UUID intentId,Phase phase,TopologyChange.State state,int pendingOwners,boolean retirementBlocked) {}
     public interface DataPlane {
         NativeTopologyFreeze freeze(RatisTopologyFreezeRecord record) throws IOException;
@@ -79,7 +80,7 @@ public final class RatisTopologyController implements AutoCloseable {
             requireHandle(h); if(maxSteps<1 || maxSteps>MAX_STEPS) throw new IllegalArgumentException("Invalid topology step bound");
             for(int i=0;i<maxSteps;i++) {
                 if(h.fields.containsKey("pendingAck")) { acknowledge(h); continue; }
-                if(h.phase()==Phase.CONFLICT) throw new Conflict(); if(h.phase()==Phase.ACTIVE && pending(h)==0) break;
+                if(h.phase()==Phase.CONFLICT) throw new Conflict(); if(h.phase()==Phase.RETIRED) break;
                 if(h.fields.containsKey("pendingCommand")) { execute(h); continue; } step(h);
             }
             return new Progress(h.id,h.phase(),h.state(),pending(h),h.state().phase()==TopologyChange.Phase.ACTIVE);
@@ -125,7 +126,8 @@ public final class RatisTopologyController implements AutoCloseable {
                 else { value(h,"cursor",cursor+1); collect(h,TopologyChange.Stage.ACTIVATE,"actProofCursor",Phase.ACTIVATE_PROOFS); }
             }
             case ACTIVE -> {
-                if(cursor%3==0) { seedNode(h); value(h,"cursor",cursor+1); save(h); }
+                if(pending(h)==0) { freeze(h,catalogue.prepareRetirement(next(h),d,state,schema(h),imported(h)),Phase.RETIRED); execute(h); }
+                else if(cursor%3==0) { seedNode(h); value(h,"cursor",cursor+1); save(h); }
                 else if(cursor%3==1) { value(h,"cursor",cursor+1); collect(h,TopologyChange.Stage.SEED,"seedProofCursor",Phase.ACTIVE); }
                 else { value(h,"cursor",cursor+1); collect(h,TopologyChange.Stage.ACTIVATE,"actProofCursor",Phase.ACTIVE); }
             }

@@ -99,6 +99,19 @@ public final class RatisTopologyCatalogue {
         if(expected.phase()!=TopologyChange.Phase.SEEDED) throw new IllegalArgumentException("Topology publication requires exact SEEDED intent");
         return prepareProgress(operation,definition,expected,expected.publish(),schemaHead,importHead,true);
     }
+    /** Completes administration only; native parents and their receipt/lineage/pin references remain retained. */
+    public DistributedCommand prepareRetirement(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead) {
+        expected.requireDefinition(definition);
+        requireRetirementCoverage(expected);
+        return prepareProgress(operation,definition,expected,expected.retire(),schemaHead,importHead,false);
+    }
+    private static void requireRetirementCoverage(TopologyChange.State state) {
+        if(state.phase()!=TopologyChange.Phase.ACTIVE) throw new IllegalArgumentException("Topology retirement requires exact ACTIVE intent");
+        for(var target:state.header().targets()) for(var owner:target.owners()) {
+            var key=new TopologyChange.Key(target.groupId(),owner.replicaId());
+            if(!state.seeded().containsKey(key) || !state.activated().containsKey(key)) throw new IllegalArgumentException("Topology retirement waits for every configured target owner");
+        }
+    }
     private DistributedCommand prepareProgress(OperationId operation,TopologyChange.Definition definition,TopologyChange.State expected,TopologyChange.State next,RatisSchemaAdministration.Head schemaHead,RatisRangeImportCatalogue.Head importHead,boolean publication) {
         var header=next.header(); byte[] bytes=next.encode();
         var directory=expected.phase()==TopologyChange.Phase.PUBLISHED || expected.phase()==TopologyChange.Phase.ACTIVE ? definition.targetDirectory() : definition.sourceDirectory();
@@ -122,17 +135,18 @@ public final class RatisTopologyCatalogue {
         requireCurrentWitnesses(command,reader);
         var previous=TopologyChange.State.decode(command.predicates().getFirst().expectedValue()); var next=TopologyChange.State.decode(command.mutations().getFirst().value());
         var definition=TopologyChange.Definition.decode(reader.read(definitionKey(next.header().definitionDigest()))); next.requireDefinition(definition);
-        if(previous.phase()==TopologyChange.Phase.SEEDED && next.phase()==TopologyChange.Phase.PUBLISHED) {
+        if((previous.phase()==TopologyChange.Phase.SEEDED && next.phase()==TopologyChange.Phase.PUBLISHED) || (previous.phase()==TopologyChange.Phase.ACTIVE && next.phase()==TopologyChange.Phase.RETIRED)) {
+            boolean retirement=next.phase()==TopologyChange.Phase.RETIRED;
             for(var target:definition.header().targets()) {
                 int qualified=0; IOException unavailable=null;
                 for(var owner:target.owners()) {
                     if(owner.role()!=ReplicaDescriptor.Role.VOTER) continue;
-                    var proof=previous.seeded().get(new TopologyChange.Key(target.groupId(),owner.replicaId())); if(proof==null) continue;
+                    var proof=(retirement ? previous.activated() : previous.seeded()).get(new TopologyChange.Key(target.groupId(),owner.replicaId())); if(proof==null) continue;
                     try { requireQualified(proof,owners.read(definition,proof)); qualified++; }
                     catch(IOException invalid) { unavailable=invalid; }
                     if(qualified==target.quorum()) break;
                 }
-                if(qualified<target.quorum()) throw new IOException("Topology publication lacks fresh committed child SEED quorum",unavailable);
+                if(qualified<target.quorum()) throw new IOException(retirement ? "Topology retirement lacks fresh committed child ACTIVATE quorum" : "Topology publication lacks fresh committed child SEED quorum",unavailable);
             }
         } else {
             var proof=addedProof(previous,next); requireQualified(proof,owners.read(definition,proof));
@@ -212,6 +226,9 @@ public final class RatisTopologyCatalogue {
                     else throw new IllegalArgumentException("Invalid relocation execution step");
                 } else if(previous.phase()==TopologyChange.Phase.SEEDED && next.phase()==TopologyChange.Phase.PUBLISHED) {
                     if(command.mutations().size()!=3) throw new IllegalArgumentException("Topology publication must atomically replace its directory");
+                } else if(previous.phase()==TopologyChange.Phase.ACTIVE && next.phase()==TopologyChange.Phase.RETIRED) {
+                    if(command.mutations().size()!=2 || !next.equals(previous.retire())) throw new IllegalArgumentException("Topology retirement must retain original execution proofs");
+                    requireRetirementCoverage(previous);
                 } else {
                     if(command.mutations().size()!=2 || next.phase()==TopologyChange.Phase.RETIRED || previous.terminal()) throw new IllegalArgumentException("Topology terminal retention barriers are not configured");
                     var proof=addedProof(previous,next);
