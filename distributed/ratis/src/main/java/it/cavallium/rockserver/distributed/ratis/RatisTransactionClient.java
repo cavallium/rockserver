@@ -38,9 +38,13 @@ public final class RatisTransactionClient implements AutoCloseable {
     /** Infrastructure and grant maintenance are borrowed; only the bounded client wrappers are owned. */
     public RatisTransactionClient(DistributedSchema schema,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,
                                   RatisRoutedClient data,RWScheduler scheduler,Limits limits) {
+        this(schema,snapshotHomes,transactionHomes,data,scheduler,limits,RatisJournalAccess.standalone());
+    }
+    static RatisTransactionClient journalOwned(DistributedSchema schema,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisJournalAccess access){return new RatisTransactionClient(schema,snapshotHomes,transactionHomes,data,scheduler,limits,access);}
+    private RatisTransactionClient(DistributedSchema schema,RatisSnapshotFences snapshotHomes,RatisTransactionStatuses transactionHomes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisJournalAccess access) {
         this.schema=Objects.requireNonNull(schema); this.data=Objects.requireNonNull(data); Objects.requireNonNull(limits); data.requireKnownSchema(schema); directory=data.directory(schema);
-        snapshots=new RatisSnapshotClient(schema,snapshotHomes,data,scheduler,limits.snapshots(),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED);
-        commits=new RatisAtomicClient(schema,transactionHomes,data,scheduler,limits.commits());
+        snapshots=RatisSnapshotClient.journalOwned(schema,snapshotHomes,data,scheduler,limits.snapshots(),RatisSnapshotCaptureRequest.Mode.WRITE_CERTIFIED,access);
+        commits=RatisAtomicClient.journalOwned(schema,directory,transactionHomes,data,scheduler,limits.commits(),access);
     }
     public synchronized Lease open(Path snapshotPath,Path commitPath,Identity identity,TransactionScope scope,Duration ttl,RequestContext context) throws IOException {
         requireOpen(); Objects.requireNonNull(identity); Path capture=Objects.requireNonNull(snapshotPath).toAbsolutePath().normalize(),commit=Objects.requireNonNull(commitPath).toAbsolutePath().normalize();

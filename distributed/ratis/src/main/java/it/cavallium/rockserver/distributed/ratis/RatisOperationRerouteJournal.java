@@ -68,7 +68,7 @@ public final class RatisOperationRerouteJournal implements AutoCloseable {
             if(create)io.write(path,body,MAX_BYTES);else {
                 SessionJournalFiles.force(path);
                 if(Files.exists(pending,LinkOption.NOFOLLOW_LINKS)) {
-                    byte[] future=read(pending);
+                    byte[] future=access.read(pending,MAX_BYTES);
                     if(Arrays.equals(body,future))Files.delete(pending);
                     else if(origin==null) {
                         var pendingBody=ByteBuffer.wrap(future);pendingBody.position(44);blob(pendingBody,RangeDirectoryCodec.MAX_ENCODED_BYTES);blob(pendingBody,DistributedCommandCodec.MAX_ENCODED_BYTES);blob(pendingBody,RangeDirectoryCodec.MAX_ENCODED_BYTES);byte[] next=blob(pendingBody,OperationRerouteOrigin.MAX_BYTES,true);

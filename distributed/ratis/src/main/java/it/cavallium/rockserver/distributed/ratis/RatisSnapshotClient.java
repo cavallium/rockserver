@@ -38,7 +38,7 @@ public final class RatisSnapshotClient implements AutoCloseable {
     private final RatisSnapshotFences homes;
     private final RatisRoutedClient data;
     private final RWScheduler scheduler;
-    private final Limits limits;
+    private final Limits limits;private final RatisJournalAccess journalAccess;
     private final RatisSnapshotCaptureRequest.Mode mode;
     private final Map<Path,Lease> leases=new LinkedHashMap<>();
     private long chargedBytes;
@@ -48,6 +48,11 @@ public final class RatisSnapshotClient implements AutoCloseable {
         this(schema,homes,data,scheduler,limits,RatisSnapshotCaptureRequest.Mode.READ_ONLY);
     }
     RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode) {
+        this(schema,homes,data,scheduler,limits,mode,RatisJournalAccess.standalone());
+    }
+    static RatisSnapshotClient journalOwned(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access){return new RatisSnapshotClient(schema,homes,data,scheduler,limits,mode,access);}
+    private RatisSnapshotClient(DistributedSchema schema,RatisSnapshotFences homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access) {
+        journalAccess=Objects.requireNonNull(access);
         this.mode=Objects.requireNonNull(mode); this.schema=Objects.requireNonNull(schema); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); this.scheduler=Objects.requireNonNull(scheduler); this.limits=Objects.requireNonNull(limits);
         data.requireKnownSchema(schema); directory=data.directory(schema); homes.requireDatabaseBinding(schema.clusterId(),schema.databaseId());
     }
@@ -237,17 +242,17 @@ public final class RatisSnapshotClient implements AutoCloseable {
         }
         private void initialize() throws IOException {
             if (plan==null) {
-                var candidate=RatisDurableSnapshot.reopen(path,homes,data);
+                var candidate=RatisDurableSnapshot.reopenOwned(path,homes,data,journalAccess);
                 try { validateIdentity(candidate); journal=candidate; }
                 catch (Exception failure) { try { candidate.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Invalid snapshot client journal",failure); }
             } else {
                 if (!creationAttempted && Files.exists(path)) throw new IOException("Snapshot journal exists; reopen it"); creationAttempted=true;
                 var initial=SnapshotFenceStatus.begin(plan.fence()); var first=plan.fence().participants().stream().map(SnapshotFence.Participant::installOperation).min(Comparator.comparingLong(OperationId::sequence)).orElseThrow();
                 if (Files.exists(path)) {
-                    var candidate=RatisDurableSnapshot.reopen(path,homes,data);
+                    var candidate=RatisDurableSnapshot.reopenOwned(path,homes,data,journalAccess);
                     try { if (!candidate.snapshot().initial().equals(initial) || !ttl.equals(candidate.snapshot().requestedTtl())) throw new IOException("Uncertain snapshot publication changed its frozen definition/lifetime"); validateIdentity(candidate); journal=candidate; }
                     catch (Exception failure) { try { candidate.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } if (failure instanceof IOException io) throw io; throw new IOException("Invalid uncertain snapshot publication",failure); }
-                } else journal=RatisDurableSnapshot.create(path,homes,data,initial,homes.prepare(new OperationId(first.sessionId(),first.epoch(),first.sequence()+128),null,initial),plan.routes(),ttl,mode);
+                } else journal=RatisDurableSnapshot.createOwned(path,homes,data,initial,homes.prepare(new OperationId(first.sessionId(),first.epoch(),first.sequence()+128),null,initial),plan.routes(),ttl,mode,journalAccess);
                 plan=null;
             }
             ttl=journal.snapshot().requestedTtl();

@@ -12,11 +12,13 @@ import java.util.concurrent.CompletableFuture;
 
 /** Downloads exact node-owned artifacts through the original persisted snapshot owner. */
 public final class RatisRemoteExportSource implements RatisExportClient.ChunkSource {
+    private final RatisJournalAccess journalAccess;
     private final RatisSnapshotClient snapshots;
     private final RatisRoutedClient routed;
     private final Map<UUID,RatisExportJournal.Snapshot> bindings=new HashMap<>();
     private final Map<UUID,Set<UUID>> cleanup=new HashMap<>();
-    public RatisRemoteExportSource(RatisSnapshotClient snapshots,RatisRoutedClient routed) {
+    public RatisRemoteExportSource(RatisSnapshotClient snapshots,RatisRoutedClient routed,RatisJournalAccess journalAccess) {
+        this.journalAccess=Objects.requireNonNull(journalAccess);
         this.snapshots=Objects.requireNonNull(snapshots); this.routed=Objects.requireNonNull(routed);
     }
     @Override public synchronized void bind(RatisExportJournal.Snapshot saved) throws IOException {
@@ -63,7 +65,7 @@ public final class RatisRemoteExportSource implements RatisExportClient.ChunkSou
                 }
                 SessionJournalFiles.force(download.getParent());
             }
-            RatisExportJournal.publishDownload(request,descriptor,artifact);
+            RatisExportJournal.publishDownload(request,descriptor,artifact,journalAccess);
             return CompletableFuture.completedFuture(descriptor.nativeChunk(artifact));
         } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }
     }

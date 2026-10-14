@@ -50,7 +50,7 @@ public final class RatisDatabaseBackupFactory implements AutoCloseable {
                 var coordinator=new RatisSnapshotCoordinator(durable,a.homes(),a.routed(),last->{boundedControl(first,last);if(last.sequence()==first.sequence()+RatisSnapshotClient.CONTROL_SLOTS-1)throw new IOException("Backup HOME reservation exhausted");return new OperationId(last.sessionId(),last.epoch(),last.sequence()+1);},UUID::randomUUID,policy.retention());owners.add(coordinator);
                 UUID exportId=UUID.nameUUIDFromBytes((definition.backupId()+"/export/"+p.fence().fenceId()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 var export=new RatisExportJournal.Definition(exportId,p.fence(),d.directory().columns().stream().sorted(RangeDirectoryCodec.UUID_ORDER).toList(),source,client.identityDigest(),exports,policy.retention());
-                bindings.put(p.fence().fenceId(),new RatisDatabaseBackupDriver.Binding(durable,coordinator,a.routed(),job.resolve(p.fence().fenceId()+".export"),export,new RatisRemoteExportSource(client,a.routed())));
+                bindings.put(p.fence().fenceId(),new RatisDatabaseBackupDriver.Binding(durable,coordinator,a.routed(),job.resolve(p.fence().fenceId()+".export"),export,new RatisRemoteExportSource(client,a.routed(),RatisJournalAccess.standalone())));
             }
             if(!initializedBefore)SessionJournalFiles.write(initialized,definition.digest(),64);else{try(var file=FileChannel.open(initialized,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS)){file.force(true);}SessionJournalFiles.force(job);}
             var backend=new RatisSnapshotCohortClient(groups,restored::get);var driver=new RatisDatabaseBackupDriver(global,archive,authority,backend,operators,bindings);

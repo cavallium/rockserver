@@ -1613,9 +1613,19 @@ mandatory-path preflight precede new issuance. Batch preflight is atomic: denied
 plans retain no fresh metadata or promises and preserve prior unknown debt.
 Eleven focused inventory/native-session/budget cases pass, including denied path
 and disk plans with no issuance, same-budget retry and lost-reply exact cold grant
-recovery (`sdk-journal-atomic-preflight-gate.log`). Factory-root exclusion and live
-schema/CDC/export/ordinary transaction/snapshot journal propagation remain pending;
-this is not a complete backend-wide disk or whole-node RAM acceptance claim.
+recovery (`sdk-journal-atomic-preflight-gate.log`). Factory-root ownership now
+precedes inventory and HOME construction, remains shared with its connection, and
+releases after actual factory dependencies drain. Directory/inode admission avoids
+opening a duplicate marker channel that could release the original process lock.
+A child-JVM probe verifies OS exclusion after duplicate and hardlink-alias refusal
+and successful acquisition after final release. Schema, CDC, ordinary transaction,
+snapshot and export metadata producers now use the same explicit journal capability;
+export SST payloads retain their separate artifact policy. Thirty-two focused
+factory/inventory/session/export cases pass, including cold export ACK and forced
+metadata removal (`sdk-root-producer-refrozen-gate.log`). Another 81 cases pass
+across reroute, renewal, shared budgets, RANGE, connection cold recovery, schema,
+CDC and transaction/snapshot clients (`sdk-broad-journal-regression.log`). Existing client RAM
+policies remain separate; this does not prove a whole-node RAM envelope.
 A controlled native split now passes full connection close/reopen with the latest
 activated directory, exact old/new token lookup, another native write and no extra
 historical grants. The original forced generation binding is preserved; known

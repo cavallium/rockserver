@@ -17,6 +17,7 @@ final class RatisSchemaJobBridge implements AutoCloseable {
     private final RWScheduler clock;
     private final ClientFactory factory;
     private final RatisSchemaClient.TrustedOperatorResolver resolver;
+    private final RatisJournalAccess journalAccess;
     private final int maximumRequests,maximumQueued;
     private final long maximumBytes;
     private final ExecutorService lane;
@@ -36,16 +37,17 @@ final class RatisSchemaJobBridge implements AutoCloseable {
         Entry(UUID id,UUID domain,Kind kind,State state) { this.id=id;this.domain=Objects.requireNonNull(domain); this.kind=kind; this.state=state; }
         Status status() { return new Status(id,kind,state,phase,result); }
     }
-    RatisSchemaJobBridge(Path root,Path clientRoot,RWScheduler clock,ClientFactory factory,RatisSchemaClient.TrustedOperatorResolver resolver,Map<UUID,RatisRoutedClient> routed,int requests,int queued,long maximumBytes) throws IOException {
+    RatisSchemaJobBridge(Path root,Path clientRoot,RWScheduler clock,ClientFactory factory,RatisSchemaClient.TrustedOperatorResolver resolver,Map<UUID,RatisRoutedClient> routed,int requests,int queued,long maximumBytes,RatisJournalAccess journalAccess) throws IOException {
+        this.journalAccess=Objects.requireNonNull(journalAccess);
         this.routed=Map.copyOf(routed);if(routed.isEmpty())throw new IllegalArgumentException("Schema bridge requires declared domains");this.root=root; this.clientRoot=clientRoot; this.clock=clock; this.factory=factory; this.resolver=resolver; maximumRequests=requests; maximumQueued=queued; this.maximumBytes=maximumBytes;
         Files.createDirectories(root); Files.createDirectories(clientRoot);
         try (var files=Files.newDirectoryStream(root,"*.bridge")) {
-            for (var file:files) { if (entries.size()>=requests) throw new IOException("Schema request inventory exceeds connection limits"); var e=decode(SessionJournalFiles.read(file,4096)); if (!routed.containsKey(e.domain) || !file.getFileName().toString().equals(e.id+".bridge") || entries.putIfAbsent(e.id,e)!=null) throw new IOException("Invalid schema bridge identity"); if (e.state!=State.DONE && e.state!=State.ABORTED && e.state!=State.CONFLICT) e.state=Files.exists(clientPath(e.id),LinkOption.NOFOLLOW_LINKS) ? State.PAUSED : State.NOT_STARTED; }
+            for (var file:files) { if (entries.size()>=requests) throw new IOException("Schema request inventory exceeds connection limits"); var e=decode(journalAccess.read(file,4096)); if (!routed.containsKey(e.domain) || !file.getFileName().toString().equals(e.id+".bridge") || entries.putIfAbsent(e.id,e)!=null) throw new IOException("Invalid schema bridge identity"); if (e.state!=State.DONE && e.state!=State.ABORTED && e.state!=State.CONFLICT) e.state=Files.exists(clientPath(e.id),LinkOption.NOFOLLOW_LINKS) ? State.PAUSED : State.NOT_STARTED; }
         }
         try {
             for(var domain:routed.keySet()) {
                 select(domain);var data=routed.get(domain);var history=new ArrayList<Map.Entry<UUID,Long>>();
-                for(var entry:entries.values())if(entry.domain.equals(domain) && Files.exists(clientPath(entry.id),LinkOption.NOFOLLOW_LINKS)){var fields=RatisSchemaClientJournal.read(clientPath(entry.id));var definition=fields.get("definition");if(definition!=null)history.add(Map.entry(entry.id,it.cavallium.rockserver.core.common.distributed.SchemaChange.Definition.decode(definition).targetSchema().schemaEpoch()));}
+                for(var entry:entries.values())if(entry.domain.equals(domain) && Files.exists(clientPath(entry.id),LinkOption.NOFOLLOW_LINKS)){var fields=RatisSchemaClientJournal.readOwned(clientPath(entry.id),journalAccess);var definition=fields.get("definition");if(definition!=null)history.add(Map.entry(entry.id,it.cavallium.rockserver.core.common.distributed.SchemaChange.Definition.decode(definition).targetSchema().schemaEpoch()));}
                 history.sort(Map.Entry.comparingByValue());long bootstrapEpoch=data.directory().schemaEpoch();
                 for(var entry:history)if(entry.getValue()>bootstrapEpoch)try(var handle=client.reopen(entry.getKey(),resolver)){client.completed(handle);}
                 history.sort(Map.Entry.<UUID,Long>comparingByValue().reversed());
@@ -64,7 +66,7 @@ final class RatisSchemaJobBridge implements AutoCloseable {
             if (e==null || !file.equals(clientPath(e.id))) throw new IOException("Unowned initial schema checkpoint");
             if (e.cancelled || stopping || expired(e)) throw new CancellationException("Schema action did not reach its first durable checkpoint");
         }
-        RatisSchemaClientJournal.write(file,fields);
+        RatisSchemaClientJournal.writeOwned(file,fields,journalAccess);
     }
     RatisSchemaClient.TrustedOperatorResolver resolver() { return resolver; }
     CompletableFuture<Long> check(UUID domain,String name,byte[] hash,RequestContext context) {
@@ -135,7 +137,7 @@ final class RatisSchemaJobBridge implements AutoCloseable {
     @Override public void close() throws IOException { stop(); synchronized (this) { if (actual!=0) throw new IOException("Schema actual I/O remains active; ownership retained"); if (closed) return; } client.close(); lane.shutdown(); timer.shutdown(); synchronized (this) { closed=true; } }
     private void persist(Entry e) throws IOException {
         var out=new ByteArrayOutputStream(); try (var data=new DataOutputStream(out)) { data.writeLong(e.id.getMostSignificantBits()); data.writeLong(e.id.getLeastSignificantBits());data.writeLong(e.domain.getMostSignificantBits());data.writeLong(e.domain.getLeastSignificantBits()); data.writeUTF(e.kind.name()); data.writeUTF(e.state.name()); data.writeUTF(e.phase==null ? "" : e.phase.name()); data.writeBoolean(e.result!=null); if (e.result!=null) { data.writeLong(e.result.value()); data.writeBoolean(e.result.changed()); data.writeBoolean(e.result.aborted()); } }
-        SessionJournalFiles.write(root.resolve(e.id+".bridge"),out.toByteArray(),4096);
+        journalAccess.write(root.resolve(e.id+".bridge"),out.toByteArray(),4096);
     }
     private static Entry decode(byte[] bytes) throws IOException {
         try (var in=new DataInputStream(new ByteArrayInputStream(bytes))) { var e=new Entry(new UUID(in.readLong(),in.readLong()),new UUID(in.readLong(),in.readLong()),Kind.valueOf(in.readUTF()),State.valueOf(in.readUTF())); String phase=in.readUTF(); e.phase=phase.isEmpty() ? null : RatisSchemaClient.Phase.valueOf(phase); if (in.readBoolean()) e.result=new Result(e.id,e.kind,in.readLong(),in.readBoolean(),in.readBoolean()); if (in.read()!=-1) throw new IOException("Trailing schema bridge bytes"); return e; } catch (RuntimeException invalid) { throw new IOException("Invalid schema bridge record",invalid); }

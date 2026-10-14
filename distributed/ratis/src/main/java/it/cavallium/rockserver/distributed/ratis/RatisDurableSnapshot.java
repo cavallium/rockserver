@@ -36,7 +36,8 @@ public final class RatisDurableSnapshot implements AutoCloseable {
         ParticipantProgress progress() { return new ParticipantProgress(route,installFrozen,installReceipt,gate,ready,capture,token,certifiedHandle,captureLost,captureReleased,captureReleaseLost,releaseFrozen,releaseReceipt,retirementProof); }
     }
     @FunctionalInterface interface Persistence {void write(Path path,byte[] body,int maximum)throws IOException;}
-    Persistence persistence=SessionJournalFiles::write;
+    private final RatisJournalAccess journalAccess;
+    Persistence persistence;
     private final Path path;
     private final RatisSnapshotFences homes;
     private final RatisRoutedClient data;
@@ -68,8 +69,11 @@ public final class RatisDurableSnapshot implements AutoCloseable {
     }
     public static RatisDurableSnapshot create(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,
             RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode) throws IOException {
+        return createOwned(path,homes,data,initial,registration,routes,requestedTtl,mode,RatisJournalAccess.standalone());
+    }
+    static RatisDurableSnapshot createOwned(Path path,RatisSnapshotFences homes,RatisRoutedClient data,SnapshotFenceStatus initial,RatisRoutedClient.PreparedCommand registration,List<RangeDescriptor> routes,Duration requestedTtl,RatisSnapshotCaptureRequest.Mode mode,RatisJournalAccess access)throws IOException {
         requireTtl(requestedTtl,mode);
-        var journal=new RatisDurableSnapshot(path,homes,data,true);
+        var journal=new RatisDurableSnapshot(path,homes,data,true,access);
         journal.requestedTtl=requestedTtl; journal.captureMode=mode;journal.identity=dataBinding(data,mode);
         try {
             journal.initial=Objects.requireNonNull(initial);
@@ -91,8 +95,10 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             journal.capacity(); journal.persist(); return journal;
         } catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
-    public static RatisDurableSnapshot reopen(Path path,RatisSnapshotFences homes,RatisRoutedClient data) throws IOException { return new RatisDurableSnapshot(path,homes,data,false); }
-    private RatisDurableSnapshot(Path file,RatisSnapshotFences homes,RatisRoutedClient data,boolean create) throws IOException {
+    public static RatisDurableSnapshot reopen(Path path,RatisSnapshotFences homes,RatisRoutedClient data) throws IOException { return new RatisDurableSnapshot(path,homes,data,false,RatisJournalAccess.standalone()); }
+    static RatisDurableSnapshot reopenOwned(Path path,RatisSnapshotFences homes,RatisRoutedClient data,RatisJournalAccess access)throws IOException {return new RatisDurableSnapshot(path,homes,data,false,access);}
+    private RatisDurableSnapshot(Path file,RatisSnapshotFences homes,RatisRoutedClient data,boolean create,RatisJournalAccess access) throws IOException {
+        journalAccess=Objects.requireNonNull(access);persistence=access::write;access.register(file,MAX_BYTES);access.register(file.resolveSibling(file.getFileName()+".lock"),32);
         path=file.toAbsolutePath(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data); identity=data.sessionIdentityDigest(); homeIdentity=homes.identityDigest();
         if (!Files.isDirectory(path.getParent())) throw new IOException("Snapshot journal parent is absent");
         channel=FileChannel.open(path.resolveSibling(path.getFileName()+".lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE); FileLock acquired=null;
@@ -100,7 +106,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             try { acquired=channel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Snapshot journal already owned",owned); }
             if (acquired==null) throw new IOException("Snapshot journal already owned"); lock=acquired;
             if (create==Files.exists(path)) throw new IOException(create ? "Snapshot journal already exists" : "Snapshot journal absent");
-            if (!create) { byte[] body=SessionJournalFiles.read(path,MAX_BYTES); decode(body); capacity(); if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical snapshot journal"); SessionJournalFiles.force(path); SessionJournalFiles.force(path.getParent()); }
+            if (!create) { byte[] body=journalAccess.read(path,MAX_BYTES); decode(body); capacity(); if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical snapshot journal"); SessionJournalFiles.force(path); SessionJournalFiles.force(path.getParent()); }
         } catch (IOException | RuntimeException | Error failure) {
             try { if (acquired!=null) acquired.release(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure;
@@ -438,7 +444,7 @@ public final class RatisDurableSnapshot implements AutoCloseable {
             for (var entry:entries.values()) if ((entry.capture!=null || entry.token!=null || observed.progress(entry.route.groupId()).capture()!=null) && !entry.captureReleased && !entry.captureReleaseLost) throw new IllegalStateException("Snapshot capture pin is still owned or unresolved");
             body=encode(); active=true;
         }
-        try { SessionJournalFiles.remove(path,body,MAX_BYTES); synchronized (this) { reclaimed=true; } }
+        try { journalAccess.remove(path,body,MAX_BYTES,SessionJournalFiles.FILESYSTEM); synchronized (this) { reclaimed=true; } }
         catch (IOException | RuntimeException failure) { synchronized (this) { fenced=true; } if (failure instanceof IOException io) throw io; throw new IOException("Snapshot journal reclamation failed; reopen it",failure); }
         finally { end(); }
     }

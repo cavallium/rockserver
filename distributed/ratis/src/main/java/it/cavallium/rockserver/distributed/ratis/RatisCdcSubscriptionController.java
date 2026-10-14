@@ -23,6 +23,7 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
         private Conflict(String action) { super("Frozen CDC "+action+" command conflicted; reopen does not rebase it"); }
     }
     private enum Action { CREATE, DELIVER, ACK, HANDOFF, CLOSE }
+    private final RatisJournalAccess journalAccess;
     private final Path root;
     private final UUID cluster,database;
     private final RatisNodePlan.Catalogue binding;
@@ -51,6 +52,11 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
         @Override public void close() throws IOException { synchronized(RatisCdcSubscriptionController.this) { if(busy) throw new IOException("CDC I/O still active"); released=true; handles.remove(id,this); } }
     }
     public RatisCdcSubscriptionController(Path root,UUID cluster,UUID database,RatisNodePlan.Catalogue binding,RaftClient client,RatisRoutedClient routed) throws IOException {
+        this(root,cluster,database,binding,client,routed,RatisJournalAccess.standalone());
+    }
+    static RatisCdcSubscriptionController journalOwned(Path root,UUID cluster,UUID database,RatisNodePlan.Catalogue binding,RaftClient client,RatisRoutedClient routed,RatisJournalAccess access)throws IOException {return new RatisCdcSubscriptionController(root,cluster,database,binding,client,routed,access);}
+    private RatisCdcSubscriptionController(Path root,UUID cluster,UUID database,RatisNodePlan.Catalogue binding,RaftClient client,RatisRoutedClient routed,RatisJournalAccess access) throws IOException {
+        journalAccess=Objects.requireNonNull(access);access.register(root.resolve("cdc-controller.lock"),32);
         this.root=root.toAbsolutePath().normalize(); this.cluster=Objects.requireNonNull(cluster); this.database=Objects.requireNonNull(database);
         this.binding=Objects.requireNonNull(binding); this.client=Objects.requireNonNull(client); this.routed=Objects.requireNonNull(routed);
         var route=routed.directory(); if(!route.clusterId().equals(cluster) || !route.databaseId().equals(database)) throw new IllegalArgumentException("Foreign CDC routed database");
@@ -77,7 +83,7 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
             if(handles.containsKey(subscriptionId)) return handles.get(subscriptionId);
             if(handles.size()>=MAX_JOBS) throw new IOException("CDC handle capacity exhausted");
             final Handle h;
-            try { h=new Handle(subscriptionId,RatisSchemaClientJournal.read(path(subscriptionId))); validateRecovered(h); }
+            try { h=new Handle(subscriptionId,RatisSchemaClientJournal.readOwned(path(subscriptionId),journalAccess)); validateRecovered(h); }
             catch(RuntimeException malformed) { throw new IOException("Invalid retained CDC journal",malformed); }
             handles.put(subscriptionId,h); return h;
         } finally { end(); }
@@ -325,7 +331,7 @@ public final class RatisCdcSubscriptionController implements AutoCloseable {
     private static String text(Handle h,String key) { return new String(h.fields.get(key),StandardCharsets.UTF_8); }
     private static void text(Handle h,String key,String value) { h.fields.put(key,value.getBytes(StandardCharsets.UTF_8)); }
     private Path path(UUID id) { return root.resolve(id+".cdc"); }
-    private void save(Handle h) throws IOException { try { RatisSchemaClientJournal.write(path(h.id),h.fields); } catch(IOException failure) { fenced=true; throw failure; } }
+    private void save(Handle h) throws IOException { try { RatisSchemaClientJournal.writeOwned(path(h.id),h.fields,journalAccess); } catch(IOException failure) { fenced=true; throw failure; } }
     private synchronized void begin() throws IOException { if(closed || fenced || !lock.isValid()) throw new IOException("CDC controller closed/fenced; reopen original journal"); if(busy) throw new IOException("CDC I/O still active"); busy=true; }
     private synchronized void end() { busy=false; notifyAll(); }
     private void requireHandle(Handle h) { if(h==null || h.released || handles.get(h.id)!=h) throw new IllegalArgumentException("Foreign CDC handle"); }

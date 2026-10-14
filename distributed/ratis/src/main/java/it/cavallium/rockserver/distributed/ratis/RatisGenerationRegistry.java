@@ -95,7 +95,7 @@ final class RatisGenerationRegistry implements AutoCloseable {
             for(var id:List.copyOf(slots.keySet())) {
                 var path=requests.resolve(id+".request"); var slot=slots.get(id);
                 if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS)) { if(slot.checkpointed) throw new IOException("Original reserved schema request is missing"); slots.remove(id); }
-                else reconcile(id,RatisSchemaClientJournal.read(path));
+                else reconcile(id,RatisSchemaClientJournal.readOwned(path,access));
             }
             if(bindingCount()+slots.size()>maximum) throw new IOException("Recovered generations exceed connection capacity");
             persist();

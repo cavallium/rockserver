@@ -23,6 +23,7 @@ public final class RatisTransactionStatuses {
     void requireDirectoryBinding(RangeDirectory expected) {
         if (!Arrays.equals(routed.directory().payloadDigest(),expected.payloadDigest())) throw new IllegalArgumentException("Home reader differs from declared placement");
     }
+    long directoryBytes(){return RangeDirectoryCodec.encodedSize(routed.directory());}
     byte[] identityDigest() {
         var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }

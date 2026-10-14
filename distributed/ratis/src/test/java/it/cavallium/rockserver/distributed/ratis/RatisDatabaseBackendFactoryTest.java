@@ -181,10 +181,10 @@ class RatisDatabaseBackendFactoryTest {
         try(var fixture=new Fixture()) {
             Path owned=root.resolve("export-backend");long issued=fixture.nativeDomains.catalogue.epochs.read().nextEpoch();var borrowed=fixture.nativeDomains.client;
             var sourceAbsent=(org.apache.ratis.client.RaftClient)Proxy.newProxyInstance(org.apache.ratis.client.RaftClient.class.getClassLoader(),new Class<?>[]{org.apache.ratis.client.RaftClient.class},(proxy,method,args)->{if(method.getName().equals("getGroupId"))return borrowed.getGroupId();throw new AssertionError("Source-free export open attempted catalogue RPC: "+method);});
-            try(var factory=fixture.factory(owned,sourceAbsent)){var exports=factory.exports();assertSame(exports,factory.exports());assertThrows(java.nio.channels.OverlappingFileLockException.class,()->{try(var duplicate=fixture.factory(owned,sourceAbsent)){duplicate.exports();}});assertEquals(issued,fixture.nativeDomains.catalogue.epochs.read().nextEpoch());assertEquals(0,fixture.nativeDomains.catalogue.epochs.read().grants().size());assertFalse(Files.exists(owned.resolve("export-allocations")));factory.drainExports();}
-            assertEquals(4,fixture.transportCloses.get());for(var data:fixture.nativeDomains.data)assertNull(data.routed.read(data.column,new byte[]{7}));
+            try(var factory=fixture.factory(owned,sourceAbsent)){var exports=factory.exports();assertSame(exports,factory.exports());assertThrows(IOException.class,()->{try(var duplicate=fixture.factory(owned,sourceAbsent)){duplicate.exports();}});assertEquals(issued,fixture.nativeDomains.catalogue.epochs.read().nextEpoch());assertEquals(0,fixture.nativeDomains.catalogue.epochs.read().grants().size());assertFalse(Files.exists(owned.resolve("export-allocations")));factory.drainExports();}
+            assertEquals(2,fixture.transportCloses.get());for(var data:fixture.nativeDomains.data)assertNull(data.routed.read(data.column,new byte[]{7}));
             try(var factory=fixture.factory(owned,sourceAbsent)){assertNotNull(factory.exports());assertEquals(issued,fixture.nativeDomains.catalogue.epochs.read().nextEpoch());assertEquals(0,fixture.nativeDomains.catalogue.epochs.read().grants().size());assertFalse(Files.exists(owned.resolve("export-allocations")));}
-            assertEquals(6,fixture.transportCloses.get(),"The refused duplicate retires only its own HOME transports");
+            assertEquals(4,fixture.transportCloses.get(),"The refused duplicate never constructs HOME transports");
         }
     }
 

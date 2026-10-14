@@ -59,8 +59,8 @@ final class RatisRerouteReclamation {
     private void resume(long sequence,Verify verify,SessionJournalFiles.Removal removal,BeforeDelete before)throws IOException {
         Path marker=marker(sequence),pending=marker.resolveSibling(marker.getFileName()+".pending"),job=root.resolve(Long.toString(sequence));byte[] body;
         if(!Files.exists(marker,LinkOption.NOFOLLOW_LINKS)){
-            body=SessionJournalFiles.read(pending,MAX_BYTES);var manifest=decode(body);if(manifest.operation.sequence()!=sequence)throw new IOException("Pending reclamation changed sequence");verify.done(job);verifyImages(job,manifest,false);SessionJournalFiles.force(pending);Files.move(pending,marker,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(root);
-        }else{body=SessionJournalFiles.read(marker,MAX_BYTES);if(Files.exists(pending,LinkOption.NOFOLLOW_LINKS)){if(!Arrays.equals(body,SessionJournalFiles.read(pending,MAX_BYTES)))throw new IOException("Foreign pending reclamation");removal.delete(pending);removal.force(root);}}
+            body=access.read(pending,MAX_BYTES);var manifest=decode(body);if(manifest.operation.sequence()!=sequence)throw new IOException("Pending reclamation changed sequence");verify.done(job);verifyImages(job,manifest,false);SessionJournalFiles.force(pending);Files.move(pending,marker,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(root);
+        }else{body=access.read(marker,MAX_BYTES);if(Files.exists(pending,LinkOption.NOFOLLOW_LINKS)){if(!Arrays.equals(body,access.read(pending,MAX_BYTES)))throw new IOException("Foreign pending reclamation");removal.delete(pending);removal.force(root);}}
         var manifest=decode(body);if(manifest.operation.sequence()!=sequence)throw new IOException("Reclamation changed sequence");verifyImages(job,manifest,true);
         before.run(job);var channels=new ArrayList<FileChannel>();var locks=new ArrayList<FileLock>();
         try{
@@ -69,7 +69,7 @@ final class RatisRerouteReclamation {
             for(var image:manifest.files)if(!image.name.endsWith(".lock")){var path=job.resolve(image.name);if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){checkImage(path,image);removal.delete(path);removal.force(path.getParent());access.deleted(path);}}
         }finally{IOException failure=null;for(var channel:channels)try{channel.close();}catch(IOException cleanup){if(failure==null)failure=cleanup;else failure.addSuppressed(cleanup);}if(failure!=null)throw failure;}
         for(var image:manifest.files)if(image.name.endsWith(".lock")){var path=job.resolve(image.name);if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){checkImage(path,image);removal.delete(path);removal.force(path.getParent());access.deleted(path);}}
-        var bindings=job.resolve("bindings");if(Files.exists(bindings,LinkOption.NOFOLLOW_LINKS)){removal.delete(bindings);removal.force(job);}if(Files.exists(job,LinkOption.NOFOLLOW_LINKS)){removal.delete(job);removal.force(root);}access.remove(marker,body,MAX_BYTES,removal);
+        var bindings=job.resolve("bindings");if(Files.exists(bindings,LinkOption.NOFOLLOW_LINKS)){removal.delete(bindings);removal.force(job);}if(Files.exists(job,LinkOption.NOFOLLOW_LINKS)){removal.delete(job);removal.force(root);}access.reclaimedTree(job);access.remove(marker,body,MAX_BYTES,removal);
     }
     private void verifyImages(Path job,Manifest manifest,boolean missing)throws IOException {
         var expected=new HashMap<String,FileImage>();for(var image:manifest.files)expected.put(image.name,image);

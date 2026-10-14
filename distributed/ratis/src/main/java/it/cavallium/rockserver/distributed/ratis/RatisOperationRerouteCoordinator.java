@@ -89,8 +89,9 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
     private CommandResult resolve(Job job,RatisOperationRerouteJournal input,RequestContext context,RatisAtomicClient.InlineCheck check)throws IOException {
         requireSelected(job,input);
         if(job.published)return job.result;
-        check.check();Path issuing=job.directory.resolve("issuer.bin");
+        check.check();preflight(job,input,epochs.read());Path issuing=job.directory.resolve("issuer.bin");
         try(var issuer=Files.exists(issuing) ? RatisGrantIssuer.reopenOwned(issuing,epochs,access) : RatisGrantIssuer.createOwned(issuing,epochs,Math.addExact(epochs.read().logicalTimeMillis(),SessionEpochLedger.MAX_LIFETIME_MILLIS),access)) {
+            issuer.beforeIssue(next->preflight(job,input,next));
             for(int n=0;issuer.phase()!=RatisGrantIssuer.Phase.ISSUED && n<32;n++){check.check();var phase=issuer.step();if(phase==RatisGrantIssuer.Phase.EXPIRED || phase==RatisGrantIssuer.Phase.EXHAUSTED)throw new IOException("Reroute control grant unavailable; original allocation retained");}
             if(issuer.issued()==null)throw new IOException("Reroute issuance quantum incomplete");var controls=issuer.issued().grant();
             if(input.origin()==null) {
@@ -129,6 +130,26 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
             }
             check.check();routed.appendSourceOutcome(input.sourceDirectory(),job.publication,intents);job.result=CommandResult.decode(job.publication.result());job.published=true;job.persist();return job.result;
         }
+    }
+    private void preflight(Job job,RatisOperationRerouteJournal input,SessionEpochLedger ledger)throws IOException {
+        if(ledger==null)throw new IOException("Reroute issuance authority absent");var target=input.targetDirectory();var command=input.originalCommand();
+        var plan=command.acceptance()==null?RatisTransactionPlan.fromOriginal(target,command):null;var routes=plan==null?command.acceptance().scope().participants(target,TransactionStatus.MAX_PARTICIPANTS):plan.partitions().stream().map(p->p.route()).toList();
+        long commandBytes=DistributedCommandCodec.encodedSize(command),directoryBytes=RangeDirectoryCodec.encodedSize(target),sourceBytes=RangeDirectoryCodec.encodedSize(input.sourceDirectory());
+        long resultBytes=command.kind()==DistributedCommand.Kind.COMMIT_ACCEPTED || command.mutations().stream().allMatch(m->m.returnMode()==Mutation.ReturnMode.NONE)?8:CommandResult.MAX_BYTES;
+        long requestBytes=24+commandBytes+OperationRerouteOrigin.MAX_BYTES+directoryBytes+input.absence().freeze().encode().length+HomeIdentity.MAX_BYTES;
+        long stateBytes=Math.min(MAX_STATE_BYTES,256+HomeFenceProof.MAX_BYTES+2*requestBytes+3*resultBytes);
+        long evidence=20+commandBytes+sourceBytes+directoryBytes+RatisTopologyOperationOutcomeRpc.reply(input.absence()).length;
+        long partitionBytes=plan==null?0:plan.partitions().stream().mapToLong(p->DistributedCommandCodec.encodedSize(p.command())).sum();long atomicBytes=2*directoryBytes+4L*TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536+evidence+4*resultBytes+2*partitionBytes;
+        for(var route:routes)atomicBytes+=SessionWindowJournal.routeSize(route)+2L*ParticipantFinalization.MAX_BYTES+TransactionStatus.MAX_BYTES+2L*ParticipantFenceProof.MAX_BYTES+529;
+        if(atomicBytes+32>RatisDurableTransaction.MAX_BYTES)throw new IOException("Reroute future journal graph exceeds bounded capacity");
+        long ledgerBytes=72L+40L*Math.min(SessionEpochLedger.MAX_GRANTS,ledger.grants().size()+1);var paths=new ArrayList<RatisJournalAccess.Reservation>();
+        paths.add(new RatisJournalAccess.Reservation(job.directory.resolve("issuer.bin"),RatisGrantIssuer.MAX_BYTES,2*(2*ledgerBytes+4096)));paths.add(new RatisJournalAccess.Reservation(job.directory.resolve("issuer.bin.lock"),32,0));
+        paths.add(new RatisJournalAccess.Reservation(job.directory.resolve("owner.lock"),32,0));paths.add(new RatisJournalAccess.Reservation(job.state,MAX_STATE_BYTES,2*stateBytes));
+        paths.add(new RatisJournalAccess.Reservation(job.directory.resolve("input.bin"),RatisOperationRerouteJournal.MAX_BYTES,2*Math.min(RatisOperationRerouteJournal.MAX_BYTES,Files.size(job.directory.resolve("input.bin"))+OperationRerouteOrigin.MAX_BYTES)));
+        paths.add(new RatisJournalAccess.Reservation(job.directory.resolve("input.bin").resolveSibling(job.directory.resolve("input.bin").getFileName()+".lock"),32,0));paths.add(new RatisJournalAccess.Reservation(input.atomicPath(),RatisDurableTransaction.MAX_BYTES,plan==null?0:2*(atomicBytes+32)));paths.add(new RatisJournalAccess.Reservation(input.atomicPath().resolveSibling(input.atomicPath().getFileName()+".lock"),32,0));
+        Path bindings=job.directory.resolve("bindings");for(var route:routes)for(boolean control:List.of(true,false)){Path file=bindings.resolve(route.groupId()+"-"+control+".bin");paths.add(new RatisJournalAccess.Reservation(file,RatisSessionMaintenance.MAX_JOURNAL,2*Math.min(RatisSessionMaintenance.MAX_JOURNAL,SessionWindowJournal.routeSize(route)+2*ledgerBytes+4096)));paths.add(new RatisJournalAccess.Reservation(file.resolveSibling(file.getFileName()+".lock"),32,0));}
+        for(var name:List.of("home-control.bin","home-business.bin")){Path file=bindings.resolve(name);paths.add(new RatisJournalAccess.Reservation(file,RatisSessionMaintenance.MAX_JOURNAL,2*Math.min(RatisSessionMaintenance.MAX_JOURNAL,homes.directoryBytes()+2*ledgerBytes+4096)));paths.add(new RatisJournalAccess.Reservation(file.resolveSibling(file.getFileName()+".lock"),32,0));}
+        paths.add(new RatisJournalAccess.Reservation(root.resolve("reclaim-"+command.operationId().sequence()+".bin"),RatisRerouteReclamation.MAX_BYTES,2L*RatisRerouteReclamation.MAX_BYTES));access.preflight(paths);
     }
     private void bind(Job job,RatisOperationRerouteJournal input,SessionEpochLedger.Grant controls,TransactionStatus reserved,RatisAtomicClient.InlineCheck check)throws IOException {
         Path paths=Files.createDirectories(job.directory.resolve("bindings"));SessionJournalFiles.force(paths);SessionJournalFiles.force(job.directory);
