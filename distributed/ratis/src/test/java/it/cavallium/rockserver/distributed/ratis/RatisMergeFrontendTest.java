@@ -37,6 +37,7 @@ class RatisMergeFrontendTest {
     static <T> T await(CompletableFuture<T> value) throws Exception { return value.get(15,TimeUnit.SECONDS); }
     static void bytes(Buf actual,int... expected) { assertNotNull(actual); assertArrayEquals(value(expected).toByteArray(),actual.toByteArray()); }
     final class Fixture implements AutoCloseable {
+        final RatisPointFixtureBudget budget=new RatisPointFixtureBudget();
         final RatisAtomicClientTest.Fixture f;
         final DistributedSchema schema;
         final RatisTransactionClient transactions;
@@ -64,10 +65,12 @@ class RatisMergeFrontendTest {
             var transport=f.transport(); routed=new RatisRoutedClient(f.data.directory(),new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor route,UUID column,byte[] key) throws IOException { return transport.read(route,column,key); }
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { synchronized (sent) { sent.add(command); } var result=transport.command(route,command); if (lose.getAndSet(false)) throw new IOException("Lost native MERGE reply"); return result; }
+                public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException {synchronized(sent){sent.add(command);}return transport.commandAsync(route,command).thenApply(result->{if(lose.getAndSet(false))throw new CompletionException(new IOException("Lost native MERGE reply"));return result;});}
+                public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{return transport.transactionAsync(route,bytes,fresh);}
                 public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh) throws IOException { return transport.transaction(route,bytes,fresh); }
             });
             window=f.root.resolve("merge-window"); journal=f.root.resolve("merge-request"); session=RatisDurableSessionClient.create(window,routed,issuance,grant,RatisSessionClient.Limits.defaults());
-            direct=new RatisRocksDBDirect(schema,routed,session,f.scheduler,journal); adapter=new RatisRocksDBAdapter(schema,f.data.directory(),transactions,allocations,direct,null,new AtomicLong()::incrementAndGet);
+            direct=budget.open(schema,routed,session,f.scheduler,journal,window); adapter=new RatisRocksDBAdapter(schema,f.data.directory(),transactions,allocations,direct,null,new AtomicLong()::incrementAndGet);
         }
         DistributedSchema install(DistributedSchema source,long api,UUID column,String name,DistributedSchema.Operator operator,boolean bucket) throws Exception {
             var shape=ColumnSchema.of(IntArrayList.of(1),bucket ? ObjectArrayList.of(ColumnHashType.ALLSAME8) : ObjectArrayList.of(),true,operator.name(),operator.version(),operator.className());
@@ -85,7 +88,7 @@ class RatisMergeFrontendTest {
             }
             f.data.refreshSchema(definition,activated); lastDefinition=definition; lastActivation=activated; return target;
         }
-        @Override public void close() throws Exception { adapter.close(); if (!closedDirect) { direct.close(); session.close(); } routed.close(); transactions.close(); f.close(); }
+        @Override public void close() throws Exception { adapter.close(); if (!closedDirect) { direct.close(); session.close(); } routed.close(); transactions.close(); budget.close();f.close(); }
     }
     /** Test caller explicitly consumes bounded results and ACKs; production observer completion never does this. */
     static Object callerWriteAndAcknowledge(Fixture x,long column,List<Keys> keys,List<Buf> values,RatisRocksDBDirect.WriteKind kind,RequestType.RequestTypeId callback,boolean multi)throws Exception {
@@ -126,7 +129,7 @@ class RatisMergeFrontendTest {
             assertThrows(ExecutionException.class,() -> await(x.direct.execute(token,RequestContext.batch())));
             var pending=x.session.pending().getFirst(); byte[] original=DistributedCommandCodec.encode(pending.command()); assertEquals(RatisRocksDBDirect.RecoveryState.PENDING,x.direct.recoveryState());
             x.direct.close(); x.session.close(); x.closedDirect=true;
-            try (var session=RatisDurableSessionClient.reopen(x.window,x.routed); var direct=new RatisRocksDBDirect(x.schema,x.routed,session,x.f.scheduler,x.journal)) {
+            try (var session=RatisDurableSessionClient.reopen(x.window,x.routed); var direct=x.budget.open(x.schema,x.routed,session,x.f.scheduler,x.journal,x.window)) {
                 assertThrows(ExecutionException.class,() -> await(direct.prepareSequence(direct.owner(),token.requestId(),token.requestSequence(),75,List.of(key(2)),List.of(value(3)),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,false,RequestContext.batch())));
                 bytes((Buf)await(direct.execute(token,RequestContext.batch())),1,2);assertTrue(session.pending().isEmpty());assertEquals(RatisRocksDBDirect.RecoveryState.COMPLETE,direct.recoveryState());direct.acknowledgeResult(token,direct.status(token).resultDigest());assertEquals(RatisRocksDBDirect.RecoveryState.NONE,direct.recoveryState());
                 synchronized (x.sent) { var retry=x.sent.getLast(); assertArrayEquals(original,DistributedCommandCodec.encode(retry)); }
@@ -143,14 +146,11 @@ class RatisMergeFrontendTest {
             assertTrue(x.session.pending().stream().allMatch(RatisDurableSessionClient.Pending::consumed)); x.session.close(); x.closedDirect=true;
             var operator=x.schema.column(75).operator(); x.install(x.schema,77,new UUID(310,77),"later-merge",operator,false); x.routed.refreshSchema(x.lastDefinition,x.lastActivation);
             int before=x.sent.size();
-            try (var session=RatisDurableSessionClient.reopen(x.window,x.routed); var direct=new RatisRocksDBDirect(x.schema,x.routed,session,x.f.scheduler,x.journal)) {
+            try (var session=RatisDurableSessionClient.reopen(x.window,x.routed); var direct=x.budget.open(x.schema,x.routed,session,x.f.scheduler,x.journal,x.window)) {
                 assertEquals(RatisRocksDBDirect.RecoveryState.PENDING,direct.recoveryState());
                 var failure=assertThrows(ExecutionException.class,() -> await(direct.execute(token,RequestContext.batch())));
                 assertEquals(RocksDBException.RocksDBErrorType.COMMIT_FAILED,assertInstanceOf(RocksDBException.class,failure.getCause()).getErrorUniqueId());
-                assertTrue(failure.getCause().getMessage().contains("1 applied prefix items")); assertEquals(before,x.sent.size());assertEquals(CommandResult.Status.STALE_SCHEMA,direct.status(token).outcome());assertEquals(RatisRocksDBDirect.RecoveryState.COMPLETE,direct.recoveryState());direct.acknowledgeResult(token,direct.status(token).resultDigest());assertEquals(RatisRocksDBDirect.RecoveryState.NONE,direct.recoveryState());
-            }
-            try (var journal=new RatisDirectRequestJournal(x.journal,binding)) {
-                assertEquals(CommandResult.Status.STALE_SCHEMA,journal.request().unsubmittedStatus); assertEquals(1,journal.request().cursor()); assertArrayEquals(new byte[]{1,2},journal.request().results.getFirst().value(0)); assertNull(journal.request().pending);
+                assertTrue(failure.getCause().getMessage().contains("1 applied prefix items")); assertEquals(before,x.sent.size());assertEquals(CommandResult.Status.STALE_SCHEMA,direct.status(token).outcome());assertEquals(1,direct.status(token).appliedMutations());assertArrayEquals(new byte[]{1,2},CommandResult.decode(direct.resultPage(token,0,1,CommandResult.MAX_BYTES).getFirst()).value(0));assertEquals(RatisRocksDBDirect.RecoveryState.COMPLETE,direct.recoveryState());direct.acknowledgeResult(token,direct.status(token).resultDigest());assertEquals(RatisRocksDBDirect.RecoveryState.NONE,direct.recoveryState());
             }
             var encoded=x.schema.encodeLogicalKey(x.schema.column(75).columnId(),key(2)); assertArrayEquals(new byte[]{1,2},x.routed.read(x.schema.column(75).columnId(),encoded.physicalKey()));
             assertNull(x.routed.read(x.schema.column(75).columnId(),x.schema.encodeLogicalKey(x.schema.column(75).columnId(),key(200)).physicalKey()));

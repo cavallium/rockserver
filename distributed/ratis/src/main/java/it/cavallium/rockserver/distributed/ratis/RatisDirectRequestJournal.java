@@ -37,6 +37,7 @@ final class RatisDirectRequestJournal implements AutoCloseable {
             if (Files.exists(this.path)) { byte[] body=SessionJournalFiles.read(this.path,MAX_BYTES); request=decode(body); if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical direct journal"); SessionJournalFiles.force(this.path); SessionJournalFiles.force(this.path.getParent()); }
         } catch (IOException | RuntimeException | Error failure) { try { if (acquired!=null) acquired.release(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
+    void retire() throws IOException {requireOpen();if(request==null)return;try{SessionJournalFiles.remove(path,encode(),MAX_BYTES);request=null;}catch(IOException failure){fenced=true;throw failure;}}
     Request request() throws IOException { requireOpen(); return request; }
     void begin(Request next) throws IOException { requireOpen(); validate(next); request=next; persist(); }
     void bind(OperationId operation) throws IOException { requireOpen(); if (request.pending!=null || request.terminal()) throw new IOException("Direct pending binding changed"); request.pending=operation; request.pendingIndex=request.cursor(); persist(); }
@@ -110,5 +111,5 @@ final class RatisDirectRequestJournal implements AutoCloseable {
     private static byte[] blob(ByteBuffer in,int maximum) throws IOException { int size=in.getInt(); if (size<0 || size>maximum || size>in.remaining()) throw new IOException("Invalid direct journal blob"); byte[] value=new byte[size]; in.get(value); return value; }
     private static boolean flag(ByteBuffer in) throws IOException { int flag=in.get() & 255; if (flag>1) throw new IOException("Invalid direct journal flag"); return flag==1; }
     private void requireOpen() throws IOException { if (closed || fenced || !lock.isValid()) throw new IOException("Direct journal closed/fenced; reopen it"); }
-    public void close() throws IOException { if (closed && !channel.isOpen()) return; closed=true; try { if (lock.isValid()) lock.release(); } finally { channel.close(); } }
+    public void close() throws IOException { if (closed && !channel.isOpen()) return; closed=true; request=null; try { if (lock.isValid()) lock.release(); } finally { channel.close(); } }
 }

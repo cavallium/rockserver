@@ -136,6 +136,25 @@ public final class RatisDurableSessionClient implements AutoCloseable {
             try { requireOpen(); checkpoint(); pending.result=result; return result; } finally { lane.unlock(); }
         } finally { lane.lock(); try { pending.executing=false; active--; } finally { lane.unlock(); } }
     }
+    CompletableFuture<CommandResult> executeAsync(Pending pending,RequestContext context,RatisAtomicClient.InlineCheck check,Executor checkpoints,RatisRequestBudget budget){
+        lane.lock();try{requireOpen();owned(pending);if(pending.awaitingAcceptance)throw new IllegalStateException("Durable intent has not been accepted");if(pending.result!=null)return CompletableFuture.completedFuture(pending.result);if(pending.executing)throw new IOException("This durable operation is already executing");pending.executing=true;active++;}catch(Exception failure){return CompletableFuture.failedFuture(failure);}finally{lane.unlock();}
+        var result=new CompletableFuture<CommandResult>();CompletableFuture<Void> recovery;
+        if(reroutes==null || !recoveryPending)recovery=CompletableFuture.completedFuture(null);else recovery=budget.recover(() -> {recoverReroutesOwned(context,check,true,budget);return null;});
+        recovery.thenCompose(ignored -> client.executeAsync(pending.pending)).handle((value,failure) -> {
+            Throwable cause=unwrap(failure);if(cause instanceof RatisRoutedClient.OriginalOperationAbsent && reroutes!=null)return budget.recover(() -> client.execute(pending.pending,original -> reroutes.executeOwned(original,context,check,budget)));
+            return cause==null?CompletableFuture.completedFuture(value):CompletableFuture.<CommandResult>failedFuture(cause);
+        }).thenCompose(stage -> stage).whenComplete((value,failure) -> {
+            final Throwable problem=unwrap(failure);
+            Runnable checkpoint=() -> {Throwable failed=problem;lane.lock();try{if(failed==null){requireOpen();checkpoint();pending.result=value;}}catch(Throwable error){failed=error;}finally{pending.executing=false;active--;lane.unlock();}if(failed==null)result.complete(value);else result.completeExceptionally(failed);};
+            try{checkpoints.execute(checkpoint);}catch(RuntimeException rejected){lane.lock();try{fenced=true;pending.executing=false;active--;}finally{lane.unlock();}result.completeExceptionally(rejected);}
+        });return result.copy();
+    }
+    CompletableFuture<Void> recoverReroutesAsync(RequestContext context,RatisAtomicClient.InlineCheck check,RatisRequestBudget budget){if(reroutes==null)return CompletableFuture.completedFuture(null);return budget.recover(() -> {recoverReroutesOwned(context,check,false,budget);return null;});}
+    private void recoverReroutesOwned(RequestContext context,RatisAtomicClient.InlineCheck check,boolean onlyPending,RatisRequestBudget budget)throws IOException {
+        lane.lock();try{requireOpen();if(reroutes==null || onlyPending && !recoveryPending)return;active++;}finally{lane.unlock();}
+        try{reroutes.recoverConsumedOwned(this,context,check,budget);lane.lock();try{recoveryPending=false;}finally{lane.unlock();}}finally{lane.lock();try{active--;}finally{lane.unlock();}}
+    }
+    private static Throwable unwrap(Throwable failure){while((failure instanceof CompletionException || failure instanceof ExecutionException) && failure.getCause()!=null)failure=failure.getCause();return failure;}
     /** Application must durably consume the returned outcome first. Persist consumption before any later piggyback ACK. */
     public void acknowledge(Pending pending) throws IOException {
         if(reroutes==null){acknowledgeLocally(pending);return;}admitted(()->{acknowledge(pending,RequestContext.batch(),()->{});return null;});

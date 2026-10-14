@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.distributed.ratis;
 
+import java.util.concurrent.CompletableFuture;
+
 import it.cavallium.rockserver.core.common.distributed.*;
 
 import java.io.IOException;
@@ -241,6 +243,16 @@ public final class RatisSessionClient {
         } finally {
             synchronized (this) { entry.executing=false; }
         }
+    }
+    @FunctionalInterface interface AsyncExecution { CompletableFuture<CommandResult> execute(RatisRoutedClient.PreparedCommand original)throws IOException; }
+    /** Actual RPC lifetime is independent of cancellation of the returned observer. */
+    public CompletableFuture<CommandResult> executeAsync(Pending entry){return executeAsync(entry,routed::executeAsync);}
+    CompletableFuture<CommandResult> executeAsync(Pending entry,AsyncExecution execution){
+        try {synchronized(this){requireOwner(entry);if(entry.awaitingAcceptance)throw new IllegalStateException("Transaction intent has not been accepted");if(entry.result!=null)return CompletableFuture.completedFuture(entry.result);if(entry.executing)throw new IOException("This session operation is already executing");entry.executing=true;}}
+        catch(Exception failure){return CompletableFuture.failedFuture(failure);}
+        var result=new CompletableFuture<CommandResult>();final CompletableFuture<CommandResult> actual;
+        try {actual=Objects.requireNonNull(execution.execute(entry.prepared));}catch(Throwable failure){synchronized(this){entry.executing=false;}return CompletableFuture.failedFuture(failure);}
+        actual.whenComplete((value,failure) -> {try {if(failure==null){if(value==null)throw new IOException("Missing session outcome");validateResult(entry.command(),value);synchronized(this){entry.result=value;}}}catch(Throwable invalid){failure=invalid;}finally{synchronized(this){entry.executing=false;}}if(failure==null)result.complete(value);else result.completeExceptionally(failure);});return result.copy();
     }
     /** Call only after the application has durably consumed the returned outcome, including conflicts. */
     public synchronized void acknowledge(Pending entry) {

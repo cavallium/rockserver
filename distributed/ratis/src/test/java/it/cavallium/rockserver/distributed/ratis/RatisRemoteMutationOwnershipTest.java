@@ -21,13 +21,13 @@ class RatisRemoteMutationOwnershipTest {
             assertEquals(0,x.writes.size());assertEquals(RemoteMutationStatus.State.PREPARED,x.direct.status(token).state());
             x.lose.set(true);assertThrows(ExecutionException.class,() -> x.direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS));var original=x.session.pending().getFirst().command().operationId();
             x.abandoned=true;x.direct.close();x.session.close();
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=new RatisRocksDBDirect(x.f.schema,x.routed,session,x.f.scheduler,x.journal)) {
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=x.budget.open(x.f.schema,x.routed,session,x.f.scheduler,x.journal,x.window)) {
                 assertNull(direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS));assertEquals(original,x.writes.getLast());int effects=x.f.writes();
                 assertEquals(RemoteMutationStatus.State.TERMINAL,direct.status(token).state());assertEquals(1,direct.resultPage(token,0,1,CommandResult.MAX_BYTES).size());
                 assertThrows(ExecutionException.class,() -> direct.prepareSequence(owner,request,0,71,List.of(key),List.of(RatisAtomicClientTest.value(8)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.PREVIOUS,false,RequestContext.batch()).get(10,TimeUnit.SECONDS));
                 assertThrows(IOException.class,() -> direct.acknowledgeResult(token,new byte[32]));direct.acknowledgeResult(token,direct.status(token).resultDigest());assertEquals(effects,x.f.writes());
             }
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=new RatisRocksDBDirect(x.f.schema,x.routed,session,x.f.scheduler,x.journal)) {
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=x.budget.open(x.f.schema,x.routed,session,x.f.scheduler,x.journal,x.window)) {
                 assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,direct.status(token).state());direct.acknowledgeResult(token,direct.status(token).resultDigest());assertThrows(ExecutionException.class,() -> direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS));
                 var next=direct.prepareSequence(owner,UUID.randomUUID(),1,71,List.of(key),List.of(value),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.PREVIOUS,false,RequestContext.batch()).get(10,TimeUnit.SECONDS);
                 assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,direct.status(token).state());assertArrayEquals(new byte[]{9},((it.cavallium.buffer.Buf)direct.execute(next,RequestContext.batch()).get(10,TimeUnit.SECONDS)).toByteArray());
@@ -63,11 +63,11 @@ class RatisRemoteMutationOwnershipTest {
             var token=x.direct.prepareSequence(owner,request,0,75,List.of(key,key),List.of(RatisMergeFrontendTest.value(1),RatisMergeFrontendTest.value(2)),RatisRocksDBDirect.WriteKind.MERGE,RequestType.RequestTypeId.MERGED,true,RequestContext.batch()).get(15,TimeUnit.SECONDS);
             assertTrue(x.sent.isEmpty());x.lose.set(true);assertThrows(ExecutionException.class,() -> x.direct.execute(token,RequestContext.batch()).get(15,TimeUnit.SECONDS));x.direct.close();x.session.close();x.closedDirect=true;
             byte[] acknowledged;
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=new RatisRocksDBDirect(x.schema,x.routed,session,x.f.scheduler,x.journal)) {
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=x.budget.open(x.schema,x.routed,session,x.f.scheduler,x.journal,x.window)) {
                 var result=(List<?>)direct.execute(token,RequestContext.batch()).get(15,TimeUnit.SECONDS);assertArrayEquals(new byte[]{1},((it.cavallium.buffer.Buf)result.get(0)).toByteArray());assertArrayEquals(new byte[]{1,2},((it.cavallium.buffer.Buf)result.get(1)).toByteArray());
                 assertEquals(x.sent.get(0).operationId(),x.sent.get(1).operationId());assertEquals(2,direct.status(token).appliedMutations());int sent=x.sent.size();direct.execute(token,RequestContext.batch()).get(15,TimeUnit.SECONDS);assertEquals(sent,x.sent.size());acknowledged=direct.status(token).resultDigest();direct.acknowledgeResult(token,acknowledged);
             }
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=new RatisRocksDBDirect(x.schema,x.routed,session,x.f.scheduler,x.journal)) {
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=x.budget.open(x.schema,x.routed,session,x.f.scheduler,x.journal,x.window)) {
                 assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,direct.status(token).state());direct.acknowledgeResult(token,acknowledged);assertArrayEquals(new byte[]{1,2},x.routed.read(x.schema.column(75).columnId(),new byte[]{2}));
             }
         }
@@ -104,7 +104,7 @@ class RatisRemoteMutationOwnershipTest {
         try(var x=fixtures.new Fixture()) {
             var owner=x.direct.owner();var key=RatisAtomicClientTest.key(2);var token=x.direct.prepareSequence(owner,UUID.randomUUID(),0,71,List.of(key),List.of(RatisAtomicClientTest.value(9)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,false,RequestContext.batch()).get(10,TimeUnit.SECONDS);x.direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS);var digest=x.direct.status(token).resultDigest();int effects=x.f.writes();x.direct.afterRetirementForce(() -> {throw new java.io.UncheckedIOException(new IOException("Lost retirement force reply"));});
             assertThrows(java.io.UncheckedIOException.class,() -> x.direct.acknowledgeResult(token,digest));assertThrows(IOException.class,() -> x.direct.status(token));assertThrows(ExecutionException.class,() -> x.direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS));x.abandoned=true;x.direct.close();x.session.close();
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=new RatisRocksDBDirect(x.f.schema,x.routed,session,x.f.scheduler,x.journal)){assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,direct.status(token).state());assertEquals(1,direct.owner().nextRequestSequence());direct.acknowledgeResult(token,digest);assertThrows(ExecutionException.class,() -> direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS));assertEquals(effects,x.f.writes());}
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=x.budget.open(x.f.schema,x.routed,session,x.f.scheduler,x.journal,x.window)){assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,direct.status(token).state());assertEquals(1,direct.owner().nextRequestSequence());direct.acknowledgeResult(token,digest);assertThrows(ExecutionException.class,() -> direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS));assertEquals(effects,x.f.writes());}
         }
     }
     @Test void unknownBindForceKeepsOriginalSessionIdentityBeforeAnyDataEffect() throws Exception {
@@ -112,7 +112,7 @@ class RatisRemoteMutationOwnershipTest {
         try(var x=fixtures.new Fixture()) {
             var token=x.direct.prepareSequence(x.direct.owner(),UUID.randomUUID(),0,71,List.of(RatisAtomicClientTest.key(2)),List.of(RatisAtomicClientTest.value(9)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,false,RequestContext.batch()).get(10,TimeUnit.SECONDS);
             var pending=x.journal.resolveSibling(x.journal.getFileName()+".pending");java.nio.file.Files.createDirectory(pending);assertThrows(ExecutionException.class,() -> x.direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS));assertTrue(x.writes.isEmpty());var original=x.session.pending().getFirst().command().operationId();assertThrows(IOException.class,() -> x.direct.status(token));x.abandoned=true;x.direct.close();x.session.close();java.nio.file.Files.deleteIfExists(pending);
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=new RatisRocksDBDirect(x.f.schema,x.routed,session,x.f.scheduler,x.journal)){direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(1,x.writes.size());assertEquals(original,x.writes.getFirst());}
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var direct=x.budget.open(x.f.schema,x.routed,session,x.f.scheduler,x.journal,x.window)){direct.execute(token,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(1,x.writes.size());assertEquals(original,x.writes.getFirst());}
         }
     }
     @Test void nativeGrantExpiryRetainsAppliedPrefixAndRejectsExpiredRetryAfterAck() throws Exception {
@@ -136,7 +136,7 @@ class RatisRemoteMutationOwnershipTest {
         var fixtures=new RatisRocksDBDirectTest();fixtures.root=root;
         try(var x=fixtures.new Fixture()) {
             x.direct.prepareSequence(x.direct.owner(),UUID.randomUUID(),0,71,List.of(RatisAtomicClientTest.key(2)),List.of(RatisAtomicClientTest.value(9)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,false,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertTrue(x.writes.isEmpty());x.abandoned=true;x.direct.close();x.session.close();java.nio.file.Files.delete(x.journal);
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed)){assertThrows(IOException.class,() -> new RatisRocksDBDirect(x.f.schema,x.routed,session,x.f.scheduler,x.journal));}
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed)){assertThrows(IOException.class,() -> x.budget.open(x.f.schema,x.routed,session,x.f.scheduler,x.journal,x.window));}
         }
     }
     @Test void bulkNativeExpiryExposesTerminalOutcomeAndConfirmedGroupMutationCountAfterAck() throws Exception {

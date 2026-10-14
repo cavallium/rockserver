@@ -50,7 +50,14 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
         if(!operation.sessionId().equals(business.sessionId()) || operation.epoch()!=business.epoch())throw new IOException("Reroute changed original session grant");
         return root.resolve(Long.toString(operation.sequence()));
     }
+    CommandResult executeOwned(RatisRoutedClient.PreparedCommand original,RequestContext context,RatisAtomicClient.InlineCheck check,RatisRequestBudget budget)throws IOException {
+        try(var credit=budget.recoveryCredit()){credit.require(16L*1024*1024);return execute(original,context,check,credit);}
+    }
     CommandResult execute(RatisRoutedClient.PreparedCommand original,RequestContext context,RatisAtomicClient.InlineCheck check)throws IOException {
+        return execute(original,context,check,null);
+    }
+    private CommandResult execute(RatisRoutedClient.PreparedCommand original,RequestContext context,RatisAtomicClient.InlineCheck check,RatisRequestBudget.RecoveryCredit credit)throws IOException {
+        if(credit!=null)credit.require(recoveryGeometry(original.command(),original.sourceDirectory(),null));
         enter();boolean reroute=false;try {
             check.check();var directory=operationPath(original.command().operationId());var input=directory.resolve("input.bin");
             if(!Files.exists(input,LinkOption.NOFOLLOW_LINKS)) {
@@ -58,7 +65,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
                     enterReroute();reroute=true;
                     if(RatisOperationRerouteAdmissionRpc.acknowledgementOnly(original.command()))throw new IOException("Absent original ACK has no reroute authority",absent);
                     reserveSelection(directory,check);
-                    var target=directories.read(schema.domainId());if(target==null)throw new IOException("Authoritative reroute target directory is absent");try{schema.requireMatches(target);}catch(IllegalArgumentException changed){throw new IOException("Reroute target changed original logical schema; original operation retained",changed);}routed.refresh(target);Files.createDirectories(directory);SessionJournalFiles.force(directory);SessionJournalFiles.force(root);
+                    var target=directories.read(schema.domainId());if(target==null)throw new IOException("Authoritative reroute target directory is absent");try{schema.requireMatches(target);}catch(IllegalArgumentException changed){throw new IOException("Reroute target changed original logical schema; original operation retained",changed);}if(credit!=null)credit.require(recoveryGeometry(original.command(),absent.originalDirectory(),target));routed.refresh(target);Files.createDirectories(directory);SessionJournalFiles.force(directory);SessionJournalFiles.force(root);
                     try(var selected=RatisOperationRerouteJournal.select(input,binding,absent.originalDirectory(),original.command(),target,absent.evidence(),Duration.ofSeconds(30))){}
                 }
             }
@@ -139,6 +146,24 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
         check.check();var request=homes.prepareRecovery(job.abort,reserved,reserved.abortReservation(TransactionStatus.NoEffectOutcome.CONFLICT),null);if(homes.executeRecovery(request).result().status()!=CommandResult.Status.SUCCESS)throw new IOException("Reserved no-effect abort did not apply");
     }
     /** Caller has already forced application consumption in the original window. */
+    void recoverConsumedOwned(RatisDurableSessionClient window,RequestContext context,RatisAtomicClient.InlineCheck check,RatisRequestBudget budget)throws IOException {
+        if(!retainedWork)return;try(var credit=budget.recoveryCredit()){credit.require(16L*1024*1024);credit.require(recoveryGeometry(null,null,null));recoverConsumed(window,context,check);}
+    }
+    /** Point commands have one logical effect/participant. Charge retained graphs and all future output/canonical copies before loading or selecting them. */
+    private long recoveryGeometry(DistributedCommand command,RangeDirectory source,RangeDirectory target)throws IOException {
+        if(command!=null && (command.kind()!=DistributedCommand.Kind.DATA || command.mutations().size()!=1 || !command.predicates().isEmpty()))throw new IOException("Point recovery geometry requires one frozen DATA effect");
+        long input=command==null?0:DistributedCommandCodec.encodedSize(command);
+        long directories=RatisSessionClient.directoryCharge(routed.directory());
+        if(source!=null)directories+=RatisSessionClient.directoryCharge(source);if(target!=null)directories+=RatisSessionClient.directoryCharge(target);
+        // Until the catalogue target is read, reserve its bounded decode staging. The selected actual directory is charged above before journal/plan construction.
+        long targetStaging=target==null?4L*RangeDirectoryCodec.MAX_ENCODED_BYTES:0;
+        long nativeMetadata=8L*(TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+ParticipantFenceProof.MAX_BYTES+ParticipantFinalization.MAX_BYTES)+4L*SessionEpochLedger.MAX_BYTES;
+        return Math.addExact(16L*1024*1024+16L*CommandResult.MAX_BYTES+32L*RangeDirectoryCodec.MAX_ENCODED_BYTES+nativeMetadata+targetStaging,Math.addExact(32L*(input+directories),8L*retainedFileBytes(root,0,new int[]{0})));
+    }
+    private static long retainedFileBytes(Path directory,int depth,int[] entries)throws IOException {
+        if(depth>3)throw new IOException("Reroute journal graph depth exceeded");long bytes=0;
+        try(var files=Files.newDirectoryStream(directory)){for(var path:files){if(++entries[0]>MAX_RETAINED_JOBS*(4*TransactionStatus.MAX_PARTICIPANTS+20)+16)throw new IOException("Reroute journal graph entry bound exceeded");if(Files.isDirectory(path,LinkOption.NOFOLLOW_LINKS))bytes=Math.addExact(bytes,retainedFileBytes(path,depth+1,entries));else if(Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))bytes=Math.addExact(bytes,Files.size(path));else throw new IOException("Foreign reroute journal graph object");}}return bytes;
+    }
     void recoverConsumed(RatisDurableSessionClient window,RequestContext context,RatisAtomicClient.InlineCheck check)throws IOException {
         enter();boolean reroute=false;try {
             long acknowledged=window.acknowledgedThrough();if(acknowledged<0 || !retainedWork)return;enterReroute();reroute=true;

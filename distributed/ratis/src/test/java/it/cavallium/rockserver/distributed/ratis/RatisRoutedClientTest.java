@@ -255,6 +255,17 @@ class RatisRoutedClientTest {
         }
     }
 
+    @Test void synchronousAsyncSubmissionFailureResolvesOnlyTheOriginalOutcomeWithoutResubmitting()throws Exception {
+        var submission=new IOException("Synchronous uncertain submit");var lookup=new IOException("Original outcome unavailable");var attempts=new AtomicInteger();var queries=new AtomicInteger();var observed=new AtomicReference<DistributedCommand>();
+        var transport=new RecordingTransport(){
+            @Override public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{attempts.incrementAndGet();observed.set(command);throw submission;}
+            @Override public CompletableFuture<byte[]> transactionAsync(RangeDescriptor route,byte[] bytes,boolean fresh){queries.incrementAndGet();assertTrue(fresh);var request=RatisTopologyOperationOutcomeRpc.decodeRequest(bytes);assertEquals(observed.get().operationId(),request.operation());assertArrayEquals(observed.get().receiptDigest(),request.receiptDigest());return CompletableFuture.failedFuture(lookup);}
+        };
+        try(var client=new RatisRoutedClient(directory(1,1),transport)){
+            var original=client.prepare(OPERATION,List.of(put(A,1)));byte[] encoded=DistributedCommandCodec.encode(original.command());var failure=assertThrows(ExecutionException.class,()->client.executeAsync(original).get(5,TimeUnit.SECONDS));assertSame(submission,failure.getCause());assertArrayEquals(new Throwable[]{lookup},submission.getSuppressed());assertEquals(1,attempts.get());assertEquals(1,queries.get());assertArrayEquals(encoded,DistributedCommandCodec.encode(observed.get()));
+        }
+    }
+
     private class RecordingTransport implements RatisRoutedClient.Transport {
         final List<DistributedCommand> commands = new ArrayList<>();
         final List<RatisTopologyOperationOutcomeRpc.Request> outcomes = new ArrayList<>();

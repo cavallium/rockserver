@@ -21,7 +21,7 @@ public final class RatisRemoteMutationApi implements RemoteMutationAsyncAPI {
         try {
             var write=switch(kind){case PUT -> RatisRocksDBDirect.WriteKind.PUT;case DELETE -> RatisRocksDBDirect.WriteKind.DELETE;case MERGE -> RatisRocksDBDirect.WriteKind.MERGE;default -> throw new IllegalArgumentException("Point input requires PUT, DELETE or MERGE");};
             if(keys.isEmpty() || keys.size()>MAX_POINT_ITEMS || !multi && keys.size()!=1 || write==RatisRocksDBDirect.WriteKind.DELETE && !values.isEmpty() || write!=RatisRocksDBDirect.WriteKind.DELETE && values.size()!=keys.size())throw new IllegalArgumentException("Invalid point input count");
-            var frozen=copy(keys,values,MAX_POINT_INPUT_BYTES);return connection.preparePointMutation(owner,id,sequence,column,frozen.keys(),frozen.values(),write,callback,multi,context);
+            return connection.preparePointMutation(owner,id,sequence,column,keys,values,write,callback,multi,context);
         }catch(Exception failure){return CompletableFuture.failedFuture(failure);}
     }
     @Override public CompletableFuture<RemoteMutationToken> prepareRange(RemoteMutationOwner owner,UUID id,long sequence,long column,Keys lower,Keys upper,RequestContext context){try{return connection.prepareRangeMutation(owner,id,sequence,column,copyBound(lower),copyBound(upper),context);}catch(Exception failure){return CompletableFuture.failedFuture(failure);}}

@@ -20,6 +20,8 @@ import static it.cavallium.rockserver.distributed.ratis.RatisAtomicClientTest.*;
 
 /** Actual native DATA/session journals through the concrete connection; transport is controlled. */
 class RatisRocksDBConnectionTest {
+    final RatisPointFixtureBudget pointBudget=new RatisPointFixtureBudget();
+    @org.junit.jupiter.api.AfterEach void closePointBudget()throws Exception{pointBudget.close();}
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     static <T> T await(CompletableFuture<T> value) throws Exception { return value.get(10,TimeUnit.SECONDS); }
     final class Fixture implements AutoCloseable {
@@ -41,7 +43,7 @@ class RatisRocksDBConnectionTest {
             assertEquals(CommandResult.Status.SUCCESS,catalogue.execute(catalogue.prepare(f.outer.operation(4),null,f.directory)).status());
             factory=(schema,directory,path,ids) -> {
                 var session=first ? direct.session : RatisDurableSessionClient.reopen(direct.window,direct.routed);
-                var writer=first ? direct.direct : new RatisRocksDBDirect(schema,direct.routed,session,f.scheduler,direct.journal); first=false;
+                var writer=first ? direct.direct : direct.budget.open(schema,direct.routed,session,f.scheduler,direct.journal,direct.window); first=false;
                 var transactions=new RatisTransactionClient(schema,f.snapshots,f.homes,f.data,f.scheduler,RatisTransactionClient.Limits.defaults());
                 var snapshots=suppliedSnapshots==null ? new RatisSnapshotClient(schema,f.snapshots,f.data,f.scheduler,RatisSnapshotClient.Limits.defaults()) : suppliedSnapshots;
                 var ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations); var adapter=new RatisRocksDBAdapter(schema,directory,transactions,allocations,writer,ranges,ids);
@@ -142,7 +144,7 @@ class RatisRocksDBConnectionTest {
                         assertEquals(CommandResult.Status.SUCCESS,data.execute(data.prepareSessionControl(control)).status());
                     }
                     return RatisDurableSessionClient.create(window,data,issuance,grant,RatisSessionClient.Limits.defaults());
-                },List.of()).create(schema,directory,path,ids);
+                },List.of(),pointBudget.shared).create(schema,directory,path,ids);
             };
             Path connectionRoot=root.resolve("dynamic-connection"); var limits=new RatisRocksDBConnection.Limits(4,64,8,128L*1024*1024,8);
             long recreated;
@@ -194,7 +196,7 @@ class RatisRocksDBConnectionTest {
                     var before=epochs.read(); var issuance=before.issue(UUID.randomUUID(),1000); var grant=issuance.grants().getLast(); assertEquals(CommandResult.Status.SUCCESS,epochs.execute(epochs.prepare(nativeSchema.outer.operation(operations.getAndIncrement()),before,issuance)).status());
                     for(var range:placement.ranges()) { var control=epochs.prepareSessionBinding(placement,range.groupId(),new OperationId(new UUID(950,1),issuance.nextEpoch(),operations.getAndIncrement()),grant,32,-1); assertEquals(CommandResult.Status.SUCCESS,nativeSchema.routed.execute(nativeSchema.routed.prepareSessionControl(control)).status()); }
                     return RatisDurableSessionClient.create(window,nativeSchema.routed,issuance,grant,RatisSessionClient.Limits.defaults());
-                },List.of()).create(schema,directory,path,ids);
+                },List.of(),pointBudget.shared).create(schema,directory,path,ids);
                 try {
                     var transactions=mock(RatisTransactionClient.class); var snapshots=mock(RatisSnapshotClient.class);
                     when(transactions.open(any(),any(),any(),any(),any(),any())).thenAnswer(call -> {

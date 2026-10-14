@@ -17,6 +17,8 @@ import static it.cavallium.rockserver.distributed.ratis.RatisAtomicClientTest.*;
 
 /** Common facade with real native DATA and separate exclusive bulk/point grants; controlled transport only. */
 class RatisConnectionBatchesTest {
+    final RatisPointFixtureBudget pointBudget=new RatisPointFixtureBudget();
+    @org.junit.jupiter.api.AfterEach void closePointBudget()throws Exception{pointBudget.close();}
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     static <T> T await(CompletableFuture<T> future) throws Exception { return future.get(10,TimeUnit.SECONDS); }
     static KVBatch batch() { return new KVBatch.KVBatchRef(List.of(key(2),key(3),key(4)),List.of(value(1),value(2),value(3))); }
@@ -54,7 +56,7 @@ class RatisConnectionBatchesTest {
                 assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(f.outer.operation(sequence.getAndIncrement()),previous,next)).status());
                 for(var group:f.groups) { var control=f.catalogue.epochs.prepareSessionBinding(directory,group,new OperationId(f.admin,next.nextEpoch(),sequence.getAndIncrement()),grant,32,-1); assertEquals(CommandResult.Status.SUCCESS,routed.execute(routed.prepareSessionControl(control)).status()); }
                 grants.add(grant); windows.add(window); return RatisDurableSessionClient.create(window,routed,next,grant,RatisSessionClient.Limits.defaults());
-            },List.of());
+            },List.of(),pointBudget.shared);
         }
         RatisRocksDBConnection open(int capacity) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/batches"),connectionRoot,java.util.Map.of(f.schema.domainId(),routed),(name,shape)->f.schema.domainId(),f.scheduler,binding,f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(8,64,8,128L*1024*1024,capacity),List.of(replicas)); }
         public void close() throws Exception { routed.close(); f.close(); }

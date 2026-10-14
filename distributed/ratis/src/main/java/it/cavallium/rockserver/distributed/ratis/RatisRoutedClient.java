@@ -1470,7 +1470,9 @@ public final class RatisRoutedClient implements AutoCloseable {
         if(moved)requireNamespace(prepared.source);else requireIdentity(prepared.source);
         return snapshotAsync(()->{
             if(moved)return readOriginalOutcomeAsync(prepared).thenCompose(reply->resolvedOriginalOutcomeAsync(prepared,reply));
-            return transport.commandAsync(descriptor,prepared.command).handle((result,failure)->{
+            CompletableFuture<CommandResult> submitted;
+            try{submitted=transport.commandAsync(descriptor,prepared.command);}catch(IOException failure){submitted=CompletableFuture.failedFuture(failure);}
+            return submitted.handle((result,failure)->{
                 if(failure==null)return result==null?CompletableFuture.<CommandResult>failedFuture(new IOException("Missing command result")):CompletableFuture.completedFuture(result);
                 Throwable cause=unwrap(failure);
                 if(!(cause instanceof IOException unresolved)||cause instanceof java.io.InterruptedIOException)return CompletableFuture.<CommandResult>failedFuture(cause);
