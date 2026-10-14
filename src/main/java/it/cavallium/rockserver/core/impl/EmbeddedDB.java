@@ -3334,12 +3334,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		long elapsed = Math.max(0L, System.nanoTime() - started);
 		var completions = startupReadsByHandle.get(column.getNativeHandle());
 		if (completions == null) return;
+		recordStartupReadElapsed(completions, elapsed, keys, nativeBulkReadFailed(statuses, keys));
+	}
+
+	private static boolean nativeBulkReadFailed(@Nullable List<org.rocksdb.ByteBufferGetStatus> statuses, int keys) {
 		boolean failed = statuses == null || statuses.size() != keys;
 		if (statuses != null) for (var status : statuses) {
 			Code code = status.status.getCode();
 			failed |= code != Code.Ok && code != Code.NotFound;
 		}
-		recordStartupReadElapsed(completions, elapsed, keys, failed);
+		return failed;
 	}
 
 	private void startStartupIo(Map<String, String> columnCaches) {
@@ -6643,18 +6647,28 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 
 			var nativeDb = db.get();
 			var columnHandles = List.of(col.cfh());
+			var diagnostic = StartupIoJfr.nativeRead("bulk", nativeKeys.length);
 			var sample = sampleLatency ? existsMultiPerfSampler.begin(nativeDb) : null;
 			List<org.rocksdb.ByteBufferGetStatus> statuses = null;
 			long readStarted = System.nanoTime();
 			activeNativeMultiGets.incrementAndGet();
 			long startupStarted = startStartupRead();
 			try {
+				if (diagnostic != null) diagnostic.begin();
 				statuses = nativeDb.multiGetByteBuffers(readOptions, columnHandles, nativeKeys, emptyValues);
 			} finally {
-				recordStartupBulk(col.cfh(), startupStarted, nativeKeys.length, statuses);
-				activeNativeMultiGets.decrementAndGet();
-				recordCompactionForegroundRead(readStarted, nativeKeys.length);
-				if (sample != null) existsMultiPerfSampler.finish(sample);
+				try {
+					if (diagnostic != null) diagnostic.end();
+				} finally {
+					recordStartupBulk(col.cfh(), startupStarted, nativeKeys.length, statuses);
+					activeNativeMultiGets.decrementAndGet();
+					recordCompactionForegroundRead(readStarted, nativeKeys.length);
+					if (sample != null) existsMultiPerfSampler.finish(sample);
+				}
+				if (diagnostic != null) {
+					diagnostic.failed = nativeBulkReadFailed(statuses, nativeKeys.length);
+					diagnostic.commit();
+				}
 			}
 			var result = new ArrayList<Boolean>(statuses.size());
 			for (var status : statuses) {
@@ -11105,13 +11119,16 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			Buf calculatedKey,
 			boolean useDefaultReadOptions)
 			throws org.rocksdb.RocksDBException {
+		var diagnostic = StartupIoJfr.nativeRead("point", 1);
+		boolean failed = true, nativeStarted = false;
 		long readStarted = System.nanoTime();
 		try {
 			var reader = Objects.requireNonNull(fastGetReader);
 			long startupStarted = startStartupRead();
-			boolean failed = true;
 			byte[] value;
 			try {
+				nativeStarted = true;
+				if (diagnostic != null) diagnostic.begin();
 				value = useDefaultReadOptions
 					? reader.getHeap(cfh,
 							calculatedKey.getBackingByteArray(),
@@ -11123,10 +11140,22 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							calculatedKey.getBackingByteArrayOffset(),
 							calculatedKey.getBackingByteArrayLength());
 			failed = false;
-			} finally { recordStartupRead(cfh, startupStarted, 0, failed); }
+			} finally {
+				try {
+					if (diagnostic != null) diagnostic.end();
+				} finally {
+					recordStartupRead(cfh, startupStarted, 0, failed);
+				}
+			}
 			return toBuf(value);
 
-		} finally { recordCompactionForegroundRead(readStarted, 0); }
+		} finally {
+			recordCompactionForegroundRead(readStarted, 0);
+			if (diagnostic != null && nativeStarted) {
+				diagnostic.failed = failed;
+				diagnostic.commit();
+			}
+		}
 	}
 
 	private ColumnInstance getColumn(long columnId) {

@@ -46,6 +46,14 @@ final class StartupIoJfr {
     @Name("rockserver.NativePut") @Label("Native RocksDB Put attempt")
     @Category("Rockserver") @Enabled(false) @StackTrace(false)
     static final class NativePut extends Event { public boolean failed; }
+    @Name("rockserver.NativeRead") @Label("Completed native point or status-only bulk read")
+    @Category("Rockserver") @Enabled(false) @StackTrace(false)
+    static final class NativeRead extends Event {
+        public String kind;
+        public int keyCount;
+        public boolean failed;
+    }
+    private static final EventType NATIVE_READ = EventType.getEventType(NativeRead.class);
     private static final EventType POLICY = EventType.getEventType(Policy.class);
     private static final EventType STORAGE = EventType.getEventType(Storage.class);
     private static final EventType SERVICE_PUT = EventType.getEventType(ServicePut.class);
@@ -58,6 +66,11 @@ final class StartupIoJfr {
     static NativePut nativePut() {
         if (!NATIVE_PUT.isEnabled()) return null;
         return new NativePut();
+    }
+    static NativeRead nativeRead(String kind, int keyCount) {
+        if (!NATIVE_READ.isEnabled()) return null;
+        var event = new NativeRead(); event.kind = kind; event.keyCount = keyCount;
+        return event;
     }
     static void storage(String database, String storage, long epoch, int mask, boolean fallback) {
         if (!STORAGE.isEnabled()) return;
