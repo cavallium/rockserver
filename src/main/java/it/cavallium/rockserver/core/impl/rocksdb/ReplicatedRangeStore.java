@@ -198,7 +198,7 @@ public final class ReplicatedRangeStore {
     private long sourceOutcomeCountLimit,sourceOutcomeByteLimit;
     /** Trusted adapter bootstrap; ordinary standalone admission is unchanged without promises. */
     public void configureSourceOutcomeCapacity(long count,long bytes) {
-        if(count<1 || bytes<92)throw new IllegalArgumentException("Invalid source receipt capacity");enterNative();applyLane.lock();
+        if(count<1 || bytes<88)throw new IllegalArgumentException("Invalid source receipt capacity");enterNative();applyLane.lock();
         try { if(sourceOutcomeCountLimit!=0 && (sourceOutcomeCountLimit!=count || sourceOutcomeByteLimit!=bytes))throw new IllegalStateException("Source receipt capacity already configured");ensureReceiptUsage();var effective=readUsage(usageKey).plus(sourceOutcomePromises(null));if(effective.count()>count || effective.bytes()>bytes)throw new IllegalStateException("Retained receipts/promises exceed proposed source capacity");sourceOutcomeCountLimit=count;sourceOutcomeByteLimit=bytes; }
         catch(RocksDBException failure) { throw new IllegalStateException("Cannot qualify source receipt capacity",failure); }
         finally { applyLane.unlock();leaveNative(); }
@@ -274,7 +274,7 @@ public final class ReplicatedRangeStore {
                 if(!fenced && old==null) {
                     var command=request.original();long minimum=minimumSessionEpoch(null),floor=acknowledgedThrough(id,null);long ack=command.acknowledgedThrough();
                     if(sessionMetadata!=null)batch.put(state,sessionAckCountKey(),ByteBuffer.allocate(8).putLong(sessionMetadata.count()).array());
-                    if(ack>floor) { batch.put(state,sessionFloorKey(id),ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(ack).array());batch.deleteRange(receipts,receiptKey(new OperationId(id.sessionId(),id.epoch(),0)),receiptKey(new OperationId(id.sessionId(),id.epoch(),ack+1))); }
+                    if(ack>floor) { batch.put(state,sessionFloorKey(id),ByteBuffer.allocate(8).putLong(ack).array());batch.deleteRange(receipts,receiptKey(new OperationId(id.sessionId(),id.epoch(),0)),receiptKey(new OperationId(id.sessionId(),id.epoch(),ack+1))); }
                     for(var prior:List.copyOf(published.keySet()))if(prior.epoch()<minimum || prior.sessionId().equals(id.sessionId()) && prior.epoch()==id.epoch() && prior.sequence()<=ack) { batch.delete(state,sourceOutcomeKey(0x66,prior));published.remove(prior); }
                     byte[] receipt=encodeReceipt(command.receiptDigest(),stable);updateReceiptUsage(batch,command,-1,ack,minimum,floor,receipt.length,position,id);batch.put(receipts,receiptKey(id),receipt);
                 } else batch.put(state,usageKey,encodeTotalUsage(readUsage(usageKey),position));
@@ -313,7 +313,6 @@ public final class ReplicatedRangeStore {
         return command.kind()==DistributedCommand.Kind.DATA && command.acknowledgedThrough()>=0
                 || control!=null && !control.binding() && freeze.header().clusterId().equals(control.authority().clusterId()) && freeze.header().databaseId().equals(control.authority().databaseId());
     }
-    private static final int STATE_VERSION = 1;
     private static final int MAX_RESULT_BYTES = 2 * 1024 * 1024;
     public static final int MAX_SCHEMA_AUTHORITY_BYTES=5*1024*1024;
     /** Consensus bound for original bucket bytes plus retained staged bucket replacements. */
@@ -862,7 +861,7 @@ public final class ReplicatedRangeStore {
         applied = recovered == null ? null : decodePosition(recovered);
         pendingInstallation = this.db.get(state, installingKey);
         if (pendingInstallation != null) {
-            if (pendingInstallation.length != 52 || ByteBuffer.wrap(pendingInstallation).getInt() != STATE_VERSION) {
+            if (pendingInstallation.length != 48) {
                 throw new IllegalStateException("Invalid pending installation marker");
             }
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
@@ -883,7 +882,7 @@ public final class ReplicatedRangeStore {
     void configureSnapshotAdmission(PoolSnapshotAdmission guard) { this.snapshotAdmission = guard; }
 
     /** Null means no log entry has yet completed. This is not a durable snapshot watermark. */
-    static byte[] topologyVirginUsage() { return ByteBuffer.allocate(36).putInt(STATE_VERSION).putLong(0).putLong(0).putLong(0).putLong(-1).array(); }
+    static byte[] topologyVirginUsage() { return ByteBuffer.allocate(32).putLong(0).putLong(0).putLong(0).putLong(-1).array(); }
     public ApplyPosition applied() { return applied; }
     /** Process-only failure; native release outcome is unknown and requires pool replacement. */
     public Throwable snapshotReleaseFailure() { return snapshotReleaseFailure; }
@@ -990,8 +989,8 @@ public final class ReplicatedRangeStore {
     }
     static ApplyPosition snapshotInstallationCut(byte[] pending) {
         if(pending==null)return null;
-        if(pending.length!=52 || ByteBuffer.wrap(pending).getInt()!=STATE_VERSION)throw new IllegalArgumentException("Invalid pending snapshot installation intent");
-        var in=ByteBuffer.wrap(pending);in.getInt();return new ApplyPosition(in.getLong(),in.getLong());
+        if(pending.length!=48)throw new IllegalArgumentException("Invalid pending snapshot installation intent");
+        var in=ByteBuffer.wrap(pending);return new ApplyPosition(in.getLong(),in.getLong());
     }
     private Map<String,byte[]> learnerSchemaRows(NativeTopologyLearnerImagePermission permission) throws RocksDBException {
         var aliases=new HashMap<>(topologyLearner.physicalNames());
@@ -3452,7 +3451,7 @@ public final class ReplicatedRangeStore {
                         if(cdc!=null) publishCdc=cdc.advanceClock(batch,clock);
                     }
                     if (effectiveMinimum > currentEpochFloor) {
-                        batch.put(state, epochFloorKey(), ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(effectiveMinimum).array());
+                        batch.put(state, epochFloorKey(), ByteBuffer.allocate(8).putLong(effectiveMinimum).array());
                         batch.deleteRange(state, bindingPrefix(), bindingKey(effectiveMinimum));
                         batch.deleteRange(state,sessionFloorPrefix(),sessionFloorEpoch(effectiveMinimum));
                         batch.deleteRange(receipts,markerKey,receiptEpoch(effectiveMinimum));
@@ -3460,7 +3459,7 @@ public final class ReplicatedRangeStore {
                     if (effectiveAcknowledgement > currentFloor) {
                         long floor = effectiveAcknowledgement;
                         batch.put(state, sessionFloorKey(command.operationId()),
-                                ByteBuffer.allocate(12).putInt(STATE_VERSION).putLong(floor).array());
+                                ByteBuffer.allocate(8).putLong(floor).array());
                         batch.deleteRange(receipts, receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), 0)),
                                 receiptKey(new OperationId(command.operationId().sessionId(), command.operationId().epoch(), floor + 1)));
                     }
@@ -3874,7 +3873,6 @@ public final class ReplicatedRangeStore {
             }
             if (pendingInstallation != null) {
                 var pending = ByteBuffer.wrap(pendingInstallation);
-                pending.getInt();
                 long pendingTerm = pending.getLong();
                 long pendingIndex = pending.getLong();
                 byte[] hash = new byte[32];
@@ -3887,7 +3885,7 @@ public final class ReplicatedRangeStore {
             if(topologyLearner!=null && applied!=null && (expected.position().index()<applied.index() || expected.position().term()<applied.term() || expected.position().index()==applied.index() && expected.position().term()!=applied.term()))throw new IOException("Learner image regresses actual completed tail");
             try (var lease = ownership.claimInstall(owner)) {
                 resetScopedUnderLane(); installationGeneration++; homeStatusCapacityKnown=false;
-                pendingInstallation = ByteBuffer.allocate(52).putInt(STATE_VERSION)
+                pendingInstallation = ByteBuffer.allocate(48)
                         .putLong(expected.position().term()).putLong(expected.position().index()).put(expected.sha256()).array();
                 // Publish recovery authority before the first destructive interval change.
                 try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
@@ -4013,7 +4011,7 @@ public final class ReplicatedRangeStore {
             if (id.epoch() < minimumSessionEpoch(null) || id.sequence() <= acknowledgedThrough(id, null)) return expiredResult();
             byte[] key=receiptKey(id);int size=db.get(receipts,key,new byte[0]);
             if(size==org.rocksdb.RocksDB.NOT_FOUND)return null;
-            if(size<36 || size>36+MAX_RESULT_BYTES)throw new IllegalStateException("Invalid durable receipt size");
+            if(size<32 || size>32+MAX_RESULT_BYTES)throw new IllegalStateException("Invalid durable receipt size");
             byte[] saved=new byte[size];if(db.get(receipts,key,saved)!=size)throw new IllegalStateException("Durable receipt changed during bounded outcome read");
             return decodeReceipt(saved,payloadDigest);
         } finally { applyLane.unlock(); }
@@ -4962,7 +4960,7 @@ public final class ReplicatedRangeStore {
                 return new ReceiptRetentionEstimate(usage, false, 0, 0, maintenance);
             }
             requireUnlocked(command);
-            if(staleControl) return new ReceiptRetentionEstimate(usage,true,1,92,false);
+            if(staleControl) return new ReceiptRetentionEstimate(usage,true,1,88,false);
             var scope=commandScope(command); if(scope!=null) requireUngated(scope);
             var authority=sessionAuthority();
             if (requireSessionAuthority && command.sessionControl()==null && command.minimumSessionEpoch()<0 && authority==null) {
@@ -4980,7 +4978,7 @@ public final class ReplicatedRangeStore {
                 removed = removed.plus(scanUsage(receipts, receiptKey(new OperationId(id.sessionId(), id.epoch(), 0)),
                         receiptKey(new OperationId(id.sessionId(), id.epoch(), command.acknowledgedThrough() + 1)), true));
             }
-            long maximumBytes = 84L + (terminalExpiry || command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)
+            long maximumBytes = 80L + (terminalExpiry || command.mutations().stream().allMatch(m -> m.returnMode() == Mutation.ReturnMode.NONE)
                     ? 8 : CommandResult.MAX_BYTES);
             return new ReceiptRetentionEstimate(usage, true, Math.max(0, 1 - removed.count),
                     Math.max(0, maximumBytes - removed.bytes), maintenance);
@@ -4989,26 +4987,26 @@ public final class ReplicatedRangeStore {
 
     private record Usage(long count, long bytes) {
         Usage {
-            if (count < 0 || bytes < 0 || (count == 0 ? bytes != 0 : bytes / count < 84)) {
+            if (count < 0 || bytes < 0 || (count == 0 ? bytes != 0 : bytes / count < 80)) {
                 throw new IllegalStateException("Invalid receipt usage");
             }
         }
         Usage plus(Usage other) { return new Usage(Math.addExact(count, other.count), Math.addExact(bytes, other.bytes)); }
         Usage minus(Usage other) { return new Usage(Math.subtractExact(count, other.count), Math.subtractExact(bytes, other.bytes)); }
-        byte[] encode() { return ByteBuffer.allocate(20).putInt(STATE_VERSION).putLong(count).putLong(bytes).array(); }
+        byte[] encode() { return ByteBuffer.allocate(16).putLong(count).putLong(bytes).array(); }
     }
 
     private static Usage decodeUsage(byte[] value) {
         if (value == null) return new Usage(0, 0);
-        if (value.length != 20 || ByteBuffer.wrap(value).getInt() != STATE_VERSION) {
+        if (value.length != 16) {
             throw new IllegalStateException("Invalid receipt usage metadata");
         }
-        return new Usage(ByteBuffer.wrap(value, 4, 16).getLong(), ByteBuffer.wrap(value, 12, 8).getLong());
+        return new Usage(ByteBuffer.wrap(value, 0, 16).getLong(), ByteBuffer.wrap(value, 8, 8).getLong());
     }
 
-    // Current distinct records: total/count/bytes/term/index (36 bytes), epoch bucket/count/bytes (20 bytes).
+    // Current distinct records: total/count/bytes/term/index (32 bytes), epoch bucket/count/bytes (16 bytes).
     private static byte[] encodeTotalUsage(Usage usage, ApplyPosition position) {
-        return ByteBuffer.allocate(36).put(usage.encode()).putLong(position == null ? 0 : position.term())
+        return ByteBuffer.allocate(32).put(usage.encode()).putLong(position == null ? 0 : position.term())
                 .putLong(position == null ? -1 : position.index()).array();
     }
 
@@ -5070,16 +5068,16 @@ public final class ReplicatedRangeStore {
 
     private static void validateReceiptRow(byte[] key, byte[] value) {
         if (key.length != 48 || ByteBuffer.wrap(key, 16, 8).getLong() < 0
-                || ByteBuffer.wrap(key, 40, 8).getLong() < 0 || value.length < 36
-                || value.length > 36 + MAX_RESULT_BYTES || ByteBuffer.wrap(value).getInt() != STATE_VERSION) {
+                || ByteBuffer.wrap(key, 40, 8).getLong() < 0 || value.length < 32
+                || value.length > 32 + MAX_RESULT_BYTES) {
             throw new IllegalStateException("Invalid durable receipt row");
         }
     }
 
     private static Usage decodeTotalUsage(byte[] value,ApplyPosition position) {
-        if (value==null || value.length!=36) throw new IllegalStateException("Missing or malformed total receipt usage");
-        var usage=decodeUsage(Arrays.copyOf(value,20));
-        var input=ByteBuffer.wrap(value,20,16);
+        if (value==null || value.length!=32) throw new IllegalStateException("Missing or malformed total receipt usage");
+        var usage=decodeUsage(Arrays.copyOf(value,16));
+        var input=ByteBuffer.wrap(value,16,16);
         if (input.getLong()!=(position==null ? 0 : position.term()) || input.getLong()!=(position==null ? -1 : position.index())) {
             throw new IllegalStateException("Receipt usage differs from completed apply position");
         }
@@ -5164,7 +5162,7 @@ public final class ReplicatedRangeStore {
     }
 
     public static final int MAX_SESSION_ACK_NAMESPACES=65_536;
-    public static final long MAX_SESSION_ACK_BYTES=25L+53L*MAX_SESSION_ACK_NAMESPACES;
+    public static final long MAX_SESSION_ACK_BYTES=25L+49L*MAX_SESSION_ACK_NAMESPACES;
     private int sessionAckLimit=MAX_SESSION_ACK_NAMESPACES;
     private java.util.TreeMap<Long,Integer> sessionAckEpochs;
     private int sessionAckCount;
@@ -5174,8 +5172,8 @@ public final class ReplicatedRangeStore {
         try(var options=new ReadOptions().setSnapshot(snapshot).setFillCache(false);var iterator=databaseOwner.newIterator(state,options)) {
             long minimum=minimumSessionEpoch(options);byte[] prefix=sessionFloorPrefix();var sizing=new byte[0];iterator.seek(prefix);
             for(;iterator.isValid() && iterator.key().length>=prefix.length && Arrays.equals(iterator.key(),0,prefix.length,prefix,0,prefix.length);iterator.next()) {
-                byte[] key=iterator.key();if(key.length!=41 || iterator.value(sizing)!=12)throw new IllegalStateException("Invalid session ACK namespace shape");long epoch=ByteBuffer.wrap(key,17,8).getLong();
-                var value=ByteBuffer.wrap(iterator.value());int encoding=value.getInt();long floor=value.getLong();if(epoch<minimum || encoding!=STATE_VERSION || floor<0 || floor==Long.MAX_VALUE || ++count>MAX_SESSION_ACK_NAMESPACES)throw new IllegalStateException("Session ACK namespace inventory corrupt or unbounded");epochs.merge(epoch,1,Integer::sum);
+                byte[] key=iterator.key();if(key.length!=41 || iterator.value(sizing)!=8)throw new IllegalStateException("Invalid session ACK namespace shape");long epoch=ByteBuffer.wrap(key,17,8).getLong();
+                var value=ByteBuffer.wrap(iterator.value());long floor=value.getLong();if(epoch<minimum || floor<0 || floor==Long.MAX_VALUE || ++count>MAX_SESSION_ACK_NAMESPACES)throw new IllegalStateException("Session ACK namespace inventory corrupt or unbounded");epochs.merge(epoch,1,Integer::sum);
             }
             iterator.status();byte[] total=db.get(state,options,sessionAckCountKey());if(total==null ? count!=0 : total.length!=8 || ByteBuffer.wrap(total).getLong()!=count)throw new IllegalStateException("Session ACK namespace count differs from inventory");
         }
@@ -5230,9 +5228,8 @@ public final class ReplicatedRangeStore {
     private long minimumSessionEpoch(ReadOptions options) throws RocksDBException {
         byte[] value = options == null ? db.get(state, epochFloorKey()) : db.get(state, options, epochFloorKey());
         if (value == null) return 0;
-        if (value.length != 12) throw new IllegalStateException("Invalid session epoch floor");
+        if (value.length != 8) throw new IllegalStateException("Invalid session epoch floor");
         var input = ByteBuffer.wrap(value);
-        if (input.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported session epoch floor version");
         long floor = input.getLong();
         if (floor < 0) throw new IllegalStateException("Invalid session epoch floor");
         return floor;
@@ -5247,9 +5244,8 @@ public final class ReplicatedRangeStore {
     private long acknowledgedThrough(OperationId id, ReadOptions options) throws RocksDBException {
         byte[] value = options == null ? db.get(state, sessionFloorKey(id)) : db.get(state, options, sessionFloorKey(id));
         if (value == null) return -1;
-        if (value.length != 12) throw new IllegalStateException("Invalid session floor");
+        if (value.length != 8) throw new IllegalStateException("Invalid session floor");
         var input = ByteBuffer.wrap(value);
-        if (input.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported session floor version");
         long floor = input.getLong();
         if (floor < 0 || floor == Long.MAX_VALUE) throw new IllegalStateException("Invalid session floor sequence");
         return floor;
@@ -5262,16 +5258,15 @@ public final class ReplicatedRangeStore {
         return ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
     }
     private static byte[] encodePosition(ApplyPosition position) {
-        return ByteBuffer.allocate(20).putInt(STATE_VERSION).putLong(position.term()).putLong(position.index()).array();
+        return ByteBuffer.allocate(16).putLong(position.term()).putLong(position.index()).array();
     }
     private static byte[] encodeConfiguration(Configuration configuration) {
-        return ByteBuffer.allocate(20 + configuration.data.length).putInt(STATE_VERSION)
+        return ByteBuffer.allocate(16 + configuration.data.length)
                 .putLong(configuration.term()).putLong(configuration.index()).put(configuration.data).array();
     }
     private static Configuration decodeConfiguration(byte[] value) {
-        if (value.length <= 20 || value.length > 20 + 65536) throw new IllegalStateException("Invalid cut configuration bytes");
+        if (value.length <= 16 || value.length > 16 + 65536) throw new IllegalStateException("Invalid cut configuration bytes");
         var input = ByteBuffer.wrap(value);
-        if (input.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported configuration version");
         long term = input.getLong();
         long index = input.getLong();
         byte[] data = new byte[input.remaining()];
@@ -5279,23 +5274,21 @@ public final class ReplicatedRangeStore {
         return new Configuration(term, index, data);
     }
     static ApplyPosition decodePosition(byte[] value) {
-        if (value.length != 20) throw new IllegalStateException("Invalid applied marker");
+        if (value.length != 16) throw new IllegalStateException("Invalid applied marker");
         var buffer = ByteBuffer.wrap(value);
-        if (buffer.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported applied marker version");
         return new ApplyPosition(buffer.getLong(), buffer.getLong());
     }
     private static byte[] encodeReceipt(byte[] digest, byte[] result) {
-        return ByteBuffer.allocate(36 + result.length).putInt(STATE_VERSION).put(digest).put(result).array();
+        return ByteBuffer.allocate(32 + result.length).put(digest).put(result).array();
     }
     private static byte[] decodeReceipt(byte[] value, byte[] digest) {
-        if (digest.length != 32 || value.length < 36 || value.length > 36 + MAX_RESULT_BYTES) {
+        if (digest.length != 32 || value.length < 32 || value.length > 32 + MAX_RESULT_BYTES) {
             throw new IllegalStateException("Invalid durable receipt");
         }
         var buffer = ByteBuffer.wrap(value);
-        if (buffer.getInt() != STATE_VERSION) throw new IllegalStateException("Unsupported receipt version");
         byte[] originalHash = new byte[32];
         buffer.get(originalHash);
         if (!Arrays.equals(originalHash, digest)) throw new IllegalArgumentException("Operation identity reused with different payload");
-        return Arrays.copyOfRange(value, 36, value.length);
+        return Arrays.copyOfRange(value, 32, value.length);
     }
 }

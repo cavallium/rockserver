@@ -12,7 +12,7 @@ import java.util.*;
 final class SessionWindowJournal implements AutoCloseable {
     static final int MAX_BYTES=64*1024*1024;
     static final long MAX_WINDOW_BYTES=16L*1024*1024;
-    private static final int MAGIC=0x53574a4c, VERSION=1, HEADER_BYTES=125;
+    private static final int MAGIC=0x53574a4c, HEADER_BYTES=121;
     record Saved(SessionEpochLedger.Grant grant,RatisSessionClient.Limits limits,RatisSessionClient.WindowState state) {}
     private final Path path;
     private final RatisRoutedClient routed;
@@ -78,7 +78,6 @@ final class SessionWindowJournal implements AutoCloseable {
             if (body.length<HEADER_BYTES) throw new IOException("Truncated session window journal");
             var input=ByteBuffer.wrap(body);
             if (input.getInt()!=MAGIC) throw new IOException("Unsupported session window journal");
-            if (input.getInt()!=VERSION) throw new IOException("Unsupported session window journal version");
             byte[] bound=new byte[32]; input.get(bound); if (!Arrays.equals(bound,identity)) throw new IOException("Wrong session window journal identity");
             var grant=new SessionEpochLedger.Grant(input.getLong(),uuid(input),input.getLong(),input.getLong());
             var limits=new RatisSessionClient.Limits(input.getInt(),input.getLong(),input.getLong()); validateLimits(limits);
@@ -147,7 +146,7 @@ final class SessionWindowJournal implements AutoCloseable {
         var result=new java.util.TreeMap<String,RangeDirectory>();for(var entry:saved.state().entries()){var source=entry.prepared().sourceDirectory();result.put(java.util.HexFormat.of().formatHex(source.payloadDigest()),source);}return result;
     }
     private byte[] encode(Saved saved,int size) {
-        var output=ByteBuffer.allocate(size).putInt(MAGIC).putInt(VERSION).put(identity); var grant=saved.grant(); var limits=saved.limits(); var state=saved.state();
+        var output=ByteBuffer.allocate(size).putInt(MAGIC).put(identity); var grant=saved.grant(); var limits=saved.limits(); var state=saved.state();
         output.putLong(grant.epoch()); uuid(output,grant.sessionId()); output.putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis());
         output.putInt(limits.outstanding()).putLong(limits.commandBytes()).putLong(limits.resultBytes());
         output.putLong(state.nextSequence()).putLong(state.acknowledgedThrough()).put((byte)(state.exhausted() ? 1 : 0)).putInt(state.entries().size());

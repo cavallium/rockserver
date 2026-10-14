@@ -26,7 +26,7 @@ class SessionEpochLedgerTest {
     }
     @Test void canonicalCodecBoundsAndEveryTruncationAreValidated() {
         var ledger=SessionEpochLedger.initial(cluster,database,10).issue(a,100).issue(b,200);
-        byte[] encoded=ledger.encode(); assertEquals(156,encoded.length);
+        byte[] encoded=ledger.encode(); assertEquals(152,encoded.length);
         assertEquals(ledger,SessionEpochLedger.decode(encoded)); assertArrayEquals(encoded,SessionEpochLedger.decode(encoded).encode());
         for (int n=0;n<encoded.length;n++) {
             byte[] truncated=Arrays.copyOf(encoded,n);
@@ -34,7 +34,7 @@ class SessionEpochLedgerTest {
         }
         assertThrows(IllegalArgumentException.class,() -> SessionEpochLedger.decode(Arrays.copyOf(encoded,encoded.length+1)));
         for (int count : new int[]{-1,1025,Integer.MAX_VALUE}) {
-            byte[] bad=encoded.clone(); ByteBuffer.wrap(bad).putInt(72,count);
+            byte[] bad=encoded.clone(); ByteBuffer.wrap(bad).putInt(68,count);
             assertThrows(IllegalArgumentException.class,() -> SessionEpochLedger.decode(bad));
         }
     }

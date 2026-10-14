@@ -6,7 +6,7 @@ import java.util.*;
 /** Immutable origin audit for an accepted plan; the snapshot term is not a replay-term constraint. */
 public record TransactionAcceptance(ApplyPosition snapshot,long leaderGeneration,UUID ownerIncarnation,
                                     TransactionScope scope,byte[] result) {
-    private static final int VERSION=1, FIXED_BYTES=52;
+    private static final int FIXED_BYTES=48;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
@@ -27,7 +27,7 @@ public record TransactionAcceptance(ApplyPosition snapshot,long leaderGeneration
     @Override public byte[] result() { return result.clone(); }
     int encodedSize() { return (int)size(scope,result.length); }
     void encode(ByteBuffer output) {
-        output.putInt(VERSION).putLong(snapshot.term()).putLong(snapshot.index()).putLong(leaderGeneration);
+        output.putLong(snapshot.term()).putLong(snapshot.index()).putLong(leaderGeneration);
         uuid(output,ownerIncarnation); var spans=ordered(scope); output.putInt(spans.size());
         for (var span:spans) {
             output.put((byte)(span.isPoint() ? 1 : 2)); uuid(output,span.columnId());
@@ -37,7 +37,6 @@ public record TransactionAcceptance(ApplyPosition snapshot,long leaderGeneration
     }
     static TransactionAcceptance decode(ByteBuffer input) {
         if (input.remaining()<FIXED_BYTES+25+8 || input.remaining()>DistributedCommandCodec.MAX_ENCODED_BYTES) throw new IllegalArgumentException("Invalid transaction acceptance length");
-        if (input.getInt()!=VERSION) throw new IllegalArgumentException("Unknown transaction acceptance version");
         var snapshot=new ApplyPosition(input.getLong(),input.getLong()); long generation=input.getLong(); UUID owner=uuid(input);
         int count=input.getInt();
         if (snapshot.term()<1 || generation<0 || count<1 || count>TransactionScope.MAX_SPANS || 25L*count>input.remaining()-12) {

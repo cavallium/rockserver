@@ -405,7 +405,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private final boolean enableSessionControls;
     public record RetentionLimits(long dataCount, long dataBytes, long maintenanceCount, long maintenanceBytes) {
         public RetentionLimits {
-            if (dataCount < 1 || dataBytes < 92 || maintenanceCount < 1 || maintenanceBytes < 92) throw new IllegalArgumentException("Invalid retention limits");
+            if (dataCount < 1 || dataBytes < 88 || maintenanceCount < 1 || maintenanceBytes < 88) throw new IllegalArgumentException("Invalid retention limits");
             Math.addExact(dataCount,maintenanceCount); Math.addExact(dataBytes,maintenanceBytes);
         }
         public static RetentionLimits defaults() { return new RetentionLimits(4096,16L*1024*1024,16,64*1024); }
@@ -1426,9 +1426,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(RatisTopologyActivationRecord.isActivation(prefix))return role==RatisNodePlan.Role.DATA?RatisTopologyActivationRecord.MAX_BYTES:0;
         if(RatisSchemaActivateRecord.isActivate(prefix))return role==RatisNodePlan.Role.DATA?RatisSchemaActivateRecord.MAX_BYTES:0;
         if(RatisTopologyRelocationRecord.isRecord(prefix))return role==RatisNodePlan.Role.DATA && prefix.length>=5 && prefix[4]==RatisTopologyRelocationRecord.Action.COMPLETE.ordinal()?RatisTopologyRelocationRecord.MAX_BYTES:0;
-        if(prefix.length<DistributedCommandCodec.HEADER_BYTES || ByteBuffer.wrap(prefix).getInt()!=DistributedCommandCodec.FORMAT_VERSION)return 0;
-        return switch(prefix[4]&255) {
-            case 1 -> ByteBuffer.wrap(prefix).getInt(101)==0 && ByteBuffer.wrap(prefix).getInt(105)==0?DistributedCommandCodec.HEADER_BYTES
+        if(prefix.length<DistributedCommandCodec.HEADER_BYTES)return 0;
+        return switch(prefix[DistributedCommandCodec.KIND_OFFSET]&255) {
+            case 1 -> ByteBuffer.wrap(prefix).getInt(DistributedCommandCodec.MUTATION_COUNT_OFFSET)==0 && ByteBuffer.wrap(prefix).getInt(DistributedCommandCodec.PREDICATE_COUNT_OFFSET)==0?DistributedCommandCodec.HEADER_BYTES
                     : snapshotHomeProgressShape(wire)?DistributedCommandCodec.MAX_ENCODED_BYTES:0;
             case 2 -> DistributedCommandCodec.HEADER_BYTES+8L;
             case 3 -> wire.size()>=DistributedCommandCodec.HEADER_BYTES+4 && logWireInt(wire,DistributedCommandCodec.HEADER_BYTES)==RangeSessionControl.ADVANCE_BYTES
@@ -1441,7 +1441,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private boolean snapshotHomeProgressShape(ByteString wire) {
         if(!snapshotHomeConfigured || role!=RatisNodePlan.Role.SNAPSHOT_HOME || wire.size()>DistributedCommandCodec.MAX_ENCODED_BYTES)return false;
         try {
-            if(logWireLong(wire,93)!=-1 || logWireInt(wire,101)!=1 || logWireInt(wire,105)!=1)return false;
+            if(logWireLong(wire,DistributedCommandCodec.ACK_OFFSET)!=-1 || logWireInt(wire,DistributedCommandCodec.MUTATION_COUNT_OFFSET)!=1 || logWireInt(wire,DistributedCommandCodec.PREDICATE_COUNT_OFFSET)!=1)return false;
             int p=DistributedCommandCodec.HEADER_BYTES;
             if(wire.byteAt(p++)!=1 || wire.byteAt(p++)!=0 || logWireLong(wire,p)!=homeColumn.getMostSignificantBits() || logWireLong(wire,p+8)!=homeColumn.getLeastSignificantBits() || logWireInt(wire,p+16)!=16)return false;
             p+=20;long keyHigh=logWireLong(wire,p),keyLow=logWireLong(wire,p+8);p+=16;int bytes=logWireInt(wire,p);p+=4;
@@ -2504,8 +2504,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private boolean snapshotHomeProgressInput(ByteBuffer wire) {
         if (!snapshotHomeConfigured || role!=RatisNodePlan.Role.SNAPSHOT_HOME) return false;
         try {
-            if (wire.remaining()<DistributedCommandCodec.HEADER_BYTES || wire.getInt(0)!=DistributedCommandCodec.FORMAT_VERSION
-                    || wire.get(4)!=1 || wire.getLong(93)!=-1 || wire.getInt(101)!=1 || wire.getInt(105)!=1) return false;
+            if (wire.remaining()<DistributedCommandCodec.HEADER_BYTES
+                    || wire.get(DistributedCommandCodec.KIND_OFFSET)!=1 || wire.getLong(DistributedCommandCodec.ACK_OFFSET)!=-1 || wire.getInt(DistributedCommandCodec.MUTATION_COUNT_OFFSET)!=1 || wire.getInt(DistributedCommandCodec.PREDICATE_COUNT_OFFSET)!=1) return false;
             wire.position(DistributedCommandCodec.HEADER_BYTES);
             if (wire.get()!=1 || wire.get()!=0 || wire.getLong()!=homeColumn.getMostSignificantBits() || wire.getLong()!=homeColumn.getLeastSignificantBits() || wire.getInt()!=16) return false;
             long keyHigh=wire.getLong(),keyLow=wire.getLong(); int valueBytes=wire.getInt();
@@ -2522,7 +2522,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
         var content=request.getMessage().getContent();
         // The bounded prefix classifies ordinary command/participant inputs before their full copy/decode.
-        var prefix=content.substring(0,Math.min(content.size(),109)).toByteArray();
+        var prefix=content.substring(0,Math.min(content.size(),DistributedCommandCodec.HEADER_BYTES)).toByteArray();
         RatisNodeResourceBudget.Kind kind=null;
         if (RatisParticipantRecord.isParticipant(prefix)) {
             kind=RatisParticipantRecord.isFinalization(prefix) || RatisParticipantRecord.isNegative(prefix) || RatisParticipantRecord.isRetirement(prefix)
@@ -2530,9 +2530,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         } else if (RatisSnapshotRecord.isSnapshot(prefix) || HomeRecovery.isRecovery(prefix) || RatisHomeRetirementRecord.isRetirement(prefix)
                 || RatisSnapshotRetirementRecord.isRetirement(prefix) || RatisSnapshotHomeRetirementRecord.isRetirement(prefix)) {
             kind=RatisNodeResourceBudget.Kind.PROTECTED;
-        } else if (prefix.length>=109 && java.nio.ByteBuffer.wrap(prefix).getInt()==DistributedCommandCodec.FORMAT_VERSION) {
-            int semantic=prefix[4]&255;
-            boolean maintenance=semantic==2 || semantic==3 || semantic==1 && java.nio.ByteBuffer.wrap(prefix).getInt(101)==0 && java.nio.ByteBuffer.wrap(prefix).getInt(105)==0;
+        } else if (prefix.length>=DistributedCommandCodec.HEADER_BYTES && (prefix[DistributedCommandCodec.KIND_OFFSET]&255)>=1 && (prefix[DistributedCommandCodec.KIND_OFFSET]&255)<=5) {
+            int semantic=prefix[DistributedCommandCodec.KIND_OFFSET]&255;
+            boolean maintenance=semantic==2 || semantic==3 || semantic==1 && java.nio.ByteBuffer.wrap(prefix).getInt(DistributedCommandCodec.MUTATION_COUNT_OFFSET)==0 && java.nio.ByteBuffer.wrap(prefix).getInt(DistributedCommandCodec.PREDICATE_COUNT_OFFSET)==0;
             kind=maintenance || snapshotHomeProgressInput(content.asReadOnlyByteBuffer()) ? RatisNodeResourceBudget.Kind.PROTECTED : RatisNodeResourceBudget.Kind.ORDINARY;
         }
         if(kind==null && (RatisRangeImportRecord.isImport(prefix) || RatisReferencedFile.Request.isRequest(prefix) || RatisTopologyFreezeRecord.isFreeze(prefix)

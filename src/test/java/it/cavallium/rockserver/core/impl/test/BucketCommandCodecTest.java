@@ -22,7 +22,7 @@ class BucketCommandCodecTest {
             assertEquals(DistributedCommand.Kind.DATA,decoded.kind()); assertEquals(ack,decoded.acknowledgedThrough()); assertEquals(-1,decoded.minimumSessionEpoch());
             assertTrue(decoded.hasBucketData()); assertEquals(original.mutations(),decoded.mutations()); assertEquals(original.predicates(),decoded.predicates());
             assertArrayEquals(encoded,DistributedCommandCodec.encode(decoded)); assertEquals(encoded.length,DistributedCommandCodec.encodedSize(original));
-            assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(encoded),original.payloadDigest()); assertEquals(5,encoded[109]);
+            assertArrayEquals(MessageDigest.getInstance("SHA-256").digest(encoded),original.payloadDigest()); assertEquals(5,encoded[105]);
         }
         var predicateOnlyBucket=new DistributedCommand(GROUP,1,new byte[32],OPERATION,List.of(new Mutation(Mutation.Kind.PUT,COLUMN,new byte[0],new byte[0])),
                 List.of(KeyPredicate.bucketMember(COLUMN,new byte[0],List.of(new byte[0]),null)));
@@ -44,14 +44,14 @@ class BucketCommandCodecTest {
                 List.of(Mutation.bucketPut(COLUMN,new byte[] {9},List.of(new byte[] {1}),new byte[] {7},Mutation.ReturnMode.NONE))));
         for (int length=0;length<valid.length;length++) { byte[] truncated=Arrays.copyOf(valid,length); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(truncated)); }
         assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(Arrays.copyOf(valid,valid.length+1)));
-        for (int count:new int[] {-1,0,257,Integer.MAX_VALUE}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(137,count); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
-        byte[] tooLong=valid.clone(); ByteBuffer.wrap(tooLong).putChar(141,(char)65535); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(tooLong));
-        for (int offset:new int[] {101,105,127,132}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,Integer.MAX_VALUE); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
-        for (int offset:new int[] {109,110}) { byte[] bad=valid.clone(); bad[offset]=99; assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
-        byte[] nullPut=valid.clone(); ByteBuffer.wrap(nullPut).putInt(132,-1); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(nullPut));
-        byte[] deletion=valid.clone(); deletion[109]=6; assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(deletion));
+        for (int count:new int[] {-1,0,257,Integer.MAX_VALUE}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(133,count); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
+        byte[] tooLong=valid.clone(); ByteBuffer.wrap(tooLong).putChar(137,(char)65535); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(tooLong));
+        for (int offset:new int[] {97,101,123,128}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,Integer.MAX_VALUE); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
+        for (int offset:new int[] {105,106}) { byte[] bad=valid.clone(); bad[offset]=99; assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(bad)); }
+        byte[] nullPut=valid.clone(); ByteBuffer.wrap(nullPut).putInt(128,-1); assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(nullPut));
+        byte[] deletion=valid.clone(); deletion[105]=6; assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(deletion));
         byte[] predicate=DistributedCommandCodec.encode(new DistributedCommand(GROUP,1,new byte[32],OPERATION,List.of(bucket()),List.of(KeyPredicate.bucketMember(COLUMN,new byte[0],List.of(new byte[0]),null))));
-        predicate[146]=3; assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(predicate));
+        predicate[142]=3; assertThrows(IllegalArgumentException.class,() -> DistributedCommandCodec.decode(predicate));
     }
     @Test void componentBudgetsAndExplicitFactoryShapesAreBounded() {
         for (long ack:new long[] {-2,3,Long.MAX_VALUE}) assertThrows(IllegalArgumentException.class,() -> command(ack));

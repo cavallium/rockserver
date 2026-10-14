@@ -16,6 +16,21 @@ does not establish complete distributed API parity or production acceptance.
 Earlier checkpoints below retain the limitations known at their validation time.
 This section and the remaining gates at the end describe the current branch.
 
+- Redundant format-version words are removed from the current command, schema,
+  directory, acceptance, session journals, native image and internal state rows.
+  Java and Rust readers, command admission offsets and receipt budgets use the
+  changed layout directly. Semantic identities and epochs remain. Current-source
+  validation passes 125 distinct Java cases and 56 Rust library cases, including
+  cold session reopening, receipt accounting and protected snapshot-HOME admission.
+  Evidence: `/tmp/rockserver-oct14-current-format-coherent-reactor-gate.log`,
+  `/tmp/rockserver-oct14-current-format-ratis-final-gate.log`,
+  `/tmp/rockserver-oct14-current-format-session-lifecycle-gate.log` and
+  `/tmp/rockserver-current-format-rust-gate.log`.
+  The downstream native/node selection passes 181 cases with the changed layouts
+  in `/tmp/rockserver-oct14-current-format-native-node-integrated-gate.log`.
+  The remaining Ratis receipt minimum is now 88 bytes; an existing native capacity
+  workflow reproduced the old rejection, and all twelve retention/admission cases
+  pass at the corrected limits in `/tmp/rockserver-oct14-retention-minimum-fixed.log`.
 - Both distributed startup listings now stream native MANIFEST fragments within
   4,102 live CFs, 4,096 bytes per name and 8 MiB of names throughout replay.
   Complete malformed records and CRC errors fail; incomplete trailing records

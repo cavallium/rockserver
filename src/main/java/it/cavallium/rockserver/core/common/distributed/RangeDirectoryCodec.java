@@ -8,7 +8,6 @@ import java.util.*;
 
 /** Canonical bounded big-endian directory encoding; this blob carries catalogue CAS generation. */
 public final class RangeDirectoryCodec {
-    public static final int FORMAT_VERSION = 1;
     public static final int MAX_RANGES = 1024;
     public static final int MAX_REPLICAS = 16;
     public static final int MAX_COLUMNS = 256;
@@ -20,7 +19,7 @@ public final class RangeDirectoryCodec {
     private RangeDirectoryCodec() {}
 
     public static long encodedSize(RangeDirectory directory) {
-        long bytes = 112 + 16L * directory.columns().size();
+        long bytes = 108 + 16L * directory.columns().size();
         for (RangeDescriptor range : directory.ranges()) {
             byte[] lower = range.lowerInclusive(), upper = range.upperExclusive();
             bytes += 61L + (lower == null ? 0 : lower.length) + (upper == null ? 0 : upper.length);
@@ -32,7 +31,6 @@ public final class RangeDirectoryCodec {
     public static byte[] encode(RangeDirectory directory) {
         Objects.requireNonNull(directory, "directory");
         var output = ByteBuffer.allocate((int) encodedSize(directory));
-        output.putInt(FORMAT_VERSION);
         putUuid(output, directory.clusterId());
         putUuid(output, directory.databaseId());
         putUuid(output, directory.domainId());
@@ -62,9 +60,8 @@ public final class RangeDirectoryCodec {
 
     public static RangeDirectory decode(byte[] encoded) {
         Objects.requireNonNull(encoded, "encoded");
-        if (encoded.length < 112 || encoded.length > MAX_ENCODED_BYTES) throw new IllegalArgumentException("Invalid directory byte size");
+        if (encoded.length < 108 || encoded.length > MAX_ENCODED_BYTES) throw new IllegalArgumentException("Invalid directory byte size");
         var input = ByteBuffer.wrap(encoded);
-        if (input.getInt() != FORMAT_VERSION) throw new IllegalArgumentException("Unknown directory version");
         UUID cluster = getUuid(input), database = getUuid(input), domain = getUuid(input);
         long schemaEpoch = input.getLong();
         byte[] schema = new byte[32];

@@ -115,7 +115,7 @@ class NativeRangeImageTest {
                         .putLong(GROUP.getLeastSignificantBits()).putLong(1).putLong(SESSION.getMostSignificantBits())
                         .putLong(SESSION.getLeastSignificantBits()).putLong(0).array();
                 assertArrayEquals(receiptKey, rows.get(7).key());
-                assertArrayEquals(bytes("original-result"), Arrays.copyOfRange(rows.get(7).value(), 36, rows.get(7).value().length));
+                assertArrayEquals(bytes("original-result"), Arrays.copyOfRange(rows.get(7).value(), 32, rows.get(7).value().length));
                 Path sameCut = directory.resolve("same.image");
                 NativeRangeImage.write(sameCut, pin, interval(), LIMITS);
                 assertArrayEquals(Files.readAllBytes(image), Files.readAllBytes(sameCut));
@@ -200,18 +200,18 @@ class NativeRangeImageTest {
         int stateRow = userKey + 1 + userValueLength;
         int stateKey = stateRow + 9;
         int stateValue = stateKey + 16;
-        int[][] badInts = {{4, 2}, {96, Integer.MAX_VALUE}, {firstRow + 17, Integer.MAX_VALUE},
-                {firstRow + 21, -1}, {stateValue, 2}};
+        int[][] badInts = {{0, 2}, {92, Integer.MAX_VALUE}, {firstRow + 17, Integer.MAX_VALUE},
+                {firstRow + 21, -1}};
         for (int[] bad : badInts) {
             byte[] changed = valid.clone();
             ByteBuffer.wrap(changed).putInt(bad[0], bad[1]);
             rejectResealed(changed);
         }
         byte[] position = valid.clone();
-        ByteBuffer.wrap(position).putLong(72, 9);
+        ByteBuffer.wrap(position).putLong(68, 9);
         rejectResealed(position);
         byte[] group = valid.clone();
-        group[8] ^= 1;
+        group[4] ^= 1;
         rejectResealed(group);
         byte[] metadata = valid.clone();
         metadata[stateKey] ^= 1;
@@ -223,9 +223,9 @@ class NativeRangeImageTest {
         section[firstRow] = 9;
         rejectResealed(section);
         byte[] marker = valid.clone();
-        ByteBuffer.wrap(marker).putLong(stateValue + 12, 9);
+        ByteBuffer.wrap(marker).putLong(stateValue + 8, 9);
         rejectResealed(marker);
-        int receiptRow = stateValue + 20;
+        int receiptRow = stateValue + 16;
         byte[] receiptPrefix = valid.clone();
         receiptPrefix[receiptRow + 9] ^= 1;
         rejectResealed(receiptPrefix);
@@ -308,8 +308,8 @@ class NativeRangeImageTest {
             pool.store.applyNoop(new ApplyPosition(1,0));
             byte[] key = ByteBuffer.allocate(41).putLong(GROUP.getMostSignificantBits()).putLong(GROUP.getLeastSignificantBits())
                     .put((byte)2).putLong(1).putLong(SESSION.getMostSignificantBits()).putLong(SESSION.getLeastSignificantBits()).array();
-            var values = List.of(new byte[11],ByteBuffer.allocate(12).putInt(99).putLong(0).array(),
-                    ByteBuffer.allocate(12).putInt(1).putLong(-1).array(),ByteBuffer.allocate(12).putInt(1).putLong(Long.MAX_VALUE).array());
+            var values = List.of(new byte[7], new byte[9],
+                    ByteBuffer.allocate(8).putLong(-1).array(),ByteBuffer.allocate(8).putLong(Long.MAX_VALUE).array());
             for (int i=0;i<values.size();i++) {
                 pool.db.put(pool.handles.get(3),key,values.get(i));
                 Path output = directory.resolve("bad-floor-"+i+".image");
@@ -333,7 +333,7 @@ class NativeRangeImageTest {
 
     private int headerEnd(byte[] image) {
         var input = ByteBuffer.wrap(image);
-        input.position(96);
+        input.position(92);
         int columns = input.getInt();
         input.position(input.position() + columns * 16);
         for (int i = 0; i < 2; i++) {

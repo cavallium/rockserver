@@ -152,8 +152,8 @@ class RangeDirectoryCodecTest {
         assertThrows(IllegalArgumentException.class, () -> RangeDirectoryCodec.decode(Arrays.copyOf(encoded, encoded.length + 1)));
         assertThrows(IllegalArgumentException.class, () -> RangeDirectoryCodec.decode(new byte[RangeDirectoryCodec.MAX_ENCODED_BYTES + 1]));
         // Fixed header has two columns, then one range with null bounds and three replicas.
-        int range = 144, state = range + 56, replica = range + 61;
-        int[][] badInts = {{0, 2}, {104, -1}, {104, 257}, {140, 1025}, {range + 48, -2}, {range + 52, Integer.MAX_VALUE},
+        int range = 140, state = range + 56, replica = range + 61;
+        int[][] badInts = {{100, -1}, {100, 257}, {136, 1025}, {range + 48, -2}, {range + 52, Integer.MAX_VALUE},
                 {state + 1, 17}, {replica + 49, Integer.MAX_VALUE}};
         for (int[] bad : badInts) {
             byte[] changed = encoded.clone();
@@ -165,9 +165,9 @@ class RangeDirectoryCodecTest {
         byte[] unknownRole = encoded.clone(); unknownRole[replica + 48] = 127;
         assertThrows(IllegalArgumentException.class, () -> RangeDirectoryCodec.decode(unknownRole));
         byte[] columnsOutOfOrder = encoded.clone();
-        byte[] first = Arrays.copyOfRange(encoded, 108, 124);
-        System.arraycopy(encoded, 124, columnsOutOfOrder, 108, 16);
-        System.arraycopy(first, 0, columnsOutOfOrder, 124, 16);
+        byte[] first = Arrays.copyOfRange(encoded, 104, 120);
+        System.arraycopy(encoded, 120, columnsOutOfOrder, 104, 16);
+        System.arraycopy(first, 0, columnsOutOfOrder, 120, 16);
         assertThrows(IllegalArgumentException.class, () -> RangeDirectoryCodec.decode(columnsOutOfOrder));
     }
 

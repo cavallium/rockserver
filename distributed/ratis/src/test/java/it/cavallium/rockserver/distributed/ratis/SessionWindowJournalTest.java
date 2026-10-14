@@ -76,21 +76,18 @@ class SessionWindowJournalTest {
             for (int size:new int[] {0,31,32,120,valid.length-1}) {
                 Files.write(path,Arrays.copyOf(valid,size)); assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
             }
-            for (int offset:new int[] {0,4,117,121}) {
+            for (int offset:new int[] {0,4,113,117}) {
                 byte[] changed=body.clone(); ByteBuffer.wrap(changed).putInt(offset,Integer.MAX_VALUE);
                 SessionJournalFiles.write(path,changed,SessionWindowJournal.MAX_BYTES);
                 assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
             }
-            byte[] badFlag=body.clone(); badFlag[116]=2; SessionJournalFiles.write(path,badFlag,SessionWindowJournal.MAX_BYTES);
+            byte[] badFlag=body.clone(); badFlag[112]=2; SessionJournalFiles.write(path,badFlag,SessionWindowJournal.MAX_BYTES);
             assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
             byte[] badConsumed=body.clone(); badConsumed[badConsumed.length-2]=2; SessionJournalFiles.write(path,badConsumed,SessionWindowJournal.MAX_BYTES);
             assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
-            var route=ByteBuffer.wrap(body); route.position(121); int commandBytes=route.getInt(); route.position(route.position()+commandBytes+48);
-            for (int i=0;i<2;i++) { int length=route.getInt(); if (length>=0) route.position(route.position()+length); }
-            assertEquals(1,route.getInt()); route.position(route.position()+48); int peerBytes=route.getInt(); assertTrue(peerBytes>0);
-            byte[] nonAscii=body.clone(); nonAscii[route.position()]=(byte)0xff; SessionJournalFiles.write(path,nonAscii,SessionWindowJournal.MAX_BYTES);
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
-            byte[] changedSequence=body.clone(); ByteBuffer.wrap(changedSequence).putLong(100,2); SessionJournalFiles.write(path,changedSequence,SessionWindowJournal.MAX_BYTES);
+            var table=ByteBuffer.wrap(body);table.position(117);assertEquals(1,table.getInt());int directoryBytes=table.getInt(),directoryStart=table.position();var route=ByteBuffer.wrap(body,directoryStart,directoryBytes).slice();route.position(100);int columns=route.getInt();route.position(route.position()+16*columns);assertEquals(1,route.getInt());route.position(route.position()+48);for(int n=0;n<2;n++){int length=route.getInt();if(length>=0)route.position(route.position()+length);}route.get();assertEquals(1,route.getInt());route.position(route.position()+48);route.get();int peerBytes=route.getInt();assertTrue(peerBytes>0);
+            byte[] nonAscii=body.clone();nonAscii[directoryStart+route.position()]=(byte)0xff;SessionJournalFiles.write(path,nonAscii,SessionWindowJournal.MAX_BYTES);assertThrows(IOException.class,()->SessionWindowJournal.open(path,routed,false));
+            byte[] changedSequence=body.clone(); ByteBuffer.wrap(changedSequence).putLong(96,2); SessionJournalFiles.write(path,changedSequence,SessionWindowJournal.MAX_BYTES);
             assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
             Files.write(path,valid); try (var journal=SessionWindowJournal.open(path,routed,false)) { assertEquals(1,journal.read().state().entries().size()); }
         }

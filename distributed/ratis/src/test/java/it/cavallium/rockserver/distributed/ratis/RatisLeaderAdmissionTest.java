@@ -63,6 +63,12 @@ class RatisLeaderAdmissionTest {
                 machine.notifyTermIndexUpdated(1,0);
                 assertNotNull(machine.startTransaction(request(group,peer,first)).getException(),"Old-term native apply does not admit new leader");
                 machine.notifyTermIndexUpdated(2,1);
+                var empty=new DistributedCommand(groupId,1,new byte[32],new OperationId(UUID.randomUUID(),1,1),List.of(),List.of(),0);
+                assertEquals(105,DistributedCommandCodec.encode(empty).length);
+                var maintenance=machine.startTransaction(request(group,peer,empty));
+                assertNull(maintenance.getException(),"Exact empty current DATA header admits protected maintenance");
+                assertSame(maintenance,machine.preAppendTransaction(maintenance));
+                machine.cancelTransaction(maintenance);
                 var a=machine.startTransaction(request(group,peer,first));
                 var b=machine.startTransaction(request(group,peer,command(groupId,column,session,1)));
                 assertNull(a.getException()); assertNull(b.getException());

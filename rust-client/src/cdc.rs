@@ -1138,7 +1138,7 @@ impl TryFrom<wire::CdcEnvelope> for Envelope {
                 previous = event.mutation_ordinal;
                 let mutation: Mutation = required(event.mutation)?.try_into()?;
                 bytes += mutation.budget_bytes();
-                if bytes > MAX_COMMAND_BYTES - 109 {
+                if bytes > MAX_COMMAND_BYTES - 105 {
                     return Err(invalid("CDC envelope mutation budget exceeded"));
                 }
                 Ok(Event {
@@ -1457,7 +1457,7 @@ fn validate_endpoint(address: &[u8]) -> Result<()> {
 }
 impl Directory {
     pub fn decode(v: wire::CdcDirectory, expected_domain: Id) -> Result<Self> {
-        if v.canonical.len() < 112
+        if v.canonical.len() < 108
             || v.canonical.len() > 1024 * 1024
             || v.encoded_len() > MAX_FRAME_BYTES
             || v.columns.is_empty()
@@ -1501,8 +1501,7 @@ impl Directory {
             return Err(invalid("invalid CDC directory identity"));
         }
         let mut r = Reader(&result.canonical);
-        if r.i32()? != 1
-            || r.id()? != result.cluster_id
+        if r.id()? != result.cluster_id
             || r.id()? != result.database_id
             || r.id()? != result.domain_id
             || r.i64()? != result.schema_epoch
@@ -2768,7 +2767,6 @@ mod tests {
     }
     fn directory_with_replicas(replicas: &[ReplicaFixture<'_>]) -> wire::CdcDirectory {
         let mut canonical = Vec::new();
-        canonical.extend_from_slice(&1i32.to_be_bytes());
         for uuid in [
             definition().cluster_id,
             definition().database_id,
@@ -2920,9 +2918,9 @@ mod tests {
         negative[0] = 0x80;
         let mut v = directory();
         v.columns = vec![negative.to_vec(), positive.to_vec()];
-        v.canonical[104..108].copy_from_slice(&2i32.to_be_bytes());
-        v.canonical[108..124].copy_from_slice(&positive);
-        v.canonical.splice(124..124, negative);
+        v.canonical[100..104].copy_from_slice(&2i32.to_be_bytes());
+        v.canonical[104..120].copy_from_slice(&positive);
+        v.canonical.splice(120..120, negative);
         let d = Directory::decode(v.clone(), definition().domain_id).unwrap();
         let definition = d
             .definition([6; 16], [7; 16], vec![positive, negative], checkpoint())
@@ -2932,8 +2930,8 @@ mod tests {
             definition.encode().unwrap().columns,
             vec![negative.to_vec(), positive.to_vec()]
         );
-        v.canonical[108..124].copy_from_slice(&negative);
-        v.canonical[124..140].copy_from_slice(&positive);
+        v.canonical[104..120].copy_from_slice(&negative);
+        v.canonical[120..136].copy_from_slice(&positive);
         assert!(Directory::decode(v, definition.domain_id).is_err());
         let checkpoint = Checkpoint(BTreeMap::from([
             (

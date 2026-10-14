@@ -7,8 +7,8 @@ import java.util.*;
 
 /** Single current canonical command format, with explicit semantic kind and item tags. */
 public final class DistributedCommandCodec {
-    public static final int FORMAT_VERSION=1, MAX_ITEMS=2048, MAX_MUTATIONS=MAX_ITEMS, MAX_ENCODED_BYTES=2*1024*1024;
-    public static final int HEADER_BYTES=109;
+    public static final int MAX_ITEMS=2048, MAX_MUTATIONS=MAX_ITEMS, MAX_ENCODED_BYTES=2*1024*1024;
+    public static final int KIND_OFFSET=0, ACK_OFFSET=89, MUTATION_COUNT_OFFSET=97, PREDICATE_COUNT_OFFSET=101, HEADER_BYTES=105;
     private DistributedCommandCodec() {}
     public static int encodedSize(DistributedCommand command) {
         Objects.requireNonNull(command); int size=HEADER_BYTES;
@@ -23,7 +23,7 @@ public final class DistributedCommandCodec {
         };
     }
     public static byte[] encode(DistributedCommand command) {
-        var output=ByteBuffer.allocate(encodedSize(command)).putInt(FORMAT_VERSION).put((byte)kind(command.kind()));
+        var output=ByteBuffer.allocate(encodedSize(command)).put((byte)kind(command.kind()));
         uuid(output,command.groupId()); output.putLong(command.rangeEpoch()).put(command.schemaDigest());
         uuid(output,command.operationId().sessionId()); output.putLong(command.operationId().epoch()).putLong(command.operationId().sequence());
         output.putLong(command.acknowledgedThrough()).putInt(command.mutations().size()).putInt(command.predicates().size());
@@ -50,7 +50,6 @@ public final class DistributedCommandCodec {
         Objects.requireNonNull(encoded);
         if (encoded.length<HEADER_BYTES || encoded.length>MAX_ENCODED_BYTES) throw new IllegalArgumentException("Invalid command byte length");
         var input=ByteBuffer.wrap(encoded);
-        if (input.getInt()!=FORMAT_VERSION) throw new IllegalArgumentException("Unsupported command format");
         var kind=kind(input.get() & 255); UUID group=uuid(input); long epoch=input.getLong(); byte[] schema=new byte[32]; input.get(schema);
         var operation=new OperationId(uuid(input),input.getLong(),input.getLong()); long ack=input.getLong(); int count=input.getInt(), predicates=input.getInt();
         boolean data=kind==DistributedCommand.Kind.DATA || kind==DistributedCommand.Kind.COMMIT_ACCEPTED;

@@ -35,7 +35,7 @@ class DistributedSchemaTest {
         byte[] encoded=DistributedSchemaCodec.encode(original); var decoded=DistributedSchemaCodec.decode(encoded);
         assertArrayEquals(encoded,DistributedSchemaCodec.encode(decoded)); assertArrayEquals(original.digest(),decoded.digest());
         assertEquals(original.columns(),decoded.columns()); assertEquals(1,decoded.physicalKeyCodecVersion());
-        assertEquals(A,new UUID(ByteBuffer.wrap(encoded).getLong(76),ByteBuffer.wrap(encoded).getLong(84)));
+        assertEquals(A,new UUID(ByteBuffer.wrap(encoded).getLong(72),ByteBuffer.wrap(encoded).getLong(80)));
         assertArrayEquals(encoded,DistributedSchemaCodec.encode(schema(4,first,second)));
     }
 
@@ -112,18 +112,18 @@ class DistributedSchemaTest {
         byte[] valid=DistributedSchemaCodec.encode(schema(0,column(1,A,"x",fixed(4))));
         for (int length=0;length<valid.length;length++) { byte[] shortBytes=Arrays.copyOf(valid,length); assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(shortBytes)); }
         assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(Arrays.copyOf(valid,valid.length+1)));
-        for (int offset:new int[] {0,4,8,68,72,100,105,109,113}) {
+        for (int offset:new int[] {0,4,64,68,96,101,105,109}) {
             byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,Integer.MAX_VALUE);
             assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(bad));
         }
-        for (int offset:new int[] {117,118}) { byte[] bad=valid.clone(); bad[offset]=2; assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(bad)); }
-        byte[] badName=valid.clone(); badName[104]=(byte)0xff; assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(badName));
-        byte[] negative=valid.clone(); ByteBuffer.wrap(negative).putLong(60,-1); assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(negative));
+        for (int offset:new int[] {113,114}) { byte[] bad=valid.clone(); bad[offset]=2; assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(bad)); }
+        byte[] badName=valid.clone(); badName[100]=(byte)0xff; assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(badName));
+        byte[] negative=valid.clone(); ByteBuffer.wrap(negative).putLong(56,-1); assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(negative));
         byte[] variable=DistributedSchemaCodec.encode(schema(0,column(1,A,"x",ColumnSchema.of(IntArrayList.of(),ObjectArrayList.of(ColumnHashType.XXHASH32),true))));
-        variable[117]=99; assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(variable));
+        variable[113]=99; assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(variable));
         assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(new byte[DistributedSchemaCodec.MAX_BYTES+1]));
         byte[] two=DistributedSchemaCodec.encode(schema(0,column(1,A,"x",fixed()),column(2,B,"y",fixed())));
-        System.arraycopy(two,76,two,115,16); assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(two));
+        System.arraycopy(two,72,two,111,16); assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(two));
     }
 
     @Test void combinedSchemaBudgetAndColumnCountsAreBoundedBeforeEncoding() {
@@ -149,7 +149,7 @@ class DistributedSchemaTest {
         var tooWide=column(1,A,"wide",fixed(ceiling+1));
         assertThrows(IllegalArgumentException.class,() -> schema(ceiling+1,tooWide));
         byte[] encoded=DistributedSchemaCodec.encode(schema(0,tooWide));
-        ByteBuffer.wrap(encoded).putInt(68,ceiling+1);
+        ByteBuffer.wrap(encoded).putInt(64,ceiling+1);
         assertThrows(IllegalArgumentException.class,() -> DistributedSchemaCodec.decode(encoded));
     }
 

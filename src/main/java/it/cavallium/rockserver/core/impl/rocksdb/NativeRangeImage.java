@@ -33,7 +33,6 @@ import java.util.*;
 /** Portable logical range image from one native snapshot cut; no host paths or physical SST identity. */
 public final class NativeRangeImage {
     private static final int MAGIC = 0x4e52494d; // NRIM
-    private static final int VERSION = 1;
     private static final int HASH_BYTES = 32;
     private static final Comparator<UUID> UUID_ORDER = (a, b) -> {
         int first = Long.compareUnsigned(a.getMostSignificantBits(), b.getMostSignificantBits());
@@ -230,7 +229,7 @@ public final class NativeRangeImage {
         if(maximumNamespaces<1 || maximumNamespaces>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES)throw new IllegalArgumentException("Invalid receiver session metadata capacity");
         var retained=new HashSet<OperationId>();var promises=new HashSet<OperationId>();long[] floor={0};
         var manifest=visit(image,limits,(section,column,key,value)->{if(section!=Section.STATE || key.length<=16)return;
-            if(key[16]==3)floor[0]=ByteBuffer.wrap(value,4,8).getLong();
+            if(key[16]==3)floor[0]=ByteBuffer.wrap(value,0,8).getLong();
             if(key[16]==2){var id=ByteBuffer.wrap(key,17,24);long epoch=id.getLong();retained.add(new OperationId(new UUID(id.getLong(),id.getLong()),epoch,0));}
             if(key[16]==0x65){var original=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value).request().original();if(original.acknowledgedThrough()>=0)promises.add(new OperationId(original.operationId().sessionId(),original.operationId().epoch(),0));}
         });
@@ -239,7 +238,7 @@ public final class NativeRangeImage {
 
     /** Effective receiver receipt ceiling, including already promised source outcomes. */
     public static Manifest inspectReceiptCapacity(Path image,Limits limits,long maximumCount,long maximumBytes) throws IOException {
-        if(maximumCount<1 || maximumBytes<92)throw new IllegalArgumentException("Invalid receiver receipt capacity");long[] total={0,0};
+        if(maximumCount<1 || maximumBytes<88)throw new IllegalArgumentException("Invalid receiver receipt capacity");long[] total={0,0};
         var manifest=visit(image,limits,(section,column,key,value)-> {
             if(section==Section.RECEIPTS){total[0]++;total[1]=Math.addExact(total[1],key.length+(long)value.length);}
             if(section==Section.STATE && key.length>16 && key[16]==0x65){var credit=it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit.decode(value);total[0]++;total[1]=Math.addExact(total[1],credit.request().reservedBytes());}
@@ -365,7 +364,6 @@ public final class NativeRangeImage {
 
     private static void writeHeader(DataOutputStream output, Header header) throws IOException {
         output.writeInt(MAGIC);
-        output.writeInt(VERSION);
         writeUuid(output, header.owner().groupId());
         output.writeLong(header.owner().epoch());
         output.write(header.schema());
@@ -379,7 +377,7 @@ public final class NativeRangeImage {
     }
 
     private static Header readHeader(DataInputStream input, BoundedInput counted, Limits limits) throws IOException {
-        if (input.readInt() != MAGIC || input.readInt() != VERSION) throw new IOException("Unsupported image magic/version");
+        if (input.readInt() != MAGIC) throw new IOException("Unsupported image magic");
         var owner = new RangeOwnership.Owner(readUuid(input), input.readLong());
         byte[] schema = new byte[HASH_BYTES];
         input.readFully(schema);
@@ -760,13 +758,12 @@ public final class NativeRangeImage {
                 }
                 if (section == Section.STATE && key.length > 16 && (key[16] == 0x10 || key[16] == 0x11)) {
                     boolean total = key[16] == 0x10;
-                    if (key.length != (total ? 17 : 41) || (total ? value.length != 36 : value.length != 20)) {
+                    if (key.length != (total ? 17 : 41) || (total ? value.length != 32 : value.length != 16)) {
                         throw new IOException("Invalid image receipt usage shape");
                     }
                     var usage = ByteBuffer.wrap(value);
-                    if (usage.getInt() != 1) throw new IOException("Unsupported image receipt usage version");
                     long count = usage.getLong(), bytes = usage.getLong();
-                    if (count < 0 || bytes < 0 || (count == 0 ? bytes != 0 : bytes / count < 84)) {
+                    if (count < 0 || bytes < 0 || (count == 0 ? bytes != 0 : bytes / count < 80)) {
                         throw new IOException("Invalid image receipt usage totals");
                     }
                     if (total) {
@@ -786,8 +783,8 @@ public final class NativeRangeImage {
                     }
                 }
                 if (section == Section.RECEIPTS) {
-                    if (key.length != 48 || value.length < 36 || value.length > 36 + 2 * 1024 * 1024
-                            || ByteBuffer.wrap(value).getInt() != 1 || ByteBuffer.wrap(key, 16, 8).getLong() < epochFloor
+                    if (key.length != 48 || value.length < 32 || value.length > 32 + 2 * 1024 * 1024
+                            || ByteBuffer.wrap(key, 16, 8).getLong() < epochFloor
                             || ByteBuffer.wrap(key, 40, 8).getLong() < 0) {
                         throw new IOException("Invalid image receipt row");
                     }
@@ -801,26 +798,25 @@ public final class NativeRangeImage {
                     receiptBytes = addUsage(receiptBytes, (long) key.length + value.length);
                 }
                 if (section == Section.STATE && key.length > 16 && key[16] == 3) {
-                    if (key.length != 17 || value.length != 12) throw new IOException("Invalid image epoch floor shape");
+                    if (key.length != 17 || value.length != 8) throw new IOException("Invalid image epoch floor shape");
                     var epochValue = ByteBuffer.wrap(value);
-                    if (epochValue.getInt() != 1 || (epochFloor = epochValue.getLong()) < 0) throw new IOException("Invalid image epoch floor");
+                    if ((epochFloor = epochValue.getLong()) < 0) throw new IOException("Invalid image epoch floor");
                 }
                 if(section==Section.STATE && key.length>16 && key[16]==0x15){if(key.length!=17 || value.length!=8 || acknowledgementNamespaceCount!=null)throw new IOException("Invalid image ACK namespace count");acknowledgementNamespaceCount=ByteBuffer.wrap(value).getLong();}
                 if (section == Section.STATE && key.length > 16 && key[16] == 2) {
-                    if (++acknowledgementNamespaces>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES || key.length != 41 || value.length != 12 || ByteBuffer.wrap(key, 17, 8).getLong() < 0) {
+                    if (++acknowledgementNamespaces>ReplicatedRangeStore.MAX_SESSION_ACK_NAMESPACES || key.length != 41 || value.length != 8 || ByteBuffer.wrap(key, 17, 8).getLong() < 0) {
                         throw new IOException("Invalid image session floor shape");
                     }
                     long namespaceEpoch=ByteBuffer.wrap(key,17,8).getLong();var namespace=ByteBuffer.wrap(key,25,16);acknowledgementNamespaceIds.add(new OperationId(new UUID(namespace.getLong(),namespace.getLong()),namespaceEpoch,0));
                     minimumAcknowledgementEpoch=Math.min(minimumAcknowledgementEpoch,namespaceEpoch);
                     var floorValue = ByteBuffer.wrap(value);
-                    if (floorValue.getInt() != 1) throw new IOException("Unsupported image session floor version");
                     long floor = floorValue.getLong();
                     if (floor < 0 || floor == Long.MAX_VALUE) throw new IOException("Invalid image session floor sequence");
                 }
                 if (section == Section.STATE && key.length == 16) {
-                    if (value.length != 20) throw new IOException("Invalid image applied marker length");
+                    if (value.length != 16) throw new IOException("Invalid image applied marker length");
                     var markerValue = ByteBuffer.wrap(value);
-                    if (markerValue.getInt() != 1 || markerValue.getLong() != header.position().term()
+                    if (markerValue.getLong() != header.position().term()
                             || markerValue.getLong() != header.position().index()) {
                         throw new IOException("Image applied marker differs from header");
                     }

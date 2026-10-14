@@ -67,7 +67,7 @@ class NativeRangeSessionImageTest {
         assertInvalid(1, rows);
     }
 
-    private static Row acknowledgement(long epoch,int id){return new Row(ByteBuffer.allocate(41).putLong(0).putLong(1).put((byte)2).putLong(epoch).putLong(0).putLong(id).array(),ByteBuffer.allocate(12).putInt(1).putLong(0).array());}
+    private static Row acknowledgement(long epoch,int id){return new Row(ByteBuffer.allocate(41).putLong(0).putLong(1).put((byte)2).putLong(epoch).putLong(0).putLong(id).array(),ByteBuffer.allocate(8).putLong(0).array());}
     private static Row acknowledgementCount(long count){return new Row(key((byte)0x15,null),ByteBuffer.allocate(8).putLong(count).array());}
     @Test void orphanReplayFloorsAreLegalButCounterEpochAndFinitePopulationAreRequired() throws Exception {
         assertValid(1,List.of(acknowledgement(1,1),acknowledgementCount(1)));
@@ -104,13 +104,13 @@ class NativeRangeSessionImageTest {
     }
     private Path image(long floor, List<Row> controls) throws Exception {
         var bytes = new ByteArrayOutputStream(); var output = new DataOutputStream(bytes);
-        output.writeInt(0x4e52494d); output.writeInt(1); uuid(output, GROUP); output.writeLong(1);
+        output.writeInt(0x4e52494d); uuid(output, GROUP); output.writeLong(1);
         output.write(new byte[32]); output.writeLong(1); output.writeLong(0); uuid(output, DOMAIN);
         output.writeInt(1); uuid(output, COLUMN); output.writeInt(-1); output.writeInt(-1); output.writeInt(0);
         var rows = new ArrayList<Row>();
-        rows.add(new Row(ByteBuffer.allocate(16).putLong(0).putLong(1).array(), ByteBuffer.allocate(20).putInt(1).putLong(1).putLong(0).array()));
-        rows.add(new Row(key((byte)0x10,null),ByteBuffer.allocate(36).putInt(1).putLong(0).putLong(0).putLong(1).putLong(0).array()));
-        if (floor != 0) rows.add(new Row(key((byte) 3, null), ByteBuffer.allocate(12).putInt(1).putLong(floor).array()));
+        rows.add(new Row(ByteBuffer.allocate(16).putLong(0).putLong(1).array(), ByteBuffer.allocate(16).putLong(1).putLong(0).array()));
+        rows.add(new Row(key((byte)0x10,null),ByteBuffer.allocate(32).putLong(0).putLong(0).putLong(1).putLong(0).array()));
+        if (floor != 0) rows.add(new Row(key((byte) 3, null), ByteBuffer.allocate(8).putLong(floor).array()));
         rows.addAll(controls); rows.sort((a, b) -> Arrays.compareUnsigned(a.key(), b.key()));
         for (Row row : rows) {
             output.writeByte(2); output.writeInt(row.key().length); output.writeInt(row.value().length);

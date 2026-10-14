@@ -11,7 +11,7 @@ import java.util.*;
 /** Canonical bounded content encoding, independent of routing generations and placements. */
 public final class DistributedSchemaCodec {
     public static final int MAX_BYTES=2*1024*1024, MAX_KEY_COMPONENTS=256, MAX_NAME_BYTES=4096;
-    private static final int MAGIC=0x44534348, VERSION=1, HEADER_BYTES=76, MIN_COLUMN_BYTES=39;
+    private static final int MAGIC=0x44534348, HEADER_BYTES=72, MIN_COLUMN_BYTES=39;
     static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());
@@ -20,7 +20,7 @@ public final class DistributedSchemaCodec {
     public static byte[] encode(DistributedSchema schema) {
         long size=encodedSize(schema);
         if (size>MAX_BYTES) throw new IllegalArgumentException("Distributed schema exceeds byte budget");
-        var output=ByteBuffer.allocate((int)size).putInt(MAGIC).putInt(VERSION).putInt(DistributedSchema.PHYSICAL_KEY_CODEC_VERSION);
+        var output=ByteBuffer.allocate((int)size).putInt(MAGIC).putInt(DistributedSchema.PHYSICAL_KEY_CODEC_VERSION);
         uuid(output,schema.clusterId()); uuid(output,schema.databaseId()); uuid(output,schema.domainId());
         output.putLong(schema.schemaEpoch()).putInt(schema.routingPrefixBytes()).putInt(schema.columns().size());
         for (var column:schema.columns()) {
@@ -40,7 +40,7 @@ public final class DistributedSchemaCodec {
         Objects.requireNonNull(bytes);
         if (bytes.length<HEADER_BYTES || bytes.length>MAX_BYTES) throw new IllegalArgumentException("Invalid distributed schema size");
         var input=ByteBuffer.wrap(bytes);
-        if (input.getInt()!=MAGIC || input.getInt()!=VERSION || input.getInt()!=DistributedSchema.PHYSICAL_KEY_CODEC_VERSION) {
+        if (input.getInt()!=MAGIC || input.getInt()!=DistributedSchema.PHYSICAL_KEY_CODEC_VERSION) {
             throw new IllegalArgumentException("Unsupported distributed schema/physical key codec");
         }
         UUID cluster=uuid(input), database=uuid(input), domain=uuid(input); long epoch=input.getLong();

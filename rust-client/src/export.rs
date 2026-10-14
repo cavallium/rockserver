@@ -400,11 +400,11 @@ impl<'a> SchemaReader<'a> {
 }
 impl ExportSchema {
     pub fn decode(encoded: &[u8]) -> Result<Self> {
-        if !(76..=MAX_SCHEMA_BYTES).contains(&encoded.len()) {
+        if !(72..=MAX_SCHEMA_BYTES).contains(&encoded.len()) {
             return Err(invalid("invalid export schema size"));
         }
         let mut r = SchemaReader(encoded);
-        if r.i32()? != 0x44534348 || r.i32()? != 1 || r.i32()? != 1 {
+        if r.i32()? != 0x44534348 || r.i32()? != 1 {
             return Err(invalid("unsupported export schema or physical key codec"));
         }
         let cluster_id = r.uuid()?;
@@ -1090,7 +1090,7 @@ mod tests {
             encoded.extend_from_slice(value.as_bytes());
         }
         let mut encoded = Vec::new();
-        for header in [0x44534348i32, 1, 1] {
+        for header in [0x44534348i32, 1] {
             encoded.extend_from_slice(&header.to_be_bytes());
         }
         for uuid in [[3; 16], [4; 16], [5; 16]] {
@@ -1347,37 +1347,37 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn schema_decoder_rejects_noncanonical_ids_names_utf8_and_carrier_versions() {
+    fn schema_decoder_rejects_noncanonical_ids_names_utf8_and_physical_codec() {
         let bytes = schema_bytes();
-        assert_eq!(bytes.len(), 267);
-        for offset in [4, 8] {
+        assert_eq!(bytes.len(), 263);
+        for offset in [0, 4] {
             let mut v = bytes.clone();
             v[offset..offset + 4].copy_from_slice(&2i32.to_be_bytes());
             assert!(ExportSchema::decode(&v).is_err());
         }
         let mut v = bytes.clone();
-        v[92..100].copy_from_slice(&0i64.to_be_bytes());
+        v[88..96].copy_from_slice(&0i64.to_be_bytes());
         assert!(ExportSchema::decode(&v).is_err());
         let mut v = bytes.clone();
-        v[140..148].copy_from_slice(&1i64.to_be_bytes());
+        v[136..144].copy_from_slice(&1i64.to_be_bytes());
         assert!(ExportSchema::decode(&v).is_err());
         let mut v = bytes.clone();
-        v[124..140].copy_from_slice(&[1; 16]);
+        v[120..136].copy_from_slice(&[1; 16]);
         assert!(ExportSchema::decode(&v).is_err());
         let mut v = bytes.clone();
-        v[76..92].copy_from_slice(&[0x80; 16]);
+        v[72..88].copy_from_slice(&[0x80; 16]);
         assert!(ExportSchema::decode(&v).is_err());
         let mut v = bytes.clone();
-        v[124..140].copy_from_slice(&[0x80; 16]);
+        v[120..136].copy_from_slice(&[0x80; 16]);
         assert!(ExportSchema::decode(&v).is_ok());
         let mut v = bytes.clone();
-        v[152] = b'a';
+        v[148] = b'a';
         assert!(ExportSchema::decode(&v).is_err());
         let mut v = bytes.clone();
-        v[104] = 0xff;
+        v[100] = 0xff;
         assert!(ExportSchema::decode(&v).is_err());
         let mut v = bytes.clone();
-        v[100..104].copy_from_slice(&4097i32.to_be_bytes());
+        v[96..100].copy_from_slice(&4097i32.to_be_bytes());
         assert!(ExportSchema::decode(&v).is_err());
         let mut v = bytes;
         v.push(0);
@@ -1387,34 +1387,34 @@ mod tests {
     fn schema_decoder_enforces_shape_prefix_hash_flags_and_operator_versions() {
         let bytes = schema_bytes();
         let mut v = bytes.clone();
-        v[60..68].copy_from_slice(&(-1i64).to_be_bytes());
+        v[56..64].copy_from_slice(&(-1i64).to_be_bytes());
         assert!(ExportSchema::decode(&v).is_err());
         for (offset, value) in [
-            (72, 257i32),
-            (105, 257),
-            (109, 0),
-            (109, MAX_SCHEMA_BYTES as i32),
-            (117, 3),
-            (68, 3),
+            (68, 257i32),
+            (101, 257),
+            (105, 0),
+            (105, MAX_SCHEMA_BYTES as i32),
+            (113, 3),
+            (64, 3),
+            (234, 0),
             (238, 0),
-            (242, 0),
-            (263, 0),
+            (259, 0),
         ] {
             let mut v = bytes.clone();
             v[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
             assert!(ExportSchema::decode(&v).is_err());
         }
-        for (offset, value) in [(121, 0u8), (121, 2), (122, 2), (123, 2)] {
+        for (offset, value) in [(117, 0u8), (117, 2), (118, 2), (119, 2)] {
             let mut v = bytes.clone();
             v[offset] = value;
             assert!(ExportSchema::decode(&v).is_err());
         }
         let mut v = bytes.clone();
-        v[181..189].copy_from_slice(&(-1i64).to_be_bytes());
+        v[177..185].copy_from_slice(&(-1i64).to_be_bytes());
         assert!(ExportSchema::decode(&v).is_err());
         // Equal byte prefix length is insufficient: every column must use the same fixed component boundaries.
         let mut v = bytes;
-        v[157..161].copy_from_slice(&2i32.to_be_bytes());
+        v[153..157].copy_from_slice(&2i32.to_be_bytes());
         assert!(ExportSchema::decode(&v).is_err());
     }
     #[test]

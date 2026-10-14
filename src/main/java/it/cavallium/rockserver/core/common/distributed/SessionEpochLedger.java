@@ -10,7 +10,7 @@ public record SessionEpochLedger(UUID clusterId, UUID databaseId, long generatio
                                  long minimumEpoch, long nextEpoch, List<Grant> grants) {
     public static final int MAX_GRANTS = 1024;
     public static final long MAX_LIFETIME_MILLIS = 86_400_000;
-    public static final int MAX_BYTES = 76 + MAX_GRANTS * 40;
+    public static final int MAX_BYTES = 72 + MAX_GRANTS * 40;
     private static final int MAGIC = 0x5345504c;
     public record Grant(long epoch, UUID sessionId, long issuedAtMillis, long expiresAtMillis) {
         public Grant {
@@ -73,7 +73,7 @@ public record SessionEpochLedger(UUID clusterId, UUID databaseId, long generatio
         }
     }
     public byte[] encode() {
-        var output = ByteBuffer.allocate(76+grants.size()*40).putInt(MAGIC).putInt(1);
+        var output = ByteBuffer.allocate(72+grants.size()*40).putInt(MAGIC);
         uuid(output,clusterId); uuid(output,databaseId);
         output.putLong(generation).putLong(logicalTimeMillis).putLong(minimumEpoch).putLong(nextEpoch).putInt(grants.size());
         for (Grant grant : grants) {
@@ -82,9 +82,9 @@ public record SessionEpochLedger(UUID clusterId, UUID databaseId, long generatio
         return output.array();
     }
     public static SessionEpochLedger decode(byte[] bytes) {
-        if (bytes.length < 76 || bytes.length > MAX_BYTES) throw new IllegalArgumentException("Invalid ledger byte size");
+        if (bytes.length < 72 || bytes.length > MAX_BYTES) throw new IllegalArgumentException("Invalid ledger byte size");
         var input = ByteBuffer.wrap(bytes);
-        if (input.getInt() != MAGIC || input.getInt() != 1) throw new IllegalArgumentException("Unsupported epoch ledger");
+        if (input.getInt() != MAGIC) throw new IllegalArgumentException("Unsupported epoch ledger");
         UUID cluster = uuid(input), database = uuid(input);
         long generation = input.getLong(), time = input.getLong(), minimum = input.getLong(), next = input.getLong();
         int count = input.getInt();

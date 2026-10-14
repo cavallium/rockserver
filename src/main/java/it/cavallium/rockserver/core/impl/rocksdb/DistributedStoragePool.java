@@ -176,8 +176,8 @@ public final class DistributedStoragePool implements AutoCloseable {
             if(!Arrays.equals(db.get(state,groupSchemaKey(parent.groupId(),0x62)),digest)) throw new IllegalArgumentException("Topology retirement pointer missing/changed");
             byte[] value=db.get(state,groupSchemaKey(parent.groupId(),0x60)); if(value==null || !NativeTopologyFreeze.decode(value).equals(seed.parentFreezes().get(parent.groupId()))) throw new IllegalArgumentException("Topology retirement original FREEZE changed");
             byte[] marker=db.get(state,Arrays.copyOf(groupSchemaKey(parent.groupId(),0),16));
-            if(marker==null || marker.length!=20 || ByteBuffer.wrap(marker).getInt()!=1) throw new IllegalArgumentException("Retired parent lacks completed native marker");
-            var cut=new ApplyPosition(ByteBuffer.wrap(marker,4,16).getLong(),ByteBuffer.wrap(marker,12,8).getLong()); seed.parentFreezes().get(parent.groupId()).requireCut(cut);
+            if(marker==null || marker.length!=16) throw new IllegalArgumentException("Retired parent lacks completed native marker");
+            var cut=new ApplyPosition(ByteBuffer.wrap(marker,0,16).getLong(),ByteBuffer.wrap(marker,8,8).getLong()); seed.parentFreezes().get(parent.groupId()).requireCut(cut);
         }
         for(var target:seed.definition().targets()) { byte[] bytes=db.get(state,groupSchemaKey(target.groupId(),0x61)); if(bytes==null || !NativeTopologyBirth.decode(bytes).equals(seed.birth(target.groupId()))) throw new IllegalArgumentException("Topology child birth missing/changed"); }
         for(var entry:seed.physicalNames().entrySet()) { var binding=bindings.get(entry.getKey()); if(binding==null || !binding.name().equals(entry.getValue()) || binding.mergeAdmitted()!=seed.mergeColumns().contains(entry.getKey())) throw new IllegalArgumentException("Topology physical binding changed"); }

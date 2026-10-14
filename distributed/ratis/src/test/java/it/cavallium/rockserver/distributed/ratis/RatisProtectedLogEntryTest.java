@@ -41,6 +41,19 @@ class RatisProtectedLogEntryTest {
         assertFalse(f.machine.isProtectedLogEntry(entry(new DistributedCommand(OTHER,0,DIGEST,ACK,List.of(),List.of(),0))));
         verifyNoInteractions(f.store);
     }
+    @Test void snapshotHomeSuccessorUsesTheCurrentHeaderBeforeProtectedClassification() throws Exception {
+        var f=fixture();
+        for(var setting:Map.of("role",RatisNodePlan.Role.SNAPSHOT_HOME,"snapshotHomeConfigured",true,"homeColumn",COLUMN,"homeCluster",OTHER,"homeDatabase",COLUMN).entrySet()) {
+            var field=RatisRangeStateMachine.class.getDeclaredField(setting.getKey());field.setAccessible(true);field.set(f.machine,setting.getValue());
+        }
+        var fence=new SnapshotFence(OTHER,COLUMN,OTHER,new UUID(0,10),GROUP,0,OP,0,0,DIGEST,
+                List.of(new SnapshotFence.Participant(COLUMN,OTHER,0,DIGEST,new OperationId(OP.sessionId(),1,2),new OperationId(OP.sessionId(),1,3),new TransactionScope(List.of(TransactionScope.Span.range(COLUMN,null,null))))));
+        var before=SnapshotFenceStatus.begin(fence);var after=before.abort();
+        byte[] key=ByteBuffer.allocate(16).putLong(fence.fenceId().getMostSignificantBits()).putLong(fence.fenceId().getLeastSignificantBits()).array();
+        var command=new DistributedCommand(GROUP,0,DIGEST,ACK,List.of(new Mutation(Mutation.Kind.PUT,COLUMN,key,after.encode())),List.of(new KeyPredicate(COLUMN,key,before.encode())),-1);
+        assertTrue(f.machine.isProtectedLogEntry(entry(command)));
+        verifyNoInteractions(f.store);
+    }
     @Test void canonicalCommitAndAbortFinalizationsRequireTheExactParticipantGroup() throws Exception {
         var f=fixture();var initial=TransactionStatus.begin(OTHER,COLUMN,OTHER,new UUID(0,5),OP,0,DIGEST,DIGEST,
                 List.of(new TransactionStatus.Participant(COLUMN,GROUP,0,DIGEST,DIGEST,null,false)));

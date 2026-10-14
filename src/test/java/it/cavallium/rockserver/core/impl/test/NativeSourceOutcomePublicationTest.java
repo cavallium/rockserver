@@ -28,8 +28,8 @@ class NativeSourceOutcomePublicationTest {
     byte[] success() { return new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode(); }
     @Test void reservedCapacityPublishesOriginalReceiptWithoutUserEffectsAndLostReplyIsExact()throws Exception {
         try(var f=topology.new Fixture(root.resolve("source"));var h=home.new Fixture(root.resolve("home"))) {
-            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(2,184);
-            var request=reserve(f,h,1,1);assertEquals(92,request.reservedBytes());var credit=f.parent.applySourceOutcomeCredit(new ApplyPosition(1,3),request);assertEquals(1,f.parent.sourceOutcomeCredits().size());
+            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(2,176);
+            var request=reserve(f,h,1,1);assertEquals(88,request.reservedBytes());var credit=f.parent.applySourceOutcomeCredit(new ApplyPosition(1,3),request);assertEquals(1,f.parent.sourceOutcomeCredits().size());
             var outcome=f.parent.readTopologyOperationOutcome(request.origin().clusterId(),request.origin().databaseId(),request.origin().domainId(),request.origin().source(),request.original().operationId(),request.original().receiptDigest());assertEquals(credit,outcome.credit());assertNull(outcome.result());
             var another=reserve(f,h,2,2);assertThrows(IllegalStateException.class,()->f.parent.estimateSourceOutcomeCredit(another));assertEquals(new ApplyPosition(1,3),f.parent.applied());
             var result=success();var published=f.parent.publishSourceOutcome(new ApplyPosition(1,4),request,result);assertEquals(NativeSourceOutcomePublication.Outcome.RETAINED,published.outcome());assertTrue(f.parent.sourceOutcomeCredits().isEmpty());assertArrayEquals(result,f.parent.operationResult(request.original().operationId(),request.original().receiptDigest()));
@@ -40,20 +40,20 @@ class NativeSourceOutcomePublicationTest {
     }
     @Test void pendingCreditAndPublishedOriginalProofSurviveReopenAndPortableImage()throws Exception {
         Path path=root.resolve("source"),image=root.resolve("source-image");NativeSourceOutcomeCredit.Request request;NativeSourceOutcomeCredit credit;RangeDescriptor parent;
-        try(var f=topology.new Fixture(path);var h=home.new Fixture(root.resolve("home"))) { f.freeze();f.parent.configureSourceOutcomeCapacity(2,184);parent=f.definition.parents().getFirst();request=reserve(f,h,1,1);credit=f.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);NativeRangeImage.write(image,f.parent,topology.limits); }
+        try(var f=topology.new Fixture(path);var h=home.new Fixture(root.resolve("home"))) { f.freeze();f.parent.configureSourceOutcomeCapacity(2,176);parent=f.definition.parents().getFirst();request=reserve(f,h,1,1);credit=f.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);NativeRangeImage.write(image,f.parent,topology.limits); }
         NativeRangeImage.inspect(image,topology.limits);
         for(Path target:List.of(path,root.resolve("target")))try(var pool=topology.helper.pool(target)) {
             var store=topology.helper.open(pool,parent);
             store.initializeConfiguration(new byte[]{1});store.enableCdc(request.origin().source().rangeId());
             if(!target.equals(path)) { store.fence();store.installSnapshot(image,topology.limits);store.activate(); }
-            store.configureSourceOutcomeCapacity(2,184);assertEquals(credit,store.sourceOutcomeCredit(request.original().operationId(),request.original().receiptDigest()));
+            store.configureSourceOutcomeCapacity(2,176);assertEquals(credit,store.sourceOutcomeCredit(request.original().operationId(),request.original().receiptDigest()));
             var result=store.publishSourceOutcome(new ApplyPosition(2,3),request,success());assertEquals(NativeSourceOutcomePublication.Outcome.RETAINED,result.outcome());assertEquals(credit.position(),result.publication().creditPosition());
         }
         try(var pool=topology.helper.pool(path)) { var store=topology.helper.open(pool,parent);assertEquals(new ApplyPosition(2,3),store.sourceOutcomePublication(request,success()).publication().position());assertTrue(store.sourceOutcomeCredits().isEmpty()); }
     }
     @Test void ackCannotDonatePendingPromiseAndFencedPublicationDoesNotResurrectOutcome()throws Exception {
         try(var f=topology.new Fixture(root.resolve("source"));var h=home.new Fixture(root.resolve("home"))) {
-            f.freeze();f.parent.configureSourceOutcomeCapacity(2,184);var request=reserve(f,h,1,1);f.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);
+            f.freeze();f.parent.configureSourceOutcomeCapacity(2,176);var request=reserve(f,h,1,1);f.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);
             var ack=new DistributedCommand(request.original().groupId(),1,f.parent.schemaDigest(),new OperationId(request.original().operationId().sessionId(),1,2),List.of(),List.of(),1);
             f.parent.apply(new ApplyPosition(1,3),ack);assertNotNull(f.parent.sourceOutcomeCredit(request.original().operationId(),request.original().receiptDigest()));assertNull(f.parent.sourceOutcomePublication(request,success()));
             var publication=f.parent.publishSourceOutcome(new ApplyPosition(1,4),request,success());assertEquals(NativeSourceOutcomePublication.Outcome.FENCED,publication.outcome());assertTrue(f.parent.sourceOutcomeCredits().isEmpty());assertEquals(CommandResult.Status.SESSION_EXPIRED,CommandResult.decode(f.parent.operationResult(request.original().operationId(),request.original().receiptDigest())).status());
@@ -62,7 +62,7 @@ class NativeSourceOutcomePublicationTest {
     }
     @Test void epochFenceKeepsPendingRecoveryCreditUntilTerminalPublication()throws Exception {
         try(var f=topology.new Fixture(root.resolve("source"));var h=home.new Fixture(root.resolve("home"))) {
-            f.freeze();f.parent.configureSourceOutcomeCapacity(2,184);var request=reserve(f,h,1,1);var credit=f.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);
+            f.freeze();f.parent.configureSourceOutcomeCapacity(2,176);var request=reserve(f,h,1,1);var credit=f.parent.applySourceOutcomeCredit(new ApplyPosition(1,2),request);
             var floor=DistributedCommand.advanceSessionEpochFloor(request.original().groupId(),1,f.parent.schemaDigest(),new OperationId(home.admin,2,0),2);f.parent.apply(new ApplyPosition(1,3),floor);
             assertEquals(credit,f.parent.sourceOutcomeCredit(request.original().operationId(),request.original().receiptDigest()));assertTrue(f.parent.estimateSourceOutcomeCredit(request).fenced());assertNull(f.parent.sourceOutcomePublication(request,success()));
             assertEquals(NativeSourceOutcomePublication.Outcome.FENCED,f.parent.publishSourceOutcome(new ApplyPosition(1,4),request,success()).outcome());assertTrue(f.parent.sourceOutcomeCredits().isEmpty());
@@ -90,13 +90,13 @@ class NativeSourceOutcomePublicationTest {
             var mutation=new Mutation(Mutation.Kind.PUT,topology.helper.outer.fixed,topology.helper.helper.key(1),topology.helper.helper.key(8),Mutation.ReturnMode.CURRENT);var base=new DistributedCommand(request.original().groupId(),1,f.parent.schemaDigest(),new OperationId(topology.helper.outer.session,1,2),List.of(mutation));
             var result=new CommandResult(CommandResult.Status.SUCCESS,List.of(topology.helper.helper.key(8))).encode();var accepted=DistributedCommand.acceptedTransaction(base,new TransactionAcceptance(new ApplyPosition(1,0),0,new UUID(0,77),new TransactionScope(List.of(TransactionScope.Span.point(mutation.columnId(),mutation.key()))),result));
             var old=request.origin();var origin=new OperationRerouteOrigin(old.clusterId(),old.databaseId(),old.domainId(),old.source(),accepted.operationId(),accepted.receiptDigest(),old.absenceCommitment(),old.absenceCut(),old.targetDirectoryDigest(),old.planDigest(),old.targetParticipantCount(),new OperationId(home.user,5,512));var reservation=TransactionStatus.reserve(origin,request.home().definition().schemaEpoch(),request.home().definition().schemaDigest());
-            var acceptedRequest=new NativeSourceOutcomeCredit.Request(accepted,origin,request.targetDirectory(),request.freeze(),new HomeIdentity(home.group,1,new byte[32],home.column,reservation));assertEquals(8,acceptedRequest.maximumResultBytes());assertEquals(92,acceptedRequest.reservedBytes());
+            var acceptedRequest=new NativeSourceOutcomeCredit.Request(accepted,origin,request.targetDirectory(),request.freeze(),new HomeIdentity(home.group,1,new byte[32],home.column,reservation));assertEquals(8,acceptedRequest.maximumResultBytes());assertEquals(88,acceptedRequest.reservedBytes());
         }
     }
 
     @Test void durableSourceAckPromiseWinsRaceWithOrdinaryNamespaceGrowthAndAllowsTerminalPublication() throws Exception {
         try(var f=topology.new Fixture(root.resolve("aux-source"));var h=home.new Fixture(root.resolve("aux-home"))) {
-            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(100,100*92);f.parent.configureSessionMetadataCapacity(2);
+            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(100,100*88);f.parent.configureSessionMetadataCapacity(2);
             var original=f.write(f.parent,1,8);original=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),original.operationId(),original.mutations(),List.of(),0);
             var request=reserveOriginal(f,h,original,1);assertEquals(1,f.parent.estimateSourceSessionMetadata(request).additionalNamespaces());
             f.parent.applySourceOutcomeCredit(new ApplyPosition(1,3),request);assertEquals(0,f.parent.estimateSourceSessionMetadata(request).additionalNamespaces());
@@ -117,7 +117,7 @@ class NativeSourceOutcomePublicationTest {
     @Test void receiverBudgetIncludesActualFloorsAndUnconsumedSourceNamespacePromises() throws Exception {
         var image=root.resolve("promised.image");
         try(var f=topology.new Fixture(root.resolve("promise-donor"));var h=home.new Fixture(root.resolve("promise-home"))) {
-            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(100,100*92);
+            f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.freeze();f.parent.configureSourceOutcomeCapacity(100,100*88);
             var original=f.write(f.parent,1,8);original=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),original.operationId(),original.mutations(),List.of(),0);
             var request=reserveOriginal(f,h,original,1);f.parent.applySourceOutcomeCredit(new ApplyPosition(1,3),request);
             for(int n=0;n<2;n++){var acknowledgement=new DistributedCommand(original.groupId(),original.rangeEpoch(),original.schemaDigest(),new OperationId(new UUID(0,8100+n),1,1),List.of(),List.of(),0);assertEquals(CommandResult.Status.SUCCESS,CommandResult.decode(f.parent.apply(new ApplyPosition(1,4+n),acknowledgement)).status());}
@@ -133,11 +133,11 @@ class NativeSourceOutcomePublicationTest {
         try(var f=topology.new Fixture(path)) {
             f.parent.apply(new ApplyPosition(1,1),f.write(f.parent,0,9));f.parent.apply(new ApplyPosition(1,2),f.write(f.parent,1,8));
             assertTrue(f.parent.sourceOutcomeCredits().isEmpty());assertEquals(2,f.parent.receiptUsage().retainedCount());
-            assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(1,92));f.parent.configureSourceOutcomeCapacity(2,184);
+            assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(1,88));f.parent.configureSourceOutcomeCapacity(2,176);
             try(var pin=f.parent.capture()){NativeRangeImage.write(image,pin,pin.interval(),topology.limits);}
         }
-        try(var f=topology.new Fixture(path)){assertTrue(f.parent.sourceOutcomeCredits().isEmpty());assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(1,184));assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(2,92));f.parent.configureSourceOutcomeCapacity(2,184);}
-        try(var f=topology.new Fixture(root.resolve("tighter-target"))){f.parent.configureSourceOutcomeCapacity(1,92);var cut=f.parent.applied();f.parent.fence();assertThrows(java.io.IOException.class,()->f.parent.installSnapshot(image,topology.limits));assertEquals(cut,f.parent.applied());assertFalse(f.parent.pendingInstallation());}
+        try(var f=topology.new Fixture(path)){assertTrue(f.parent.sourceOutcomeCredits().isEmpty());assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(1,176));assertThrows(IllegalStateException.class,()->f.parent.configureSourceOutcomeCapacity(2,88));f.parent.configureSourceOutcomeCapacity(2,176);}
+        try(var f=topology.new Fixture(root.resolve("tighter-target"))){f.parent.configureSourceOutcomeCapacity(1,88);var cut=f.parent.applied();f.parent.fence();assertThrows(java.io.IOException.class,()->f.parent.installSnapshot(image,topology.limits));assertEquals(cut,f.parent.applied());assertFalse(f.parent.pendingInstallation());}
     }
 
 }

@@ -26,7 +26,7 @@ public record NativeSourceOutcomeCredit(Request request,ApplyPosition position) 
             for(var mutation:original.mutations())if(!targetDirectory.columns().contains(mutation.columnId()))throw new IllegalArgumentException("Source credit mutation projection changed");for(var predicate:original.predicates())if(!targetDirectory.columns().contains(predicate.columnId()))throw new IllegalArgumentException("Source credit predicate projection changed");
         }
         public int maximumResultBytes() { return original.kind()==DistributedCommand.Kind.COMMIT_ACCEPTED || original.mutations().stream().allMatch(m->m.returnMode()==Mutation.ReturnMode.NONE) ? 8 : CommandResult.MAX_BYTES; }
-        public long reservedBytes() { return 84L+maximumResultBytes(); }
+        public long reservedBytes() { return 80L+maximumResultBytes(); }
         public byte[] encode() { try { var bytes=new ByteArrayOutputStream();var out=new DataOutputStream(bytes);out.writeInt(0x534f5251);for(byte[] part:List.of(DistributedCommandCodec.encode(original),origin.encode(),RangeDirectoryCodec.encode(targetDirectory),freeze.encode(),home.encode())) { out.writeInt(part.length);out.write(part); }return bytes.toByteArray(); } catch(IOException impossible) { throw new AssertionError(impossible); } }
         public byte[] digest() { return hash(encode()); }
         public static Request decode(byte[] bytes) {

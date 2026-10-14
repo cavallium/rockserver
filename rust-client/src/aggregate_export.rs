@@ -198,13 +198,10 @@ fn endpoint(address: &str) -> bool {
         && port.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p))
 }
 fn directory(encoded: &[u8], schema: &ExportSchema) -> Result<AggregateDirectory> {
-    if !(112..=1024 * 1024).contains(&encoded.len()) {
+    if !(108..=1024 * 1024).contains(&encoded.len()) {
         return Err(invalid("invalid aggregate directory size"));
     }
     let mut r = Read(encoded);
-    if r.i32()? != 1 {
-        return Err(invalid("unsupported current directory carrier"));
-    }
     let cluster_id = r.id()?;
     let database_id = r.id()?;
     let domain_id = r.id()?;
@@ -776,7 +773,7 @@ mod tests {
     }
     fn schema(domain: u8, has_column: bool) -> Vec<u8> {
         let mut b = Vec::new();
-        for v in [0x44534348, 1, 1] {
+        for v in [0x44534348, 1] {
             int(&mut b, v)
         }
         for v in [3, 4, domain] {
@@ -798,7 +795,6 @@ mod tests {
     }
     fn dir(domain: u8, has_column: bool) -> Vec<u8> {
         let mut b = Vec::new();
-        int(&mut b, 1);
         for v in [3, 4, domain] {
             uuid(&mut b, v)
         }
