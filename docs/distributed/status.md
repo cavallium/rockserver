@@ -36,8 +36,8 @@ This section and the remaining gates at the end describe the current branch.
   Complete malformed records and CRC errors fail; incomplete trailing records
   preserve the previous inventory. Fresh pools skip listing only after proving
   an empty bounded directory tree; retained files without CURRENT cannot be
-  adopted as a new database. The pinned JNI source is `bc1ddab`, reconstructed
-  exactly by wrapper `69caf44`. Its 28 extent and six Java cases pass, including
+  adopted as a new database. Startup qualification used JNI source `bc1ddab`,
+  reconstructed exactly by wrapper `69caf44`. Its 28 extent and six Java cases pass, including
   actual cross-process lock ownership. The unchanged native inventory has nine
   earlier passing cases. Main native consumers initially passed 103 cases; the subsequent eight-case pool
   gate also verifies lost-CURRENT refusal without changing the retained MANIFEST.
@@ -1603,8 +1603,19 @@ ordinary frontend defaults do not expose node-wide maintenance. Twelve Java and
 six Rust controlled contract cases pass (`physical-wire-and-exact-bulk-third-gate.log`,
 `rust-physical-first-gate.log`, `9f2eb22`). These are no-socket checks, not independent
 endpoint or operator-listener authentication acceptance. The current qualified JNI
-is installed only in the task's private Maven repository; final wrapper/source-pin
-integration remains unfinished.
+is installed only in the task's private Maven repository. Wrapper `5d0277c`
+reconstructs source `157838f56566ce4e80e9e8036ab4799f85f049d8` from the immutable
+upstream lock and one final-tree delta. Its tree
+`e92737804f00836db4630ce23f0b1fa9baa717a1` exactly matches checkpoint `5dc7215`.
+The unchanged first seventeen patches and refreshed final delta replay cleanly.
+The source checker passes after removing a JNI namespace directive and escaping
+an equivalent test character. The fresh Debug/GCC16/ABI1/JDK25 artifact passes
+39 JNI and 34 filesystem cases; eight metadata and 57 completion/recovery cases
+passed before those two source-only fixes, with the core implementation unchanged.
+The packaged library matches the built library and embeds the reconstructed
+source commit. Evidence: `qualified-artifact.json` and `qualified-*-gate.log` in
+`/home/cavallium/.codex/manual-worktrees/rockserver/bounded-native-wrapper-output`.
+The production Debian/GCC12 recipe build remains unproven.
 
 Topology catalogue retirement now requires exact ACTIVE state and fresh committed
 ACTIVATE quorum evidence for every target. The controller retains the original
