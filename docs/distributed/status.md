@@ -84,8 +84,24 @@ This section and the remaining gates at the end describe the current branch.
   a fatal resource error rather than skipped corruption. Five codec, 251 log and
   19 raw cases pass; evidence is `charged-codec-reader-streaming_uncompress_budget_test.log`
   and `charged-codec-reader-final-{log_test,raw_flush_test}.log` in that native output
-  directory. Batch/protection rows, retained memtables and replay count ceilings
-  remain unaccounted for; this does not establish the complete replay envelope.
+  directory. Batch/protection rows and retained memtables remain unaccounted for;
+  this does not establish the complete replay memory envelope.
+- Native checkpoint `0bf907d` qualifies cold raw receipts against the recovered
+  MANIFEST and referenced SSTs before retirement. Interrupted raw output replays
+  its original WAL and forces replacement metadata before admitting a new WAL;
+  abandoned output debt survives failed sync of every actual parent directory.
+  Explicit batch and decoded-entry ceilings cover the whole recovery, including
+  controls and zero-mutation batches, before batch copying. The current C++ and
+  Java/JNI policy takes these limits directly, with no compatibility overload.
+  Thirty-two completion and 22 raw cases pass in
+  `cold-installed-qualification-suite.log` and `replay-count-raw-suite.log` in the
+  native output directory. Missing/corrupt referenced SSTs fail even with paranoid
+  checks disabled. A separate dropped-CF case passes retained SST-reader ownership,
+  durable DROP, interrupted receipt retirement and cold qualification in
+  `cold-installed-drop-focused.log`. Large replay requiring prepaid recovery SST
+  output, complete replay memory admission and Java/JNI runtime
+  qualification of this checkpoint remain pending. The installed private JNI is
+  unchanged.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
