@@ -49,70 +49,44 @@ This section and the remaining gates at the end describe the current branch.
   The recipe enables RTTI in every release profile; shell and generated flag-matrix
   checks pass. The installed private JNI remains the qualified Debug candidate;
   this recipe repair does not establish a production native build.
-- The separate native candidate at `902f574` combines accepted-prefix MANIFEST
-  recovery, bounded raw writing and prepaid cohort primitives in one current
-  layout. Its Debug build passes, followed by 80 component cases: 28 extent,
-  20 completion, nine inventory, ten blob-builder and 13 raw-writer cases.
-  Evidence is `raw-primitives-merge-qualification.json` in the task-owned
-  `native-completion-integration-output` directory. Actual producer and atomic
-  orchestration, ordered installation, cold raw-cohort resolution and retained
-  source-owner barriers remain pending. This candidate has not replaced the
-  installed private JNI or established protected completion in the node.
-  The subsequent `de6ed23` candidate integrates sealed preparation before output,
-  source RAM admission before bundle allocation and cancellation drain outside
-  the DB mutex. Its combined build and 90 cases pass, including five new source
-  lifetime and budget-denial cases; evidence is `helper-merge-tests.json` in that
-  same output directory. Producer, installer and cold-resolution wiring remain
-  incomplete; these tests qualify the helper and existing primitives.
-  The connected native working tree now passes one actual ordinary-full flush:
-  reservation is observed before SST creation, followed by protected SST and
-  metadata installation without increasing quotas. The build passes 233 steps;
-  evidence is `actual-prepaid-full-copy.log` in the same output directory.
-  The run exposed and fixed a dropped completion claim in `FileOptions` copying.
-  The repaired connected checkpoint passes 94 cases: 25 completion, 32 extent,
-  17 raw-writer and 20 flush cases. They include atomic precreate admission,
-  denied reservation with no SST, unknown Ready reply ownership, actual two-flush
-  shutdown drain and live/lost issuer barriers. Evidence is
-  `actual-producer-repaired-{completion,extent,flush}.log` and
-  `root-raw-repaired-full.log` in that output directory. Qualified cold-cohort
-  resolution and complete shared replay RAM/count admission remain open; this
-  native working tree has not replaced the private JNI.
-- The subsequent native reader/codec checkpoint charges backing, fragmented and
-  decompressed storage, checksum contexts and ZSTD allocations through one shared
-  working-RAM policy. Replacement overlap is admitted before allocation; retained
-  capacity stays charged through actual destruction. Window/allocation denial is
-  a fatal resource error rather than skipped corruption. Five codec, 251 log and
-  19 raw cases pass; evidence is `charged-codec-reader-streaming_uncompress_budget_test.log`
-  and `charged-codec-reader-final-{log_test,raw_flush_test}.log` in that native output
-  directory. That gate does not qualify batch/protection rows or retained memtables;
-  it does not establish the complete replay memory envelope.
-- Native checkpoint `0bf907d` qualifies cold raw receipts against the recovered
-  MANIFEST and referenced SSTs before retirement. Interrupted raw output replays
-  its original WAL and forces replacement metadata before admitting a new WAL;
-  abandoned output debt survives failed sync of every actual parent directory.
-  Explicit batch and decoded-entry ceilings cover the whole recovery, including
-  controls and zero-mutation batches, before batch copying. The current C++ and
-  Java/JNI policy takes these limits directly, with no compatibility overload.
-  Thirty-two completion and 22 raw cases pass in
-  `cold-installed-qualification-suite.log` and `replay-count-raw-suite.log` in the
-  native output directory. Missing/corrupt referenced SSTs fail even with paranoid
-  checks disabled. A separate dropped-CF case passes retained SST-reader ownership,
-  durable DROP, interrupted receipt retirement and cold qualification in
-  `cold-installed-drop-focused.log`. Large replay requiring prepaid recovery SST
-  output, complete replay memory admission and Java/JNI runtime
-  qualification of this checkpoint remain pending. The installed private JNI is
-  unchanged.
-  Native checkpoint `038afa9` additionally admits fresh replay batch copies and
-  protection storage through that same RAM policy before allocation, retaining
-  the charge until batch destruction. Controls count toward replay work without
-  consuming protection rows. The current GCC/libstdc++ ABI1 profile is qualified;
-  other allocation profiles are refused before raw operation. The 25 raw and 33
-  completion cases passed before the additional foreign-WAL record guard in
-  `replay-batch-memory-protection-{raw,completion}.log`. Timed/wide-column records
-  are now rejected before copying, while standalone cold reopening still succeeds;
-  all 26 raw cases pass in `raw-unsupported-recovery-final-suite.log`. That run
-  included frozen recovery-SST primitives that are not yet wired or qualified.
-  Retained memtable admission and the full node memory envelope remain pending.
+- The separate native candidate at `3a8d111` combines one current accepted-prefix
+  layout, bounded raw writing, prepaid live cohorts and qualified cold recovery.
+  Raw output preserves every version, merge operand and range; preparation admits
+  RAM before allocating and drains cancellation outside the DB mutex. Actual live
+  and atomic workflows exercise reservation before SST creation, denied reservation
+  with no output, lost Ready replies, original issuer ownership and shutdown drain.
+  Reader/codec storage, batch copies and protection rows use one shared RAM policy.
+  Credit is acquired before allocation, and retained capacity stays charged until
+  destruction. Explicit batch and decoded-entry ceilings cover the whole recovery,
+  including controls and zero-mutation batches. Timed/wide-column WAL records are
+  refused before copying; policy-absent standalone cold recovery remains available.
+  The qualified allocation profile is current GCC/libstdc++ ABI1. Earlier reader
+  and codec evidence includes five codec and 251 log cases in
+  `charged-codec-reader-streaming_uncompress_budget_test.log` and
+  `charged-codec-reader-final-log_test.log` in the native output directory.
+- Cold raw receipts now require actual recovered MANIFEST/SST qualification before
+  retirement, including missing/corrupt SST refusal with paranoid checks disabled
+  and a durably dropped CF with a retained SST reader. Interrupted output replays
+  its original WAL and forces replacement metadata before a new WAL. Large replay
+  counts and reserves typed recovery SST children before creating output, then
+  installs actual spill edits and child/original outcomes in that replacement.
+  Native cases cover 12 original 128 KiB writes, multiple 64 KiB replay spills and
+  exact retry after a lost Ready reply. Abandoned output debt survives failed sync
+  of every actual output parent. Independent source review found no concrete defect
+  in this recovery-output scope.
+- Memtable construction now admits fixed object, arena/shard/cache and optional
+  bloom allocations before allocation. CF creation and switching fully construct
+  replacements before MANIFEST/WAL effects; denial preserves the old memtable.
+  The reservation remains held through actual object deallocation, including
+  constructor unwind. Raw range access uses its existing serialized lane and one
+  cache slot. Final Debug source passes 167 selected cases: 28 raw, 35 completion,
+  20 flush, 29 batch, eight memtable-list, 14 DB/memtable, one table/memtable and
+  32 extent cases. Evidence is `construction-actual-free-*.log` in the task-owned
+  `native-completion-integration-output` directory. Insertion storage and range
+  cache replacement admission, live pre-WAL generation-bound credits, the full
+  node memory envelope and Java/JNI runtime qualification remain pending. The
+  native candidate has not replaced the installed private JNI or established
+  protected completion in the node.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
