@@ -26,13 +26,58 @@ public final class StartupIoPolicy {
     public record Decision(int pressureMask, boolean capturePressure, boolean qualifiedHealthy, boolean idleNeutral) {}
 
     /** Fresh idle recovery windows permit capture again, without qualifying admission growth. */
-    public Decision sample(InputSample input, long nowNanos) {
-        if (input == null) { recovering = true; return last = unknown(true); }
+    public Decision sample(InputSample input, long nowNanos) { return sample(input, nowNanos, null); }
+
+    Decision sampleRecorded(String database, String workload, long epoch, InputSample input, long nowNanos) {
+        var event = StartupIoJfr.policy();
+        if (event == null) return sample(input, nowNanos);
+        event.database = database; event.workload = workload; event.epoch = epoch; event.inputPresent = input != null;
+        if (input != null) {
+            event.inputEpoch = input.epoch(); event.sampleAgeNanos = nowNanos - input.sampledNanos();
+            event.telemetryValid = input.telemetryValid(); event.complete = input.complete();
+            event.fresh = fresh(input, nowNanos); event.workers = input.workers();
+            event.active = input.active(); event.queued = input.queued(); event.accepted = input.accepted();
+            event.terminal = input.terminal(); event.writeOutstanding = input.writeOutstanding();
+            event.urgentRecovery = input.urgentRecovery();
+            var reads = input.reads(); var writes = input.writes();
+            event.readsPresent = reads != null; event.writesPresent = writes != null;
+            event.structurallyValid = valid(input);
+            if (reads != null) {
+                event.readValid = reads.valid();
+                event.readGeneration = reads.generation(); event.pointCompleted = reads.pointCompleted(); event.bulkCompleted = reads.bulkCompleted();
+                if (reads.point() != null) { var c = reads.point(); event.pointCount = c.count(); event.pointNanos = c.nanos(); event.pointMaxNanos = c.tailNanos(); event.pointFailures = c.failures(); }
+                if (reads.bulk() != null) { var c = reads.bulk(); event.bulkCount = c.count(); event.bulkNanos = c.nanos(); event.bulkMaxNanos = c.tailNanos(); event.bulkFailures = c.failures(); }
+            }
+            if (writes != null) {
+                event.writeValid = writes.valid();
+                event.writeGeneration = writes.generation(); event.writeCompleted = writes.completed(); event.activeWrites = writes.active();
+                if (writes.calls() != null) { var c = writes.calls(); event.writeCount = c.count(); event.writeNanos = c.nanos(); event.writeMaxNanos = c.tailNanos(); event.writeFailures = c.failures(); }
+            }
+        }
+        var decision = sample(input, nowNanos, event);
+        event.recovering = recovering; event.recoveryWindows = goodWindows;
+        event.pointReady = point.ready(); event.bulkReady = bulk.ready(); event.writeReady = write.ready();
+        event.pointWindows = point.windows; event.bulkWindows = bulk.windows; event.writeWindows = write.windows;
+        event.pointMeanNanos = point.mean; event.pointBaselineMaxNanos = point.tail;
+        event.bulkMeanNanos = bulk.mean; event.bulkBaselineMaxNanos = bulk.tail;
+        event.writeMeanNanos = write.mean; event.writeBaselineMaxNanos = write.tail;
+        event.pressureMask = decision.pressureMask(); event.capturePressure = decision.capturePressure();
+        event.qualifiedHealthy = decision.qualifiedHealthy(); event.idleNeutral = decision.idleNeutral(); event.commit();
+        return decision;
+    }
+
+    private static Decision diagnosed(StartupIoJfr.Policy event, String reason, Decision decision) {
+        if (event != null) event.reason = reason;
+        return decision;
+    }
+
+    private Decision sample(InputSample input, long nowNanos, StartupIoJfr.Policy event) {
+        if (input == null) { recovering = true; return last = diagnosed(event, "missing_input", unknown(true)); }
         // Repeated consumers cannot add a healthy window or drain a tail again.
         if (previous != null && input.epoch() == previous.epoch()) {
-            if (input.equals(previous) && fresh(input, nowNanos)) return last;
+            if (input.equals(previous) && fresh(input, nowNanos)) return diagnosed(event, "repeated_epoch", last);
             recovering = true; goodWindows = 0;
-            return last = new Decision(UNKNOWN | FOREGROUND | (input.urgentRecovery() ? URGENT : 0), true, false, false);
+            return last = diagnosed(event, "changed_or_stale_repeated_epoch", new Decision(UNKNOWN | FOREGROUND | (input.urgentRecovery() ? URGENT : 0), true, false, false));
         }
         boolean reset = previous != null && (previous.reads() == null || previous.writes() == null
                 || input.epoch() < previous.epoch()
@@ -47,43 +92,53 @@ public final class StartupIoPolicy {
                    || input.writes().completed() < previous.writes().completed()));
         if (reset) { point.reset(); bulk.reset(); write.reset(); }
         boolean valid = !reset && fresh(input, nowNanos) && valid(input) && conserved(input);
+        if (event != null) {
+            event.windowEvaluated = true; event.windowValid = valid;
+            event.reset = reset; event.structurallyValid = valid(input);
+            event.conservationChecked = !reset && fresh(input, nowNanos) && event.structurallyValid;
+            event.conserved = event.conservationChecked && conserved(input);
+        }
         previous = input;
         if (input.urgentRecovery()) {
             recovering = true; goodWindows = 0;
-            return last = new Decision(URGENT | (valid ? 0 : UNKNOWN), true, false, false);
+            return last = diagnosed(event, "urgent_recovery", new Decision(URGENT | (valid ? 0 : UNKNOWN), true, false, false));
         }
-        if (!valid) { recovering = true; return last = unknown(true); }
+        if (!valid) { recovering = true; return last = diagnosed(event, "invalid_window", unknown(true)); }
         var reads = input.reads();
         var writes = input.writes().calls();
         boolean busy = input.writeOutstanding() || input.writes().active() > 0 || input.active() > 0 || input.queued() > 0 || input.accepted() > input.terminal();
         boolean completed = reads.point().count() > 0 || reads.bulk().count() > 0 || writes.count() > 0;
+        if (event != null) {
+            event.pointSlow = point.slow(reads.point()); event.bulkSlow = bulk.slow(reads.bulk());
+            event.writeSlow = write.slow(writes.count(), writes.nanos(), writes.tailNanos());
+        }
         boolean pressure = reads.point().failures() > 0 || reads.bulk().failures() > 0 || writes.failures() > 0
                 || input.queued() > 0
                 || point.slow(reads.point()) || bulk.slow(reads.bulk()) || write.slow(writes.count(), writes.nanos(), writes.tailNanos());
         if (pressure) {
             recovering = true; goodWindows = 0;
-            return last = new Decision(FOREGROUND, true, false, false);
+            return last = diagnosed(event, "failure_queue_or_slow_cohort", new Decision(FOREGROUND, true, false, false));
         }
         if (!completed) {
             if (!busy && recovering) {
                 if (++goodWindows >= RECOVERY_WINDOWS) { recovering = false; goodWindows = 0; }
-                return last = new Decision(UNKNOWN | (recovering ? FOREGROUND : 0), recovering, false, !recovering);
+                return last = diagnosed(event, "idle_recovery", new Decision(UNKNOWN | (recovering ? FOREGROUND : 0), recovering, false, !recovering));
             }
             goodWindows = 0;
-            return last = new Decision(UNKNOWN | (busy || recovering ? FOREGROUND : 0),
-                    busy || recovering, false, !busy && !recovering);
+            return last = diagnosed(event, "no_completions", new Decision(UNKNOWN | (busy || recovering ? FOREGROUND : 0),
+                    busy || recovering, false, !busy && !recovering));
         }
         if (input.writeOutstanding() || input.writes().active() > 0)
-            return last = unknown(true);
+            return last = diagnosed(event, "outstanding_write", unknown(true));
         point.observe(reads.point()); bulk.observe(reads.bulk()); write.observe(writes.count(), writes.nanos(), writes.tailNanos());
         boolean calibrated = (reads.point().count() == 0 || point.ready())
                 && (reads.bulk().count() == 0 || bulk.ready())
                 && (writes.count() == 0 || write.ready());
-        if (!calibrated) return last = unknown(busy || recovering);
+        if (!calibrated) return last = diagnosed(event, "calibrating", unknown(busy || recovering));
         if (recovering && ++goodWindows < RECOVERY_WINDOWS)
-            return last = new Decision(UNKNOWN, true, false, false);
+            return last = diagnosed(event, "completed_recovery", new Decision(UNKNOWN, true, false, false));
         recovering = false; goodWindows = 0;
-        return last = new Decision(0, false, true, false);
+        return last = diagnosed(event, "qualified_healthy", new Decision(0, false, true, false));
     }
 
     private boolean conserved(InputSample input) {

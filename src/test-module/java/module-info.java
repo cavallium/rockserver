@@ -1,4 +1,5 @@
 module rockserver.core.test {
+	requires jdk.jfr;
 	requires jazzer.api;
 	requires jazzer.junit;
 	requires org.lz4.java;

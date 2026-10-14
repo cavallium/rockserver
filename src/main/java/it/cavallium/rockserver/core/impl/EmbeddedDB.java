@@ -3259,15 +3259,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return startupWriteGroups.computeIfAbsent(group, _ -> new StartupWriteCompletions());
 	}
 	private void nativePut(ColumnFamilyHandle column, @Nullable WriteOptions options, byte[] key, byte[] value) throws org.rocksdb.RocksDBException {
+		var diagnostic = StartupIoJfr.nativePut();
 		var observer = startupWriteCounter(column);
 		long started = observer == null ? 0 : observer.begin();
 		boolean failed = true;
 		try {
+			if (diagnostic != null) diagnostic.begin();
 			if (options == null) db.get().put(column, key, value);
 			else db.get().put(column, options, key, value);
 			failed = false;
 		} finally {
-			if (observer != null) observer.complete(started, failed);
+			try {
+				if (diagnostic != null) diagnostic.end();
+			} finally {
+				if (observer != null) observer.complete(started, failed);
+			}
+			if (diagnostic != null) {
+				diagnostic.failed = failed;
+				diagnostic.commit();
+			}
 		}
 	}
 	private void nativeDelete(ColumnFamilyHandle column, @Nullable WriteOptions options, byte[] key) throws org.rocksdb.RocksDBException {
@@ -3736,6 +3746,23 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			long columnId,
 			@NotNull Keys keys,
 			@NotNull Buf value,
+			RequestPut<? super Buf, T> requestType) throws RocksDBException {
+		var diagnostic = StartupIoJfr.servicePut();
+		boolean failed = true;
+		try {
+			T result = putExecution(transactionOrUpdateId, columnId, keys, value, requestType);
+			failed = false;
+			return result;
+		} finally {
+			if (diagnostic != null) {
+				diagnostic.end();
+				diagnostic.failed = failed;
+				diagnostic.commit();
+			}
+		}
+	}
+
+	private <T> T putExecution(long transactionOrUpdateId, long columnId, Keys keys, Buf value,
 			RequestPut<? super Buf, T> requestType) throws RocksDBException {
 		var start = System.nanoTime();
 		actionLogger.logAction("Put", start, columnId, keys, value, transactionOrUpdateId, null, null, requestType);
