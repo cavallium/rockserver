@@ -340,6 +340,8 @@ service RocksDB {
 
    list<KV> getAllInRangeNoCache(1: required i64 transactionId, 2: required i64 columnId, 3: list<binary> startKeysInclusive, 4: list<binary> endKeysExclusive, 5: required bool reverse, 7: required RequestContext context) throws (1: RocksDBThriftException e),
 
+   OptionalLongValue checkMergeOperator(1: required string operatorName, 2: required binary hash, 3: required RequestContext context) throws (1: RocksDBThriftException e),
+
    i64 uploadMergeOperator(1: required string operatorName, 2: required string className, 3: required binary jarPayload, 4: required RequestContext context) throws (1: RocksDBThriftException e),
 
    list<OptionalBinary> putMultiGetPrevious(1: required i64 transactionOrUpdateId, 2: required i64 columnId, 3: required list<list<binary>> keysMulti, 4: required list<binary> valueMulti, 5: required RequestContext context) throws (1: RocksDBThriftException e),

@@ -359,7 +359,12 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public Long checkMergeOperator(String name, byte[] hash) {
-		throw new UnsupportedOperationException("checkMergeOperator not implemented for Thrift");
+		try {
+			var response = client.checkMergeOperator(name, ByteBuffer.wrap(hash), currentWireRequestContext());
+			return response.isSetValue() ? response.getValue() : null;
+		} catch (TException e) {
+			throw wrap(e);
+		}
 	}
 
 	@Override
@@ -974,7 +979,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 
 	@Override
 	public CompletableFuture<Long> checkMergeOperatorAsync(String name, byte[] hash) {
-		return CompletableFuture.failedFuture(new UnsupportedOperationException("checkMergeOperator not implemented for Thrift"));
+		return supplyAsyncContextual(() -> checkMergeOperator(name, hash), executor);
 	}
 
 	@Override

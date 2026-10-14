@@ -101,6 +101,8 @@ public class RocksDB {
 
     public java.util.List<KV> getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
+    public OptionalLongValue checkMergeOperator(java.lang.String operatorName, java.nio.ByteBuffer hash, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
+
     public long uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
 
     public java.util.List<OptionalBinary> putMultiGetPrevious(long transactionOrUpdateId, long columnId, java.util.List<java.util.List<java.nio.ByteBuffer>> keysMulti, java.util.List<java.nio.ByteBuffer> valueMulti, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException;
@@ -226,6 +228,8 @@ public class RocksDB {
     public void getAllInRange(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException;
 
     public void getAllInRangeNoCache(long transactionId, long columnId, java.util.List<java.nio.ByteBuffer> startKeysInclusive, java.util.List<java.nio.ByteBuffer> endKeysExclusive, boolean reverse, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException;
+
+    public void checkMergeOperator(java.lang.String operatorName, java.nio.ByteBuffer hash, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException;
 
     public void uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException;
 
@@ -1583,6 +1587,35 @@ public class RocksDB {
         throw result.e;
       }
       throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "getAllInRangeNoCache failed: unknown result");
+    }
+
+    @Override
+    public OptionalLongValue checkMergeOperator(java.lang.String operatorName, java.nio.ByteBuffer hash, RequestContext context) throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      send_checkMergeOperator(operatorName, hash, context);
+      return recv_checkMergeOperator();
+    }
+
+    public void send_checkMergeOperator(java.lang.String operatorName, java.nio.ByteBuffer hash, RequestContext context) throws org.apache.thrift.TException
+    {
+      checkMergeOperator_args args = new checkMergeOperator_args();
+      args.setOperatorName(operatorName);
+      args.setHash(hash);
+      args.setContext(context);
+      sendBase("checkMergeOperator", args);
+    }
+
+    public OptionalLongValue recv_checkMergeOperator() throws RocksDBThriftException, org.apache.thrift.TException
+    {
+      checkMergeOperator_result result = new checkMergeOperator_result();
+      receiveBase(result, "checkMergeOperator");
+      if (result.isSetSuccess()) {
+        return result.success;
+      }
+      if (result.e != null) {
+        throw result.e;
+      }
+      throw new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.MISSING_RESULT, "checkMergeOperator failed: unknown result");
     }
 
     @Override
@@ -4052,6 +4085,47 @@ public class RocksDB {
     }
 
     @Override
+    public void checkMergeOperator(java.lang.String operatorName, java.nio.ByteBuffer hash, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException {
+      checkReady();
+      checkMergeOperator_call method_call = new checkMergeOperator_call(operatorName, hash, context, resultHandler, this, ___protocolFactory, ___transport);
+      this.___currentMethod = method_call;
+      ___manager.call(method_call);
+    }
+
+    public static class checkMergeOperator_call extends org.apache.thrift.async.TAsyncMethodCall<OptionalLongValue> {
+      private java.lang.String operatorName;
+      private java.nio.ByteBuffer hash;
+      private RequestContext context;
+      public checkMergeOperator_call(java.lang.String operatorName, java.nio.ByteBuffer hash, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler, org.apache.thrift.async.TAsyncClient client, org.apache.thrift.protocol.TProtocolFactory protocolFactory, org.apache.thrift.transport.TNonblockingTransport transport) throws org.apache.thrift.TException {
+        super(client, protocolFactory, transport, resultHandler, false);
+        this.operatorName = operatorName;
+        this.hash = hash;
+        this.context = context;
+      }
+
+      @Override
+      public void write_args(org.apache.thrift.protocol.TProtocol prot) throws org.apache.thrift.TException {
+        prot.writeMessageBegin(new org.apache.thrift.protocol.TMessage("checkMergeOperator", org.apache.thrift.protocol.TMessageType.CALL, 0));
+        checkMergeOperator_args args = new checkMergeOperator_args();
+        args.setOperatorName(operatorName);
+        args.setHash(hash);
+        args.setContext(context);
+        args.write(prot);
+        prot.writeMessageEnd();
+      }
+
+      @Override
+      public OptionalLongValue getResult() throws RocksDBThriftException, org.apache.thrift.TException {
+        if (getState() != org.apache.thrift.async.TAsyncMethodCall.State.RESPONSE_READ) {
+          throw new java.lang.IllegalStateException("Method call not finished!");
+        }
+        org.apache.thrift.transport.TMemoryInputTransport memoryTransport = new org.apache.thrift.transport.TMemoryInputTransport(getFrameBuffer().array());
+        org.apache.thrift.protocol.TProtocol prot = client.getProtocolFactory().getProtocol(memoryTransport);
+        return (new Client(prot)).recv_checkMergeOperator();
+      }
+    }
+
+    @Override
     public void uploadMergeOperator(java.lang.String operatorName, java.lang.String className, java.nio.ByteBuffer jarPayload, RequestContext context, org.apache.thrift.async.AsyncMethodCallback<java.lang.Long> resultHandler) throws org.apache.thrift.TException {
       checkReady();
       uploadMergeOperator_call method_call = new uploadMergeOperator_call(operatorName, className, jarPayload, context, resultHandler, this, ___protocolFactory, ___transport);
@@ -4745,6 +4819,7 @@ public class RocksDB {
       processMap.put("reduceRangeEntriesCount", new reduceRangeEntriesCount());
       processMap.put("getAllInRange", new getAllInRange());
       processMap.put("getAllInRangeNoCache", new getAllInRangeNoCache());
+      processMap.put("checkMergeOperator", new checkMergeOperator());
       processMap.put("uploadMergeOperator", new uploadMergeOperator());
       processMap.put("putMultiGetPrevious", new putMultiGetPrevious());
       processMap.put("putMultiGetDelta", new putMultiGetDelta());
@@ -6442,6 +6517,43 @@ public class RocksDB {
       }
     }
 
+    public static class checkMergeOperator<I extends Iface> extends org.apache.thrift.ProcessFunction<I, checkMergeOperator_args, checkMergeOperator_result> {
+      public checkMergeOperator() {
+        super("checkMergeOperator");
+      }
+
+      @Override
+      public checkMergeOperator_args getEmptyArgsInstance() {
+        return new checkMergeOperator_args();
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      protected boolean rethrowUnhandledExceptions() {
+        return false;
+      }
+
+      @Override
+      public checkMergeOperator_result getEmptyResultInstance() {
+        return new checkMergeOperator_result();
+      }
+
+      @Override
+      public checkMergeOperator_result getResult(I iface, checkMergeOperator_args args) throws org.apache.thrift.TException {
+        checkMergeOperator_result result = getEmptyResultInstance();
+        try {
+          result.success = iface.checkMergeOperator(args.operatorName, args.hash, args.context);
+        } catch (RocksDBThriftException e) {
+          result.e = e;
+        }
+        return result;
+      }
+    }
+
     public static class uploadMergeOperator<I extends Iface> extends org.apache.thrift.ProcessFunction<I, uploadMergeOperator_args, uploadMergeOperator_result> {
       public uploadMergeOperator() {
         super("uploadMergeOperator");
@@ -7091,6 +7203,7 @@ public class RocksDB {
       processMap.put("reduceRangeEntriesCount", new reduceRangeEntriesCount());
       processMap.put("getAllInRange", new getAllInRange());
       processMap.put("getAllInRangeNoCache", new getAllInRangeNoCache());
+      processMap.put("checkMergeOperator", new checkMergeOperator());
       processMap.put("uploadMergeOperator", new uploadMergeOperator());
       processMap.put("putMultiGetPrevious", new putMultiGetPrevious());
       processMap.put("putMultiGetDelta", new putMultiGetDelta());
@@ -10523,6 +10636,82 @@ public class RocksDB {
       @Override
       public void start(I iface, getAllInRangeNoCache_args args, org.apache.thrift.async.AsyncMethodCallback<java.util.List<KV>> resultHandler) throws org.apache.thrift.TException {
         iface.getAllInRangeNoCache(args.transactionId, args.columnId, args.startKeysInclusive, args.endKeysExclusive, args.reverse, args.context,resultHandler);
+      }
+    }
+
+    public static class checkMergeOperator<I extends AsyncIface> extends org.apache.thrift.AsyncProcessFunction<I, checkMergeOperator_args, OptionalLongValue, checkMergeOperator_result> {
+      public checkMergeOperator() {
+        super("checkMergeOperator");
+      }
+
+      @Override
+      public checkMergeOperator_result getEmptyResultInstance() {
+        return new checkMergeOperator_result();
+      }
+
+      @Override
+      public checkMergeOperator_args getEmptyArgsInstance() {
+        return new checkMergeOperator_args();
+      }
+
+      @Override
+      public org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> getResultHandler(final org.apache.thrift.server.AbstractNonblockingServer.AsyncFrameBuffer fb, final int seqid) {
+        final org.apache.thrift.AsyncProcessFunction fcall = this;
+        return new org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue>() {
+          @Override
+          public void onComplete(OptionalLongValue o) {
+            checkMergeOperator_result result = new checkMergeOperator_result();
+            result.success = o;
+            try {
+              fcall.sendResponse(fb, result, org.apache.thrift.protocol.TMessageType.REPLY,seqid);
+            } catch (org.apache.thrift.transport.TTransportException e) {
+              _LOGGER.error("TTransportException writing to internal frame buffer", e);
+              fb.close();
+            } catch (java.lang.Exception e) {
+              _LOGGER.error("Exception writing to internal frame buffer", e);
+              onError(e);
+            }
+          }
+          @Override
+          public void onError(java.lang.Exception e) {
+            byte msgType = org.apache.thrift.protocol.TMessageType.REPLY;
+            org.apache.thrift.TSerializable msg;
+            checkMergeOperator_result result = new checkMergeOperator_result();
+            if (e instanceof RocksDBThriftException) {
+              result.e = (RocksDBThriftException) e;
+              result.setEIsSet(true);
+              msg = result;
+            } else if (e instanceof org.apache.thrift.transport.TTransportException) {
+              _LOGGER.error("TTransportException inside handler", e);
+              fb.close();
+              return;
+            } else if (e instanceof org.apache.thrift.TApplicationException) {
+              _LOGGER.error("TApplicationException inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = (org.apache.thrift.TApplicationException)e;
+            } else {
+              _LOGGER.error("Exception inside handler", e);
+              msgType = org.apache.thrift.protocol.TMessageType.EXCEPTION;
+              msg = new org.apache.thrift.TApplicationException(org.apache.thrift.TApplicationException.INTERNAL_ERROR, e.getMessage());
+            }
+            try {
+              fcall.sendResponse(fb,msg,msgType,seqid);
+            } catch (java.lang.Exception ex) {
+              _LOGGER.error("Exception writing to internal frame buffer", ex);
+              fb.close();
+            }
+          }
+        };
+      }
+
+      @Override
+      public boolean isOneway() {
+        return false;
+      }
+
+      @Override
+      public void start(I iface, checkMergeOperator_args args, org.apache.thrift.async.AsyncMethodCallback<OptionalLongValue> resultHandler) throws org.apache.thrift.TException {
+        iface.checkMergeOperator(args.operatorName, args.hash, args.context,resultHandler);
       }
     }
 
@@ -65163,6 +65352,1088 @@ public class RocksDB {
               struct.success.add(_elem620);
             }
           }
+          struct.setSuccessIsSet(true);
+        }
+        if (incoming.get(1)) {
+          struct.e = new RocksDBThriftException();
+          struct.e.read(iprot);
+          struct.setEIsSet(true);
+        }
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class checkMergeOperator_args implements org.apache.thrift.TBase<checkMergeOperator_args, checkMergeOperator_args._Fields>, java.io.Serializable, Cloneable, Comparable<checkMergeOperator_args>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("checkMergeOperator_args");
+
+    private static final org.apache.thrift.protocol.TField OPERATOR_NAME_FIELD_DESC = new org.apache.thrift.protocol.TField("operatorName", org.apache.thrift.protocol.TType.STRING, (short)1);
+    private static final org.apache.thrift.protocol.TField HASH_FIELD_DESC = new org.apache.thrift.protocol.TField("hash", org.apache.thrift.protocol.TType.STRING, (short)2);
+    private static final org.apache.thrift.protocol.TField CONTEXT_FIELD_DESC = new org.apache.thrift.protocol.TField("context", org.apache.thrift.protocol.TType.STRUCT, (short)3);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new checkMergeOperator_argsStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new checkMergeOperator_argsTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable java.lang.String operatorName; // required
+    public @org.apache.thrift.annotation.Nullable java.nio.ByteBuffer hash; // required
+    public @org.apache.thrift.annotation.Nullable RequestContext context; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      OPERATOR_NAME((short)1, "operatorName"),
+      HASH((short)2, "hash"),
+      CONTEXT((short)3, "context");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 1: // OPERATOR_NAME
+            return OPERATOR_NAME;
+          case 2: // HASH
+            return HASH;
+          case 3: // CONTEXT
+            return CONTEXT;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.OPERATOR_NAME, new org.apache.thrift.meta_data.FieldMetaData("operatorName", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING)));
+      tmpMap.put(_Fields.HASH, new org.apache.thrift.meta_data.FieldMetaData("hash", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.FieldValueMetaData(org.apache.thrift.protocol.TType.STRING          , true)));
+      tmpMap.put(_Fields.CONTEXT, new org.apache.thrift.meta_data.FieldMetaData("context", org.apache.thrift.TFieldRequirementType.REQUIRED,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RequestContext.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(checkMergeOperator_args.class, metaDataMap);
+    }
+
+    public checkMergeOperator_args() {
+    }
+
+    public checkMergeOperator_args(
+      java.lang.String operatorName,
+      java.nio.ByteBuffer hash,
+      RequestContext context)
+    {
+      this();
+      this.operatorName = operatorName;
+      this.hash = org.apache.thrift.TBaseHelper.copyBinary(hash);
+      this.context = context;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public checkMergeOperator_args(checkMergeOperator_args other) {
+      if (other.isSetOperatorName()) {
+        this.operatorName = other.operatorName;
+      }
+      if (other.isSetHash()) {
+        this.hash = org.apache.thrift.TBaseHelper.copyBinary(other.hash);
+      }
+      if (other.isSetContext()) {
+        this.context = new RequestContext(other.context);
+      }
+    }
+
+    @Override
+    public checkMergeOperator_args deepCopy() {
+      return new checkMergeOperator_args(this);
+    }
+
+    @Override
+    public void clear() {
+      this.operatorName = null;
+      this.hash = null;
+      this.context = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public java.lang.String getOperatorName() {
+      return this.operatorName;
+    }
+
+    public checkMergeOperator_args setOperatorName(@org.apache.thrift.annotation.Nullable java.lang.String operatorName) {
+      this.operatorName = operatorName;
+      return this;
+    }
+
+    public void unsetOperatorName() {
+      this.operatorName = null;
+    }
+
+    /** Returns true if field operatorName is set (has been assigned a value) and false otherwise */
+    public boolean isSetOperatorName() {
+      return this.operatorName != null;
+    }
+
+    public void setOperatorNameIsSet(boolean value) {
+      if (!value) {
+        this.operatorName = null;
+      }
+    }
+
+    public byte[] getHash() {
+      setHash(org.apache.thrift.TBaseHelper.rightSize(hash));
+      return hash == null ? null : hash.array();
+    }
+
+    public java.nio.ByteBuffer bufferForHash() {
+      return org.apache.thrift.TBaseHelper.copyBinary(hash);
+    }
+
+    public checkMergeOperator_args setHash(byte[] hash) {
+      this.hash = hash == null ? (java.nio.ByteBuffer)null     : java.nio.ByteBuffer.wrap(hash.clone());
+      return this;
+    }
+
+    public checkMergeOperator_args setHash(@org.apache.thrift.annotation.Nullable java.nio.ByteBuffer hash) {
+      this.hash = org.apache.thrift.TBaseHelper.copyBinary(hash);
+      return this;
+    }
+
+    public void unsetHash() {
+      this.hash = null;
+    }
+
+    /** Returns true if field hash is set (has been assigned a value) and false otherwise */
+    public boolean isSetHash() {
+      return this.hash != null;
+    }
+
+    public void setHashIsSet(boolean value) {
+      if (!value) {
+        this.hash = null;
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RequestContext getContext() {
+      return this.context;
+    }
+
+    public checkMergeOperator_args setContext(@org.apache.thrift.annotation.Nullable RequestContext context) {
+      this.context = context;
+      return this;
+    }
+
+    public void unsetContext() {
+      this.context = null;
+    }
+
+    /** Returns true if field context is set (has been assigned a value) and false otherwise */
+    public boolean isSetContext() {
+      return this.context != null;
+    }
+
+    public void setContextIsSet(boolean value) {
+      if (!value) {
+        this.context = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case OPERATOR_NAME:
+        if (value == null) {
+          unsetOperatorName();
+        } else {
+          setOperatorName((java.lang.String)value);
+        }
+        break;
+
+      case HASH:
+        if (value == null) {
+          unsetHash();
+        } else {
+          if (value instanceof byte[]) {
+            setHash((byte[])value);
+          } else {
+            setHash((java.nio.ByteBuffer)value);
+          }
+        }
+        break;
+
+      case CONTEXT:
+        if (value == null) {
+          unsetContext();
+        } else {
+          setContext((RequestContext)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case OPERATOR_NAME:
+        return getOperatorName();
+
+      case HASH:
+        return getHash();
+
+      case CONTEXT:
+        return getContext();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case OPERATOR_NAME:
+        return isSetOperatorName();
+      case HASH:
+        return isSetHash();
+      case CONTEXT:
+        return isSetContext();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof checkMergeOperator_args)
+        return this.equals((checkMergeOperator_args)that);
+      return false;
+    }
+
+    public boolean equals(checkMergeOperator_args that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_operatorName = true && this.isSetOperatorName();
+      boolean that_present_operatorName = true && that.isSetOperatorName();
+      if (this_present_operatorName || that_present_operatorName) {
+        if (!(this_present_operatorName && that_present_operatorName))
+          return false;
+        if (!this.operatorName.equals(that.operatorName))
+          return false;
+      }
+
+      boolean this_present_hash = true && this.isSetHash();
+      boolean that_present_hash = true && that.isSetHash();
+      if (this_present_hash || that_present_hash) {
+        if (!(this_present_hash && that_present_hash))
+          return false;
+        if (!this.hash.equals(that.hash))
+          return false;
+      }
+
+      boolean this_present_context = true && this.isSetContext();
+      boolean that_present_context = true && that.isSetContext();
+      if (this_present_context || that_present_context) {
+        if (!(this_present_context && that_present_context))
+          return false;
+        if (!this.context.equals(that.context))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetOperatorName()) ? 131071 : 524287);
+      if (isSetOperatorName())
+        hashCode = hashCode * 8191 + operatorName.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetHash()) ? 131071 : 524287);
+      if (isSetHash())
+        hashCode = hashCode * 8191 + hash.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetContext()) ? 131071 : 524287);
+      if (isSetContext())
+        hashCode = hashCode * 8191 + context.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(checkMergeOperator_args other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetOperatorName(), other.isSetOperatorName());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetOperatorName()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.operatorName, other.operatorName);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetHash(), other.isSetHash());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetHash()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.hash, other.hash);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetContext(), other.isSetContext());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetContext()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.context, other.context);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    @Override
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+    }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("checkMergeOperator_args(");
+      boolean first = true;
+
+      sb.append("operatorName:");
+      if (this.operatorName == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.operatorName);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("hash:");
+      if (this.hash == null) {
+        sb.append("null");
+      } else {
+        org.apache.thrift.TBaseHelper.toString(this.hash, sb);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("context:");
+      if (this.context == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.context);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      if (operatorName == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'operatorName' was not present! Struct: " + toString());
+      }
+      if (hash == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'hash' was not present! Struct: " + toString());
+      }
+      if (context == null) {
+        throw new org.apache.thrift.protocol.TProtocolException("Required field 'context' was not present! Struct: " + toString());
+      }
+      // check for sub-struct validity
+      if (context != null) {
+        context.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class checkMergeOperator_argsStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public checkMergeOperator_argsStandardScheme getScheme() {
+        return new checkMergeOperator_argsStandardScheme();
+      }
+    }
+
+    private static class checkMergeOperator_argsStandardScheme extends org.apache.thrift.scheme.StandardScheme<checkMergeOperator_args> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, checkMergeOperator_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 1: // OPERATOR_NAME
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.operatorName = iprot.readString();
+                struct.setOperatorNameIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 2: // HASH
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRING) {
+                struct.hash = iprot.readBinary();
+                struct.setHashIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 3: // CONTEXT
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.context = new RequestContext();
+                struct.context.read(iprot);
+                struct.setContextIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, checkMergeOperator_args struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.operatorName != null) {
+          oprot.writeFieldBegin(OPERATOR_NAME_FIELD_DESC);
+          oprot.writeString(struct.operatorName);
+          oprot.writeFieldEnd();
+        }
+        if (struct.hash != null) {
+          oprot.writeFieldBegin(HASH_FIELD_DESC);
+          oprot.writeBinary(struct.hash);
+          oprot.writeFieldEnd();
+        }
+        if (struct.context != null) {
+          oprot.writeFieldBegin(CONTEXT_FIELD_DESC);
+          struct.context.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class checkMergeOperator_argsTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public checkMergeOperator_argsTupleScheme getScheme() {
+        return new checkMergeOperator_argsTupleScheme();
+      }
+    }
+
+    private static class checkMergeOperator_argsTupleScheme extends org.apache.thrift.scheme.TupleScheme<checkMergeOperator_args> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, checkMergeOperator_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        oprot.writeString(struct.operatorName);
+        oprot.writeBinary(struct.hash);
+        struct.context.write(oprot);
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, checkMergeOperator_args struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        struct.operatorName = iprot.readString();
+        struct.setOperatorNameIsSet(true);
+        struct.hash = iprot.readBinary();
+        struct.setHashIsSet(true);
+        struct.context = new RequestContext();
+        struct.context.read(iprot);
+        struct.setContextIsSet(true);
+      }
+    }
+
+    private static <S extends org.apache.thrift.scheme.IScheme> S scheme(org.apache.thrift.protocol.TProtocol proto) {
+      return (org.apache.thrift.scheme.StandardScheme.class.equals(proto.getScheme()) ? STANDARD_SCHEME_FACTORY : TUPLE_SCHEME_FACTORY).getScheme();
+    }
+  }
+
+  @SuppressWarnings({"cast", "rawtypes", "serial", "unchecked", "unused"})
+  public static class checkMergeOperator_result implements org.apache.thrift.TBase<checkMergeOperator_result, checkMergeOperator_result._Fields>, java.io.Serializable, Cloneable, Comparable<checkMergeOperator_result>   {
+    private static final org.apache.thrift.protocol.TStruct STRUCT_DESC = new org.apache.thrift.protocol.TStruct("checkMergeOperator_result");
+
+    private static final org.apache.thrift.protocol.TField SUCCESS_FIELD_DESC = new org.apache.thrift.protocol.TField("success", org.apache.thrift.protocol.TType.STRUCT, (short)0);
+    private static final org.apache.thrift.protocol.TField E_FIELD_DESC = new org.apache.thrift.protocol.TField("e", org.apache.thrift.protocol.TType.STRUCT, (short)1);
+
+    private static final org.apache.thrift.scheme.SchemeFactory STANDARD_SCHEME_FACTORY = new checkMergeOperator_resultStandardSchemeFactory();
+    private static final org.apache.thrift.scheme.SchemeFactory TUPLE_SCHEME_FACTORY = new checkMergeOperator_resultTupleSchemeFactory();
+
+    public @org.apache.thrift.annotation.Nullable OptionalLongValue success; // required
+    public @org.apache.thrift.annotation.Nullable RocksDBThriftException e; // required
+
+    /** The set of fields this struct contains, along with convenience methods for finding and manipulating them. */
+    public enum _Fields implements org.apache.thrift.TFieldIdEnum {
+      SUCCESS((short)0, "success"),
+      E((short)1, "e");
+
+      private static final java.util.Map<java.lang.String, _Fields> byName = new java.util.HashMap<java.lang.String, _Fields>();
+
+      static {
+        for (_Fields field : java.util.EnumSet.allOf(_Fields.class)) {
+          byName.put(field.getFieldName(), field);
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByThriftId(int fieldId) {
+        switch(fieldId) {
+          case 0: // SUCCESS
+            return SUCCESS;
+          case 1: // E
+            return E;
+          default:
+            return null;
+        }
+      }
+
+      /**
+       * Find the _Fields constant that matches fieldId, throwing an exception
+       * if it is not found.
+       */
+      public static _Fields findByThriftIdOrThrow(int fieldId) {
+        _Fields fields = findByThriftId(fieldId);
+        if (fields == null) throw new java.lang.IllegalArgumentException("Field " + fieldId + " doesn't exist!");
+        return fields;
+      }
+
+      /**
+       * Find the _Fields constant that matches name, or null if its not found.
+       */
+      @org.apache.thrift.annotation.Nullable
+      public static _Fields findByName(java.lang.String name) {
+        return byName.get(name);
+      }
+
+      private final short _thriftId;
+      private final java.lang.String _fieldName;
+
+      _Fields(short thriftId, java.lang.String fieldName) {
+        _thriftId = thriftId;
+        _fieldName = fieldName;
+      }
+
+      @Override
+      public short getThriftFieldId() {
+        return _thriftId;
+      }
+
+      @Override
+      public java.lang.String getFieldName() {
+        return _fieldName;
+      }
+    }
+
+    // isset id assignments
+    public static final java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> metaDataMap;
+    static {
+      java.util.Map<_Fields, org.apache.thrift.meta_data.FieldMetaData> tmpMap = new java.util.EnumMap<_Fields, org.apache.thrift.meta_data.FieldMetaData>(_Fields.class);
+      tmpMap.put(_Fields.SUCCESS, new org.apache.thrift.meta_data.FieldMetaData("success", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, OptionalLongValue.class)));
+      tmpMap.put(_Fields.E, new org.apache.thrift.meta_data.FieldMetaData("e", org.apache.thrift.TFieldRequirementType.DEFAULT,
+          new org.apache.thrift.meta_data.StructMetaData(org.apache.thrift.protocol.TType.STRUCT, RocksDBThriftException.class)));
+      metaDataMap = java.util.Collections.unmodifiableMap(tmpMap);
+      org.apache.thrift.meta_data.FieldMetaData.addStructMetaDataMap(checkMergeOperator_result.class, metaDataMap);
+    }
+
+    public checkMergeOperator_result() {
+    }
+
+    public checkMergeOperator_result(
+      OptionalLongValue success,
+      RocksDBThriftException e)
+    {
+      this();
+      this.success = success;
+      this.e = e;
+    }
+
+    /**
+     * Performs a deep copy on <i>other</i>.
+     */
+    public checkMergeOperator_result(checkMergeOperator_result other) {
+      if (other.isSetSuccess()) {
+        this.success = new OptionalLongValue(other.success);
+      }
+      if (other.isSetE()) {
+        this.e = new RocksDBThriftException(other.e);
+      }
+    }
+
+    @Override
+    public checkMergeOperator_result deepCopy() {
+      return new checkMergeOperator_result(this);
+    }
+
+    @Override
+    public void clear() {
+      this.success = null;
+      this.e = null;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public OptionalLongValue getSuccess() {
+      return this.success;
+    }
+
+    public checkMergeOperator_result setSuccess(@org.apache.thrift.annotation.Nullable OptionalLongValue success) {
+      this.success = success;
+      return this;
+    }
+
+    public void unsetSuccess() {
+      this.success = null;
+    }
+
+    /** Returns true if field success is set (has been assigned a value) and false otherwise */
+    public boolean isSetSuccess() {
+      return this.success != null;
+    }
+
+    public void setSuccessIsSet(boolean value) {
+      if (!value) {
+        this.success = null;
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    public RocksDBThriftException getE() {
+      return this.e;
+    }
+
+    public checkMergeOperator_result setE(@org.apache.thrift.annotation.Nullable RocksDBThriftException e) {
+      this.e = e;
+      return this;
+    }
+
+    public void unsetE() {
+      this.e = null;
+    }
+
+    /** Returns true if field e is set (has been assigned a value) and false otherwise */
+    public boolean isSetE() {
+      return this.e != null;
+    }
+
+    public void setEIsSet(boolean value) {
+      if (!value) {
+        this.e = null;
+      }
+    }
+
+    @Override
+    public void setFieldValue(_Fields field, @org.apache.thrift.annotation.Nullable java.lang.Object value) {
+      switch (field) {
+      case SUCCESS:
+        if (value == null) {
+          unsetSuccess();
+        } else {
+          setSuccess((OptionalLongValue)value);
+        }
+        break;
+
+      case E:
+        if (value == null) {
+          unsetE();
+        } else {
+          setE((RocksDBThriftException)value);
+        }
+        break;
+
+      }
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public java.lang.Object getFieldValue(_Fields field) {
+      switch (field) {
+      case SUCCESS:
+        return getSuccess();
+
+      case E:
+        return getE();
+
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    /** Returns true if field corresponding to fieldID is set (has been assigned a value) and false otherwise */
+    @Override
+    public boolean isSet(_Fields field) {
+      if (field == null) {
+        throw new java.lang.IllegalArgumentException();
+      }
+
+      switch (field) {
+      case SUCCESS:
+        return isSetSuccess();
+      case E:
+        return isSetE();
+      }
+      throw new java.lang.IllegalStateException();
+    }
+
+    @Override
+    public boolean equals(java.lang.Object that) {
+      if (that instanceof checkMergeOperator_result)
+        return this.equals((checkMergeOperator_result)that);
+      return false;
+    }
+
+    public boolean equals(checkMergeOperator_result that) {
+      if (that == null)
+        return false;
+      if (this == that)
+        return true;
+
+      boolean this_present_success = true && this.isSetSuccess();
+      boolean that_present_success = true && that.isSetSuccess();
+      if (this_present_success || that_present_success) {
+        if (!(this_present_success && that_present_success))
+          return false;
+        if (!this.success.equals(that.success))
+          return false;
+      }
+
+      boolean this_present_e = true && this.isSetE();
+      boolean that_present_e = true && that.isSetE();
+      if (this_present_e || that_present_e) {
+        if (!(this_present_e && that_present_e))
+          return false;
+        if (!this.e.equals(that.e))
+          return false;
+      }
+
+      return true;
+    }
+
+    @Override
+    public int hashCode() {
+      int hashCode = 1;
+
+      hashCode = hashCode * 8191 + ((isSetSuccess()) ? 131071 : 524287);
+      if (isSetSuccess())
+        hashCode = hashCode * 8191 + success.hashCode();
+
+      hashCode = hashCode * 8191 + ((isSetE()) ? 131071 : 524287);
+      if (isSetE())
+        hashCode = hashCode * 8191 + e.hashCode();
+
+      return hashCode;
+    }
+
+    @Override
+    public int compareTo(checkMergeOperator_result other) {
+      if (!getClass().equals(other.getClass())) {
+        return getClass().getName().compareTo(other.getClass().getName());
+      }
+
+      int lastComparison = 0;
+
+      lastComparison = java.lang.Boolean.compare(isSetSuccess(), other.isSetSuccess());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetSuccess()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.success, other.success);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      lastComparison = java.lang.Boolean.compare(isSetE(), other.isSetE());
+      if (lastComparison != 0) {
+        return lastComparison;
+      }
+      if (isSetE()) {
+        lastComparison = org.apache.thrift.TBaseHelper.compareTo(this.e, other.e);
+        if (lastComparison != 0) {
+          return lastComparison;
+        }
+      }
+      return 0;
+    }
+
+    @org.apache.thrift.annotation.Nullable
+    @Override
+    public _Fields fieldForId(int fieldId) {
+      return _Fields.findByThriftId(fieldId);
+    }
+
+    @Override
+    public void read(org.apache.thrift.protocol.TProtocol iprot) throws org.apache.thrift.TException {
+      scheme(iprot).read(iprot, this);
+    }
+
+    public void write(org.apache.thrift.protocol.TProtocol oprot) throws org.apache.thrift.TException {
+      scheme(oprot).write(oprot, this);
+      }
+
+    @Override
+    public java.lang.String toString() {
+      java.lang.StringBuilder sb = new java.lang.StringBuilder("checkMergeOperator_result(");
+      boolean first = true;
+
+      sb.append("success:");
+      if (this.success == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.success);
+      }
+      first = false;
+      if (!first) sb.append(", ");
+      sb.append("e:");
+      if (this.e == null) {
+        sb.append("null");
+      } else {
+        sb.append(this.e);
+      }
+      first = false;
+      sb.append(")");
+      return sb.toString();
+    }
+
+    public void validate() throws org.apache.thrift.TException {
+      // check for required fields
+      // check for sub-struct validity
+      if (success != null) {
+        success.validate();
+      }
+    }
+
+    private void writeObject(java.io.ObjectOutputStream out) throws java.io.IOException {
+      try {
+        write(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(out)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private void readObject(java.io.ObjectInputStream in) throws java.io.IOException, java.lang.ClassNotFoundException {
+      try {
+        read(new org.apache.thrift.protocol.TCompactProtocol(new org.apache.thrift.transport.TIOStreamTransport(in)));
+      } catch (org.apache.thrift.TException te) {
+        throw new java.io.IOException(te);
+      }
+    }
+
+    private static class checkMergeOperator_resultStandardSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public checkMergeOperator_resultStandardScheme getScheme() {
+        return new checkMergeOperator_resultStandardScheme();
+      }
+    }
+
+    private static class checkMergeOperator_resultStandardScheme extends org.apache.thrift.scheme.StandardScheme<checkMergeOperator_result> {
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol iprot, checkMergeOperator_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TField schemeField;
+        iprot.readStructBegin();
+        while (true)
+        {
+          schemeField = iprot.readFieldBegin();
+          if (schemeField.type == org.apache.thrift.protocol.TType.STOP) {
+            break;
+          }
+          switch (schemeField.id) {
+            case 0: // SUCCESS
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.success = new OptionalLongValue();
+                struct.success.read(iprot);
+                struct.setSuccessIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            case 1: // E
+              if (schemeField.type == org.apache.thrift.protocol.TType.STRUCT) {
+                struct.e = new RocksDBThriftException();
+                struct.e.read(iprot);
+                struct.setEIsSet(true);
+              } else {
+                org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+              }
+              break;
+            default:
+              org.apache.thrift.protocol.TProtocolUtil.skip(iprot, schemeField.type);
+          }
+          iprot.readFieldEnd();
+        }
+        iprot.readStructEnd();
+
+        // check for required fields of primitive type, which can't be checked in the validate method
+        struct.validate();
+      }
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol oprot, checkMergeOperator_result struct) throws org.apache.thrift.TException {
+        struct.validate();
+
+        oprot.writeStructBegin(STRUCT_DESC);
+        if (struct.success != null) {
+          oprot.writeFieldBegin(SUCCESS_FIELD_DESC);
+          struct.success.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        if (struct.e != null) {
+          oprot.writeFieldBegin(E_FIELD_DESC);
+          struct.e.write(oprot);
+          oprot.writeFieldEnd();
+        }
+        oprot.writeFieldStop();
+        oprot.writeStructEnd();
+      }
+
+    }
+
+    private static class checkMergeOperator_resultTupleSchemeFactory implements org.apache.thrift.scheme.SchemeFactory {
+      @Override
+      public checkMergeOperator_resultTupleScheme getScheme() {
+        return new checkMergeOperator_resultTupleScheme();
+      }
+    }
+
+    private static class checkMergeOperator_resultTupleScheme extends org.apache.thrift.scheme.TupleScheme<checkMergeOperator_result> {
+
+      @Override
+      public void write(org.apache.thrift.protocol.TProtocol prot, checkMergeOperator_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol oprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet optionals = new java.util.BitSet();
+        if (struct.isSetSuccess()) {
+          optionals.set(0);
+        }
+        if (struct.isSetE()) {
+          optionals.set(1);
+        }
+        oprot.writeBitSet(optionals, 2);
+        if (struct.isSetSuccess()) {
+          struct.success.write(oprot);
+        }
+        if (struct.isSetE()) {
+          struct.e.write(oprot);
+        }
+      }
+
+      @Override
+      public void read(org.apache.thrift.protocol.TProtocol prot, checkMergeOperator_result struct) throws org.apache.thrift.TException {
+        org.apache.thrift.protocol.TTupleProtocol iprot = (org.apache.thrift.protocol.TTupleProtocol) prot;
+        java.util.BitSet incoming = iprot.readBitSet(2);
+        if (incoming.get(0)) {
+          struct.success = new OptionalLongValue();
+          struct.success.read(iprot);
           struct.setSuccessIsSet(true);
         }
         if (incoming.get(1)) {
