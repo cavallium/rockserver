@@ -26,18 +26,20 @@ final class RatisDirectRequestJournal implements AutoCloseable {
         }
         DistributedCommand pendingItem() { return items.get(pendingIndex); }
     }
+    private final RatisJournalAccess access;
     private final Path path; private final byte[] binding; private final FileChannel channel; private final FileLock lock;
     private boolean closed,fenced; private Request request;
-    RatisDirectRequestJournal(Path path,byte[] binding) throws IOException {
+    RatisDirectRequestJournal(Path path,byte[] binding,RatisJournalAccess access) throws IOException {
+        this.access=Objects.requireNonNull(access);access.register(path,MAX_BYTES);access.register(path.resolveSibling(path.getFileName()+".lock"),32);
         this.path=path.toAbsolutePath(); this.binding=binding.clone(); if (binding.length!=32 || !Files.isDirectory(this.path.getParent())) throw new IOException("Direct journal binding/parent invalid");
         channel=FileChannel.open(this.path.resolveSibling(this.path.getFileName()+".lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE); FileLock acquired=null;
         try {
             try { acquired=channel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Direct journal already owned",owned); }
             if (acquired==null) throw new IOException("Direct journal already owned"); lock=acquired;
-            if (Files.exists(this.path)) { byte[] body=SessionJournalFiles.read(this.path,MAX_BYTES); request=decode(body); if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical direct journal"); SessionJournalFiles.force(this.path); SessionJournalFiles.force(this.path.getParent()); }
+            if (Files.exists(this.path)) { byte[] body=access.read(this.path,MAX_BYTES); request=decode(body); if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical direct journal"); SessionJournalFiles.force(this.path); SessionJournalFiles.force(this.path.getParent()); }
         } catch (IOException | RuntimeException | Error failure) { try { if (acquired!=null) acquired.release(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
-    void retire() throws IOException {requireOpen();if(request==null)return;try{SessionJournalFiles.remove(path,encode(),MAX_BYTES);request=null;}catch(IOException failure){fenced=true;throw failure;}}
+    void retire() throws IOException {requireOpen();if(request==null)return;try{access.remove(path,encode(),MAX_BYTES,SessionJournalFiles.FILESYSTEM);request=null;}catch(IOException failure){fenced=true;throw failure;}}
     Request request() throws IOException { requireOpen(); return request; }
     void begin(Request next) throws IOException { requireOpen(); validate(next); request=next; persist(); }
     void bind(OperationId operation) throws IOException { requireOpen(); if (request.pending!=null || request.terminal()) throw new IOException("Direct pending binding changed"); request.pending=operation; request.pendingIndex=request.cursor(); persist(); }
@@ -53,7 +55,7 @@ final class RatisDirectRequestJournal implements AutoCloseable {
     }
     static CommandResult.Status terminalOutcome(Request request) {if(!request.terminal())throw new IllegalArgumentException("Direct outcome is not terminal");if(request.unsubmittedStatus!=null)return request.unsubmittedStatus;if(request.overflow)return CommandResult.Status.RESULT_TOO_LARGE;return request.results.isEmpty()?CommandResult.Status.SUCCESS:request.results.getLast().status();}
     static byte[] resultDigest(Request request) { var out=new java.io.ByteArrayOutputStream(); for(var result:request.results)out.writeBytes(result.encode()); out.write(request.overflow?1:0); out.write(request.unsubmittedStatus==null?0:request.unsubmittedStatus.ordinal()+1); return RemoteMutationToken.digest(out.toByteArray()); }
-    private void persist() throws IOException { try { SessionJournalFiles.write(path,encode(),MAX_BYTES); } catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Direct journal failed; reopen it",failure); } }
+    private void persist() throws IOException { try { access.write(path,encode(),MAX_BYTES); } catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Direct journal failed; reopen it",failure); } }
     private byte[] encode() throws IOException {
         if (request==null) throw new IOException("Direct request absent"); validate(request);
         long size=56L+RemoteMutationToken.BYTES+(request.pending==null ? 0 : 36);

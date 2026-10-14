@@ -244,7 +244,7 @@ class RatisAcceptedSessionClientTest {
                 assertThrows(IOException.class,() -> RatisDurableSessionClient.reopen(path,routed));
             }
             SessionJournalFiles.write(path,valid,SessionWindowJournal.MAX_BYTES);
-            try (var journal=SessionWindowJournal.open(path,routed,false)) {
+            try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) {
                 var saved=journal.read(); var entry=saved.state().entries().getFirst();
                 var wrong=new RatisSessionClient.WindowEntry(entry.prepared(),new CommandResult(CommandResult.Status.SUCCESS,List.of(new byte[] {99})),false,false);
                 var state=new RatisSessionClient.WindowState(saved.state().nextSequence(),saved.state().acknowledgedThrough(),saved.state().exhausted(),List.of(wrong));

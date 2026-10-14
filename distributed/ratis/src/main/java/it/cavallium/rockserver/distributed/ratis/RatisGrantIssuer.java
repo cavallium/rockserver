@@ -8,7 +8,7 @@ import java.util.*;
 
 /** Durable one-user grant allocation. Caller owns the borrowed catalogue facade and issuance authority. */
 public final class RatisGrantIssuer implements AutoCloseable {
-    private static final int MAGIC=0x5247494a, MAX_BYTES=2*SessionEpochLedger.MAX_BYTES+4096;
+    static final int MAGIC=0x5247494a, MAX_BYTES=2*SessionEpochLedger.MAX_BYTES+4096;
     public enum Phase { IDLE, PENDING, RETRY, ISSUED, EXPIRED, EXHAUSTED }
     public record Issued(SessionEpochLedger issuance,SessionEpochLedger.Grant grant) {
         public Issued {
@@ -18,6 +18,7 @@ public final class RatisGrantIssuer implements AutoCloseable {
         }
     }
     private record State(UUID user,UUID issuer,long sequence,long acknowledged,Phase phase,DistributedCommand pending,Issued issued) {}
+    private final RatisJournalAccess access;
     private final Path path;
     private final RatisSessionEpochs epochs;
     private final byte[] identity;
@@ -25,14 +26,20 @@ public final class RatisGrantIssuer implements AutoCloseable {
     private final FileChannel channel;
     private final FileLock lock;
     private State state;
+    @FunctionalInterface interface BeforeIssue {void check(SessionEpochLedger replacement)throws IOException;}
+    private BeforeIssue beforeIssue=next->{};
+    synchronized void beforeIssue(BeforeIssue check)throws IOException {requireOpen();if(busy)throw new IOException("Actual issuer call remains owned");beforeIssue=Objects.requireNonNull(check);}
     private boolean busy,closed,fenced;
 
     public static RatisGrantIssuer create(Path path,RatisSessionEpochs epochs,long expiresAtMillis) throws IOException {
         if (expiresAtMillis<=0) throw new IllegalArgumentException("Grant expiry must be positive");
-        return new RatisGrantIssuer(path,epochs,true,expiresAtMillis);
+        return new RatisGrantIssuer(path,epochs,true,expiresAtMillis,RatisJournalAccess.standalone());
     }
-    public static RatisGrantIssuer reopen(Path path,RatisSessionEpochs epochs) throws IOException { return new RatisGrantIssuer(path,epochs,false,0); }
-    private RatisGrantIssuer(Path path,RatisSessionEpochs epochs,boolean create,long requestedExpiry) throws IOException {
+    public static RatisGrantIssuer reopen(Path path,RatisSessionEpochs epochs) throws IOException { return new RatisGrantIssuer(path,epochs,false,0,RatisJournalAccess.standalone()); }
+    static RatisGrantIssuer createOwned(Path path,RatisSessionEpochs epochs,long expiry,RatisJournalAccess access)throws IOException {if(expiry<=0)throw new IllegalArgumentException("Grant expiry must be positive");return new RatisGrantIssuer(path,epochs,true,expiry,access);}
+    static RatisGrantIssuer reopenOwned(Path path,RatisSessionEpochs epochs,RatisJournalAccess access)throws IOException {return new RatisGrantIssuer(path,epochs,false,0,access);}
+    private RatisGrantIssuer(Path path,RatisSessionEpochs epochs,boolean create,long requestedExpiry,RatisJournalAccess access) throws IOException {
+        this.access=Objects.requireNonNull(access);access.register(path,MAX_BYTES);access.register(path.resolveSibling(path.getFileName()+".lock"),32);
         this.path=path.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs); identity=epochs.identityDigest();
         if (!Files.isDirectory(this.path.getParent())) throw new IOException("Grant issuer journal parent is absent");
         channel=FileChannel.open(this.path.resolveSibling(this.path.getFileName()+".lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
@@ -46,7 +53,7 @@ public final class RatisGrantIssuer implements AutoCloseable {
                 do { issuer=UUID.randomUUID(); } while (issuer.equals(user));
                 state=new State(user,issuer,0,-1,Phase.IDLE,null,null); persist(state);
             } else {
-                var input=new DataInputStream(new ByteArrayInputStream(SessionJournalFiles.read(this.path,MAX_BYTES)));
+                var input=new DataInputStream(new ByteArrayInputStream(access.read(this.path,MAX_BYTES)));
                 if (input.readInt()!=MAGIC || input.readInt()!=1 || !Arrays.equals(input.readNBytes(32),identity)) throw new IOException("Wrong grant issuer journal identity/version");
                 expiresAtMillis=input.readLong(); if (expiresAtMillis<=0) throw new IOException("Invalid journaled grant expiry");
                 state=decode(input); if (input.available()!=0) throw new IOException("Trailing grant issuer journal bytes");
@@ -85,6 +92,7 @@ public final class RatisGrantIssuer implements AutoCloseable {
                 before=new State(before.user(),before.issuer(),before.sequence(),before.acknowledged(),Phase.PENDING,pending,null);
                 save(before);
             }
+            beforeIssue.check(replacement(before.pending()));
             var result=epochs.execute(before.pending());
             if (result.valueCount()!=0 || result.status()==CommandResult.Status.RESULT_TOO_LARGE) throw new IOException("Unexpected grant issuance outcome");
             Phase phase; Issued issued=null;
@@ -109,7 +117,7 @@ public final class RatisGrantIssuer implements AutoCloseable {
             uuid(output,next.user()); uuid(output,next.issuer()); output.writeLong(next.sequence()); output.writeLong(next.acknowledged()); output.writeByte(wire(next.phase()));
             blob(output,next.pending()==null ? null : DistributedCommandCodec.encode(next.pending()));
             blob(output,next.issued()==null ? null : next.issued().issuance().encode()); output.flush();
-            SessionJournalFiles.write(path,bytes.toByteArray(),MAX_BYTES);
+            access.write(path,bytes.toByteArray(),MAX_BYTES);
         } catch (IOException failure) { fenced=true; throw failure; }
     }
     private State decode(DataInputStream input) throws IOException {

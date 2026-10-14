@@ -16,6 +16,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class RatisTransactionIdentities implements RatisRocksDBAdapter.AllocationSource,AutoCloseable {
     public static final int BLOCK_SIZE=RatisSnapshotClient.CONTROL_SLOTS+RatisAtomicClient.CONTROL_SLOTS+2,MAX_PENDING=16;
     private static final int MAGIC=0x54584944,BYTES=64,FILE_BYTES=BYTES+32;
+    private final RatisJournalAccess access;
     private final Path root,file;
     private final SessionEpochLedger.Grant grant;
     private final int window;
@@ -32,12 +33,15 @@ public final class RatisTransactionIdentities implements RatisRocksDBAdapter.All
     public static RatisTransactionIdentities create(Path root,SessionEpochLedger.Grant grant,int outstandingWindow,RWScheduler scheduler) throws IOException {
         return create(root,grant,outstandingWindow,scheduler,(file,bytes) -> SessionJournalFiles.write(file,bytes,FILE_BYTES));
     }
-    static RatisTransactionIdentities create(Path root,SessionEpochLedger.Grant grant,int window,RWScheduler scheduler,Checkpoint checkpoint) throws IOException { return new RatisTransactionIdentities(root,grant,window,scheduler,true,checkpoint); }
+    static RatisTransactionIdentities create(Path root,SessionEpochLedger.Grant grant,int window,RWScheduler scheduler,Checkpoint checkpoint) throws IOException { return new RatisTransactionIdentities(root,grant,window,scheduler,true,checkpoint,RatisJournalAccess.standalone()); }
     public static RatisTransactionIdentities reopen(Path root,SessionEpochLedger.Grant grant,int outstandingWindow,RWScheduler scheduler) throws IOException {
-        return new RatisTransactionIdentities(root,grant,outstandingWindow,scheduler,false,(file,bytes) -> SessionJournalFiles.write(file,bytes,FILE_BYTES));
+        return new RatisTransactionIdentities(root,grant,outstandingWindow,scheduler,false,(file,bytes) -> SessionJournalFiles.write(file,bytes,FILE_BYTES),RatisJournalAccess.standalone());
     }
     /** Grant and adequate DATA/HOME windows must be installed and exclusively owned by this allocator. */
-    private RatisTransactionIdentities(Path directory,SessionEpochLedger.Grant grant,int window,RWScheduler scheduler,boolean create,Checkpoint checkpoint) throws IOException {
+    static RatisTransactionIdentities createOwned(Path root,SessionEpochLedger.Grant grant,int window,RWScheduler scheduler,RatisJournalAccess access)throws IOException {return new RatisTransactionIdentities(root,grant,window,scheduler,true,(file,bytes)->access.write(file,bytes,FILE_BYTES),access);}
+    static RatisTransactionIdentities reopenOwned(Path root,SessionEpochLedger.Grant grant,int window,RWScheduler scheduler,RatisJournalAccess access)throws IOException {return new RatisTransactionIdentities(root,grant,window,scheduler,false,(file,bytes)->access.write(file,bytes,FILE_BYTES),access);}
+    private RatisTransactionIdentities(Path directory,SessionEpochLedger.Grant grant,int window,RWScheduler scheduler,boolean create,Checkpoint checkpoint,RatisJournalAccess access) throws IOException {
+        this.access=Objects.requireNonNull(access);access.register(directory.resolve("identities.bin"),FILE_BYTES);access.register(directory.resolve("identities.lock"),32);
         root=Objects.requireNonNull(directory).toAbsolutePath().normalize(); file=root.resolve("identities.bin"); this.grant=Objects.requireNonNull(grant); this.scheduler=Objects.requireNonNull(scheduler);
         this.checkpoint=Objects.requireNonNull(checkpoint);
         if (window<BLOCK_SIZE || window>RangeSessionControl.MAX_OUTSTANDING) throw new IllegalArgumentException("Transaction identity window cannot contain a complete reserved block"); this.window=window;
@@ -53,7 +57,7 @@ public final class RatisTransactionIdentities implements RatisRocksDBAdapter.All
                 try (var paths=Files.list(root)) { if (paths.anyMatch(path -> !path.getFileName().toString().equals("identities.lock"))) throw new IOException("New identity root contains existing state"); }
                 persist(0,0);
             } else {
-                byte[] bytes=SessionJournalFiles.read(file,FILE_BYTES); var input=ByteBuffer.wrap(bytes);
+                byte[] bytes=access.read(file,FILE_BYTES); var input=ByteBuffer.wrap(bytes);
                 if (bytes.length!=BYTES || input.getInt()!=MAGIC) throw new IOException("Invalid identity journal");
                 var saved=new SessionEpochLedger.Grant(input.getLong(),new UUID(input.getLong(),input.getLong()),input.getLong(),input.getLong());
                 int savedWindow=input.getInt(); next=input.getLong(); ordinal=input.getLong();

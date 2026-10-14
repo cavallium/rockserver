@@ -43,6 +43,7 @@ public final class RatisAtomicClient implements AutoCloseable {
     private final RatisRoutedClient data;
     private final RWScheduler scheduler;
     private final Limits limits;
+    private RatisJournalAccess journalAccess=RatisJournalAccess.standalone();
     private RatisRequestBudget budget;
     private java.util.function.Supplier<RatisRequestBudget.Lease> retainedCredit;
     @FunctionalInterface interface PublicationObserver { void published(Path path)throws IOException; }
@@ -73,6 +74,7 @@ public final class RatisAtomicClient implements AutoCloseable {
         this(schema,target,homes,data,scheduler,limits);
         this.budget=Objects.requireNonNull(budget);this.retainedCredit=Objects.requireNonNull(retainedCredit);
     }
+    static RatisAtomicClient journalOwned(DistributedSchema schema,RangeDirectory target,RatisTransactionStatuses homes,RatisRoutedClient data,RWScheduler scheduler,Limits limits,RatisJournalAccess access){var client=new RatisAtomicClient(schema,target,homes,data,scheduler,limits);client.journalAccess=Objects.requireNonNull(access);return client;}
     public Operation executeAtomic(Path journal,Identity identity,List<RatisLogicalClient.Change> changes,List<RatisLogicalClient.Condition> conditions,Duration ttl,RequestContext context) throws IOException {
         long deadline=scheduler.resolveMonotonicDeadline(context);
         var plan=RatisTransactionPlan.logical(schema,directory,identity.business(),changes,conditions);
@@ -356,13 +358,12 @@ public final class RatisAtomicClient implements AutoCloseable {
             publish();
         }
         private RatisDurableTransaction openJournal() throws IOException {
-            return budget==null ? RatisDurableTransaction.reopen(path,homes,data)
+            return budget==null ? RatisDurableTransaction.reopenJournalOwned(path,homes,data,journalAccess)
                     : RatisDurableTransaction.reopenAccounted(path,homes,data,budget,credit);
         }
         private RatisDurableTransaction createJournal(RatisOperationRerouteAdmissionRpc.Evidence evidence) throws IOException {
             if(budget!=null)return RatisDurableTransaction.createAccounted(path,homes,data,initialization.initial(),registration,initialization.intents(),evidence,budget,credit);
-            return evidence==null ? RatisDurableTransaction.create(path,homes,data,initialization.initial(),registration,initialization.intents())
-                    : RatisDurableTransaction.createReserved(path,homes,data,initialization.initial(),registration,initialization.intents(),evidence);
+            return RatisDurableTransaction.createJournalOwned(path,homes,data,initialization.initial(),registration,initialization.intents(),evidence,journalAccess);
         }
         private void publish() throws IOException {
             if (java.nio.file.Files.exists(path)) {

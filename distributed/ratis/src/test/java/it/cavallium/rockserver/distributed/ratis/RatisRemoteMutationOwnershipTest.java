@@ -169,11 +169,11 @@ class RatisRemoteMutationOwnershipTest {
         }
     }
     @Test void releasedSequenceFloorBoundsMetadataAndNeverReissuesEvictedIdentity() throws Exception {
-        UUID owner=UUID.randomUUID(),cluster=UUID.randomUUID(),database=UUID.randomUUID(),domain=UUID.randomUUID();var authority=new RemoteMutationOwner(cluster,database,domain,owner,1,0,RemoteMutationToken.Kind.POINT,new byte[32],new byte[32]);var file=root.resolve("receipts");var receipts=new RatisRemoteMutationReceipts(file,authority,false);RemoteMutationToken first=null;
+        UUID owner=UUID.randomUUID(),cluster=UUID.randomUUID(),database=UUID.randomUUID(),domain=UUID.randomUUID();var authority=new RemoteMutationOwner(cluster,database,domain,owner,1,0,RemoteMutationToken.Kind.POINT,new byte[32],new byte[32]);var file=root.resolve("receipts");var receipts=new RatisRemoteMutationReceipts(file,authority,false,RatisJournalAccess.standalone());RemoteMutationToken first=null;
         for(int n=0;n<1024;n++){var token=new RemoteMutationToken(cluster,database,domain,owner,new UUID(0,n),1,n,RemoteMutationToken.Kind.POINT,new byte[32],new byte[32],new byte[32]);if(first==null)first=token;receipts.requireNew(token);receipts.bind(token);receipts.acknowledge(new RemoteMutationStatus(token,RemoteMutationStatus.State.ACKNOWLEDGED,1,0,0,CommandResult.Status.SUCCESS,new byte[32]));}
-        var reopened=new RatisRemoteMutationReceipts(file,authority,true);assertEquals(1024,reopened.nextSequence());assertEquals(RemoteMutationStatus.State.EXPIRED,reopened.find(first).state());assertFalse(reopened.find(first).progressKnown());var original=first;assertThrows(IOException.class,() -> reopened.requireNew(original));
+        var reopened=new RatisRemoteMutationReceipts(file,authority,true,RatisJournalAccess.standalone());assertEquals(1024,reopened.nextSequence());assertEquals(RemoteMutationStatus.State.EXPIRED,reopened.find(first).state());assertFalse(reopened.find(first).progressKnown());var original=first;assertThrows(IOException.class,() -> reopened.requireNew(original));
         var next=new RemoteMutationToken(cluster,database,domain,owner,UUID.randomUUID(),1,1024,RemoteMutationToken.Kind.POINT,new byte[32],new byte[32],new byte[32]);reopened.requireNew(next);assertTrue(java.nio.file.Files.size(file)<128*1024);
         var changedOwner=new RemoteMutationToken(cluster,database,domain,UUID.randomUUID(),first.requestId(),1,0,RemoteMutationToken.Kind.POINT,new byte[32],new byte[32],new byte[32]);assertThrows(IOException.class,() -> reopened.find(changedOwner));
-        java.nio.file.Files.delete(file);assertThrows(IOException.class,() -> new RatisRemoteMutationReceipts(file,authority,true));
+        java.nio.file.Files.delete(file);assertThrows(IOException.class,() -> new RatisRemoteMutationReceipts(file,authority,true,RatisJournalAccess.standalone()));
     }
 }

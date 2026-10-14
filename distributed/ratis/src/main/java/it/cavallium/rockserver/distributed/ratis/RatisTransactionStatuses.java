@@ -45,9 +45,9 @@ public final class RatisTransactionStatuses {
     public record RegistrationRead(TransactionStatus status,RangeDescriptor descriptor) {}
     public TransactionStatus read(UUID transaction) throws IOException { return readRegistration(transaction).status(); }
     /** One HOME group selected by the exact transaction key; maintenance clients remain borrowed. */
-    void ensureBinding(Path journal,RatisSessionEpochs epochs,UUID transaction,SessionEpochLedger.Grant grant,int window)throws IOException {
+    void ensureBinding(Path journal,RatisSessionEpochs epochs,UUID transaction,SessionEpochLedger.Grant grant,int window,RatisJournalAccess access)throws IOException {
         var directory=routed.directory();var route=directory.route(column,key(transaction));
-        try(var maintenance=new RatisSessionMaintenance(journal,epochs,routed,route.groupId())) {
+        try(var maintenance=new RatisSessionMaintenance(journal,epochs,routed,route.groupId(),null,access)) {
             var pending=maintenance.pendingCommand();if(pending==null)pending=maintenance.prepareBinding(grant,window);
             if(pending.sessionControl()==null || !pending.sessionControl().binding() || !pending.sessionControl().grant().equals(grant) || pending.sessionControl().outstandingWindow()!=window)throw new IOException("HOME binding changed frozen grant/window");
             if(maintenance.execute().status()!=CommandResult.Status.SUCCESS)throw new IOException("HOME binding did not apply");

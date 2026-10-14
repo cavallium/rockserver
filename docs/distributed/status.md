@@ -1605,7 +1605,17 @@ intent is allocated over an unresolved one. Global selector uncertainty and
 deadlines still stop discovery; if no owner is usable, the original failures are
 reported. Eight renewal and two pipeline cases pass
 (`point-renewal-slot-isolation-fixed-gate.log`). Shared envelope integration for
-bulk/range actors remains unfinished in the separate SDK resource worktree.
+bulk/range actors is implemented in the separate SDK resource worktree, with
+128 MiB/16-request shared defaults unchanged. Its explicit journal capability now
+covers session windows, grant/binding records, POINT input/receipt/owner state,
+allocation/generation metadata and reroute journals. Cold inventory and complete
+mandatory-path preflight precede new issuance. Batch preflight is atomic: denied
+plans retain no fresh metadata or promises and preserve prior unknown debt.
+Eleven focused inventory/native-session/budget cases pass, including denied path
+and disk plans with no issuance, same-budget retry and lost-reply exact cold grant
+recovery (`sdk-journal-atomic-preflight-gate.log`). Factory-root exclusion and live
+schema/CDC/export/ordinary transaction/snapshot journal propagation remain pending;
+this is not a complete backend-wide disk or whole-node RAM acceptance claim.
 A controlled native split now passes full connection close/reopen with the latest
 activated directory, exact old/new token lookup, another native write and no extra
 historical grants. The original forced generation binding is preserved; known

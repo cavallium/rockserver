@@ -73,6 +73,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
         Entry(Intent intent) { this.intent=intent; }
         ParticipantProgress progress() { return new ParticipantProgress(intent,preparation,vote,finalization,receipt,outcome,retirementProof); }
     }
+    private final RatisJournalAccess journalAccess;
     private final Path path;
     private RatisRequestBudget budget;
     private RatisRequestBudget.Lease retainedCredit;
@@ -97,11 +98,11 @@ public final class RatisDurableTransaction implements AutoCloseable {
                 evidenceBytes=evidence.encode().length;
             }
             retained.growTo(Math.max(retained.amount,RatisAtomicClient.retainedGeometry(futureBytes(intents)+evidenceBytes)));
-            return create(path,homes,data,initial,registration,intents,evidence,budget,retained);
+            return create(path,homes,data,initial,registration,intents,evidence,budget,retained,RatisJournalAccess.standalone());
         }
     }
     static RatisDurableTransaction reopenAccounted(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,RatisRequestBudget budget,RatisRequestBudget.Lease retained)throws IOException {
-        return new RatisDurableTransaction(path,homes,data,false,budget,retained);
+        return new RatisDurableTransaction(path,homes,data,false,budget,retained,RatisJournalAccess.standalone());
     }
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
@@ -129,10 +130,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return create(path,homes,data,initial,registration,intents,evidence);
     }
     private static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws IOException {
-        return create(path,homes,data,initial,registration,intents,evidence,null,null);
+        return create(path,homes,data,initial,registration,intents,evidence,null,null,RatisJournalAccess.standalone());
     }
-    private static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence,RatisRequestBudget budget,RatisRequestBudget.Lease retained)throws IOException {
-        var journal=new RatisDurableTransaction(path,homes,data,true,budget,retained);
+    private static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence,RatisRequestBudget budget,RatisRequestBudget.Lease retained,RatisJournalAccess access)throws IOException {
+        var journal=new RatisDurableTransaction(path,homes,data,true,budget,retained,access);
         try {
             journal.initial=Objects.requireNonNull(initial); initial.requireInitial(); if(initial.reserved())throw new IllegalArgumentException("Participant journal requires promoted HOME initial status");
             journal.reservationEvidence=validateReservationEvidence(initial,evidence);
@@ -150,13 +151,16 @@ public final class RatisDurableTransaction implements AutoCloseable {
             journal.capacity(); journal.persist(); return journal;
         } catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
+    static RatisDurableTransaction createJournalOwned(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence,RatisJournalAccess access)throws IOException {return create(path,homes,data,initial,registration,intents,evidence,null,null,access);}
+    static RatisDurableTransaction reopenJournalOwned(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,RatisJournalAccess access)throws IOException {return new RatisDurableTransaction(path,homes,data,false,null,null,access);}
     public static RatisDurableTransaction reopen(Path path,RatisTransactionStatuses homes,RatisRoutedClient data) throws IOException {
         return new RatisDurableTransaction(path,homes,data,false);
     }
     private RatisDurableTransaction(Path file,RatisTransactionStatuses homes,RatisRoutedClient data,boolean create) throws IOException {
-        this(file,homes,data,create,null,null);
+        this(file,homes,data,create,null,null,RatisJournalAccess.standalone());
     }
-    private RatisDurableTransaction(Path file,RatisTransactionStatuses homes,RatisRoutedClient data,boolean create,RatisRequestBudget budget,RatisRequestBudget.Lease retained) throws IOException {
+    private RatisDurableTransaction(Path file,RatisTransactionStatuses homes,RatisRoutedClient data,boolean create,RatisRequestBudget budget,RatisRequestBudget.Lease retained,RatisJournalAccess access) throws IOException {
+        journalAccess=Objects.requireNonNull(access);if(budget==null){access.register(file,MAX_BYTES);access.register(file.resolveSibling(file.getFileName()+".lock"),32);}
         this.budget=budget;this.retainedCredit=retained;
         path=file.toAbsolutePath().normalize(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
         identity=data.sessionIdentityDigest(); homeIdentity=homes.identityDigest();
@@ -171,7 +175,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
             if (!create) {
                 long input=RatisRequestBudget.files(path,path.resolveSibling(path.getFileName()+".pending"));
                 try(var workspace=budget==null?null:budget.work(Math.addExact(65536,4*input))) {
-                    byte[] body=SessionJournalFiles.read(path,MAX_BYTES); decode(body); capacity();
+                    byte[] body=budget==null?journalAccess.read(path,MAX_BYTES):SessionJournalFiles.read(path,MAX_BYTES); decode(body); capacity();
                     if(retainedCredit!=null)retainedCredit.growTo(Math.max(retainedCredit.amount,RatisAtomicClient.retainedGeometry(futureBytes(entries.values().stream().map(e->e.intent).toList()))));
                     if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical transaction journal");
                     SessionJournalFiles.force(path); SessionJournalFiles.force(path.getParent());
@@ -523,7 +527,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
             try{body=encode();active=true;}catch(Throwable failure){if(workspace!=null)workspace.close();throw failure;}
         }
         try {
-            SessionJournalFiles.remove(path,body,MAX_BYTES,io);
+            if(disk==null)journalAccess.remove(path,body,MAX_BYTES,io);else SessionJournalFiles.remove(path,body,MAX_BYTES,io);
             if(disk!=null)disk.forcedReconcile();
             synchronized (this) { reclaimed=true; }
         } catch (IOException | RuntimeException failure) {
@@ -536,7 +540,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private void persist() throws IOException {
         try (var workspace=budget==null?null:budget.work(Math.addExact(65536,3*encodedSize()))) {
             long size=encodedSize();if(disk!=null)disk.prepareReplacement(size+32);
-            SessionJournalFiles.write(path,encode(),MAX_BYTES);if(disk!=null)disk.forcedReconcile();
+            if(disk==null)journalAccess.write(path,encode(),MAX_BYTES);else{SessionJournalFiles.write(path,encode(),MAX_BYTES);disk.forcedReconcile();}
         }
         catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Transaction journal persistence failed; reopen it",failure); }
     }

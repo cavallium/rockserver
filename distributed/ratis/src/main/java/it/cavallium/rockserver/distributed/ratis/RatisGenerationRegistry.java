@@ -10,6 +10,7 @@ import java.util.function.LongSupplier;
 /** Immutable proof-qualified generations. Handle owners remain reachable until connection shutdown. */
 final class RatisGenerationRegistry implements AutoCloseable {
     record Owned(DistributedSchema schema,RangeDirectory directory,RatisRocksDBConnection.Generation generation) {}
+    private final RatisJournalAccess access;
     private final Path root;
     private final Map<UUID,RatisRoutedClient> routed;
     private final RatisSchemaCatalogue schemas;
@@ -18,14 +19,14 @@ final class RatisGenerationRegistry implements AutoCloseable {
     private final int maximum;
     private final Capacity capacity;
     private final Map<String,Owned> generations=new LinkedHashMap<>();
-    RatisGenerationRegistry(Path root,Map<UUID,RatisRoutedClient> routed,RatisSchemaCatalogue schemas,RatisRocksDBConnection.GenerationFactory factory,LongSupplier ids,int maximum,Capacity capacity) throws IOException {
-        this.root=root; this.routed=Map.copyOf(routed); this.schemas=schemas; this.factory=factory; this.ids=ids; this.maximum=maximum; this.capacity=capacity; Files.createDirectories(root);
+    RatisGenerationRegistry(Path root,Map<UUID,RatisRoutedClient> routed,RatisSchemaCatalogue schemas,RatisRocksDBConnection.GenerationFactory factory,LongSupplier ids,int maximum,Capacity capacity,RatisJournalAccess access) throws IOException {
+        this.access=Objects.requireNonNull(access);this.root=root; this.routed=Map.copyOf(routed); this.schemas=schemas; this.factory=factory; this.ids=ids; this.maximum=maximum; this.capacity=capacity; Files.createDirectories(root);
         try {
         if(routed.size()>maximum)throw new IOException("Declared domains exceed the shared generation budget");var currentSchemas=new ArrayList<DistributedSchema>();long schemaBytes=0;for(var data:routed.values()){var schema=schemas.read(data.directory().schemaDigest());if(schema==null)throw new IOException("Advertised domain schema content is missing");schema.requireMatches(data.directory());schemaBytes+=DistributedSchemaCodec.encodedSize(schema)+RangeDirectoryCodec.encode(data.directory()).length;if(schemaBytes>16L*1024*1024)throw new IOException("Database generation metadata exceeds shared byte budget");currentSchemas.add(schema);}requireUnique(currentSchemas);
         try (var files=Files.newDirectoryStream(root)) {
             for (var folder:files) {
                 if (!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unexpected connection generation entry");
-                var in=ByteBuffer.wrap(SessionJournalFiles.read(folder.resolve("binding"),8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); if (in.hasRemaining() || !folder.getFileName().toString().equals(key(schema))) throw new IOException("Invalid generation binding");
+                var in=ByteBuffer.wrap(access.read(folder.resolve("binding"),8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); if (in.hasRemaining() || !folder.getFileName().toString().equals(key(schema))) throw new IOException("Invalid generation binding");
                 schema.requireMatches(directory);var data=data(schema.domainId());data.requireKnownSchema(schema);var qualified=data.directory(schema);
                 // Only this exclusively owned, forced generation binding restores historical placement.
                 // Its actors separately cross-check their immutable root bindings; no route is published or retargeted here.
@@ -42,8 +43,8 @@ final class RatisGenerationRegistry implements AutoCloseable {
         if (create) {
             capacity.admitBinding(schema);
             byte[] a=DistributedSchemaCodec.encode(schema),b=RangeDirectoryCodec.encode(directory); var expected=ByteBuffer.allocate(8+a.length+b.length).putInt(a.length).put(a).putInt(b.length).put(b).array();
-            if (Files.exists(folder,LinkOption.NOFOLLOW_LINKS)) { if (!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS) || !Arrays.equals(expected,SessionJournalFiles.read(folder.resolve("binding"),8*1024*1024))) throw new IOException("Original generation binding is missing/changed"); }
-            else { Files.createDirectory(folder); SessionJournalFiles.write(folder.resolve("binding"),expected,8*1024*1024); SessionJournalFiles.force(root); }
+            if (Files.exists(folder,LinkOption.NOFOLLOW_LINKS)) { if (!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS) || !Arrays.equals(expected,access.read(folder.resolve("binding"),8*1024*1024))) throw new IOException("Original generation binding is missing/changed"); }
+            else { Files.createDirectory(folder); access.write(folder.resolve("binding"),expected,8*1024*1024); SessionJournalFiles.force(root); }
         }
         capacity.forceBinding(folder);
         capacity.bound(schema);
@@ -73,17 +74,19 @@ final class RatisGenerationRegistry implements AutoCloseable {
     /** Forced slot ownership precedes the controller's first mutating checkpoint. */
     static final class Capacity {
         private record Slot(byte[] source,byte[] directory,byte[] target,boolean checkpointed) {}
+        private final RatisJournalAccess access;
         private final Path file,bindings,requests;
         @FunctionalInterface interface BindingForce { void force(Path path) throws IOException; }
         private final int maximum;
         private final BindingForce bindingForce;
         private final Map<UUID,Slot> slots=new LinkedHashMap<>();
         private boolean fenced;
-        Capacity(Path file,Path bindings,Path requests,int maximum,boolean used) throws IOException { this(file,bindings,requests,maximum,used,SessionJournalFiles::force); }
-        Capacity(Path file,Path bindings,Path requests,int maximum,boolean used,BindingForce bindingForce) throws IOException {
+        Capacity(Path file,Path bindings,Path requests,int maximum,boolean used,RatisJournalAccess access) throws IOException { this(file,bindings,requests,maximum,used,SessionJournalFiles::force,access); }
+        Capacity(Path file,Path bindings,Path requests,int maximum,boolean used,BindingForce bindingForce,RatisJournalAccess access) throws IOException {
+            this.access=Objects.requireNonNull(access);access.register(file,4096);
             this.file=file; this.bindings=bindings; this.requests=requests; this.maximum=maximum; this.bindingForce=Objects.requireNonNull(bindingForce);
             if (Files.exists(file,LinkOption.NOFOLLOW_LINKS)) {
-                try (var in=new DataInputStream(new ByteArrayInputStream(SessionJournalFiles.read(file,4096)))) {
+                try (var in=new DataInputStream(new ByteArrayInputStream(access.read(file,4096)))) {
                     int count=in.readInt(); if(count<0 || count>maximum) throw new IOException("Invalid generation reservations");
                     for(int i=0;i<count;i++) { var id=new UUID(in.readLong(),in.readLong()); var slot=new Slot(read(in),read(in),read(in),in.readBoolean()); if(slot.source.length!=32 || slot.directory.length!=32 || slot.target.length!=0 && slot.target.length!=32) throw new IOException("Invalid reserved generation identity"); if(slots.putIfAbsent(id,slot)!=null) throw new IOException("Duplicate generation reservation"); }
                     if(in.read()!=-1) throw new IOException("Trailing generation reservation bytes");
@@ -143,7 +146,7 @@ final class RatisGenerationRegistry implements AutoCloseable {
         private boolean hasTargetBinding(byte[] target) throws IOException {
             if(target.length==0) return false; var path=bindings.resolve(HexFormat.of().formatHex(target)).resolve("binding");
             if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS)) return false;
-            try { var in=ByteBuffer.wrap(SessionJournalFiles.read(path,8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); schema.requireMatches(directory);
+            try { var in=ByteBuffer.wrap(access.read(path,8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); schema.requireMatches(directory);
                 if(in.hasRemaining() || !Arrays.equals(schema.digest(),target)) throw new IOException("Reserved target binding changed"); forceBinding(path.getParent()); return true;
             } catch(IllegalArgumentException invalid) { throw new IOException("Invalid reserved target binding",invalid); }
         }
@@ -157,7 +160,7 @@ final class RatisGenerationRegistry implements AutoCloseable {
         private void requireUsable() throws IOException { if(fenced) throw new IOException("Generation capacity persistence uncertain; reopen required"); }
         private void persist() throws IOException {
             requireUsable(); var bytes=new ByteArrayOutputStream(); try(var out=new DataOutputStream(bytes)) { out.writeInt(slots.size()); for(var entry:slots.entrySet()) { out.writeLong(entry.getKey().getMostSignificantBits()); out.writeLong(entry.getKey().getLeastSignificantBits()); write(out,entry.getValue().source); write(out,entry.getValue().directory); write(out,entry.getValue().target); out.writeBoolean(entry.getValue().checkpointed); } }
-            try { SessionJournalFiles.write(file,bytes.toByteArray(),4096); } catch(IOException failure) { fenced=true; throw failure; }
+            try { access.write(file,bytes.toByteArray(),4096); } catch(IOException failure) { fenced=true; throw failure; }
         }
         private static void write(DataOutputStream out,byte[] bytes) throws IOException { out.writeInt(bytes.length); out.write(bytes); }
         private static byte[] read(DataInputStream in) throws IOException { int size=in.readInt(); if(size<0 || size>32 || size>in.available()) throw new IOException("Invalid generation reservation body"); return in.readNBytes(size); }

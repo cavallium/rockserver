@@ -25,9 +25,9 @@ class RatisPointOwnerRenewalTest {
             var directories=f.catalogue.epochs.catalogue(f.outer.directoryColumn);assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(f.outer.operation(commands.getAndIncrement()),null,f.directory)).status());
             sessions=new RatisRocksDBConnection.SessionFactory(List.of(f.data,f.homeClient),(path,schema,plan)->{
                 opens.incrementAndGet();
-                if(loseIssue.getAndSet(false)){lost.set(RatisBackendSessions.issue(path,f.catalogue.epochs,5).grant());throw new IOException("Lost original issue reply");}
-                if(loseBinding.getAndSet(false)){lostPlan.set(plan);lostBindingRoot.set(path);var issued=RatisBackendSessions.issue(path,f.catalogue.epochs,5);lost.set(issued.grant());RatisBackendSessions.bind(path,f.catalogue.epochs,issued,32,plan.targets());throw new IOException("Lost original binding reply");}
-                var window=RatisBackendSessions.window(path,f.data,f.catalogue.epochs,5,RatisSessionClient.Limits.defaults(),plan.targets());
+                if(loseIssue.getAndSet(false)){lost.set(RatisBackendSessions.issue(path,f.catalogue.epochs,5, RatisJournalAccess.standalone()).grant());throw new IOException("Lost original issue reply");}
+                if(loseBinding.getAndSet(false)){lostPlan.set(plan);lostBindingRoot.set(path);var issued=RatisBackendSessions.issue(path,f.catalogue.epochs,5, RatisJournalAccess.standalone());lost.set(issued.grant());RatisBackendSessions.bind(path,f.catalogue.epochs,issued,32,plan.targets(), RatisJournalAccess.standalone());throw new IOException("Lost original binding reply");}
+                var window=RatisBackendSessions.window(path,f.data,f.catalogue.epochs,5,RatisSessionClient.Limits.defaults(),plan.targets(), RatisJournalAccess.standalone());
                 if(entered!=null){entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS)){window.close();throw new IOException("Renewal fixture barrier timed out");}}catch(InterruptedException failure){window.close();throw new IOException(failure);}}
                 return window;
             });
@@ -76,7 +76,7 @@ class RatisPointOwnerRenewalTest {
             f.window.close();f.coordinator.close();
             var sessions=new RatisRocksDBConnection.SessionFactory(List.of(stale,f.homeClient),(path,schema,plan)->{
                 if(Arrays.equals(plan.directory().payloadDigest(),f.source.directory.payloadDigest()))return RatisDurableSessionClient.reopen(f.windowPath,stale);
-                return RatisBackendSessions.window(path,stale,f.catalogue.epochs,1000,RatisSessionClient.Limits.defaults(),plan.targets());
+                return RatisBackendSessions.window(path,stale,f.catalogue.epochs,1000,RatisSessionClient.Limits.defaults(),plan.targets(), RatisJournalAccess.standalone());
             });
             Path owners=root.resolve("split-owners");var directories=f.catalogue.epochs.catalogue(f.outer.directoryColumn);RemoteMutationToken originalToken,newToken;RemoteMutationOwner replacement;
             try(var manager=new RatisPointOwnerManager(f.source.schema,f.source.directory,stale,f.scheduler,owners,budget,sessions,f.catalogue.epochs,directories,header->{var definition=TopologyChange.Definition.decode(f.point(RatisTopologyCatalogue.definitionKey(header.definitionDigest())));header.requireDefinition(definition);return definition.sourceDirectory();},f.homes)) {
@@ -98,8 +98,8 @@ class RatisPointOwnerRenewalTest {
                 var owner=manager.available().getFirst();originalToken=x.write(manager,owner,2,1);
                 assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(x.f.outer.operation(x.commands.getAndIncrement()),x.f.directory,dataFirst)).status());x.f.data.refresh(dataFirst);x.f.homeClient.refresh(homeFirst);x.expire(owner);x.loseBinding.set(true);assertThrows(ExecutionException.class,()->await(manager.discover(RequestContext.batch())));issued=x.lost.get();planBytes=x.lostPlan.get().encode();assertArrayEquals(dataFirst.payloadDigest(),x.lostPlan.get().directory().payloadDigest());assertTrue(x.lostPlan.get().targets().stream().anyMatch(target->Arrays.equals(homeFirst.payloadDigest(),target.directory().payloadDigest())));
                 var dataLater=advancePlacement(dataFirst);var homeLater=advancePlacement(homeFirst);assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(x.f.outer.operation(x.commands.getAndIncrement()),dataFirst,dataLater)).status());x.f.data.refresh(dataLater);x.f.homeClient.refresh(homeLater);
-                var issuedState=RatisBackendSessions.issue(x.lostBindingRoot.get(),x.f.catalogue.epochs,5);var wrong=x.sessions.bindings(dataLater).freeze();long cut=x.f.stores.get(x.f.groups.getFirst()).applied().index();assertThrows(IOException.class,()->RatisBackendSessions.bind(x.lostBindingRoot.get(),x.f.catalogue.epochs,issuedState,32,wrong.targets()));assertEquals(cut,x.f.stores.get(x.f.groups.getFirst()).applied().index(),"Mismatched retained plan must not submit a binding");
-                var target=x.lostPlan.get().targets().getFirst();assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(root.resolve("fresh-stale-binding"),x.f.catalogue.epochs,target.routed(),target.group(),target.directory()));
+                var issuedState=RatisBackendSessions.issue(x.lostBindingRoot.get(),x.f.catalogue.epochs,5, RatisJournalAccess.standalone());var wrong=x.sessions.bindings(dataLater).freeze();long cut=x.f.stores.get(x.f.groups.getFirst()).applied().index();assertThrows(IOException.class,()->RatisBackendSessions.bind(x.lostBindingRoot.get(),x.f.catalogue.epochs,issuedState,32,wrong.targets(), RatisJournalAccess.standalone()));assertEquals(cut,x.f.stores.get(x.f.groups.getFirst()).applied().index(),"Mismatched retained plan must not submit a binding");
+                var target=x.lostPlan.get().targets().getFirst();assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(root.resolve("fresh-stale-binding"),x.f.catalogue.epochs,target.routed(),target.group(),target.directory(), RatisJournalAccess.standalone()));
 
             }
             try(var cold=x.open()) {
@@ -118,11 +118,11 @@ class RatisPointOwnerRenewalTest {
                 public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{sent.add(DistributedCommandCodec.encode(command));var result=base.command(route,command);if(lose.getAndSet(false))throw new IOException("Lost applied native binding reply");return result;}
             })) {
                 var group=f.groups.getFirst();Path journal=root.resolve("binding");byte[] original;
-                try(var owner=RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,f.directory)){owner.prepareBinding(grant,32);original=DistributedCommandCodec.encode(owner.pendingCommand());assertThrows(IOException.class,owner::execute);assertNotNull(owner.pendingCommand());}
+                try(var owner=RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,f.directory, RatisJournalAccess.standalone())){owner.prepareBinding(grant,32);original=DistributedCommandCodec.encode(owner.pendingCommand());assertThrows(IOException.class,owner::execute);assertNotNull(owner.pendingCommand());}
                 var latest=advancePlacement(f.directory);routed.refresh(latest);
-                assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(root.resolve("fresh-old-placement"),f.catalogue.epochs,routed,group,f.directory));assertEquals(1,sent.size());
-                try(var retained=RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,f.directory)){assertArrayEquals(original,DistributedCommandCodec.encode(retained.pendingCommand()));assertEquals(CommandResult.Status.SUCCESS,retained.execute().status());assertNotNull(retained.propagated());}
-                assertEquals(2,sent.size());assertArrayEquals(original,sent.getFirst());assertArrayEquals(original,sent.getLast());assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,latest));assertEquals(2,sent.size());
+                assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(root.resolve("fresh-old-placement"),f.catalogue.epochs,routed,group,f.directory, RatisJournalAccess.standalone()));assertEquals(1,sent.size());
+                try(var retained=RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,f.directory, RatisJournalAccess.standalone())){assertArrayEquals(original,DistributedCommandCodec.encode(retained.pendingCommand()));assertEquals(CommandResult.Status.SUCCESS,retained.execute().status());assertNotNull(retained.propagated());}
+                assertEquals(2,sent.size());assertArrayEquals(original,sent.getFirst());assertArrayEquals(original,sent.getLast());assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,latest, RatisJournalAccess.standalone()));assertEquals(2,sent.size());
             }
         }
     }

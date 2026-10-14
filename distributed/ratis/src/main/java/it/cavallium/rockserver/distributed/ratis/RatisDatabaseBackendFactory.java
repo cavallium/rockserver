@@ -33,6 +33,7 @@ public final class RatisDatabaseBackendFactory implements AutoCloseable {
             RatisRocksDBConnection.DomainPlacement placement,RatisSchemaClient.TrustedOperatorResolver resolver,Policy policy,Homes homes,RatisSchemaReplicaClient replicas)throws IOException{
         this.replicas=Objects.requireNonNull(replicas);RatisRoutedClient first=null,second=null;
         try{this.root=root.toAbsolutePath().normalize();this.plan=Objects.requireNonNull(plan);this.catalogue=Objects.requireNonNull(catalogue);this.data=Map.copyOf(data);this.scheduler=Objects.requireNonNull(scheduler);this.placement=Objects.requireNonNull(placement);this.resolver=Objects.requireNonNull(resolver);this.policy=Objects.requireNonNull(policy);this.pointBudget=new RatisRequestBudget(policy.pointOwners());
+            RatisBackendJournalInventory.inventory(this.root,pointBudget);
             var domains=plan.domains().stream().map(RatisNodePlan.Domain::domainId).collect(java.util.stream.Collectors.toSet());if(!domains.equals(this.data.keySet()))throw new IOException("Aggregate backend requires every declared DATA domain");
             var snapshot=home(plan,RatisNodePlan.Role.SNAPSHOT_HOME);var transaction=home(plan,RatisNodePlan.Role.TRANSACTION_HOME);
             first=homes.connect(snapshot.directory());second=homes.connect(transaction.directory());snapshots=first;transactions=second;snapshotHomes=new RatisSnapshotFences(snapshots,snapshot.column());transactionHomes=new RatisTransactionStatuses(transactions,transaction.column());
@@ -42,12 +43,12 @@ public final class RatisDatabaseBackendFactory implements AutoCloseable {
     private static RatisNodePlan.Home home(RatisNodePlan plan,RatisNodePlan.Role role)throws IOException{var homes=plan.homes().stream().filter(h->h.role()==role).toList();if(homes.size()!=1)throw new IOException("Aggregate backend requires one complete declared "+role+" directory");return homes.getFirst();}
     public synchronized RatisRocksDBConnection open(URI uri)throws IOException{
         if(closed || connection!=null)throw new IOException("Aggregate backend already opened or closed");Files.createDirectories(root);
-        connection=new RatisRocksDBConnection(uri,root,data,placement,scheduler,plan.catalogue(),catalogue,replicas,operators,resolver,this::generation,policy.connection(),List.of());return connection;
+        connection=new RatisRocksDBConnection(uri,root,data,placement,scheduler,plan.catalogue(),catalogue,replicas,operators,resolver,this::generation,policy.connection(),List.of(),pointBudget);return connection;
     }
     private RatisRocksDBConnection.Generation generation(DistributedSchema schema,RangeDirectory directory,Path generationRoot,java.util.function.LongSupplier ids)throws IOException{
         var routed=data.get(schema.domainId());if(routed==null)throw new IOException("Generation domain has no declared routed DATA client");schema.requireMatches(directory);routed.requireKnownSchema(schema);
-        var allocationTargets=targets(routed,directory,true);var allocator=new RatisBackendAllocations(generationRoot.resolve("allocations"),epochs,scheduler,policy.grantLifetimeMillis(),policy.maximumAllocationGrants(),allocationTargets);
-        var sessions=new RatisRocksDBConnection.SessionFactory(List.of(routed,transactions),(path,expectedSchema,plan)->RatisBackendSessions.window(path,routed,epochs,policy.grantLifetimeMillis(),policy.sessions(),plan.targets()));
+        var allocationTargets=targets(routed,directory,true);var allocator=new RatisBackendAllocations(generationRoot.resolve("allocations"),epochs,scheduler,policy.grantLifetimeMillis(),policy.maximumAllocationGrants(),allocationTargets,pointBudget);
+        var sessions=new RatisRocksDBConnection.SessionFactory(List.of(routed,transactions),(path,expectedSchema,plan)->RatisBackendSessions.window(path,routed,epochs,policy.grantLifetimeMillis(),policy.sessions(),plan.targets(),pointBudget));
         var factory=RatisRocksDBConnection.durableGenerationFactory(routed,scheduler,snapshotHomes,transactionHomes,epochs,directories,header->{var definition=topology.readDefinition(header.definitionDigest());if(definition==null)throw new IOException("Immutable ACK topology definition absent");header.requireDefinition(definition);return definition.sourceDirectory();},allocator,sessions,List.of(allocator),pointBudget);
         return factory.create(schema,directory,generationRoot,ids);
     }
@@ -71,7 +72,7 @@ public final class RatisDatabaseBackendFactory implements AutoCloseable {
             for(var domain:input.domains()){var routed=exportRoute(domain);for(var range:domain.directory().ranges())targets.put(range.groupId(),new RatisBackendSessions.Target(routed,range.groupId(),domain.directory()));}
             var home=snapshots.directory();for(var range:home.ranges())targets.put(range.groupId(),new RatisBackendSessions.Target(snapshots,range.groupId(),home));
             synchronized(this){if(closed || exportAllocationOpening)throw new IOException("Export allocator closed or opening");allocator=exportAllocations;if(allocator==null)exportAllocationOpening=true;}
-            if(allocator==null){try{allocator=new RatisBackendAllocations(root.resolve("export-allocations"),epochs,scheduler,policy.grantLifetimeMillis(),policy.maximumAllocationGrants(),List.of());synchronized(this){exportAllocations=allocator;}}finally{synchronized(this){exportAllocationOpening=false;}}}
+            if(allocator==null){try{allocator=new RatisBackendAllocations(root.resolve("export-allocations"),epochs,scheduler,policy.grantLifetimeMillis(),policy.maximumAllocationGrants(),List.of(),pointBudget);synchronized(this){exportAllocations=allocator;}}finally{synchronized(this){exportAllocationOpening=false;}}}
             return allocator.allocateIssued(List.copyOf(targets.values()),context);
         }catch(IOException failure){return java.util.concurrent.CompletableFuture.failedFuture(failure);}
     }

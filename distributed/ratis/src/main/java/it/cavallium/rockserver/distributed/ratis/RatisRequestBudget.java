@@ -10,7 +10,7 @@ import java.util.concurrent.*;
 import static it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.SERVER_OVERLOADED;
 
 /** Credits precede owner construction and input copies, and outlive observers until actual ownership drains. */
-final class RatisRequestBudget implements AutoCloseable {
+final class RatisRequestBudget implements AutoCloseable,RatisJournalAccess {
     record Geometry(long inputBytes,long resultBytes,long maximumItemBytes,long maximumResultBytes,long logicalBytes,int items) {
         long bytes(){long journal=56+RemoteMutationToken.BYTES+36+32+8L*items+inputBytes+resultBytes;return Math.addExact(64L*1024+logicalBytes,Math.addExact(4*journal,4*(maximumItemBytes+maximumResultBytes)));}
     }
@@ -56,11 +56,14 @@ final class RatisRequestBudget implements AutoCloseable {
     }
     /** Retained path debt survives actor close. Call while holding the journal's stable ownership lock to reconcile. */
     final class Disk implements AutoCloseable {
-        final Path path,pending;final int maximum;private long amount;private boolean owned;
+        final Path path,pending;private int maximum;private long amount,reservedPeak;private boolean owned;
         Disk(Path path,int maximum,long amount){this.path=path;this.pending=path.resolveSibling(path.getFileName()+".pending");this.maximum=maximum;this.amount=amount;}
         long inventory()throws IOException{return Math.addExact(file(path,maximum),file(pending,maximum));}
         void prepareReplacement(long encodedBytes){synchronized(RatisRequestBudget.this){if(!owned || encodedBytes<32 || encodedBytes>maximum)throw new IllegalStateException("Invalid journal replacement geometry");long peak=Math.addExact(amount,encodedBytes);diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}}
-        void forcedReconcile()throws IOException{long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned)throw new IllegalStateException("Journal disk ownership released");if(actual>amount){diskCapacity(actual-amount);diskBytes+=actual-amount;}else diskBytes-=amount-actual;amount=actual;}}
+        void forcedReconcile()throws IOException{long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned)throw new IllegalStateException("Journal disk ownership released");actual=Math.max(actual,reservedPeak);if(actual>amount){diskCapacity(actual-amount);diskBytes+=actual-amount;}else diskBytes-=amount-actual;amount=actual;}}
+        void reservePeak(long peak){synchronized(RatisRequestBudget.this){if(!owned || peak<0)throw new IllegalStateException("Invalid journal promise");if(peak>amount){diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}reservedPeak=Math.max(reservedPeak,peak);}}
+        void prepareOwnedReplacement(long encodedBytes)throws IOException {long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned || encodedBytes<32 || encodedBytes>maximum)throw new IOException("Invalid journal replacement geometry");long peak=Math.max(amount,Math.addExact(actual,encodedBytes));diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}}
+        void releasePromise()throws IOException {SessionJournalFiles.force(path.getParent());if(Files.exists(path,LinkOption.NOFOLLOW_LINKS))SessionJournalFiles.force(path);long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned)throw new IllegalStateException("Journal ownership released");if(actual>amount){diskCapacity(actual-amount);diskBytes+=actual-amount;}else diskBytes-=amount-actual;amount=actual;reservedPeak=0;}}
         long debt(){synchronized(RatisRequestBudget.this){return amount;}}
         @Override public void close(){synchronized(RatisRequestBudget.this){if(!owned)return;owned=false;diskOwners--;}}
     }
@@ -70,9 +73,42 @@ final class RatisRequestBudget implements AutoCloseable {
         // Two UnixPath objects retain UTF-8 arrays, cached UTF-16 strings and component-offset arrays.
         // Include object/array/map headers and the longer pending suffix before registry retention.
         long actual=Math.addExact(file(path,maximum),file(path.resolveSibling(path.getFileName()+".pending"),maximum));long metadata=Math.addExact(2048L,Math.multiplyExact(32L,Math.addExact(text.length(),8L)));
-        synchronized(this){if(closed)throw new IOException("Shared journal budget closed");var existing=journals.get(path);if(existing!=null){if(existing.owned || existing.maximum!=maximum)throw new IOException("Journal already owned or maximum changed");if(actual>existing.amount){diskCapacity(actual-existing.amount);diskBytes+=actual-existing.amount;existing.amount=actual;}existing.owned=true;diskOwners++;return existing;}
+        synchronized(this){if(closed)throw new IOException("Shared journal budget closed");var existing=journals.get(path);if(existing!=null){if(existing.owned)throw new IOException("Journal already owned");if(actual>existing.amount){diskCapacity(actual-existing.amount);diskBytes+=actual-existing.amount;existing.amount=actual;}existing.maximum=maximum;existing.owned=true;diskOwners++;return existing;}
             if(journals.size()>=limits.maximumJournalPaths())throw RocksDBException.of(SERVER_OVERLOADED,"Shared journal path registry exhausted");capacity(metadata);diskCapacity(actual);var created=new Disk(path,maximum,actual);created.owned=true;journals.put(path,created);bytes+=metadata;pathBytes+=metadata;diskBytes+=actual;diskOwners++;return created;}
     }
+    @Override public void register(Path path,int maximum)throws IOException {try(var disk=disk(path,maximum)) {}}
+    @Override public byte[] read(Path path,int maximum)throws IOException {try(var disk=disk(path,maximum)){var body=SessionJournalFiles.read(path,maximum);SessionJournalFiles.force(path);SessionJournalFiles.force(path.getParent());disk.forcedReconcile();return body;}}
+    @Override public void write(Path path,byte[] body,int maximum)throws IOException {try(var disk=disk(path,maximum)){if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS) && Files.exists(disk.pending,LinkOption.NOFOLLOW_LINKS))throw new IOException("Unpublished original journal requires exact recovery");disk.prepareOwnedReplacement(Math.addExact(body.length,32L));SessionJournalFiles.write(path,body,maximum);disk.forcedReconcile();}}
+    @Override public void remove(Path path,byte[] body,int maximum,SessionJournalFiles.Removal removal)throws IOException {try(var disk=disk(path,maximum)){SessionJournalFiles.remove(path,body,maximum,removal);disk.releasePromise();}}
+    @Override public void deleted(Path path)throws IOException {Path exact=path.toAbsolutePath().normalize();synchronized(this){if(!journals.containsKey(exact))return;}try(var disk=disk(exact,Integer.MAX_VALUE)){if(Files.exists(exact,LinkOption.NOFOLLOW_LINKS) || Files.exists(disk.pending,LinkOption.NOFOLLOW_LINKS))throw new IOException("Deleted journal graph remains present");disk.releasePromise();}}
+    private record PlannedJournal(Path path,int maximum,long actual,long peak,long metadata) {}
+    /** Validate and charge the entire no-IO plan atomically. A denied plan cannot consume registry slots or promises. */
+    @Override public void preflight(List<RatisJournalAccess.Reservation> reservations)throws IOException {
+        if(reservations.size()>limits.maximumJournalPaths())throw RocksDBException.of(SERVER_OVERLOADED,"Shared journal plan path count exhausted");
+        try(var staging=work(8192)){
+            var planned=new LinkedHashMap<Path,PlannedJournal>();
+            for(var reservation:reservations){
+                var input=reservation.path();String original=input.toString();if(original.length()>4096)throw new IOException("Invalid owned journal path");
+                long metadata=Math.addExact(2048L,Math.multiplyExact(32L,Math.addExact(original.length(),8L)));staging.growTo(Math.addExact(staging.amount,metadata));
+                Path path=input.toAbsolutePath().normalize();String text=path.toString();if(text.length()>4096 || path.getFileName().toString().endsWith(".pending"))throw new IOException("Invalid owned journal path");
+                long normalizedMetadata=Math.addExact(2048L,Math.multiplyExact(32L,Math.addExact(text.length(),8L)));if(normalizedMetadata>metadata)staging.growTo(Math.addExact(staging.amount,normalizedMetadata-metadata));
+                long actual=Math.addExact(file(path,reservation.maximum()),file(path.resolveSibling(path.getFileName()+".pending"),reservation.maximum()));
+                var previous=planned.get(path);if(previous!=null && previous.maximum()!=reservation.maximum())throw new IOException("Conflicting journal plan bounds");
+                planned.put(path,new PlannedJournal(path,reservation.maximum(),actual,Math.max(reservation.peakBytes(),previous==null?0:previous.peak()),normalizedMetadata));
+            }
+            synchronized(this){
+                long diskGrowth=0,retainedMetadata=0;int additions=0;
+                for(var plan:planned.values()){var existing=journals.get(plan.path());if(existing!=null){if(existing.owned && plan.peak()>0)throw new IOException("Journal already owned during preflight");diskGrowth=Math.addExact(diskGrowth,Math.max(existing.amount,Math.max(plan.actual(),plan.peak()))-existing.amount);}else{additions++;retainedMetadata=Math.addExact(retainedMetadata,plan.metadata());diskGrowth=Math.addExact(diskGrowth,Math.max(plan.actual(),plan.peak()));}}
+                if(additions>limits.maximumJournalPaths()-journals.size())throw RocksDBException.of(SERVER_OVERLOADED,"Shared journal path registry exhausted");
+                capacity(0);diskCapacity(diskGrowth);if(retainedMetadata>staging.amount)throw new IllegalStateException("Unpaid journal path graph");
+                // The admitted normalized path objects transfer from staging to the registry; no second graph/copy is created.
+                staging.amount-=retainedMetadata;pathBytes+=retainedMetadata;diskBytes+=diskGrowth;
+                for(var plan:planned.values()){var existing=journals.get(plan.path());if(existing==null){existing=new Disk(plan.path(),plan.maximum(),Math.max(plan.actual(),plan.peak()));journals.put(plan.path(),existing);}else{existing.amount=Math.max(existing.amount,Math.max(plan.actual(),plan.peak()));if(!existing.owned)existing.maximum=plan.maximum();}existing.reservedPeak=Math.max(existing.reservedPeak,plan.peak());}
+            }
+        }
+    }
+    @Override public void reserve(RatisJournalAccess.Reservation reservation)throws IOException {preflight(List.of(reservation));}
+    @Override public void fulfilled(RatisJournalAccess.Reservation reservation)throws IOException {if(reservation.peakBytes()==0)return;try(var disk=disk(reservation.path(),reservation.maximum())){disk.releasePromise();}}
     private static long file(Path path,int maximum)throws IOException {if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS))return 0;if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Foreign journal object");long size=Files.size(path);if(size>maximum)throw new IOException("Journal inventory exceeds bound");return size;}
     synchronized long chargedBytes(){return bytes+limits.recoveryBytes()+limits.renewalBytes();}
     synchronized long chargedDiskBytes(){return diskBytes;}
