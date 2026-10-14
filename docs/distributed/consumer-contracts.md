@@ -2,6 +2,14 @@
 
 Read-only evidence for distributed Rockserver, inspected 2026-10-07 against Yotsuba commit `61ee2eb79b0a5738d9df2829563f49a21523fc21` in `/home/cavallium/IdeaProjects/Yotsuba-private`. Relevant inspected paths had no working-tree diff. This is source evidence, not a benchmark or production measurement.
 
+A read-only refresh on 2026-10-15 found that this checkout is now at
+`321817a7d831f6571a7903d3ed5a878ec5b5e355`, pins Rockserver `2.0.2` in
+`server/source/pom.xml`, and has no tracked `MessagesV2Migration` file. A tracked
+Java-source search found no `DatabaseExportDefinition`, `exportDatabase` or
+`ExportWitness` references. The evidence below remains specific to `61ee2eb`;
+it does not establish aggregate-export adoption by the current checkout. No
+Yotsuba files were changed.
+
 Path prefixes used below:
 
 - `core/`: `server/source/core/src/main/java/org/yotsuba/core/database/data/`
