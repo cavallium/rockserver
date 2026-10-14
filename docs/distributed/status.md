@@ -82,11 +82,23 @@ This section and the remaining gates at the end describe the current branch.
   cache slot. Final Debug source passes 167 selected cases: 28 raw, 35 completion,
   20 flush, 29 batch, eight memtable-list, 14 DB/memtable, one table/memtable and
   32 extent cases. Evidence is `construction-actual-free-*.log` in the task-owned
-  `native-completion-integration-output` directory. Insertion storage and range
-  cache replacement admission, live pre-WAL generation-bound credits, the full
-  node memory envelope and Java/JNI runtime qualification remain pending. The
-  native candidate has not replaced the installed private JNI or established
-  protected completion in the node.
+  `native-completion-integration-output` directory.
+- Native checkpoint `bbffdf1` prepays generation-bound entry slabs, range-cache
+  replacements and plan metadata before WAL, including the loader's pipelined
+  path. Parallel insertion consumes those credits; rejected writes leave WAL and
+  sequence state unchanged and clear prepared sync flags. WBM cache reservation
+  runs before WAL and transfers accounting without allocating during insertion.
+  Shared reservation objects/control blocks and detached caches stay charged
+  through actual deallocation. Raw tombstone fragmentation copies both boundaries;
+  an overwrite-before-free test verifies detached readers retain their own bytes.
+  Final source passes 438 selected cases: 33 raw, 251 log, ten normal/pipelined
+  planner, 35 completion, 20 flush, 32 extent, five codec, 29 batch, eight
+  memtable-list, 14 DB/memtable and one table/memtable case. Evidence is
+  `insertion-final-*.log` in that native output directory. Review findings for blob
+  admission and detached boundaries are repaired. Future flush workspace/control
+  headroom, flush-scheduler allocation, the full node memory envelope and Java/JNI
+  runtime qualification remain pending. The native candidate has not replaced the
+  installed private JNI or established protected completion in the node.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
