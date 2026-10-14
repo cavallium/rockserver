@@ -38,13 +38,13 @@ final class RatisPointOwnerManager implements AutoCloseable {
     private synchronized boolean pending(Entry entry){return selected[entry.slot]<0 || !entries.get(selected[entry.slot]).root.equals(entry.root) && (entry.previous==null?selected[entry.slot]<0:entries.get(selected[entry.slot]).root.equals(entry.previous));}
     private void reserve(Entry entry)throws IOException {
         if(entry.credit!=null)return;Path directory=folder(entry),input=directory.resolve("input");long files=RatisRequestBudget.files(input,directory.resolve("input.released"),directory.resolve("session/window.bin"));
-        entry.credit=budget.owner(4*DistributedSchemaCodec.encodedSize(schema)+entry.reservation,files);
+        entry.credit=budget.owner(RemoteMutationToken.Kind.POINT,4*DistributedSchemaCodec.encodedSize(schema)+entry.reservation,files);
     }
     private void start(int slot,RangeDirectory data)throws IOException {
         Entry old; synchronized(this){old=selected[slot]<0?null:entries.get(selected[slot]);}
         if(old!=null)old.actor.beginRenewal();synchronized(this){if(entries.size()>=budget.limits().maximumPointOwners())throw new IOException("Retained point owner history capacity exhausted");}Entry entry=null;boolean intent=false,created=false;
         try {
-            schema.requireMatches(data);var input=factory.bindings(data);long reservation=input.reservation();var credit=budget.owner(4*DistributedSchemaCodec.encodedSize(schema)+reservation,0);
+            schema.requireMatches(data);var input=factory.bindings(data);long reservation=input.reservation();var credit=budget.owner(RemoteMutationToken.Kind.POINT,4*DistributedSchemaCodec.encodedSize(schema)+reservation,0);
             try{var plan=input.freeze();entry=new Entry(UUID.randomUUID(),old==null?null:old.root,slot,reservation,plan.digest());entry.plan=plan;entry.credit=credit;}catch(Throwable failure){credit.close();throw failure;}
             Files.createDirectory(folder(entry));created=true;writeIntent(entry);intent=true;synchronized(this){entries.add(entry);}persist();open(entry);
         }catch(IOException|RuntimeException failure){if(!intent){if(created){synchronized(this){entries.add(entry);fenced=true;}}else{if(entry!=null && entry.credit!=null)entry.credit.close();}}throw failure;}

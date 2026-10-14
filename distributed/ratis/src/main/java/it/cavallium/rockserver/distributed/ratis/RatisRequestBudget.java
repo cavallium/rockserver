@@ -14,37 +14,89 @@ final class RatisRequestBudget implements AutoCloseable {
     record Geometry(long inputBytes,long resultBytes,long maximumItemBytes,long maximumResultBytes,long logicalBytes,int items) {
         long bytes(){long journal=56+RemoteMutationToken.BYTES+36+32+8L*items+inputBytes+resultBytes;return Math.addExact(64L*1024+logicalBytes,Math.addExact(4*journal,4*(maximumItemBytes+maximumResultBytes)));}
     }
-    private final RemoteMutationOwnerLimits limits;private final ThreadPoolExecutor recovery;private long bytes;private int owners,requests;private boolean closed;
-    RatisRequestBudget(RemoteMutationOwnerLimits limits){this.limits=Objects.requireNonNull(limits);recovery=new ThreadPoolExecutor(limits.recoveryWorkers(),limits.recoveryWorkers(),0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(limits.maximumRequests()),Thread.ofPlatform().daemon(true).name("ratis-point-recovery-",0).factory(),new ThreadPoolExecutor.AbortPolicy());}
+    private final RemoteMutationOwnerLimits limits;private final ThreadPoolExecutor recovery;
+    private long bytes,diskBytes,pathBytes;private int owners,requests,works,diskOwners,recoveryOwners;private boolean closed;
+    private final EnumMap<RemoteMutationToken.Kind,Integer> ownerCounts=new EnumMap<>(RemoteMutationToken.Kind.class),requestCounts=new EnumMap<>(RemoteMutationToken.Kind.class);
+    private final Map<Path,Disk> journals=new HashMap<>();
+    RatisRequestBudget(RemoteMutationOwnerLimits limits){this.limits=Objects.requireNonNull(limits);recovery=new ThreadPoolExecutor(limits.recoveryWorkers(),limits.recoveryWorkers(),0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(limits.maximumRequests()),Thread.ofPlatform().daemon(true).name("ratis-request-recovery-",0).factory(),new ThreadPoolExecutor.AbortPolicy());}
     RemoteMutationOwnerLimits limits(){return limits;}
-    private void capacity(long amount){if(closed || amount<0 || amount>limits.maximumBytes()-limits.recoveryBytes()-limits.renewalBytes()-bytes)throw RocksDBException.of(SERVER_OVERLOADED,"Shared point owner byte envelope exhausted");}
-    synchronized Owner owner(long directoryBytes,long openingBytes){long base=256L*1024+directoryBytes;long opening=Math.addExact(base,4*openingBytes);if(owners>=limits.maximumPointOwners())throw RocksDBException.of(SERVER_OVERLOADED,"Point owner history count exhausted");capacity(opening);owners++;bytes+=opening;return new Owner(base,opening);}
-    final class Owner implements AutoCloseable {
-        final long base;private long charged;private boolean released,opened;
-        Owner(long base,long charged){this.base=base;this.charged=charged;}
-        Lease opened(Geometry retained){synchronized(RatisRequestBudget.this){if(released || opened)throw new IllegalStateException("Owner construction credit already transferred");long amount=retained==null?0:retained.bytes();if(retained!=null && requests>=limits.maximumRequests())throw RocksDBException.of(SERVER_OVERLOADED,"Shared retained point request count exhausted");long replacement=base+amount;long delta=replacement-charged;if(delta>0)capacity(delta);bytes+=delta;charged=base;opened=true;if(retained!=null){requests++;return new Lease(amount);}return null;}}
-        @Override public void close(){synchronized(RatisRequestBudget.this){if(released)return;released=true;owners--;bytes-=charged;}}
+    private static void kind(RemoteMutationToken.Kind kind){if(kind!=RemoteMutationToken.Kind.POINT && kind!=RemoteMutationToken.Kind.BULK && kind!=RemoteMutationToken.Kind.RANGE)throw new IllegalArgumentException("Unsupported shared owner kind");}
+    private int maximumOwners(RemoteMutationToken.Kind kind){return switch(kind){case POINT->limits.maximumPointOwners();case BULK->limits.maximumBulkOwners();case RANGE->limits.maximumRangeOwners();default->throw new IllegalArgumentException("Unsupported owner kind");};}
+    private void capacity(long amount){if(closed || amount<0 || amount>limits.maximumBytes()-limits.recoveryBytes()-limits.renewalBytes()-bytes)throw RocksDBException.of(SERVER_OVERLOADED,"Shared remote owner byte envelope exhausted");}
+    synchronized Owner owner(RemoteMutationToken.Kind kind,long directoryBytes,long openingBytes){
+        kind(kind);if(directoryBytes<0 || openingBytes<0)throw new IllegalArgumentException("Negative owner geometry");long base=Math.addExact(256L<<10,directoryBytes),opening=Math.addExact(base,Math.multiplyExact(4,openingBytes));
+        if(ownerCounts.getOrDefault(kind,0)>=maximumOwners(kind))throw RocksDBException.of(SERVER_OVERLOADED,"Remote owner kind/history count exhausted");capacity(opening);owners++;ownerCounts.merge(kind,1,Integer::sum);bytes+=opening;return new Owner(kind,base,opening);
     }
-    synchronized Lease request(Geometry geometry){long amount=geometry.bytes();if(requests>=limits.maximumRequests())throw RocksDBException.of(SERVER_OVERLOADED,"Shared point request count exhausted");capacity(amount);requests++;bytes+=amount;return new Lease(amount);}
-    synchronized Lease work(long amount){capacity(amount);bytes+=amount;return new Lease(amount,false);}
-    final class Lease implements AutoCloseable {final long amount;final boolean request;boolean released;Lease(long amount){this(amount,true);}Lease(long amount,boolean request){this.amount=amount;this.request=request;}@Override public void close(){synchronized(RatisRequestBudget.this){if(released)return;released=true;bytes-=amount;if(request)requests--;}}}
-    <T> CompletableFuture<T> recover(Callable<T> work){var result=new CompletableFuture<T>();try{recovery.execute(() -> {try{result.complete(work.call());}catch(Throwable failure){result.completeExceptionally(failure);}});}catch(RuntimeException failure){result.completeExceptionally(failure);}return result;}
-    /** Fixed workspace is shared only by the bounded recovery workers; excess is charged to the same envelope. */
-    RecoveryCredit recoveryCredit(){synchronized(this){if(recoveryOwners>=limits.recoveryWorkers())throw RocksDBException.of(SERVER_OVERLOADED,"Shared recovery owners exhausted");recoveryOwners++;return new RecoveryCredit();}}
-    private int recoveryOwners;
+    final class Owner implements AutoCloseable {
+        final RemoteMutationToken.Kind kind;final long base;private long charged;private boolean released,opened;
+        Owner(RemoteMutationToken.Kind kind,long base,long charged){this.kind=kind;this.base=base;this.charged=charged;}
+        void requireOpening(long fileBytes){synchronized(RatisRequestBudget.this){if(released || opened || fileBytes<0)throw new IllegalStateException("Owner opening credit unavailable");long target=Math.addExact(base,Math.multiplyExact(6,fileBytes));if(target>charged){capacity(target-charged);bytes+=target-charged;charged=target;}}}
+        Lease opened(long retainedBytes,boolean retained){synchronized(RatisRequestBudget.this){if(released || opened || retainedBytes<0 || !retained && retainedBytes!=0)throw new IllegalStateException("Owner opening credit unavailable");if(retained && requests>=limits.maximumRequests())throw RocksDBException.of(SERVER_OVERLOADED,"Shared retained request count exhausted");long replacement=Math.addExact(base,retainedBytes),delta=replacement-charged;if(delta>0)capacity(delta);bytes+=delta;charged=base;opened=true;if(retained){requests++;requestCounts.merge(kind,1,Integer::sum);return new Lease(kind,retainedBytes,true);}return null;}}
+        /** ACKed cold state needs cleanup workspace, not a new retained public request or a second opening reservation. */
+        Lease openedWorkspace(long minimum){synchronized(RatisRequestBudget.this){if(released || opened || minimum<0)throw new IllegalStateException("Owner opening credit unavailable");long amount=Math.max(minimum,charged-base),delta=Math.addExact(base,amount)-charged;if(delta>0)capacity(delta);bytes+=delta;charged=base;opened=true;works++;return new Lease(null,amount,false);}}
+        @Override public void close(){synchronized(RatisRequestBudget.this){if(released)return;released=true;owners--;ownerCounts.merge(kind,-1,Integer::sum);bytes-=charged;}}
+    }
+    synchronized Lease request(RemoteMutationToken.Kind kind,long amount){kind(kind);if(requests>=limits.maximumRequests())throw RocksDBException.of(SERVER_OVERLOADED,"Shared remote request count exhausted");capacity(amount);requests++;requestCounts.merge(kind,1,Integer::sum);bytes+=amount;return new Lease(kind,amount,true);}
+    synchronized Lease work(long amount){capacity(amount);works++;bytes+=amount;return new Lease(null,amount,false);}
+    final class Lease implements AutoCloseable {
+        volatile long amount;final RemoteMutationToken.Kind kind;final boolean request;private boolean released;
+        private final RatisRequestBudget budget=RatisRequestBudget.this;
+        Lease(RemoteMutationToken.Kind kind,long amount,boolean request){this.kind=kind;this.amount=amount;this.request=request;}
+        void growTo(long target){synchronized(RatisRequestBudget.this){if(released || target<amount)throw new IllegalStateException("Invalid credit growth");capacity(target-amount);bytes+=target-amount;amount=target;}}
+        void shrinkTo(long target){synchronized(RatisRequestBudget.this){if(released || target<0 || target>amount)throw new IllegalStateException("Invalid credit shrink");bytes-=amount-target;amount=target;}}
+        void transferTo(Lease target,long transferred){synchronized(RatisRequestBudget.this){if(target==this || target.budget!=budget || released || target.released || transferred<0 || transferred>amount)throw new IllegalStateException("Invalid credit transfer");long replacement=Math.addExact(target.amount,transferred);amount-=transferred;target.amount=replacement;}}
+        @Override public void close(){synchronized(RatisRequestBudget.this){if(released)return;released=true;bytes-=amount;amount=0;if(request){requests--;requestCounts.merge(kind,-1,Integer::sum);}else works--;}}
+    }
+    <T> CompletableFuture<T> recover(Callable<T> work){var result=new CompletableFuture<T>();try{recovery.execute(()->{try{result.complete(work.call());}catch(Throwable failure){result.completeExceptionally(failure);}});}catch(RuntimeException failure){result.completeExceptionally(failure);}return result;}
+    RecoveryCredit recoveryCredit(){synchronized(this){if(closed || recoveryOwners>=limits.recoveryWorkers())throw RocksDBException.of(SERVER_OVERLOADED,"Shared recovery owners exhausted");recoveryOwners++;return new RecoveryCredit();}}
     final class RecoveryCredit implements AutoCloseable {
         private long extra;private boolean released;
-        void require(long geometry){synchronized(RatisRequestBudget.this){if(released)throw new IllegalStateException("Recovery credit released");long needed=Math.max(0,geometry-limits.recoveryBytes()/limits.recoveryWorkers());if(needed>extra){capacity(needed-extra);bytes+=needed-extra;extra=needed;}}}
+        void require(long geometry){synchronized(RatisRequestBudget.this){if(released || geometry<0)throw new IllegalStateException("Recovery credit unavailable");long needed=Math.max(0,geometry-limits.recoveryBytes()/limits.recoveryWorkers());if(needed>extra){capacity(needed-extra);bytes+=needed-extra;extra=needed;}}}
         @Override public void close(){synchronized(RatisRequestBudget.this){if(released)return;released=true;bytes-=extra;recoveryOwners--;}}
     }
+    /** Retained path debt survives actor close. Call while holding the journal's stable ownership lock to reconcile. */
+    final class Disk implements AutoCloseable {
+        final Path path,pending;final int maximum;private long amount;private boolean owned;
+        Disk(Path path,int maximum,long amount){this.path=path;this.pending=path.resolveSibling(path.getFileName()+".pending");this.maximum=maximum;this.amount=amount;}
+        long inventory()throws IOException{return Math.addExact(file(path,maximum),file(pending,maximum));}
+        void prepareReplacement(long encodedBytes){synchronized(RatisRequestBudget.this){if(!owned || encodedBytes<32 || encodedBytes>maximum)throw new IllegalStateException("Invalid journal replacement geometry");long peak=Math.addExact(amount,encodedBytes);diskCapacity(peak-amount);diskBytes+=peak-amount;amount=peak;}}
+        void forcedReconcile()throws IOException{long actual=inventory();synchronized(RatisRequestBudget.this){if(!owned)throw new IllegalStateException("Journal disk ownership released");if(actual>amount){diskCapacity(actual-amount);diskBytes+=actual-amount;}else diskBytes-=amount-actual;amount=actual;}}
+        long debt(){synchronized(RatisRequestBudget.this){return amount;}}
+        @Override public void close(){synchronized(RatisRequestBudget.this){if(!owned)return;owned=false;diskOwners--;}}
+    }
+    private void diskCapacity(long amount){if(closed || amount<0 || amount>limits.maximumDiskBytes()-diskBytes)throw RocksDBException.of(SERVER_OVERLOADED,"Shared journal replacement disk envelope exhausted");}
+    Disk disk(Path input,int maximum)throws IOException {
+        if(maximum<32)throw new IllegalArgumentException("Invalid journal maximum");Path path=input.toAbsolutePath().normalize();String text=path.toString();if(text.length()>4096 || path.getFileName().toString().endsWith(".pending"))throw new IOException("Invalid owned journal path");
+        // Two UnixPath objects retain UTF-8 arrays, cached UTF-16 strings and component-offset arrays.
+        // Include object/array/map headers and the longer pending suffix before registry retention.
+        long actual=Math.addExact(file(path,maximum),file(path.resolveSibling(path.getFileName()+".pending"),maximum));long metadata=Math.addExact(2048L,Math.multiplyExact(32L,Math.addExact(text.length(),8L)));
+        synchronized(this){if(closed)throw new IOException("Shared journal budget closed");var existing=journals.get(path);if(existing!=null){if(existing.owned || existing.maximum!=maximum)throw new IOException("Journal already owned or maximum changed");if(actual>existing.amount){diskCapacity(actual-existing.amount);diskBytes+=actual-existing.amount;existing.amount=actual;}existing.owned=true;diskOwners++;return existing;}
+            if(journals.size()>=limits.maximumJournalPaths())throw RocksDBException.of(SERVER_OVERLOADED,"Shared journal path registry exhausted");capacity(metadata);diskCapacity(actual);var created=new Disk(path,maximum,actual);created.owned=true;journals.put(path,created);bytes+=metadata;pathBytes+=metadata;diskBytes+=actual;diskOwners++;return created;}
+    }
+    private static long file(Path path,int maximum)throws IOException {if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS))return 0;if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Foreign journal object");long size=Files.size(path);if(size>maximum)throw new IOException("Journal inventory exceeds bound");return size;}
     synchronized long chargedBytes(){return bytes+limits.recoveryBytes()+limits.renewalBytes();}
+    synchronized long chargedDiskBytes(){return diskBytes;}
     synchronized int retainedRequests(){return requests;}
-    static long files(Path... paths)throws IOException{long bytes=0;for(var path:paths)if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Foreign point owner journal object");bytes=Math.addExact(bytes,Files.size(path));}return bytes;}
+    synchronized int retainedRequests(RemoteMutationToken.Kind kind){return requestCounts.getOrDefault(kind,0);}
+    synchronized int retainedOwners(RemoteMutationToken.Kind kind){return ownerCounts.getOrDefault(kind,0);}
+    static long files(Path... paths)throws IOException{long bytes=0;for(var path:paths)if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){if(!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Foreign owner journal object");bytes=Math.addExact(bytes,Files.size(path));}return bytes;}
+    static long bulkBase(RangeDirectory directory){return Math.addExact(96L<<10,2*RangeDirectoryCodec.encodedSize(directory));}
+    static long bulkRetained(RatisBatchRequestJournal.Request request){long commands=0,items=0;for(var chunk:request.chunks){commands=Math.addExact(commands,DistributedCommandCodec.encodedSize(chunk));items+=chunk.mutations().size();}return Math.addExact(bulkBase(request.directory),Math.addExact(3*commands,128*items));}
+    static long bulkInput(DistributedSchema schema,long column,int[][] keys,int[] values,long retainedEncoded)throws IOException {
+        if(keys.length!=values.length || keys.length>RatisRocksDBBatches.MAX_INPUT_ITEMS)throw new IllegalArgumentException("Invalid bulk input count");
+        var shape=RatisLogicalClient.supported(schema,column).schema();long physical=0;for(int n=0;n<shape.keysCount();n++)physical+=shape.key(n);long logical=0,components=0,wire=0;
+        for(int n=0;n<keys.length;n++){var parts=keys[n];if(parts.length!=shape.keysCount())throw new IllegalArgumentException("Bulk logical key shape changed");long members=shape.variableLengthKeysCount()==0?0:4;
+            for(int k=0;k<parts.length;k++){int size=parts[k];if(size<0 || (k<shape.fixedLengthKeysCount()?size!=shape.key(k):size>65535))throw new IllegalArgumentException("Bulk logical key width changed");logical=Math.addExact(logical,4L+size);components++;if(k>=shape.fixedLengthKeysCount())members+=2L+size;}
+            long size=Math.max(0,values[n]);logical=Math.addExact(logical,4+size);long item=DistributedCommandCodec.HEADER_BYTES+26+physical+members+size;if(item>RatisRocksDBBatches.MAX_CHUNK_BYTES)throw new IllegalArgumentException("Bulk item exceeds native chunk bound");wire=Math.addExact(wire,item);
+        }
+        if(logical>RatisRocksDBBatches.MAX_INPUT_BYTES)throw new IllegalArgumentException("Bulk logical input exceeds bound");
+        return Math.addExact(128L<<10,Math.addExact(3*logical+64*components+512L*keys.length+3*wire,6*Math.addExact(retainedEncoded,wire)));
+    }
     static Geometry geometry(DistributedSchema schema,long column,List<Keys> keys,List<Buf> values,RatisRocksDBDirect.WriteKind kind,RequestType.RequestTypeId type,boolean multi){
         if(keys.isEmpty() || keys.size()>256 || !multi && keys.size()!=1 || kind!=RatisRocksDBDirect.WriteKind.DELETE && keys.size()!=values.size())throw new IllegalArgumentException("Invalid point input count");var shape=RatisLogicalClient.supported(schema,column).schema();long physical=0;for(int n=0;n<shape.keysCount();n++)physical+=shape.key(n);long input=0,logical=0,maximum=0;
         for(int n=0;n<keys.size();n++){var components=keys.get(n).keys();if(components.length!=shape.keysCount())throw new IllegalArgumentException("Logical key shape changed");long members=shape.variableLengthKeysCount()==0?0:4;for(int part=0;part<components.length;part++){int size=components[part].size();if(part<shape.fixedLengthKeysCount()?size!=shape.key(part):size>65535)throw new IllegalArgumentException("Logical key width changed");logical+=size;if(part>=shape.fixedLengthKeysCount())members+=2L+size;}long value=kind==RatisRocksDBDirect.WriteKind.DELETE || values.get(n)==null?0:values.get(n).size();logical+=value;long item=DistributedCommandCodec.HEADER_BYTES+26+physical+members+value;if(item>DistributedCommandCodec.MAX_ENCODED_BYTES)throw new IllegalArgumentException("Point item exceeds command bound");input+=item;maximum=Math.max(maximum,item);}
         if(input>RatisDirectRequestJournal.MAX_INPUT)throw new IllegalArgumentException("Point input exceeds aggregate bound");boolean returns=type!=RequestType.RequestTypeId.NOTHING && type!=RequestType.RequestTypeId.ENSURE;long oneResult=!returns?8:shape.hasValue()?CommandResult.MAX_BYTES:12;long result=Math.min(RatisDirectRequestJournal.MAX_RESULTS+CommandResult.MAX_BYTES,keys.size()*oneResult);return new Geometry(input,result,maximum,oneResult,logical,keys.size());
     }
     static Geometry geometry(DistributedSchema schema,RatisDirectRequestJournal.Request request){long input=0,maximum=0,logical=0;for(var item:request.items){var mutation=item.mutations().getFirst();var shape=schema.column(mutation.columnId()).schema();long hashes=0;for(int n=shape.fixedLengthKeysCount();n<shape.keysCount();n++)hashes+=shape.key(n);long bytes=DistributedCommandCodec.encodedSize(item);input+=bytes;maximum=Math.max(maximum,bytes);logical+=mutation.encodedSize()-26-hashes-(shape.variableLengthKeysCount()==0?0:4+2L*shape.variableLengthKeysCount());}boolean returns=request.type!=RequestType.RequestTypeId.NOTHING && request.type!=RequestType.RequestTypeId.ENSURE;boolean hasValue=schema.column(request.items.getFirst().mutations().getFirst().columnId()).schema().hasValue();long one=!returns?8:hasValue?CommandResult.MAX_BYTES:12;return new Geometry(input,Math.min(RatisDirectRequestJournal.MAX_RESULTS+CommandResult.MAX_BYTES,request.items.size()*one),maximum,one,logical,request.items.size());}
-    @Override public synchronized void close()throws IOException{if(owners!=0 || requests!=0 || recoveryOwners!=0)throw new IOException("Shared point owners/requests remain charged");closed=true;recovery.shutdown();}
+    @Override public synchronized void close()throws IOException{if(owners!=0 || requests!=0 || works!=0 || recoveryOwners!=0 || diskOwners!=0 || bytes!=pathBytes)throw new IOException("Shared owners/requests/actual work remain charged");closed=true;recovery.shutdown();}
 }

@@ -21,7 +21,7 @@ class RatisPointOwnerRenewalTest {
         volatile CountDownLatch entered,release;final AtomicLong commands=new AtomicLong(900);final Path ownersRoot;
         Fixture(Path fixtureRoot,int history)throws Exception {
             f=new RatisAtomicClientTest.Fixture(fixtureRoot.resolve("native"),true);ownersRoot=fixtureRoot.resolve("owners");
-            budget=new RatisRequestBudget(new RemoteMutationOwnerLimits(1,history,history,128L<<20,16L<<20,8L<<20,1));
+            budget=new RatisRequestBudget(new RemoteMutationOwnerLimits(1,history,0,0,history,128L<<20,512L<<20,512,16L<<20,8L<<20,1));
             var directories=f.catalogue.epochs.catalogue(f.outer.directoryColumn);assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(f.outer.operation(commands.getAndIncrement()),null,f.directory)).status());
             sessions=new RatisRocksDBConnection.SessionFactory(List.of(f.data,f.homeClient),(path,schema,plan)->{
                 opens.incrementAndGet();
@@ -72,7 +72,7 @@ class RatisPointOwnerRenewalTest {
     }
     @Test void quiescentExpiredOwnerRenewsOntoActualActivatedSplitChildrenAndKeepsOldTokenAcrossColdReopen()throws Exception {
         var helper=new RatisOperationRerouteCoordinatorTest();helper.root=root;
-        try(var f=helper.new Fixture();var stale=new RatisRoutedClient(f.source.directory,f.transport());var budget=new RatisRequestBudget(new RemoteMutationOwnerLimits(1,4,4,128L<<20,16L<<20,8L<<20,1))) {
+        try(var f=helper.new Fixture();var stale=new RatisRoutedClient(f.source.directory,f.transport());var budget=new RatisRequestBudget(new RemoteMutationOwnerLimits(1,4,0,0,4,128L<<20,512L<<20,512,16L<<20,8L<<20,1))) {
             f.window.close();f.coordinator.close();
             var sessions=new RatisRocksDBConnection.SessionFactory(List.of(stale,f.homeClient),(path,schema,plan)->{
                 if(Arrays.equals(plan.directory().payloadDigest(),f.source.directory.payloadDigest()))return RatisDurableSessionClient.reopen(f.windowPath,stale);

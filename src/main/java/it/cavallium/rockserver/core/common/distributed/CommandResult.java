@@ -33,9 +33,14 @@ public final class CommandResult {
         byte[] value = values.get(index);
         return value == null ? null : value.clone();
     }
+    /** Exact canonical size without materializing result values or the encoded buffer. */
+    public int encodedSize() {
+        int bytes=8;
+        for(byte[] value:values)bytes+=4+(value==null?0:value.length);
+        return bytes;
+    }
     public byte[] encode() {
-        int bytes = 8;
-        for (byte[] value : values) bytes += 4 + (value == null ? 0 : value.length);
+        int bytes=encodedSize();
         int code = switch (status) {
             case SUCCESS -> 0; case RESULT_TOO_LARGE -> 1; case CONFLICT -> 2; case SESSION_EXPIRED -> 3; case STALE_SCHEMA -> 4;
         };

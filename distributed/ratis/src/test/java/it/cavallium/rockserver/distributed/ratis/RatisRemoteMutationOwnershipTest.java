@@ -13,6 +13,11 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Native effects and durable envelopes only; no listener or quorum claims. */
 class RatisRemoteMutationOwnershipTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
+    private static RatisRangeDeleteClient openRange(RatisAtomicClientTest.Fixture f,RatisRocksDBAdapter.AllocationSource allocations,Path folder,RatisRequestBudget budget)throws IOException {
+        var credit=budget.owner(RemoteMutationToken.Kind.RANGE,4L*(DistributedSchemaCodec.encodedSize(f.schema)+RangeDirectoryCodec.encodedSize(f.directory)),RatisRequestBudget.files(folder.resolve("input"),folder.resolve("input.pending"),folder.resolve("atomic"),folder.resolve("atomic.pending")));
+        try{return new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder,budget,credit);}catch(IOException|RuntimeException|Error failure){credit.close();throw failure;}
+    }
+
     @Test void lostPointResultRequiresOriginalTokenAndExplicitAckAcrossReopen() throws Exception {
         var fixtures=new RatisRocksDBDirectTest();fixtures.root=root;
         try(var x=fixtures.new Fixture()) {
@@ -39,7 +44,7 @@ class RatisRemoteMutationOwnershipTest {
         try(var x=fixtures.new Fixture()) {
             var owner=x.batches.owner();var token=x.batches.prepare(owner,UUID.randomUUID(),0,71,false);var batch=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.key(2)),List.of(RatisAtomicClientTest.value(9)));byte[] digest=RemoteMutationInputs.batch(71,false,batch);
             assertEquals(0,x.writes.size());x.lose.set(true);assertThrows(ExecutionException.class,() -> x.batches.append(token,0,batch,digest,RequestContext.batch()).get(10,TimeUnit.SECONDS));x.batches.close();x.session.close();
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var batches=new RatisRocksDBBatches(x.f.schema,x.routed,session,x.f.scheduler,x.journal,RatisRocksDBBatches.SessionOwnership.BORROWED)) {
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var batches=x.open(session)) {
                 var resumed=batches.resumeRetained(token,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertFalse(resumed.sourceComplete());assertEquals(1,resumed.copiedBatches());int writes=x.writes.size();
                 batches.append(token,0,batch,digest,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(writes,x.writes.size());
                 var changed=new KVBatch.KVBatchRef(batch.keys(),List.of(RatisAtomicClientTest.value(8)));assertThrows(ExecutionException.class,() -> batches.append(token,0,changed,RemoteMutationInputs.batch(71,false,changed),RequestContext.batch()).get(10,TimeUnit.SECONDS));
@@ -73,18 +78,18 @@ class RatisRemoteMutationOwnershipTest {
         }
     }
     @Test void acceptedRangeSidecarLostReplyKeepsSameCapturesAndExplicitAck() throws Exception {
-        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("range-native"),true)) {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("range-native"),true);var budget=new RatisRequestBudget(RemoteMutationOwnerLimits.defaults())) {
             RatisRocksDBAdapterTest.seed(f,71,RatisAtomicClientTest.key(2),RatisAtomicClientTest.value(1),1900);RatisRocksDBAdapterTest.seed(f,71,RatisAtomicClientTest.key(200),RatisAtomicClientTest.value(2),1901);
             var allocations=new RatisRocksDBAdapterTest.Allocations(f);var folder=root.resolve("range-owner");RemoteMutationToken token;
-            try(var actor=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)) {
+            try(var actor=openRange(f,allocations,folder,budget)) {
                 token=actor.prepare(actor.owner(),UUID.randomUUID(),0,71,RatisAtomicClientTest.key(2),RatisAtomicClientTest.key(201));assertEquals(0,f.opens.get());assertEquals(0,allocations.count.get());
                 f.beforeHomeRead=() -> {throw new java.io.UncheckedIOException(new IOException("Lost original HOME reply"));};assertThrows(ExecutionException.class,() -> actor.execute(token,RequestContext.batch()).observer().get(15,TimeUnit.SECONDS));
             }
             java.nio.file.Files.move(folder.resolve("atomic"),folder.resolve("atomic.pending"));int captures=f.opens.get();assertEquals(2,captures);f.beforeHomeRead=null;
-            try(var actor=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)) {
+            try(var actor=openRange(f,allocations,folder,budget)) {
                 actor.execute(token,RequestContext.batch()).observer().get(15,TimeUnit.SECONDS);assertEquals(captures,f.opens.get());assertEquals(1,allocations.count.get());assertNull(f.get(71,RatisAtomicClientTest.key(2)));assertNull(f.get(71,RatisAtomicClientTest.key(200)));assertEquals(RemoteMutationStatus.State.TERMINAL,actor.status(token).state());assertEquals(CommandResult.Status.SUCCESS,actor.status(token).outcome());assertEquals(2,actor.status(token).appliedMutations());assertThrows(IOException.class,() -> actor.prepare(new RemoteMutationOwner(token.clusterId(),token.databaseId(),token.domainId(),UUID.randomUUID(),token.ownerEpoch(),0,token.kind(),token.schemaDigest(),token.directoryDigest()),token.requestId(),0,71,RatisAtomicClientTest.key(2),RatisAtomicClientTest.key(201)));actor.acknowledgeResult(token,actor.status(token).resultDigest());
             }
-            try(var actor=new RatisRangeDeleteClient(f.schema,f.directory,f.data,f.homes,f.scheduler,allocations,folder)) {assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,actor.status(token).state());actor.acknowledgeResult(token,actor.status(token).resultDigest());assertEquals(captures,f.opens.get());}
+            try(var actor=openRange(f,allocations,folder,budget)) {assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,actor.status(token).state());actor.acknowledgeResult(token,actor.status(token).resultDigest());assertEquals(captures,f.opens.get());}
         }
     }
     @Test void thousandNoncommutativeRequestsReuseOneGrantAndEvictedPrepareNeverBecomesFresh() throws Exception {
@@ -145,7 +150,7 @@ class RatisRemoteMutationOwnershipTest {
             var token=x.batches.prepare(x.batches.owner(),UUID.randomUUID(),0,71,false);var batch=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.key(2),RatisAtomicClientTest.key(200)),List.of(RatisAtomicClientTest.value(9),RatisAtomicClientTest.value(8)));var once=new java.util.concurrent.atomic.AtomicBoolean();
             x.batches.beforeAcknowledgementMarker(() -> {if(!once.compareAndSet(false,true))return;try {var before=x.f.catalogue.epochs.read();var expired=before.advanceTime(x.session.grant().expiresAtMillis());assertEquals(CommandResult.Status.SUCCESS,x.f.catalogue.epochs.execute(x.f.catalogue.epochs.prepare(x.f.outer.operation(3),before,expired)).status());int n=0;for(var group:x.f.groups){var clock=DistributedCommand.sessionControl(group,1,x.f.schema.digest(),new OperationId(x.f.admin,3,n++),RangeSessionControl.advance(expired),-1);assertEquals(CommandResult.Status.SUCCESS,x.f.data.execute(x.f.data.prepareSessionControl(clock)).status());}}catch(IOException failure){throw new java.io.UncheckedIOException(failure);}});
             x.batches.append(token,0,batch,RemoteMutationInputs.batch(71,false,batch),RequestContext.batch()).get(10,TimeUnit.SECONDS);var status=x.batches.status(token);assertEquals(RemoteMutationStatus.State.TERMINAL,status.state());assertEquals(CommandResult.Status.SESSION_EXPIRED,status.outcome());assertEquals(1,status.appliedMutations());assertArrayEquals(new byte[]{9},x.f.get(71,RatisAtomicClientTest.key(2)));assertNull(x.f.get(71,RatisAtomicClientTest.key(200)));x.batches.acknowledgeResult(token,status.resultDigest());x.batches.close();x.session.close();
-            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var batches=new RatisRocksDBBatches(x.f.schema,x.routed,session,x.f.scheduler,x.journal,RatisRocksDBBatches.SessionOwnership.BORROWED)){var acknowledged=batches.status(token);assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,acknowledged.state());assertEquals(CommandResult.Status.SESSION_EXPIRED,acknowledged.outcome());assertEquals(1,acknowledged.appliedMutations());}
+            try(var session=RatisDurableSessionClient.reopen(x.window,x.routed);var batches=x.open(session)){var acknowledged=batches.status(token);assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,acknowledged.state());assertEquals(CommandResult.Status.SESSION_EXPIRED,acknowledged.outcome());assertEquals(1,acknowledged.appliedMutations());}
         }
     }
     @Test void unsubmittedPointSuffixExposesStaleSchemaOutcomeAndSavedAppliedPrefix() throws Exception {

@@ -74,6 +74,35 @@ public final class RatisDurableTransaction implements AutoCloseable {
         ParticipantProgress progress() { return new ParticipantProgress(intent,preparation,vote,finalization,receipt,outcome,retirementProof); }
     }
     private final Path path;
+    private RatisRequestBudget budget;
+    private RatisRequestBudget.Lease retainedCredit;
+    private RatisRequestBudget.Disk disk;
+    static long futureBytes(List<Intent> intents) throws IOException {
+        long size=2L*RangeDirectoryCodec.MAX_ENCODED_BYTES+4L*TransactionStatus.MAX_BYTES+HomeFenceProof.MAX_BYTES+65536L;
+        for(var intent:intents)size+=DistributedCommandCodec.encodedSize(intent.acceptedBusiness())+SessionWindowJournal.routeSize(intent.route())
+                +2L*ParticipantFinalization.MAX_BYTES+TransactionStatus.MAX_BYTES+2L*ParticipantFenceProof.MAX_BYTES+529;
+        if(size+32>MAX_BYTES)throw new IOException("Transaction future persistence capacity unavailable");
+        return size+32;
+    }
+    static RatisDurableTransaction createAccounted(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence,RatisRequestBudget budget,RatisRequestBudget.Lease retained)throws IOException {
+        // Evidence counting traverses immutable directories/commands; even their defensive copies
+        // are covered before any evidence encoder is invoked. RANGE normally has no evidence.
+        try(var workspace=evidence==null?null:budget.work(4L*RangeDirectoryCodec.MAX_ENCODED_BYTES)) {
+            long evidenceBytes=0;
+            if(evidence!=null) {
+                long bound=20L+DistributedCommandCodec.encodedSize(evidence.original())+RangeDirectoryCodec.encodedSize(evidence.sourceDirectory())
+                        +RangeDirectoryCodec.encodedSize(evidence.targetDirectory())+RatisTopologyOperationOutcomeRpc.MAX_REPLY_BYTES;
+                for(var intent:evidence.intents())bound+=36L+DistributedCommandCodec.encodedSize(intent.acceptedBusiness());
+                workspace.growTo(Math.max(workspace.amount,6*bound));
+                evidenceBytes=evidence.encode().length;
+            }
+            retained.growTo(Math.max(retained.amount,RatisAtomicClient.retainedGeometry(futureBytes(intents)+evidenceBytes)));
+            return create(path,homes,data,initial,registration,intents,evidence,budget,retained);
+        }
+    }
+    static RatisDurableTransaction reopenAccounted(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,RatisRequestBudget budget,RatisRequestBudget.Lease retained)throws IOException {
+        return new RatisDurableTransaction(path,homes,data,false,budget,retained);
+    }
     private final RatisTransactionStatuses homes;
     private final RatisRoutedClient data;
     private final FileChannel channel;
@@ -89,7 +118,7 @@ public final class RatisDurableTransaction implements AutoCloseable {
     private RatisRoutedClient.PreparedHomeRecoveryOperation pendingRecovery;
     private HomeRecoveryReceipt recoveryReceipt;
     private HomeFenceProof homeRetirementProof;
-    private boolean active,closed,fenced,homeSuperseded,reclaimed;
+    private boolean active,closed,disposed,fenced,homeSuperseded,reclaimed;
 
     public static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,
             TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents) throws IOException {
@@ -100,7 +129,10 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return create(path,homes,data,initial,registration,intents,evidence);
     }
     private static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence)throws IOException {
-        var journal=new RatisDurableTransaction(path,homes,data,true);
+        return create(path,homes,data,initial,registration,intents,evidence,null,null);
+    }
+    private static RatisDurableTransaction create(Path path,RatisTransactionStatuses homes,RatisRoutedClient data,TransactionStatus initial,RatisRoutedClient.PreparedCommand registration,List<Intent> intents,RatisOperationRerouteAdmissionRpc.Evidence evidence,RatisRequestBudget budget,RatisRequestBudget.Lease retained)throws IOException {
+        var journal=new RatisDurableTransaction(path,homes,data,true,budget,retained);
         try {
             journal.initial=Objects.requireNonNull(initial); initial.requireInitial(); if(initial.reserved())throw new IllegalArgumentException("Participant journal requires promoted HOME initial status");
             journal.reservationEvidence=validateReservationEvidence(initial,evidence);
@@ -122,7 +154,11 @@ public final class RatisDurableTransaction implements AutoCloseable {
         return new RatisDurableTransaction(path,homes,data,false);
     }
     private RatisDurableTransaction(Path file,RatisTransactionStatuses homes,RatisRoutedClient data,boolean create) throws IOException {
-        path=file.toAbsolutePath(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
+        this(file,homes,data,create,null,null);
+    }
+    private RatisDurableTransaction(Path file,RatisTransactionStatuses homes,RatisRoutedClient data,boolean create,RatisRequestBudget budget,RatisRequestBudget.Lease retained) throws IOException {
+        this.budget=budget;this.retainedCredit=retained;
+        path=file.toAbsolutePath().normalize(); this.homes=Objects.requireNonNull(homes); this.data=Objects.requireNonNull(data);
         identity=data.sessionIdentityDigest(); homeIdentity=homes.identityDigest();
         if (!Files.isDirectory(path.getParent())) throw new IOException("Transaction journal parent is absent");
         channel=FileChannel.open(path.resolveSibling(path.getFileName()+".lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
@@ -131,10 +167,21 @@ public final class RatisDurableTransaction implements AutoCloseable {
             try { acquired=channel.tryLock(); } catch (OverlappingFileLockException owned) { throw new IOException("Transaction journal already owned",owned); }
             if (acquired==null) throw new IOException("Transaction journal already owned"); lock=acquired;
             if (create==Files.exists(path)) throw new IOException(create ? "Transaction journal already exists" : "Transaction journal absent");
-            if (!create) { byte[] body=SessionJournalFiles.read(path,MAX_BYTES); decode(body); capacity(); if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical transaction journal"); SessionJournalFiles.force(path); SessionJournalFiles.force(path.getParent()); }
+            if(budget!=null)disk=budget.disk(path,MAX_BYTES);
+            if (!create) {
+                long input=RatisRequestBudget.files(path,path.resolveSibling(path.getFileName()+".pending"));
+                try(var workspace=budget==null?null:budget.work(Math.addExact(65536,4*input))) {
+                    byte[] body=SessionJournalFiles.read(path,MAX_BYTES); decode(body); capacity();
+                    if(retainedCredit!=null)retainedCredit.growTo(Math.max(retainedCredit.amount,RatisAtomicClient.retainedGeometry(futureBytes(entries.values().stream().map(e->e.intent).toList()))));
+                    if (!Arrays.equals(body,encode())) throw new IOException("Noncanonical transaction journal");
+                    SessionJournalFiles.force(path); SessionJournalFiles.force(path.getParent());
+                }
+            }
+            if(disk!=null)disk.forcedReconcile();
         } catch (IOException | RuntimeException | Error failure) {
             try { if (acquired!=null) acquired.release(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+            if(disk!=null)disk.close();
             throw failure;
         }
     }
@@ -469,28 +516,36 @@ public final class RatisDurableTransaction implements AutoCloseable {
     public void reclaimRetired() throws IOException { reclaimRetired(SessionJournalFiles.FILESYSTEM); }
     void reclaimRetired(SessionJournalFiles.Removal io) throws IOException {
         final byte[] body;
+        RatisRequestBudget.Lease workspace=null;
         synchronized (this) {
             requireOpen(); if (!reclaimable()) throw new IOException("Reclamation requires an idle consumed transaction and saved HOME retirement proof");
-            body=encode(); active=true;
+            if(budget!=null)workspace=budget.work(Math.addExact(65536,3*encodedSize()));
+            try{body=encode();active=true;}catch(Throwable failure){if(workspace!=null)workspace.close();throw failure;}
         }
         try {
             SessionJournalFiles.remove(path,body,MAX_BYTES,io);
+            if(disk!=null)disk.forcedReconcile();
             synchronized (this) { reclaimed=true; }
         } catch (IOException | RuntimeException failure) {
             synchronized (this) { fenced=true; }
             if (failure instanceof IOException ioFailure) throw ioFailure; throw new IOException("Transaction reclamation failed; ownership retained",failure);
-        } finally { synchronized (this) { active=false; } }
+        } finally { synchronized (this) { active=false; } if(workspace!=null)workspace.close(); }
     }
     private void requireOpen() throws IOException { if (reclaimed) throw new IOException("Transaction journal reclaimed"); if (closed || fenced || !lock.isValid()) throw new IOException("Transaction journal closed/fenced; reopen it"); }
     private void idle() throws IOException { requireOpen(); if (homeRetirementProof!=null) throw new RatisHomeRetiredException(homeRetirementProof); if (active) throw new IOException("Transaction journal RPC already active"); }
     private void persist() throws IOException {
-        try { SessionJournalFiles.write(path,encode(),MAX_BYTES); }
+        try (var workspace=budget==null?null:budget.work(Math.addExact(65536,3*encodedSize()))) {
+            long size=encodedSize();if(disk!=null)disk.prepareReplacement(size+32);
+            SessionJournalFiles.write(path,encode(),MAX_BYTES);if(disk!=null)disk.forcedReconcile();
+        }
         catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Transaction journal persistence failed; reopen it",failure); }
     }
     @Override public synchronized void close() throws IOException {
         if (active) throw new IOException("Transaction RPC active; file ownership retained");
-        if (closed && !channel.isOpen()) return; closed=true;
+        if (disposed) return; closed=true;
         try { if (lock.isValid()) lock.release(); } finally { channel.close(); }
+        entries.clear();initial=null;observed=null;pending=null;homeResult=null;pendingRecovery=null;recoveryReceipt=null;homeRetirementProof=null;reservationEvidence=null;homeRoute=null;
+        if(disk!=null){disk.close();disk=null;}disposed=true;
     }
     /** Reserve all later proof/request metadata before registration can have effects. Results live only in accepted intents. */
     private void capacity() throws IOException {
@@ -534,16 +589,23 @@ public final class RatisDurableTransaction implements AutoCloseable {
         for (int i=0;i<count;i++) if (!assigned[i]) throw new IOException("Global transaction result slots must exactly cover 0..N-1");
         return count;
     }
-    private byte[] encode() throws IOException {
-        long size=4+64+4L+(reservationEvidence==null ? 0 : reservationEvidence.length)+4L+initial.encode().length+SessionWindowJournal.routeSize(homeRoute)+32+24+4+(observed==null ? 0 : observed.encode().length)+1;
-        if (pending!=null) size+=4L+(pendingRecovery==null ? DistributedCommandCodec.encodedSize(pending.command()) : pendingRecovery.bytes().length)+SessionWindowJournal.routeSize(pending.descriptor());
+    private static long statusSize(TransactionStatus status) {
+        return TransactionStatus.HEADER_BYTES+(status.origin()==null?0:OperationRerouteOrigin.MAX_BYTES)+(long)TransactionStatus.PARTICIPANT_BYTES*status.participants().size();
+    }
+    private long encodedSize() throws IOException {
+        long size=4+64+4L+(reservationEvidence==null ? 0 : reservationEvidence.length)+4L+statusSize(initial)+SessionWindowJournal.routeSize(homeRoute)+32+24+4+(observed==null ? 0 : statusSize(observed))+1;
+        if (pending!=null) size+=4L+(pendingRecovery==null ? DistributedCommandCodec.encodedSize(pending.command()) : 9L+DistributedCommandCodec.encodedSize(pendingRecovery.recovery().command())+(pendingRecovery.recovery().proof()==null?0:73))+SessionWindowJournal.routeSize(pending.descriptor());
         size+=positionSize(recoveryReceipt==null ? null : recoveryReceipt.position());
-        size+=4+(homeResult==null ? 0 : homeResult.encode().length)+1+4+(homeRetirementProof==null ? 0 : homeRetirementProof.encode().length)+4;
+        size+=4+(homeResult==null ? 0 : homeResult.encodedSize())+1+4+(homeRetirementProof==null ? 0 : 28L+76+statusSize(homeRetirementProof.identity().definition()))+4;
         for (var entry:entries.values()) {
-            size+=SessionWindowJournal.routeSize(entry.intent.route())+4L+DistributedCommandCodec.encodedSize(entry.intent.acceptedBusiness())+64+4L+4L*entry.intent.resultPositions().size()+(entry.intent.captureId()==null ? 1 : 17)+4+(entry.registration==null ? 0 : entry.registration.encode().length)+1+voteSize(entry.vote)+4+(entry.finalization==null ? 0 : entry.finalization.finalization().encode().length)+positionSize(entry.receipt)+4+(entry.retirementProof==null ? 0 : entry.retirementProof.encode().length)+1;
-            if (entry.outcome!=null) size+=4L+entry.outcome.finalization().encode().length+16+voteSize(entry.outcome.vote());
+            size+=SessionWindowJournal.routeSize(entry.intent.route())+4L+DistributedCommandCodec.encodedSize(entry.intent.acceptedBusiness())+64+4L+4L*entry.intent.resultPositions().size()+(entry.intent.captureId()==null ? 1 : 17)+4+(entry.registration==null ? 0 : statusSize(entry.registration))+1+voteSize(entry.vote)+4+(entry.finalization==null ? 0 : ParticipantFinalization.HEADER_BYTES+statusSize(entry.finalization.finalization().decision()))+positionSize(entry.receipt)+4+(entry.retirementProof==null ? 0 : 28L+44+statusSize(entry.retirementProof.identity().definition()))+1;
+            if (entry.outcome!=null) size+=4L+ParticipantFinalization.HEADER_BYTES+statusSize(entry.outcome.finalization().decision())+16+voteSize(entry.outcome.vote());
         }
         if (size+32>MAX_BYTES) throw new IOException("Transaction journal bound exceeded");
+        return size;
+    }
+    private byte[] encode() throws IOException {
+        long size=encodedSize();
         var output=ByteBuffer.allocate((int)size).putInt(MAGIC).put(identity).put(homeIdentity);
         blob(output,reservationEvidence);blob(output,initial.encode()); SessionWindowJournal.route(output,homeRoute); operation(output,lastHome); uuid(output,recoveryNamespace); output.putLong(recoverySequence); blob(output,observed==null ? null : observed.encode());
         output.put((byte)(pending==null ? 0 : pendingRecovery==null ? 1 : 2)); if (pending!=null) { blob(output,pendingRecovery==null ? DistributedCommandCodec.encode(pending.command()) : pendingRecovery.bytes()); SessionWindowJournal.route(output,pending.descriptor()); }

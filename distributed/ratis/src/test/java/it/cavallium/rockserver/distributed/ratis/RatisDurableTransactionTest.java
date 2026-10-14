@@ -26,6 +26,23 @@ class RatisDurableTransactionTest {
     RatisDurableTransaction create(Path path,RatisParticipantPrepareTest.Node home,RatisParticipantPrepareTest.Node data,Plan plan) throws Exception {
         return RatisDurableTransaction.create(path,home.statuses,data.routed,plan.initial(),plan.registration(),List.of(plan.intent()));
     }
+    @Test void deniedPersistenceWorkspaceDoesNotEncodeRetainedMetadata()throws Exception {
+        helper.root=root;
+        try(var home=helper.new Node("count-home",true);var data=helper.new Node("count-data",false);var pin=data.f.store.captureTracked(helper.scope(data,1,4));
+                var budget=org.mockito.Mockito.spy(new RatisRequestBudget(RemoteMutationOwnerLimits.defaults()))) {
+            var plan=plan(home,data,pin);var homes=org.mockito.Mockito.spy(home.statuses);
+            var retained=new java.util.concurrent.atomic.AtomicReference<CommandResult>();
+            org.mockito.Mockito.doAnswer(call->{var result=org.mockito.Mockito.spy(home.statuses.execute(call.getArgument(0)));retained.set(result);return result;})
+                    .when(homes).execute(org.mockito.ArgumentMatchers.any(RatisRoutedClient.PreparedCommand.class));
+            try(var credit=budget.request(RemoteMutationToken.Kind.RANGE,0);
+                    var journal=RatisDurableTransaction.createAccounted(root.resolve("count.bin"),homes,data.routed,plan.initial(),plan.registration(),List.of(plan.intent()),null,budget,credit)) {
+                org.mockito.Mockito.doThrow(new IllegalStateException("Workspace denied before metadata encoding")).when(budget).work(org.mockito.ArgumentMatchers.anyLong());
+                assertThrows(IOException.class,journal::executeHome);
+                assertNotNull(retained.get());org.mockito.Mockito.verify(retained.get(),org.mockito.Mockito.never()).encode();
+                assertEquals(plan.initial(),home.statuses.read(plan.initial().transactionId()));
+            }
+        }
+    }
     @Test void lostRegistrationPrepareAndFinalizeRepliesRecoverFromExactForcedRequestsAndNativeProofs() throws Exception {
         helper.root=root;
         try (var home=helper.new Node("home",true); var data=helper.new Node("data",false); var pin=data.f.store.captureTracked(helper.scope(data,1,4))) {
