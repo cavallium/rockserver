@@ -31,12 +31,12 @@ class RatisRocksDBBatchesTest {
             });
             session=RatisDurableSessionClient.create(window,routed,ledger,grant,RatisSessionClient.Limits.defaults()); batches=open(session);
         }
-        RatisRocksDBBatches open(RatisDurableSessionClient selected)throws IOException{return openShared(f.schema,routed,selected,f.scheduler,journal,budget);}
+        RatisRocksDBBatches open(RatisDurableSessionClient selected)throws IOException{return openShared(f.schema,f.directory,routed,selected,f.scheduler,journal,budget);}
         public void close() throws Exception { batches.close(); session.close(); routed.close(); f.close();budget.close(); }
     }
-    static RatisRocksDBBatches openShared(DistributedSchema schema,RatisRoutedClient routed,RatisDurableSessionClient session,it.cavallium.rockserver.core.impl.RWScheduler scheduler,Path journal,RatisRequestBudget budget)throws IOException {
+    static RatisRocksDBBatches openShared(DistributedSchema schema,RangeDirectory directory,RatisRoutedClient routed,RatisDurableSessionClient session,it.cavallium.rockserver.core.impl.RWScheduler scheduler,Path journal,RatisRequestBudget budget)throws IOException {
         var owner=budget.owner(RemoteMutationToken.Kind.BULK,RangeDirectoryCodec.encodedSize(routed.directory(schema)),RatisRequestBudget.files(journal,journal.resolveSibling(journal.getFileName()+".pending")));
-        try{return new RatisRocksDBBatches(schema,routed,session,scheduler,journal,RatisRocksDBBatches.SessionOwnership.BORROWED,budget,owner);}catch(IOException|RuntimeException|Error failure){owner.close();throw failure;}
+        try{return new RatisRocksDBBatches(schema,directory,routed,session,scheduler,journal,RatisRocksDBBatches.SessionOwnership.BORROWED,budget,owner);}catch(IOException|RuntimeException|Error failure){owner.close();throw failure;}
     }
     static Publisher<KVBatch> one(KVBatch batch) {
         return subscriber -> subscriber.onSubscribe(new Subscription() {
@@ -149,12 +149,12 @@ class RatisRocksDBBatchesTest {
                 public CommandResult command(RangeDescriptor route,DistributedCommand command) throws IOException { writes.add(command); try { var result=CommandResult.decode(store.apply(new ApplyPosition(1,position.incrementAndGet()),command)); if(lose.getAndSet(false)) throw new IOException("Lost merged native chunk reply"); return result; } catch(org.rocksdb.RocksDBException failure) { throw new IOException(failure); } }
             })) {
                 var window=root.resolve("merge-window.bin"); var journal=root.resolve("merge-bulk.bin"); var owner=UUID.randomUUID(); var request=UUID.randomUUID(); RemoteMutationToken token; var batch=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.member(10,"a"),RatisAtomicClientTest.member(10,"b"),RatisAtomicClientTest.member(10,"a")),List.of(RatisAtomicClientTest.value(1),RatisAtomicClientTest.value(9),it.cavallium.buffer.Buf.wrap(new byte[]{2,3})));
-                try(var session=RatisDurableSessionClient.create(window,routed,ledger,grant,RatisSessionClient.Limits.defaults()); var batches=openShared(schema,routed,session,scheduler,journal,budget)) {
+                try(var session=RatisDurableSessionClient.create(window,routed,ledger,grant,RatisSessionClient.Limits.defaults()); var batches=openShared(schema,directory,routed,session,scheduler,journal,budget)) {
                     token=batches.prepare(batches.owner(),request,0,1,true); assertEquals(0,writes.size());
                     var observer=batches.append(token,0,batch,RemoteMutationInputs.batch(1,true,batch),RequestContext.batch()); assertThrows(ExecutionException.class,() -> observer.get(10,TimeUnit.SECONDS)); batches.actualCompletion(observer).get(10,TimeUnit.SECONDS);
                     assertEquals(1,writes.size()); assertEquals(3,writes.getFirst().mutations().size()); assertTrue(writes.getFirst().mutations().stream().allMatch(m -> m.kind()==Mutation.Kind.BUCKET_MERGE));
                 }
-                try(var session=RatisDurableSessionClient.reopen(window,routed); var batches=openShared(schema,routed,session,scheduler,journal,budget)) {
+                try(var session=RatisDurableSessionClient.reopen(window,routed); var batches=openShared(schema,directory,routed,session,scheduler,journal,budget)) {
                     var progress=batches.resumeRetained(token,RequestContext.batch()).get(10,TimeUnit.SECONDS); assertEquals(3,progress.acknowledgedMutations()); assertEquals(writes.getFirst().operationId(),writes.getLast().operationId());
                     byte[] raw=routed.read(column,new byte[]{10,0}); var bucket=schema.decodeBucket(column,new byte[]{10,0},raw); assertArrayEquals(new byte[]{1,2,3},bucket.get(List.of("a".getBytes()))); assertArrayEquals(new byte[]{9},bucket.get(List.of("b".getBytes()))); int count=writes.size(); batches.append(token,0,batch,RemoteMutationInputs.batch(1,true,batch),RequestContext.batch()).get(10,TimeUnit.SECONDS); assertEquals(count,writes.size());
                     var tiny=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.member(10,"a")),List.of(RatisAtomicClientTest.value(4)));byte[] tinyDigest=RemoteMutationInputs.batch(1,true,tiny);
@@ -162,7 +162,7 @@ class RatisRocksDBBatchesTest {
                     var expired=assertThrows(ExecutionException.class,()->batches.append(token,0,batch,RemoteMutationInputs.batch(1,true,batch),RequestContext.batch()).get(10,TimeUnit.SECONDS));assertInstanceOf(RatisBulkInputExpiredException.class,expired.getCause());assertEquals(RemoteMutationStatus.State.PENDING,batches.status(token).state());assertEquals(0,batches.owner().nextRequestSequence());
                     int applied=writes.size();batches.append(token,4100,tiny,tinyDigest,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(applied,writes.size());
                 }
-                try(var session=RatisDurableSessionClient.reopen(window,routed);var batches=openShared(schema,routed,session,scheduler,journal,budget)){
+                try(var session=RatisDurableSessionClient.reopen(window,routed);var batches=openShared(schema,directory,routed,session,scheduler,journal,budget)){
                     var tiny=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.member(10,"a")),List.of(RatisAtomicClientTest.value(4)));byte[] digest=RemoteMutationInputs.batch(1,true,tiny);int applied=writes.size();batches.append(token,4100,tiny,digest,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(applied,writes.size());batches.append(token,4101,tiny,digest,RequestContext.batch()).get(10,TimeUnit.SECONDS);
                     var expected=new byte[4104];expected[0]=1;expected[1]=2;expected[2]=3;Arrays.fill(expected,3,expected.length,(byte)4);assertArrayEquals(expected,schema.decodeBucket(column,new byte[]{10,0},routed.read(column,new byte[]{10,0})).get(List.of("a".getBytes())));
                     batches.finishInput(token,RequestContext.batch()).get(10,TimeUnit.SECONDS);batches.acknowledgeResult(token,batches.status(token).resultDigest());

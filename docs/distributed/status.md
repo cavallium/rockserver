@@ -11,7 +11,7 @@ The full target remains [architecture.md](architecture.md), with the identified
 consumer behavior in [consumer-contracts.md](consumer-contracts.md). This checkpoint
 does not establish complete distributed API parity or production acceptance.
 
-## Current acceptance (2026-10-14)
+## Current acceptance (2026-10-15)
 
 Earlier checkpoints below retain the limitations known at their validation time.
 This section and the remaining gates at the end describe the current branch.
@@ -1606,6 +1606,17 @@ deadlines still stop discovery; if no owner is usable, the original failures are
 reported. Eight renewal and two pipeline cases pass
 (`point-renewal-slot-isolation-fixed-gate.log`). Shared envelope integration for
 bulk/range actors remains unfinished in the separate SDK resource worktree.
+A controlled native split now passes full connection close/reopen with the latest
+activated directory, exact old/new token lookup, another native write and no extra
+historical grants. The original forced generation binding is preserved; known
+schema authority still qualifies recovery, and future or same-generation divergent
+placements reject. Changing the saved directory while keeping a valid checksum
+also rejects against the original actor roots before issuance. BULK construction
+now takes its explicit frozen generation directory, preserving receipt authority
+on cold reopen. Five focused cold-connection/reroute/BULK cases pass
+(`topology-connection-cold-fixed-second.log`). These controlled checks do not
+establish independent listener/quorum or actual HOME-relocation acceptance.
+
 
 Node-owned physical discovery now returns bounded qualified targets and actual
 per-CF scalar/comparator observations, without synthesizing a logical estimate

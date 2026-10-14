@@ -82,7 +82,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
                 bulkSession=sessions.open(Files.createDirectories(root.resolve("bulk-session")),schema,bulkBindings.freeze());bulkOwner=bulkSession;
                 for(var actor:points.all())if(actor.owner().ownerId().equals(bulkSession.grant().sessionId()) && actor.owner().ownerEpoch()==bulkSession.grant().epoch())throw new IOException("Point and bulk sessions require distinct exclusively owned grants");
                 bulkSession.installReroutes(root.resolve("bulk-reroutes"),schema,epochs,routed,transactionHomes,scheduler,directories,acknowledgementDirectories);
-                batches=new RatisRocksDBBatches(schema,routed,bulkSession,scheduler,root.resolve("bulk"),RatisRocksDBBatches.SessionOwnership.OWNED,budget,bulkCredit); bulkSession=null;bulkCredit=null;
+                batches=new RatisRocksDBBatches(schema,directory,routed,bulkSession,scheduler,root.resolve("bulk"),RatisRocksDBBatches.SessionOwnership.OWNED,budget,bulkCredit); bulkSession=null;bulkCredit=null;
                 tx=new RatisTransactionClient(schema,snapshotHomes,transactionHomes,routed,scheduler,RatisTransactionClient.Limits.defaults()); snapshots=new RatisSnapshotClient(schema,snapshotHomes,routed,scheduler,RatisSnapshotClient.Limits.defaults()); ranges=new RatisRocksDBRanges(schema,directory,snapshots,allocations);
                 Path rangeRoot=root.resolve("range-delete");
                 rangeCredit=budget.owner(RemoteMutationToken.Kind.RANGE,4L*(DistributedSchemaCodec.encodedSize(schema)+RangeDirectoryCodec.encodedSize(directory)),RatisRequestBudget.files(rangeRoot.resolve("input"),rangeRoot.resolve("input.pending"),rangeRoot.resolve("atomic"),rangeRoot.resolve("atomic.pending")));

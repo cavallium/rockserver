@@ -22,7 +22,7 @@ class RatisBulkRequestBudgetTest {
             var pending=x.journal.resolveSibling(x.journal.getFileName()+".pending");java.nio.file.Files.createDirectory(pending);assertThrows(java.io.IOException.class,()->x.batches.acknowledgeResult(token,x.batches.status(token).resultDigest()));assertTrue(java.nio.file.Files.isRegularFile(x.journal));x.batches.close();x.session.close();java.nio.file.Files.delete(pending);
             long opening=RatisRequestBudget.files(x.journal);var owner=x.budget.owner(RemoteMutationToken.Kind.BULK,RangeDirectoryCodec.encodedSize(x.routed.directory(x.f.schema)),opening);owner.requireOpening(opening);long room=Math.max(0,cleanup-6*opening)+(128L<<10);assertTrue(room<6*encoded,"The old second encoding reservation cannot fit");
             try(owner;var session=RatisDurableSessionClient.reopen(x.window,x.routed);var competing=x.budget.request(RemoteMutationToken.Kind.POINT,x.budget.limits().maximumBytes()-x.budget.chargedBytes()-room);
-                    var reopened=new RatisRocksDBBatches(x.f.schema,x.routed,session,x.f.scheduler,x.journal,RatisRocksDBBatches.SessionOwnership.BORROWED,x.budget,owner)){
+                    var reopened=new RatisRocksDBBatches(x.f.schema,x.f.directory,x.routed,session,x.f.scheduler,x.journal,RatisRocksDBBatches.SessionOwnership.BORROWED,x.budget,owner)){
                 assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,reopened.status(token).state());assertEquals(0,x.budget.retainedRequests(RemoteMutationToken.Kind.BULK));assertFalse(java.nio.file.Files.exists(x.journal));
             }
         }

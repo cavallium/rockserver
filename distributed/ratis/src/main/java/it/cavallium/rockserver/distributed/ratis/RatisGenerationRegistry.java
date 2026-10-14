@@ -26,7 +26,11 @@ final class RatisGenerationRegistry implements AutoCloseable {
             for (var folder:files) {
                 if (!Files.isDirectory(folder,LinkOption.NOFOLLOW_LINKS)) throw new IOException("Unexpected connection generation entry");
                 var in=ByteBuffer.wrap(SessionJournalFiles.read(folder.resolve("binding"),8*1024*1024)); var schema=DistributedSchemaCodec.decode(blob(in,DistributedSchemaCodec.MAX_BYTES)); var directory=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES)); if (in.hasRemaining() || !folder.getFileName().toString().equals(key(schema))) throw new IOException("Invalid generation binding");
-                schema.requireMatches(directory); var data=data(schema.domainId());data.requireKnownSchema(schema); if (!Arrays.equals(data.directory(schema).payloadDigest(),directory.payloadDigest())) throw new IOException("Original generation placement changed"); add(schema,directory,folder,false);
+                schema.requireMatches(directory);var data=data(schema.domainId());data.requireKnownSchema(schema);var qualified=data.directory(schema);
+                // Only this exclusively owned, forced generation binding restores historical placement.
+                // Its actors separately cross-check their immutable root bindings; no route is published or retargeted here.
+                if(directory.generation()>qualified.generation() || directory.generation()==qualified.generation() && !Arrays.equals(directory.payloadDigest(),qualified.payloadDigest()))throw new IOException("Original generation placement is not qualified by current schema authority");
+                add(schema,directory,folder,false);
             }
         }
         for(var domain:routed.keySet())current(domain);validateColumns();
