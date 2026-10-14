@@ -173,6 +173,22 @@ This section and the remaining gates at the end describe the current branch.
   assertion failure; it is not a full-suite pass. This is the replacement
   primitive only: explicit writer credit, prepaid completion slots, the ledger
   control-memory envelope and final JNI integration remain unwired.
+- Native checkpoint `bc768db` explicitly charges WAL, MANIFEST and SST writer
+  buffers before allocation and retains their credit until actual deallocation.
+  USER admission funds the next WAL; asynchronous precreation owns that slot
+  before scheduling and returns failed slots after destroying their writers.
+  MANIFEST rotation has two prepaid writer slots; SST buffers use their selected
+  source workspace. Future workspace includes the writer's overlap with the plan
+  and uncached verification reader. Ordinary policy-absent writers retain their
+  existing behavior. All 155 selected Debug cases pass: 32 planner, ten writer/
+  aligned-buffer, ten workspace, 35 raw, 36 XFS completion and 32 XFS extent.
+  The full-capacity planner workflow now verifies three multi-CF flush cycles,
+  actual async WAL hits, MANIFEST replacement and cold reopen in normal atomic
+  and supported pipelined modes. Evidence is `writer-credit-*-gate.log` in the
+  native output directory. Three reader fixtures now allow writer setup before
+  exhausting their actual remaining budget; refusal and range limits remain.
+  Ledger candidate/validation/encoding storage, post-force authority allocations,
+  full node bounds and final private JNI/wrapper integration remain open.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
