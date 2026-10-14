@@ -162,6 +162,17 @@ This section and the remaining gates at the end describe the current branch.
   two simultaneous retained WAL owners, plus precreation/replacement and MANIFEST
   rotation. The buffer fix must fund ordinary retained owners and preserve
   next-WAL/two-MANIFEST completion capacity through actual buffer destruction.
+- Native checkpoint `0f59863` adds copy-preserving status-based aligned-buffer
+  replacement. It validates capacity rounding, allocation overflow and copy
+  bounds before allocation; allocator refusal, invalid results and allocation
+  exceptions preserve the original buffer. New storage is copied before the
+  old owner releases it. Ordinary void allocation remains unchanged.
+  Thirty-nine selected reader/writer cases pass (`aligned-replacement-focused`
+  and `aligned-replacement-writer-consumer` logs). The full reader/writer run
+  hit its 60-second cap in parameterized readahead cases without a recorded
+  assertion failure; it is not a full-suite pass. This is the replacement
+  primitive only: explicit writer credit, prepaid completion slots, the ledger
+  control-memory envelope and final JNI integration remain unwired.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
