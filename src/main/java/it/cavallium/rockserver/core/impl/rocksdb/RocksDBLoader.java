@@ -648,7 +648,7 @@ public class RocksDBLoader {
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger,
             @Nullable MeterRegistry meterRegistry, @Nullable String databaseName,
             Set<String> extraInternalColumns) {
-        return load(path,config,logger,meterRegistry,databaseName,extraInternalColumns,null,null);
+        return load(path,config,logger,meterRegistry,databaseName,extraInternalColumns,null,null,null);
     }
     public record ColumnFamilyInventoryLimits(int maximumCount, int maximumNameBytes, long maximumTotalNameBytes) {
         public ColumnFamilyInventoryLimits {
@@ -660,7 +660,7 @@ public class RocksDBLoader {
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger,
             @Nullable MeterRegistry meterRegistry, @Nullable String databaseName,
             Set<String> extraInternalColumns, OperatorResolver resolver,
-            @Nullable ColumnFamilyInventoryLimits inventoryLimits) {
+            @Nullable ColumnFamilyInventoryLimits inventoryLimits, @Nullable NativeExtentEnv nativeEnv) {
         extraInternalColumns = Set.copyOf(extraInternalColumns);
         for (String name : extraInternalColumns) {
             if (name.isEmpty() || name.indexOf('\0') >= 0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name)) {
@@ -681,8 +681,9 @@ public class RocksDBLoader {
                 }
             }
             var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
+            if (nativeEnv != null) configureNativeExtentOptions(optionsWithCache.options(), nativeEnv, refs, logger);
             return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger,
-                    meterRegistry, databaseName, extraInternalColumns, resolver, inventoryLimits);
+                    meterRegistry, databaseName, extraInternalColumns, resolver, inventoryLimits, nativeEnv);
         } catch (RuntimeException | Error failure) {
             try {
                 refs.close();
@@ -1022,12 +1023,70 @@ public class RocksDBLoader {
         try { getWalDir(path.toAbsolutePath(),config).map(Path::toString).ifPresent(options::setWalDir); return options; }
         catch(GestaltException|RuntimeException failure) { options.close(); throw new IOException("Cannot resolve read-only native paths",failure); }
     }
-    static ColumnFamilyOptions readOnlyColumnOptions(String name,Path path,DatabaseConfig config,RocksDBObjects refs) throws IOException {
+    static DBOptions readOnlyOptions(Path path, DatabaseConfig config, NativeExtentEnv env,
+            RocksDBObjects refs, Logger logger) throws IOException {
+        var options = readOnlyOptions(path, config);
+        try {
+            if (env != null) configureNativeExtentOptions(options, env, refs, logger);
+            return options;
+        } catch (RuntimeException | Error failure) { options.close(); throw failure; }
+    }
+    private static void configureNativeExtentOptions(DBOptions options, NativeExtentEnv env,
+            RocksDBObjects refs, Logger logger) {
+        var callback = new org.rocksdb.Logger(InfoLogLevel.WARN_LEVEL) {
+            @Override protected void log(InfoLogLevel level, String message) {
+                switch (level) {
+                    case ERROR_LEVEL, FATAL_LEVEL -> logger.error("{}", message);
+                    case WARN_LEVEL -> logger.warn("{}", message);
+                    default -> logger.debug("{}", message);
+                }
+            }
+        };
+        // Reverse cleanup closes every native Options owner before its callback.
+        refs.addFirst(callback);
+        options.setEnv(env).setLogger(callback).setAllowMmapReads(false).setAllowMmapWrites(false)
+                .setUseDirectReads(false).setUseDirectIoForFlushAndCompaction(false);
+        if (!options.walDir().isEmpty()) options.setWalDir(Path.of(options.walDir()).toAbsolutePath().normalize().toString());
+        if (!options.dbLogDir().isEmpty()) options.setDbLogDir(Path.of(options.dbLogDir()).toAbsolutePath().normalize().toString());
+    }
+    static void configureNativeExtentColumnOptions(String name, ColumnFamilyOptions options,
+            Path path, GlobalDatabaseConfig global) {
+        try {
+            FallbackColumnConfig selected = global.fallbackColumnOptions();
+            if (!name.equals(DistributedStoragePool.STATE_COLUMN) && !name.equals(DistributedStoragePool.RECEIPTS_COLUMN)) {
+                for (var candidate : global.columnOptions()) if (candidate.name().equals(name)) { selected = candidate; break; }
+            }
+            options.setCfPaths(mapList(getVolumeConfigs(path.toAbsolutePath().normalize(), selected),
+                    p -> new DbPath(p.path().toAbsolutePath().normalize(), p.targetSize())));
+        } catch (GestaltException failure) {
+            throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                    "Cannot resolve managed native CF paths", failure);
+        }
+    }
+
+    /** Exact native path resolution, including directories that the managed Env cannot create. */
+    public static List<Path> nativeExtentDirectories(Path path, DatabaseConfig config) throws IOException {
+        Path absolute = path.toAbsolutePath().normalize();
+        var directories = new LinkedHashSet<Path>();
+        directories.add(absolute);
+        try {
+            var global = config.global();
+            var wal = getWalDir(absolute, config).orElse(absolute).toAbsolutePath().normalize();
+            directories.add(wal);
+            if (resolveWalTtlSeconds(global) > 0 || resolveWalSizeLimitMb(global) > 0) directories.add(wal.resolve("archive"));
+            getLogPath(absolute, config).map(p -> p.toAbsolutePath().normalize()).ifPresent(directories::add);
+            for (var volume : getVolumeConfigs(absolute, global.fallbackColumnOptions())) directories.add(volume.path().toAbsolutePath().normalize());
+            for (var column : global.columnOptions()) for (var volume : getVolumeConfigs(absolute, column)) directories.add(volume.path().toAbsolutePath().normalize());
+            return List.copyOf(directories);
+        } catch (GestaltException failure) { throw new IOException("Cannot resolve native extent directories", failure); }
+    }
+    static ColumnFamilyOptions readOnlyColumnOptions(String name,Path path,DatabaseConfig config,RocksDBObjects refs,NativeExtentEnv env) throws IOException {
         try {
             var global=config.global(); FallbackColumnConfig selected=global.fallbackColumnOptions();
             if(!name.equals(DistributedStoragePool.STATE_COLUMN) && !name.equals(DistributedStoragePool.RECEIPTS_COLUMN)) for(var candidate:global.columnOptions()) if(candidate.name().equals(name)) { selected=candidate; break; }
             var options=getCompatibilityColumnOptions(refs);
             options.setCfPaths(mapList(getVolumeConfigs(path.toAbsolutePath(),selected),p -> new DbPath(p.path(),p.targetSize())));
+            if (env != null) configureNativeExtentColumnOptions(name,options,path,global);
             return options;
         } catch(GestaltException failure) { throw new IOException("Cannot resolve read-only CF paths",failure); }
     }
@@ -1065,7 +1124,7 @@ public class RocksDBLoader {
         @NotNull Path definitiveDbPath,
         DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger,
         @Nullable MeterRegistry meterRegistry, @Nullable String databaseName, Set<String> extraInternalColumns, OperatorResolver resolver,
-        @Nullable ColumnFamilyInventoryLimits inventoryLimits) {
+        @Nullable ColumnFamilyInventoryLimits inventoryLimits, @Nullable NativeExtentEnv nativeEnv) {
         var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
         Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
@@ -1111,6 +1170,7 @@ public class RocksDBLoader {
                   }
                 }) {
                     options.setCreateIfMissing(true);
+                    if (nativeEnv != null) options.setEnv(nativeEnv);
                     List<byte[]> names;
                     if (inventoryLimits == null) {
                         names = RocksDB.listColumnFamilies(options, path.toString());
@@ -1157,6 +1217,7 @@ public class RocksDBLoader {
                         ? new ColumnOptionsWithMerge(getCompatibilityColumnOptions(refs, path, definitiveDbPath, databaseOptions), null)
                         : getColumnOptions(name, path, definitiveDbPath, databaseOptions.global(),
                                 logger, refs, path == null, optionsWithCache.caches(), resolver);
+                if (nativeEnv != null) configureNativeExtentColumnOptions(name, columnFamilyOptions.options(), definitiveDbPath, databaseOptions.global());
 
                 // Create base directories
                 List<DbPathRecord> volumeConfigs = getVolumeConfigs(definitiveDbPath, entry.getValue());

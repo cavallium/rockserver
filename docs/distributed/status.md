@@ -29,6 +29,15 @@ This section and the remaining gates at the end describe the current branch.
   `/tmp/rockserver-233-main-lost-current-repair-gate.log`.
   Native Env ownership and ordinary allocation admission are qualified at the
   JNI boundary; shared node wiring and protected completion remain pending.
+- The core pool owner now borrows one NativeExtentEnv for writable options,
+  preflight/read-only opens and both bounded listings. Native Logger callbacks
+  remain owned through Options cleanup; qualified paths are canonical and use
+  supported buffered I/O. One actual two-pool fixture passes writes, flush,
+  native SST export and cold reopen. Qualified bootstrap rejects foreign files
+  throughout its configured directory forest before writing operator authority.
+  All 19 core pool/WAL/close cases pass in
+  `/tmp/rockserver-native-env-node-integrated-gate.log`. Node lifecycle acceptance
+  is still pending its new fixtures and one existing lifecycle timeout.
 
 - The aggregate common connection routes the complete database domain roster,
   retains schema generations and uses durable point/bulk grants and rotating

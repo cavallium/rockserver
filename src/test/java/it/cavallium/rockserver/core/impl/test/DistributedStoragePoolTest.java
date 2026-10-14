@@ -82,7 +82,7 @@ class DistributedStoragePoolTest {
         }
         var failure = assertThrows(RuntimeException.class, () -> RocksDBLoader.load(path,
                 ConfigParser.parseDefault(), LoggerFactory.getLogger(getClass()), null, null, Set.of(), null,
-                new RocksDBLoader.ColumnFamilyInventoryLimits(1, 4096, 8 * 1024 * 1024)));
+                new RocksDBLoader.ColumnFamilyInventoryLimits(1, 4096, 8 * 1024 * 1024), null));
         assertTrue(failure.getMessage().contains("maxCount") ||
                 failure.getCause() != null && failure.getCause().getMessage().contains("maxCount"));
         try (var options = new org.rocksdb.Options()) {
@@ -107,6 +107,86 @@ class DistributedStoragePoolTest {
         assertTrue(failure.getCause().getMessage().contains("lacks CURRENT"), failure::toString);
         assertFalse(Files.exists(current));
         assertArrayEquals(retained, Files.readAllBytes(manifest));
+    }
+
+    @Test void borrowedNativeEnvOwnsTwoPoolsAndExportThroughColdReopen() throws Exception {
+        var config = parse("""
+                database.global: {
+                  wal-path: "wal"
+                  fallback-column-options: {
+                    write-buffer-size: "64KiB"
+                    volumes: [{volume-path: "data", target-size: "1GiB"}]
+                  }
+                }
+                """);
+        Path first = directory.resolve("managed-first"), second = directory.resolve("managed-second");
+        Path exports = Files.createDirectory(directory.resolve("managed-exports"));
+        for (var path : List.of(first, second)) for (var nativePath : RocksDBLoader.nativeExtentDirectories(path, config)) Files.createDirectories(nativePath);
+        var limits = new org.rocksdb.NativeExtentEnv.Limits(1L << 30, 256L << 20, 1L << 30, 256L << 20,
+                64L << 10, 1024, 2048, 8L << 20);
+        String journal = directory.resolve("managed-extent-journal").toString();
+        var roots = List.of(first.toString(), second.toString(), exports.toString());
+        UUID firstGroup = UUID.randomUUID(), secondGroup = UUID.randomUUID();
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try (var env = new org.rocksdb.NativeExtentEnv(journal, roots, limits);
+                 var a = DistributedStoragePool.open(first, config, LoggerFactory.getLogger(getClass()), null, null, Map.of(), env);
+                 var b = DistributedStoragePool.open(second, config, LoggerFactory.getLogger(getClass()), null, null, Map.of(), env)) {
+                assertFalse(loaded(a).dbOptions().useDirectIoForFlushAndCompaction());
+                assertFalse(loaded(b).dbOptions().allowMmapWrites());
+                var left = range(a, firstGroup, null, null);
+                var right = range(b, secondGroup, null, null);
+                if (attempt == 0) {
+                    left.apply(new ApplyPosition(1, 0), put(firstGroup, new byte[]{1}, new byte[]{11}), new byte[0]);
+                    right.apply(new ApplyPosition(1, 0), put(secondGroup, new byte[]{2}, new byte[]{22}), new byte[0]);
+                    try (var flush = new org.rocksdb.FlushOptions().setWaitForFlush(true)) {
+                        loaded(a).db().get().flush(flush);
+                        loaded(b).db().get().flush(flush);
+                    }
+                    try (var pin = left.capture(new TransactionScope(List.of(TransactionScope.Span.range(COLUMN, null, null))))) {
+                        var manifest = a.exportSst(exports.resolve("owned.sst"), pin, COLUMN, null, null,
+                                new NativeRangeSstExport.Limits(10, 1024, 1024 * 1024, Duration.ofSeconds(10)));
+                        assertEquals(1, manifest.rows());
+                    }
+                }
+                try (var pin = left.capture()) { assertArrayEquals(new byte[]{11}, pin.get(COLUMN, new byte[]{1})); }
+                try (var pin = right.capture()) { assertArrayEquals(new byte[]{22}, pin.get(COLUMN, new byte[]{2})); }
+            }
+        }
+        assertTrue(Files.size(exports.resolve("owned.sst")) > 0);
+    }
+
+    @Test void qualifiedBootstrapRefusesForeignFilesAcrossExternalConfiguredRoots() throws Exception {
+        Path poolPath = directory.resolve("external-bootstrap");
+        Path wal = directory.resolve("external-wal"), data = directory.resolve("external-data");
+        var config = parse("""
+                database.global: {
+                  wal-path: "%s"
+                  fallback-column-options.volumes: [{volume-path: "%s", target-size: "1GiB"}]
+                }
+                """.formatted(wal, data));
+        for (var path : RocksDBLoader.nativeExtentDirectories(poolPath, config)) Files.createDirectories(path);
+        var limits = new org.rocksdb.NativeExtentEnv.Limits(1L << 30, 256L << 20, 1L << 30, 256L << 20,
+                64L << 10, 1024, 2048, 8L << 20);
+        var schema = new it.cavallium.rockserver.core.common.distributed.DistributedSchema(
+                UUID.randomUUID(), UUID.randomUUID(), DOMAIN, 0, 0, List.of());
+        try (var env = new org.rocksdb.NativeExtentEnv(directory.resolve("external-extent-journal").toString(),
+                List.of(poolPath.toString(), wal.toString(), data.toString()), limits)) {
+            for (var root : List.of(wal, data)) {
+                Path foreign = Files.write(root.resolve("foreign.sst"), new byte[]{1});
+                try {
+                    var failure = assertThrows(IllegalStateException.class, () -> DistributedStoragePool.open(
+                            poolPath, config, LoggerFactory.getLogger(getClass()), List.of(schema), Map.of(), Map.of(), env));
+                    assertTrue(failure.getCause().getMessage().contains("Unidentified native bootstrap entry"));
+                    assertFalse(Files.exists(poolPath.resolveSibling(poolPath.getFileName() + ".operators")));
+                    assertFalse(Files.exists(poolPath.resolve("CURRENT")));
+                    assertArrayEquals(new byte[]{1}, Files.readAllBytes(foreign));
+                } finally { Files.delete(foreign); }
+            }
+            try (var pool = DistributedStoragePool.open(poolPath, config, LoggerFactory.getLogger(getClass()),
+                    List.of(schema), Map.of(), Map.of(), env)) {
+                assertTrue(loaded(pool).db().get().isOwningHandle());
+            }
+        }
     }
 
     @Test void disjointRangesShareOneDatabaseAndPhysicalFamiliesAndReopen() throws Exception {

@@ -367,7 +367,8 @@ public final class DistributedStoragePool implements AutoCloseable {
         PreparedColumn(String name) { this(name,artifacts.qualified() ? artifacts::resolve : null); }
         PreparedColumn(String name,RocksDBLoader.OperatorResolver resolver) {
             this.name=name;
-            try { options=RocksDBLoader.getColumnOptions(name,loaded.path(),loaded.definitiveDbPath(),globalConfig,logger,resources,false,loaded.caches(),resolver); }
+            try { options=RocksDBLoader.getColumnOptions(name,loaded.path(),loaded.definitiveDbPath(),globalConfig,logger,resources,false,loaded.caches(),resolver);
+                if (loaded.dbOptions().getEnv() instanceof org.rocksdb.NativeExtentEnv) RocksDBLoader.configureNativeExtentColumnOptions(name,options.options(),loaded.definitiveDbPath(),globalConfig); }
             catch(RuntimeException|Error failure) { resources.close(); throw failure; }
         }
         @Override public void close() { if(!adopted) resources.close(); }
@@ -401,20 +402,25 @@ public final class DistributedStoragePool implements AutoCloseable {
         } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot recover native CF births",failure); }
     }
     /** Reads forced metadata, including WAL, without installing user callbacks or enabling native writes. */
-    private static void preflightNativeBindings(Path path,DatabaseConfig config,DistributedOperatorArtifacts artifacts) throws IOException,RocksDBException {
+    private static void preflightNativeBindings(Path path,DatabaseConfig config,DistributedOperatorArtifacts artifacts,
+            org.rocksdb.NativeExtentEnv env, Logger logger) throws IOException,RocksDBException {
         org.rocksdb.RocksDB.loadLibrary();
         List<byte[]> names; try(var listing=new org.rocksdb.Options()) {
+            if (env != null) listing.setEnv(env);
             names=org.rocksdb.RocksDB.listColumnFamiliesBounded(listing,path.toString(),
                     INVENTORY_LIMITS.maximumCount(),INVENTORY_LIMITS.maximumNameBytes(),INVENTORY_LIMITS.maximumTotalNameBytes());
         }
         boolean hasState=names.stream().anyMatch(name -> Arrays.equals(name,STATE_COLUMN.getBytes(StandardCharsets.US_ASCII)));
         if(!hasState) { if(artifacts.qualified()) throw new IOException("Qualified native pool lacks STATE"); return; }
-        try(var refs=new RocksDBObjects(); var dbOptions=RocksDBLoader.readOnlyOptions(path,config)) {
+        try(var refs=new RocksDBObjects(); var dbOptions=RocksDBLoader.readOnlyOptions(path,config,env,refs,logger)) {
             dbOptions.setWalRecoveryMode(org.rocksdb.WALRecoveryMode.AbsoluteConsistency);
             var descriptors=new ArrayList<ColumnFamilyDescriptor>(); var nativeHandles=new ArrayList<ColumnFamilyHandle>();
             // Read-only subsets replay only the opened metadata families, avoiding USER MERGE callbacks.
             // The complete on-disk listing still drives exact live-CF birth/operator coverage below.
-            for(var name:names){String physical=new String(name,StandardCharsets.US_ASCII);if(physical.equals("default") || physical.equals(STATE_COLUMN))descriptors.add(new ColumnFamilyDescriptor(name,RocksDBLoader.readOnlyColumnOptions(physical,path,config,refs)));}
+            for(var name:names){String physical=new String(name,StandardCharsets.US_ASCII);if(physical.equals("default") || physical.equals(STATE_COLUMN)) {
+                var options=RocksDBLoader.readOnlyColumnOptions(physical,path,config,refs,env);
+                descriptors.add(new ColumnFamilyDescriptor(name,options));
+            }}
             try(var db=org.rocksdb.RocksDB.openReadOnly(dbOptions,path.toString(),descriptors,nativeHandles)) {
                 try {
                     ColumnFamilyHandle state=null; for(var handle:nativeHandles) if(Arrays.equals(handle.getName(),STATE_COLUMN.getBytes(StandardCharsets.US_ASCII))) state=handle;
@@ -790,6 +796,11 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     public static DistributedStoragePool open(Path persistentPath, DatabaseConfig config, Logger logger,
             java.util.Collection<DistributedSchema> bootstrapSchemas,Map<UUID,String> bootstrapPhysicalColumns,Map<UUID,String> nonDATAPlainBindings) {
+        return open(persistentPath, config, logger, bootstrapSchemas, bootstrapPhysicalColumns, nonDATAPlainBindings, null);
+    }
+    public static DistributedStoragePool open(Path persistentPath, DatabaseConfig config, Logger logger,
+            java.util.Collection<DistributedSchema> bootstrapSchemas,Map<UUID,String> bootstrapPhysicalColumns,
+            Map<UUID,String> nonDATAPlainBindings, org.rocksdb.NativeExtentEnv env) {
         Objects.requireNonNull(persistentPath, "persistentPath");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(logger, "logger");
@@ -809,22 +820,44 @@ public final class DistributedStoragePool implements AutoCloseable {
         try {
             artifacts=new DistributedOperatorArtifacts(persistentPath);
             if(bootstrapSchemas!=null && !Files.exists(persistentPath.resolve("CURRENT"))) {
-                if(Files.exists(persistentPath)) {
+                if (env != null) requireEmptyNativeBootstrap(persistentPath, config);
+                else if(Files.exists(persistentPath)) {
                     if(!Files.isDirectory(persistentPath)) throw new IOException("Native pool path is not a directory");
                     try(var entries=Files.newDirectoryStream(persistentPath)) { if(entries.iterator().hasNext()) throw new IOException("Unidentified nonempty native pool cannot authorize bootstrap"); }
                 }
                 artifacts.qualifyBootstrap(List.copyOf(bootstrapSchemas),Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),true);
             }
             if(bootstrapSchemas!=null && Files.exists(persistentPath.resolve("CURRENT"))) artifacts.qualifyBootstrap(List.copyOf(bootstrapSchemas),Objects.requireNonNull(bootstrapPhysicalColumns),Objects.requireNonNull(nonDATAPlainBindings),false);
-            if(Files.exists(persistentPath.resolve("CURRENT"))) preflightNativeBindings(persistentPath,config,artifacts);
+            if(Files.exists(persistentPath.resolve("CURRENT"))) preflightNativeBindings(persistentPath,config,artifacts,env,logger);
         } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot qualify native operator bindings",failure); }
         RocksDBLoader.OperatorResolver resolver=artifacts.qualified() ? name -> RESERVED_COLUMNS.contains(name) ? null : artifacts.resolve(name) : null;
-        var nativeLoaded=RocksDBLoader.load(persistentPath,config,logger,null,null,INTERNAL_COLUMNS,resolver,INVENTORY_LIMITS);
+        var nativeLoaded=RocksDBLoader.load(persistentPath,config,logger,null,null,INTERNAL_COLUMNS,resolver,INVENTORY_LIMITS,env);
         try { return new DistributedStoragePool(nativeLoaded,globalConfig,logger,artifacts); }
         catch(RuntimeException|Error failure) {
             try { nativeLoaded.db().close(); } catch(Exception cleanup) { failure.addSuppressed(cleanup); }
             if(!nativeLoaded.db().get().isOwningHandle()) try { nativeLoaded.refs().close(); } catch(RuntimeException cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
+        }
+    }
+
+    private static void requireEmptyNativeBootstrap(Path path, DatabaseConfig config) throws IOException {
+        var declared = RocksDBLoader.nativeExtentDirectories(path, config);
+        var forest = declared.stream().filter(directory -> declared.stream()
+                .noneMatch(parent -> !parent.equals(directory) && directory.startsWith(parent))).toList();
+        var allowed = new HashSet<Path>();
+        for (var directory : declared) for (var root : forest) if (directory.startsWith(root)) {
+            for (var parent = directory; parent != null && parent.startsWith(root); parent = parent.getParent()) allowed.add(parent);
+        }
+        int count = 0;
+        for (var root : forest) try (var entries = Files.walk(root, 33)) {
+            var iterator = entries.iterator();
+            while (iterator.hasNext()) {
+                var entry = iterator.next();
+                if (++count > 65536 || root.relativize(entry).getNameCount() > 32 || !allowed.contains(entry)
+                        || !Files.isDirectory(entry, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IOException("Unidentified native bootstrap entry");
+                }
+            }
         }
     }
 
