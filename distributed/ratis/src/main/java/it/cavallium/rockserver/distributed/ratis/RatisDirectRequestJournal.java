@@ -50,6 +50,7 @@ final class RatisDirectRequestJournal implements AutoCloseable {
         requireOpen(); if (status!=CommandResult.Status.STALE_SCHEMA || request.pending!=null || request.terminal()) throw new IOException("No-effects rejection requires an unsubmitted remaining item");
         request.unsubmittedStatus=status; persist();
     }
+    static CommandResult.Status terminalOutcome(Request request) {if(!request.terminal())throw new IllegalArgumentException("Direct outcome is not terminal");if(request.unsubmittedStatus!=null)return request.unsubmittedStatus;if(request.overflow)return CommandResult.Status.RESULT_TOO_LARGE;return request.results.isEmpty()?CommandResult.Status.SUCCESS:request.results.getLast().status();}
     static byte[] resultDigest(Request request) { var out=new java.io.ByteArrayOutputStream(); for(var result:request.results)out.writeBytes(result.encode()); out.write(request.overflow?1:0); out.write(request.unsubmittedStatus==null?0:request.unsubmittedStatus.ordinal()+1); return RemoteMutationToken.digest(out.toByteArray()); }
     private void persist() throws IOException { try { SessionJournalFiles.write(path,encode(),MAX_BYTES); } catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Direct journal failed; reopen it",failure); } }
     private byte[] encode() throws IOException {

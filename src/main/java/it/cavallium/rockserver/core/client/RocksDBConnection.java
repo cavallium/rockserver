@@ -23,6 +23,13 @@ public interface RocksDBConnection extends Closeable {
 				"Distributed CDC subscriptions are unavailable through this connection");
 	}
 
+	/** Distributed mutation preparation, recovery and explicit result acknowledgement. */
+	default it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI getRemoteMutationApi() {
+		throw it.cavallium.rockserver.core.common.RocksDBException.of(
+				it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED,
+				"Remote mutation ownership is unavailable through this connection");
+	}
+
 	/** Return the effective backend features and limits supported through this connection. */
 	RockserverCapabilities getCapabilities();
 
