@@ -125,6 +125,7 @@ public final class ThriftConnection extends BaseConnection {
 		return delegate.getCapabilities();
 	}
     @Override public it.cavallium.rockserver.core.common.cdc.DistributedCdcAsyncAPI getDistributedCdcApi() { return delegate.getDistributedCdcApi(); }
+    @Override public it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI getRemoteMutationApi() { return delegate.getRemoteMutationApi(); }
 
 	@Override
 	public void close() throws IOException {
@@ -169,6 +170,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 	private final RockserverCapabilities capabilities;
 	private final AtomicBoolean closed = new AtomicBoolean();
     private ThriftDistributedCdcClient distributedCdc;
+    private ThriftRemoteMutationClient remoteMutations;
 
 	private static it.cavallium.rockserver.core.common.api.RequestContext[] createNoTimeoutWireContexts() {
 		var contexts = new it.cavallium.rockserver.core.common.api.RequestContext[WorkloadProfile.values().length];
@@ -250,6 +252,13 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
         return distributedCdc;
     }
 
+    @Override public synchronized it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI getRemoteMutationApi() {
+        if(capabilities.backendMode()!=RockserverCapabilities.BackendMode.DISTRIBUTED)throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,"Explicit remote mutations require a distributed backend");
+        if(closed.get())throw RocksDBException.of(RocksDBErrorType.NOT_IMPLEMENTED,"Connection closed");
+        if(remoteMutations==null)remoteMutations=new ThriftRemoteMutationClient(host,port,executor,maxFrameSize);
+        return remoteMutations;
+    }
+
 
 	@Override
 	public URI getUrl() {
@@ -262,8 +271,10 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
 			return;
 		}
         final ThriftDistributedCdcClient cdc;
-        synchronized(this) { cdc=distributedCdc; }
+        final ThriftRemoteMutationClient mutations;
+        synchronized(this) { cdc=distributedCdc; mutations=remoteMutations; }
         if(cdc!=null) cdc.close();
+        if(mutations!=null) mutations.close();
 		for (var slot : allClientSlots) {
 			slot.close();
 		}

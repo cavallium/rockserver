@@ -77,6 +77,15 @@ public class ThriftServer extends Server {
         this(client, http2Host, http2Port, maxFrameSize, null);
     }
 
+    private static it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI remoteMutationBackend(RocksDBConnection client) {
+        if(client.getCapabilities().backendMode()!=it.cavallium.rockserver.core.common.RockserverCapabilities.BackendMode.DISTRIBUTED)return null;
+        try{return client.getRemoteMutationApi();}
+        catch(it.cavallium.rockserver.core.common.RocksDBException unavailable){
+            if(unavailable.getErrorUniqueId()!=it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType.NOT_IMPLEMENTED)throw unavailable;
+            return null;
+        }
+    }
+
     public ThriftServer(RocksDBConnection client, String host, int port,
             it.cavallium.rockserver.core.common.export.ExportAsyncAPI exportBackend) throws IOException {
         this(client, host, port, ThriftTransportLimits.configuredServerMaxFrameSize(), exportBackend);
@@ -99,6 +108,8 @@ public class ThriftServer extends Server {
                         new ExportThriftService(exportBackend, validatedMaxFrameSize)));
         processor.registerProcessor(DistributedCdcThriftService.SERVICE_NAME,
                 new DistributedCdcThriftService(client.getCapabilities().withTransportLimit(validatedMaxFrameSize).cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null,validatedMaxFrameSize).boundedProcessor());
+        processor.registerProcessor(RemoteMutationThriftService.SERVICE_NAME,
+                new RemoteMutationThriftService(remoteMutationBackend(client),validatedMaxFrameSize).boundedProcessor());
         try {
             var serverTransport = new ConfiguredNonblockingServerSocket(
 					new InetSocketAddress(http2Host, http2Port),
