@@ -6,6 +6,7 @@ import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
@@ -18,9 +19,9 @@ public final class RatisRocksDBBatches implements AutoCloseable {
     public enum RecoveryState { NONE,ACTIVE,PENDING,COMPLETE }
     public record Progress(UUID requestId,long copiedBatches,long acknowledgedChunks,long acknowledgedMutations,boolean sourceComplete,int retainedChunks,CommandResult.Status failure) {}
     private final DistributedSchema schema; private final RangeDirectory directory; private final RatisRoutedClient routed; private final RatisDurableSessionClient session; private final RWScheduler scheduler; private final SessionOwnership ownership;
-    private final RatisBatchRequestJournal journal; private final ReentrantLock persistence=new ReentrantLock();
+    private final RatisRemoteMutationReceipts receipts; private final RatisBatchRequestJournal journal; private final ReentrantLock persistence=new ReentrantLock();
     private final Map<CompletableFuture<?>,CompletableFuture<Void>> completions=new IdentityHashMap<>();
-    private Task active; private boolean closed,published;
+    private Task active; private boolean closed;
     private ScheduledThreadPoolExecutor deadlineTimer;
     private volatile Progress retainedProgress;
     private volatile Runnable beforeAcknowledgementMarker;
@@ -29,8 +30,8 @@ public final class RatisRocksDBBatches implements AutoCloseable {
         byte[] binding; var grant=session.grant();
         try { var digest=java.security.MessageDigest.getInstance("SHA-256"); digest.update(schema.digest()); digest.update(routed.sessionIdentityDigest()); digest.update(ByteBuffer.allocate(40).putLong(grant.sessionId().getMostSignificantBits()).putLong(grant.sessionId().getLeastSignificantBits()).putLong(grant.epoch()).putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis()).array()); binding=digest.digest(); }
         catch(java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
-        journal=new RatisBatchRequestJournal(path,binding);
-        try { if(journal.request()==null && !session.pristine() || session.pending().stream().filter(p -> !p.consumed()).count()>1) throw new IOException("Bulk session must be exclusively bound to its own retained input"); }
+        boolean usedOwner=Files.exists(path.resolveSibling(path.getFileName()+".lock")); journal=new RatisBatchRequestJournal(path,binding);
+        try { receipts=new RatisRemoteMutationReceipts(path.resolveSibling(path.getFileName()+".released"),authority(0),usedOwner || journal.request()!=null || !session.pristine());receipts.validateJournal(journal.request()==null?null:journal.request().token);if(journal.request()!=null)journal.request().resultAcknowledged=receipts.retired(journal.request().token); if(journal.request()==null && (!session.pristine() && !receipts.established() || session.pending().stream().anyMatch(p -> !p.consumed())) || session.pending().stream().filter(p -> !p.consumed()).count()>1) throw new IOException("Bulk session must be exclusively bound to its own retained input"); }
         catch(IOException|RuntimeException|Error failure) { try { journal.close(); } catch(IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
         refreshProgress();
     }
@@ -40,39 +41,42 @@ public final class RatisRocksDBBatches implements AutoCloseable {
     RatisDurableSessionClient ownedSession() { return session; }
     public CompletableFuture<Void> putBatch(long column,Publisher<KVBatch> source,PutBatchMode mode,RequestContext context) {
         if(mode!=PutBatchMode.WRITE_BATCH) return CompletableFuture.failedFuture(new UnsupportedOperationException("Unsupported distributed PUT batch mode: "+mode));
-        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(column,source,mode)); return voidObserver(start(column,source,false,context)); }
+        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(column,source,mode)); return CompletableFuture.failedFuture(new IOException("Distributed bulk mutation requires caller token and copied ordinal input")); }
         catch(Exception failure) { return CompletableFuture.failedFuture(failure); }
     }
     public CompletableFuture<Void> mergeBatch(long column,Publisher<KVBatch> source,MergeBatchMode mode,RequestContext context) {
         if(mode!=MergeBatchMode.MERGE_WRITE_BATCH) return CompletableFuture.failedFuture(new UnsupportedOperationException("Unsupported distributed MERGE batch mode: "+mode));
-        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch(column,source,mode)); return voidObserver(start(column,source,true,context)); }
+        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.MergeBatch(column,source,mode)); return CompletableFuture.failedFuture(new IOException("Distributed bulk mutation requires caller token and copied ordinal input")); }
         catch(Exception failure) { return CompletableFuture.failedFuture(failure); }
-    }
-    private CompletableFuture<Void> voidObserver(CompletableFuture<Progress> pending) {
-        var observer=new CompletableFuture<Void>(); var actual=actualCompletion(pending);
-        synchronized(this) { completions.put(observer,actual); }
-        CompletableFuture.allOf(actual,observer.handle((value,error) -> null)).whenComplete((ignored,error) -> { synchronized(this) { completions.remove(observer); } });
-        pending.whenComplete((value,error) -> { if(error==null) observer.complete(null); else observer.completeExceptionally(error); });
-        observer.whenComplete((value,error) -> { if(observer.isCancelled()) pending.cancel(false); }); return observer;
-    }
-    private CompletableFuture<Progress> start(long column,Publisher<KVBatch> source,boolean merge,RequestContext context) {
-        try {
-            Objects.requireNonNull(source); schema.column(column); var task=reserve(context); task.schedule(() -> {
-                task.check(); persistence.lock(); try { if(journal.request()!=null && !published) throw new IOException("Resolve retained batch progress before subscribing another source"); journal.begin(merge,directory); refreshProgress(); published=false; } finally { persistence.unlock(); }
-                task.column=column; task.merge=merge; source.subscribe(task);
-            }); return task.view;
-        } catch(Exception failure) { return CompletableFuture.failedFuture(failure); }
     }
     public CompletableFuture<Progress> resumeRetained(RequestContext context) {
-        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(0,ignored -> {},PutBatchMode.WRITE_BATCH)); var task=reserve(context); task.schedule(() -> { Progress value; persistence.lock(); try { if(journal.request()==null || published) throw new IOException("No retained bulk input"); drain(task); value=snapshot(); } finally { persistence.unlock(); } task.settle(value,null); }); return task.view; }
+        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(0,ignored -> {},PutBatchMode.WRITE_BATCH)); var task=reserve(context); task.schedule(() -> { Progress value; persistence.lock(); try { if(journal.request()==null || journal.request().resultAcknowledged) throw new IOException("No retained bulk input"); drain(task); value=snapshot(); } finally { persistence.unlock(); } task.settle(value,null); }); return task.view; }
         catch(Exception failure) { return CompletableFuture.failedFuture(failure); }
     }
+    public RemoteMutationOwner owner() throws IOException {return authority(receipts.nextSequence());}
+    private RemoteMutationOwner authority(long nextSequence) {var grant=session.grant();return new RemoteMutationOwner(schema.clusterId(),schema.databaseId(),schema.domainId(),grant.sessionId(),grant.epoch(),nextSequence,RemoteMutationToken.Kind.BULK,schema.digest(),directory.payloadDigest());}
+    public RemoteMutationToken prepare(RemoteMutationOwner expectedOwner,UUID requestId,long requestSequence,long column,boolean merge) throws IOException {
+        if(!owner().sameAuthority(expectedOwner))throw new IOException("Bulk owner differs from installed durable session"); schema.column(column); var token=new RemoteMutationToken(schema.clusterId(),schema.databaseId(),schema.domainId(),expectedOwner.ownerId(),requestId,expectedOwner.ownerEpoch(),requestSequence,RemoteMutationToken.Kind.BULK,schema.digest(),directory.payloadDigest(),RemoteMutationInputs.bulkHeader(column,merge));
+        synchronized(this) { if(active!=null || closed)throw new IOException("Bulk actor busy or closed"); persistence.lock(); try { receipts.requireNew(token); var retained=journal.request(); if(retained!=null && !retained.resultAcknowledged) { if(!token.equals(retained.token))throw new IOException("Original bulk owner or input differs"); return token; } journal.begin(token,column,merge,directory); receipts.bind(token); refreshProgress();return token; } finally { persistence.unlock(); } }
+    }
+    private RatisBatchRequestJournal.Request exact(RemoteMutationToken token) throws IOException { var r=journal.request(); if(receipts.retired(token))throw new IOException("Request sequence expired or acknowledged"); if(r==null || !token.equals(r.token))throw new IOException("Original bulk token unavailable or differs"); return r; }
+    private static void validateMutationProfile(RequestContext context) {it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(0,ignored -> {},PutBatchMode.WRITE_BATCH));}
+    public CompletableFuture<Progress> append(RemoteMutationToken token,long ordinal,KVBatch batch,byte[] inputDigest,RequestContext context) {
+        final Task task; try { validateMutationProfile(context); task=reserve(context); } catch(Exception failure) {return CompletableFuture.failedFuture(failure);}
+        final List<DistributedCommand> chunks; final byte[] actual;
+        try {if(!persistence.tryLock())throw new IOException("Bulk copied input busy");try {var r=exact(token);chunks=copy(batch,r.column,r.merge);actual=RemoteMutationInputs.batch(r.column,r.merge,batch);if(!Arrays.equals(actual,inputDigest))throw new IOException("Copied batch digest differs");}finally{persistence.unlock();}}
+        catch(Exception failure){task.schedule(() -> {throw failure;});return task.view;}
+        task.schedule(() -> {persistence.lock();try {var r=exact(token);if(r.resultAcknowledged)throw new IOException("Bulk result already acknowledged");if(!r.inputDigests.containsKey(ordinal) && (!r.chunks.isEmpty() || r.eof || r.failure!=null))throw new IOException("Resolve previous copied batch before append");boolean olderDuplicate=r.inputDigests.containsKey(ordinal) && ordinal<r.copiedBatches-1;journal.remoteInput(ordinal,actual,chunks);refreshProgress();if(!olderDuplicate)drain(task);task.settle(snapshot(),null);}finally{persistence.unlock();}});return task.view;
+    }
+    public CompletableFuture<Progress> finishInput(RemoteMutationToken token,RequestContext context) { try { validateMutationProfile(context); var task=reserve(context);task.schedule(() -> { persistence.lock();try { var r=exact(token);if(r.resultAcknowledged || !r.chunks.isEmpty() || r.pending!=null)throw new IOException("Bulk copied input remains unresolved");journal.eof();refreshProgress();task.settle(snapshot(),null); } finally { persistence.unlock(); } });return task.view; } catch(Exception failure) {return CompletableFuture.failedFuture(failure);} }
+    public RemoteMutationStatus status(RemoteMutationToken token) throws IOException { if(!persistence.tryLock())return new RemoteMutationStatus(token,RemoteMutationStatus.State.PENDING,-1,-1,0,null);try {var released=receipts.find(token);if(released!=null)return released;var retained=journal.request();if(retained==null || retained.token==null || !retained.token.requestId().equals(token.requestId()))return new RemoteMutationStatus(token,RemoteMutationStatus.State.UNAVAILABLE,-1,-1,0,null);var r=exact(token); var state=r.resultAcknowledged?RemoteMutationStatus.State.ACKNOWLEDGED:r.complete() || r.failure!=null?RemoteMutationStatus.State.TERMINAL:r.copiedBatches==0?RemoteMutationStatus.State.PREPARED:RemoteMutationStatus.State.PENDING;return new RemoteMutationStatus(token,state,r.acknowledgedMutations,r.copiedBatches,0,state==RemoteMutationStatus.State.TERMINAL || state==RemoteMutationStatus.State.ACKNOWLEDGED?RatisBatchRequestJournal.resultDigest(r):null); } finally {persistence.unlock();} }
+    public void acknowledgeResult(RemoteMutationToken token,byte[] digest) throws IOException { persistence.lock();try {var released=receipts.find(token);if(released!=null){if(!Arrays.equals(released.resultDigest(),digest))throw new IOException("Released bulk ACK changed");return;}var r=exact(token);synchronized(this){if(active!=null)throw new IOException("Bulk actual work remains active");}if(!(r.complete() || r.failure!=null) || !Arrays.equals(RatisBatchRequestJournal.resultDigest(r),digest))throw new IOException("Bulk ACK differs from terminal outcome");receipts.acknowledge(new RemoteMutationStatus(token,RemoteMutationStatus.State.ACKNOWLEDGED,r.acknowledgedMutations,r.copiedBatches,0,digest));r.resultAcknowledged=true;} finally {persistence.unlock();} }
     public Progress progress() throws IOException { return retainedProgress; }
     private void refreshProgress() throws IOException { retainedProgress=snapshot(); }
     private Progress snapshot() throws IOException { var r=journal.request(); return r==null ? null : new Progress(r.id,r.copiedBatches,r.acknowledgedChunks,r.acknowledgedMutations,r.complete(),r.chunks.size()-r.cursor,r.failure==null ? null : r.failure.status()); }
     public RecoveryState recoveryState() throws IOException {
         synchronized(this) { if(active!=null) return RecoveryState.ACTIVE; }
-        persistence.lock(); try { var r=journal.request(); return r==null || published ? RecoveryState.NONE : r.complete() || r.failure!=null ? RecoveryState.COMPLETE : RecoveryState.PENDING; } finally { persistence.unlock(); }
+        persistence.lock(); try { var r=journal.request(); return r==null || r.resultAcknowledged ? RecoveryState.NONE : r.complete() || r.failure!=null ? RecoveryState.COMPLETE : RecoveryState.PENDING; } finally { persistence.unlock(); }
     }
     public synchronized CompletableFuture<Void> actualCompletion(CompletableFuture<?> observer) { var actual=completions.get(observer); if(actual!=null) return actual.copy(); if(observer.isDone()) return CompletableFuture.completedFuture(null); throw new IllegalArgumentException("Unknown bulk observer"); }
     private Task reserve(RequestContext context) {
@@ -111,7 +115,7 @@ public final class RatisRocksDBBatches implements AutoCloseable {
         var actual=pending.command(); if(actual.kind()!=DistributedCommand.Kind.DATA || pending.awaitingAcceptance() || !expected.groupId().equals(actual.groupId()) || expected.rangeEpoch()!=actual.rangeEpoch() || !Arrays.equals(expected.schemaDigest(),actual.schemaDigest()) || !expected.mutations().equals(actual.mutations()) || !actual.predicates().isEmpty()) throw new IOException("Original pending batch command differs");
     }
     private void drain(Task task) throws Exception {
-        var r=journal.request();
+        var r=journal.request();receipts.requireNew(r.token);
         while(!r.chunks.isEmpty() && r.failure==null) {
             var expected=r.chunks.get(r.cursor); var pending=find(r.pending);
             if(r.result!=null) {
@@ -129,26 +133,23 @@ public final class RatisRocksDBBatches implements AutoCloseable {
         }
     }
     @FunctionalInterface private interface Work { void run() throws Exception; }
-    private final class Task implements Subscriber<KVBatch> {
+    private final class Task {
         final RequestContext context; final long deadline; final CompletableFuture<Progress> result=new CompletableFuture<>(),view=result.copy(); final CompletableFuture<Void> drained=new CompletableFuture<>();
-        final ArrayDeque<Work> queue=new ArrayDeque<>(); Subscription subscription; ScheduledFuture<?> deadlineHook; boolean requested,inFlight,running,stop,eof,settled; Throwable sourceFailure,outcomeFailure; Progress outcome; long column; boolean merge;
+        final ArrayDeque<Work> queue=new ArrayDeque<>(); ScheduledFuture<?> deadlineHook; boolean running,stop,settled; Throwable outcomeFailure; Progress outcome;
         Task(RequestContext context,long deadline) { this.context=context; this.deadline=deadline; view.whenComplete((value,error) -> { if(view.isCancelled()) cancel(); }); }
         void armDeadline() {
             var hook=deadlineTimer.schedule(this::expired,Math.max(0,scheduler.remainingMonotonicDeadlineNanos(deadline)),TimeUnit.NANOSECONDS);
             synchronized(this) { if(settled) hook.cancel(false); else deadlineHook=hook; }
         }
         void expired() {
-            synchronized(this) { if(settled) return; }
-            if(!scheduler.isMonotonicDeadlineExpired(deadline)) { armDeadline(); return; }
-            var timeout=new IOException("Bulk deadline expired; copied input retained",new TimeoutException()); Subscription source; boolean idle;
-            synchronized(this) { if(settled) return; stop=true; source=subscription; idle=!running && !inFlight; }
-            if(source!=null) try { source.cancel(); } catch(RuntimeException failure) { timeout.addSuppressed(failure); }
-            view.completeExceptionally(timeout);
-            synchronized(this) { idle=!running && !inFlight; }
-            if(idle) { settle(null,timeout); synchronized(this) { idle=!running && !inFlight; } if(idle) publish(); }
+            synchronized(this) {if(settled)return;}
+            if(!scheduler.isMonotonicDeadlineExpired(deadline)){armDeadline();return;}
+            var timeout=new IOException("Bulk deadline expired; copied input retained",new TimeoutException());boolean idle;
+            synchronized(this){if(settled)return;stop=true;idle=!running;}
+            view.completeExceptionally(timeout);if(idle){settle(null,timeout);synchronized(this){idle=!running;}if(idle)publish();}
         }
-        void check() throws IOException { synchronized(this) { if(stop) throw new IOException("Bulk observer stopped; copied input retained"); if(sourceFailure!=null) throw new IOException("Publisher failed; copied input retained",sourceFailure); } if(deadline!=Long.MAX_VALUE && scheduler.isMonotonicDeadlineExpired(deadline)) throw new IOException("Bulk deadline expired; copied input retained"); }
-        void cancel() { Subscription source; boolean idle; synchronized(this) { stop=true; source=subscription; idle=!inFlight && !running; } if(source!=null) source.cancel(); if(idle) schedule(() -> { throw new IOException("Bulk observer canceled"); }); }
+        void check() throws IOException {synchronized(this){if(stop)throw new IOException("Bulk observer stopped; copied input retained");}if(deadline!=Long.MAX_VALUE && scheduler.isMonotonicDeadlineExpired(deadline))throw new IOException("Bulk deadline expired; copied input retained");}
+        void cancel() {boolean idle;synchronized(this){stop=true;idle=!running;}if(idle)schedule(() -> {throw new IOException("Bulk observer canceled");});}
         void schedule(Work work) { synchronized(this) { if(settled) return; if(running) { if(queue.size()>=1) throw new IllegalStateException("Bulk callback queue overflow"); queue.add(work); return; } running=true; } dispatch(work); }
         void dispatch(Work work) {
             class Job implements Runnable,RWScheduler.RejectionAwareTask {
@@ -160,34 +161,12 @@ public final class RatisRocksDBBatches implements AutoCloseable {
             try { scheduler.executor(context.profile(),OperationFamily.MUTATION,deadline).execute(job,Math.min(48L*1024*1024,WorkloadCost.MAX_ESTIMATED_BYTES)); } catch(RuntimeException error) { job.reject(error); }
         }
         void next() { Work next; boolean finish; synchronized(this) { next=settled ? null : queue.poll(); if(next==null) running=false; finish=settled && !running; } if(next!=null) dispatch(next); else if(finish) publish(); }
-        void settle(Progress value,Throwable error) { Subscription source; ScheduledFuture<?> hook; synchronized(this) { if(settled) return; settled=true; outcome=value; outcomeFailure=error; queue.clear(); source=subscription; hook=deadlineHook; deadlineHook=null; } if(hook!=null) hook.cancel(false); if(source!=null) try { source.cancel(); } catch(RuntimeException cleanup) { synchronized(this) { if(outcomeFailure==null) outcomeFailure=cleanup; else outcomeFailure.addSuppressed(cleanup); } } }
+        void settle(Progress value,Throwable error) {ScheduledFuture<?> hook;synchronized(this){if(settled)return;settled=true;outcome=value;outcomeFailure=error;queue.clear();hook=deadlineHook;deadlineHook=null;}if(hook!=null)hook.cancel(false);}
         void publish() {
-            synchronized(RatisRocksDBBatches.this) { if(active!=this) return; if(outcomeFailure==null && !view.isCancelled()) published=true; active=null; }
+            synchronized(RatisRocksDBBatches.this) { if(active!=this) return;  active=null; }
             drained.complete(null); if(outcomeFailure==null) result.complete(outcome); else result.completeExceptionally(outcomeFailure);
             synchronized(RatisRocksDBBatches.this) { completions.remove(view); }
         }
-        void requestNext() { Subscription source; synchronized(this) { if(stop || settled || eof || sourceFailure!=null) return; requested=true; source=subscription; } source.request(1); }
-        @Override public void onSubscribe(Subscription source) { boolean reject; synchronized(this) { reject=subscription!=null || stop || settled; if(!reject) subscription=source; } if(reject) source.cancel(); else requestNext(); }
-        @Override public void onNext(KVBatch batch) {
-            boolean invalid; synchronized(this) { invalid=!requested || inFlight || eof || stop || settled; if(!invalid) { requested=false; inFlight=true; } }
-            if(invalid) { onError(new IllegalStateException("Publisher exceeded demand one")); return; }
-            try { var chunks=copy(Objects.requireNonNull(batch),column,merge); schedule(() -> {
-                persistence.lock(); try { boolean end; synchronized(this) { end=eof; } journal.input(chunks,end); refreshProgress(); drain(this); synchronized(this) { inFlight=false; } } finally { persistence.unlock(); }
-                finishSource();
-            }); } catch(Throwable error) { onError(error); synchronized(this) { inFlight=false; } schedule(() -> { throw new IOException("Invalid copied batch",error); }); }
-        }
-        void finishSource() throws Exception {
-            boolean end; Throwable error; synchronized(this) { end=eof; error=sourceFailure; }
-            if(error!=null) throw new IOException("Publisher failed; acknowledged group chunks retained",error);
-            check(); Progress complete=null;
-            persistence.lock(); try {
-                if(journal.request().failure!=null) throw new IOException("Native bulk chunk retained terminal outcome: "+journal.request().failure.status());
-                if(end) { journal.eof(); refreshProgress(); complete=snapshot(); }
-            } finally { persistence.unlock(); }
-            if(end) settle(complete,null); else requestNext();
-        }
-        @Override public void onError(Throwable error) { boolean idle; synchronized(this) { if(settled) return; sourceFailure=Objects.requireNonNull(error); idle=!inFlight; } if(idle) schedule(() -> { throw new IOException("Publisher failed",error); }); }
-        @Override public void onComplete() { boolean idle; synchronized(this) { if(settled || sourceFailure!=null) return; eof=true; idle=!inFlight; } if(idle) schedule(this::finishSource); }
     }
     @Override public void close() throws IOException { synchronized(this) { if(active!=null) throw new IOException("Bulk work active; native/session ownership retained"); closed=true; } journal.close(); if(ownership==SessionOwnership.OWNED) session.close(); if(deadlineTimer!=null) deadlineTimer.shutdown(); }
 }

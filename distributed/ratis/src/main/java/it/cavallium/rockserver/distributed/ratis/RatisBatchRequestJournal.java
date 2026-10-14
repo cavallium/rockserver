@@ -10,7 +10,7 @@ import java.util.*;
 final class RatisBatchRequestJournal implements AutoCloseable {
     static final int MAX_BYTES=16*1024*1024;
     static final class Request {
-        final UUID id; final boolean merge; final RangeDirectory directory;
+        RemoteMutationToken token; boolean resultAcknowledged; long column; final Map<Long,byte[]> inputDigests=new LinkedHashMap<>(); final UUID id; final boolean merge; final RangeDirectory directory;
         long copiedBatches,acknowledgedChunks,acknowledgedMutations;
         List<DistributedCommand> chunks=List.of(); int cursor; OperationId pending; CommandResult result,failure; boolean eof;
         Request(UUID id,boolean merge,RangeDirectory directory) { this.id=id; this.merge=merge; this.directory=directory; }
@@ -35,7 +35,9 @@ final class RatisBatchRequestJournal implements AutoCloseable {
         } catch(IOException|RuntimeException|Error failure) { if(acquired!=null) try { acquired.release(); } catch(IOException cleanup) { failure.addSuppressed(cleanup); } try { channel.close(); } catch(IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
     Request request() throws IOException { requireOpen(); return request; }
-    void begin(boolean merge,RangeDirectory directory) throws IOException { requireOpen(); request=new Request(UUID.randomUUID(),merge,directory); persist(); }
+    void begin(RemoteMutationToken token,long column,boolean merge,RangeDirectory directory) throws IOException { requireOpen(); request=new Request(token.requestId(),merge,directory); request.token=token; request.column=column; persist(); }
+    void remoteInput(long ordinal,byte[] digest,List<DistributedCommand> chunks) throws IOException { requireOpen(); if(request.inputDigests.containsKey(ordinal)) { if(!Arrays.equals(request.inputDigests.get(ordinal),digest))throw new IOException("Copied ordinal input changed"); return; } if(ordinal!=request.copiedBatches || request.inputDigests.size()>=4096)throw new IOException("Input ordinal unavailable or receipt capacity exhausted"); request.inputDigests.put(ordinal,digest.clone()); input(chunks,false); }
+    static byte[] resultDigest(Request request) { var out=java.nio.ByteBuffer.allocate(33).putLong(request.copiedBatches).putLong(request.acknowledgedChunks).putLong(request.acknowledgedMutations).putLong(request.eof?1:0).put((byte)(request.failure==null?0:request.failure.status().ordinal()+1)); return RemoteMutationToken.digest(out.array()); }
     void input(List<DistributedCommand> chunks,boolean eof) throws IOException {
         requireOpen(); if(request==null || !request.chunks.isEmpty() || request.pending!=null || request.eof) throw new IOException("Previous copied batch is unresolved");
         request.chunks=List.copyOf(chunks); request.cursor=0; request.copiedBatches=Math.incrementExact(request.copiedBatches); request.eof=eof; persist();
@@ -57,7 +59,7 @@ final class RatisBatchRequestJournal implements AutoCloseable {
         out.writeLong(request.copiedBatches); out.writeLong(request.acknowledgedChunks); out.writeLong(request.acknowledgedMutations); out.writeBoolean(request.eof); out.writeInt(request.cursor); out.writeInt(request.chunks.size());
         for(var chunk:request.chunks) blob(out,DistributedCommandCodec.encode(chunk)); out.writeBoolean(request.pending!=null);
         if(request.pending!=null) { uuid(out,request.pending.sessionId()); out.writeLong(request.pending.epoch()); out.writeLong(request.pending.sequence()); }
-        out.writeBoolean(request.result!=null); if(request.result!=null) blob(out,request.result.encode()); out.writeBoolean(request.failure!=null); if(request.failure!=null) blob(out,request.failure.encode()); out.flush(); if(bytes.size()+32>MAX_BYTES) throw new IOException("Batch journal exceeds bound"); return bytes.toByteArray();
+        out.writeBoolean(request.result!=null); if(request.result!=null) blob(out,request.result.encode()); out.writeBoolean(request.failure!=null); if(request.failure!=null) blob(out,request.failure.encode()); out.write(request.token.encode()); out.writeLong(request.column); out.writeInt(request.inputDigests.size()); for(var entry:request.inputDigests.entrySet()) { out.writeLong(entry.getKey()); out.write(entry.getValue()); } out.flush(); if(bytes.size()+32>MAX_BYTES) throw new IOException("Batch journal exceeds bound"); return bytes.toByteArray();
     }
     private Request decode(byte[] bytes) throws IOException {
         try {
@@ -67,11 +69,11 @@ final class RatisBatchRequestJournal implements AutoCloseable {
             if(count<0 || count>RatisRocksDBBatches.MAX_INPUT_ITEMS || 4L*count>in.available()) throw new IOException("Invalid retained batch chunk count"); var chunks=new ArrayList<DistributedCommand>(count);
             for(int i=0;i<count;i++) chunks.add(DistributedCommandCodec.decode(blob(in,RatisRocksDBBatches.MAX_CHUNK_BYTES))); result.chunks=List.copyOf(chunks);
             if(in.readBoolean()) result.pending=new OperationId(uuid(in),in.readLong(),in.readLong()); if(in.readBoolean()) result.result=CommandResult.decode(blob(in,CommandResult.MAX_BYTES)); if(in.readBoolean()) result.failure=CommandResult.decode(blob(in,CommandResult.MAX_BYTES));
-            if(in.available()!=0) throw new IOException("Trailing batch journal input"); validate(result); return result;
+            result.token=RemoteMutationToken.decode(in.readNBytes(RemoteMutationToken.BYTES)); result.column=in.readLong(); int receipts=in.readInt(); if(receipts<0 || receipts>4096)throw new IOException("Invalid copied ordinal receipts"); for(int n=0;n<receipts;n++) { long ordinal=in.readLong();byte[] digest=in.readNBytes(32);if(ordinal!=n || digest.length!=32 || result.inputDigests.put(ordinal,digest)!=null)throw new IOException("Invalid ordinal receipt"); } if(in.available()!=0) throw new IOException("Trailing batch journal input"); validate(result); return result;
         } catch(RuntimeException invalid) { throw new IOException("Invalid batch journal",invalid); }
     }
     private static void validate(Request request) throws IOException {
-        if(request==null || request.copiedBatches<0 || request.acknowledgedChunks<0 || request.acknowledgedMutations<0 || request.cursor<0 || request.cursor>=Math.max(1,request.chunks.size()) || request.result!=null && request.pending==null || request.pending!=null && request.chunks.isEmpty()) throw new IOException("Invalid retained batch progress");
+        if(request==null || request.token==null || request.token.kind()!=RemoteMutationToken.Kind.BULK || !request.token.requestId().equals(request.id) || request.copiedBatches<0 || request.acknowledgedChunks<0 || request.acknowledgedMutations<0 || request.cursor<0 || request.cursor>=Math.max(1,request.chunks.size()) || request.result!=null && request.pending==null || request.pending!=null && request.chunks.isEmpty()) throw new IOException("Invalid retained batch progress");
         long bytes=0; int items=0;
         for(var chunk:request.chunks) {
             bytes+=DistributedCommandCodec.encodedSize(chunk); items+=chunk.mutations().size();

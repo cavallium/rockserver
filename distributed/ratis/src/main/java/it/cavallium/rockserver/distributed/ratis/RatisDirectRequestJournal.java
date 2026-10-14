@@ -15,12 +15,12 @@ final class RatisDirectRequestJournal implements AutoCloseable {
     private static final int MAGIC=0x52445251;
     static final class Request {
         final RatisRocksDBDirect.WriteKind kind; final RequestType.RequestTypeId type; final boolean multi; final List<DistributedCommand> items; final List<CommandResult> results=new ArrayList<>();
-        OperationId pending; int pendingIndex=-1; boolean overflow; CommandResult.Status unsubmittedStatus;
+        RemoteMutationToken token; boolean resultAcknowledged; OperationId pending; int pendingIndex=-1; boolean overflow; CommandResult.Status unsubmittedStatus;
         Request(RatisRocksDBDirect.WriteKind kind,RequestType.RequestTypeId type,boolean multi,List<DistributedCommand> items) { this.kind=Objects.requireNonNull(kind); this.type=type; this.multi=multi; this.items=List.copyOf(items); }
         int cursor() { return results.size(); }
         boolean terminal() { return unsubmittedStatus!=null || overflow || !results.isEmpty() && results.getLast().status()!=CommandResult.Status.SUCCESS || cursor()==items.size(); }
         boolean same(Request other) {
-            if (kind!=other.kind || type!=other.type || multi!=other.multi || items.size()!=other.items.size()) return false;
+            if (!Objects.equals(token,other.token) || kind!=other.kind || type!=other.type || multi!=other.multi || items.size()!=other.items.size()) return false;
             for (int n=0;n<items.size();n++) if (!Arrays.equals(DistributedCommandCodec.encode(items.get(n)),DistributedCommandCodec.encode(other.items.get(n)))) return false;
             return true;
         }
@@ -50,10 +50,11 @@ final class RatisDirectRequestJournal implements AutoCloseable {
         requireOpen(); if (status!=CommandResult.Status.STALE_SCHEMA || request.pending!=null || request.terminal()) throw new IOException("No-effects rejection requires an unsubmitted remaining item");
         request.unsubmittedStatus=status; persist();
     }
+    static byte[] resultDigest(Request request) { var out=new java.io.ByteArrayOutputStream(); for(var result:request.results)out.writeBytes(result.encode()); out.write(request.overflow?1:0); out.write(request.unsubmittedStatus==null?0:request.unsubmittedStatus.ordinal()+1); return RemoteMutationToken.digest(out.toByteArray()); }
     private void persist() throws IOException { try { SessionJournalFiles.write(path,encode(),MAX_BYTES); } catch (IOException | RuntimeException failure) { fenced=true; if (failure instanceof IOException io) throw io; throw new IOException("Direct journal failed; reopen it",failure); } }
     private byte[] encode() throws IOException {
         if (request==null) throw new IOException("Direct request absent"); validate(request);
-        long size=56L+(request.pending==null ? 0 : 36);
+        long size=56L+RemoteMutationToken.BYTES+(request.pending==null ? 0 : 36);
         for (var item:request.items) size+=4L+DistributedCommandCodec.encodedSize(item);
         for (var result:request.results) size+=4L+result.encode().length;
         if (size+32>MAX_BYTES) throw new IOException("Direct request journal exceeds bound");
@@ -64,6 +65,7 @@ final class RatisDirectRequestJournal implements AutoCloseable {
         out.put((byte)(request.overflow ? 1 : 0)).put((byte)(request.pending==null ? 0 : 1));
         if (request.pending!=null) out.putInt(request.pendingIndex).putLong(request.pending.sessionId().getMostSignificantBits()).putLong(request.pending.sessionId().getLeastSignificantBits()).putLong(request.pending.epoch()).putLong(request.pending.sequence());
         out.put((byte)(request.unsubmittedStatus==null ? 0 : 1));
+        out.put(request.token.encode());
         if (out.hasRemaining()) throw new IOException("Direct journal size calculation changed"); return out.array();
     }
     private Request decode(byte[] body) throws IOException {
@@ -73,10 +75,11 @@ final class RatisDirectRequestJournal implements AutoCloseable {
             int kind=in.getInt(); if (kind<0 || kind>=RequestType.RequestTypeId.values().length) throw new IOException("Invalid direct callback"); boolean multi=flag(in); int count=in.getInt(); if (count<1 || count>256 || count*4L>in.remaining()) throw new IOException("Invalid direct item count");
             var items=new ArrayList<DistributedCommand>(); for (int n=0;n<count;n++) items.add(DistributedCommandCodec.decode(blob(in,DistributedCommandCodec.MAX_ENCODED_BYTES)));
             var result=new Request(RatisRocksDBDirect.WriteKind.values()[effect],RequestType.RequestTypeId.values()[kind],multi,items); count=in.getInt(); if (count<0 || count>items.size()) throw new IOException("Invalid direct progress"); for (int n=0;n<count;n++) result.results.add(CommandResult.decode(blob(in,CommandResult.MAX_BYTES)));
-            result.overflow=flag(in); if (flag(in)) { result.pendingIndex=in.getInt(); result.pending=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong()); } if (flag(in)) result.unsubmittedStatus=CommandResult.Status.STALE_SCHEMA; if (in.hasRemaining()) throw new IOException("Trailing direct journal bytes"); validate(result); return result;
+            result.overflow=flag(in); if (flag(in)) { result.pendingIndex=in.getInt(); result.pending=new OperationId(new UUID(in.getLong(),in.getLong()),in.getLong(),in.getLong()); } if (flag(in)) result.unsubmittedStatus=CommandResult.Status.STALE_SCHEMA; byte[] token=new byte[RemoteMutationToken.BYTES]; in.get(token); result.token=RemoteMutationToken.decode(token); if (in.hasRemaining()) throw new IOException("Trailing direct journal bytes"); validate(result); return result;
         } catch (RuntimeException invalid) { throw new IOException("Invalid direct journal",invalid); }
     }
     private static void validate(Request request) throws IOException {
+        if (request.token==null || request.token.kind()!=RemoteMutationToken.Kind.POINT)throw new IOException("Direct request lacks caller ownership");
         if (request.items.isEmpty() || request.items.size()>256 || !request.multi && request.items.size()!=1 || request.results.size()>request.items.size()) throw new IOException("Invalid direct request count");
         boolean returns=request.type==RequestType.RequestTypeId.MERGED || request.type==RequestType.RequestTypeId.PREVIOUS || request.type==RequestType.RequestTypeId.PREVIOUS_PRESENCE || request.type==RequestType.RequestTypeId.DELTA || request.type==RequestType.RequestTypeId.CHANGED;
         if (request.kind==RatisRocksDBDirect.WriteKind.MERGE ? request.type!=RequestType.RequestTypeId.MERGED && request.type!=RequestType.RequestTypeId.NOTHING
