@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.distributed.SnapshotFence;
 
 import it.cavallium.rockserver.core.config.DatabaseConfig;
 import it.cavallium.rockserver.core.common.distributed.DistributedSchema;
+import it.cavallium.rockserver.core.common.distributed.DistributedSchemaCodec;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologySeed;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyRecoveryFence;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration;
@@ -791,6 +792,86 @@ public final class RatisNodeRuntime implements AutoCloseable {
     public RatisNodePlan.Role role(UUID group){return groups.require(group).role();}
     public RangeDirectory groupDirectory(UUID group){var directory=groups.require(group).directory();if(directory==null)throw new IllegalArgumentException("Catalogue has no DATA directory");return directory;}
     public it.cavallium.rockserver.core.common.distributed.RangeDescriptor groupDescriptor(UUID group){var descriptor=groups.require(group).descriptor();if(descriptor==null)throw new IllegalArgumentException("Catalogue has no DATA descriptor");return descriptor;}
+    /** Structural current-head qualification from forced native history; this does not assert Raft readiness. */
+    public void requireCurrentPlacement(Map<UUID,RangeDirectory> directories,Map<UUID,DistributedSchema> schemas)throws IOException {
+        Objects.requireNonNull(directories);Objects.requireNonNull(schemas);
+        synchronized(this){if(closing || closeRequested || closed || installing)throw new IOException("Native placement ownership is changing/unavailable");}
+        if(!directories.keySet().equals(routedClients.keySet()) || !schemas.keySet().equals(directories.keySet()))throw new IOException("Current placement domain scope differs from configured node");
+        try {
+            var local=new HashSet<UUID>();
+            for(var domain:directories.keySet()) {
+                var candidate=directories.get(domain);var schema=schemas.get(domain);var bootstrap=plan.directory(domain);
+                if(candidate==null || schema==null || !candidate.domainId().equals(domain) || !candidate.clusterId().equals(plan.clusterId()) || !candidate.databaseId().equals(plan.databaseId()))throw new IOException("Current placement namespace changed");
+                schema.requireMatches(candidate);
+                if(!Arrays.equals(data(domain).directory().payloadDigest(),candidate.payloadDigest()))throw new IOException("Current route does not match qualified catalogue placement");
+                boolean directoryQualified=Arrays.equals(bootstrap.payloadDigest(),candidate.payloadDigest());
+                for(var range:candidate.ranges()) {
+                    var replica=range.replicas().stream().filter(r->r.nodeId().equals(plan.nodeId())).findFirst().orElse(null);if(replica==null)continue;
+                    if(!replica.nodeIncarnation().equals(plan.nodeIncarnation()) || !replica.peerId().equals(plan.peerId()) || !replica.address().equals(plan.address()))throw new IOException("Current placement changed local node incarnation/endpoint");
+                    local.add(range.groupId());var entry=groups.require(range.groupId());var store=stores.get(range.groupId());
+                    if(entry.role()!=RatisNodePlan.Role.DATA || entry.retired() || store==null || !entry.descriptor().equals(range) || !entry.directory().domainId().equals(domain))throw new IOException("Current range lacks exact recovered native registration");
+                    boolean original=bootstrap.ranges().stream().anyMatch(range::equals) && Arrays.equals(bootstrap.schemaDigest(),candidate.schemaDigest());
+                    boolean plannedFenced=original && range.topologyState()==RangeDescriptor.TopologyState.FENCED;
+                    if(store.pendingInstallation() || store.topologyBirthPending() || store.topologyRecoveryOnly() || store.topologyRetired() || !plannedFenced && (store.importPending() || store.topologyFreeze()!=null))throw new IOException("Current range retains pending/recovery/retired ownership");
+                    if(store.importPending() && plan.importDefinition(range.groupId())==null)throw new IOException("Fenced import lacks original planned ownership");
+                    var ownership=store.ownership();var interval=ownership.interval();
+                    if(!ownership.owner().groupId().equals(range.groupId()) || ownership.owner().epoch()!=range.rangeEpoch() || !interval.domainId().equals(domain) || !interval.columns().equals(candidate.columns()) || !Arrays.equals(interval.lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(interval.upperExclusive(),range.upperExclusive()))throw new IOException("Current native ownership geometry changed");
+                    var nativeSchema=store.installedSchema();if(nativeSchema==null || !Arrays.equals(DistributedSchemaCodec.encode(nativeSchema),DistributedSchemaCodec.encode(schema)))throw new IOException("Current schema lacks exact recovered native installation");nativeSchema.requireMatches(candidate);
+                    boolean qualified=original;
+                    if(entry.seed()!=null) {
+                        var seed=owner(range.groupId()).pool.topologySeed(entry.seed().definition().intentId());var activation=store.topologyActivation();
+                        if(seed==null || !seed.equals(entry.seed()) || store.topologyBirth()==null || activation==null || !activation.catalogueGroup().equals(plan.catalogue().groupId()))throw new IOException("Current child lacks forced birth/activation history");
+                        store.topologyBirth().requireSeed(seed);activation.requireSeed(seed);activation.requireCut(store.applied());qualified=true;
+                        if(Arrays.equals(seed.definition().targetDirectory().payloadDigest(),candidate.payloadDigest()))directoryQualified=true;
+                    }
+                    if(entry.learner()!=null) {
+                        if(!entry.learner().equals(store.topologyLearnerRegistration()) || !owner(range.groupId()).pool.topologyLearners().contains(entry.learner()) || !store.topologyLearnerServing())throw new IOException("Current learner lacks forced serving adoption");qualified=true;
+                    }
+                    var installation=store.schemaInstallation();var activation=store.schemaActivation();
+                    if(installation!=null) {
+                        if(activation==null || !activation.catalogueGroup().equals(plan.catalogue().groupId()) || !activation.installation().equals(installation.proof()))throw new IOException("Current schema has no completed native activation");
+                        activation.requireHeader(installation.definition().header());activation.requireCut(store.applied());installation.definition().targetSchema().requireMatches(candidate);qualified=true;
+                        if(Arrays.equals(installation.definition().targetDirectory().payloadDigest(),candidate.payloadDigest()))directoryQualified=true;
+                    }
+                    var imported=store.importActivation();if(imported!=null) {
+                        var definition=plan.importDefinition(range.groupId());if(definition==null || !imported.catalogueGroup().equals(plan.catalogue().groupId()))throw new IOException("Current import lacks original configured publication");
+                        imported.receipt().requireManifest(definition.manifest(range.groupId()));imported.requireCut(store.applied());qualified=true;
+                        if(Arrays.equals(definition.targetDirectory().payloadDigest(),candidate.payloadDigest()))directoryQualified=true;
+                    }
+                    if(entry.relocation()!=null) {
+                        var record=entry.relocation();var cfg=store.configuration();
+                        if(record.action()!=RatisTopologyRelocationRecord.Action.COMPLETE || !record.catalogue().equals(plan.catalogue().groupId()) || !record.definition().targets().getFirst().equals(range) || cfg==null || !RatisTopologyRelocationRecord.sameConfiguration(cfg.data(),record.targetConfiguration()) || !savedRelocation(record))throw new IOException("Current relocation lacks forced completed configuration history");
+                        byte[] saved=SessionJournalFiles.read(relocationPath(record),RatisTopologyRelocationRecord.MAX_BYTES+16);var cut=ByteBuffer.wrap(saved);if(store.applied()==null || !RatisRelocationOwnerRpc.covers(store.applied(),new ApplyPosition(cut.getLong(),cut.getLong())))throw new IOException("Relocation sidecar exceeds completed native prefix");qualified=true;
+                        if(Arrays.equals(record.definition().targetDirectory().payloadDigest(),candidate.payloadDigest()))directoryQualified=true;
+                    }
+                    if(!qualified)throw new IOException("Current placement is not backed by original or forced native history");
+                    if(groups.require(range.groupId())!=entry || !Arrays.equals(DistributedSchemaCodec.encode(store.installedSchema()),DistributedSchemaCodec.encode(nativeSchema)))throw new IOException("Native placement changed during qualification");
+                }
+                if(!directoryQualified)requireCommittedPublication(candidate);
+            }
+            for(var entry:groups.entries())if(entry.role()==RatisNodePlan.Role.DATA && !entry.retired() && entry.descriptor().replicas().stream().anyMatch(r->r.nodeId().equals(plan.nodeId())) && !local.contains(entry.descriptor().groupId()))throw new IOException("Recovered local DATA owner is absent from current placement");
+        }catch(org.rocksdb.RocksDBException|IllegalArgumentException|IllegalStateException invalid){throw new IOException("Current placement differs from forced native history",invalid);}
+    }
+    /** Remote publication is qualified by its immutable administrative intent, never a bare directory CAS. */
+    private void requireCommittedPublication(RangeDirectory candidate)throws IOException {
+        var column=plan.catalogue().directoryColumn();var domain=candidate.domainId();
+        var topologies=epochs.topologyCatalogue(column);var topology=topologies.readHead(domain);
+        if(topology!=null && (topology.phase()==TopologyChange.Phase.PUBLISHED || topology.phase()==TopologyChange.Phase.ACTIVE || topology.phase()==TopologyChange.Phase.RETIRED)) {
+            var definition=topologies.readDefinition(topology.header().definitionDigest());
+            if(definition!=null) {topology.requireDefinition(definition);if(Arrays.equals(definition.targetDirectory().payloadDigest(),candidate.payloadDigest()) && topology.equals(topologies.readHead(domain)))return;}
+        }
+        var administrations=epochs.schemaAdministration(column);var schema=administrations.readHead(domain);
+        if(schema!=null && (schema.status().phase()==SchemaChange.Phase.PUBLISHED || schema.status().phase()==SchemaChange.Phase.RETIRED)) {
+            var definition=administrations.readDefinition(schema.status().header().definitionDigest());
+            if(definition!=null && Arrays.equals(definition.header().encode(),schema.status().header().encode()) && Arrays.equals(definition.targetDirectory().payloadDigest(),candidate.payloadDigest())) {var confirmed=administrations.readHead(domain);if(confirmed!=null && Arrays.equals(confirmed.encode(),schema.encode()))return;}
+        }
+        var imports=epochs.rangeImports(column);var imported=imports.readHead(domain);
+        if(imported!=null && imported.phase()!=RatisRangeImportCatalogue.Phase.PREPARED) {
+            var definition=imports.readDefinition(imported.definitionDigest());
+            if(definition!=null) {imported.requireDefinition(definition);if(Arrays.equals(definition.targetDirectory().payloadDigest(),candidate.payloadDigest())) {var confirmed=imports.readHead(domain);if(confirmed!=null && Arrays.equals(confirmed.encode(),imported.encode()))return;}}
+        }
+        throw new IOException("Current directory generation lacks original, native, or immutable committed publication");
+    }
     /** Only an already forced native recipe may extend the local voting registry. Exact retry never formats an owner. */
     public void installTopologySeed(NativeTopologySeed seed)throws IOException{
         beginSeedLifecycle(true);try{installTopologySeedOwned(seed);}catch(org.rocksdb.RocksDBException failure){throw new IOException("Native topology children could not register",failure);}finally{endSeedLifecycle();}

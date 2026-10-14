@@ -154,6 +154,19 @@ class RatisNodeServiceTest {
             assertEquals(1,env.catalogue.closes.get()); assertEquals(1,env.transportCloses); assertTrue(env.timer.isDisposed()); assertEquals(1,fake.closes);
         }
     }
+    @Test void catalogueAndPublicRouteAdvanceCannotSubstituteForNativePlacementProof() throws Exception {
+        var schema=schema();
+        try(var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {
+            initialize(env,schema);publish(env,schema);var fake=new RatisNodeRuntimeTest.FakeServer();
+            try(var service=RatisNodeService.recover(manifest(env,schema),env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create)) {
+                service.start();service.verifyCatalogue();var before=env.routed.directory();
+                var unproven=new RangeDirectory(before.clusterId(),before.databaseId(),before.domainId(),before.schemaEpoch(),before.schemaDigest(),before.generation()+1,before.columns(),before.routingPrefixBytes(),before.ranges());
+                var o=env.outer;var catalogue=new RatisCatalogue(env.catalogue.client,o.cluster,o.database,o.catalogue,1,new byte[32],o.directoryColumn);
+                catalogue.execute(catalogue.prepare(o.operation(4),before,unproven));env.routed.refresh(unproven);
+                assertThrows(IOException.class,service::verifyCatalogue);
+            }
+        }
+    }
     @Test void failedNativeDrainRetainsAllDependenciesUntilRetryableClose() throws Exception {
         var schema=schema();
         try (var env=new RatisNodeRuntimeTest.Env(root,false,schema.digest())) {

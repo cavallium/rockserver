@@ -1632,6 +1632,20 @@ reopen preserves existing debt, and post-ACK debt equals the retained input,
 atomic and receipt file lengths. The unchanged 40 cases from
 `topology-sdk-integrated-gate.log` are reused with the full 20-case
 `sdk-integrated-range-receipt-gate.log` rerun.
+Node service catalogue checks now qualify the current published schema and routes
+against forced native placement history while retaining the original manifest's
+bootstrap identity. The actual one-service/two-pool split workflow reproduces the
+original rejection and passes with the fix (`node-service-original-split-reproduction.log`,
+`node-service-fixed-split-reproduction.log`). Ten service cases also pass, including
+refusal of a catalogue/public-router generation advance without native or committed
+publication provenance (`node-service-two-pool-split-first-gate.log`). The final
+13-case selection also accepts qualified remote-only and locally unaffected
+topology publications and rejects unqualified route/directory advancement
+(`node-service-remote-placement-gate.log`). Remote owner admission is controlled;
+this is not remote quorum evidence. Another 36 standalone/command-codec cases
+pass against the integrated core and qualified private JNI artifact
+(`integrated-standalone-codec-gate.log`). The combined import/schema/backup and
+cold-service workflow remains in progress.
 A controlled native split now passes full connection close/reopen with the latest
 activated directory, exact old/new token lookup, another native write and no extra
 historical grants. The original forced generation binding is preserved; known

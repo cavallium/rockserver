@@ -20,7 +20,7 @@ import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.util.TimeDuration;
 import reactor.core.scheduler.*;
 
-/** Owns one established static node and its shared clients/scheduler. Starting is not catalogue or quorum readiness. */
+/** Owns one established node and its shared clients/scheduler. Starting is not catalogue or quorum readiness. */
 public final class RatisNodeService implements AutoCloseable {
     static final class Resources implements AutoCloseable {
         final RaftClient catalogue; final Map<UUID,RatisRoutedClient> routed; final RWScheduler scheduler; final Scheduler timer;
@@ -48,7 +48,7 @@ public final class RatisNodeService implements AutoCloseable {
         }
     }
     private final RatisNodeManifest manifest; private final Resources resources; private final RatisNodeRuntime node;
-    private Map<UUID,RangeDirectory> expectedDirectories; private boolean restorePending,restoreOwned;
+    private boolean restorePending,restoreOwned;
     private final RatisSchemaCatalogue schemas; private final RatisDatabaseDomainRoster roster;
     private boolean starting,closing,closed,closeRequested; private int checks;
     private RatisDatabaseBackendFactory frontendBackend;
@@ -60,7 +60,6 @@ public final class RatisNodeService implements AutoCloseable {
         this.manifest=manifest; this.resources=resources; this.node=node; var plan=manifest.plan(); var c=plan.catalogue();
         schemas=new RatisSchemaCatalogue(resources.catalogue,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
         roster=new RatisDatabaseDomainRoster(resources.catalogue,plan.clusterId(),plan.databaseId(),c);
-        var expected=new HashMap<UUID,RangeDirectory>();plan.domains().forEach(d->expected.put(d.directory().domainId(),d.directory()));expectedDirectories=Map.copyOf(expected);
     }
     /** Never grants placement-creation authority. Root must contain established native and Raft state. */
     public static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config) throws IOException {
@@ -110,7 +109,7 @@ public final class RatisNodeService implements AutoCloseable {
         try {
             if(!restoring)preflight(root,manifest.plan());
             if(!resources.routed.keySet().equals(manifest.schemas().keySet()))throw new IOException("Recovery routed domains differ from manifest");
-            for(var entry:resources.routed.entrySet())manifest.schema(entry.getKey()).requireMatches(entry.getValue().directory());
+            for(var entry:resources.routed.entrySet())manifest.schema(entry.getKey()).requireMatches(entry.getValue().bootstrapDirectory());
             var plan=manifest.plan(); var c=plan.catalogue();
             var epochs=new RatisSessionEpochs(resources.catalogue,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
             var replicaConfig=new RatisNodeRuntime.SchemaReplicaConfig(manifest.schemaReplicaLimits(),Objects.requireNonNull(policy));
@@ -187,12 +186,16 @@ public final class RatisNodeService implements AutoCloseable {
         try {
             var complete=roster.readComplete();
             if(!complete.directories().keySet().equals(manifest.schemas().keySet()))throw new IOException("Catalogue roster differs from node manifest");
-            for(var expected:manifest.schemas().values()) {
-                var schema=schemas.read(expected.digest());var directory=complete.directories().get(expected.domainId());
-                if(schema==null || !Arrays.equals(DistributedSchemaCodec.encode(expected),DistributedSchemaCodec.encode(schema))
-                        || !Arrays.equals(expectedDirectories.get(expected.domainId()).payloadDigest(),directory.payloadDigest()))throw new IOException("Catalogue differs from node manifest");
+            var currentSchemas=new HashMap<UUID,DistributedSchema>();
+            for(var domain:manifest.schemas().keySet()) {
+                var directory=complete.directories().get(domain);var schema=schemas.read(directory.schemaDigest());
+                if(schema==null)throw new IOException("Current catalogue schema is absent");
+                try{schema.requireMatches(directory);}catch(IllegalArgumentException invalid){throw new IOException("Current catalogue schema differs from directory",invalid);}
+                currentSchemas.put(domain,schema);
             }
-            roster.requireUnchanged(complete.roster());
+            node.requireCurrentPlacement(complete.directories(),currentSchemas);
+            var after=roster.readComplete();
+            if(!complete.roster().equals(after.roster()) || complete.directories().entrySet().stream().anyMatch(entry->!Arrays.equals(entry.getValue().payloadDigest(),after.directories().get(entry.getKey()).payloadDigest())))throw new IOException("Current catalogue placement changed during qualification");
         } finally { synchronized (this) { checks--; } }
     }
     /** Original placement identity stays immutable; only proven final serving routes become frontend expectations. */
@@ -201,7 +204,6 @@ public final class RatisNodeService implements AutoCloseable {
         try {
             var authority=original.requireExecutionLedger(issued);var view=roster.readComplete();
             if(!view.roster().equals(original.roster()))throw new IOException("Restored roster differs from frozen plan");
-            var expected=new HashMap<UUID,RangeDirectory>();
             for(var domain:original.domains()){
                 var schema=schemas.read(domain.schema().digest());var directory=view.directories().get(domain.schema().domainId());
                 if(schema==null || !Arrays.equals(DistributedSchemaCodec.encode(schema),DistributedSchemaCodec.encode(domain.schema()))
@@ -209,10 +211,9 @@ public final class RatisNodeService implements AutoCloseable {
                 var route=resources.routed.get(domain.schema().domainId());
                 if(!Arrays.equals(route.directory().payloadDigest(),directory.payloadDigest()))throw new IOException("Restored route not qualified");
                 for(var range:directory.ranges())route.stateView(range.groupId()).requireServing(authority);
-                expected.put(directory.domainId(),directory);
             }
             roster.requireUnchanged(original.roster());
-            synchronized(this){expectedDirectories=Map.copyOf(expected);restorePending=false;}
+            synchronized(this){restorePending=false;}
         }finally{synchronized(this){checks--;}}
     }
     public RatisNodeReadiness.Report readiness() throws IOException {

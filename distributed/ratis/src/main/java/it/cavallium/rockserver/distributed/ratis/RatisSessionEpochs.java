@@ -38,6 +38,8 @@ public final class RatisSessionEpochs {
     RatisTopologyAuthority.Client topologyAuthority() { return new RatisTopologyAuthority.Client(client,cluster,database,group); }
     RatisTopologyJoinAuthority.Client topologyJoinAuthority() { return new RatisTopologyJoinAuthority.Client(client,cluster,database,group); }
     RatisTopologyCatalogue topologyCatalogue(UUID directoryColumn) { return new RatisTopologyCatalogue(client,cluster,database,group,rangeEpoch,schema,Objects.requireNonNull(directoryColumn)); }
+    RatisSchemaAdministration schemaAdministration(UUID directoryColumn) { return new RatisSchemaAdministration(client,cluster,database,group,rangeEpoch,schema,Objects.requireNonNull(directoryColumn)); }
+    RatisRangeImportCatalogue rangeImports(UUID directoryColumn) { return new RatisRangeImportCatalogue(client,cluster,database,group,rangeEpoch,schema,Objects.requireNonNull(directoryColumn)); }
     RatisCatalogue catalogue(UUID directoryColumn) { return new RatisCatalogue(client,cluster,database,group,rangeEpoch,schema,Objects.requireNonNull(directoryColumn)); }
     void requireDatabaseBinding(UUID expectedCluster,UUID expectedDatabase) {
         if (!cluster.equals(expectedCluster) || !database.equals(expectedDatabase)) throw new IllegalArgumentException("Wrong session authority database");
