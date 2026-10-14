@@ -77,6 +77,15 @@ This section and the remaining gates at the end describe the current branch.
   `root-raw-repaired-full.log` in that output directory. Qualified cold-cohort
   resolution and complete shared replay RAM/count admission remain open; this
   native working tree has not replaced the private JNI.
+- The subsequent native reader/codec checkpoint charges backing, fragmented and
+  decompressed storage, checksum contexts and ZSTD allocations through one shared
+  working-RAM policy. Replacement overlap is admitted before allocation; retained
+  capacity stays charged through actual destruction. Window/allocation denial is
+  a fatal resource error rather than skipped corruption. Five codec, 251 log and
+  19 raw cases pass; evidence is `charged-codec-reader-streaming_uncompress_budget_test.log`
+  and `charged-codec-reader-final-{log_test,raw_flush_test}.log` in that native output
+  directory. Batch/protection rows, retained memtables and replay count ceilings
+  remain unaccounted for; this does not establish the complete replay envelope.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
