@@ -21,9 +21,10 @@ This section and the remaining gates at the end describe the current branch.
   Complete malformed records and CRC errors fail; incomplete trailing records
   preserve the previous inventory. Fresh pools skip listing only after proving
   an empty bounded directory tree; retained files without CURRENT cannot be
-  adopted as a new database. The pinned JNI source is `233bc576`, reconstructed
-  exactly by wrapper `522580a`. Its 19 extent, nine inventory and six Java cases
-  pass. Main native consumers passed 103 cases; the subsequent eight-case pool
+  adopted as a new database. The pinned JNI source is `bc1ddab`, reconstructed
+  exactly by wrapper `0facc219`. Its 28 extent and six Java cases pass, including
+  actual cross-process lock ownership. The unchanged native inventory has nine
+  earlier passing cases. Main native consumers initially passed 103 cases; the subsequent eight-case pool
   gate also verifies lost-CURRENT refusal without changing the retained MANIFEST.
   Evidence: `/tmp/rockserver-233-main-native-startup-repair-gate.log` and
   `/tmp/rockserver-233-main-lost-current-repair-gate.log`.
@@ -45,14 +46,16 @@ This section and the remaining gates at the end describe the current branch.
   Native directories are validated against reserved node namespaces before
   identity or directory effects, and fresh roots refuse retained export/journal
   authority. The Env closes after actual pool/Options/background drain and before
-  the node lock. Seventy-four distinct controlled Ratis cases pass across the
+  the node lock. Seventy-five distinct controlled Ratis cases pass across the
   namespace/runtime/manifest, native non-capacity, quota and cold-source gates.
-  Evidence: `/tmp/rockserver-native-env-node-namespace-gate.log`,
-  `/tmp/rockserver-native-env-node-quota-consumers-gate.log` (17 pass, five fixture
-  timeouts), and `/tmp/rockserver-native-env-source-cold-pressure-gate.log` (five
-  repaired cases pass). The shared-capacity case still exposes native source
-  `233bc576` reconciliation failure; its stricter NoSpace/no-write-effect assertion
-  remains pending the separately reviewed native repair. This is ordinary native
+  Source `bc1ddab` restores the actual delegate preallocation lifecycle and proves
+  requested allocation separately from physical block counts; live locked inodes
+  retain their debt without opening secondary descriptors. XFS is tested; ext4 is
+  permitted but untested, and unsupported filesystem profiles are refused before
+  managed creation. Standalone DefaultEnv behavior remains unchanged.
+  The integrated 181-case gate (106 core, 75 Ratis) passes with no failures or skips:
+  `/tmp/rockserver-bc1-native-node-integrated-gate.log`. The shared-capacity case now
+  proves NoSpace and no denied-write effect across both pools. This is ordinary native
   admission, not protected native completion or a physical-block quota.
 
 - The aggregate common connection routes the complete database domain roster,
