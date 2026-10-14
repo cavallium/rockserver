@@ -15,9 +15,26 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import jdk.jfr.Enabled;
+import jdk.jfr.Event;
+import jdk.jfr.EventType;
+import jdk.jfr.Name;
+import jdk.jfr.StackTrace;
 
 /** Paired in-process service qualification; production loader, schedulers and feedback controller own all policy. */
 public final class StartupEmbeddedQualification {
+    @Name("rockserver.QualificationWrite") @Enabled(false) @StackTrace(false)
+    static final class PublicWrite extends Event {
+        public long sequence;
+        public boolean failed = true;
+        static final EventType TYPE = EventType.getEventType(PublicWrite.class);
+    }
+    @Name("rockserver.QualificationForeground") @Enabled(false) @StackTrace(false)
+    static final class Foreground extends Event {
+        public String mode;
+        public boolean failed = true;
+        static final EventType TYPE = EventType.getEventType(Foreground.class);
+    }
     private static final String EMBEDDED_MARKER = ".startup-embedded-qualification";
     private static Keys keys(byte[] bytes) { return new Keys(Buf.wrap(bytes)); }
     private static void verifyValue(Buf actual, int id) {
@@ -267,6 +284,8 @@ public final class StartupEmbeddedQualification {
                 var completedWrites = new AtomicLong(); var duringReads = new AtomicLong();
                 var start = new CountDownLatch(1);
                 var schedulerBefore = settledScheduler(scheduler);
+                var foregroundEvent = Foreground.TYPE.isEnabled() ? new Foreground() : null;
+                if (foregroundEvent != null) { foregroundEvent.mode = mode; foregroundEvent.begin(); }
                 long started = System.nanoTime();
                 long workDeadline = started + TimeUnit.SECONDS.toNanos(workloadSeconds);
                 output.put("scheduler_before", schedulerBefore);
@@ -327,8 +346,18 @@ public final class StartupEmbeddedQualification {
                             for (int sequence = 0; sequence < WRITES || readers.get() > 0; sequence++) {
                                 int id = sequence % WRITES; long cycle = System.nanoTime(); boolean activeReaders = readers.get() > 0;
                                 Keys requestKey = keys(writeKey(id)); Buf requestValue = Buf.wrap(value(~id));
-                                long before = System.nanoTime(); awaitRequest(async.putAsync(0, column, requestKey, requestValue, RequestType.none()), workDeadline);
-                                long ns = System.nanoTime() - before; write.record(ns);
+                                var writeEvent = PublicWrite.TYPE.isEnabled() ? new PublicWrite() : null;
+                                if (writeEvent != null) { writeEvent.sequence = sequence; writeEvent.begin(); }
+                                long before = System.nanoTime();
+                                long ns;
+                                try {
+                                    awaitRequest(async.putAsync(0, column, requestKey, requestValue, RequestType.none()), workDeadline);
+                                    ns = System.nanoTime() - before;
+                                    if (writeEvent != null) writeEvent.failed = false;
+                                } finally {
+                                    if (writeEvent != null) { writeEvent.end(); writeEvent.commit(); }
+                                }
+                                write.record(ns);
                                 if (before - openedAt < startupWindowMs * 1_000_000L) startupWrites.record(ns);
                                 verifyValue(awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline), ~id);
                                 completedWrites.incrementAndGet(); if (activeReaders) duringReads.incrementAndGet();
@@ -341,10 +370,17 @@ public final class StartupEmbeddedQualification {
                     try {
                         for (var task : tasks) awaitRequest(task, workDeadline);
                         foregroundEnded = System.nanoTime();
+                        if (foregroundEvent != null) foregroundEvent.failed = false;
                         output.put("cache_stats_before_final_capture", cacheStats(resources));
                         if (budget != null) output.put("admission_at_foreground_end", admission(budget));
                     }
-                    finally { running.set(false); pool.shutdownNow(); monitor.get(10, TimeUnit.SECONDS); }
+                    finally {
+                        try {
+                            if (foregroundEvent != null) { foregroundEvent.end(); foregroundEvent.commit(); }
+                        } finally {
+                            running.set(false); pool.shutdownNow(); monitor.get(10, TimeUnit.SECONDS);
+                        }
+                    }
                 }
                 output.put("foreground_elapsed_ns", foregroundEnded - started);
                 output.put("startup_post_open", Map.of(

@@ -14,10 +14,28 @@ import subprocess
 import tempfile
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urlparse
 from experiment_support import sha256
 
 MODES = ("none", "cache", "admission", "both")
+DIAGNOSTIC_EVENTS = ("rockserver.StartupIoPolicy", "rockserver.StartupIoStorageFeedback",
+                     "rockserver.ServicePut", "rockserver.NativePut",
+                     "rockserver.QualificationWrite", "rockserver.QualificationForeground")
+
+
+def diagnostic_settings(path):
+    config = ET.Element("configuration", version="2.0", label="Startup qualification diagnostics",
+                        description="Private timing and actual policy events; no request payloads", provider="Rockserver")
+    for name in (*DIAGNOSTIC_EVENTS, "jdk.GarbageCollection", "jdk.GCPhasePause", "jdk.ThreadPark", "jdk.DataLoss"):
+        event = ET.SubElement(config, "event", name=name)
+        ET.SubElement(event, "setting", name="enabled").text = "true"
+        ET.SubElement(event, "setting", name="stackTrace").text = "false"
+        if name == "jdk.ThreadPark":
+            ET.SubElement(event, "setting", name="threshold").text = "100 us"
+        elif name not in ("rockserver.StartupIoPolicy", "rockserver.StartupIoStorageFeedback", "jdk.DataLoss"):
+            ET.SubElement(event, "setting", name="threshold").text = "0 ns"
+    ET.ElementTree(config).write(path, encoding="utf-8", xml_declaration=True)
 
 
 def save(path, value):
@@ -134,6 +152,7 @@ def main():
     p.add_argument("--startup-window-ms", type=int, default=5000, help="Separate post-open public request-start window,100..60000ms")
     p.add_argument("--buffered-reads", action="store_true")
     p.add_argument("--prepare-only", action="store_true")
+    p.add_argument("--diagnostics-jfr", action="store_true", help="Opt-in bounded private recording; diagnostic results cannot qualify performance")
     a = p.parse_args()
     if not 0 <= a.read_ceiling_mib <= (2**63 - 1) // (1024**2):
         p.error("Read ceiling must be nonnegative and representable in signed bytes/second")
@@ -155,6 +174,9 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     classes = out / "classes"
     classes.mkdir()
+    jfr_settings = out / "diagnostics.jfc"
+    if a.diagnostics_jfr:
+        diagnostic_settings(jfr_settings)
     source_dir = Path(__file__).parent / "java"
     sources = [source_dir / (name + ".java") for name in ("StartupProductionQualification", "StartupEmbeddedQualification")]
     entries = [Path(v).resolve(strict=True) for v in a.classpath.split(os.pathsep)]
@@ -168,6 +190,9 @@ def main():
     manifest = {"scope": "Paired local EmbeddedConnection/EmbeddedDB in-process service qualification; network/transport and live production excluded",
                 "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                 "sources": [{"path": str(s), "sha256": sha256(s)} for s in sources],
+                "diagnostics_jfr": {"enabled": a.diagnostics_jfr, "events": DIAGNOSTIC_EVENTS,
+                    "maximum_recording_bytes": 256 * 1024**2,
+                    "scope": "Matched diagnostic timing only; recording overhead and possible data loss preclude performance acceptance"},
                 "runner_sha256": sha256(Path(__file__)), "runtime_artifacts": artifacts,
                 "expected_native_artifact": native_artifact, "expected_code_sources": expected_sources,
                 "java_option_environment": {name: os.environ.get(name) for name in
@@ -227,6 +252,9 @@ def main():
                    str(db), str(cache), mode, str(a.dataset_mib), str(a.operations), str(not a.buffered_reads).lower(),
                    str(a.data_sample_every), str(a.metadata_sample_every), str(a.capture_period_ms), str(a.timeout),
                    str(a.seed_hot_keys), str(a.seed_passes), str(a.startup_window_ms), str(a.read_ceiling_mib)]
+        if a.diagnostics_jfr:
+            command.insert(4, "-XX:StartFlightRecording=name=startup,settings=" + str(jfr_settings)
+                           + ",filename=" + str(out / (label + ".jfr")) + ",maxsize=256m,dumponexit=true")
         save(out / (label + ".command.json"), command)
         save(out / (label + ".identity-expected.json"), {"user_home": str(home),
             "native_artifact": native_artifact, "code_sources": expected_sources,
@@ -402,6 +430,8 @@ def main():
                 result = "PASS" if a.pairs >= 3 and min(gains) >= 1.10 and max(tails) <= 1.20 and max(tail_bounds) <= 1.20 else "INCONCLUSIVE_OR_REGRESSION"
                 if not exercised:
                     result = "INCONCLUSIVE_MECHANISM_NOT_EXERCISED"
+                if a.diagnostics_jfr:
+                    result = "DIAGNOSTIC_ONLY"
                 comparisons.append({"disk": disk_index, "mode": mode, "mechanism_exercised": exercised,
                     "paired_throughput_ratios": gains, "protected_p99_ratios": tails, "median_throughput_ratio": statistics.median(gains),
                     "protected_actual_p99_ratio_upper_bounds": tail_bounds,
