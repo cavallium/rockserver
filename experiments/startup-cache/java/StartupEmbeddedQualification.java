@@ -265,9 +265,9 @@ public final class StartupEmbeddedQualification {
                 output.put("seed_cache_stats_after_history", cacheStats(resources));
                 output.put("seed_cache_occupancy_after_history", cacheOccupancy(resources));
                 int status = captureIdle(resources);
-                if (status != 0) throw new IllegalStateException("Seed durable capture failed: " + status);
                 output.put("capture_status", status); output.put("cache_stats", cacheStats(resources));
                 output.put("seed_cache_occupancy_after_capture", cacheOccupancy(resources));
+                if (status != 0) throw new IllegalStateException("Seed durable capture failed: " + json(output));
                 output.put("cache_compatibility_id", resources.snapshotCaches().getFirst().compatibilityId());
                 Files.writeString(db.resolve(EMBEDDED_MARKER), "v1:" + count);
             } else if (checking) {

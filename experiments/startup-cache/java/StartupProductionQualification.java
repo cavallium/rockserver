@@ -124,8 +124,14 @@ public final class StartupProductionQualification {
         return Map.of("data", data.stats(), "metadata", metadata.stats());
     }
     static int captureBoth(SnapshotCache data, SnapshotCache metadata) throws InterruptedException {
-        int dataStatus = capture(data).status(), metadataStatus = capture(metadata).status();
-        return Math.max(dataStatus, metadataStatus);
+        var dataResult = capture(data);
+        var metadataResult = capture(metadata);
+        int status = Math.max(dataResult.status(), metadataResult.status());
+        if (status != 0) System.err.println("Snapshot capture incomplete: " + json(Map.of(
+                "data_status", dataResult.status(), "data_message", dataResult.message(),
+                "metadata_status", metadataResult.status(), "metadata_message", metadataResult.message(),
+                "cache_stats", stats(data, metadata))));
+        return status;
     }
     static void flushToLevelOne(RocksDB db, FlushOptions flush) throws RocksDBException {
         db.flush(flush);
