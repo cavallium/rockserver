@@ -151,6 +151,17 @@ This section and the remaining gates at the end describe the current branch.
   post-Ready ledger snapshot/candidate/encoded-image amplification. No ENOMEM
   failure was reproduced in those paths. Their captured control-memory envelope,
   full node bounds and final private JNI/wrapper integration remain open.
+- Native checkpoint `36d6dee` removes the full caller ledger snapshot from
+  completion cleanup. It reads only the selected claim's root, recovered output
+  descriptors and recovery-child IDs under the ledger lock, preserving namespace
+  serialization and reconciliation ordering. Projection allocation failure returns
+  before force. The affected XFS file-system and completion/recovery suites pass
+  all 68 cases (`control-cleanup-*.log`). Candidate-state validation and force
+  serialization still lack captured control-RAM admission; this reduction does
+  not establish the full memory envelope. Writer inspection confirms more than
+  two simultaneous retained WAL owners, plus precreation/replacement and MANIFEST
+  rotation. The buffer fix must fund ordinary retained owners and preserve
+  next-WAL/two-MANIFEST completion capacity through actual buffer destruction.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
