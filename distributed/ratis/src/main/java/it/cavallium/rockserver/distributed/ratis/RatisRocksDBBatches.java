@@ -52,10 +52,18 @@ public final class RatisRocksDBBatches implements AutoCloseable {
     private static void validateMutationProfile(RequestContext context) {it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(0,ignored -> {},PutBatchMode.WRITE_BATCH));}
     public CompletableFuture<Progress> append(RemoteMutationToken token,long ordinal,KVBatch batch,byte[] inputDigest,RequestContext context) {
         final Task task; try { validateMutationProfile(context); task=reserve(context); } catch(Exception failure) {return CompletableFuture.failedFuture(failure);}
-        final List<DistributedCommand> chunks; final byte[] actual;
-        try {if(!persistence.tryLock())throw new IOException("Bulk copied input busy");try {var r=exact(token);chunks=copy(batch,r.column,r.merge);actual=RemoteMutationInputs.batch(r.column,r.merge,batch);if(!Arrays.equals(actual,inputDigest))throw new IOException("Copied batch digest differs");}finally{persistence.unlock();}}
-        catch(Exception failure){task.schedule(() -> {throw failure;});return task.view;}
-        task.schedule(() -> {persistence.lock();try {var r=exact(token);if(r.resultAcknowledged)throw new IOException("Bulk result already acknowledged");if(!r.inputDigests.containsKey(ordinal) && (!r.chunks.isEmpty() || r.eof || r.failure!=null))throw new IOException("Resolve previous copied batch before append");boolean olderDuplicate=r.inputDigests.containsKey(ordinal) && ordinal<r.copiedBatches-1;journal.remoteInput(ordinal,actual,chunks);refreshProgress();if(!olderDuplicate)drain(task);task.settle(snapshot(),null);}finally{persistence.unlock();}});return task.view;
+        byte[] expected=inputDigest!=null && inputDigest.length==32?inputDigest.clone():null;
+        task.schedule(() -> {persistence.lock();try {
+            task.check();if(expected==null)throw new IOException("Invalid input digest");var r=exact(token);if(r.resultAcknowledged)throw new IOException("Bulk result already acknowledged");
+            if(ordinal<0)throw new IOException("Negative input ordinal");
+            if(ordinal<=r.retiredInputThrough)throw new RatisBulkInputExpiredException(ordinal,r.retiredInputThrough);
+            var frozen=freeze(batch,r.column);var actual=RemoteMutationInputs.batch(r.column,r.merge,frozen);
+            if(!Arrays.equals(actual,expected))throw new IOException("Copied batch digest differs");
+            boolean retained=journal.retainedInput(ordinal,actual);
+            if(retained){if(ordinal==r.copiedBatches-1 && journal.unresolvedInput())drain(task);}
+            else {if(r.failure!=null)throw new IOException("Bulk input has terminal partial failure");var chunks=copy(frozen,r.column,r.merge);journal.remoteInput(ordinal,actual,chunks);refreshProgress();drain(task);}
+            task.settle(snapshot(),null);
+        }finally{persistence.unlock();}});return task.view;
     }
     public CompletableFuture<Progress> finishInput(RemoteMutationToken token,RequestContext context) { try { validateMutationProfile(context); var task=reserve(context);task.schedule(() -> { persistence.lock();try { var r=exact(token);if(r.resultAcknowledged || !r.chunks.isEmpty() || r.pending!=null)throw new IOException("Bulk copied input remains unresolved");journal.eof();refreshProgress();task.settle(snapshot(),null); } finally { persistence.unlock(); } });return task.view; } catch(Exception failure) {return CompletableFuture.failedFuture(failure);} }
     public RemoteMutationStatus status(RemoteMutationToken token) throws IOException { if(!persistence.tryLock())return new RemoteMutationStatus(token,RemoteMutationStatus.State.PENDING,-1,-1,0,null,null);try {var released=receipts.find(token);if(released!=null)return released;var retained=journal.request();if(retained==null || retained.token==null || !retained.token.requestId().equals(token.requestId()))return new RemoteMutationStatus(token,RemoteMutationStatus.State.UNAVAILABLE,-1,-1,0,null,null);var r=exact(token); var state=r.resultAcknowledged?RemoteMutationStatus.State.ACKNOWLEDGED:r.complete() || r.failure!=null?RemoteMutationStatus.State.TERMINAL:r.copiedBatches==0?RemoteMutationStatus.State.PREPARED:RemoteMutationStatus.State.PENDING;return new RemoteMutationStatus(token,state,r.acknowledgedMutations,r.copiedBatches,0,r.complete() || r.failure!=null?RatisBatchRequestJournal.terminalOutcome(r):null,state==RemoteMutationStatus.State.TERMINAL || state==RemoteMutationStatus.State.ACKNOWLEDGED?RatisBatchRequestJournal.resultDigest(r):null); } finally {persistence.unlock();} }
@@ -75,6 +83,19 @@ public final class RatisRocksDBBatches implements AutoCloseable {
             task.armDeadline();
         } return task; }
     }
+    /** Runs only inside the admitted scheduler job. Hash and native commands consume this same immutable logical copy. */
+    private KVBatch freeze(KVBatch input,long column){
+        var keys=Objects.requireNonNull(input.keys());var values=Objects.requireNonNull(input.values());int count=keys.size();
+        if(count!=values.size() || count>MAX_INPUT_ITEMS)throw new IllegalArgumentException("Invalid copied input count");
+        var selectedKeys=new ArrayList<Keys>(count);var selectedValues=new ArrayList<it.cavallium.buffer.Buf>(count);long bytes=0;int components=schema.column(column).schema().keys().size();
+        for(int n=0;n<count;n++){
+            var source=Objects.requireNonNull(keys.get(n)).keys();if(source.length!=components)throw new IllegalArgumentException("Logical key component count changed");
+            var copied=new it.cavallium.buffer.Buf[components];for(int c=0;c<components;c++){var part=Objects.requireNonNull(source[c]);int length=part.size();bytes=Math.addExact(bytes,4L+length);if(bytes>MAX_INPUT_BYTES)throw new IllegalArgumentException("Copied logical input exceeds bound");copied[c]=freezeBytes(part,length);}
+            var value=values.get(n);int valueLength=value==null?0:value.size();bytes=Math.addExact(bytes,4L+valueLength);if(bytes>MAX_INPUT_BYTES)throw new IllegalArgumentException("Copied logical input exceeds bound");selectedKeys.add(new Keys(copied));selectedValues.add(value==null?null:freezeBytes(value,valueLength));
+        }
+        return new KVBatch.KVBatchRef(List.copyOf(selectedKeys),Collections.unmodifiableList(selectedValues));
+    }
+    private static it.cavallium.buffer.Buf freezeBytes(it.cavallium.buffer.Buf source,int size){byte[] bytes=new byte[size];for(int n=0;n<size;n++)bytes[n]=source.getByte(n);if(source.size()!=size)throw new IllegalArgumentException("Logical component length changed during copy");return it.cavallium.buffer.Buf.wrap(bytes);}
     private List<DistributedCommand> copy(KVBatch batch,long column,boolean merge) {
         var keys=Objects.requireNonNull(batch.keys()); var values=Objects.requireNonNull(batch.values());
         if(keys.size()!=values.size() || keys.size()>MAX_INPUT_ITEMS) throw new IllegalArgumentException("Invalid copied KVBatch counts");
@@ -118,7 +139,7 @@ public final class RatisRocksDBBatches implements AutoCloseable {
                 var unresolved=session.pending().stream().filter(p -> !p.consumed()).toList(); if(unresolved.size()>1) throw new IOException("Bulk session lost exclusive ownership");
                 pending=unresolved.isEmpty() ? session.prepareAt(r.directory,expected.mutations(),List.of()) : unresolved.getFirst(); require(expected,pending); journal.bind(pending.command().operationId());
             }
-            require(expected,pending); var result=session.execute(pending,task.context,task::check); journal.result(result); session.acknowledge(pending,task.context,task::check); var hook=beforeAcknowledgementMarker; if(hook!=null) hook.run(); journal.acknowledged(); refreshProgress(); task.check();
+            require(expected,pending); var result=session.execute(pending,task.context,task::check); journal.result(result); session.acknowledge(pending,task.context,task::check);session.recoverReroutes(task.context,task::check,false); var hook=beforeAcknowledgementMarker; if(hook!=null) hook.run(); journal.acknowledged(); refreshProgress(); task.check();
         }
     }
     @FunctionalInterface private interface Work { void run() throws Exception; }

@@ -110,6 +110,14 @@ class RatisRocksDBBatchesTest {
         }
     }
 
+    @Test void completedInputRetryNeverDrainsAnotherUnresolvedCopiedBatch()throws Exception {
+        try(var x=new Fixture()){
+            var token=prepare(x.batches);var first=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.key(2)),List.of(RatisAtomicClientTest.value(1)));var second=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.key(3)),List.of(RatisAtomicClientTest.value(2)));
+            x.batches.append(token,0,first,RemoteMutationInputs.batch(71,false,first),RequestContext.batch()).get(10,TimeUnit.SECONDS);x.lose.set(true);var failed=x.batches.append(token,1,second,RemoteMutationInputs.batch(71,false,second),RequestContext.batch());assertThrows(ExecutionException.class,()->failed.get(10,TimeUnit.SECONDS));x.batches.actualCompletion(failed).get(10,TimeUnit.SECONDS);int writes=x.writes.size();
+            var unchanged=x.batches.append(token,0,first,RemoteMutationInputs.batch(71,false,first),RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(writes,x.writes.size());assertTrue(unchanged.retainedChunks()>0);x.batches.append(token,1,second,RemoteMutationInputs.batch(71,false,second),RequestContext.batch()).get(10,TimeUnit.SECONDS);x.batches.finishInput(token,RequestContext.batch()).get(10,TimeUnit.SECONDS);x.batches.acknowledgeResult(token,x.batches.status(token).resultDigest());
+        }
+    }
+
     public static class AppendOperator extends it.cavallium.rockserver.core.impl.FFMByteArrayMergeOperator {
         public AppendOperator(String identity) { super(identity); }
         @Override public byte[] merge(byte[] key,byte[] existing,List<byte[]> operands) { var bytes=new java.io.ByteArrayOutputStream(); if(existing!=null) bytes.writeBytes(existing); operands.forEach(bytes::writeBytes); return bytes.toByteArray(); }
@@ -142,7 +150,16 @@ class RatisRocksDBBatchesTest {
                 }
                 try(var session=RatisDurableSessionClient.reopen(window,routed); var batches=new RatisRocksDBBatches(schema,routed,session,scheduler,journal,RatisRocksDBBatches.SessionOwnership.BORROWED)) {
                     var progress=batches.resumeRetained(RequestContext.batch()).get(10,TimeUnit.SECONDS); assertEquals(3,progress.acknowledgedMutations()); assertEquals(writes.getFirst().operationId(),writes.getLast().operationId());
-                    byte[] raw=routed.read(column,new byte[]{10,0}); var bucket=schema.decodeBucket(column,new byte[]{10,0},raw); assertArrayEquals(new byte[]{1,2,3},bucket.get(List.of("a".getBytes()))); assertArrayEquals(new byte[]{9},bucket.get(List.of("b".getBytes()))); int count=writes.size(); batches.append(token,0,batch,RemoteMutationInputs.batch(1,true,batch),RequestContext.batch()).get(10,TimeUnit.SECONDS); assertEquals(count,writes.size()); batches.finishInput(token,RequestContext.batch()).get(10,TimeUnit.SECONDS); batches.acknowledgeResult(token,batches.status(token).resultDigest());
+                    byte[] raw=routed.read(column,new byte[]{10,0}); var bucket=schema.decodeBucket(column,new byte[]{10,0},raw); assertArrayEquals(new byte[]{1,2,3},bucket.get(List.of("a".getBytes()))); assertArrayEquals(new byte[]{9},bucket.get(List.of("b".getBytes()))); int count=writes.size(); batches.append(token,0,batch,RemoteMutationInputs.batch(1,true,batch),RequestContext.batch()).get(10,TimeUnit.SECONDS); assertEquals(count,writes.size());
+                    var tiny=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.member(10,"a")),List.of(RatisAtomicClientTest.value(4)));byte[] tinyDigest=RemoteMutationInputs.batch(1,true,tiny);
+                    for(int ordinal=1;ordinal<=4100;ordinal++)batches.append(token,ordinal,tiny,tinyDigest,RequestContext.batch()).get(10,TimeUnit.SECONDS);
+                    var expired=assertThrows(ExecutionException.class,()->batches.append(token,0,batch,RemoteMutationInputs.batch(1,true,batch),RequestContext.batch()).get(10,TimeUnit.SECONDS));assertInstanceOf(RatisBulkInputExpiredException.class,expired.getCause());assertEquals(RemoteMutationStatus.State.PENDING,batches.status(token).state());assertEquals(0,batches.owner().nextRequestSequence());
+                    int applied=writes.size();batches.append(token,4100,tiny,tinyDigest,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(applied,writes.size());
+                }
+                try(var session=RatisDurableSessionClient.reopen(window,routed);var batches=new RatisRocksDBBatches(schema,routed,session,scheduler,journal,RatisRocksDBBatches.SessionOwnership.BORROWED)){
+                    var tiny=new KVBatch.KVBatchRef(List.of(RatisAtomicClientTest.member(10,"a")),List.of(RatisAtomicClientTest.value(4)));byte[] digest=RemoteMutationInputs.batch(1,true,tiny);int applied=writes.size();batches.append(token,4100,tiny,digest,RequestContext.batch()).get(10,TimeUnit.SECONDS);assertEquals(applied,writes.size());batches.append(token,4101,tiny,digest,RequestContext.batch()).get(10,TimeUnit.SECONDS);
+                    var expected=new byte[4104];expected[0]=1;expected[1]=2;expected[2]=3;Arrays.fill(expected,3,expected.length,(byte)4);assertArrayEquals(expected,schema.decodeBucket(column,new byte[]{10,0},routed.read(column,new byte[]{10,0})).get(List.of("a".getBytes())));
+                    batches.finishInput(token,RequestContext.batch()).get(10,TimeUnit.SECONDS);batches.acknowledgeResult(token,batches.status(token).resultDigest());
                 }
             }
         } finally { scheduler.disposeGracefully().block(java.time.Duration.ofSeconds(10)); }
