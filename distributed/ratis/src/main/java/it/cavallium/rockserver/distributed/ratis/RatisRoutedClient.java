@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -1187,10 +1189,19 @@ public final class RatisRoutedClient implements AutoCloseable {
                                              List<KeyPredicate> predicates, long acknowledgedThrough) {
         return prepareInternal(current(),operation,mutations,predicates,acknowledgedThrough);
     }
+    interface OwnerDirectoryLease extends AutoCloseable {@Override void close();}
+    private static final class OwnerDirectory {final RangeDirectory directory;int owners;OwnerDirectory(RangeDirectory directory){this.directory=directory;}}
+    private final Map<String,OwnerDirectory> ownerDirectories=new HashMap<>();
+    /** Trusted forced owner-root restoration only; never changes current routing or accepts a caller-selected schema. */
+    synchronized OwnerDirectoryLease retainOwnerDirectory(RatisSessionBindingPlan plan){
+        requireOpen();var frozen=plan.directory();requireIdentity(frozen);var digest=java.util.HexFormat.of().formatHex(frozen.payloadDigest());var retained=ownerDirectories.get(digest);
+        if(retained==null){if(ownerDirectories.size()>=64)throw new IllegalStateException("Retained owner directory capacity exhausted");retained=new OwnerDirectory(frozen);ownerDirectories.put(digest,retained);}retained.owners=Math.addExact(retained.owners,1);var owner=retained;
+        return new OwnerDirectoryLease(){boolean released;public void close(){synchronized(RatisRoutedClient.this){if(released)return;released=true;if(--owner.owners==0)ownerDirectories.remove(digest,owner);}}};
+    }
     /** Resume a forced complete request using its exact locally qualified original directory. */
     public synchronized PreparedCommand prepareAt(RangeDirectory original,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,long acknowledgedThrough) {
         requireOpen(); requireIdentity(Objects.requireNonNull(original));
-        if (!Arrays.equals(original.payloadDigest(),directory.payloadDigest()) && acceptedSchemas.stream().noneMatch(known -> Arrays.equals(known.payloadDigest(),original.payloadDigest()))) throw new IllegalArgumentException("Original directory was not qualified for this client");
+        if (!Arrays.equals(original.payloadDigest(),directory.payloadDigest()) && acceptedSchemas.stream().noneMatch(known -> Arrays.equals(known.payloadDigest(),original.payloadDigest())) && !ownerDirectories.containsKey(java.util.HexFormat.of().formatHex(original.payloadDigest()))) throw new IllegalArgumentException("Original directory was not qualified for this client");
         return prepareInternal(original,operation,mutations,predicates,acknowledgedThrough);
     }
     private PreparedCommand prepareInternal(RangeDirectory observed,OperationId operation,List<Mutation> mutations,List<KeyPredicate> predicates,long acknowledgedThrough) {
@@ -1284,6 +1295,12 @@ public final class RatisRoutedClient implements AutoCloseable {
                 || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch()
                 || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE) throw new IllegalArgumentException("Invalid recovered control route");
         return new PreparedCommand(observed,descriptor,command);
+    }
+    /** Only journal recovery uses this exact binding source; fresh binding still requires the current placement. */
+    PreparedCommand restoreBindingControl(DistributedCommand command,RangeDirectory frozen,RangeDescriptor descriptor){
+        Objects.requireNonNull(frozen);requireIdentity(frozen);var control=command.sessionControl();
+        if(control==null || !control.binding() || command.kind()!=DistributedCommand.Kind.SESSION_CONTROL || !control.authority().clusterId().equals(frozen.clusterId()) || !control.authority().databaseId().equals(frozen.databaseId()) || !Arrays.equals(command.schemaDigest(),frozen.schemaDigest()) || !command.groupId().equals(descriptor.groupId()) || command.rangeEpoch()!=descriptor.rangeEpoch() || descriptor.topologyState()!=RangeDescriptor.TopologyState.ACTIVE || frozen.ranges().stream().noneMatch(descriptor::equals))throw new IllegalArgumentException("Retained binding differs from its frozen source");
+        return new PreparedCommand(frozen,descriptor,command);
     }
     /** Restore an immutable user retry route without rebasing it onto the current topology. */
     PreparedCommand restoreSessionCommand(DistributedCommand command,RangeDescriptor descriptor) {

@@ -47,6 +47,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
                     throw new IOException("Wrong maintenance journal identity");
                 }
                 rangeEpoch=input.readLong();
+                if(!Arrays.equals(input.readNBytes(32),bindingDigest()) || clockRoute!=null && rangeEpoch!=clockRoute.descriptor().rangeEpoch())throw new IOException("Retained maintenance frozen binding changed");
                 state=decode(input);
                 if (input.available()!=0) throw new IOException("Trailing maintenance journal data");
                 // Also seals an atomic rename whose previous owner could not confirm the directory force.
@@ -64,7 +65,11 @@ public final class RatisSessionMaintenance implements AutoCloseable {
         }
     }
     static RatisSessionMaintenance frozenBinding(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,RangeDirectory directory)throws IOException{
-        if(!Arrays.equals(RangeDirectoryCodec.encode(directory),RangeDirectoryCodec.encode(routed.directory())))throw new IOException("Fresh grant target changed before maintenance admission");var descriptor=directory.ranges().stream().filter(range->range.groupId().equals(group)&&range.topologyState()==RangeDescriptor.TopologyState.ACTIVE).findFirst().orElseThrow(()->new IOException("Fresh grant target absent from frozen directory"));var owner=new RatisSessionMaintenance(journal,epochs,routed,group,new ClockRoute(directory,descriptor,false));owner.bindingDirectory=directory;return owner;
+        boolean retained=Files.exists(journal,LinkOption.NOFOLLOW_LINKS),current=Arrays.equals(directory.payloadDigest(),routed.directory().payloadDigest());
+        if(!retained && Files.exists(journal.resolveSibling(journal.getFileName()+".lock"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Used binding maintenance journal is missing");
+        if(!retained && !current)throw new IOException("Fresh grant target changed before maintenance admission");var descriptor=directory.ranges().stream().filter(range->range.groupId().equals(group)&&range.topologyState()==RangeDescriptor.TopologyState.ACTIVE).findFirst().orElseThrow(()->new IOException("Fresh grant target absent from frozen directory"));
+        var owner=new RatisSessionMaintenance(journal,epochs,routed,group,new ClockRoute(directory,descriptor,false));
+        if(!current && owner.pendingCommand()==null && owner.propagated()==null){owner.close();throw new IOException("No exact retained binding permits old-placement recovery");}owner.bindingDirectory=directory;return owner;
     }
     public synchronized DistributedCommand pendingCommand() { return state.pending()==null ? null : state.pending().command(); }
     public synchronized SessionAuthority propagated() { return state.propagated(); }
@@ -138,7 +143,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
     private void persist(State next) throws IOException {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
-            output.writeInt(MAGIC); output.write(identity); uuid(output,group); output.writeLong(rangeEpoch);
+            output.writeInt(MAGIC); output.write(identity); uuid(output,group); output.writeLong(rangeEpoch);output.write(bindingDigest());
             uuid(output,next.session()); output.writeLong(next.epoch()); output.writeLong(next.nextSequence()); output.writeLong(next.acknowledgedThrough());
             blob(output,next.propagated()==null ? null : new RangeSessionControl(next.propagated(),null,0).encode());
             blob(output,next.pending()==null ? null : DistributedCommandCodec.encode(next.pending().command()));
@@ -147,6 +152,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             SessionJournalFiles.write(journal,body,MAX_JOURNAL);
         } catch (IOException failure) { fenced=true; throw failure; }
     }
+    private byte[] bindingDigest(){return clockRoute!=null && !clockRoute.metadataOnly()?clockRoute.directory().payloadDigest():new byte[32];}
     private byte[] readJournal() throws IOException { return SessionJournalFiles.read(journal,MAX_JOURNAL); }
     private State decode(DataInputStream input) throws IOException {
         var session=uuid(input); long epoch=input.readLong(), sequence=input.readLong(), acknowledged=input.readLong();
@@ -164,7 +170,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
                 var command=DistributedCommandCodec.decode(pending); var descriptor=route(input);
                 if (!command.operationId().equals(new OperationId(session,epoch,sequence)) || command.acknowledgedThrough()!=acknowledged
                         || !command.groupId().equals(group) || command.rangeEpoch()!=rangeEpoch) throw new IOException("Pending maintenance identity changed");
-                prepared=clockRoute!=null && !command.sessionControl().binding() ? routed.restoreMetadataSessionControl(command,clockRoute.directory(),descriptor) : routed.restoreSessionControl(command,descriptor);
+                prepared=clockRoute==null?routed.restoreSessionControl(command,descriptor):command.sessionControl().binding()?routed.restoreBindingControl(command,clockRoute.directory(),descriptor):routed.restoreMetadataSessionControl(command,clockRoute.directory(),descriptor);
             }
             return new State(session,epoch,sequence,acknowledged,cut==null ? null : cut.authority(),prepared);
         } catch (IllegalArgumentException invalid) { throw new IOException("Invalid maintenance journal state",invalid); }
