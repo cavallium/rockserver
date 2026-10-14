@@ -15,7 +15,7 @@ import java.util.*;
 public final class RatisNodeManifest {
     /** Includes the file checksum; encoded bodies leave room for its 32 bytes. */
     public static final int MAX_BYTES=RatisNodePlan.MAX_METADATA_BYTES;
-    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=540;
+    private static final int MAGIC=0x524e4d46, MAX_NAME_BYTES=4096, SETTINGS_BYTES=484+RatisNativeExtentPolicy.BYTES;
     private static final Comparator<UUID> UUID_ORDER=(a,b) -> {
         int first=Long.compareUnsigned(a.getMostSignificantBits(),b.getMostSignificantBits());
         return first!=0 ? first : Long.compareUnsigned(a.getLeastSignificantBits(),b.getLeastSignificantBits());

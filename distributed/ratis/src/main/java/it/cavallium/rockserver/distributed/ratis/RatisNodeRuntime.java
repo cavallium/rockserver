@@ -123,6 +123,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private RatisTopologyOwnerClient topologyOwners;private boolean topologyOwnersClosed;
     private long groupManagementCall;
     private final Set<UUID> virginSeedAdds=new HashSet<>();
+    private static final int NODE_IDENTITY_BYTES=65+RatisNativeExtentPolicy.BYTES;
     private org.rocksdb.NativeExtentEnv nativeExtentEnv;private boolean nativeExtentBound;
     private final Map<UUID,PoolOwner> pools=new LinkedHashMap<>();private final Map<UUID,UUID> groupPools=new ConcurrentHashMap<>(); private RaftServer server; private RatisCatalogueClock clock;
     static RatisNodeResourceBudget.Limits poolResources(RatisNodeResourceBudget.Limits spec,RatisNodeResourceBudget.Limits ceiling){return new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(Math.min(spec.ordinary().bytes(),ceiling.ordinary().bytes()),Math.min(spec.ordinary().owners(),ceiling.ordinary().owners())),new RatisNodeResourceBudget.Lane(Math.min(spec.protectedLane().bytes(),ceiling.protectedLane().bytes()),Math.min(spec.protectedLane().owners(),ceiling.protectedLane().owners())));}
@@ -172,7 +173,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 synchronized(RatisNodeRuntime.this){
                     if(!reference.nodeIncarnation().equals(plan.nodeIncarnation()) || reference.processIncarnation().equals(snapshotProcessIncarnation) || !started || closeRequested || closing || closed || lock==null || !lock.isValid() || lockChannel==null || !lockChannel.isOpen())return false;
                     // This incarnation has one established root. Its prior owner must drain native resources before surrendering this lock, or exit the process.
-                    return identityExposed(SessionJournalFiles.read(root.resolve("node.identity"),128));
+                    return identityExposed(SessionJournalFiles.read(root.resolve("node.identity"),NODE_IDENTITY_BYTES));
                 }
             }
             public RatisSnapshotCohortService.Member member(UUID group,SnapshotFence fence,boolean ready)throws Exception{
@@ -357,9 +358,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if(nativeExtentBound && !Files.isRegularFile(journal,LinkOption.NOFOLLOW_LINKS))throw new IOException("Original native extent journal is missing");
         for(var path:layout.directories()){if(nativeExtentBound && !Files.isDirectory(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Established native extent directory is missing: "+path);createAndForceNativeDirectory(path);}
         SessionJournalFiles.force(root);
-        try{nativeExtentEnv=new org.rocksdb.NativeExtentEnv(journal.toString(),layout.roots().stream().map(Path::toString).toList(),settings.resources().nativeExtents().limits());}
+        try(var memoryOwner=new org.rocksdb.NativeRawFlushLimits(settings.resources().nativeExtents().raw())){nativeExtentEnv=new org.rocksdb.NativeExtentEnv(journal.toString(),layout.roots().stream().map(Path::toString).toList(),settings.resources().nativeExtents().limits(),memoryOwner);}
         catch(org.rocksdb.RocksDBException failure){throw new IOException("Cannot bind original shared native extent environment",failure);}
-        if(!nativeExtentBound){nativeExtentBound=true;SessionJournalFiles.write(identity,identity(false),128);}
+        if(!nativeExtentBound){nativeExtentBound=true;SessionJournalFiles.write(identity,identity(false),NODE_IDENTITY_BYTES);}
     }
     private static void createAndForceNativeDirectory(Path path)throws IOException {
         var missing=new ArrayList<Path>();for(Path current=path;current!=null && !Files.exists(current,LinkOption.NOFOLLOW_LINKS);current=current.getParent())missing.add(current);
@@ -384,7 +385,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         var extentLayout=nativeExtentLayout();
         Path identity=root.resolve("node.identity"), logs=root.resolve("raft"), nativePath=root.resolve("native");
         if (Files.exists(identity,LinkOption.NOFOLLOW_LINKS)) {
-            int phase=identityPhase(SessionJournalFiles.read(identity,128));nativeExtentBound=phase>=1;boolean exposed=phase==2;
+            int phase=identityPhase(SessionJournalFiles.read(identity,NODE_IDENTITY_BYTES));nativeExtentBound=phase>=1;boolean exposed=phase==2;
             if (!exposed && startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Interrupted initial placement requires explicit authorization to resume");
             if (exposed) {
                 for(var spec:plan.pools().values())if(!Files.isRegularFile(spec.nativePath(root).resolve("CURRENT")))throw new IOException("Established native pool state is missing; refuse empty-voter recovery: "+spec.id());
@@ -402,7 +403,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 if(directory.equals("native")){requireInitialPoolStaging(path);continue;}
                 if (Files.exists(path)) try (var entries=Files.list(path)) { if (entries.findAny().isPresent()) throw new IOException("Unidentified node data must not be adopted"); }
             }
-            SessionJournalFiles.write(identity,identity(false),128);
+            SessionJournalFiles.write(identity,identity(false),NODE_IDENTITY_BYTES);
         }
         for (String directory:List.of("native","raft","sessions","recovery","schema-replicas")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
         SessionJournalFiles.force(root);
@@ -876,7 +877,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         try {
             for(var entry:routedClients.entrySet())if(!Arrays.equals(entry.getValue().directory().payloadDigest(),startupDirectories.get(entry.getKey()).payloadDigest()))throw new IOException("Node placement changed before start");
             // Persist before the first possible network/voting exposure, including a start attempt that later fails.
-            SessionJournalFiles.write(root.resolve("node.identity"),identity(true),128);
+            SessionJournalFiles.write(root.resolve("node.identity"),identity(true),NODE_IDENTITY_BYTES);
             server.start(); var existing=new HashSet<RaftGroupId>(); server.getGroupIds().forEach(existing::add);
             if (!machines.keySet().containsAll(existing)) throw new IOException("Server recovered an unplanned group");
             for (var group:groups.raftGroups()) if (!existing.contains(group.getGroupId()))addGroup(group);

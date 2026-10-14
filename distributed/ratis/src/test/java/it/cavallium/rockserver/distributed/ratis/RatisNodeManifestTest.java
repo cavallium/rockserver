@@ -21,7 +21,9 @@ class RatisNodeManifestTest {
         var original=manifest(false);var base=original.settings();
         var node=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(128L*1024*1024,64),new RatisNodeResourceBudget.Lane(64L*1024*1024,32));
         var pool=new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(32L*1024*1024,16),new RatisNodeResourceBudget.Lane(16L*1024*1024,8));
-        var limits=new RatisNodeRuntime.ResourceLimits(node,pool,1L<<30,1L<<40,16L<<30,13L<<30,RatisCommittedApplyDispatcher.Policy.defaults(),RatisDiskRunway.Policy.defaults(),RatisMigrationController.Policy.defaults(),RatisNativeExtentPolicy.defaults());
+        var defaults=RatisNativeExtentPolicy.defaults();
+        var nativePolicy=new RatisNativeExtentPolicy(defaults.filesystemOrdinaryBytes(),defaults.filesystemProtectedBytes(),defaults.nodeOrdinaryBytes(),defaults.nodeProtectedBytes(),defaults.quantum(),defaults.maximumFiles(),defaults.maximumAliases(),defaults.maximumStateBytes(),new org.rocksdb.NativeRawFlushLimits.Limits(12000,2400,32L<<20,96L<<20,2L<<30,300000,9000000));
+        var limits=new RatisNodeRuntime.ResourceLimits(node,pool,1L<<30,1L<<40,16L<<30,13L<<30,RatisCommittedApplyDispatcher.Policy.defaults(),RatisDiskRunway.Policy.defaults(),RatisMigrationController.Policy.defaults(),nativePolicy);
         var settings=new RatisNodeRuntime.Settings(base.images(),base.retention(),base.clockPeriod(),base.propagationVisits(),base.maxPropagationRanges(),base.shutdownTimeout(),base.exports(),limits);
         var value=new RatisNodeManifest(original.schemas().values(),original.plan(),settings,original.readThreads(),original.writeThreads());
         var cold=RatisNodeManifest.decode(RatisNodeManifest.encode(value));assertEquals(limits,cold.settings().resources());
@@ -192,9 +194,11 @@ class RatisNodeManifestTest {
         byte[] reversed=valid.clone(); System.arraycopy(valid,bindings,reversed,second,16); System.arraycopy(valid,second,reversed,bindings,16);
         assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(reversed));
         byte[] groupBudget=valid.clone(); ByteBuffer.wrap(groupBudget).putInt(tail+64,1); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(groupBudget));
-        int settingsStart=valid.length-540;
+        int settingsStart=valid.length-(484+RatisNativeExtentPolicy.BYTES);
         for(int offset:new int[]{0,8,16,24,32,48}){byte[] bad=valid.clone();ByteBuffer.wrap(bad).putLong(settingsStart+484+offset,0);assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(bad));}
         for(int offset:new int[]{40,44}){byte[] bad=valid.clone();ByteBuffer.wrap(bad).putInt(settingsStart+484+offset,0);assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(bad));}
+        for(int offset:new int[]{0,8}){byte[] bad=valid.clone();ByteBuffer.wrap(bad).putLong(settingsStart+540+offset,-1);assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(bad));}
+        for(int offset:new int[]{16,24,32,40,48}){byte[] bad=valid.clone();ByteBuffer.wrap(bad).putLong(settingsStart+540+offset,0);assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(bad));}
         for(int offset=0;offset<48;offset+=8){byte[] bad=valid.clone();ByteBuffer.wrap(bad).putLong(settingsStart+428+offset,0);assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(bad));}
         for(int offset:new int[]{48,52}){byte[] bad=valid.clone();ByteBuffer.wrap(bad).putInt(settingsStart+428+offset,0);assertThrows(IllegalArgumentException.class,()->RatisNodeManifest.decode(bad));}
         for (int offset:new int[] {settingsStart+72,settingsStart+76}) { byte[] bad=valid.clone(); ByteBuffer.wrap(bad).putInt(offset,2); assertThrows(IllegalArgumentException.class,() -> RatisNodeManifest.decode(bad)); }

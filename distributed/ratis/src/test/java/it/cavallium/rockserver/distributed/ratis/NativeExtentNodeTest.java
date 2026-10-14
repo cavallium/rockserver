@@ -28,7 +28,7 @@ class NativeExtentNodeTest {
             var plan=plan(f);var policy=RatisNativeExtentPolicy.defaults();var server=new RatisNodeRuntimeTest.FakeServer();
             try(var node=open(f,plan,server,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,policy)){node.start();assertTrue(nativeEnv(node).isOwningHandle());
                 for(var schema:f.schemas){var store=f.store(server,group(plan,schema));put(store,schema,0,(byte)1,new byte[]{(byte)(schema==f.first?7:9)});var pool=node.nativePool(node.poolId(group(plan,schema)));pool.flushLocal(pool.maintenanceSession(),schema.columnIds().iterator().next());}
-                assertEquals(2,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),128)[0]);assertTrue(Files.isRegularFile(f.env.nodeRoot.resolve("native-extents.journal")));
+                assertEquals(2,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),65+RatisNativeExtentPolicy.BYTES)[0]);assertTrue(Files.isRegularFile(f.env.nodeRoot.resolve("native-extents.journal")));
             }
             server=new RatisNodeRuntimeTest.FakeServer();try(var node=open(f,plan,server,RatisNodeRuntime.Startup.RECOVER,policy)){node.start();for(var schema:f.schemas)assertArrayEquals(new byte[]{(byte)(schema==f.first?7:9)},f.store(server,group(plan,schema)).readCurrentPoint(schema.columnIds().iterator().next(),new byte[]{1}));}
         }
@@ -41,8 +41,9 @@ class NativeExtentNodeTest {
             // bootstrap small, then cross a finite shared ceiling with distinct native payloads.
             for(var spec:compact){assertEquals(64L<<10,spec.config().global().databaseWriteBufferSize().longValue());}
             var defaults=RatisNativeExtentPolicy.defaults();long ceiling=16L<<20;
-            var policy=new RatisNativeExtentPolicy(defaults.filesystemOrdinaryBytes(),defaults.filesystemProtectedBytes(),ceiling,defaults.nodeProtectedBytes(),defaults.quantum(),defaults.maximumFiles(),defaults.maximumAliases(),defaults.maximumStateBytes());
+            var policy=new RatisNativeExtentPolicy(defaults.filesystemOrdinaryBytes(),defaults.filesystemProtectedBytes(),ceiling,defaults.nodeProtectedBytes(),defaults.quantum(),defaults.maximumFiles(),defaults.maximumAliases(),defaults.maximumStateBytes(),defaults.raw());
             var server=new RatisNodeRuntimeTest.FakeServer();boolean denied=false;var successful=new HashSet<UUID>();
+            org.rocksdb.NativeExtentEnv.Usage usage;
             try(var node=open(f,plan,server,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,policy)){node.start();
                 for(int n=0;n<128 && !denied;n++){
                     var schema=n%2==0?f.first:f.second;var store=f.store(server,group(plan,schema));var before=store.applied();var value=new byte[1<<20];new Random(n+1).nextBytes(value);byte key=(byte)(n/2+1);boolean applied=false;
@@ -50,16 +51,22 @@ class NativeExtentNodeTest {
                     catch(org.rocksdb.RocksDBException failure){assertEquals(org.rocksdb.Status.SubCode.NoSpace,failure.getStatus().getSubCode(),failure::toString);if(!applied){assertEquals(before,store.applied());assertNull(store.readCurrentPoint(schema.columnIds().iterator().next(),new byte[]{key}));denied=true;}}
                 }
                 assertTrue(denied,"The aggregate native node ceiling must reject growth, not independently reset per pool");assertEquals(Set.of(firstPool,secondPool),successful);
+                usage=nativeEnv(node).usage();
             }
             long observed=0;for(var spec:plan.pools().values())try(var files=Files.walk(spec.nativePath(f.env.nodeRoot))){for(var file:files.filter(path->Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS)).toList()){long size=Files.size(file);observed+=((size+policy.quantum()-1)/policy.quantum())*policy.quantum();}}
-            assertTrue(observed<=ceiling,"Observed rounded native files exceed the shared ceiling");
+            assertTrue(usage.ordinaryBytes()<=ceiling,"Ordinary native requests exceed the shared ceiling");
+            assertTrue(usage.protectedBytes()<=policy.nodeProtectedBytes(),"Protected native requests exceed their reserved ceiling");
+            assertTrue(observed<=Math.addExact(usage.ordinaryBytes(),usage.protectedBytes()),"Observed rounded native files exceed admitted requests across both lanes");
         }
     }
     @Test void changedLimitsMissingOriginalJournalAndReplacedManagedRootRefuseBeforePoolEffects()throws Exception {
         var helper=new RatisNodeMultiDomainTest();helper.root=root;try(var f=helper.new Fixture()){
             var plan=plan(f);var policy=RatisNativeExtentPolicy.defaults();try(var node=open(f,plan,new RatisNodeRuntimeTest.FakeServer(),RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,policy)){node.start();}
-            var changed=new RatisNativeExtentPolicy(policy.filesystemOrdinaryBytes(),policy.filesystemProtectedBytes(),policy.nodeOrdinaryBytes()-policy.quantum(),policy.nodeProtectedBytes(),policy.quantum(),policy.maximumFiles(),policy.maximumAliases(),policy.maximumStateBytes());
+            var changed=new RatisNativeExtentPolicy(policy.filesystemOrdinaryBytes(),policy.filesystemProtectedBytes(),policy.nodeOrdinaryBytes()-policy.quantum(),policy.nodeProtectedBytes(),policy.quantum(),policy.maximumFiles(),policy.maximumAliases(),policy.maximumStateBytes(),policy.raw());
             var denied=new RatisNodeRuntimeTest.FakeServer();assertThrows(IOException.class,()->open(f,plan,denied,RatisNodeRuntime.Startup.RECOVER,changed));assertFalse(denied.created);
+            var raw=policy.raw();
+            var changedRaw=new RatisNativeExtentPolicy(policy.filesystemOrdinaryBytes(),policy.filesystemProtectedBytes(),policy.nodeOrdinaryBytes(),policy.nodeProtectedBytes(),policy.quantum(),policy.maximumFiles(),policy.maximumAliases(),policy.maximumStateBytes(),new org.rocksdb.NativeRawFlushLimits.Limits(raw.maximumPointEntries(),raw.maximumRangeEntries(),raw.maximumInputBytes(),raw.maximumOutputBytes(),raw.maximumWorkingBytes()-1,raw.maximumReplayBatches(),raw.maximumReplayEntries()));
+            var rawDenied=new RatisNodeRuntimeTest.FakeServer();assertThrows(IOException.class,()->open(f,plan,rawDenied,RatisNodeRuntime.Startup.RECOVER,changedRaw));assertFalse(rawDenied.created);
             var journal=f.env.nodeRoot.resolve("native-extents.journal");var saved=Files.readAllBytes(journal);Files.delete(journal);var missing=new RatisNodeRuntimeTest.FakeServer();assertThrows(IOException.class,()->open(f,plan,missing,RatisNodeRuntime.Startup.RECOVER,policy));assertFalse(missing.created);assertFalse(Files.exists(journal));Files.write(journal,saved);
             var managed=plan.pools().get(firstPool).nativePath(f.env.nodeRoot);var retired=managed.resolveSibling(managed.getFileName()+"-retained");Files.move(managed,retired);try(var files=Files.walk(retired)){for(var original:files.toList()){var destination=managed.resolve(retired.relativize(original));if(Files.isDirectory(original,LinkOption.NOFOLLOW_LINKS))Files.createDirectories(destination);else Files.copy(original,destination);}}
             try{var replaced=new RatisNodeRuntimeTest.FakeServer();assertThrows(IOException.class,()->open(f,plan,replaced,RatisNodeRuntime.Startup.RECOVER,policy));assertFalse(replaced.created);assertTrue(Files.exists(managed.resolve("CURRENT")),"Replacement has complete copied DB files; original native root identity must still reject it");}finally{try(var files=Files.walk(managed)){for(var copy:files.sorted(Comparator.reverseOrder()).toList())Files.delete(copy);}Files.move(retired,managed);}
@@ -69,7 +76,7 @@ class NativeExtentNodeTest {
     @Test void boundUnexposedJournalCannotBeRecreatedAfterInterruptedPoolInitialization()throws Exception {
         var helper=new RatisNodeMultiDomainTest();helper.root=root;try(var f=helper.new Fixture()){
             var plan=plan(f);var failed=new RatisNodeRuntimeTest.FakeServer();failed.failCreate=true;assertThrows(IOException.class,()->open(f,plan,failed,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,RatisNativeExtentPolicy.defaults()));
-            assertEquals(1,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),128)[0]);var journal=f.env.nodeRoot.resolve("native-extents.journal");Files.delete(journal);
+            assertEquals(1,SessionJournalFiles.read(f.env.nodeRoot.resolve("node.identity"),65+RatisNativeExtentPolicy.BYTES)[0]);var journal=f.env.nodeRoot.resolve("native-extents.journal");Files.delete(journal);
             var retry=new RatisNodeRuntimeTest.FakeServer();assertThrows(IOException.class,()->open(f,plan,retry,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,RatisNativeExtentPolicy.defaults()));assertFalse(retry.created);assertFalse(Files.exists(journal));
         }
     }

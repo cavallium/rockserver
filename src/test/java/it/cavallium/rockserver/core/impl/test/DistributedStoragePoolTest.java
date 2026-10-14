@@ -128,7 +128,7 @@ class DistributedStoragePoolTest {
         var roots = List.of(first.toString(), second.toString(), exports.toString());
         UUID firstGroup = UUID.randomUUID(), secondGroup = UUID.randomUUID();
         for (int attempt = 0; attempt < 2; attempt++) {
-            try (var env = new org.rocksdb.NativeExtentEnv(journal, roots, limits);
+            try (var env = new org.rocksdb.NativeExtentEnv(journal, roots, limits, null);
                  var a = DistributedStoragePool.open(first, config, LoggerFactory.getLogger(getClass()), null, null, Map.of(), env);
                  var b = DistributedStoragePool.open(second, config, LoggerFactory.getLogger(getClass()), null, null, Map.of(), env)) {
                 assertFalse(loaded(a).dbOptions().useDirectIoForFlushAndCompaction());
@@ -170,7 +170,7 @@ class DistributedStoragePoolTest {
         var schema = new it.cavallium.rockserver.core.common.distributed.DistributedSchema(
                 UUID.randomUUID(), UUID.randomUUID(), DOMAIN, 0, 0, List.of());
         try (var env = new org.rocksdb.NativeExtentEnv(directory.resolve("external-extent-journal").toString(),
-                List.of(poolPath.toString(), wal.toString(), data.toString()), limits)) {
+                List.of(poolPath.toString(), wal.toString(), data.toString()), limits, null)) {
             for (var root : List.of(wal, data)) {
                 Path foreign = Files.write(root.resolve("foreign.sst"), new byte[]{1});
                 try {
