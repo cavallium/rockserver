@@ -51,7 +51,7 @@ class RatisConnectionBatchesTest {
                 }
             });
             factory=RatisRocksDBConnection.durableGenerationFactory(routed,f.scheduler,f.snapshots,f.homes,f.catalogue.epochs,f.catalogue.epochs.catalogue(f.outer.directoryColumn),header->f.catalogue.epochs.topologyCatalogue(f.outer.directoryColumn).readDefinition(header.definitionDigest()).sourceDirectory(),new RatisRocksDBAdapterTest.Allocations(f),(path,schema,directory) -> {
-                Path window=path.resolve("window"); if(Files.exists(window)) return RatisDurableSessionClient.reopen(window,routed);
+                Path window=path.resolve("window.bin"); if(Files.exists(window)) return RatisDurableSessionClient.reopen(window,routed);
                 var previous=f.catalogue.epochs.read(); var next=previous.issue(UUID.randomUUID(),1000); var grant=next.grants().getLast();
                 assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(f.outer.operation(sequence.getAndIncrement()),previous,next)).status());
                 for(var group:f.groups) { var control=f.catalogue.epochs.prepareSessionBinding(directory,group,new OperationId(f.admin,next.nextEpoch(),sequence.getAndIncrement()),grant,32,-1); assertEquals(CommandResult.Status.SUCCESS,routed.execute(routed.prepareSessionControl(control)).status()); }
@@ -61,52 +61,68 @@ class RatisConnectionBatchesTest {
         RatisRocksDBConnection open(int capacity) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/batches"),connectionRoot,java.util.Map.of(f.schema.domainId(),routed),(name,shape)->f.schema.domainId(),f.scheduler,binding,f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(8,64,8,128L*1024*1024,capacity),List.of(replicas)); }
         public void close() throws Exception { routed.close(); f.close(); }
     }
-    @Test void commonWriteBatchUsesOneNativeCommandAndSeparateExclusiveGrants() throws Exception {
+    static RemoteMutationToken prepare(RemoteMutationAsyncAPI api)throws Exception {
+        var owner=await(api.owners(71,RequestContext.batch())).stream().filter(candidate->candidate.kind()==RemoteMutationToken.Kind.BULK).findFirst().orElseThrow();UUID request=UUID.randomUUID();long sequence=owner.nextRequestSequence();return await(api.prepareBulk(owner,request,sequence,71,false,RequestContext.batch()));
+    }
+    static void acknowledge(RemoteMutationAsyncAPI api,RemoteMutationToken token,RemoteMutationStatus status)throws Exception {
+        assertEquals(RemoteMutationStatus.State.TERMINAL,status.state());assertEquals(CommandResult.Status.SUCCESS,status.outcome());await(api.acknowledge(token,status.resultDigest(),RequestContext.batch()));
+    }
+    /** Caller owns subscription/demand; the remote API receives only identified copied batches. */
+    static final class CallerStream implements Subscriber<KVBatch> {
+        final RemoteMutationAsyncAPI api;final RemoteMutationToken token;final CompletableFuture<RemoteMutationStatus> result=new CompletableFuture<>(){@Override public boolean cancel(boolean interrupt){stop();return super.cancel(false);}};final AtomicBoolean finishing=new AtomicBoolean(),stopped=new AtomicBoolean();
+        volatile Subscription source;volatile CompletableFuture<RemoteMutationStatus> pending;long ordinal;volatile boolean complete;
+        CallerStream(RemoteMutationAsyncAPI api,RemoteMutationToken token,Publisher<KVBatch> publisher){this.api=api;this.token=token;publisher.subscribe(this);}
+        public void onSubscribe(Subscription subscription){if(source!=null){subscription.cancel();return;}source=subscription;subscription.request(1);}
+        public void onNext(KVBatch batch){if(result.isDone())return;var copied=api.appendBatch(token,ordinal++,batch,RemoteMutationInputs.batch(71,false,batch),RequestContext.batch());pending=copied;copied.whenComplete((status,failure)->{if(result.isDone())return;if(failure!=null){fail(failure);return;}pending=null;if(complete)finish();else source.request(1);});}
+        void stop(){if(!stopped.compareAndSet(false,true))return;if(source!=null)source.cancel();var copied=pending;if(copied!=null)copied.cancel(false);}
+        void fail(Throwable failure){stop();result.completeExceptionally(failure);}
+        public void onError(Throwable failure){fail(failure);}
+        public void onComplete(){complete=true;if(pending==null)finish();}
+        void finish(){if(result.isDone() || !finishing.compareAndSet(false,true))return;var finishing=api.finishInput(token,RequestContext.batch());pending=finishing;finishing.whenComplete((status,failure)->{if(failure==null)result.complete(status);else fail(failure);});}
+    }
+    @Test void identifiedWriteBatchUsesOneNativeCommandAndSeparateExclusiveGrants() throws Exception {
         try(var f=new Fixture(); var connection=f.open(8)) {
-            assertEquals(2,f.grants.size()); assertNotEquals(f.grants.get(0).sessionId(),f.grants.get(1).sessionId()); assertNotEquals(f.windows.get(0),f.windows.get(1));
-            assertEquals(4096,connection.batchLimits().maximumInputItems()); assertEquals(8*1024*1024,connection.batchLimits().maximumEncodedInputBytes());
-            connection.getSyncApi(RequestContext.batch()).putBatch(71,RatisRocksDBBatchesTest.one(batch()),PutBatchMode.WRITE_BATCH);
-            assertEquals(1,f.writes.size()); assertEquals(3,f.writes.getFirst().mutations().size());
-            assertEquals(List.of(Mutation.Kind.PUT,Mutation.Kind.PUT,Mutation.Kind.PUT),f.writes.getFirst().mutations().stream().map(Mutation::kind).toList());
-            for(int i=2;i<=4;i++) assertArrayEquals(new byte[]{(byte)(i-1)},await(connection.getAsyncApi(RequestContext.batch()).getAsync(0,71,key(i),RequestType.<Buf>current())).toByteArray());
-            var recovery=await(connection.batchRecoveryStatus(RequestContext.batch())).getFirst(); assertEquals(RatisRocksDBBatches.RecoveryState.NONE,recovery.state()); assertTrue(recovery.progress().sourceComplete()); assertEquals(3,recovery.progress().acknowledgedMutations());
-            var subscribed=new AtomicInteger(); Publisher<KVBatch> forbidden=ignored -> subscribed.incrementAndGet();
-            for(var mode:PutBatchMode.values()) if(mode!=PutBatchMode.WRITE_BATCH) assertThrows(ExecutionException.class,() -> await(connection.getAsyncApi(RequestContext.batch()).putBatchAsync(71,forbidden,mode)));
-            for(var mode:MergeBatchMode.values()) if(mode!=MergeBatchMode.MERGE_WRITE_BATCH) assertThrows(ExecutionException.class,() -> await(connection.getAsyncApi(RequestContext.batch()).mergeBatchAsync(71,forbidden,mode)));
-            assertEquals(0,subscribed.get()); assertEquals(1,f.writes.size()); assertEquals(0,f.f.catalogue.closes.get());
+            assertEquals(2,f.grants.size());assertNotEquals(f.grants.get(0).sessionId(),f.grants.get(1).sessionId());assertNotEquals(f.windows.get(0),f.windows.get(1));
+            assertEquals(4096,connection.batchLimits().maximumInputItems());assertEquals(8*1024*1024,connection.batchLimits().maximumEncodedInputBytes());
+            var remote=connection.getRemoteMutationApi();var token=prepare(remote);var caller=new CallerStream(remote,token,RatisRocksDBBatchesTest.one(batch()));var terminal=await(caller.result);assertEquals(3,terminal.appliedMutations());acknowledge(remote,token,terminal);
+            assertEquals(1,f.writes.size());assertEquals(3,f.writes.getFirst().mutations().size());assertEquals(List.of(Mutation.Kind.PUT,Mutation.Kind.PUT,Mutation.Kind.PUT),f.writes.getFirst().mutations().stream().map(Mutation::kind).toList());
+            for(int i=2;i<=4;i++)assertArrayEquals(new byte[]{(byte)(i-1)},await(connection.getAsyncApi(RequestContext.batch()).getAsync(0,71,key(i),RequestType.<Buf>current())).toByteArray());
+            var recovery=await(connection.batchRecoveryStatus(RequestContext.batch())).getFirst();assertEquals(RatisRocksDBBatches.RecoveryState.NONE,recovery.state());assertTrue(recovery.progress().sourceComplete());assertEquals(3,recovery.progress().acknowledgedMutations());
+            var subscribed=new AtomicInteger();Publisher<KVBatch> forbidden=ignored->subscribed.incrementAndGet();
+            for(var mode:PutBatchMode.values())assertThrows(ExecutionException.class,()->await(connection.getAsyncApi(RequestContext.batch()).putBatchAsync(71,forbidden,mode)));
+            for(var mode:MergeBatchMode.values())assertThrows(ExecutionException.class,()->await(connection.getAsyncApi(RequestContext.batch()).mergeBatchAsync(71,forbidden,mode)));
+            assertEquals(0,subscribed.get());assertEquals(1,f.writes.size());assertEquals(0,f.f.catalogue.closes.get());
         }
     }
-    @Test void commonLostReplyColdReopenRequiresExactSchemaAndTokenAndNeverReplaysUnseenTail() throws Exception {
+    @Test void identifiedLostReplyColdReopenRequiresExactTokenAndNeverReplaysUnseenTail() throws Exception {
         try(var f=new Fixture()) {
-            RatisRocksDBConnection.BatchRecovery original;
+            RemoteMutationToken token;
             try(var connection=f.open(8)) {
-                f.lose.set(true); assertThrows(ExecutionException.class,() -> await(connection.getAsyncApi(RequestContext.batch()).putBatchAsync(71,RatisRocksDBBatchesTest.one(batch()),PutBatchMode.WRITE_BATCH)));
-                original=await(connection.batchRecoveryStatus(RequestContext.batch())).getFirst(); assertEquals(RatisRocksDBBatches.RecoveryState.PENDING,original.state()); assertFalse(original.progress().sourceComplete()); assertEquals(1,f.writes.size());
+                var remote=connection.getRemoteMutationApi();token=prepare(remote);f.lose.set(true);var input=batch();assertThrows(ExecutionException.class,()->await(remote.appendBatch(token,0,input,RemoteMutationInputs.batch(71,false,input),RequestContext.batch())));
+                var original=await(remote.status(token,RequestContext.batch()));assertEquals(RemoteMutationStatus.State.PENDING,original.state());assertEquals(1,f.writes.size());
             }
             try(var connection=f.open(8)) {
-                assertThrows(ExecutionException.class,() -> await(connection.resumeBatchRequest(original.schemaDigest(),UUID.randomUUID(),RequestContext.batch())));
-                assertThrows(ExecutionException.class,() -> await(connection.resumeBatchRequest(new byte[32],original.progress().requestId(),RequestContext.batch())));
-                assertEquals(1,f.writes.size());
-                assertThrows(ExecutionException.class,() -> await(connection.getAsyncApi(RequestContext.batch()).putAsync(0,71,key(5),value(7),RequestType.none())));
-                var result=await(connection.resumeBatchRequest(original.schemaDigest(),original.progress().requestId(),RequestContext.batch())); assertEquals(original.progress().requestId(),result.requestId()); assertEquals(3,result.acknowledgedMutations()); assertFalse(result.sourceComplete());
-                assertEquals(2,f.writes.size()); assertArrayEquals(DistributedCommandCodec.encode(f.writes.getFirst()),DistributedCommandCodec.encode(f.writes.getLast()));
-                await(connection.getAsyncApi(RequestContext.batch()).putBatchAsync(71,RatisRocksDBBatchesTest.one(new KVBatch.KVBatchRef(List.of(key(5)),List.of(value(7)))),PutBatchMode.WRITE_BATCH));
-                assertEquals(3,f.writes.size()); assertArrayEquals(new byte[]{7},await(connection.getAsyncApi(RequestContext.batch()).getAsync(0,71,key(5),RequestType.<Buf>current())).toByteArray()); assertEquals(2,f.grants.size(),"Reopen must retain each original grant");
+                var remote=connection.getRemoteMutationApi();var changed=new RemoteMutationToken(token.clusterId(),token.databaseId(),token.domainId(),token.ownerId(),UUID.randomUUID(),token.ownerEpoch(),token.requestSequence(),token.kind(),token.schemaDigest(),token.directoryDigest(),token.inputDigest());
+                assertThrows(ExecutionException.class,()->await(remote.resume(changed,RequestContext.batch())));var foreign=new RemoteMutationToken(token.clusterId(),token.databaseId(),token.domainId(),token.ownerId(),token.requestId(),token.ownerEpoch(),token.requestSequence(),token.kind(),new byte[32],token.directoryDigest(),token.inputDigest());assertThrows(ExecutionException.class,()->await(remote.resume(foreign,RequestContext.batch())));assertEquals(1,f.writes.size());var untouched=await(remote.status(token,RequestContext.batch()));assertEquals(RemoteMutationStatus.State.PENDING,untouched.state());assertEquals(0,untouched.appliedMutations(),"Rejected token must not drain the original copied chunk");assertEquals(1,untouched.copiedBatches());
+                assertThrows(ExecutionException.class,()->await(connection.getAsyncApi(RequestContext.batch()).putAsync(0,71,key(5),value(7),RequestType.none())));
+                var result=await(remote.resume(token,RequestContext.batch()));assertEquals(RemoteMutationStatus.State.PENDING,result.state());assertEquals(3,result.appliedMutations());assertEquals(1,result.copiedBatches());assertEquals(2,f.writes.size());assertArrayEquals(DistributedCommandCodec.encode(f.writes.getFirst()),DistributedCommandCodec.encode(f.writes.getLast()));
+                var finished=await(remote.finishInput(token,RequestContext.batch()));acknowledge(remote,token,finished);
+                var next=prepare(remote);var input=new KVBatch.KVBatchRef(List.of(key(5)),List.of(value(7)));await(remote.appendBatch(next,0,input,RemoteMutationInputs.batch(71,false,input),RequestContext.batch()));acknowledge(remote,next,await(remote.finishInput(next,RequestContext.batch())));
+                assertEquals(3,f.writes.size());assertArrayEquals(new byte[]{7},await(connection.getAsyncApi(RequestContext.batch()).getAsync(0,71,key(5),RequestType.<Buf>current())).toByteArray());assertEquals(2,f.grants.size(),"Reopen must retain each original grant");
             }
         }
     }
-    @Test void canceledCommonBatchKeepsCapacityAndCloseOwnershipThroughActualReply() throws Exception {
+    @Test void canceledCallerBatchKeepsCapacityAndCloseOwnershipThroughActualReply() throws Exception {
         try(var f=new Fixture()) {
-            var connection=f.open(1); f.entered=new CountDownLatch(1); f.release=new CountDownLatch(1); var demanded=new AtomicInteger(); var canceled=new AtomicBoolean();
-            Publisher<KVBatch> source=subscriber -> subscriber.onSubscribe(new Subscription() { public void request(long n) { assertEquals(1,n); demanded.incrementAndGet(); subscriber.onNext(batch()); } public void cancel() { canceled.set(true); } });
+            var connection=f.open(1);var remote=connection.getRemoteMutationApi();var token=prepare(remote);f.entered=new CountDownLatch(1);f.release=new CountDownLatch(1);var demanded=new AtomicInteger();var canceled=new AtomicBoolean();
+            Publisher<KVBatch> source=subscriber->subscriber.onSubscribe(new Subscription(){public void request(long n){assertEquals(1,n);demanded.incrementAndGet();subscriber.onNext(batch());}public void cancel(){canceled.set(true);}});
             try {
-                var observer=connection.getAsyncApi(RequestContext.batch()).putBatchAsync(71,source,PutBatchMode.WRITE_BATCH); assertTrue(f.entered.await(5,TimeUnit.SECONDS)); assertTrue(observer.cancel(false)); assertTrue(canceled.get());
-                var rejected=assertThrows(ExecutionException.class,() -> await(connection.getAsyncApi(RequestContext.batch()).getAsync(0,71,key(2),RequestType.<Buf>current()))); assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,assertInstanceOf(RocksDBException.class,rejected.getCause()).getErrorUniqueId());
-                assertThrows(IOException.class,connection::close); f.release.countDown();
-                var drained=new CompletableFuture<Void>(); f.f.scheduler.executor(RequestContext.batch(),OperationFamily.MUTATION).execute(() -> drained.complete(null)); await(drained); connection.close(); assertEquals(1,demanded.get());
-            } finally { f.release.countDown(); connection.close(); }
+                var caller=new CallerStream(remote,token,source);assertTrue(f.entered.await(5,TimeUnit.SECONDS));assertTrue(caller.result.cancel(false));assertTrue(canceled.get());
+                var rejected=assertThrows(ExecutionException.class,()->await(connection.getAsyncApi(RequestContext.batch()).getAsync(0,71,key(2),RequestType.<Buf>current())));assertEquals(RocksDBException.RocksDBErrorType.SERVER_OVERLOADED,assertInstanceOf(RocksDBException.class,rejected.getCause()).getErrorUniqueId());
+                assertThrows(IOException.class,connection::close);f.release.countDown();var drained=new CompletableFuture<Void>();f.f.scheduler.executor(RequestContext.batch(),OperationFamily.MUTATION).execute(()->drained.complete(null));await(drained);connection.close();assertEquals(1,demanded.get());
+            }finally{f.release.countDown();connection.close();}
             f.entered=null;
-            try(var reopened=f.open(1)) { var recovery=await(reopened.batchRecoveryStatus(RequestContext.batch())).getFirst(); var saved=await(reopened.resumeBatchRequest(recovery.schemaDigest(),recovery.progress().requestId(),RequestContext.batch())); assertEquals(3,saved.acknowledgedMutations()); assertFalse(saved.sourceComplete()); assertEquals(1,f.writes.size()); }
+            try(var reopened=f.open(1)){var resumed=reopened.getRemoteMutationApi();var saved=await(resumed.resume(token,RequestContext.batch()));assertEquals(3,saved.appliedMutations());assertEquals(RemoteMutationStatus.State.PENDING,saved.state());assertEquals(1,f.writes.size());acknowledge(resumed,token,await(resumed.finishInput(token,RequestContext.batch())));assertEquals(1,demanded.get());}
         }
     }
 }

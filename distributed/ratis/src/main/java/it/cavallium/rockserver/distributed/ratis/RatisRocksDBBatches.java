@@ -38,8 +38,8 @@ public final class RatisRocksDBBatches implements AutoCloseable {
     boolean binds(DistributedSchema schema,RangeDirectory directory) { return Arrays.equals(this.schema.digest(),schema.digest()) && Arrays.equals(this.directory.payloadDigest(),directory.payloadDigest()); }
     void beforeAcknowledgementMarker(Runnable hook) { beforeAcknowledgementMarker=hook; }
     RatisDurableSessionClient ownedSession() { return session; }
-    public CompletableFuture<Progress> resumeRetained(RequestContext context) {
-        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(0,ignored -> {},PutBatchMode.WRITE_BATCH)); var task=reserve(context); task.schedule(() -> { Progress value; persistence.lock(); try { if(journal.request()==null || journal.request().resultAcknowledged) throw new IOException("No retained bulk input"); drain(task); value=snapshot(); } finally { persistence.unlock(); } task.settle(value,null); }); return task.view; }
+    public CompletableFuture<Progress> resumeRetained(RemoteMutationToken token,RequestContext context) {
+        try { it.cavallium.rockserver.core.impl.WorkloadAdmission.validateClient(context,new RocksDBAPICommand.RocksDBAPICommandSingle.PutBatch(0,ignored -> {},PutBatchMode.WRITE_BATCH)); var task=reserve(context); task.schedule(() -> { Progress value; persistence.lock(); try { if(exact(token).resultAcknowledged) throw new IOException("No retained bulk input"); drain(task); value=snapshot(); } finally { persistence.unlock(); } task.settle(value,null); }); return task.view; }
         catch(Exception failure) { return CompletableFuture.failedFuture(failure); }
     }
     public RemoteMutationOwner owner() throws IOException {return authority(receipts.nextSequence());}

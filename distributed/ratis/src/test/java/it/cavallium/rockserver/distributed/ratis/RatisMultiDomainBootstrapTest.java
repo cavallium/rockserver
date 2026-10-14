@@ -9,7 +9,7 @@ import java.io.IOException;
 import java.lang.reflect.*;
 import java.nio.file.*;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.api.BlockingApi;
 import org.apache.ratis.protocol.*;
@@ -47,7 +47,7 @@ class RatisMultiDomainBootstrapTest {
         final class Data implements AutoCloseable {
             final UUID domain,column,group;final DistributedSchema schema;final RangeDirectory directory;final RangeDescriptor descriptor;
             final ReplicatedRangeStore store;final RatisRangeStateMachine machine;final RaftStorage storage;final RaftGroup raft;
-            final RatisRoutedClient routed;final RatisNodePlan plan;boolean unavailable;int stateReads,commands;
+            final RatisRoutedClient routed;final RatisNodePlan plan;boolean unavailable;int stateReads,commands;long nextApplyIndex;
             Data(int n)throws Exception {
                 domain=new UUID(821,n);column=new UUID(822,n);group=new UUID(823,n);
                 schema=new DistributedSchema(outer.cluster,outer.database,domain,1,0,List.of(new DistributedSchema.Column(70+n,column,"logical-"+n,ColumnSchema.of(IntArrayList.of(1),new ObjectArrayList<>(),true),null)));
@@ -63,13 +63,15 @@ class RatisMultiDomainBootstrapTest {
                 var identity=(RaftServer)Proxy.newProxyInstance(RaftServer.class.getClassLoader(),new Class<?>[]{RaftServer.class},(proxy,method,args)->switch(method.getName()){case "getId"->peer.getId();case "toString"->"multi-domain-native";default->throw new AssertionError(method);});machine.initialize(identity,raft.getGroupId(),storage);machine.notifyTermIndexUpdated(1,0);
                 routed=new RatisRoutedClient(directory,new RatisRoutedClient.Transport(){
                     public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{return append(command);}
+                    public CompletableFuture<CommandResult> commandAsync(RangeDescriptor route,DistributedCommand command)throws IOException{return appendAsync(command);}
                     public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{return ScopedTransactionRpc.pointValue(query(ScopedTransactionRpc.pointRequest(column,key)),2<<20);}
                     public RangeStateView stateView(RangeDescriptor route)throws IOException{stateReads++;return RangeStateView.decode(ScopedTransactionRpc.parse(query(ScopedTransactionRpc.frame(ScopedTransactionRpc.STATE,new byte[0])),ScopedTransactionRpc.MAX_REPLY_BYTES).body());}
                     public byte[] transaction(RangeDescriptor route,byte[] request,boolean fresh)throws IOException{return query(request);}
                 });
             }
             byte[] query(byte[] request)throws IOException {if(unavailable)throw new IOException("Domain unavailable");try{return machine.query(message(request)).get(5,TimeUnit.SECONDS).getContent().toByteArray();}catch(Exception failure){throw new IOException(failure);}}
-            CommandResult append(DistributedCommand command)throws IOException {if(unavailable)throw new IOException("Domain unavailable");commands++;try{var tx=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(raft.getPeers().iterator().next().getId()).setGroupId(raft.getGroupId()).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(message(DistributedCommandCodec.encode(command))).build());if(tx.getException()!=null)throw new IOException("Native admission rejected",tx.getException());machine.preAppendTransaction(tx);tx.initLogEntry(1,store.applied().index()+1);return CommandResult.decode(machine.applyTransaction(tx).get(5,TimeUnit.SECONDS).getContent().toByteArray());}catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException(failure);}}
+            synchronized CompletableFuture<CommandResult> appendAsync(DistributedCommand command)throws IOException {if(unavailable)throw new IOException("Domain unavailable");commands++;try{var tx=machine.startTransaction(RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(raft.getPeers().iterator().next().getId()).setGroupId(raft.getGroupId()).setCallId(1).setType(RaftClientRequest.writeRequestType()).setMessage(message(DistributedCommandCodec.encode(command))).build());if(tx.getException()!=null)throw new IOException("Native admission rejected",tx.getException());machine.preAppendTransaction(tx);nextApplyIndex=Math.max(nextApplyIndex,store.applied().index())+1;tx.initLogEntry(1,nextApplyIndex);return machine.applyTransaction(tx).thenApply(reply->CommandResult.decode(reply.getContent().toByteArray()));}catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException(failure);}}
+            CommandResult append(DistributedCommand command)throws IOException{try{return appendAsync(command).get(5,TimeUnit.SECONDS);}catch(Exception failure){throw new IOException(failure);}}
             public void close()throws Exception{routed.close();machine.close();machine.awaitNativeReaders(java.time.Duration.ofSeconds(5));storage.close();}
         }
         List<RatisDatabaseBootstrap.Domain> domains(){return List.of(new RatisDatabaseBootstrap.Domain(data.get(0).plan,data.get(0).routed,data.get(0).schema,null),new RatisDatabaseBootstrap.Domain(data.get(1).plan,data.get(1).routed,data.get(1).schema,RatisColumnAllocation.counterValue(71)));}

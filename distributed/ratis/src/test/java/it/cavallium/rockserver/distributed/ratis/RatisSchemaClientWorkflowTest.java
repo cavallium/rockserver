@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.lang.reflect.Proxy;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.*;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.api.BlockingApi;
 import org.apache.ratis.protocol.*;
@@ -39,6 +40,7 @@ class RatisSchemaClientWorkflowTest {
         final RatisSessionEpochsTest outer=new RatisSessionEpochsTest(); final RatisSessionEpochsTest.Fixture metadata;
         final RaftClient client; final RatisSchemaAdministration admin; final RatisNodePlan.Catalogue catalogue;
         final DistributedSchema initial; final RangeDirectory initialDirectory; final List<Peer> peers=new ArrayList<>();
+        final ExecutorService nativeCommands=new ThreadPoolExecutor(1,1,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(16),Thread.ofPlatform().daemon(true).name("schema-fixture-native").factory(),new ThreadPoolExecutor.AbortPolicy());
         final RatisRoutedClient routed; final RatisSchemaReplicaClient replicas; final RatisOperatorCatalogue operators;
         boolean lagging,nonforced; String losePhase; boolean lost;
         final Set<DistributedSchema.Operator> admittedOperators=new HashSet<>();
@@ -81,7 +83,10 @@ class RatisSchemaClientWorkflowTest {
             catalogue=new RatisNodePlan.Catalogue(outer.catalogue,1,new byte[32],outer.directoryColumn,outer.sessions,members);
             routed=new RatisRoutedClient(initialDirectory,new RatisRoutedClient.Transport() {
                 public byte[] read(RangeDescriptor descriptor,UUID column,byte[] key) throws IOException { try(var pin=peers.getFirst().store.capture()) { return pin.get(column,key); } catch(Exception failure) { throw new IOException(failure); } }
-                public CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException { try { beforeDataCommand.accept(command); var result=CommandResult.decode(peers.getFirst().store.apply(peers.getFirst().next(),command)); if(!lagging) for(int i=1;i<peers.size();i++) peers.get(i).store.apply(peers.get(i).next(),command); return result; } catch(Exception failure) { throw new IOException(failure); } }
+                public synchronized CommandResult command(RangeDescriptor descriptor,DistributedCommand command) throws IOException { try { beforeDataCommand.accept(command); var result=CommandResult.decode(peers.getFirst().store.apply(peers.getFirst().next(),command)); if(!lagging) for(int i=1;i<peers.size();i++) peers.get(i).store.apply(peers.get(i).next(),command); return result; } catch(Exception failure) { throw new IOException(failure); } }
+                public CompletableFuture<CommandResult> commandAsync(RangeDescriptor descriptor,DistributedCommand command) {
+                    var result=new CompletableFuture<CommandResult>();try{nativeCommands.execute(()->{try{result.complete(command(descriptor,command));}catch(Throwable failure){result.completeExceptionally(failure);}});}catch(RuntimeException rejected){result.completeExceptionally(rejected);}return result;
+                }
                 public byte[] transaction(RangeDescriptor descriptor,byte[] bytes,boolean fresh) throws IOException {
                     try {
                         int kind=ScopedTransactionRpc.kind(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);
@@ -138,7 +143,7 @@ class RatisSchemaClientWorkflowTest {
         }
         RatisSchemaClient client(Path journals) throws IOException { return new RatisSchemaClient(journals,outer.cluster,outer.database,initial.domainId(),catalogue,client,routed,replicas,operators); }
         void advance(RatisSchemaClient client,RatisSchemaClient.Handle handle) throws Exception { for(int n=0;n<200;n++) { var progress=client.advance(handle,1); if(progress.result()!=null && progress.phase()!=RatisSchemaClient.Phase.RETIRE) return; if(progress.phase()==RatisSchemaClient.Phase.CONFLICT) fail("Unexpected metadata conflict"); } fail("Schema request did not complete"); }
-        public void close() throws Exception { replicas.close(); routed.close(); for(var peer:peers) peer.close(); metadata.close(); }
+        public void close() throws Exception { nativeCommands.shutdown();if(!nativeCommands.awaitTermination(10,TimeUnit.SECONDS))throw new IOException("Actual native fixture commands remain owned");replicas.close(); routed.close(); for(var peer:peers) peer.close(); metadata.close(); }
     }
     static Set<UUID> mergeColumns(DistributedSchema schema) { var result=new HashSet<UUID>(); for(var column:schema.columns()) if(column.operator()!=null) result.add(column.columnId()); return result; }
     public static class AppendOperator extends it.cavallium.rockserver.core.impl.FFMByteArrayMergeOperator {

@@ -273,7 +273,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         return diagnosticOwned(context,remaining -> {var generation=originalMutationGeneration(token).generation();return switch(token.kind()) {
             case POINT -> {var actor=generation.point(token);var observer=actor.execute(token,remaining);yield new OwnedDiagnostic<>(observer,actor.actualCompletion(observer),() -> observer.cancel(false));}
             case RANGE -> {var result=generation.adapter().rangeDeletes().execute(token,remaining);yield new OwnedDiagnostic<>(result.observer().thenApply(value -> (Object)value),result.drained(),result.cancel());}
-            case BULK -> {generation.batches().status(token);var observer=generation.batches().resumeRetained(remaining);yield new OwnedDiagnostic<>(observer.thenApply(value -> (Object)value),generation.batches().actualCompletion(observer),() -> observer.cancel(false));}
+            case BULK -> {var observer=generation.batches().resumeRetained(token,remaining);yield new OwnedDiagnostic<>(observer.thenApply(value -> (Object)value),generation.batches().actualCompletion(observer),() -> observer.cancel(false));}
         };});
     }
     public CompletableFuture<RemoteMutationStatus> remoteMutationStatus(RemoteMutationToken token,RequestContext context) {return diagnostic(context,remaining -> {RatisGenerationRegistry.Owned owner;try {owner=originalMutationGeneration(token);}catch(IOException absent){return CompletableFuture.completedFuture(new RemoteMutationStatus(token,RemoteMutationStatus.State.OWNER_UNAVAILABLE,-1,-1,0,null,null));}var generation=owner.generation();return CompletableFuture.completedFuture(switch(token.kind()){case POINT -> {RatisRocksDBDirect actor;try{actor=generation.point(token);}catch(IOException absent){yield new RemoteMutationStatus(token,RemoteMutationStatus.State.OWNER_UNAVAILABLE,-1,-1,0,null,null);}yield actor.status(token);}case RANGE -> generation.adapter().rangeDeletes().status(token);case BULK -> generation.batches().status(token);});});}
@@ -287,17 +287,6 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     public CompletableFuture<Object> resumeDirectRequest(byte[] schemaDigest,RequestContext context) { byte[] frozen=schemaDigest.clone(); return diagnostic(context,remaining -> { for (var generation:generations.all()) if (Arrays.equals(generation.schema().digest(),frozen) && generation.generation().direct()!=null) return generation.generation().direct().resumeRetained(remaining); return CompletableFuture.failedFuture(new IOException("Unknown original direct generation")); }); }
     public CompletableFuture<List<BatchRecovery>> batchRecoveryStatus(RequestContext context) {
         return diagnostic(context,remaining -> { var states=new ArrayList<BatchRecovery>(); for(var generation:generations.all()) if(generation.generation().batches()!=null) { var batches=generation.generation().batches(); states.add(new BatchRecovery(generation.schema().digest(),generation.schema().schemaEpoch(),batches.recoveryState(),batches.progress())); } return CompletableFuture.completedFuture(List.copyOf(states)); });
-    }
-    public CompletableFuture<RatisRocksDBBatches.Progress> resumeBatchRequest(byte[] schemaDigest,UUID requestId,RequestContext context) {
-        byte[] frozen=Objects.requireNonNull(schemaDigest).clone(); Objects.requireNonNull(requestId);
-        return diagnosticOwned(context,remaining -> {
-            for(var generation:generations.all()) if(Arrays.equals(generation.schema().digest(),frozen) && generation.generation().batches()!=null) {
-                var batches=generation.generation().batches(); var progress=batches.progress();
-                if(progress==null || !requestId.equals(progress.requestId())) throw new IOException("Batch token differs from original retained request");
-                var observer=batches.resumeRetained(remaining); return new OwnedDiagnostic<>(observer,batches.actualCompletion(observer),() -> observer.cancel(false));
-            }
-            throw new IOException("Unknown original batch generation");
-        });
     }
     private record OwnedDiagnostic<T>(CompletableFuture<T> observer,CompletableFuture<Void> drained,Runnable cancelObserver) {}
     @FunctionalInterface private interface OwnedDiagnosticWork<T> { OwnedDiagnostic<T> run(RequestContext remaining) throws Exception; }
