@@ -208,6 +208,27 @@ This section and the remaining gates at the end describe the current branch.
   confirms that the node's extent Env and pool raw limits do not yet share one
   native RAM-budget owner. That wiring, full node bounds and final private
   JNI/wrapper qualification remain unfinished.
+- Native checkpoint `626045e` and node wiring `8e10052` retain one shared raw RAM
+  owner in the extent ledger and every pool's native options. JNI setter/copy
+  paths preserve exact pointer identity; incompatible setters and native writable,
+  read-only and secondary opens refuse before their file effects. Java owner
+  closure does not release capacity still held by native databases/readers.
+  The current node policy/manifest/identity now bind the seven raw limits directly.
+  The compiler plugin uses its Java-25-capable bytecode reader (`3.14.1`).
+  The actual node flush exposed a MANIFEST bound mismatch: raw epochs now freeze
+  and checked-round the original preallocation size before reservation, including
+  a 4 MiB profile and an option change after reservation. Typed extent usage
+  counts each identity once, allowing separate ordinary/protected ceiling checks.
+  Current Debug source passes 156 native cases (45 completion, 32 planner,
+  35 raw, 34 filesystem, ten workspace) and 35 SDK cases. The Java selection
+  passes 79 cases across pool/node/runtime/service/manifest workflows: 55 unchanged
+  passing cases from `shared-budget-node-repaired-gate.log` are reused with the
+  final 24-case `shared-budget-node-usage-gate.log`. Native/SDK evidence is
+  `shared-budget-*-gate.log` in the native output directory. The private task SDK
+  was rebuilt together with JNI; the global Maven repository and original
+  checkouts were not changed. Allocator-backed state/candidate/validation/registry
+  storage, prospective control credit before USER WAL, full node resource bounds
+  and final wrapper/source qualification remain unfinished.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
