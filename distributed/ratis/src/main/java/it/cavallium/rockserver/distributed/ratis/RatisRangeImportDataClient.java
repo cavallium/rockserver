@@ -33,9 +33,13 @@ public final class RatisRangeImportDataClient implements RatisRangeImportControl
         clients=new RatisClientPool(MAX_CLIENTS,range->connections.open(range,ClientId.randomId()),null,(range,id)->connections.open(range,ClientId.valueOf(id)));
     }
     private RangeDescriptor range(RangeImportDefinition definition,UUID group) throws IOException {
-        var qualified=plan.importDefinition(group);
-        if(qualified==null || !Arrays.equals(qualified.digest(),definition.digest()) || !Arrays.equals(plan.directory(definition.sourceDirectory().domainId()).payloadDigest(),definition.sourceDirectory().payloadDigest()))throw new IOException("Import differs from operator-qualified placement");
-        return plan.groupDescriptor(group);
+        try {
+            // The immutable plan already validates each source against the preceding import target.
+            // Later imports therefore bind to their exact definition, not the bootstrap directory.
+            var qualified=plan.importDefinition(group);
+            if(qualified==null || !Arrays.equals(qualified.digest(),definition.digest()))throw new IOException("Import differs from operator-qualified placement");
+            return plan.groupDescriptor(group);
+        }catch(IllegalArgumentException unplanned){throw new IOException("Import differs from operator-qualified placement",unplanned);}
     }
     private synchronized void enter()throws IOException{if(closing || broken!=null || active>=MAX_CALLS)throw new IOException("Import data transport unavailable",broken);active++;}
     private synchronized void leave(){active--;notifyAll();}
