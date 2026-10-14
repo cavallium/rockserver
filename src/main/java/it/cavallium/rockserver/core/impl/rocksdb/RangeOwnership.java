@@ -286,6 +286,17 @@ public final class RangeOwnership {
         return ownership;
     }
 
+    /** Trusted durable metadata registration grants no USER interval, even alongside current descendants. */
+    synchronized void validateMetadataRecovery(Owner owner,Interval interval) {
+        var previous=owners.get(owner.groupId());
+        if(previous!=null && (!previous.owner().equals(owner) || !previous.interval().domainId().equals(interval.domainId())
+                || !Arrays.equals(previous.interval().lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(previous.interval().upperExclusive(),interval.upperExclusive())))throw new IllegalArgumentException("Metadata recovery changed original owner geometry");
+        if(leases.containsKey(owner.groupId()) || topologyTargets.containsKey(owner.groupId()))throw new IllegalStateException("Original owner has an unsettled native geometry operation");
+    }
+    synchronized void recoverMetadata(Owner owner,Interval interval) {
+        validateMetadataRecovery(owner,interval);owners.put(owner.groupId(),new Ownership(owner,interval,State.RETIRED));
+    }
+
     public synchronized Ownership fence(Owner expected) {
         return transition(expected, State.ACTIVE, State.FENCED);
     }

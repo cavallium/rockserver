@@ -9,6 +9,7 @@ import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.NativeSchemaFence;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyFreeze;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyRecoveryFence;
+import it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration;
 import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomeCredit;
 import it.cavallium.rockserver.core.common.distributed.NativeSourceOutcomePublication;
 import it.cavallium.rockserver.core.common.distributed.NativeTopologyBirth;
@@ -166,12 +167,18 @@ public final class ReplicatedRangeStore {
         } finally { applyLane.unlock();leaveNative(); }
     }
     private void requireTopologyMetadataOwner() throws RocksDBException {
+        requireTopologyMetadataOwner(true);
+    }
+    private void requireTopologyMetadataOwner(boolean ready) throws RocksDBException {
+        if(ready)requireMetadataRecoveryReady();
+        if(metadataRecoveryRegistration!=null && !metadataImageInstalledUnderLane())throw new IllegalStateException("Source metadata has no completed registered image");
         var ownershipState=ownership.get(owner).state();var freeze=activeTopologyFreeze;
         if(closing || pendingInstallation!=null || importPending() || freeze==null || applied==null || applied.term()<=0 || applied.index()<0
                 || ownershipState!=RangeOwnership.State.ACTIVE && ownershipState!=RangeOwnership.State.FENCED && ownershipState!=RangeOwnership.State.RETIRED
                 || ownershipState==RangeOwnership.State.RETIRED && !topologyRetired())throw new IllegalStateException("Topology metadata lacks a completed sealed native owner");
         var original=db.get(state,topologyFreezeKey());if(original==null || !freeze.equals(NativeTopologyFreeze.decode(original)) || !groupId.equals(freeze.groupId()) || !Arrays.equals(freeze.header().schemaDigest(),schemaDigest))throw new IllegalStateException("Topology metadata original FREEZE changed");freeze.requireCut(applied);
         if(topologyRetired() && !Arrays.equals(topologyRetirement,db.get(state,topologyOwnershipKey(0x62))))throw new IllegalStateException("Topology metadata retirement proof changed");
+        if(metadataRecoveryRegistration!=null && (!metadataRecoveryRegistration.freeze().equals(freeze) || !Arrays.equals(metadataRecoveryRegistration.digest(),db.get(state,topologyOwnershipKey(0x6f)))))throw new IllegalStateException("Source metadata registration changed");
         byte[] marker=db.get(state,markerKey);if(marker==null || !applied.equals(decodePosition(marker)))throw new IllegalStateException("Topology metadata completed marker changed");
         var cfg=configurationUnderAdmission();if(cfg==null || cfg.term()>applied.term() || cfg.index()>applied.index() || cfg.index()==applied.index() && cfg.term()!=applied.term())throw new IllegalStateException("Topology metadata native configuration exceeds completed prefix");
         var authority=sessionAuthority();if(authority!=null && (!authority.clusterId().equals(freeze.header().clusterId()) || !authority.databaseId().equals(freeze.header().databaseId())))throw new IllegalStateException("Topology metadata session authority namespace changed");
@@ -218,8 +225,8 @@ public final class ReplicatedRangeStore {
         if(credit!=null && !Arrays.equals(credit.request().original().payloadDigest(),command.payloadDigest()))throw new IllegalArgumentException("Operation identity is reserved for the exact source original payload");
     }
     private boolean sourceOperationFenced(OperationId operation) throws RocksDBException { return operation.epoch()<minimumSessionEpoch(null) || operation.sequence()<=acknowledgedThrough(operation,null); }
-    private void requireSourceOutcomeRequest(NativeSourceOutcomeCredit.Request request) throws RocksDBException {
-        requireTopologyMetadataOwner();if(!activeTopologyFreeze.equals(request.freeze()) || !request.original().groupId().equals(groupId) || request.original().rangeEpoch()!=rangeEpoch)throw new IllegalArgumentException("Source outcome differs from sealed native owner");
+    private void requireSourceOutcomeRequest(NativeSourceOutcomeCredit.Request request,boolean ready) throws RocksDBException {
+        requireTopologyMetadataOwner(ready);if(!activeTopologyFreeze.equals(request.freeze()) || !request.original().groupId().equals(groupId) || request.original().rangeEpoch()!=rangeEpoch)throw new IllegalArgumentException("Source outcome differs from sealed native owner");
         if(!request.targetDirectory().columns().equals(logicalColumns()) || (logicalSchema!=null || retiredRoutingPrefix>=0) && request.targetDirectory().routingPrefixBytes()!=(logicalSchema!=null ? logicalSchema.routingPrefixBytes() : retiredRoutingPrefix))throw new IllegalArgumentException("Source recovery target projection changed");
         request.freeze().requireCut(request.origin().absenceCut());if(request.origin().absenceCut().index()>applied.index() || request.origin().absenceCut().term()>applied.term())throw new IllegalArgumentException("Source credit absence cut exceeds native prefix");
     }
@@ -227,11 +234,28 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(operation);Objects.requireNonNull(originalReceiptDigest);if(originalReceiptDigest.length!=32)throw new IllegalArgumentException("Invalid source original receipt digest");
         enterNative();applyLane.lock();try { requireTopologyMetadataOwner();var credit=sourceOutcomeCredits.get(operation);if(credit!=null && !Arrays.equals(credit.request().original().receiptDigest(),originalReceiptDigest))throw new IllegalArgumentException("Source original credit digest changed");return credit; } finally { applyLane.unlock();leaveNative(); }
     }
-    public List<NativeSourceOutcomeCredit> sourceOutcomeCredits() { enterNative();applyLane.lock();try { return List.copyOf(sourceOutcomeCredits.values()); } finally { applyLane.unlock();leaveNative(); } }
+    public List<NativeSourceOutcomeCredit> sourceOutcomeCredits() { enterNative();applyLane.lock();try { requireMetadataRecoveryReady();return List.copyOf(sourceOutcomeCredits.values()); } finally { applyLane.unlock();leaveNative(); } }
+    public record SourceOutcomeReplayState(NativeSourceOutcomeCredit credit,NativeSourceOutcomePublication publication,boolean fenced,byte[] result) {
+        public SourceOutcomeReplayState {result=result==null?null:result.clone();}
+        @Override public byte[] result(){return result==null?null:result.clone();}
+    }
+    /** Trusted committed-log replay only. This state cannot qualify a fresh proposal or authoritative ABSENT. */
+    public SourceOutcomeReplayState readCommittedSourceOutcome(NativeSourceOutcomeCredit.Request request)throws RocksDBException {
+        Objects.requireNonNull(request);enterNative();applyLane.lock();try {
+            requireSourceOutcomeRequest(request,false);var id=request.original().operationId();var credit=sourceOutcomeCredits.get(id);var publication=sourceOutcomePublications.get(id);
+            if(credit!=null && !credit.request().equals(request) || publication!=null && !Arrays.equals(publication.requestDigest(),request.digest()))throw new IllegalArgumentException("Committed source replay changed original input");
+            boolean fenced=sourceOperationFenced(id);byte[] result=publication!=null && !fenced?operationResultUnderAdmission(id,request.original().receiptDigest()):null;
+            if(publication!=null){publication.requireCut(applied);if(!fenced){if(result==null)throw new IllegalStateException("Source publication lost original retained result");publication.requireRequest(request,result);}}
+            return new SourceOutcomeReplayState(credit,publication,fenced,result);
+        }finally{applyLane.unlock();leaveNative();}
+    }
     public record SourceOutcomeCreditEstimate(ReceiptUsage usage,boolean existing,boolean fenced,long additionalCount,long additionalBytes,long metadataBytes,long metadataUsageBytes) {}
     public SourceOutcomeCreditEstimate estimateSourceOutcomeCredit(NativeSourceOutcomeCredit.Request request) throws RocksDBException {
+        return estimateSourceOutcomeCredit(request,true);
+    }
+    private SourceOutcomeCreditEstimate estimateSourceOutcomeCredit(NativeSourceOutcomeCredit.Request request,boolean ready) throws RocksDBException {
         Objects.requireNonNull(request);enterNative();applyLane.lock();try {
-            requireSourceOutcomeRequest(request);ensureReceiptUsage();var id=request.original().operationId();var total=readUsage(usageKey).plus(sourceOutcomePromises(null));var usage=new ReceiptUsage(applied,total.count(),total.bytes());
+            requireSourceOutcomeRequest(request,ready);ensureReceiptUsage();var id=request.original().operationId();var total=readUsage(usageKey).plus(sourceOutcomePromises(null));var usage=new ReceiptUsage(applied,total.count(),total.bytes());
             var saved=sourceOutcomeCredits.get(id);if(saved!=null) { if(!saved.request().equals(request))throw new IllegalArgumentException("Source credit original input changed");return new SourceOutcomeCreditEstimate(usage,true,sourceOperationFenced(id),0,0,0,sourceOutcomeMetadataBytes()); }
             var published=sourceOutcomePublications.get(id);if(published!=null) { if(!Arrays.equals(published.requestDigest(),request.digest()))throw new IllegalArgumentException("Source publication original input changed");return new SourceOutcomeCreditEstimate(usage,true,sourceOperationFenced(id),0,0,0,sourceOutcomeMetadataBytes()); }
             if(sourceOperationFenced(id))return new SourceOutcomeCreditEstimate(usage,false,true,0,0,0,sourceOutcomeMetadataBytes());
@@ -246,7 +270,7 @@ public final class ReplicatedRangeStore {
     /** Trusted committed reservation after HOME RESERVED; fresh HOME/source authority is adapter-owned. */
     public NativeSourceOutcomeCredit applySourceOutcomeCredit(ApplyPosition position,NativeSourceOutcomeCredit.Request request) throws RocksDBException {
         enterNative();applyLane.lock();try {
-            var estimate=estimateSourceOutcomeCredit(request);var id=request.original().operationId();var existing=sourceOutcomeCredits.get(id);if(existing!=null) { advanceCompletedMarker(position);return existing; }
+            var estimate=estimateSourceOutcomeCredit(request,false);var id=request.original().operationId();var existing=sourceOutcomeCredits.get(id);if(existing!=null) { advanceCompletedMarker(position);return existing; }
             var publication=sourceOutcomePublications.get(id);if(publication!=null) { advanceCompletedMarker(position);return new NativeSourceOutcomeCredit(request,publication.creditPosition()); }
             if(estimate.fenced()) { advanceCompletedMarker(position);return null; }
             requireNext(position);var credit=new NativeSourceOutcomeCredit(request,position);var next=new HashMap<>(sourceOutcomeCredits);next.put(id,credit);
@@ -256,14 +280,14 @@ public final class ReplicatedRangeStore {
     }
     public SourceOutcomePublicationResult sourceOutcomePublication(NativeSourceOutcomeCredit.Request request,byte[] result) throws RocksDBException {
         Objects.requireNonNull(request);Objects.requireNonNull(result);if(result.length>request.maximumResultBytes())throw new IllegalArgumentException("Source publication result exceeds promise");
-        enterNative();applyLane.lock();try { requireSourceOutcomeRequest(request);var id=request.original().operationId();var saved=sourceOutcomePublications.get(id);if(saved!=null){saved.requireRequest(request,result);saved.requireCut(applied);return new SourceOutcomePublicationResult(sourceOperationFenced(id)?NativeSourceOutcomePublication.Outcome.FENCED:saved.outcome(),saved);}return sourceOperationFenced(id) && !sourceOutcomeCredits.containsKey(id)?new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.FENCED,null):null; } finally { applyLane.unlock();leaveNative(); }
+        enterNative();applyLane.lock();try { requireSourceOutcomeRequest(request,true);var id=request.original().operationId();var saved=sourceOutcomePublications.get(id);if(saved!=null){saved.requireRequest(request,result);saved.requireCut(applied);return new SourceOutcomePublicationResult(sourceOperationFenced(id)?NativeSourceOutcomePublication.Outcome.FENCED:saved.outcome(),saved);}return sourceOperationFenced(id) && !sourceOutcomeCredits.containsKey(id)?new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.FENCED,null):null; } finally { applyLane.unlock();leaveNative(); }
     }
     public record SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome outcome,NativeSourceOutcomePublication publication) {}
     /** Trusted verified terminal HOME result; no USER access or original grant revalidation. */
     public SourceOutcomePublicationResult publishSourceOutcome(ApplyPosition position,NativeSourceOutcomeCredit.Request request,byte[] result) throws RocksDBException {
         Objects.requireNonNull(position);Objects.requireNonNull(request);Objects.requireNonNull(result);if(result.length>request.maximumResultBytes())throw new IllegalArgumentException("Source publication result exceeds promise");byte[] stable=result.clone();CommandResult.decode(stable);
         enterNative();applyLane.lock();try {
-            requireSourceOutcomeRequest(request);ensureReceiptUsage();var id=request.original().operationId();boolean fenced=sourceOperationFenced(id);var saved=sourceOutcomePublications.get(id);
+            requireSourceOutcomeRequest(request,false);ensureReceiptUsage();var id=request.original().operationId();boolean fenced=sourceOperationFenced(id);var saved=sourceOutcomePublications.get(id);
             if(saved!=null) { saved.requireRequest(request,stable);saved.requireCut(applied);advanceCompletedMarker(position);return new SourceOutcomePublicationResult(fenced?NativeSourceOutcomePublication.Outcome.FENCED:saved.outcome(),saved); }
             var credit=sourceOutcomeCredits.get(id);if(credit==null) { if(fenced) { advanceCompletedMarker(position);return new SourceOutcomePublicationResult(NativeSourceOutcomePublication.Outcome.FENCED,null); }throw new IllegalStateException("Source publication has no durable exact receipt credit"); }
             if(!credit.request().equals(request))throw new IllegalArgumentException("Source publication changed credited input");requireNext(position);
@@ -477,6 +501,8 @@ public final class ReplicatedRangeStore {
     private volatile NativeTopologyActivation topologyActivation;
     private volatile byte[] topologyRetirement;
     private volatile NativeTopologyRecoveryFence topologyRecoveryFence;
+    private volatile NativeMetadataRecoveryRegistration metadataRecoveryRegistration;
+    private volatile boolean metadataRecoveryReady;
     private volatile TopologyPreparation topologyPreparation;
     private volatile NativeSchemaInstallation activeSchemaInstallation;
     private volatile NativeSchemaActivationProof activeSchemaActivation;
@@ -767,7 +793,7 @@ public final class ReplicatedRangeStore {
                 importIntent=new NativeSstImportManifest.Intent(manifest,position);
                 try(var options=new WriteOptions().setDisableWAL(false).setSync(true)) { db.put(state,options,importKey(0x41),importIntent.encode()); }
                 observer.at(NativeRangeSstImport.Stage.INTENT_FORCED);
-                try(var writer=new InstallWriter(batches -> {})) { for(var cf:columns.values())clearForInstall(cf,interval.lowerInclusive(),interval.upperExclusive(),null,writer); writer.flush(); }
+                try(var writer=new InstallWriter(batches -> {})) { for(var cf:columns.values())clearForInstall(cf,interval.lowerInclusive(),interval.upperExclusive(),null,writer,false); writer.flush(); }
                 db.flushWal(true); observer.at(NativeRangeSstImport.Stage.INTERVAL_RESET);
                 ingestion.run(db,columns);
                 try(var flush=new org.rocksdb.FlushOptions().setWaitForFlush(true)) { if(!columns.isEmpty())db.flush(flush,new ArrayList<>(columns.values())); }
@@ -819,11 +845,12 @@ public final class ReplicatedRangeStore {
             byte[] schemaDigest, Map<UUID, ColumnFamilyHandle> columns,
             ColumnFamilyHandle state, ColumnFamilyHandle receipts,
             Set<UUID> deterministicMergeColumns) throws RocksDBException {
-        this(db,ownership,owner,schemaDigest,columns,state,receipts,deterministicMergeColumns,false);
+        this(db,ownership,owner,schemaDigest,columns,state,receipts,deterministicMergeColumns,false,null);
     }
     ReplicatedRangeStore(RocksDB db,RangeOwnership ownership,RangeOwnership.Owner owner,
             byte[] schemaDigest,Map<UUID,ColumnFamilyHandle> columns,ColumnFamilyHandle state,
-            ColumnFamilyHandle receipts,Set<UUID> deterministicMergeColumns,boolean retiredMetadataOnly) throws RocksDBException {
+            ColumnFamilyHandle receipts,Set<UUID> deterministicMergeColumns,boolean retiredMetadataOnly,NativeMetadataRecoveryRegistration metadataRegistration) throws RocksDBException {
+        metadataRecoveryRegistration=metadataRegistration;
         this.retiredMetadataOnly=retiredMetadataOnly;
         if(retiredMetadataOnly && (ownership.get(owner).state()!=RangeOwnership.State.RETIRED || !columns.isEmpty()))throw new IllegalArgumentException("Metadata-only range requires retired ownership without USER handles");
         this.databaseOwner = Objects.requireNonNull(db);
@@ -869,8 +896,8 @@ public final class ReplicatedRangeStore {
             if (ownership.get(owner).state() == RangeOwnership.State.ACTIVE) ownership.fence(owner);
         }
         recoverTopologyOwnership();
-        if(retiredMetadataOnly && (!topologyRetired() || pendingInstallation!=null))throw new IllegalArgumentException("Metadata-only owner lacks completed retirement");
-        if(pendingInstallation==null) {
+        if(retiredMetadataOnly && (!topologyRetired() || pendingInstallation!=null && metadataRecoveryRegistration==null))throw new IllegalArgumentException("Metadata-only owner lacks completed retirement/recovery authority");
+        if(pendingInstallation==null && (metadataRecoveryRegistration==null || metadataImageInstalledUnderLane())) {
             recoverSchemaMetadata();
             recoverRelocationCompletions();
             recoverImportMetadata();
@@ -973,6 +1000,10 @@ public final class ReplicatedRangeStore {
 
     private byte[] topologyOwnershipKey(int tag) { return ByteBuffer.allocate(17).put(markerKey).put((byte)tag).array(); }
     private void recoverTopologyOwnership() throws RocksDBException {
+        int metadataSize=db.get(state,topologyOwnershipKey(0x6f),new byte[0]);if(metadataSize!=RocksDB.NOT_FOUND && (metadataSize!=32 || metadataRecoveryRegistration==null || !Arrays.equals(metadataRecoveryRegistration.digest(),db.get(state,topologyOwnershipKey(0x6f)))))throw new IllegalArgumentException("Metadata recovery lacks exact registry context");
+        if(metadataSize==RocksDB.NOT_FOUND && metadataRecoveryRegistration!=null)throw new IllegalArgumentException("Metadata recovery lost its durable pointer");
+        if(metadataRecoveryRegistration!=null && (!metadataRecoveryRegistration.groupId().equals(groupId) || metadataRecoveryRegistration.range().rangeEpoch()!=rangeEpoch))throw new IllegalArgumentException("Metadata registration changed native group identity");
+        metadataRecoveryReady=metadataRecoveryRegistration!=null && Arrays.equals(db.get(state,topologyOwnershipKey(0x70)),metadataRecoveryRegistration.digest());
         int recoverySize=db.get(state,topologyOwnershipKey(0x6d),new byte[0]);if(recoverySize>NativeTopologyRecoveryFence.MAX_BYTES)throw new IllegalArgumentException("Recovery fence exceeds bound");byte[] recovery=recoverySize==RocksDB.NOT_FOUND?null:db.get(state,topologyOwnershipKey(0x6d));topologyRecoveryFence=recovery==null?null:NativeTopologyRecoveryFence.decode(recovery);if(topologyRecoveryFence!=null)topologyRecoveryFence.requireGroup(groupId,rangeEpoch);
         byte[] learner=db.get(state,topologyOwnershipKey(0x67));topologyLearner=learner==null ? null : NativeTopologyLearnerRegistration.decode(learner);
         if(topologyLearner!=null) { var range=topologyLearner.definition().targets().getFirst();if(!range.groupId().equals(groupId) || range.rangeEpoch()!=rangeEpoch || !topologyLearner.schema().domainId().equals(interval.domainId()) || !Arrays.equals(range.lowerInclusive(),interval.lowerInclusive()) || !Arrays.equals(range.upperExclusive(),interval.upperExclusive()))throw new IllegalArgumentException("Learner registration differs from receiver ownership"); }
@@ -1071,7 +1102,43 @@ public final class ReplicatedRangeStore {
             try(var batch=new WriteBatch();var options=new WriteOptions().setDisableWAL(false).setSync(true)){batch.put(state,topologyOwnershipKey(0x6e),expected.encode());batch.delete(state,topologyOwnershipKey(0x6d));db.write(options,batch);}topologyRecoveryFence=null;
         }finally{applyLane.unlock();leaveNative();}
     }
-    public boolean topologyRetired() { return topologyRetirement!=null; }
+    public boolean topologyRetired() { return topologyRetirement!=null || metadataRecoveryRegistration!=null; }
+    public NativeMetadataRecoveryRegistration metadataRecoveryRegistration(){return metadataRecoveryRegistration;}
+    public boolean metadataRecoveryPending(){return metadataRecoveryRegistration!=null && !metadataRecoveryReady;}
+    private void requireMetadataRecoveryReady(){if(metadataRecoveryPending())throw new IllegalStateException("Source metadata recovery has not qualified its current completed prefix");}
+    private static byte[] metadataImageReceipt(NativeMetadataRecoveryRegistration registration){return ByteBuffer.allocate(48).putLong(registration.imageCut().term()).putLong(registration.imageCut().index()).put(registration.imageHash()).array();}
+    private boolean metadataImageInstalledUnderLane()throws RocksDBException {
+        var registration=metadataRecoveryRegistration;return registration!=null && pendingInstallation==null && applied!=null && NativeMetadataRecoveryRegistration.covers(applied,registration.imageCut())
+                && Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(registration));
+    }
+    @FunctionalInterface interface MetadataRecoveryForce {void force()throws RocksDBException;}
+    /** Pool mutation ownership supplies the one durable registry/registration force before local publication. */
+    void prepareMetadataRecovery(NativeMetadataRecoveryRegistration registration,MetadataRecoveryForce force)throws RocksDBException {
+        Objects.requireNonNull(registration);Objects.requireNonNull(force);requireSnapshotReleaseHealthy();
+        if(!nativeLifecycle.writeLock().tryLock())throw new IllegalStateException("Actual original native users have not drained");
+        applyLane.lock();try {
+            if(closing || snapshotPins.get()!=0)throw new IllegalStateException("Actual original native snapshots have not drained");
+            var previous=metadataRecoveryRegistration;if(previous!=null)registration.requireSuccessorOf(previous);
+            if(pendingInstallation!=null && !registration.equals(previous))throw new IllegalStateException("Uncertain metadata install requires original image retry");
+            if(applied!=null && !NativeMetadataRecoveryRegistration.covers(registration.imageCut(),applied))throw new IllegalArgumentException("Metadata image regresses completed native prefix");
+            var descriptor=registration.range();var target=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),descriptor.lowerInclusive(),descriptor.upperExclusive());
+            if(!groupId.equals(registration.groupId()) || rangeEpoch!=descriptor.rangeEpoch())throw new IllegalArgumentException("Metadata registration changed source owner");
+            ownership.validateMetadataRecovery(owner,target);byte[] digest=registration.sourceDirectory().schemaDigest();
+            // Fence first. A failed/unknown force must never reopen the previous USER owner.
+            metadataRecoveryRegistration=registration;metadataRecoveryReady=false;
+            force.force();ownership.recoverMetadata(owner,target);interval=target;schemaDigest=digest;columns=Map.of();deterministicMergeColumns=registration.mergeColumns();topologyRecoveryFence=null;
+            retiredMetadataOnly=true;installedGeneration=null;logicalSchema=null;retiredRoutingPrefix=registration.sourceDirectory().routingPrefixBytes();
+        }finally{applyLane.unlock();nativeLifecycle.writeLock().unlock();}
+    }
+    /** Fresh source-group quorum/configuration qualification is supplied by the trusted adapter. */
+    public void completeMetadataRecovery(NativeMetadataRecoveryRegistration expected,ApplyPosition requiredCut,Configuration requiredConfiguration)throws RocksDBException {
+        Objects.requireNonNull(expected);Objects.requireNonNull(requiredCut);Objects.requireNonNull(requiredConfiguration);enterNative();applyLane.lock();try {
+            if(!expected.equals(metadataRecoveryRegistration))throw new IllegalArgumentException("Metadata completion changed original recovery registration");
+            requireTopologyMetadataOwner(false);if(!metadataImageInstalledUnderLane() || !NativeMetadataRecoveryRegistration.covers(requiredCut,expected.imageCut()) || !NativeMetadataRecoveryRegistration.covers(applied,requiredCut))throw new IllegalStateException("Metadata recovery lacks actual current completed prefix");
+            var configuration=configurationUnderAdmission();if(configuration==null || configuration.term()!=requiredConfiguration.term() || configuration.index()!=requiredConfiguration.index() || !Arrays.equals(configuration.data(),requiredConfiguration.data()))throw new IllegalArgumentException("Metadata source configuration changed");
+            byte[] receipt=expected.digest();try(var options=new WriteOptions().setDisableWAL(false).setSync(true)){db.put(state,options,topologyOwnershipKey(0x70),receipt);}metadataRecoveryReady=true;
+        }finally{applyLane.unlock();leaveNative();}
+    }
     void publishTopologyRetirement(NativeTopologySeed seed) { topologyRetirement=seed.digest(); }
     /** Metadata-only parent/birth status at its own completed prefix; no USER snapshot is acquired. */
     public RangeStateView retiredOutcomeState() throws RocksDBException {
@@ -1083,10 +1150,11 @@ public final class ReplicatedRangeStore {
     /** Trusted outcome/status metadata only; does not grant USER access or acquire a native snapshot. */
     public RangeStateView metadataOutcomeState() throws RocksDBException { return readSchemaMetadata(this::metadataOutcomeStateUnderLane); }
     private RangeStateView metadataOutcomeStateUnderLane() throws RocksDBException {
+        requireMetadataRecoveryReady();
         byte[] marker=db.get(state,markerKey);if(!Objects.equals(marker==null ? null : decodePosition(marker),applied))throw new IllegalStateException("Metadata marker differs from completed prefix");
         return new RangeStateView(groupId,rangeEpoch,interval.domainId(),schemaDigest,logicalColumns(),interval.lowerInclusive(),interval.upperExclusive(),applied,minimumSessionEpoch(null),sessionAuthority(null));
     }
-    public long retiredAcknowledgedThrough(OperationId operation) throws RocksDBException { return readSchemaMetadata(() -> { if(!topologyRetired()) throw new IllegalStateException("Parent is not retired"); return acknowledgedThrough(operation,null); }); }
+    public long retiredAcknowledgedThrough(OperationId operation) throws RocksDBException { return readSchemaMetadata(() -> { requireMetadataRecoveryReady();if(!topologyRetired()) throw new IllegalStateException("Parent is not retired"); return acknowledgedThrough(operation,null); }); }
 
     private NativeTopologySeed requireTopologyActivationSeed(boolean fresh) throws RocksDBException {
         if(topologyBirth==null || schemaPreparationPool==null) throw new IllegalStateException("Topology activation requires retained local child birth");
@@ -1099,6 +1167,7 @@ public final class ReplicatedRangeStore {
         return seed;
     }
     void validateTopologyActivationRecovery() throws RocksDBException {
+        if(retiredMetadataOnly){if(!topologyRetired())throw new IllegalArgumentException("Metadata-only owner lost durable retirement/recovery authority");return;}
         if(topologyLearner!=null) {
             if(topologyRetired())throw new IllegalArgumentException("Learner cannot adopt source retirement");
             if(topologyLearner.origin()==null) { if(topologyBirth!=null || topologyActivation!=null)throw new IllegalArgumentException("Ordinary learner acquired foreign birth/activation"); }
@@ -1493,7 +1562,7 @@ public final class ReplicatedRangeStore {
     /** Bootstrap must install catalogue proposal authority before enabling new controls. Persisted data enforcement is unconditional. */
     public void enableSessionControls() {
         enterNative(); applyLane.lock();
-        try { if(topologyRetired()) { try { requireTopologyMetadataOwner(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot configure sealed topology controls",failure); } } else requireActive(); sessionControlsEnabled=true; }
+        try { if(metadataRecoveryRegistration!=null){try{if(metadataImageInstalledUnderLane())requireTopologyMetadataOwner(false);}catch(RocksDBException failure){throw new IllegalStateException("Cannot configure recovering metadata controls",failure);}}else if(topologyRetired()) { try { requireTopologyMetadataOwner(); } catch(RocksDBException failure) { throw new IllegalStateException("Cannot configure sealed topology controls",failure); } } else requireActive(); sessionControlsEnabled=true; }
         finally { applyLane.unlock(); leaveNative(); }
     }
 
@@ -2762,7 +2831,7 @@ public final class ReplicatedRangeStore {
             if(!Objects.equals(cut,applied))throw new IllegalStateException("Cohort snapshot marker differs from completed apply");
             var gate=readSnapshotGate(fence,options,cut);if(gate==null || !gate.active() || !Arrays.equals(gate.encode(),requireActiveGate(fence).encode()))throw new IllegalStateException("Cohort snapshot gate differs from completed state");
             if(fence.operation().epoch()<minimumSessionEpoch(options))throw new SnapshotRetentionExpiredException();
-            return new SnapshotPin(snapshot,cut,lease,physical);
+            return new SnapshotPin(snapshot,cut,lease,physical,false);
         }
     }
     /** A physical snapshot holds all member charges until the final alias's actual native users drain. */
@@ -3367,7 +3436,7 @@ public final class ReplicatedRangeStore {
         byte[] receiptKey = receiptKey(command.operationId());
         applyLane.lock();
         try {
-            if(learnerTail)requireTopologyLearnerImage();else if(metadataTopologyControl(command))requireTopologyMetadataOwner();else requireActive();
+            if(learnerTail)requireTopologyLearnerImage();else if(metadataTopologyControl(command))requireTopologyMetadataOwner(false);else requireActive();
             ensureReceiptUsage(); requireSourceCreditOriginal(command);requireHomeRecoveryFree(command.operationId());
             if(!metadataSchemaControl(command) && (activeTopologyFreeze!=null && !topologyAccountingControl(command) || activeSchemaFence!=null || !Arrays.equals(schemaDigest,command.schemaDigest()))) {
                 byte[] retained=db.get(receipts,receiptKey);
@@ -3752,6 +3821,7 @@ public final class ReplicatedRangeStore {
     private void applyNoopUnderAdmission(ApplyPosition position, byte[] configuration) throws RocksDBException {
         applyLane.lock();
         try {
+            if(metadataRecoveryRegistration!=null && !metadataImageInstalledUnderLane())throw new IllegalStateException("Metadata log replay requires its registered source image first");
             if(importIntent!=null && position.index()>=importIntent.position().index())throw new IllegalStateException("Pending native import owns its original committed apply position");
             var current = ownership.get(owner).state();
             if (pendingInstallation != null || (current != RangeOwnership.State.ACTIVE && current != RangeOwnership.State.FENCED && !(current==RangeOwnership.State.RETIRED && topologyRetired()))) {
@@ -3792,8 +3862,14 @@ public final class ReplicatedRangeStore {
     public NativeRangeImage.Manifest installSnapshot(Path image, NativeRangeImage.Limits limits,
             InstallationObserver observer) throws IOException, RocksDBException {
         enterNative();
-        try { return installUnderAdmission(image, limits, observer); }
+        try { return installUnderAdmission(image, limits, observer,false); }
         finally { try { drainScopedReleases(); } finally { leaveNative(); } }
+    }
+    public NativeRangeImage.Manifest installMetadataSnapshot(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException{return installMetadataSnapshot(image,limits,batches->{});}
+    /** Trusted sealed-source snapshot replacement. Descendant USER CFs and intervals are never visited. */
+    public NativeRangeImage.Manifest installMetadataSnapshot(Path image,NativeRangeImage.Limits limits,InstallationObserver observer)throws IOException,RocksDBException {
+        enterNative();try{if(!topologyRetired())throw new IllegalStateException("Metadata install requires durable source retirement/recovery registration");return installUnderAdmission(image,limits,observer,true);}
+        finally{try{drainScopedReleases();}finally{leaveNative();}}
     }
 
     private static boolean topologySchemaRow(byte[] key) { return key.length>16 && (key[16]==0x27 || key[16]==0x28 || key[16]==0x2a || key[16]==0x2b || key[16]==0x2c); }
@@ -3833,11 +3909,11 @@ public final class ReplicatedRangeStore {
     }
 
     private NativeRangeImage.Manifest installUnderAdmission(Path image, NativeRangeImage.Limits limits,
-            InstallationObserver observer) throws IOException, RocksDBException {
+            InstallationObserver observer,boolean metadata) throws IOException, RocksDBException {
         if(importPending()) throw new IllegalStateException("Unpublished native import cannot be replaced by snapshot replay");
         var context=homeRecoveryContext;
         var snapshotContext=snapshotHomeContext;
-        var expected = snapshotContext!=null ? NativeRangeImage.inspectSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column()) : context==null ? NativeRangeImage.inspect(image, limits) : NativeRangeImage.inspectHomeRecoveryReservations(image,limits,context.cluster(),context.database(),context.column());
+        var expected = metadata?NativeRangeImage.inspectMetadata(image,limits):snapshotContext!=null ? NativeRangeImage.inspectSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column()) : context==null ? NativeRangeImage.inspect(image, limits) : NativeRangeImage.inspectHomeRecoveryReservations(image,limits,context.cluster(),context.database(),context.column());
         if (!expected.owner().equals(owner) || !expected.interval().equals(interval)
                 || !Arrays.equals(expected.schemaDigest(), schemaDigest)
                 || !expected.deterministicMergeColumns().equals(deterministicMergeColumns)) {
@@ -3846,37 +3922,47 @@ public final class ReplicatedRangeStore {
         Objects.requireNonNull(observer);
         applyLane.lock();
         try {
+            if(metadata) {
+                if(applied!=null && !NativeMetadataRecoveryRegistration.covers(expected.position(),applied))throw new IOException("Metadata snapshot regresses actual completed source prefix");
+                var registration=metadataRecoveryRegistration;
+                if(registration!=null) {
+                    if(!expected.position().equals(registration.imageCut()) || !Arrays.equals(expected.sha256(),registration.imageHash()))throw new IOException("Metadata snapshot differs from exact registered image");
+                    Configuration[] configuration={null};NativeTopologyFreeze[] freeze={null};NativeRangeImage.visitMetadata(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE){if(Arrays.equals(key,configurationKey))configuration[0]=Configuration.decode(value);if(Arrays.equals(key,topologyFreezeKey()))freeze[0]=NativeTopologyFreeze.decode(value);}});
+                    if(!registration.freeze().equals(freeze[0]))throw new IOException("Metadata image changed registered original FREEZE");
+                    if(configuration[0]==null || configuration[0].term()!=registration.configurationTerm() || configuration[0].index()!=registration.configurationIndex() || !Arrays.equals(configuration[0].data(),registration.sourceConfiguration()))throw new IOException("Metadata image changed registered source configuration");
+                }
+            }
             if(pendingLearnerImagePermission!=null)throw new IllegalStateException("Unknown later image force requires exact permission retry");
             final NativeTopologyLearnerImagePermission permission=topologyLearner!=null && learnerImagePermission!=null && expected.position().equals(learnerImagePermission.imageCut()) && Arrays.equals(expected.sha256(),learnerImagePermission.imageHash()) ? learnerImagePermission : null;
-            final NativeTopologyActivation localActivation=qualifyTopologyImageOrigin(expected.topologyOrigin());
-            if(topologyLearner!=null) {
+            final NativeTopologyActivation localActivation=metadata?null:qualifyTopologyImageOrigin(expected.topologyOrigin());
+            if(!metadata && topologyLearner!=null) {
                 if(permission==null && (!expected.position().equals(topologyLearner.imageCut()) || !Arrays.equals(expected.sha256(),topologyLearner.imageHash())))throw new IOException("Learner image lacks exact original or freshly qualified later permission");
                 var configuration=new Configuration[1];NativeRangeImage.visit(image,limits,(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==1)configuration[0]=Configuration.decode(value);});
                 if(configuration[0]==null || !Arrays.equals(configuration[0].data(),(permission==null ? topologyLearner.sourceConfiguration() : permission.sourceConfiguration())))throw new IOException("Learner image changed admitted source configuration");
             }
-            final Map<String,byte[]> localSchemaRows=localActivation==null && topologyLearner==null ? null : validateTopologySchemaImage(image,limits,permission);
-            if(!sourceOutcomeCredits.isEmpty()) {
+            final Map<String,byte[]> localSchemaRows=metadata || localActivation==null && topologyLearner==null ? null : validateTopologySchemaImage(image,limits,permission);
+            if(!metadata && !sourceOutcomeCredits.isEmpty()) {
                 var incomingCredits=new HashMap<OperationId,NativeSourceOutcomeCredit>();var incomingPublications=new HashMap<OperationId,NativeSourceOutcomePublication>();
                 NativeRangeImage.visit(image,limits,(section,column,key,value)->{ if(section==NativeRangeImage.Section.STATE && key.length==49) { if(key[16]==0x65){var credit=NativeSourceOutcomeCredit.decode(value);incomingCredits.put(credit.request().original().operationId(),credit);}if(key[16]==0x66){var publication=NativeSourceOutcomePublication.decode(value);incomingPublications.put(publication.operation(),publication);} } });
                 for(var entry:sourceOutcomeCredits.entrySet()) { var retained=incomingCredits.get(entry.getKey());var terminal=incomingPublications.get(entry.getKey());if(retained!=null ? !retained.equals(entry.getValue()) : terminal==null || !Arrays.equals(terminal.requestDigest(),entry.getValue().request().digest()) || !terminal.creditPosition().equals(entry.getValue().position()))throw new IOException("Snapshot discards/changes durable source outcome credit"); }
             }
             if(topologyPreparation!=null) throw new IllegalStateException("Topology preparation owns native replacement admission");
             if(activeTopologyFreeze!=null) {
-                var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visit(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); });
+                var incoming=new NativeTopologyFreeze[1]; NativeRangeImage.visitKind(image,limits,(section,column,key,value) -> { if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60) incoming[0]=NativeTopologyFreeze.decode(value); },metadata);
                 if(!activeTopologyFreeze.equals(incoming[0])) throw new IOException("Snapshot cannot discard/change native topology FREEZE");
             }
             if(catalogueHistoryColumn!=null)NativeRangeImage.inspectCatalogueHistory(image,limits,catalogueHistoryColumn,catalogueHistoryKeys);
-            if(sourceOutcomeCountLimit!=0)NativeRangeImage.inspectReceiptCapacity(image,limits,sourceOutcomeCountLimit,sourceOutcomeByteLimit);
-            NativeRangeImage.inspectSessionMetadata(image,limits,sessionAckLimit);
-            if(cdc!=null) cdc.validateImage(image,limits,expected.position());
-            if(importBirth!=null) {
+            if(sourceOutcomeCountLimit!=0)NativeRangeImage.inspectReceiptCapacity(image,limits,sourceOutcomeCountLimit,sourceOutcomeByteLimit,metadata);
+            NativeRangeImage.inspectSessionMetadata(image,limits,sessionAckLimit,metadata);
+            if(cdc!=null) cdc.validateImage(image,limits,expected.position(),metadata);
+            if(!metadata && importBirth!=null) {
                 byte[][] incoming=new byte[3][];
                 NativeRangeImage.visit(image,limits,(section,column,key,value)->{ if(section==NativeRangeImage.Section.STATE && key.length==17) { if(key[16]==0x40)incoming[0]=value; if(key[16]==0x42)incoming[1]=value; if(key[16]==0x43)incoming[2]=value; } });
                 if(!Arrays.equals(importBirth.encode(),incoming[0]) || importReceipt==null || !Arrays.equals(importReceipt.encode(),incoming[1]) || importActivation==null || !Arrays.equals(importActivation.encode(),incoming[2]))throw new IOException("Snapshot cannot discard or change native import publication evidence");
             }
-            if(schemaPreparationPool!=null) schemaPreparationPool.validateSnapshotCapacity(this,image,limits,localSchemaRows);
+            if(!metadata && schemaPreparationPool!=null) schemaPreparationPool.validateSnapshotCapacity(this,image,limits,localSchemaRows);
             final boolean preparingLearner=permission!=null && permission.equals(learnerSchemaPreparation);
-            if(activeSchemaFence!=null || activeSchemaInstallation!=null || activeSchemaActivation!=null) {
+            if(!metadata && (activeSchemaFence!=null || activeSchemaInstallation!=null || activeSchemaActivation!=null)) {
                 var incoming=new NativeSchemaFence[1]; var incomingInstall=new NativeSchemaInstallation[1]; var incomingActivation=new NativeSchemaActivationProof[1];
                 NativeRangeImage.visit(image,limits,(section,column,key,value) -> {
                     if (section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x27) incoming[0]=NativeSchemaFence.decode(value);
@@ -3888,7 +3974,7 @@ public final class ReplicatedRangeStore {
                 if(!preparingLearner && activeSchemaActivation!=null && !activeSchemaActivation.equals(incomingActivation[0])) throw new IOException("Snapshot cannot discard or change native activation proof");
             }
             if (snapshotPins.get() != 0) throw new IllegalStateException("Native snapshot readers have not drained");
-            if (ownership.get(owner).state() != RangeOwnership.State.FENCED) {
+            if (ownership.get(owner).state() != (metadata?RangeOwnership.State.RETIRED:RangeOwnership.State.FENCED)) {
                 throw new IllegalStateException("Snapshot installation requires a fenced interval");
             }
             if (pendingInstallation != null) {
@@ -3903,7 +3989,8 @@ public final class ReplicatedRangeStore {
                 }
             }
             if(topologyLearner!=null && applied!=null && (expected.position().index()<applied.index() || expected.position().term()<applied.term() || expected.position().index()==applied.index() && expected.position().term()!=applied.term()))throw new IOException("Learner image regresses actual completed tail");
-            try (var lease = ownership.claimInstall(owner)) {
+            try (var lease = metadata?null:ownership.claimInstall(owner)) {
+                if(metadata){retiredMetadataOnly=true;columns=Map.of();if(installedGeneration!=null)installedGeneration=new SchemaGeneration(installedGeneration.schema(),interval,columns,deterministicMergeColumns);}
                 resetScopedUnderLane(); installationGeneration++; homeStatusCapacityKnown=false;
                 pendingInstallation = ByteBuffer.allocate(48)
                         .putLong(expected.position().term()).putLong(expected.position().index()).put(expected.sha256()).array();
@@ -3916,17 +4003,17 @@ public final class ReplicatedRangeStore {
                 }
                 applied = null;
                 try (var writer = new InstallWriter(observer)) {
-                    for (var cf : columns.values()) clearForInstall(cf, interval.lowerInclusive(), interval.upperExclusive(), null, writer);
-                    clearForInstall(state, markerKey, null, markerKey, writer);
-                    clearForInstall(receipts, markerKey, null, markerKey, writer);
+                    if(!metadata)for (var cf : columns.values()) clearForInstall(cf, interval.lowerInclusive(), interval.upperExclusive(), null, writer,false);
+                    clearForInstall(state, markerKey, null, markerKey, writer,metadata);
+                    clearForInstall(receipts, markerKey, null, markerKey, writer,metadata);
                     writer.flush();
                     NativeRangeImage.RowVisitor importer = (section, column, key, value) -> {
                         try {
                             switch (section) {
-                                case USER -> writer.put(columns.get(column), key, value);
+                                case USER -> {if(metadata)throw new IOException("Metadata installer cannot write USER rows");writer.put(columns.get(column), key, value);}
                                 case RECEIPTS -> writer.put(receipts, key, value);
                                 case STATE -> {
-                                    if(key.length==17 && (key[16]==0x6d || key[16]==0x6e))throw new IOException("Source image cannot replace local recovery fence");
+                                    if(key.length==17 && key[16]>=0x6d && key[16]<=0x71)throw new IOException("Source image cannot replace local recovery fence");
                                     if (Arrays.equals(key, installingKey)) throw new IOException("Image contains incomplete-install metadata");
                                     if(key.length==17 && (key[16]==0x67 || key[16]==0x69 || key[16]==0x6a || key[16]==0x6b || key[16]==0x6c) || topologyLearner!=null && key.length==33 && key[16]==0x68)break;
                                     if(localActivation!=null && key.length==17 && (key[16]==0x61 || key[16]==0x63 || key[16]==0x64))break;
@@ -3935,7 +4022,7 @@ public final class ReplicatedRangeStore {
                             }
                         } catch (RocksDBException storage) { throw new IOException("Native snapshot import failed", storage); }
                     };
-                    var actual=snapshotContext==null ? NativeRangeImage.visit(image,limits,importer) : NativeRangeImage.visitSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column(),importer);
+                    var actual=metadata?NativeRangeImage.visitMetadata(image,limits,importer):snapshotContext==null ? NativeRangeImage.visit(image,limits,importer) : NativeRangeImage.visitSnapshotHome(image,limits,snapshotContext.cluster(),snapshotContext.database(),snapshotContext.column(),importer);
                     if (!Arrays.equals(expected.sha256(), actual.sha256())) throw new IOException("Snapshot changed during installation");
                     writer.flush();
                     // Ordinary counters remain bound to the source cut; only local ownership/alias evidence is normalized.
@@ -3948,6 +4035,7 @@ public final class ReplicatedRangeStore {
                     db.flushWal(true);
                     try (var batch = new WriteBatch(); var options = new WriteOptions().setDisableWAL(false).setSync(true)) {
                         if(cdc!=null) cdc.initialize(batch);
+                        if(metadata && metadataRecoveryRegistration!=null)batch.put(state,topologyOwnershipKey(0x71),metadataImageReceipt(metadataRecoveryRegistration));
                         if(topologyLearner!=null)batch.put(state,topologyOwnershipKey(permission==null ? 0x69 : 0x6b),permission==null ? learnerImageReceipt() : ByteBuffer.allocate(48).putLong(permission.imageCut().term()).putLong(permission.imageCut().index()).put(permission.imageHash()).array());
                         if(localActivation!=null) { batch.put(state,topologyOwnershipKey(0x61),localActivation.birth().encode());batch.put(state,topologyOwnershipKey(0x63),localActivation.encode()); }
                         batch.put(state, markerKey, encodePosition(expected.position()));
@@ -4001,7 +4089,7 @@ public final class ReplicatedRangeStore {
         @Override public void close() { batch.close(); options.close(); }
     }
 
-    private void clearForInstall(ColumnFamilyHandle cf, byte[] lower, byte[] upper, byte[] prefix, InstallWriter writer)
+    private void clearForInstall(ColumnFamilyHandle cf, byte[] lower, byte[] upper, byte[] prefix, InstallWriter writer,boolean metadata)
             throws IOException, RocksDBException {
         try (var options = new ReadOptions().setFillCache(false); var iterator = databaseOwner.newIterator(cf, options)) {
             if (lower == null) iterator.seekToFirst(); else iterator.seek(lower);
@@ -4010,7 +4098,8 @@ public final class ReplicatedRangeStore {
                 if (upper != null && Arrays.compareUnsigned(key, upper) >= 0) break;
                 if (prefix != null && (key.length < prefix.length
                         || !Arrays.equals(prefix, 0, prefix.length, key, 0, prefix.length))) break;
-                if (cf.getID() != state.getID() || !Arrays.equals(key, installingKey) && !(key.length==17 && (key[16]==0x6d || key[16]==0x6e)) && !(key.length==17 && (key[16]==0x67 || topologyLearner!=null && (key[16]==0x69 || key[16]==0x6a || key[16]==0x6c))) && !(topologyLearner!=null && key.length==33 && key[16]==0x68) && !((topologyBirth!=null || topologyLearner!=null) && (topologySchemaRow(key) || key.length==17 && (key[16]==0x61 || key[16]==0x63 || key[16]==1)))) writer.delete(cf, key);
+                if(metadata){if(cf.getID()!=state.getID() || !Arrays.equals(key,installingKey) && !NativeRangeImage.metadataLocalPointer(key))writer.delete(cf,key);}
+                else if (cf.getID() != state.getID() || !Arrays.equals(key, installingKey) && !(key.length==17 && key[16]>=0x6d && key[16]<=0x71) && !(key.length==17 && (key[16]==0x67 || topologyLearner!=null && (key[16]==0x69 || key[16]==0x6a || key[16]==0x6c))) && !(topologyLearner!=null && key.length==33 && key[16]==0x68) && !((topologyBirth!=null || topologyLearner!=null) && (topologySchemaRow(key) || key.length==17 && (key[16]==0x61 || key[16]==0x63 || key[16]==1)))) writer.delete(cf, key);
                 iterator.next();
             }
             iterator.status();
@@ -4019,7 +4108,7 @@ public final class ReplicatedRangeStore {
 
     public byte[] operationResult(OperationId id, byte[] payloadDigest) throws RocksDBException {
         enterNative();
-        try { return operationResultUnderAdmission(id, payloadDigest); }
+        try { requireMetadataRecoveryReady();return operationResultUnderAdmission(id, payloadDigest); }
         finally { leaveNative(); }
     }
 
@@ -4409,11 +4498,18 @@ public final class ReplicatedRangeStore {
     public SnapshotPin captureForRecovery() throws RocksDBException {
         enterNative(); try { return captureUnderAdmission(true); } finally { leaveNative(); }
     }
+    /** Sealed source metadata from its own completed cut, with no borrowed USER handles. */
+    public SnapshotPin captureMetadataForRecovery()throws RocksDBException {
+        enterNative();try{return captureUnderAdmission(true,true);}finally{leaveNative();}
+    }
     private SnapshotPin captureUnderAdmission(boolean recovery) throws RocksDBException {
-        if (!recovery) { requireServing(); requireSchemaAdmission(); } if(!recovery || topologyLearner==null)requireActive();
+        return captureUnderAdmission(recovery,false);
+    }
+    private SnapshotPin captureUnderAdmission(boolean recovery,boolean metadata) throws RocksDBException {
+        if(metadata)requireTopologyMetadataOwner();else {if (!recovery) { requireServing(); requireSchemaAdmission(); } if(!recovery || topologyLearner==null)requireActive();}
         applyLane.lock();
         try {
-            if(!recovery) { requireServing(); requireSchemaAdmission(); } if(recovery && topologyLearner!=null)requireTopologyLearnerImage();else requireActive();
+            if(metadata)requireTopologyMetadataOwner();else {if(!recovery) { requireServing(); requireSchemaAdmission(); } if(recovery && topologyLearner!=null)requireTopologyLearnerImage();else requireActive();}
             if(schemaCaptureGate!=null) throw new IllegalStateException("INSTALL preparation blocks new native captures");
             ensureReceiptUsage();
             PoolSnapshotAdmission.Lease lease = snapshotAdmission == null ? null : snapshotAdmission.reserve();
@@ -4427,7 +4523,7 @@ public final class ReplicatedRangeStore {
                     cut = marker == null ? null : decodePosition(marker);
                     if (!Objects.equals(cut, applied)) throw new IllegalStateException("Snapshot marker differs from completed apply");
                 }
-                var pin = new SnapshotPin(snapshot, cut, lease,null);
+                var pin = new SnapshotPin(snapshot, cut, lease,null,metadata);
                 snapshotPins.incrementAndGet();
                 return pin;
             } catch (Throwable failure) {
@@ -4513,20 +4609,22 @@ public final class ReplicatedRangeStore {
         private final Map<UUID,ColumnFamilyHandle> capturedHandles;
         private final PhysicalSnapshotOwner physicalOwner;
         private final Set<UUID> capturedColumns,capturedMergeColumns;
+        private final boolean metadataOnly;
         private boolean closed;
         private int nativeUsers;
         private volatile boolean nativeReleaseSucceeded;
         private long historyScopeBytes; private volatile boolean historyTracked;
-        private SnapshotPin(Snapshot snapshot, ApplyPosition position, PoolSnapshotAdmission.Lease lease,PhysicalSnapshotOwner physicalOwner) {
+        private SnapshotPin(Snapshot snapshot, ApplyPosition position, PoolSnapshotAdmission.Lease lease,PhysicalSnapshotOwner physicalOwner,boolean metadataOnly) {
             this.snapshot = snapshot;
             this.position = position;
-            this.admissionLease = lease;this.physicalOwner=physicalOwner;capturedHandles=Map.copyOf(columns);
-            capturedSchemaDigest=schemaDigest.clone(); capturedInterval=interval; capturedColumns=Set.copyOf(columns.keySet()); capturedMergeColumns=Set.copyOf(deterministicMergeColumns);
+            this.admissionLease = lease;this.physicalOwner=physicalOwner;this.metadataOnly=metadataOnly;capturedHandles=metadataOnly?Map.of():Map.copyOf(columns);
+            capturedSchemaDigest=schemaDigest.clone(); capturedInterval=interval; capturedColumns=Set.copyOf(metadataOnly?logicalColumns():columns.keySet()); capturedMergeColumns=Set.copyOf(deterministicMergeColumns);
         }
         private boolean belongsTo(ReplicatedRangeStore store){return ReplicatedRangeStore.this==store;}
         private boolean capturedContains(byte[] key){return (capturedInterval.lowerInclusive()==null || Arrays.compareUnsigned(key,capturedInterval.lowerInclusive())>=0) && (capturedInterval.upperExclusive()==null || Arrays.compareUnsigned(key,capturedInterval.upperExclusive())<0);}
         public boolean releaseSettled(){synchronized(this){if(!closed || nativeUsers!=0)return false;}return physicalOwner==null ? nativeReleaseSucceeded : physicalOwner.releaseSucceeded;}
         public ApplyPosition position() { return position; }
+        boolean metadataOnly(){return metadataOnly;}
         public UUID groupId() { return groupId; }
         public long rangeEpoch() { return rangeEpoch; }
         public byte[] schemaDigest() { return capturedSchemaDigest.clone(); }
@@ -4542,6 +4640,7 @@ public final class ReplicatedRangeStore {
         }
         /** Local topology evidence is read from this owned native cut, never the live store cache. */
         public NativeTopologyImageOrigin topologyImageOrigin() throws RocksDBException {
+            if(metadataOnly)return null;
             acquireUse();
             try(var options=new ReadOptions().setSnapshot(snapshot)) {
                 byte[] retired=db.get(state,options,topologyOwnershipKey(0x62));if(retired!=null)throw new IllegalStateException("Retired topology parent cannot export USER image");
@@ -5230,7 +5329,7 @@ public final class ReplicatedRangeStore {
     /** Protected publication promise estimate: no original USER read or old-grant revalidation. */
     public SessionMetadataEstimate estimateSourceSessionMetadata(NativeSourceOutcomeCredit.Request request) throws RocksDBException {
         Objects.requireNonNull(request);enterNative();applyLane.lock();try {
-            requireSourceOutcomeRequest(request);if(sessionAckEpochs==null)validateSessionMetadata(null);var original=request.original();var id=original.operationId();
+            requireSourceOutcomeRequest(request,true);if(sessionAckEpochs==null)validateSessionMetadata(null);var original=request.original();var id=original.operationId();
             boolean saved=sourceOutcomeCredits.containsKey(id) || sourceOutcomePublications.containsKey(id);
             var change=!saved && !sourceOperationFenced(id) ? sessionMetadataChange(original,-1,original.acknowledgedThrough()) : new SessionMetadataChange(sessionAckCount,-1,0,false);
             return sessionMetadataEstimate(change,saved,original);
