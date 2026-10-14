@@ -162,7 +162,7 @@ class RatisExportJournalTest {
             Files.write(RatisExportJournal.download(artifact),body,StandardOpenOption.CREATE_NEW);
             var p=definition.fence().participant(group); var request=new RatisExportSourceRpc.BuildRequest(RatisExportJournal.sourceDefinition(journal.snapshot(),group),intent);
             var descriptor=new RatisExportSourceRpc.Descriptor(request.definition().digest(),intent.ordinal(),group,p.rangeEpoch(),p.schemaDigest(),column,intent.cut(),intent.scopeStart(),null,MessageDigest.getInstance("SHA-256").digest(body),1,2,3,false);
-            RatisExportJournal.publishDownload(request,descriptor,artifact);
+            RatisExportJournal.publishDownload(request,descriptor,artifact,RatisJournalAccess.standalone());
             Files.move(artifact,RatisExportJournal.download(artifact)); // Exact interrupted state: sidecar forced, download still named.
         }
         try (var journal=RatisExportJournal.reopen(path)) {

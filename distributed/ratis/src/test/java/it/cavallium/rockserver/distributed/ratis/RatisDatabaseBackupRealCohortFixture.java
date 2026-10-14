@@ -58,7 +58,7 @@ final class RatisDatabaseBackupRealCohortFixture implements AutoCloseable {
             homeRouted=new RatisRoutedClient(new RangeDirectory(base.cluster,base.database,UUID.randomUUID(),0,new byte[32],0,Set.of(homeColumn),0,List.of(homeRange)),transport);
             snapshots=new RatisSnapshotClient(state.schema,new RatisSnapshotFences(homeRouted,homeColumn),routed,scheduler,RatisSnapshotClient.Limits.defaults());
             var old=base.bindings.get(state.fence.fenceId());var d=old.exportDefinition();var definition=new RatisExportJournal.Definition(d.jobId(),d.fence(),d.columns(),d.sourceJournal(),snapshots.identityDigest(),d.limits(),d.snapshotTtl());
-            bindings.put(state.fence.fenceId(),new RatisDatabaseBackupDriver.Binding(state.durable,state.coordinator,routed,old.exportPath(),definition,new RatisRemoteExportSource(snapshots,routed)));
+            bindings.put(state.fence.fenceId(),new RatisDatabaseBackupDriver.Binding(state.durable,state.coordinator,routed,old.exportPath(),definition,new RatisRemoteExportSource(snapshots,routed,RatisJournalAccess.standalone())));
             for(var group:state.stores.keySet())groups.put(group,routed);
             doAnswer(call->{var p=(RatisRoutedClient.PreparedSnapshotCapture)call.getArgument(0);var id=p.target().descriptor().groupId();var prior=state.prepared.putIfAbsent(id,p);if(prior!=null)assertArrayEquals(prior.bytes(),p.bytes());frozen.put(id,p);state.save();return null;}).when(state.durable).freezeCapture(any());
             when(state.durable.releaseCapture(any())).thenAnswer(call->{UUID group=call.getArgument(0);registries.get(group).release(state.accepted.get(group));state.released.add(group);state.save();return RatisDurableSnapshot.CaptureReleaseProgress.RELEASED;});

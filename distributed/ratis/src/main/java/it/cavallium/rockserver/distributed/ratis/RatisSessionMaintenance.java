@@ -9,7 +9,7 @@ import java.util.*;
 
 /** One pending durable maintenance stream for a range incarnation. Caller owns the borrowed clients. */
 public final class RatisSessionMaintenance implements AutoCloseable {
-    private static final int MAGIC=0x52534d4a, MAX_JOURNAL=RangeDirectoryCodec.MAX_ENCODED_BYTES+16384;
+    static final int MAGIC=0x52534d4a, MAX_JOURNAL=RangeDirectoryCodec.MAX_ENCODED_BYTES+16384;
     private record State(UUID session,long epoch,long nextSequence,long acknowledgedThrough,SessionAuthority propagated,
                          RatisRoutedClient.PreparedCommand pending) {}
     private final RatisSessionEpochs epochs;
@@ -18,6 +18,7 @@ public final class RatisSessionMaintenance implements AutoCloseable {
     private final ClockRoute clockRoute;private RangeDirectory bindingDirectory;
     private final UUID group;
     private final long rangeEpoch;
+    private final RatisJournalAccess access;
     private final Path journal;
     private final byte[] identity;
     private final FileChannel lockChannel;
@@ -27,9 +28,11 @@ public final class RatisSessionMaintenance implements AutoCloseable {
 
     /** Parent directory must already exist on durable storage. Journal and stable .lock/.pending files belong to this owner. */
     public RatisSessionMaintenance(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group) throws IOException {
-        this(journal,epochs,routed,group,null);
+        this(journal,epochs,routed,group,null,RatisJournalAccess.standalone());
     }
-    RatisSessionMaintenance(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,ClockRoute clockRoute)throws IOException{
+    RatisSessionMaintenance(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,ClockRoute clockRoute)throws IOException{this(journal,epochs,routed,group,clockRoute,RatisJournalAccess.standalone());}
+    RatisSessionMaintenance(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,ClockRoute clockRoute,RatisJournalAccess access)throws IOException{
+        this.access=Objects.requireNonNull(access);access.register(journal,MAX_JOURNAL);access.register(journal.resolveSibling(journal.getFileName()+".lock"),32);
         this.clockRoute=clockRoute;
         this.journal=journal.toAbsolutePath(); this.epochs=Objects.requireNonNull(epochs); this.routed=Objects.requireNonNull(routed);
         this.group=Objects.requireNonNull(group); identity=routed.maintenanceIdentityDigest();
@@ -64,11 +67,11 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             throw failure;
         }
     }
-    static RatisSessionMaintenance frozenBinding(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,RangeDirectory directory)throws IOException{
+    static RatisSessionMaintenance frozenBinding(Path journal,RatisSessionEpochs epochs,RatisRoutedClient routed,UUID group,RangeDirectory directory,RatisJournalAccess access)throws IOException{
         boolean retained=Files.exists(journal,LinkOption.NOFOLLOW_LINKS),current=Arrays.equals(directory.payloadDigest(),routed.directory().payloadDigest());
         if(!retained && Files.exists(journal.resolveSibling(journal.getFileName()+".lock"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Used binding maintenance journal is missing");
         if(!retained && !current)throw new IOException("Fresh grant target changed before maintenance admission");var descriptor=directory.ranges().stream().filter(range->range.groupId().equals(group)&&range.topologyState()==RangeDescriptor.TopologyState.ACTIVE).findFirst().orElseThrow(()->new IOException("Fresh grant target absent from frozen directory"));
-        var owner=new RatisSessionMaintenance(journal,epochs,routed,group,new ClockRoute(directory,descriptor,false));
+        var owner=new RatisSessionMaintenance(journal,epochs,routed,group,new ClockRoute(directory,descriptor,false),access);
         if(!current && owner.pendingCommand()==null && owner.propagated()==null){owner.close();throw new IOException("No exact retained binding permits old-placement recovery");}owner.bindingDirectory=directory;return owner;
     }
     public synchronized DistributedCommand pendingCommand() { return state.pending()==null ? null : state.pending().command(); }
@@ -149,11 +152,11 @@ public final class RatisSessionMaintenance implements AutoCloseable {
             blob(output,next.pending()==null ? null : DistributedCommandCodec.encode(next.pending().command()));
             if (next.pending()!=null) route(output,next.pending().descriptor());
             output.flush(); byte[] body=bytes.toByteArray();
-            SessionJournalFiles.write(journal,body,MAX_JOURNAL);
+            access.write(journal,body,MAX_JOURNAL);
         } catch (IOException failure) { fenced=true; throw failure; }
     }
     private byte[] bindingDigest(){return clockRoute!=null && !clockRoute.metadataOnly()?clockRoute.directory().payloadDigest():new byte[32];}
-    private byte[] readJournal() throws IOException { return SessionJournalFiles.read(journal,MAX_JOURNAL); }
+    private byte[] readJournal() throws IOException { return access.read(journal,MAX_JOURNAL); }
     private State decode(DataInputStream input) throws IOException {
         var session=uuid(input); long epoch=input.readLong(), sequence=input.readLong(), acknowledged=input.readLong();
         byte[] propagated=blob(input,RangeSessionControl.ADVANCE_BYTES), pending=blob(input,256);

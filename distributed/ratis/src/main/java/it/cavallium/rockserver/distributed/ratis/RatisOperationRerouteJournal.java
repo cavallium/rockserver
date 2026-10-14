@@ -13,6 +13,7 @@ public final class RatisOperationRerouteJournal implements AutoCloseable {
     private static final int MAGIC=0x524f524a;
     public static final int MAX_BYTES=4+32+8+5*4+2*RangeDirectoryCodec.MAX_ENCODED_BYTES+DistributedCommandCodec.MAX_ENCODED_BYTES+OperationRerouteOrigin.MAX_BYTES+RatisTopologyOperationOutcomeRpc.MAX_REPLY_BYTES+32;
     @FunctionalInterface interface Persistence { void write(Path path,byte[] body,int maximum)throws IOException; }
+    private final RatisJournalAccess access;
     private final Path path;
     private final byte[] binding;private byte[] body;
     private final RangeDirectory source,target;
@@ -27,13 +28,13 @@ public final class RatisOperationRerouteJournal implements AutoCloseable {
         return create(path,binding,source,command,target,origin,absence,ttl,SessionJournalFiles::write);
     }
     static RatisOperationRerouteJournal create(Path path,byte[] binding,RangeDirectory source,DistributedCommand command,RangeDirectory target,OperationRerouteOrigin origin,RatisTopologyOperationOutcomeRpc.Reply absence,Duration ttl,Persistence io)throws IOException {
-        return new RatisOperationRerouteJournal(path,binding,encode(source,command,target,origin,absence,ttl,binding),Objects.requireNonNull(io));
+        return new RatisOperationRerouteJournal(path,binding,encode(source,command,target,origin,absence,ttl,binding),Objects.requireNonNull(io),RatisJournalAccess.standalone());
     }
     /** Force the complete selection before issuing its exclusive CONTROL grant. */
     public static RatisOperationRerouteJournal select(Path path,byte[] binding,RangeDirectory source,DistributedCommand original,RangeDirectory target,RatisTopologyOperationOutcomeRpc.Reply absence,Duration ttl)throws IOException {
-        return new RatisOperationRerouteJournal(path,binding,encode(source,original,target,null,absence,ttl,binding),SessionJournalFiles::write);
+        return new RatisOperationRerouteJournal(path,binding,encode(source,original,target,null,absence,ttl,binding),SessionJournalFiles::write,RatisJournalAccess.standalone());
     }
-    public synchronized void bindOrigin(OperationRerouteOrigin requested)throws IOException {bindOrigin(requested,SessionJournalFiles::write);}
+    public synchronized void bindOrigin(OperationRerouteOrigin requested)throws IOException {bindOrigin(requested,access::write);}
     synchronized void bindOrigin(OperationRerouteOrigin requested,Persistence io)throws IOException {
         if(closed || fenced || !lock.isValid())throw new IOException("Reroute selection is closed/fenced");
         if(pendingOrigin!=null && !pendingOrigin.equals(requested))throw new IOException("Pending reroute origin owns a different issued allocation");
@@ -41,8 +42,11 @@ public final class RatisOperationRerouteJournal implements AutoCloseable {
         byte[] bound=encode(source,command,target,Objects.requireNonNull(requested),absence,ttl,binding);
         try{io.write(path,bound,MAX_BYTES);body=bound;origin=requested;}catch(IOException|RuntimeException failure){fenced=true;throw failure;}
     }
-    public static RatisOperationRerouteJournal reopen(Path path,byte[] binding)throws IOException {return new RatisOperationRerouteJournal(path,binding,null,null);}
-    private RatisOperationRerouteJournal(Path file,byte[] expected,byte[] requested,Persistence io)throws IOException {
+    public static RatisOperationRerouteJournal reopen(Path path,byte[] binding)throws IOException {return new RatisOperationRerouteJournal(path,binding,null,null,RatisJournalAccess.standalone());}
+    static RatisOperationRerouteJournal selectOwned(Path path,byte[] binding,RangeDirectory source,DistributedCommand original,RangeDirectory target,RatisTopologyOperationOutcomeRpc.Reply absence,Duration ttl,RatisJournalAccess access)throws IOException {return new RatisOperationRerouteJournal(path,binding,encode(source,original,target,null,absence,ttl,binding),access::write,access);}
+    static RatisOperationRerouteJournal reopenOwned(Path path,byte[] binding,RatisJournalAccess access)throws IOException {return new RatisOperationRerouteJournal(path,binding,null,null,access);}
+    private RatisOperationRerouteJournal(Path file,byte[] expected,byte[] requested,Persistence io,RatisJournalAccess access)throws IOException {
+        this.access=Objects.requireNonNull(access);access.register(file,MAX_BYTES);access.register(file.resolveSibling(file.getFileName()+".lock"),32);
         path=Objects.requireNonNull(file).toAbsolutePath().normalize();requireDigest(expected);binding=expected.clone();
         if(path.getParent()==null || !Files.isDirectory(path.getParent(),LinkOption.NOFOLLOW_LINKS))throw new IOException("Reroute journal parent is absent");
         var lockPath=path.resolveSibling(path.getFileName()+".lock");
@@ -55,7 +59,7 @@ public final class RatisOperationRerouteJournal implements AutoCloseable {
             boolean create=requested!=null;
             if(create && Files.exists(pending,LinkOption.NOFOLLOW_LINKS))throw new IOException("Unpublished reroute sidecar requires inspection");
             if(create==Files.exists(path,LinkOption.NOFOLLOW_LINKS))throw new IOException(create ? "Reroute journal already exists" : "Reroute journal absent");
-            body=create ? requested : read(path);
+            body=create ? requested : access.read(path,MAX_BYTES);
             var in=ByteBuffer.wrap(body);if(in.getInt()!=MAGIC)throw new IOException("Invalid reroute journal tag");byte[] stored=new byte[32];in.get(stored);
             if(!Arrays.equals(stored,binding))throw new IOException("Reroute journal binding changed");ttl=Duration.ofMillis(in.getLong());
             source=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES));command=DistributedCommandCodec.decode(blob(in,DistributedCommandCodec.MAX_ENCODED_BYTES));target=RangeDirectoryCodec.decode(blob(in,RangeDirectoryCodec.MAX_ENCODED_BYTES));byte[] originBytes=blob(in,OperationRerouteOrigin.MAX_BYTES,true);origin=originBytes==null ? null : OperationRerouteOrigin.decode(originBytes);
@@ -64,7 +68,7 @@ public final class RatisOperationRerouteJournal implements AutoCloseable {
             if(create)io.write(path,body,MAX_BYTES);else {
                 SessionJournalFiles.force(path);
                 if(Files.exists(pending,LinkOption.NOFOLLOW_LINKS)) {
-                    byte[] future=read(pending);
+                    byte[] future=access.read(pending,MAX_BYTES);
                     if(Arrays.equals(body,future))Files.delete(pending);
                     else if(origin==null) {
                         var pendingBody=ByteBuffer.wrap(future);pendingBody.position(44);blob(pendingBody,RangeDirectoryCodec.MAX_ENCODED_BYTES);blob(pendingBody,DistributedCommandCodec.MAX_ENCODED_BYTES);blob(pendingBody,RangeDirectoryCodec.MAX_ENCODED_BYTES);byte[] next=blob(pendingBody,OperationRerouteOrigin.MAX_BYTES,true);

@@ -60,7 +60,7 @@ class RatisRocksDBConnectionTest {
             };
         }
         RatisRocksDBConnection open(int queuedData) throws Exception { return open(queuedData,8); }
-        RatisRocksDBConnection open(int queuedData,int generations) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/native"),connectionRoot,java.util.Map.of(direct.f.schema.domainId(),direct.routed),(name,shape)->direct.f.schema.domainId(),direct.f.scheduler,binding,direct.f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(generations,64,8,128L*1024*1024,queuedData),List.of(replicas)); }
+        RatisRocksDBConnection open(int queuedData,int generations) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/native"),connectionRoot,java.util.Map.of(direct.f.schema.domainId(),direct.routed),(name,shape)->direct.f.schema.domainId(),direct.f.scheduler,binding,direct.f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(generations,64,8,128L*1024*1024,queuedData),List.of(replicas), pointBudget.shared); }
         public void close() throws Exception { direct.close(); }
     }
     @Test void commonSyncAsyncDataSchemaNoopsAndReopenUseOwnedNativeGenerations() throws Exception {
@@ -93,7 +93,7 @@ class RatisRocksDBConnectionTest {
             var target=new DistributedSchema(source.clusterId(),source.databaseId(),source.domainId(),source.schemaEpoch()+1,source.routingPrefixBytes(),columns);
             var directory=new RangeDirectory(original.clusterId(),original.databaseId(),original.domainId(),target.schemaEpoch(),target.digest(),original.generation()+1,target.columnIds(),original.routingPrefixBytes(),original.ranges());
             Path ledger=f.connectionRoot.resolve("generation-capacity"),bindings=f.connectionRoot.resolve("generations"),sdk=f.connectionRoot.resolve("schema");
-            var capacity=new RatisGenerationRegistry.Capacity(ledger,bindings,sdk,2,true); UUID id=UUID.randomUUID(); var fields=new HashMap<String,byte[]>();
+            var capacity=new RatisGenerationRegistry.Capacity(ledger,bindings,sdk,2,true, RatisJournalAccess.standalone()); UUID id=UUID.randomUUID(); var fields=new HashMap<String,byte[]>();
             fields.put("requestId",java.nio.ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array()); fields.put("kind","CREATE".getBytes(java.nio.charset.StandardCharsets.UTF_8)); fields.put("changed",java.nio.ByteBuffer.allocate(8).putLong(1).array()); fields.put("aborted",new byte[8]); fields.put("phase","CLEANUP".getBytes(java.nio.charset.StandardCharsets.UTF_8)); fields.put("sourceSchema",DistributedSchemaCodec.encode(source)); fields.put("sourceDirectory",RangeDirectoryCodec.encode(original)); fields.put("targetSchema",DistributedSchemaCodec.encode(target));
             capacity.checkpoint(sdk.resolve(id+".request"),fields,RatisSchemaClientJournal::write);
             assertEquals(1,java.nio.ByteBuffer.wrap(SessionJournalFiles.read(ledger,4096)).getInt());
@@ -102,10 +102,10 @@ class RatisRocksDBConnectionTest {
             SessionJournalFiles.write(folder.resolve("binding"),java.nio.ByteBuffer.allocate(8+a.length+b.length).putInt(a.length).put(a).putInt(b.length).put(b).array(),8*1024*1024); SessionJournalFiles.force(bindings);
             var forced=new ArrayList<Path>(); var failRoot=new java.util.concurrent.atomic.AtomicBoolean(true);
             RatisGenerationRegistry.Capacity.BindingForce force=path -> { forced.add(path); if(path.equals(bindings) && failRoot.getAndSet(false)) throw new IOException("Uncertain generations directory force"); SessionJournalFiles.force(path); };
-            assertThrows(IOException.class,() -> new RatisGenerationRegistry.Capacity(ledger,bindings,sdk,2,true,force));
+            assertThrows(IOException.class,() -> new RatisGenerationRegistry.Capacity(ledger,bindings,sdk,2,true,force, RatisJournalAccess.standalone()));
             assertEquals(List.of(folder.resolve("binding"),folder,bindings),forced);
             assertEquals(1,java.nio.ByteBuffer.wrap(SessionJournalFiles.read(ledger,4096)).getInt(),"Failed re-force cannot consume original reservation");
-            forced.clear(); new RatisGenerationRegistry.Capacity(ledger,bindings,sdk,2,true,force);
+            forced.clear(); new RatisGenerationRegistry.Capacity(ledger,bindings,sdk,2,true,force, RatisJournalAccess.standalone());
             assertEquals(List.of(folder.resolve("binding"),folder,bindings),forced);
             assertEquals(0,java.nio.ByteBuffer.wrap(SessionJournalFiles.read(ledger,4096)).getInt());
         }
@@ -158,7 +158,7 @@ class RatisRocksDBConnectionTest {
             Path connectionRoot=root.resolve("dynamic-connection"); var limits=new RatisRocksDBConnection.Limits(4,64,8,128L*1024*1024,8);
             long recreated;RemoteMutationToken retainedToken;
             var dataKey=new Keys(Buf.wrap(new byte[]{0,0,0,0,0,0,0,2}));
-            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,java.util.Map.of(nativeSchema.initial.domainId(),routed.get()),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of())) {
+            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,java.util.Map.of(nativeSchema.initial.domainId(),routed.get()),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of(), pointBudget.shared)) {
                 var async=connection.getAsyncApi(RequestContext.batch()); var sync=connection.getSyncApi(RequestContext.batch());
                 UUID pendingId;
                 try(var pin=nativeSchema.peers.getFirst().store.capture()) {
@@ -181,7 +181,7 @@ class RatisRocksDBConnectionTest {
                 public CommandResult command(RangeDescriptor range,DistributedCommand command) throws IOException { try { if(command.sessionControl()!=null) epochs.sessionControlAdmission(routed.get().directory(),range.groupId()).accept(command); CommandResult first=null; for(var peer:nativeSchema.peers) { var result=CommandResult.decode(peer.store.apply(peer.next(),command)); if(first==null) first=result; } return first; } catch(Exception failure) { throw new IOException(failure); } }
             })) {
                 routed.set(cold); long before=nativeSchema.peers.getFirst().store.applied().index();
-                try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,java.util.Map.of(nativeSchema.initial.domainId(),cold),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of())) {
+                try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/schema"),connectionRoot,java.util.Map.of(nativeSchema.initial.domainId(),cold),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,limits,List.of(), pointBudget.shared)) {
                     assertEquals(4,cold.directory().schemaEpoch()); assertArrayEquals(new byte[]{9},connection.getSyncApi(RequestContext.batch()).get(0,recreated,dataKey,RequestType.<Buf>current()).toByteArray());
                     var remote=connection.getRemoteMutationApi();assertEquals(RemoteMutationStatus.State.TERMINAL,await(remote.status(retainedToken,RequestContext.batch())).state());var terminal=await(remote.resume(retainedToken,RequestContext.batch()));assertNull(savedPoint(connection,retainedToken));await(remote.acknowledge(retainedToken,terminal.resultDigest(),RequestContext.batch()));
                     assertEquals(before,nativeSchema.peers.getFirst().store.applied().index(),"Cold history and retained callbacks do not submit new DATA"); assertTrue(connection.pendingSchemaRequests().isEmpty());
@@ -228,7 +228,7 @@ class RatisRocksDBConnectionTest {
                     return new RatisRocksDBConnection.Generation(adapter,base.direct(),ranges,transactions,snapshots,List.of(base));
                 } catch(Throwable failure) { try { base.close(); } catch(Throwable cleanup) { failure.addSuppressed(cleanup); } if(failure instanceof IOException io) throw io; throw new IOException(failure); }
             };
-            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/old-handles"),root.resolve("handle-connection"),java.util.Map.of(nativeSchema.initial.domainId(),nativeSchema.routed),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,new RatisRocksDBConnection.Limits(2,64,8,128L*1024*1024,8),List.of())) {
+            try(var connection=new RatisRocksDBConnection(URI.create("ratis://controlled/old-handles"),root.resolve("handle-connection"),java.util.Map.of(nativeSchema.initial.domainId(),nativeSchema.routed),(name,shape)->nativeSchema.initial.domainId(),homes.scheduler,nativeSchema.catalogue,nativeSchema.client,nativeSchema.replicas,null,null,factory,new RatisRocksDBConnection.Limits(2,64,8,128L*1024*1024,8),List.of(), pointBudget.shared)) {
                 var api=connection.getAsyncApi(RequestContext.batch()); point(connection,7,dataKey,value(1),RequestType.RequestTypeId.NOTHING);
                 long oldTransaction=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertEquals(0,activePins.get());assertArrayEquals(new byte[]{1},await(api.getAsync(oldTransaction,7,dataKey,RequestType.<Buf>current())).toByteArray());assertEquals(1,activePins.get()); point(connection,7,dataKey,value(2),RequestType.RequestTypeId.NOTHING);
                 long oldCursor=await(api.openIteratorAsync(0,7,dataKey,null,false,Duration.ofSeconds(10))); assertNotEquals(oldTransaction,oldCursor); assertEquals(2,activePins.get());

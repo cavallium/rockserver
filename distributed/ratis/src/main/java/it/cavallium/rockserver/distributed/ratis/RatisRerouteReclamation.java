@@ -16,8 +16,9 @@ final class RatisRerouteReclamation {
     @FunctionalInterface interface BeforeDelete { void run(Path job)throws IOException; }
     private record FileImage(String name,long bytes,byte[] digest) {}
     private record Manifest(OperationId operation,List<FileImage> files) {}
+    private final RatisJournalAccess access;
     private final Path root;private final byte[] binding;private final SessionEpochLedger.Grant business;private final int stateMaximum;
-    RatisRerouteReclamation(Path root,byte[] binding,SessionEpochLedger.Grant business,int stateMaximum){this.root=root;this.binding=binding.clone();this.business=business;this.stateMaximum=stateMaximum;}
+    RatisRerouteReclamation(Path root,byte[] binding,SessionEpochLedger.Grant business,int stateMaximum,RatisJournalAccess access){this.access=Objects.requireNonNull(access);this.root=root;this.binding=binding.clone();this.business=business;this.stateMaximum=stateMaximum;}
     private Path marker(long sequence){return root.resolve("reclaim-"+sequence+".bin");}
     private static boolean markerName(String name){return name.matches("reclaim-(0|[1-9][0-9]*)\\.bin(\\.pending)?");}
     List<Path> jobs(int maximum)throws IOException {
@@ -39,7 +40,7 @@ final class RatisRerouteReclamation {
         var operation=input.originalCommand().operationId();requireOperation(operation);if(!job.equals(root.resolve(Long.toString(operation.sequence()))))throw new IOException("Reclamation crossed original job");
         var groups=new HashSet<UUID>();for(var route:input.targetDirectory().ranges())groups.add(route.groupId());var files=new ArrayList<FileImage>();
         collect(job,job,groups,files);if(files.stream().noneMatch(f->f.name.equals("input.bin")) || files.stream().noneMatch(f->f.name.equals("state.bin")))throw new IOException("Verified DONE journal graph is incomplete");
-        files.sort(Comparator.comparing(FileImage::name));SessionJournalFiles.write(marker(operation.sequence()),encode(new Manifest(operation,List.copyOf(files))),MAX_BYTES);
+        files.sort(Comparator.comparing(FileImage::name));access.write(marker(operation.sequence()),encode(new Manifest(operation,List.copyOf(files))),MAX_BYTES);
     }
     private void collect(Path job,Path directory,Set<UUID> groups,List<FileImage> images)throws IOException {
         try(var paths=Files.newDirectoryStream(directory)){for(var path:paths){String name=job.relativize(path).toString();
@@ -58,17 +59,17 @@ final class RatisRerouteReclamation {
     private void resume(long sequence,Verify verify,SessionJournalFiles.Removal removal,BeforeDelete before)throws IOException {
         Path marker=marker(sequence),pending=marker.resolveSibling(marker.getFileName()+".pending"),job=root.resolve(Long.toString(sequence));byte[] body;
         if(!Files.exists(marker,LinkOption.NOFOLLOW_LINKS)){
-            body=SessionJournalFiles.read(pending,MAX_BYTES);var manifest=decode(body);if(manifest.operation.sequence()!=sequence)throw new IOException("Pending reclamation changed sequence");verify.done(job);verifyImages(job,manifest,false);SessionJournalFiles.force(pending);Files.move(pending,marker,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(root);
-        }else{body=SessionJournalFiles.read(marker,MAX_BYTES);if(Files.exists(pending,LinkOption.NOFOLLOW_LINKS)){if(!Arrays.equals(body,SessionJournalFiles.read(pending,MAX_BYTES)))throw new IOException("Foreign pending reclamation");removal.delete(pending);removal.force(root);}}
+            body=access.read(pending,MAX_BYTES);var manifest=decode(body);if(manifest.operation.sequence()!=sequence)throw new IOException("Pending reclamation changed sequence");verify.done(job);verifyImages(job,manifest,false);SessionJournalFiles.force(pending);Files.move(pending,marker,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(root);
+        }else{body=access.read(marker,MAX_BYTES);if(Files.exists(pending,LinkOption.NOFOLLOW_LINKS)){if(!Arrays.equals(body,access.read(pending,MAX_BYTES)))throw new IOException("Foreign pending reclamation");removal.delete(pending);removal.force(root);}}
         var manifest=decode(body);if(manifest.operation.sequence()!=sequence)throw new IOException("Reclamation changed sequence");verifyImages(job,manifest,true);
         before.run(job);var channels=new ArrayList<FileChannel>();var locks=new ArrayList<FileLock>();
         try{
             for(var image:manifest.files)if(image.name.endsWith(".lock")){var path=job.resolve(image.name);if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS))continue;var channel=FileChannel.open(path,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);channels.add(channel);FileLock lock;try{lock=channel.tryLock();}catch(OverlappingFileLockException owned){throw new IOException("Reclamation journal remains owned",owned);}if(lock==null)throw new IOException("Reclamation journal remains owned");locks.add(lock);}
             verifyImages(job,manifest,true);
-            for(var image:manifest.files)if(!image.name.endsWith(".lock")){var path=job.resolve(image.name);if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){checkImage(path,image);removal.delete(path);removal.force(path.getParent());}}
+            for(var image:manifest.files)if(!image.name.endsWith(".lock")){var path=job.resolve(image.name);if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){checkImage(path,image);removal.delete(path);removal.force(path.getParent());access.deleted(path);}}
         }finally{IOException failure=null;for(var channel:channels)try{channel.close();}catch(IOException cleanup){if(failure==null)failure=cleanup;else failure.addSuppressed(cleanup);}if(failure!=null)throw failure;}
-        for(var image:manifest.files)if(image.name.endsWith(".lock")){var path=job.resolve(image.name);if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){checkImage(path,image);removal.delete(path);removal.force(path.getParent());}}
-        var bindings=job.resolve("bindings");if(Files.exists(bindings,LinkOption.NOFOLLOW_LINKS)){removal.delete(bindings);removal.force(job);}if(Files.exists(job,LinkOption.NOFOLLOW_LINKS)){removal.delete(job);removal.force(root);}SessionJournalFiles.remove(marker,body,MAX_BYTES,removal);
+        for(var image:manifest.files)if(image.name.endsWith(".lock")){var path=job.resolve(image.name);if(Files.exists(path,LinkOption.NOFOLLOW_LINKS)){checkImage(path,image);removal.delete(path);removal.force(path.getParent());access.deleted(path);}}
+        var bindings=job.resolve("bindings");if(Files.exists(bindings,LinkOption.NOFOLLOW_LINKS)){removal.delete(bindings);removal.force(job);}if(Files.exists(job,LinkOption.NOFOLLOW_LINKS)){removal.delete(job);removal.force(root);}access.reclaimedTree(job);access.remove(marker,body,MAX_BYTES,removal);
     }
     private void verifyImages(Path job,Manifest manifest,boolean missing)throws IOException {
         var expected=new HashMap<String,FileImage>();for(var image:manifest.files)expected.put(image.name,image);

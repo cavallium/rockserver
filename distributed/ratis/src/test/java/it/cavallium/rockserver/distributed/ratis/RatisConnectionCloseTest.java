@@ -28,7 +28,7 @@ class RatisConnectionCloseTest {
             AutoCloseable first=() -> { firstCloses.incrementAndGet(); entered.countDown(); if (!release.await(5,TimeUnit.SECONDS)) throw new IOException("Dependency close barrier timed out"); };
             AutoCloseable next=nextCloses::incrementAndGet;
             var connection=new RatisRocksDBConnection(URI.create("rockserver+ratis://fixture"),root.resolve("connection"),java.util.Map.of(x.f.schema.domainId(),x.routed),(name,shape)->x.f.schema.domainId(),x.f.scheduler,binding,x.f.catalogue.client,replicas,null,null,
-                    (schema,directory,path,ids) -> new RatisRocksDBConnection.Generation(x.adapter,x.direct,null,x.transactions,null,List.of(x.session)),RatisRocksDBConnection.Limits.defaults(),List.of(first,next));
+                    (schema,directory,path,ids) -> new RatisRocksDBConnection.Generation(x.adapter,x.direct,null,x.transactions,null,List.of(x.session)),RatisRocksDBConnection.Limits.defaults(),List.of(first,next), RatisJournalAccess.standalone());
             try {
                 var closing=workers.submit(() -> { connection.close(); return null; });
                 assertTrue(entered.await(5,TimeUnit.SECONDS));

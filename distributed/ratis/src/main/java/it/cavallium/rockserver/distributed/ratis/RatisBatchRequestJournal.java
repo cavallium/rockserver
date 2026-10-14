@@ -17,8 +17,11 @@ final class RatisBatchRequestJournal implements AutoCloseable {
         boolean complete() { return eof && chunks.isEmpty() && pending==null && failure==null; }
     }
     private final Path path; private final byte[] binding; private final FileChannel channel; private final FileLock lock;
+    private final RatisRequestBudget budget;private final RatisRequestBudget.Disk disk;
+    private final ThreadLocal<RatisRequestBudget.Lease> workspace=new ThreadLocal<>();
     private Request request; private boolean closed,fenced;
-    RatisBatchRequestJournal(Path path,byte[] binding) throws IOException {
+    RatisBatchRequestJournal(Path path,byte[] binding,RatisRequestBudget budget,RatisRequestBudget.Disk disk) throws IOException {
+        this.budget=Objects.requireNonNull(budget);this.disk=Objects.requireNonNull(disk);
         this.path=path.toAbsolutePath(); this.binding=binding.clone();
         if(binding.length!=32 || !Files.isDirectory(this.path.getParent())) throw new IOException("Invalid batch journal binding/parent");
         channel=FileChannel.open(this.path.resolveSibling(this.path.getFileName()+".lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE); FileLock acquired=null;
@@ -31,7 +34,8 @@ final class RatisBatchRequestJournal implements AutoCloseable {
                 try(var file=FileChannel.open(this.path,StandardOpenOption.READ)) { file.force(true); }
                 SessionJournalFiles.force(this.path.getParent());
             }
-            else if(Files.deleteIfExists(this.path.resolveSibling(this.path.getFileName()+".pending"))) SessionJournalFiles.force(this.path.getParent());
+            else if(Files.exists(this.path.resolveSibling(this.path.getFileName()+".pending"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Pending-only bulk journal cannot become a fresh request");
+            disk.forcedReconcile();
         } catch(IOException|RuntimeException|Error failure) { if(acquired!=null) try { acquired.release(); } catch(IOException cleanup) { failure.addSuppressed(cleanup); } try { channel.close(); } catch(IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
     Request request() throws IOException { requireOpen(); return request; }
@@ -67,7 +71,28 @@ final class RatisBatchRequestJournal implements AutoCloseable {
         request.pending=null; request.result=null; request.cursor++; if(request.cursor==request.chunks.size()) { request.chunks=List.of(); request.cursor=0;trimCompleted(); } persist();
     }
     private void requireOpen() throws IOException { if(closed || fenced) throw new IOException("Batch journal unavailable; reopen exact retained input"); }
-    private void persist() throws IOException { try { SessionJournalFiles.write(path,encode(),MAX_BYTES); } catch(IOException|RuntimeException failure) { fenced=true; if(failure instanceof IOException io) throw io; throw new IOException("Batch journal force failed",failure); } }
+    long encodedSize()throws IOException{return encodedSize(request);}
+    static long encodedSize(Request r)throws IOException {
+        validate(r);long bytes=4+32+16+1+4+RangeDirectoryCodec.encodedSize(r.directory)+32+1+4+4+1+(r.pending==null?0:32)+1+(r.result==null?0:12)+1+(r.failure==null?0:12)+RemoteMutationToken.BYTES+8+4+40L*r.inputDigests.size();
+        for(var chunk:r.chunks)bytes=Math.addExact(bytes,4L+DistributedCommandCodec.encodedSize(chunk));if(bytes+32>MAX_BYTES)throw new IOException("Batch journal exceeds bound");return bytes;
+    }
+    Closeable workspace(RatisRequestBudget.Lease credit){if(workspace.get()!=null)throw new IllegalStateException("Nested bulk encoding owner");workspace.set(credit);return workspace::remove;}
+    private final class Encoding implements AutoCloseable {
+        final RatisRequestBudget.Lease memory,source;
+        Encoding(long bytes){source=workspace.get();memory=budget.work(0);try{if(source==null)memory.growTo(bytes);else source.transferTo(memory,bytes);}catch(RuntimeException failure){memory.close();throw failure;}}
+        public void close(){if(source!=null)memory.transferTo(source,memory.amount);memory.close();}
+    }
+    private Encoding encodingCredit()throws IOException {return new Encoding(Math.multiplyExact(6,encodedSize()));}
+    private void persist() throws IOException {
+        try(var memory=encodingCredit()){disk.prepareReplacement(encodedSize()+32);SessionJournalFiles.write(path,encode(),MAX_BYTES);disk.forcedReconcile();}
+        catch(IOException|RuntimeException failure){fenced=true;if(failure instanceof IOException io)throw io;throw new IOException("Batch journal force failed",failure);}
+    }
+    /** Only after the whole-request ACK is independently forced and no actual actor work remains. */
+    void retire()throws IOException {
+        requireOpen();if(request==null)return;
+        try(var memory=encodingCredit()){SessionJournalFiles.remove(path,encode(),MAX_BYTES);disk.forcedReconcile();request=null;}
+        catch(IOException|RuntimeException failure){fenced=true;if(failure instanceof IOException io)throw io;throw new IOException("Bulk journal reclamation unknown",failure);}
+    }
     private byte[] encode() throws IOException {
         validate(request); var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(0x52424154); out.write(binding); uuid(out,request.id); out.writeBoolean(request.merge); blob(out,RangeDirectoryCodec.encode(request.directory));
         out.writeLong(request.retiredInputThrough);out.writeLong(request.copiedBatches); out.writeLong(request.acknowledgedChunks); out.writeLong(request.acknowledgedMutations); out.writeBoolean(request.eof); out.writeInt(request.cursor); out.writeInt(request.chunks.size());
@@ -109,5 +134,5 @@ final class RatisBatchRequestJournal implements AutoCloseable {
     private static byte[] blob(DataInputStream in,int max) throws IOException { int size=in.readInt(); if(size<0 || size>max || size>in.available()) throw new IOException("Batch journal field exceeds bound"); return in.readNBytes(size); }
     private static void uuid(DataOutputStream out,UUID id) throws IOException { out.writeLong(id.getMostSignificantBits()); out.writeLong(id.getLeastSignificantBits()); }
     private static UUID uuid(DataInputStream in) throws IOException { return new UUID(in.readLong(),in.readLong()); }
-    @Override public void close() throws IOException { if(closed) return; IOException failure=null; try { lock.release(); } catch(IOException ex) { failure=ex; } try { channel.close(); } catch(IOException ex) { if(failure==null) failure=ex; else failure.addSuppressed(ex); } if(failure!=null) throw failure; closed=true; }
+    @Override public void close() throws IOException { if(closed) return; IOException failure=null; try { lock.release(); } catch(IOException ex) { failure=ex; } try { channel.close(); } catch(IOException ex) { if(failure==null) failure=ex; else failure.addSuppressed(ex); } if(failure!=null) throw failure; closed=true;request=null;disk.close(); }
 }

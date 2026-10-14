@@ -143,7 +143,7 @@ class RatisDurableSessionClientTest {
             var entry=new RatisSessionClient.WindowEntry(prepared,null,false);
             var state=new RatisSessionClient.WindowState(Long.MAX_VALUE,Long.MAX_VALUE-1,true,List.of(entry));
             Path path=root.resolve("exhausted.bin");
-            try (var journal=SessionWindowJournal.open(path,routed,true)) { journal.write(grant,limits,state); }
+            try (var journal=SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone())) { journal.write(grant,limits,state); }
             try (var client=RatisDurableSessionClient.reopen(path,routed)) {
                 assertEquals(CommandResult.Status.SESSION_EXPIRED,client.execute(client.pending().getFirst()).status()); client.acknowledge(client.pending().getFirst());
                 assertEquals(Long.MAX_VALUE,client.acknowledgedThrough()); assertTrue(client.pending().isEmpty());

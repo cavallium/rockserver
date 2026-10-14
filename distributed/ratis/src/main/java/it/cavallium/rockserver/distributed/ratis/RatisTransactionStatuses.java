@@ -23,6 +23,7 @@ public final class RatisTransactionStatuses {
     void requireDirectoryBinding(RangeDirectory expected) {
         if (!Arrays.equals(routed.directory().payloadDigest(),expected.payloadDigest())) throw new IllegalArgumentException("Home reader differs from declared placement");
     }
+    long directoryBytes(){return RangeDirectoryCodec.encodedSize(routed.directory());}
     byte[] identityDigest() {
         var bytes=ByteBuffer.allocate(48).put(routed.sessionIdentityDigest()).putLong(column.getMostSignificantBits()).putLong(column.getLeastSignificantBits()).array();
         try { return java.security.MessageDigest.getInstance("SHA-256").digest(bytes); } catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
@@ -45,9 +46,9 @@ public final class RatisTransactionStatuses {
     public record RegistrationRead(TransactionStatus status,RangeDescriptor descriptor) {}
     public TransactionStatus read(UUID transaction) throws IOException { return readRegistration(transaction).status(); }
     /** One HOME group selected by the exact transaction key; maintenance clients remain borrowed. */
-    void ensureBinding(Path journal,RatisSessionEpochs epochs,UUID transaction,SessionEpochLedger.Grant grant,int window)throws IOException {
+    void ensureBinding(Path journal,RatisSessionEpochs epochs,UUID transaction,SessionEpochLedger.Grant grant,int window,RatisJournalAccess access)throws IOException {
         var directory=routed.directory();var route=directory.route(column,key(transaction));
-        try(var maintenance=new RatisSessionMaintenance(journal,epochs,routed,route.groupId())) {
+        try(var maintenance=new RatisSessionMaintenance(journal,epochs,routed,route.groupId(),null,access)) {
             var pending=maintenance.pendingCommand();if(pending==null)pending=maintenance.prepareBinding(grant,window);
             if(pending.sessionControl()==null || !pending.sessionControl().binding() || !pending.sessionControl().grant().equals(grant) || pending.sessionControl().outstandingWindow()!=window)throw new IOException("HOME binding changed frozen grant/window");
             if(maintenance.execute().status()!=CommandResult.Status.SUCCESS)throw new IOException("HOME binding did not apply");

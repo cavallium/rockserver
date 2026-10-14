@@ -41,13 +41,13 @@ class SessionWindowJournalTest {
             var state=new RatisSessionClient.WindowState(2,-1,false,List.of(entries.getFirst(),
                     new RatisSessionClient.WindowEntry(entries.getLast().prepared(),new CommandResult(CommandResult.Status.CONFLICT,List.of()),true)));
             byte[] frozen=DistributedCommandCodec.encode(entries.getFirst().prepared().command());
-            try (var journal=SessionWindowJournal.open(path,routed,true)) {
+            try (var journal=SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone())) {
                 assertThrows(IOException.class,journal::read); journal.write(GRANT,LIMITS,state);
-                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
-                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,true));
+                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone()));
+                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone()));
             }
             routed.refresh(directory(DATABASE,1,"127.0.0.1:9011"));
-            try (var journal=SessionWindowJournal.open(path,routed,false)) {
+            try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) {
                 var saved=journal.read(); assertEquals(GRANT,saved.grant()); assertEquals(LIMITS,saved.limits());
                 assertArrayEquals(frozen,DistributedCommandCodec.encode(saved.state().entries().getFirst().prepared().command()));
                 assertEquals("127.0.0.1:9001",saved.state().entries().getFirst().prepared().descriptor().replicas().getFirst().address());
@@ -57,39 +57,39 @@ class SessionWindowJournalTest {
                 var restored=RatisSessionClient.restore(routed,saved.grant(),saved.limits(),saved.state()); assertEquals(2,restored.outstanding());
                 assertFalse(LEDGER.advanceTime(100).isLive(new OperationId(GRANT.sessionId(),GRANT.epoch(),0)));
             }
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,true));
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(root.resolve("absent.bin"),routed,false));
+            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone()));
+            assertThrows(IOException.class,() -> SessionWindowJournal.open(root.resolve("absent.bin"),routed,false, RatisJournalAccess.standalone()));
         }
     }
 
     @Test void checksumWrongIdentityTruncationAndChangedCanonicalBytesAreRejectedWithoutOverwrite() throws Exception {
         Path path=root.resolve("window.bin");
         try (var routed=routed(directory(DATABASE,0,"127.0.0.1:9001"))) {
-            try (var journal=SessionWindowJournal.open(path,routed,true)) { journal.write(GRANT,LIMITS,pending(routed)); }
+            try (var journal=SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone())) { journal.write(GRANT,LIMITS,pending(routed)); }
             byte[] valid=Files.readAllBytes(path), body=SessionJournalFiles.read(path,SessionWindowJournal.MAX_BYTES);
             try (var foreign=routed(directory(new UUID(9,9),0,"127.0.0.1:9001"))) {
-                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,foreign,false));
+                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,foreign,false, RatisJournalAccess.standalone()));
             }
             assertArrayEquals(valid,Files.readAllBytes(path));
             byte[] corrupted=valid.clone(); corrupted[corrupted.length/2]^=1; Files.write(path,corrupted);
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false)); assertArrayEquals(corrupted,Files.readAllBytes(path));
+            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())); assertArrayEquals(corrupted,Files.readAllBytes(path));
             for (int size:new int[] {0,31,32,120,valid.length-1}) {
-                Files.write(path,Arrays.copyOf(valid,size)); assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
+                Files.write(path,Arrays.copyOf(valid,size)); assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone()));
             }
             for (int offset:new int[] {0,4,113,117}) {
                 byte[] changed=body.clone(); ByteBuffer.wrap(changed).putInt(offset,Integer.MAX_VALUE);
                 SessionJournalFiles.write(path,changed,SessionWindowJournal.MAX_BYTES);
-                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
+                assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone()));
             }
             byte[] badFlag=body.clone(); badFlag[112]=2; SessionJournalFiles.write(path,badFlag,SessionWindowJournal.MAX_BYTES);
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
+            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone()));
             byte[] badConsumed=body.clone(); badConsumed[badConsumed.length-2]=2; SessionJournalFiles.write(path,badConsumed,SessionWindowJournal.MAX_BYTES);
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
+            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone()));
             var table=ByteBuffer.wrap(body);table.position(117);assertEquals(1,table.getInt());int directoryBytes=table.getInt(),directoryStart=table.position();var route=ByteBuffer.wrap(body,directoryStart,directoryBytes).slice();route.position(100);int columns=route.getInt();route.position(route.position()+16*columns);assertEquals(1,route.getInt());route.position(route.position()+48);for(int n=0;n<2;n++){int length=route.getInt();if(length>=0)route.position(route.position()+length);}route.get();assertEquals(1,route.getInt());route.position(route.position()+48);route.get();int peerBytes=route.getInt();assertTrue(peerBytes>0);
-            byte[] nonAscii=body.clone();nonAscii[directoryStart+route.position()]=(byte)0xff;SessionJournalFiles.write(path,nonAscii,SessionWindowJournal.MAX_BYTES);assertThrows(IOException.class,()->SessionWindowJournal.open(path,routed,false));
+            byte[] nonAscii=body.clone();nonAscii[directoryStart+route.position()]=(byte)0xff;SessionJournalFiles.write(path,nonAscii,SessionWindowJournal.MAX_BYTES);assertThrows(IOException.class,()->SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone()));
             byte[] changedSequence=body.clone(); ByteBuffer.wrap(changedSequence).putLong(96,2); SessionJournalFiles.write(path,changedSequence,SessionWindowJournal.MAX_BYTES);
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false));
-            Files.write(path,valid); try (var journal=SessionWindowJournal.open(path,routed,false)) { assertEquals(1,journal.read().state().entries().size()); }
+            assertThrows(IOException.class,() -> SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone()));
+            Files.write(path,valid); try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) { assertEquals(1,journal.read().state().entries().size()); }
         }
     }
 
@@ -97,23 +97,23 @@ class SessionWindowJournalTest {
         Path path=root.resolve("window.bin");
         try (var routed=routed(directory(DATABASE,0,"127.0.0.1:9001"))) {
             byte[] valid;
-            try (var journal=SessionWindowJournal.open(path,routed,true)) {
+            try (var journal=SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone())) {
                 var state=pending(routed); journal.write(GRANT,LIMITS,state); valid=Files.readAllBytes(path);
                 Files.delete(path); Files.createDirectory(path); Files.writeString(path.resolve("block"),"fixture");
                 assertThrows(IOException.class,() -> journal.write(GRANT,LIMITS,state)); assertThrows(IOException.class,journal::read);
             }
             Files.delete(path.resolve("block")); Files.delete(path); Files.write(path,valid);
-            try (var journal=SessionWindowJournal.open(path,routed,false)) {
+            try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) {
                 var tooLarge=new RatisSessionClient.Limits(4,SessionWindowJournal.MAX_WINDOW_BYTES+1,1024);
                 assertThrows(IOException.class,() -> journal.write(GRANT,tooLarge,journal.read().state()));
                 assertThrows(IOException.class,journal::read); assertArrayEquals(valid,Files.readAllBytes(path));
             }
-            try (var journal=SessionWindowJournal.open(path,routed,false)) {
+            try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) {
                 var empty=new RatisSessionClient.WindowState(0,-1,false,List.of());
                 var changed=new SessionEpochLedger.Grant(GRANT.epoch(),UUID.randomUUID(),GRANT.issuedAtMillis(),GRANT.expiresAtMillis());
                 assertThrows(IOException.class,() -> journal.write(changed,LIMITS,empty)); assertThrows(IOException.class,journal::read);
             }
-            try (var journal=SessionWindowJournal.open(path,routed,false)) { assertEquals(GRANT,journal.read().grant()); }
+            try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) { assertEquals(GRANT,journal.read().grant()); }
         }
     }
 
@@ -123,7 +123,7 @@ class SessionWindowJournalTest {
                 Path path=root.resolve("limit-"+command+".bin");
                 var limits=new RatisSessionClient.Limits(1,command ? SessionWindowJournal.MAX_WINDOW_BYTES+1 : 1024,
                         command ? 1024 : SessionWindowJournal.MAX_WINDOW_BYTES+1);
-                try (var journal=SessionWindowJournal.open(path,routed,true)) {
+                try (var journal=SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone())) {
                     var empty=new RatisSessionClient.WindowState(0,-1,false,List.of());
                     assertThrows(IOException.class,() -> journal.write(GRANT,limits,empty)); assertThrows(IOException.class,journal::read);
                     assertFalse(Files.exists(path));
@@ -133,7 +133,7 @@ class SessionWindowJournalTest {
             try (var file=java.nio.channels.FileChannel.open(oversized,StandardOpenOption.CREATE_NEW,StandardOpenOption.WRITE)) {
                 file.position(SessionWindowJournal.MAX_BYTES); file.write(ByteBuffer.wrap(new byte[] {0}));
             }
-            assertThrows(IOException.class,() -> SessionWindowJournal.open(oversized,routed,false));
+            assertThrows(IOException.class,() -> SessionWindowJournal.open(oversized,routed,false, RatisJournalAccess.standalone()));
         }
     }
 
@@ -141,18 +141,18 @@ class SessionWindowJournalTest {
         Path path=root.resolve("window.bin");
         try (var routed=routed(directory(DATABASE,0,"127.0.0.1:9001"))) {
             var state=pending(routed);
-            try (var journal=SessionWindowJournal.open(path,routed,true)) { journal.write(GRANT,LIMITS,state); }
+            try (var journal=SessionWindowJournal.open(path,routed,true, RatisJournalAccess.standalone())) { journal.write(GRANT,LIMITS,state); }
             byte[] valid=Files.readAllBytes(path);
             var entry=state.entries().getFirst();
             for (var invalid:List.of(new RatisSessionClient.WindowState(2,-1,false,state.entries()),
                     new RatisSessionClient.WindowState(1,-1,false,List.of(new RatisSessionClient.WindowEntry(entry.prepared(),null,true))),
                     new RatisSessionClient.WindowState(1,-1,false,List.of(new RatisSessionClient.WindowEntry(entry.prepared(),new CommandResult(CommandResult.Status.SUCCESS,List.of(new byte[] {1})),false))))) {
-                try (var journal=SessionWindowJournal.open(path,routed,false)) {
+                try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) {
                     assertThrows(IOException.class,() -> journal.write(GRANT,LIMITS,invalid)); assertThrows(IOException.class,journal::read);
                 }
                 assertArrayEquals(valid,Files.readAllBytes(path));
             }
-            try (var journal=SessionWindowJournal.open(path,routed,false)) {
+            try (var journal=SessionWindowJournal.open(path,routed,false, RatisJournalAccess.standalone())) {
                 var command=entry.prepared().command(); var descriptor=entry.prepared().descriptor();
                 var foreign=new DistributedCommand(command.groupId(),command.rangeEpoch(),command.schemaDigest(),new OperationId(UUID.randomUUID(),GRANT.epoch(),0),command.mutations(),command.predicates());
                 var wrong=routed.restoreSessionCommand(foreign,descriptor);

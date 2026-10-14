@@ -38,18 +38,22 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     /** Only for one newly issued, exclusively owned grant. Never recreate a missing used-grant journal. */
     public static RatisDurableSessionClient create(Path path,RatisRoutedClient routed,SessionEpochLedger issuance,
             SessionEpochLedger.Grant grant,RatisSessionClient.Limits limits) throws IOException {
-        var client=new RatisSessionClient(routed,issuance,grant,limits); var journal=SessionWindowJournal.open(path,routed,true);
-        try { journal.write(grant,limits,client.snapshot()); return new RatisDurableSessionClient(client,limits,journal); }
-        catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
+        return createOwned(path,routed,issuance,grant,limits,RatisJournalAccess.standalone());
     }
     /** Reopen exact pending identities even after grant expiry; native authority decides retry outcomes. */
     public static RatisDurableSessionClient reopen(Path path,RatisRoutedClient routed) throws IOException {
-        var journal=SessionWindowJournal.open(path,routed,false);
-        try { var saved=journal.read(); return new RatisDurableSessionClient(RatisSessionClient.restore(routed,saved.grant(),saved.limits(),saved.state()),saved.limits(),journal); }
-        catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
+        return reopenOwned(path,routed,RatisJournalAccess.standalone());
     }
-    void installReroutes(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader reader)throws IOException {
-        lane.lock();try{requireOpen();if(active!=0 || reroutes!=null)throw new IOException("Durable reroute owner already configured or active");reroutes=new RatisOperationRerouteCoordinator(root,schema,epochs,routed,homes,scheduler,grant(),limits,directories,reader);rerouteScheduler=scheduler;recoveryPending=true;}finally{lane.unlock();}
+    static RatisDurableSessionClient createOwned(Path path,RatisRoutedClient routed,SessionEpochLedger issuance,SessionEpochLedger.Grant grant,RatisSessionClient.Limits limits,RatisJournalAccess access)throws IOException {
+        var client=new RatisSessionClient(routed,issuance,grant,limits);var journal=SessionWindowJournal.open(path,routed,true,access);
+        try{journal.write(grant,limits,client.snapshot());return new RatisDurableSessionClient(client,limits,journal);}catch(IOException|RuntimeException|Error failure){try{journal.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
+    }
+    static RatisDurableSessionClient reopenOwned(Path path,RatisRoutedClient routed,RatisJournalAccess access)throws IOException {
+        var journal=SessionWindowJournal.open(path,routed,false,access);
+        try{var saved=journal.read();return new RatisDurableSessionClient(RatisSessionClient.restore(routed,saved.grant(),saved.limits(),saved.state()),saved.limits(),journal);}catch(IOException|RuntimeException|Error failure){try{journal.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}
+    }
+    void installReroutes(Path root,DistributedSchema schema,RatisSessionEpochs epochs,RatisRoutedClient routed,RatisTransactionStatuses homes,RWScheduler scheduler,RatisCatalogue directories,RatisRoutedClient.SourceAckDirectoryReader reader,RatisJournalAccess access)throws IOException {
+        lane.lock();try{requireOpen();if(active!=0 || reroutes!=null)throw new IOException("Durable reroute owner already configured or active");reroutes=new RatisOperationRerouteCoordinator(root,schema,epochs,routed,homes,scheduler,grant(),limits,directories,reader,access);rerouteScheduler=scheduler;recoveryPending=true;}finally{lane.unlock();}
     }
     public SessionEpochLedger.Grant grant() { return client.grant(); }
     RatisSessionClient.Limits limits() { return limits; }

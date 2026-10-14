@@ -14,6 +14,7 @@ final class SessionWindowJournal implements AutoCloseable {
     static final long MAX_WINDOW_BYTES=16L*1024*1024;
     private static final int MAGIC=0x53574a4c, HEADER_BYTES=121;
     record Saved(SessionEpochLedger.Grant grant,RatisSessionClient.Limits limits,RatisSessionClient.WindowState state) {}
+    private final RatisJournalAccess access;
     private final Path path;
     private final RatisRoutedClient routed;
     private final byte[] identity;
@@ -22,10 +23,11 @@ final class SessionWindowJournal implements AutoCloseable {
     private Saved saved;
     private boolean closed,fenced;
 
-    static SessionWindowJournal open(Path path,RatisRoutedClient routed,boolean create) throws IOException {
-        return new SessionWindowJournal(path,routed,create);
+    static SessionWindowJournal open(Path path,RatisRoutedClient routed,boolean create,RatisJournalAccess access) throws IOException {
+        return new SessionWindowJournal(path,routed,create,access);
     }
-    private SessionWindowJournal(Path path,RatisRoutedClient routed,boolean create) throws IOException {
+    private SessionWindowJournal(Path path,RatisRoutedClient routed,boolean create,RatisJournalAccess access) throws IOException {
+        this.access=Objects.requireNonNull(access);access.register(path,MAX_BYTES);access.register(path.resolveSibling(path.getFileName()+".lock"),32);
         this.path=path.toAbsolutePath(); this.routed=Objects.requireNonNull(routed); identity=routed.sessionIdentityDigest();
         if (!Files.isDirectory(this.path.getParent())) throw new IOException("Session window journal parent is absent");
         channel=FileChannel.open(this.path.resolveSibling(this.path.getFileName()+".lock"),StandardOpenOption.CREATE,StandardOpenOption.WRITE);
@@ -35,7 +37,7 @@ final class SessionWindowJournal implements AutoCloseable {
             if (acquired==null) throw new IOException("Session window journal already owned"); lock=acquired;
             if (create==Files.exists(this.path)) throw new IOException(create ? "Session window journal already exists" : "Session window journal is absent");
             if (!create) {
-                byte[] body=SessionJournalFiles.read(this.path,MAX_BYTES); saved=decode(body);
+                byte[] body=access.read(this.path,MAX_BYTES); saved=decode(body);
                 SessionJournalFiles.force(this.path); SessionJournalFiles.force(this.path.getParent());
             }
         } catch (IOException | RuntimeException | Error failure) {
@@ -57,7 +59,7 @@ final class SessionWindowJournal implements AutoCloseable {
             var canonical=new Saved(grant,limits,restored);
             if (encodedSize(canonical)!=size) throw new IOException("Session window changed during canonical restoration");
             byte[] body=encode(canonical,size);
-            SessionJournalFiles.write(path,body,MAX_BYTES); saved=canonical;
+            access.write(path,body,MAX_BYTES); saved=canonical;
         } catch (IOException failure) { fenced=true; throw failure; }
         catch (RuntimeException invalid) {
             fenced=true; throw new IOException("Invalid bounded session window state",invalid);

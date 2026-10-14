@@ -58,7 +58,7 @@ class RatisConnectionBatchesTest {
                 grants.add(grant); windows.add(window); return RatisDurableSessionClient.create(window,routed,next,grant,RatisSessionClient.Limits.defaults());
             }),List.of(),pointBudget.shared);
         }
-        RatisRocksDBConnection open(int capacity) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/batches"),connectionRoot,java.util.Map.of(f.schema.domainId(),routed),(name,shape)->f.schema.domainId(),f.scheduler,binding,f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(8,64,8,128L*1024*1024,capacity),List.of(replicas)); }
+        RatisRocksDBConnection open(int capacity) throws Exception { var replicas=new RatisSchemaReplicaClient(1); return new RatisRocksDBConnection(URI.create("ratis://controlled/batches"),connectionRoot,java.util.Map.of(f.schema.domainId(),routed),(name,shape)->f.schema.domainId(),f.scheduler,binding,f.catalogue.client,replicas,null,null,factory,new RatisRocksDBConnection.Limits(8,64,8,128L*1024*1024,capacity),List.of(replicas), pointBudget.shared); }
         public void close() throws Exception { routed.close(); f.close(); }
     }
     static RemoteMutationToken prepare(RemoteMutationAsyncAPI api)throws Exception {

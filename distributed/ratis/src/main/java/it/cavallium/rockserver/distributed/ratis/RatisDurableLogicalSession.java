@@ -89,7 +89,7 @@ public final class RatisDurableLogicalSession implements AutoCloseable {
             try { channel.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure;
         }
     }
-    private void installReroutes()throws IOException {window.installReroutes(root.resolve("reroutes"),schema,epochs,routed,homes,scheduler,directories,acknowledgementDirectories);}
+    private void installReroutes()throws IOException {window.installReroutes(root.resolve("reroutes"),schema,epochs,routed,homes,scheduler,directories,acknowledgementDirectories,RatisJournalAccess.standalone());}
     private static void validate(long expires,RatisSessionClient.Limits limits) {
         Objects.requireNonNull(limits);
         if (expires<=0 || limits.commandBytes()>SessionWindowJournal.MAX_WINDOW_BYTES || limits.resultBytes()>SessionWindowJournal.MAX_WINDOW_BYTES) throw new IllegalArgumentException("Invalid durable logical session limits/expiry");

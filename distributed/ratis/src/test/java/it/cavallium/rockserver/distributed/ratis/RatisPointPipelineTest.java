@@ -39,8 +39,9 @@ class RatisPointPipelineTest {
                     var first=owners.select(identities.get(0));var second=owners.select(identities.get(1));byte[] key={2},value={9};
                     var prepared=first.prepareSequence(identities.get(0),UUID.randomUUID(),0,71,List.of(new Keys(Buf.wrap(key))),List.of(Buf.wrap(value)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,false,RequestContext.batch());key[0]=3;value[0]=8;firstToken=prepared.get(10,TimeUnit.SECONDS);
                     secondToken=RatisRocksDBDirectTest.prepare(second,71,List.of(RatisAtomicClientTest.key(4)),List.of(RatisAtomicClientTest.value(7)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,false);
-                    var left=first.execute(firstToken,RequestContext.batch());var leftDrained=first.actualCompletion(left);var right=second.execute(secondToken,RequestContext.batch());drains.add(leftDrained);drains.add(second.actualCompletion(right));
-                    var a=calls.poll(10,TimeUnit.SECONDS);var b=calls.poll(10,TimeUnit.SECONDS);assertNotNull(a);assertNotNull(b,"One WRITE worker must release while the first real RPC is unresolved");assertEquals(a.route().groupId(),b.route().groupId());assertNotEquals(a.command().operationId().sessionId(),b.command().operationId().sessionId());assertEquals(2,budget.retainedRequests());
+                    var left=first.execute(firstToken,RequestContext.batch());var leftDrained=first.actualCompletion(left);drains.add(leftDrained);
+                    var a=calls.poll(10,TimeUnit.SECONDS);assertNotNull(a);assertFalse(a.reply().isDone());assertFalse(leftDrained.isDone());
+                    var right=second.execute(secondToken,RequestContext.batch());drains.add(second.actualCompletion(right));var b=calls.poll(10,TimeUnit.SECONDS);if(b==null){if(left.isCompletedExceptionally())left.get(1,TimeUnit.SECONDS);if(right.isCompletedExceptionally())right.get(1,TimeUnit.SECONDS);}assertNotNull(b,"One WRITE worker must release while the first real RPC is unresolved");assertEquals(a.route().groupId(),b.route().groupId());assertNotEquals(a.command().operationId().sessionId(),b.command().operationId().sessionId());assertEquals(2,budget.retainedRequests());
                     long charged=budget.chargedBytes();assertTrue(left.cancel(false));assertFalse(a.reply().isCancelled());assertFalse(b.reply().isCancelled());assertFalse(leftDrained.isDone());assertEquals(charged,budget.chargedBytes());
                     Submitted secondCall=a.command().operationId().sessionId().equals(secondToken.ownerId())?a:b,firstCall=secondCall==a?b:a;
                     secondCall.reply().complete(transport.commandAsync(secondCall.route(),secondCall.command()).get(10,TimeUnit.SECONDS));right.get(10,TimeUnit.SECONDS);second.acknowledgeResult(secondToken,second.status(secondToken).resultDigest());assertEquals(1,budget.retainedRequests());assertFalse(leftDrained.isDone());
@@ -64,9 +65,9 @@ class RatisPointPipelineTest {
         }
     }
     @Test void sharedEnvelopeRejectsBeforeCopyAndRetainedOwnerConstruction()throws Exception {
-        var limits=new RemoteMutationOwnerLimits(2,2,2,32L<<20,16L<<20,8L<<20,1);
-        try(var budget=new RatisRequestBudget(limits);var first=budget.owner(1024,0);var second=budget.owner(1024,0)) {
-            first.opened(null);second.opened(null);long used=budget.chargedBytes();assertThrows(RocksDBException.class,()->budget.owner(1024,0));assertThrows(RocksDBException.class,()->budget.request(new RatisRequestBudget.Geometry(2L<<20,2L<<20,2L<<20,2L<<20,2L<<20,1)));assertEquals(used,budget.chargedBytes());assertEquals(0,budget.retainedRequests());
+        var limits=new RemoteMutationOwnerLimits(2,2,0,0,2,32L<<20,512L<<20,512,16L<<20,8L<<20,1);
+        try(var budget=new RatisRequestBudget(limits);var first=budget.owner(RemoteMutationToken.Kind.POINT,1024,0);var second=budget.owner(RemoteMutationToken.Kind.POINT,1024,0)) {
+            first.opened(0,false);second.opened(0,false);long used=budget.chargedBytes();assertThrows(RocksDBException.class,()->budget.owner(RemoteMutationToken.Kind.POINT,1024,0));assertThrows(RocksDBException.class,()->budget.request(RemoteMutationToken.Kind.POINT,new RatisRequestBudget.Geometry(2L<<20,2L<<20,2L<<20,2L<<20,2L<<20,1).bytes()));assertEquals(used,budget.chargedBytes());assertEquals(0,budget.retainedRequests());
         }
     }
 }

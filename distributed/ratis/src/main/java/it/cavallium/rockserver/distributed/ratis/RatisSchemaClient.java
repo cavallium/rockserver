@@ -34,7 +34,7 @@ public final class RatisSchemaClient implements AutoCloseable {
     private final RatisSchemaReplicaClient replicas;
     private final RatisOperatorCatalogue operators;
     @FunctionalInterface interface Checkpoint { void write(Path path,Map<String,byte[]> fields) throws IOException; }
-    private final Checkpoint checkpoint;
+    private final Checkpoint checkpoint;private final RatisJournalAccess journalAccess;
     private final FileChannel lockChannel;
     private final FileLock lock;
     private final Map<UUID,Handle> handles=new HashMap<>();
@@ -55,6 +55,11 @@ public final class RatisSchemaClient implements AutoCloseable {
         this(root,cluster,database,domain,binding,client,routed,replicas,operators,RatisSchemaClientJournal::write);
     }
     RatisSchemaClient(Path root,UUID cluster,UUID database,UUID domain,RatisNodePlan.Catalogue binding,RaftClient client,RatisRoutedClient routed,RatisSchemaReplicaClient replicas,RatisOperatorCatalogue operators,Checkpoint checkpoint) throws IOException {
+        this(root,cluster,database,domain,binding,client,routed,replicas,operators,checkpoint,RatisJournalAccess.standalone());
+    }
+    static RatisSchemaClient journalOwned(Path root,UUID cluster,UUID database,UUID domain,RatisNodePlan.Catalogue binding,RaftClient client,RatisRoutedClient routed,RatisSchemaReplicaClient replicas,RatisOperatorCatalogue operators,Checkpoint checkpoint,RatisJournalAccess access)throws IOException {return new RatisSchemaClient(root,cluster,database,domain,binding,client,routed,replicas,operators,checkpoint,access);}
+    private RatisSchemaClient(Path root,UUID cluster,UUID database,UUID domain,RatisNodePlan.Catalogue binding,RaftClient client,RatisRoutedClient routed,RatisSchemaReplicaClient replicas,RatisOperatorCatalogue operators,Checkpoint checkpoint,RatisJournalAccess access) throws IOException {
+        journalAccess=Objects.requireNonNull(access);access.register(root.resolve("schema-client.lock"),32);
         this.checkpoint=Objects.requireNonNull(checkpoint);
         this.root=root.toAbsolutePath(); this.cluster=Objects.requireNonNull(cluster); this.database=Objects.requireNonNull(database); this.domain=Objects.requireNonNull(domain);
         this.binding=Objects.requireNonNull(binding); this.client=Objects.requireNonNull(client); this.routed=Objects.requireNonNull(routed); this.replicas=Objects.requireNonNull(replicas); this.operators=operators;
@@ -152,7 +157,7 @@ public final class RatisSchemaClient implements AutoCloseable {
     }
     public synchronized Handle reopen(UUID request) throws IOException {
         requireIdle(); if (handles.containsKey(request)) return handles.get(request); if (handles.size()>=MAX_HANDLES) throw new IOException("Schema handles exhausted");
-        var h=new Handle(request,RatisSchemaClientJournal.read(path(request)));
+        var h=new Handle(request,RatisSchemaClientJournal.readOwned(path(request),journalAccess));
         try { validateRecovered(h); } catch(RuntimeException malformed) { throw new IOException("Invalid owned schema request journal",malformed); }
         handles.put(request,h); return h;
     }
