@@ -17,7 +17,7 @@ class RatisPointOwnerRenewalTest {
     final class Fixture implements AutoCloseable {
         final RatisAtomicClientTest.Fixture f;
         final RatisRequestBudget budget;final RatisRocksDBConnection.SessionFactory sessions;final AtomicInteger opens=new AtomicInteger();
-        final AtomicBoolean loseIssue=new AtomicBoolean(),loseBinding=new AtomicBoolean();final AtomicReference<SessionEpochLedger.Grant> lost=new AtomicReference<>();
+        final AtomicBoolean loseIssue=new AtomicBoolean(),loseBinding=new AtomicBoolean();final AtomicReference<SessionEpochLedger.Grant> lost=new AtomicReference<>();final AtomicReference<RatisSessionBindingPlan> lostPlan=new AtomicReference<>();final AtomicReference<Path> lostBindingRoot=new AtomicReference<>();
         volatile CountDownLatch entered,release;final AtomicLong commands=new AtomicLong(900);final Path ownersRoot;
         Fixture(Path fixtureRoot,int history)throws Exception {
             f=new RatisAtomicClientTest.Fixture(fixtureRoot.resolve("native"),true);ownersRoot=fixtureRoot.resolve("owners");
@@ -26,7 +26,7 @@ class RatisPointOwnerRenewalTest {
             sessions=new RatisRocksDBConnection.SessionFactory(List.of(f.data,f.homeClient),(path,schema,plan)->{
                 opens.incrementAndGet();
                 if(loseIssue.getAndSet(false)){lost.set(RatisBackendSessions.issue(path,f.catalogue.epochs,5).grant());throw new IOException("Lost original issue reply");}
-                if(loseBinding.getAndSet(false)){var issued=RatisBackendSessions.issue(path,f.catalogue.epochs,5);lost.set(issued.grant());RatisBackendSessions.bind(path,f.catalogue.epochs,issued,32,plan.targets());throw new IOException("Lost original binding reply");}
+                if(loseBinding.getAndSet(false)){lostPlan.set(plan);lostBindingRoot.set(path);var issued=RatisBackendSessions.issue(path,f.catalogue.epochs,5);lost.set(issued.grant());RatisBackendSessions.bind(path,f.catalogue.epochs,issued,32,plan.targets());throw new IOException("Lost original binding reply");}
                 var window=RatisBackendSessions.window(path,f.data,f.catalogue.epochs,5,RatisSessionClient.Limits.defaults(),plan.targets());
                 if(entered!=null){entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS)){window.close();throw new IOException("Renewal fixture barrier timed out");}}catch(InterruptedException failure){window.close();throw new IOException(failure);}}
                 return window;
@@ -86,6 +86,43 @@ class RatisPointOwnerRenewalTest {
             }
             int grants=f.catalogue.epochs.read().grants().size();try(var cold=new RatisPointOwnerManager(f.source.schema,f.source.directory,stale,f.scheduler,owners,budget,sessions,f.catalogue.epochs,directories,header->{var definition=TopologyChange.Definition.decode(f.point(RatisTopologyCatalogue.definitionKey(header.definitionDigest())));header.requireDefinition(definition);return definition.sourceDirectory();},f.homes)) {
                 assertEquals(replacement.ownerId(),await(cold.discover(RequestContext.batch())).getFirst().ownerId());assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,cold.select(originalToken).status(originalToken).state());assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,cold.select(newToken).status(newToken).state());assertTrue(cold.contains(newToken));assertEquals(grants,f.catalogue.epochs.read().grants().size());
+            }
+        }
+    }
+
+    static RangeDirectory advancePlacement(RangeDirectory directory){return new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),directory.generation()+1,directory.columns(),directory.routingPrefixBytes(),directory.ranges());}
+    @Test void pendingBindingPlanReopensOriginalDataAndHomeDirectoriesDespiteLaterAdvancement()throws Exception {
+        try(var x=new Fixture(root,4)) {
+            var directories=x.f.catalogue.epochs.catalogue(x.f.outer.directoryColumn);var dataFirst=advancePlacement(x.f.directory);var homeFirst=advancePlacement(x.f.homeClient.directory());RemoteMutationToken originalToken;SessionEpochLedger.Grant issued;byte[] planBytes;
+            try(var manager=x.open()) {
+                var owner=manager.available().getFirst();originalToken=x.write(manager,owner,2,1);
+                assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(x.f.outer.operation(x.commands.getAndIncrement()),x.f.directory,dataFirst)).status());x.f.data.refresh(dataFirst);x.f.homeClient.refresh(homeFirst);x.expire(owner);x.loseBinding.set(true);assertThrows(ExecutionException.class,()->await(manager.discover(RequestContext.batch())));issued=x.lost.get();planBytes=x.lostPlan.get().encode();assertArrayEquals(dataFirst.payloadDigest(),x.lostPlan.get().directory().payloadDigest());assertTrue(x.lostPlan.get().targets().stream().anyMatch(target->Arrays.equals(homeFirst.payloadDigest(),target.directory().payloadDigest())));
+                var dataLater=advancePlacement(dataFirst);var homeLater=advancePlacement(homeFirst);assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(x.f.outer.operation(x.commands.getAndIncrement()),dataFirst,dataLater)).status());x.f.data.refresh(dataLater);x.f.homeClient.refresh(homeLater);
+                var issuedState=RatisBackendSessions.issue(x.lostBindingRoot.get(),x.f.catalogue.epochs,5);var wrong=x.sessions.bindings(dataLater).freeze();long cut=x.f.stores.get(x.f.groups.getFirst()).applied().index();assertThrows(IOException.class,()->RatisBackendSessions.bind(x.lostBindingRoot.get(),x.f.catalogue.epochs,issuedState,32,wrong.targets()));assertEquals(cut,x.f.stores.get(x.f.groups.getFirst()).applied().index(),"Mismatched retained plan must not submit a binding");
+                var target=x.lostPlan.get().targets().getFirst();assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(root.resolve("fresh-stale-binding"),x.f.catalogue.epochs,target.routed(),target.group(),target.directory()));
+
+            }
+            try(var cold=x.open()) {
+                var owner=await(cold.discover(RequestContext.batch())).getFirst();assertEquals(issued.sessionId(),owner.ownerId());assertEquals(issued.epoch(),owner.ownerEpoch());assertArrayEquals(dataFirst.payloadDigest(),owner.directoryDigest());assertFalse(Arrays.equals(owner.directoryDigest(),x.f.data.directory().payloadDigest()));assertArrayEquals(planBytes,x.sessions.restore(planBytes).encode());assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,cold.select(originalToken).status(originalToken).state());int grants=x.f.catalogue.epochs.read().grants().size();var current=x.write(cold,owner,3,2);assertTrue(cold.contains(current));assertArrayEquals(new byte[]{2},x.f.get(71,RatisAtomicClientTest.key(3)));assertEquals(grants,x.f.catalogue.epochs.read().grants().size());
+            }
+            var oldIssued=issued;assertThrows(IllegalArgumentException.class,()->x.f.data.prepareAt(dataFirst,new OperationId(oldIssued.sessionId(),oldIssued.epoch(),1),List.of(new Mutation(Mutation.Kind.PUT,x.f.schema.column(71).columnId(),new byte[]{4},new byte[]{3})),List.of(),-1));
+        }
+    }
+
+    @Test void pendingNativeBindingReplaysExactCommandAfterPlacementAdvanceWhileFreshAndChangedPlansReject()throws Exception {
+        try(var f=new RatisAtomicClientTest.Fixture(root.resolve("native"),true)) {
+            var before=f.catalogue.epochs.read();var ledger=before.issue(UUID.randomUUID(),1000);var grant=ledger.grants().getLast();assertEquals(CommandResult.Status.SUCCESS,f.catalogue.epochs.execute(f.catalogue.epochs.prepare(f.outer.operation(900),before,ledger)).status());var base=f.transport();var sent=new ArrayList<byte[]>();var lose=new AtomicBoolean(true);
+            try(var routed=new RatisRoutedClient(f.directory,new RatisRoutedClient.Transport(){
+                public byte[] read(RangeDescriptor route,UUID column,byte[] key)throws IOException{return base.read(route,column,key);}
+                public byte[] transaction(RangeDescriptor route,byte[] bytes,boolean fresh)throws IOException{return base.transaction(route,bytes,fresh);}
+                public CommandResult command(RangeDescriptor route,DistributedCommand command)throws IOException{sent.add(DistributedCommandCodec.encode(command));var result=base.command(route,command);if(lose.getAndSet(false))throw new IOException("Lost applied native binding reply");return result;}
+            })) {
+                var group=f.groups.getFirst();Path journal=root.resolve("binding");byte[] original;
+                try(var owner=RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,f.directory)){owner.prepareBinding(grant,32);original=DistributedCommandCodec.encode(owner.pendingCommand());assertThrows(IOException.class,owner::execute);assertNotNull(owner.pendingCommand());}
+                var latest=advancePlacement(f.directory);routed.refresh(latest);
+                assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(root.resolve("fresh-old-placement"),f.catalogue.epochs,routed,group,f.directory));assertEquals(1,sent.size());
+                try(var retained=RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,f.directory)){assertArrayEquals(original,DistributedCommandCodec.encode(retained.pendingCommand()));assertEquals(CommandResult.Status.SUCCESS,retained.execute().status());assertNotNull(retained.propagated());}
+                assertEquals(2,sent.size());assertArrayEquals(original,sent.getFirst());assertArrayEquals(original,sent.getLast());assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,latest));assertEquals(2,sent.size());
             }
         }
     }

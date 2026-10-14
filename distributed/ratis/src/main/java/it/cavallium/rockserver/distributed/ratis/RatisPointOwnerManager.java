@@ -18,7 +18,7 @@ final class RatisPointOwnerManager implements AutoCloseable {
     private final List<Entry> entries=new ArrayList<>();private final int[] selected;private boolean busy,fenced,closed;private Runnable selectorHook;
     private static final class Entry {
         final UUID root,previous;final int slot;final long reservation;final byte[] planDigest;UUID owner;long epoch=-1;
-        RatisSessionBindingPlan plan;RatisRequestBudget.Owner credit;RatisRocksDBDirect actor;RatisDurableSessionClient session;boolean released;
+        RatisSessionBindingPlan plan;RatisRoutedClient.OwnerDirectoryLease qualification;RatisRequestBudget.Owner credit;RatisRocksDBDirect actor;RatisDurableSessionClient session;boolean released;
         Entry(UUID root,UUID previous,int slot,long reservation,byte[] planDigest){this.root=root;this.previous=previous;this.slot=slot;this.reservation=reservation;this.planDigest=planDigest.clone();}
     }
     RatisPointOwnerManager(DistributedSchema schema,RangeDirectory directory,RatisRoutedClient routed,RWScheduler scheduler,Path root,RatisRequestBudget budget,RatisRocksDBConnection.SessionFactory factory,RatisSessionEpochs epochs,RatisCatalogue catalogue,RatisRoutedClient.SourceAckDirectoryReader acknowledgements,RatisTransactionStatuses homes)throws IOException {
@@ -52,6 +52,7 @@ final class RatisPointOwnerManager implements AutoCloseable {
     private void open(Entry entry)throws IOException {
         if(entry.actor!=null){if(pending(entry))publish(entry);return;}reserve(entry);
         if(entry.plan==null){long size=Files.size(folder(entry).resolve("intent"));if(size<INTENT_HEADER+32 || entry.reservation<8*(size-INTENT_HEADER-32))throw new IOException("Retained intent geometry exceeds reserved credit");byte[] body=SessionJournalFiles.read(folder(entry).resolve("intent"),INTENT_HEADER+RatisSessionBindingPlan.MAX_BYTES+32);var decoded=decodeIntent(entry.root,body);if(decoded.slot!=entry.slot || !Objects.equals(decoded.previous,entry.previous) || decoded.reservation!=entry.reservation || !Arrays.equals(decoded.planDigest,entry.planDigest))throw new IOException("Immutable point intent differs from selector manifest");entry.plan=decoded.plan;}
+        if(entry.qualification==null)entry.qualification=routed.retainOwnerDirectory(entry.plan);
         var old=predecessor(entry);if(pending(entry) && old!=null)old.actor.beginRenewal();
         if(pending(entry) && routed.directory(schema).generation()<entry.plan.directory().generation())routed.refresh(entry.plan.directory());
         var session=factory.open(Files.createDirectories(folder(entry).resolve("session")),schema,entry.plan);boolean transferred=false;
@@ -96,5 +97,5 @@ final class RatisPointOwnerManager implements AutoCloseable {
     }
     private static void uuid(ByteBuffer out,UUID id){out.putLong(id==null?0:id.getMostSignificantBits()).putLong(id==null?0:id.getLeastSignificantBits());}
     private static UUID uuid(ByteBuffer in){long high=in.getLong(),low=in.getLong();return high==0 && low==0?null:new UUID(high,low);}
-    @Override public synchronized void close()throws IOException{if(closed)return;if(busy)throw new IOException("Actual point renewal remains owned");for(var entry:entries)if(!entry.released){if(entry.actor!=null)entry.actor.close();if(entry.session!=null)entry.session.close();if(entry.credit!=null)entry.credit.close();entry.released=true;}closed=true;}
+    @Override public synchronized void close()throws IOException{if(closed)return;if(busy)throw new IOException("Actual point renewal remains owned");for(var entry:entries)if(!entry.released){if(entry.actor!=null)entry.actor.close();if(entry.session!=null)entry.session.close();if(entry.qualification!=null)entry.qualification.close();if(entry.credit!=null)entry.credit.close();entry.released=true;}closed=true;}
 }
