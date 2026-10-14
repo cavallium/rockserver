@@ -48,6 +48,7 @@ public final class RatisNodeService implements AutoCloseable {
         }
     }
     private final RatisNodeManifest manifest; private final Resources resources; private final RatisNodeRuntime node;
+    private Map<UUID,RangeDirectory> expectedDirectories; private boolean restorePending,restoreOwned;
     private final RatisSchemaCatalogue schemas; private final RatisDatabaseDomainRoster roster;
     private boolean starting,closing,closed,closeRequested; private int checks;
     private RatisDatabaseBackendFactory frontendBackend;
@@ -59,6 +60,7 @@ public final class RatisNodeService implements AutoCloseable {
         this.manifest=manifest; this.resources=resources; this.node=node; var plan=manifest.plan(); var c=plan.catalogue();
         schemas=new RatisSchemaCatalogue(resources.catalogue,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.directoryColumn());
         roster=new RatisDatabaseDomainRoster(resources.catalogue,plan.clusterId(),plan.databaseId(),c);
+        var expected=new HashMap<UUID,RangeDirectory>();plan.domains().forEach(d->expected.put(d.directory().domainId(),d.directory()));expectedDirectories=Map.copyOf(expected);
     }
     /** Never grants placement-creation authority. Root must contain established native and Raft state. */
     public static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config) throws IOException {
@@ -67,6 +69,9 @@ public final class RatisNodeService implements AutoCloseable {
     /** Trusted node-local operator admission; manifest budgets persist independently of this borrowed policy. */
     public static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,RatisSchemaReplicaService.OperatorPolicy policy) throws IOException {
         Objects.requireNonNull(manifest); Objects.requireNonNull(config); Objects.requireNonNull(policy); preflight(root,manifest.plan());
+        return recover(manifest,root,config,connectResources(manifest,config),null,policy);
+    }
+    static Resources connectResources(RatisNodeManifest manifest,DatabaseConfig config)throws IOException {
         final WorkloadSettings workload;
         try { workload=WorkloadSettings.resolve(config); } catch (Exception invalid) { throw new IOException("Invalid storage workload configuration",invalid); }
         if (workload.readParallelism()!=manifest.readThreads() || workload.writeParallelism()!=manifest.writeThreads()) {
@@ -86,28 +91,48 @@ public final class RatisNodeService implements AutoCloseable {
             try { if (scheduler!=null) scheduler.dispose(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
         }
-        return recover(manifest,root,config,new Resources(client,routed,scheduler,timer),null,policy);
+        return new Resources(client,routed,scheduler,timer);
     }
+
     static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory) throws IOException {
         return recover(manifest,root,config,resources,factory,RatisNodeRuntime.SchemaReplicaConfig.defaults().policy());
     }
     static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy) throws IOException {
+        return open(manifest,root,config,resources,factory,policy,RatisNodeRuntime.Startup.RECOVER,RatisRoutedClient::connect,false,null);
+    }
+    static RatisNodeService openRestore(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,
+            RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy,RatisNodeRuntime.HomeClientFactory homes,RatisNodeRuntime.RestoreNativeInitialization staging)throws IOException {
+        return open(manifest,root,config,resources,factory,policy,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT,homes,true,Objects.requireNonNull(staging));
+    }
+    private static RatisNodeService open(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,
+            RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy,RatisNodeRuntime.Startup startup,
+            RatisNodeRuntime.HomeClientFactory homes,boolean restoring,RatisNodeRuntime.RestoreNativeInitialization staging)throws IOException {
         try {
-            preflight(root,manifest.plan());
+            if(!restoring)preflight(root,manifest.plan());
             if(!resources.routed.keySet().equals(manifest.schemas().keySet()))throw new IOException("Recovery routed domains differ from manifest");
             for(var entry:resources.routed.entrySet())manifest.schema(entry.getKey()).requireMatches(entry.getValue().directory());
             var plan=manifest.plan(); var c=plan.catalogue();
             var epochs=new RatisSessionEpochs(resources.catalogue,plan.clusterId(),plan.databaseId(),c.groupId(),c.epoch(),c.schemaDigest(),c.sessionsColumn());
             var replicaConfig=new RatisNodeRuntime.SchemaReplicaConfig(manifest.schemaReplicaLimits(),Objects.requireNonNull(policy));
-            var node=factory==null
-                    ? RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,manifest.schemas().values(),null,null,replicaConfig)
-                    : RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,manifest.settings(),RatisNodeRuntime.Startup.RECOVER,factory,manifest.schemas().values(),null,null,RatisRoutedClient::connect,replicaConfig);
-            return new RatisNodeService(manifest,resources,node);
+            var node=RatisNodeRuntime.open(plan,root,config,epochs,resources.routed,resources.scheduler,resources.timer,System::currentTimeMillis,
+                    manifest.settings(),startup,factory,manifest.schemas().values(),null,null,homes,replicaConfig,
+                    ()->new RatisSchemaReplicaClient(RatisSchemaReplicaClient.MAX_CALLS),staging);
+            var service=new RatisNodeService(manifest,resources,node);service.restorePending=restoring;service.restoreOwned=restoring;return service;
         } catch (IOException | RuntimeException | Error failure) {
             resources.abort(failure); throw failure;
         }
     }
+    void requestRestoreClose()throws IOException {
+        synchronized(this){closeRequested=true;if(starting || frontendOpening || checks!=0)throw new IOException("Node service frontend work is active");}
+        closeFrontend();
+    }
+    private void closeFrontend()throws IOException {
+        if(frontend!=null && !frontendClosed){frontend.close();frontendClosed=true;}
+    }
+    synchronized void finishRestoreOwnership(){restoreOwned=false;}
+    Resources restoreResources(){return resources;}
     private static void preflight(Path root,RatisNodePlan plan) throws IOException {
+        if(Files.exists(root.resolve("restore.owner"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Restore-owned node requires original operation reopen/adoption");
         if (!Files.isRegularFile(root.resolve("node.identity"))) {
             throw new IOException("Recovery launcher requires established node identity/native state");
         }
@@ -143,7 +168,7 @@ public final class RatisNodeService implements AutoCloseable {
     }
     void startFrontend(BackendCreator backend,ListenerCreator listener,URI listen) throws IOException {
         synchronized(this) {
-            requireOpen();if(frontendOpening || frontendBackend!=null || node.state()!=RatisNodeRuntime.State.RUNNING)
+            requireOpen();if(restorePending || frontendOpening || frontendBackend!=null || node.state()!=RatisNodeRuntime.State.RUNNING)
                 throw new IOException("Node frontend cannot start in its current state");frontendOpening=true;
         }
         try {
@@ -165,10 +190,30 @@ public final class RatisNodeService implements AutoCloseable {
             for(var expected:manifest.schemas().values()) {
                 var schema=schemas.read(expected.digest());var directory=complete.directories().get(expected.domainId());
                 if(schema==null || !Arrays.equals(DistributedSchemaCodec.encode(expected),DistributedSchemaCodec.encode(schema))
-                        || !Arrays.equals(manifest.plan().directory(expected.domainId()).payloadDigest(),directory.payloadDigest()))throw new IOException("Catalogue differs from node manifest");
+                        || !Arrays.equals(expectedDirectories.get(expected.domainId()).payloadDigest(),directory.payloadDigest()))throw new IOException("Catalogue differs from node manifest");
             }
             roster.requireUnchanged(complete.roster());
         } finally { synchronized (this) { checks--; } }
+    }
+    /** Original placement identity stays immutable; only proven final serving routes become frontend expectations. */
+    void adoptRestore(RatisDatabaseRestorePlanner.Plan original,SessionEpochLedger issued)throws IOException {
+        synchronized(this){requireOpen();if(!restorePending || checks!=0 || node.state()!=RatisNodeRuntime.State.RUNNING)throw new IOException("Restore adoption unavailable");checks++;}
+        try {
+            var authority=original.requireExecutionLedger(issued);var view=roster.readComplete();
+            if(!view.roster().equals(original.roster()))throw new IOException("Restored roster differs from frozen plan");
+            var expected=new HashMap<UUID,RangeDirectory>();
+            for(var domain:original.domains()){
+                var schema=schemas.read(domain.schema().digest());var directory=view.directories().get(domain.schema().domainId());
+                if(schema==null || !Arrays.equals(DistributedSchemaCodec.encode(schema),DistributedSchemaCodec.encode(domain.schema()))
+                        || directory==null || !Arrays.equals(directory.payloadDigest(),domain.finalDirectory().payloadDigest()))throw new IOException("Restored schema/final directory differs");
+                var route=resources.routed.get(domain.schema().domainId());
+                if(!Arrays.equals(route.directory().payloadDigest(),directory.payloadDigest()))throw new IOException("Restored route not qualified");
+                for(var range:directory.ranges())route.stateView(range.groupId()).requireServing(authority);
+                expected.put(directory.domainId(),directory);
+            }
+            roster.requireUnchanged(original.roster());
+            synchronized(this){expectedDirectories=Map.copyOf(expected);restorePending=false;}
+        }finally{synchronized(this){checks--;}}
     }
     public RatisNodeReadiness.Report readiness() throws IOException {
         synchronized (this) { requireOpen();if(checks>=32)throw new IOException("Node service check budget exhausted");checks++; }
@@ -185,10 +230,10 @@ public final class RatisNodeService implements AutoCloseable {
     @Override public void close() throws IOException {
         synchronized (this) {
             if (closed) return;
-            if (starting || closing || frontendOpening || checks!=0) throw new IOException("Node service work is active"); closeRequested=true; closing=true;
+            if (restoreOwned || starting || closing || frontendOpening || checks!=0) throw new IOException("Node service work is active"); closeRequested=true; closing=true;
         }
         try {
-            if(frontend!=null && !frontendClosed){frontend.close();frontendClosed=true;}
+            closeFrontend();
             if(frontendBackend!=null && !exportsClosed){frontendBackend.drainExports();exportsClosed=true;}
             if(frontendBackend!=null && !backendClosed){frontendBackend.close();backendClosed=true;}
             node.close(); // On a drain/pin/close failure retain all dependencies and ownership for retry.

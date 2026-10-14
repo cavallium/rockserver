@@ -44,6 +44,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         RaftServer create(RatisNodePlan plan,Path logs,Map<RaftGroupId,RatisRangeStateMachine> machines) throws IOException;
     }
     private static final ServerFactory DEFAULT_SERVER_FACTORY=RatisNodeRuntime::buildServer;
+    @FunctionalInterface interface RestoreNativeInitialization { void prepare(RatisNodeResourceBudget resources)throws IOException; }
     @FunctionalInterface interface SchemaReplicaClientFactory { RatisSchemaReplicaClient create() throws IOException; }
     @FunctionalInterface interface HomeClientFactory { RatisRoutedClient connect(it.cavallium.rockserver.core.common.distributed.RangeDirectory directory) throws IOException; }
     public record ResourceLimits(RatisNodeResourceBudget.Limits node,RatisNodeResourceBudget.Limits pool,long maximumSourceImageDiskBytes,long maximumDurableMetadataBytes,long maximumOperatorCacheBytes,long maximumNativeCacheBytes,RatisCommittedApplyDispatcher.Policy committedApply,RatisDiskRunway.Policy diskRunway,RatisMigrationController.Policy migration,RatisNativeExtentPolicy nativeExtents) {
@@ -265,14 +266,16 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
             Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas) throws IOException {
-        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schemas,snapshotHomes,recoveries,homeFactory,replicas,() -> new RatisSchemaReplicaClient(RatisSchemaReplicaClient.MAX_CALLS));
+        return open(plan,root,config,epochs,routed,scheduler,timer,time,settings,startup,factory,schemas,snapshotHomes,recoveries,homeFactory,replicas,() -> new RatisSchemaReplicaClient(RatisSchemaReplicaClient.MAX_CALLS),null);
     }
     static RatisNodeRuntime open(RatisNodePlan plan,Path root,DatabaseConfig config,RatisSessionEpochs epochs,
-            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas,SchemaReplicaClientFactory replicaFactory) throws IOException {
+            Map<UUID,RatisRoutedClient> routed,RWScheduler scheduler,Scheduler timer,LongSupplier time,Settings settings,Startup startup,ServerFactory factory,Collection<DistributedSchema> schemas,RatisSnapshotFences snapshotHomes,RecoverySettings recoveries,HomeClientFactory homeFactory,SchemaReplicaConfig replicas,SchemaReplicaClientFactory replicaFactory,RestoreNativeInitialization restoreInitialization) throws IOException {
+        if(factory==null)factory=DEFAULT_SERVER_FACTORY;
+        if(restoreInitialization!=null && startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT)throw new IOException("Restore staging requires exact authorized initialization");
         requireNativeCacheCapacity(plan,settings.resources().maximumNativeCacheBytes());
         if(factory==DEFAULT_SERVER_FACTORY)RatisStreamingTransport.server(plan,new RaftProperties());
         var node=new RatisNodeRuntime(plan,root,epochs,routed,scheduler,timer,time,settings,schemas,snapshotHomes,recoveries,replicas);
-        try { node.initialize(config,startup,factory,homeFactory,replicaFactory); return node; }
+        try { node.initialize(config,startup,factory,homeFactory,replicaFactory,restoreInitialization); return node; }
         catch (IOException | RuntimeException | Error failure) {
             try { node.close(); } catch (Exception cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
@@ -332,7 +335,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }}
     }
     private static final List<String> NODE_DIRECTORIES=List.of("raft","sessions","recovery","schema-replicas","referenced-files","topology-exposure","topology-source-artifacts","retirement","topology-relocations");
-    private static final List<String> NODE_FILES=List.of("node.identity","node.lock","metadata-claims","native-extents.journal");
+    private static final List<String> NODE_FILES=List.of("node.identity","node.lock","metadata-claims","native-extents.journal","restore.owner");
     private record NativeExtentLayout(List<Path> directories,List<Path> roots) {}
     private NativeExtentLayout nativeExtentLayout()throws IOException {
         Path journal=root.resolve("native-extents.journal").toAbsolutePath().normalize();Path exports=root.resolve("exports").toAbsolutePath().normalize();
@@ -369,7 +372,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if(missing.isEmpty() && path.getParent()!=null)SessionJournalFiles.force(path.getParent());
     }
     private static void requireNoSymlinks(Path path)throws IOException{for(Path current=path;current!=null;current=current.getParent())if(Files.isSymbolicLink(current))throw new IOException("Native extent path contains a symlink: "+current);}
-    private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory,SchemaReplicaClientFactory replicaFactory) throws IOException {
+    private void initialize(DatabaseConfig config,Startup startup,ServerFactory factory,HomeClientFactory homeFactory,SchemaReplicaClientFactory replicaFactory,RestoreNativeInitialization restoreInitialization) throws IOException {
         Objects.requireNonNull(startup); Objects.requireNonNull(factory);
         if (!Files.isDirectory(root)) throw new IOException("Node root must already exist on durable storage");
         for (var home:plan.homes()) {
@@ -384,8 +387,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if (lock==null) throw new IOException("Node root already owned");
         var extentLayout=nativeExtentLayout();
         Path identity=root.resolve("node.identity"), logs=root.resolve("raft"), nativePath=root.resolve("native");
+        boolean establishedPlacement=false;
         if (Files.exists(identity,LinkOption.NOFOLLOW_LINKS)) {
-            int phase=identityPhase(SessionJournalFiles.read(identity,NODE_IDENTITY_BYTES));nativeExtentBound=phase>=1;boolean exposed=phase==2;
+            int phase=identityPhase(SessionJournalFiles.read(identity,NODE_IDENTITY_BYTES));nativeExtentBound=phase>=1;boolean exposed=phase==2;establishedPlacement=exposed;
             if (!exposed && startup!=Startup.AUTHORIZED_INITIAL_PLACEMENT) throw new IOException("Interrupted initial placement requires explicit authorization to resume");
             if (exposed) {
                 for(var spec:plan.pools().values())if(!Files.isRegularFile(spec.nativePath(root).resolve("CURRENT")))throw new IOException("Established native pool state is missing; refuse empty-voter recovery: "+spec.id());
@@ -407,6 +411,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
         }
         for (String directory:List.of("native","raft","sessions","recovery","schema-replicas")) { Path path=Files.createDirectories(root.resolve(directory)); SessionJournalFiles.force(path); }
         SessionJournalFiles.force(root);
+        // The exact original node identity and fresh staging tree have been checked while node.lock is held.
+        if(restoreInitialization!=null)restoreInitialization.prepare(resources);
         initializeNativeExtentEnv(identity,extentLayout);
         captureHomes=snapshotHomes;
         var snapshotPlan=plan.home(RatisNodePlan.Role.SNAPSHOT_HOME);
@@ -525,7 +531,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     if(importDefinition!=null){var manifest=importDefinition.manifest(id);RatisRangeImportRecord.requirePolicy(manifest);if(manifest.columns().size()>owner.images().maxColumns() || (long)manifest.encode().length+17>owner.images().maxRowBytes() || (long)manifest.encode().length+17>owner.images().maxImageBytes())throw new IOException("Imported manifest exceeds configured native image column or byte budget");}
                     var store=registration.learner()!=null ? pool.openTopologyLearner(registration.learner()) : registration.retired() ? pool.openRetiredTopologyRange(id) : registration.seed()!=null ? pool.reopenTopologyRange(registration.seed().birth(id),seedSchema(registration.seed())) : importDefinition==null ? pool.openRange(new RangeOwnership.Owner(id,descriptor.rangeEpoch()),new RangeOwnership.Interval(directory.domainId(),directory.columns(),descriptor.lowerInclusive(),descriptor.upperExclusive()),
                             directory.schemaDigest(),bindings,recipe!=null ? recipe.mergeColumns() : home==null ? plan.domain(directory.domainId()).merges() : Set.of())
-                            : startup==Startup.RECOVER ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchemas.get(directory.domainId()))
+                            : startup==Startup.RECOVER || establishedPlacement ? pool.reopenImportRange(importDefinition.manifest(id),logicalSchemas.get(directory.domainId()))
                             : pool.openNewFencedRange(importDefinition.manifest(id),logicalSchemas.get(directory.domainId()));
                     if(registration.relocation()!=null){var configuration=store.configuration();var cut=store.applied();if(configuration==null || cut==null || configuration.term()>cut.term() || configuration.index()>cut.index() || configuration.index()==cut.index() && configuration.term()!=cut.term())throw new IOException("Relocation cold configuration lacks completed native prefix");group=groups.reconcileRelocationConfiguration(id,configuration.data());}
                     stores.put(id,store);
