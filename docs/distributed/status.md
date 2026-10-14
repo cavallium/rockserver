@@ -99,6 +99,24 @@ This section and the remaining gates at the end describe the current branch.
   headroom, flush-scheduler allocation, the full node memory envelope and Java/JNI
   runtime qualification remain pending. The native candidate has not replaced the
   installed private JNI or established protected completion in the node.
+- Native checkpoint `dc16013` prepays future flush
+  buffers and an actual empty replacement memtable before WAL. Failed admission
+  releases provisional banks/spares; switching owns its spare across mutex
+  unlock and restores it on failure. Profile changes reject dependent sources.
+  Raw immutable reader fragmentation is lazy, and live installation defers
+  optional reader-cache warming; raw output checksum verification still closes
+  its uncached reader before Ready. Bank body/control allocations use captured
+  metadata credit through actual deallocation. The isolated Debug checkpoint
+  passes 448 selected cases: four workspace, 14 normal/pipelined planner, 35 raw,
+  251 log, 29 batch, five codec, 35 XFS completion, 32 XFS extent,
+  eight memtable-list, 14 DB/memtable, 20 flush and one table/memtable.
+  The planner includes three full-capacity multi-CF/range flush cycles and cold
+  reopen, using atomic flush in normal mode and supported pipelined flushes.
+  Evidence is `workspace-owner-final-*.log` in the native output directory;
+  the extent/completion runs use its existing XFS test directory.
+  Prospective input/output limits,
+  completion control/native node bounds and Java/JNI qualification remain open.
+  This source has not replaced the private JNI.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
