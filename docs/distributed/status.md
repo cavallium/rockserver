@@ -37,7 +37,7 @@ This section and the remaining gates at the end describe the current branch.
   preserve the previous inventory. Fresh pools skip listing only after proving
   an empty bounded directory tree; retained files without CURRENT cannot be
   adopted as a new database. The pinned JNI source is `bc1ddab`, reconstructed
-  exactly by wrapper `0facc219`. Its 28 extent and six Java cases pass, including
+  exactly by wrapper `69caf44`. Its 28 extent and six Java cases pass, including
   actual cross-process lock ownership. The unchanged native inventory has nine
   earlier passing cases. Main native consumers initially passed 103 cases; the subsequent eight-case pool
   gate also verifies lost-CURRENT refusal without changing the retained MANIFEST.
@@ -46,6 +46,9 @@ This section and the remaining gates at the end describe the current branch.
   Native Env ownership and ordinary allocation admission are qualified at the
   JNI boundary; shared node wiring is described below and protected completion
   remains pending.
+  The recipe enables RTTI in every release profile; shell and generated flag-matrix
+  checks pass. The installed private JNI remains the qualified Debug candidate;
+  this recipe repair does not establish a production native build.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
