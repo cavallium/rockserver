@@ -62,9 +62,9 @@ class RatisNodeMaintenanceTest {
                 var other=new RatisNodeMaintenance(NODE,INCARNATION,List.of(f.pool),threads.scheduler,POLICY)) {
                 var target=maintenance.target(f.pool,f.column);var calls=new java.util.concurrent.atomic.AtomicInteger();f.pool.localMaintenanceObserver(column->calls.incrementAndGet());
                 assertThrows(IllegalArgumentException.class,()->other.flush(target));
-                var wrongIncarnation=new RatisNodeMaintenance.Target(target.node(),UUID.randomUUID(),target.process(),target.pool(),target.column());
+                var wrongIncarnation=new RatisNodeMaintenance.Target(target.node(),UUID.randomUUID(),target.process(),target.pool(),target.column(),target.nativeColumnId());
                 assertThrows(IllegalArgumentException.class,()->maintenance.flush(wrongIncarnation));
-                var wrongColumn=new RatisNodeMaintenance.Target(target.node(),target.incarnation(),target.process(),target.pool(),UUID.randomUUID());
+                var wrongColumn=new RatisNodeMaintenance.Target(target.node(),target.incarnation(),target.process(),target.pool(),UUID.randomUUID(),target.nativeColumnId());
                 assertThrows(ExecutionException.class,()->maintenance.flush(wrongColumn).get(5,TimeUnit.SECONDS));
                 assertThrows(IllegalArgumentException.class,()->f.pool.flushLocal(UUID.randomUUID(),f.column));
                 assertEquals(0,calls.get());
@@ -76,9 +76,10 @@ class RatisNodeMaintenanceTest {
     @Test void cancelledObserverAndPoolCloseRetainActualNativeOwnership() throws Exception {
         try(var f=new RatisTopologyFreezeTest.Fixture(root);var threads=new Threads()) {
             try(var maintenance=new RatisNodeMaintenance(NODE,INCARNATION,List.of(f.pool),threads.scheduler,POLICY)) {
+                var target=maintenance.target(f.pool,f.column);
                 var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
                 f.pool.localMaintenanceObserver(column->{entered.countDown();try{if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("release timeout");}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}});
-                var target=maintenance.target(f.pool,f.column);var operation=maintenance.flush(target);
+                var operation=maintenance.flush(target);
                 assertTrue(entered.await(5,TimeUnit.SECONDS));
                 try {
                     assertTrue(operation.cancel(false));assertEquals(1,maintenance.pending());

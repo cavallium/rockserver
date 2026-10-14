@@ -194,6 +194,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final Map<RatisNodePlan.Role,RatisRoutedClient> homeClients=new EnumMap<>(RatisNodePlan.Role.class);
     private RatisTransactionExpiryService transactionExpiry;
     private RatisPoolPressureService poolPressure;
+    private RatisNodePhysicalApi physicalApi;
     private RatisNodeMaintenance localMaintenance;
     private RatisNodeMaintenance.Policy localMaintenancePolicy;
     private RecoverySettings recoverySettings;
@@ -996,9 +997,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
         else if(!localMaintenancePolicy.equals(policy))throw new IOException("Local maintenance policy is already fixed");
         return localMaintenance;
     }
-    public synchronized RatisNodeMaintenance.Target localMaintenanceTarget(UUID poolId,UUID column) throws IOException {
-        if(!started || closeRequested || closing || closed || localMaintenance==null)throw new IOException("Local maintenance is not configured or available");
-        return localMaintenance.target(pools.get(poolId).pool,column);
+    public synchronized RatisNodePhysicalApi physicalApi(RatisNodeMaintenance.Policy policy)throws IOException {
+        var maintenance=localMaintenance(policy);if(physicalApi==null){var selected=new LinkedHashMap<UUID,DistributedStoragePool>();pools.forEach((id,owner)->selected.put(id,owner.pool));physicalApi=new RatisNodePhysicalApi(maintenance,selected,policy);}return physicalApi;
+    }
+    public RatisNodeMaintenance.Target localMaintenanceTarget(UUID poolId,UUID column)throws IOException {
+        final RatisNodeMaintenance maintenance;final DistributedStoragePool pool;
+        synchronized(this){if(!started || closeRequested || closing || closed || localMaintenance==null)throw new IOException("Local maintenance unavailable");var owner=pools.get(poolId);if(owner==null)throw new IOException("Unknown local pool");maintenance=localMaintenance;pool=owner.pool;}
+        try{return maintenance.target(pool,column);}catch(org.rocksdb.RocksDBException failure){throw new IOException("Native physical target unavailable",failure);}
     }
     public RatisSessionClockService.Snapshot maintenanceStatus() { return service==null ? null : service.latest(); }
     public Throwable maintenanceFailure() { return service==null ? null : service.lastFailure(); }

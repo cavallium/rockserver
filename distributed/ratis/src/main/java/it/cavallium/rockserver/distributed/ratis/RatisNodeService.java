@@ -220,11 +220,13 @@ public final class RatisNodeService implements AutoCloseable {
         try { return node.readiness(); }
         finally { synchronized (this) { checks--; } }
     }
+    /** Trusted node-local policy; physical observations are replica-local and never logical database totals. */
+    public synchronized it.cavallium.rockserver.core.common.ReplicaPhysicalAPI physicalApi(RatisNodeMaintenance.Policy policy)throws IOException {requireOpen();return node.physicalApi(policy);}
     public synchronized RatisNodeMaintenance localMaintenance(RatisNodeMaintenance.Policy policy) throws IOException {
         requireOpen();return node.localMaintenance(policy);
     }
-    public synchronized RatisNodeMaintenance.Target localMaintenanceTarget(UUID poolId,UUID column) throws IOException {
-        requireOpen();return node.localMaintenanceTarget(poolId,column);
+    public RatisNodeMaintenance.Target localMaintenanceTarget(UUID poolId,UUID column) throws IOException {
+        synchronized(this){requireOpen();}return node.localMaintenanceTarget(poolId,column);
     }
     private void requireOpen() throws IOException { if (closed || closeRequested || closing) throw new IOException("Node service is closing/closed"); }
     @Override public void close() throws IOException {
