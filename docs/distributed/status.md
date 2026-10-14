@@ -117,6 +117,24 @@ This section and the remaining gates at the end describe the current branch.
   Prospective input/output limits,
   completion control/native node bounds and Java/JNI qualification remain open.
   This source has not replaced the private JNI.
+- Native checkpoint `6ec62f2` checks prospective point/range/input/output geometry
+  before WAL against all unselected CF sources. Individually impossible batches
+  refuse before WAL/sequence effects; fitting batches rotate the existing flush
+  path and refresh WAL sync/sequence state. Grouping defers compatible followers
+  before they form an impossible output. Completed history and verified recovery
+  prefixes retire only their future geometry, retaining actual source/loan RAM.
+  Recovery applies the inserter's already-flushed-CF WAL filter before preview,
+  borrows prepaid output workspace, consumes its spare, and spills prefixes
+  without resetting whole-recovery counters. A qualified twelve-record replay
+  under a two-entry output limit produces at least six installed children and
+  preserves every value through cold reopen. Current Debug source passes 471
+  selected cases: ten workspace, two grouping, 28 normal/pipelined planner,
+  35 raw, 251 log, 29 batch, five codec, 36 XFS completion, 32 XFS extent,
+  eight memtable-list, 14 DB/memtable, 20 flush and one table/memtable.
+  Evidence is `geometry-final-*.log` in the native output directory. Input/output
+  geometry is now covered at the writer and replay boundaries; completion control
+  and full node resource bounds, final private JNI/wrapper integration and the
+  broader distributed acceptance gates remain unfinished.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
