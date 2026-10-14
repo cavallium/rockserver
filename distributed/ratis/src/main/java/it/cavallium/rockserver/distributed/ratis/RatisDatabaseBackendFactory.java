@@ -47,7 +47,7 @@ public final class RatisDatabaseBackendFactory implements AutoCloseable {
     private RatisRocksDBConnection.Generation generation(DistributedSchema schema,RangeDirectory directory,Path generationRoot,java.util.function.LongSupplier ids)throws IOException{
         var routed=data.get(schema.domainId());if(routed==null)throw new IOException("Generation domain has no declared routed DATA client");schema.requireMatches(directory);routed.requireKnownSchema(schema);
         var allocationTargets=targets(routed,directory,true);var allocator=new RatisBackendAllocations(generationRoot.resolve("allocations"),epochs,scheduler,policy.grantLifetimeMillis(),policy.maximumAllocationGrants(),allocationTargets);
-        RatisRocksDBConnection.SessionFactory sessions=(path,expectedSchema,expectedDirectory)->RatisBackendSessions.window(path,routed,epochs,policy.grantLifetimeMillis(),policy.sessions(),targets(routed,expectedDirectory,false));
+        var sessions=new RatisRocksDBConnection.SessionFactory(List.of(routed,transactions),(path,expectedSchema,plan)->RatisBackendSessions.window(path,routed,epochs,policy.grantLifetimeMillis(),policy.sessions(),plan.targets()));
         var factory=RatisRocksDBConnection.durableGenerationFactory(routed,scheduler,snapshotHomes,transactionHomes,epochs,directories,header->{var definition=topology.readDefinition(header.definitionDigest());if(definition==null)throw new IOException("Immutable ACK topology definition absent");header.requireDefinition(definition);return definition.sourceDirectory();},allocator,sessions,List.of(allocator),pointBudget);
         return factory.create(schema,directory,generationRoot,ids);
     }

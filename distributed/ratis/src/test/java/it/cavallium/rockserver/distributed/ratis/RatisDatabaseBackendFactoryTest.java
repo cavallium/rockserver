@@ -84,11 +84,19 @@ class RatisDatabaseBackendFactoryTest {
             Path owned=root.resolve("backend");long before=fixture.nativeDomains.catalogue.epochs.read().nextEpoch();
             try(var factory=fixture.factory(owned)){
                 var connection=factory.open(URI.create("ratis://controlled/backend"));var api=connection.getAsyncApi(RequestContext.batch());assertEquals(2,await(api.getAllColumnDefinitionsAsync()).size());
-                for(int n=0;n<2;n++){long column=71+n;await(api.putAsync(0,column,key(7),value(10+n),RequestType.none()));await(api.putBatchAsync(column,RatisRocksDBBatchesTest.one(new KVBatch.KVBatchRef(List.of(key(8),key(9)),List.of(value(20+n),value(30+n)))),PutBatchMode.WRITE_BATCH));assertArrayEquals(new byte[]{(byte)(20+n)},await(api.getAsync(0,column,key(8),RequestType.<Buf>current())).toByteArray());}
+                for(int n=0;n<2;n++) {
+                    long column=71+n;RatisRocksDBConnectionTest.point(connection,column,key(7),value(10+n),RequestType.RequestTypeId.NOTHING);
+                    var remote=connection.getRemoteMutationApi();var owner=await(remote.owners(column,RequestContext.batch())).stream().filter(candidate->candidate.kind()==RemoteMutationToken.Kind.BULK).findFirst().orElseThrow();
+                    var token=await(remote.prepareBulk(owner,UUID.randomUUID(),owner.nextRequestSequence(),column,false,RequestContext.batch()));
+                    var input=new KVBatch.KVBatchRef(List.of(key(8),key(9)),List.of(value(20+n),value(30+n)));
+                    await(remote.appendBatch(token,0,input,RemoteMutationInputs.batch(column,false,input),RequestContext.batch()));
+                    RatisConnectionBatchesTest.acknowledge(remote,token,await(remote.finishInput(token,RequestContext.batch())));
+                    assertArrayEquals(new byte[]{(byte)(20+n)},await(api.getAsync(0,column,key(8),RequestType.<Buf>current())).toByteArray());
+                }
                 long transaction=await(api.openTransactionAsync(Duration.ofSeconds(10)));assertTrue(await(api.closeTransactionAsync(transaction,false)));
-                assertEquals(before+4,fixture.nativeDomains.catalogue.epochs.read().nextEpoch(),"Each used domain owns point and bulk grants; an untouched lazy transaction allocates none");
-                var grants=fixture.nativeDomains.catalogue.epochs.read().grants();assertEquals(4,grants.size());assertEquals(4,grants.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
-                var transactionHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.TRANSACTION_HOME).findFirst().orElseThrow();assertEquals(4,transactionHome.bindings.size());
+                assertEquals(before+6,fixture.nativeDomains.catalogue.epochs.read().nextEpoch(),"Each used domain owns two POINT grants and one BULK grant; an untouched lazy transaction allocates none");
+                var grants=fixture.nativeDomains.catalogue.epochs.read().grants();assertEquals(6,grants.size());assertEquals(6,grants.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
+                var transactionHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.TRANSACTION_HOME).findFirst().orElseThrow();assertEquals(6,transactionHome.bindings.size());
                 var snapshotHome=fixture.homes.stream().filter(h->h.placement.role()==RatisNodePlan.Role.SNAPSHOT_HOME).findFirst().orElseThrow();assertTrue(snapshotHome.bindings.isEmpty(),"No snapshot grant is issued until a transaction actually captures or stages data");
             }
             assertEquals(2,fixture.transportCloses.get());long issued=fixture.nativeDomains.catalogue.epochs.read().nextEpoch();
@@ -150,14 +158,14 @@ class RatisDatabaseBackendFactoryTest {
             long firstTransaction;
             try(var factory=fixture.factory(owned)){
                 var connection=factory.open(URI.create("ratis://controlled/transaction-backend"));var api=connection.getAsyncApi(RequestContext.batch());assertEquals(5,await(api.getAllColumnDefinitionsAsync()).size());
-                await(api.putAsync(0,75,key(7),value(55),RequestType.none()));int captures=f.captureRequests.get();
+                RatisRocksDBConnectionTest.point(connection,75,key(7),value(55),RequestType.RequestTypeId.NOTHING);int captures=f.captureRequests.get();
                 firstTransaction=await(api.openTransactionAsync(Duration.ofSeconds(30)));assertEquals(captures,f.captureRequests.get());
                 await(api.putAsync(firstTransaction,71,key(2),value(41),RequestType.none()));await(api.putAsync(firstTransaction,72,key(200),value(42),RequestType.none()));
                 assertTrue(f.captureRequests.get()>captures,"Factory durable allocation must drive real native captures");assertArrayEquals(new byte[]{41},await(api.getAsync(firstTransaction,71,key(2),RequestType.<Buf>current())).toByteArray());
                 assertNull(await(api.getAsync(0,71,key(2),RequestType.<Buf>current())),"Uncommitted cross-column state remains private");
                 assertTrue(await(api.closeTransactionAsync(firstTransaction,true)));assertArrayEquals(new byte[]{41},await(api.getAsync(0,71,key(2),RequestType.<Buf>current())).toByteArray());assertArrayEquals(new byte[]{42},await(api.getAsync(0,72,key(200),RequestType.<Buf>current())).toByteArray());
                 for(var store:f.stores.values())assertEquals(0,store.activeSnapshotPins());issued=f.catalogue.epochs.read().nextEpoch();
-                var retainedGrant=f.catalogue.epochs.read().grants().stream().filter(grant->!grant.sessionId().equals(f.session)).toList();assertEquals(5,retainedGrant.size(),"Four point/bulk grants plus the one domain that actually stages a transaction");assertEquals(5,retainedGrant.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
+                var retainedGrant=f.catalogue.epochs.read().grants().stream().filter(grant->!grant.sessionId().equals(f.session)).toList();assertEquals(7,retainedGrant.size(),"Six POINT/BULK grants plus the one domain that actually stages a transaction");assertEquals(7,retainedGrant.stream().map(SessionEpochLedger.Grant::sessionId).distinct().count());
             }
             assertEquals(2,fixture.ownedHomeCloses.get());int captures=f.captureRequests.get();
             try(var factory=fixture.factory(owned)){

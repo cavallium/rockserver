@@ -210,6 +210,7 @@ final class RatisOperationRerouteCoordinator implements AutoCloseable {
             retainedWork=!reclamation.jobs(MAX_RETAINED_JOBS).isEmpty() || reclamation.hasMarkers();
         }catch(NumberFormatException invalid){throw new IOException("Unrecognized reroute cleanup directory",invalid);}finally{leave(reroute);}
     }
+    synchronized boolean quiescent()throws IOException{return !closed && active==0 && !retainedWork && reclamation.jobs(MAX_RETAINED_JOBS).isEmpty() && !reclamation.hasMarkers();}
     @Override public synchronized void close()throws IOException {if(active!=0)throw new IOException("Reroute work is still active");if(closed)return;ownershipLock.release();ownership.close();closed=true;}
     private final class Job implements AutoCloseable {
         final Path directory,state;final FileChannel channel;final FileLock lock;NativeSourceOutcomeCredit.Request request;RatisSourceOutcomeRecord publication;CommandResult result;OperationId abort,ack,consume;HomeFenceProof homeFence;boolean credited,published,sourceAcknowledged,done;

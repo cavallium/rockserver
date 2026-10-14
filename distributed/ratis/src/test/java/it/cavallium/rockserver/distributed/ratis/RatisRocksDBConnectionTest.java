@@ -144,7 +144,7 @@ class RatisRocksDBConnectionTest {
             RatisRocksDBConnection.GenerationFactory factory=(schema,directory,path,ids) -> {
                 var data=routed.get();
                 // Production factory owns constructor unwind and all generation wrappers.
-                return RatisRocksDBConnection.durableGenerationFactory(data,homes.scheduler,homes.snapshots,homes.homes,epochs,epochs.catalogue(nativeSchema.catalogue.directoryColumn()),header->epochs.topologyCatalogue(nativeSchema.catalogue.directoryColumn()).readDefinition(header.definitionDigest()).sourceDirectory(),unused,(generationRoot,selected,placement) -> {
+                return RatisRocksDBConnection.durableGenerationFactory(data,homes.scheduler,homes.snapshots,homes.homes,epochs,epochs.catalogue(nativeSchema.catalogue.directoryColumn()),header->epochs.topologyCatalogue(nativeSchema.catalogue.directoryColumn()).readDefinition(header.definitionDigest()).sourceDirectory(),unused,new RatisRocksDBConnection.SessionFactory(List.of(data),(generationRoot,selected,bindings)-> {var placement=bindings.directory();
                     Path window=generationRoot.resolve("window.bin"); if(Files.exists(window)) return RatisDurableSessionClient.reopen(window,data);
                     var before=epochs.read(); var issuance=before.issue(UUID.randomUUID(),1000); var grant=issuance.grants().getLast();
                     assertEquals(CommandResult.Status.SUCCESS,epochs.execute(epochs.prepare(nativeSchema.outer.operation(operations.getAndIncrement()),before,issuance)).status());
@@ -153,7 +153,7 @@ class RatisRocksDBConnectionTest {
                         assertEquals(CommandResult.Status.SUCCESS,data.execute(data.prepareSessionControl(control)).status());
                     }
                     return RatisDurableSessionClient.create(window,data,issuance,grant,RatisSessionClient.Limits.defaults());
-                },List.of(),pointBudget.shared).create(schema,directory,path,ids);
+                }),List.of(),pointBudget.shared).create(schema,directory,path,ids);
             };
             Path connectionRoot=root.resolve("dynamic-connection"); var limits=new RatisRocksDBConnection.Limits(4,64,8,128L*1024*1024,8);
             long recreated;RemoteMutationToken retainedToken;
@@ -200,12 +200,12 @@ class RatisRocksDBConnectionTest {
             var activePins=new AtomicInteger(); var transactionSchemas=new ArrayList<Long>(); var cursorSchemas=new ArrayList<Long>();
             var dataKey=new Keys(Buf.wrap(new byte[]{0,0,0,0,0,0,0,2}));
             RatisRocksDBConnection.GenerationFactory factory=(schema,directory,path,ids) -> {
-                var base=RatisRocksDBConnection.durableGenerationFactory(nativeSchema.routed,homes.scheduler,homes.snapshots,homes.homes,epochs,epochs.catalogue(nativeSchema.catalogue.directoryColumn()),header->epochs.topologyCatalogue(nativeSchema.catalogue.directoryColumn()).readDefinition(header.definitionDigest()).sourceDirectory(),allocations,(generationRoot,selected,placement) -> {
+                var base=RatisRocksDBConnection.durableGenerationFactory(nativeSchema.routed,homes.scheduler,homes.snapshots,homes.homes,epochs,epochs.catalogue(nativeSchema.catalogue.directoryColumn()),header->epochs.topologyCatalogue(nativeSchema.catalogue.directoryColumn()).readDefinition(header.definitionDigest()).sourceDirectory(),allocations,new RatisRocksDBConnection.SessionFactory(List.of(nativeSchema.routed),(generationRoot,selected,bindings)-> {var placement=bindings.directory();
                     Path window=generationRoot.resolve("window.bin"); if(Files.exists(window)) return RatisDurableSessionClient.reopen(window,nativeSchema.routed);
                     var before=epochs.read(); var issuance=before.issue(UUID.randomUUID(),1000); var grant=issuance.grants().getLast(); assertEquals(CommandResult.Status.SUCCESS,epochs.execute(epochs.prepare(nativeSchema.outer.operation(operations.getAndIncrement()),before,issuance)).status());
                     for(var range:placement.ranges()) { var control=epochs.prepareSessionBinding(placement,range.groupId(),new OperationId(new UUID(950,1),issuance.nextEpoch(),operations.getAndIncrement()),grant,32,-1); assertEquals(CommandResult.Status.SUCCESS,nativeSchema.routed.execute(nativeSchema.routed.prepareSessionControl(control)).status()); }
                     return RatisDurableSessionClient.create(window,nativeSchema.routed,issuance,grant,RatisSessionClient.Limits.defaults());
-                },List.of(),pointBudget.shared).create(schema,directory,path,ids);
+                }),List.of(),pointBudget.shared).create(schema,directory,path,ids);
                 try {
                     var transactions=mock(RatisTransactionClient.class); var snapshots=mock(RatisSnapshotClient.class);
                     when(transactions.open(any(),any(),any(),any(),any(),any())).thenAnswer(call -> {

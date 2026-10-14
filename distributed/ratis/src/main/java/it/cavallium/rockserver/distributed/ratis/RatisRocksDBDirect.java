@@ -28,17 +28,27 @@ public final class RatisRocksDBDirect implements AutoCloseable {
     private final RatisRemoteMutationReceipts receipts; private final RatisDirectRequestJournal journal; private final ReentrantLock persistence=new ReentrantLock();
     private final Map<CompletableFuture<?>,CompletableFuture<Void>> actualCompletions=new IdentityHashMap<>();
     synchronized CompletableFuture<Void> actualCompletion(CompletableFuture<?> observer) { var actual=actualCompletions.get(observer); if (actual!=null) return actual.copy(); if (observer.isDone()) return CompletableFuture.completedFuture(null); throw new IllegalArgumentException("Unknown direct observer"); }
-    private boolean writing,closed; private volatile Runnable acknowledgementHook; private int active;
-    public RatisRocksDBDirect(DistributedSchema schema,RatisRoutedClient routed,RatisDurableSessionClient session,RWScheduler scheduler,Path path,RatisRequestBudget budget,RatisRequestBudget.Owner ownerCredit) throws IOException {
+    private boolean writing,closed,renewing,historical; private volatile Runnable acknowledgementHook; private int active;
+    public RatisRocksDBDirect(DistributedSchema schema,RangeDirectory frozenDirectory,RatisRoutedClient routed,RatisDurableSessionClient session,RWScheduler scheduler,Path path,RatisRequestBudget budget,RatisRequestBudget.Owner ownerCredit) throws IOException {
         this.budget=Objects.requireNonNull(budget);this.ownerCredit=Objects.requireNonNull(ownerCredit);
-        this.schema=Objects.requireNonNull(schema); this.routed=Objects.requireNonNull(routed); this.session=Objects.requireNonNull(session); this.scheduler=Objects.requireNonNull(scheduler); routed.requireKnownSchema(schema); directory=routed.directory(schema);
+        this.schema=Objects.requireNonNull(schema); this.routed=Objects.requireNonNull(routed); this.session=Objects.requireNonNull(session); this.scheduler=Objects.requireNonNull(scheduler); routed.requireKnownSchema(schema); directory=Objects.requireNonNull(frozenDirectory);schema.requireMatches(directory);
         var grant=session.grant(); byte[] binding;
         try { var digest=java.security.MessageDigest.getInstance("SHA-256"); digest.update(schema.digest()); digest.update(routed.sessionIdentityDigest()); digest.update(ByteBuffer.allocate(40).putLong(grant.sessionId().getMostSignificantBits()).putLong(grant.sessionId().getLeastSignificantBits()).putLong(grant.epoch()).putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis()).array()); binding=digest.digest(); }
         catch (java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }
         boolean usedOwner=Files.exists(path.resolveSibling(path.getFileName()+".lock")); journal=new RatisDirectRequestJournal(Objects.requireNonNull(path),binding);
         try { receipts=new RatisRemoteMutationReceipts(path.resolveSibling(path.getFileName()+".released"),authority(0),usedOwner || journal.request()!=null || !session.pristine()); receipts.validateJournal(journal.request()==null?null:journal.request().token); if(journal.request()!=null && receipts.retired(journal.request().token))journal.retire(); if (journal.request()==null && !session.pristine() && !receipts.established()) throw new IOException("Missing direct request journal for a used session window"); var outstanding=session.pending().stream().filter(p -> !p.consumed()).toList(); if (outstanding.size()>1 || journal.request()==null && !outstanding.isEmpty()) throw new IOException("Direct session has no exclusively bound full request"); requestCredit=ownerCredit.opened(journal.request()==null?null:RatisRequestBudget.geometry(schema,journal.request())); }
-        catch (IOException | RuntimeException | Error failure) { ownerCredit.close();try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
+        catch (IOException | RuntimeException | Error failure) { try { journal.close(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); } throw failure; }
     }
+    boolean renewalRequired(SessionEpochLedger authority)throws IOException{return session.renewalRequired(authority);}
+    void beginRenewal()throws IOException {
+        persistence.lock();try{synchronized(this){if(closed || historical)throw new IOException("Point owner is not an active renewal source");if(renewing)return;renewing=true;if(active!=0){renewing=false;throw new IOException("Actual point tasks remain owned");}}
+            try{owner();if(journal.request()!=null || !session.quiescent())throw new IOException("Public request/native session/reroute cleanup remains owned");}catch(IOException|RuntimeException failure){synchronized(this){renewing=false;}throw failure;}
+        }finally{persistence.unlock();}
+    }
+    void historical()throws IOException {synchronized(this){if(historical)return;}beginRenewal();synchronized(this){historical=true;renewing=false;}}
+    synchronized boolean acceptsPreparation(){return !closed && !renewing && !historical;}
+    synchronized void activateSelected(){if(historical)throw new IllegalStateException("Historical owner cannot reactivate");renewing=false;}
+
     public RemoteMutationOwner owner() throws IOException {return authority(receipts.nextSequence());}
     private RemoteMutationOwner authority(long nextSequence) {var grant=session.grant();return new RemoteMutationOwner(schema.clusterId(),schema.databaseId(),schema.domainId(),grant.sessionId(),grant.epoch(),nextSequence,RemoteMutationToken.Kind.POINT,schema.digest(),directory.payloadDigest());}
     public CompletableFuture<Object> get(long column,Keys keys,RequestType.RequestTypeId type,RequestContext context) {
@@ -131,7 +141,7 @@ public final class RatisRocksDBDirect implements AutoCloseable {
     @FunctionalInterface private interface Work { Object run(Task task) throws Exception; }
     private Task reserve(RequestContext context,OperationFamily family,boolean write) {
         long deadline=scheduler.resolveMonotonicDeadline(context); long charge=write ? WRITE_BYTES : READ_BYTES;
-        synchronized (this) { if (closed || active>=MAX_TASKS || write && writing) throw RocksDBException.of(SERVER_OVERLOADED,"Direct request capacity exhausted"); var credit=budget.work(charge);var task=new Task(context,deadline,write,charge,credit); active++; actualCompletions.put(task.view,task.drained); if (write) writing=true; return task; }
+        synchronized (this) { if (closed || renewing || write && historical || active>=MAX_TASKS || write && writing) throw RocksDBException.of(SERVER_OVERLOADED,"Direct request capacity exhausted"); var credit=budget.work(charge);var task=new Task(context,deadline,write,charge,credit); active++; actualCompletions.put(task.view,task.drained); if (write) writing=true; return task; }
     }
     private CompletableFuture<Object> submit(RequestContext context,OperationFamily family,boolean write,Work work) {
         try { var task=reserve(context,family,write); task.work=work; dispatch(task,context,family); return task.view; } catch (Exception failure) { return CompletableFuture.failedFuture(failure); }

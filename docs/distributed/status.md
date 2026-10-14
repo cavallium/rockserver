@@ -1578,8 +1578,20 @@ pipeline and genuine native reroute checks pass after fixing synchronous async
 submission errors to enter original-outcome resolution
 (`point-physical-refined-gate.log`, `b5ba3a5`). Future topology geometry can still
 require recovery admission after preparation; refusal retains PENDING ownership.
-Genuine native grant renewal and shared envelope integration for bulk/range
-actors remain unfinished.
+POINT grant renewal now persists an immutable root and frozen DATA/HOME binding
+plan before native issuance, then forces the active selector only after the exact
+new owner is ready. Five actual-native expiry/recovery cases pass, including old
+token lookup, unacknowledged-request refusal, lost issue/binding replies, bounded
+history and cancelled observation with uncertain selector force. The two pipeline
+cases pass after making test cleanup settle every owned transport reply
+(`point-renewal-second-gate.log`, `point-renewal-pipeline-third-gate.log`).
+The combined connection/factory gate passed 21 of 23 cases; the two stale tokenless
+factory fixtures now use explicit identities/ACK and all three factory cases pass
+on rerun. A genuine activated-split workflow passes stale-source reroute, actual
+owner expiry, child-bound renewal, new native writes and cold old/new token lookup
+without extra grants (`point-renewal-split-and-factory-fifth-gate.log`).
+Reopening frozen binding plans after further DATA/HOME routing advancement and
+shared envelope integration for bulk/range actors remain unfinished.
 
 Node-owned physical discovery now returns bounded qualified targets and actual
 per-CF scalar/comparator observations, without synthesizing a logical estimate

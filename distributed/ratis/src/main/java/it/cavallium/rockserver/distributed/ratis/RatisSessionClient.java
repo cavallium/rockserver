@@ -53,7 +53,7 @@ public final class RatisSessionClient {
     private long sourceDirectoryBytes;
     static long directoryCharge(RangeDirectory directory) {
         long replicas=directory.ranges().stream().mapToLong(r->r.replicas().size()).sum();
-        return 4L*RangeDirectoryCodec.encode(directory).length+128L*directory.ranges().size()+160L*replicas+96L*directory.columns().size()+1024;
+        return 4L*RangeDirectoryCodec.encodedSize(directory)+128L*directory.ranges().size()+160L*replicas+96L*directory.columns().size()+1024;
     }
     private void retainDirectory(RangeDirectory directory) {
         var key=java.util.HexFormat.of().formatHex(directory.payloadDigest());if(sourceDirectories.containsKey(key))return;

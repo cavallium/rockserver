@@ -53,6 +53,12 @@ public final class RatisDurableSessionClient implements AutoCloseable {
     }
     public SessionEpochLedger.Grant grant() { return client.grant(); }
     RatisSessionClient.Limits limits() { return limits; }
+    boolean quiescent()throws IOException {
+        lane.lock();try{requireOpen();return active==0 && retained.isEmpty() && client.snapshot().entries().isEmpty() && (reroutes==null || reroutes.quiescent());}finally{lane.unlock();}
+    }
+    boolean renewalRequired(SessionEpochLedger authority)throws IOException {
+        lane.lock();try{requireOpen();var grant=grant();return client.snapshot().exhausted() || authority.logicalTimeMillis()>=grant.expiresAtMillis() || grant.epoch()<authority.minimumEpoch() || !authority.grants().contains(grant);}finally{lane.unlock();}
+    }
     boolean pristine() throws IOException {
         lane.lock(); try { requireOpen(); var state=client.snapshot();
             return state.nextSequence()==0 && state.acknowledgedThrough()==-1 && !state.exhausted() && state.entries().isEmpty();

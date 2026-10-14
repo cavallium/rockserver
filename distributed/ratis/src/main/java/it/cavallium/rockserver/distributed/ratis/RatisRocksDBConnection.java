@@ -31,7 +31,13 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     /** Trusted placement for a new named column; a null shape is an absent-name deletion lookup. */
     @FunctionalInterface public interface DomainPlacement { UUID domain(String name,ColumnSchema schema) throws IOException; }
     /** Return a generation-owned session with an exclusive installed grant. */
-    @FunctionalInterface public interface SessionFactory { RatisDurableSessionClient open(Path generationRoot,DistributedSchema schema,RangeDirectory directory) throws IOException; }
+    @FunctionalInterface public interface SessionOpening {RatisDurableSessionClient open(Path root,DistributedSchema schema,RatisSessionBindingPlan plan)throws IOException;}
+    public record SessionFactory(List<RatisRoutedClient> routes,SessionOpening opener) {
+        public SessionFactory{routes=List.copyOf(routes);Objects.requireNonNull(opener);if(routes.isEmpty() || routes.size()>3)throw new IllegalArgumentException("Invalid owner binding route count");}
+        RatisSessionBindingPlan.Input bindings(RangeDirectory directory){return RatisSessionBindingPlan.borrow(directory,routes);}
+        RatisSessionBindingPlan restore(byte[] bytes)throws IOException{return RatisSessionBindingPlan.restore(bytes,routes);}
+        RatisDurableSessionClient open(Path root,DistributedSchema schema,RatisSessionBindingPlan plan)throws IOException{return opener.open(root,schema,plan);}
+    }
     public static final class Generation implements AutoCloseable {
         private final RatisRocksDBAdapter adapter; private final RatisRocksDBDirect direct; private final RatisRocksDBBatches batches; private final RatisRocksDBRanges ranges; private final RatisTransactionClient transactions; private final RatisSnapshotClient snapshots; private final List<AutoCloseable> owned;
         private RatisPointOwnerManager points;
@@ -47,7 +53,8 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
         public RatisRocksDBBatches batches() { return batches; }
         private RatisRocksDBDirect point(RemoteMutationOwner owner)throws IOException {if(points!=null)return points.select(owner);if(direct!=null && direct.owner().sameAuthority(owner))return direct;throw new IOException("Original point owner unavailable");}
         private RatisRocksDBDirect point(RemoteMutationToken token)throws IOException {return point(new RemoteMutationOwner(token.clusterId(),token.databaseId(),token.domainId(),token.ownerId(),token.ownerEpoch(),token.requestSequence(),token.kind(),token.schemaDigest(),token.directoryDigest()));}
-        private List<RemoteMutationOwner> pointOwners()throws IOException{return points!=null?points.available():direct==null?List.of():List.of(direct.owner());}
+        private CompletableFuture<List<RemoteMutationOwner>> pointOwners(RequestContext context)throws IOException{return points!=null?points.discover(context):CompletableFuture.completedFuture(direct==null?List.of():List.of(direct.owner()));}
+        private boolean retainsPoint(RemoteMutationToken token){return points!=null && points.contains(token);}
         @Override public synchronized void close() throws IOException {
             var resources=new ArrayList<AutoCloseable>(); if(batches!=null) resources.add(batches); if(points!=null)resources.add(points);else if (direct!=null) resources.add(direct); resources.add(adapter); if (ranges!=null) resources.add(ranges); if (transactions!=null) resources.add(transactions); if (snapshots!=null) resources.add(snapshots); resources.addAll(owned);
             while (closed<resources.size()) { try { resources.get(closed).close(); closed++; } catch (IOException failure) { throw failure; } catch (Exception failure) { throw new IOException("Generation resource close failed",failure); } }
@@ -70,7 +77,7 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
             RatisPointOwnerManager points=null; RatisDurableSessionClient bulkSession=null,bulkOwner=null; RatisRocksDBBatches batches=null; RatisTransactionClient tx=null; RatisSnapshotClient snapshots=null; RatisRocksDBRanges ranges=null; RatisRocksDBDirect direct=null;RatisRangeDeleteClient rangeDeletes=null;
             try {
                 points=new RatisPointOwnerManager(schema,directory,routed,scheduler,root.resolve("points"),budget,sessions,epochs,directories,acknowledgementDirectories,transactionHomes); direct=points.reader();
-                bulkSession=sessions.open(Files.createDirectories(root.resolve("bulk-session")),schema,directory);bulkOwner=bulkSession;
+                bulkSession=sessions.open(Files.createDirectories(root.resolve("bulk-session")),schema,sessions.bindings(directory).freeze());bulkOwner=bulkSession;
                 for(var actor:points.all())if(actor.owner().ownerId().equals(bulkSession.grant().sessionId()) && actor.owner().ownerEpoch()==bulkSession.grant().epoch())throw new IOException("Point and bulk sessions require distinct exclusively owned grants");
                 bulkSession.installReroutes(root.resolve("bulk-reroutes"),schema,epochs,routed,transactionHomes,scheduler,directories,acknowledgementDirectories);
                 batches=new RatisRocksDBBatches(schema,routed,bulkSession,scheduler,root.resolve("bulk"),RatisRocksDBBatches.SessionOwnership.OWNED); bulkSession=null;
@@ -260,10 +267,11 @@ public final class RatisRocksDBConnection implements RocksDBConnection {
     private RatisSchemaClient.TrustedOperatorResolver schemasResolver() { return schemas.resolver(); }
     private RequestContext remaining(RequestContext context,long deadline) { if (deadline==Long.MAX_VALUE) return context; long nanos=clock.remainingMonotonicDeadlineNanos(deadline); if (nanos<=0) throw RocksDBException.of(RocksDBException.RocksDBErrorType.READ_DEADLINE_EXCEEDED,"Connection request deadline expired"); return new RequestContext(context.profile(),nanos); }
     private RatisGenerationRegistry.Owned originalMutationGeneration(RemoteMutationToken token) throws IOException {
-        for(var generation:generations.all()) { var schema=generation.schema(); if(schema.clusterId().equals(token.clusterId()) && schema.databaseId().equals(token.databaseId()) && schema.domainId().equals(token.domainId()) && Arrays.equals(schema.digest(),token.schemaDigest()) && Arrays.equals(generation.directory().payloadDigest(),token.directoryDigest()))return generation; }
+        for(var generation:generations.all()) { var schema=generation.schema(); if(schema.clusterId().equals(token.clusterId()) && schema.databaseId().equals(token.databaseId()) && schema.domainId().equals(token.domainId()) && Arrays.equals(schema.digest(),token.schemaDigest()) && (Arrays.equals(generation.directory().payloadDigest(),token.directoryDigest()) || token.kind()==RemoteMutationToken.Kind.POINT && generation.generation().retainsPoint(token)))return generation; }
         throw new IOException("Original mutation generation unavailable; a latest generation cannot replace it");
     }
-    public CompletableFuture<List<RemoteMutationOwner>> remoteMutationOwners(long column,RequestContext context) {return diagnostic(context,remaining -> {var generation=generations.column(column).generation();var owners=new ArrayList<RemoteMutationOwner>();owners.addAll(generation.pointOwners());if(generation.batches()!=null)owners.add(generation.batches().owner());if(generation.adapter().rangeDeletes()!=null)owners.add(generation.adapter().rangeDeletes().owner());return CompletableFuture.completedFuture(List.copyOf(owners));});}
+    public CompletableFuture<List<RemoteMutationOwner>> remoteMutationOwners(long column,RequestContext context) {return diagnostic(context,remaining->{var generation=generations.column(column).generation();return generation.pointOwners(remaining).thenApply(points->{var owners=new ArrayList<>(points);try{if(generation.batches()!=null)owners.add(generation.batches().owner());if(generation.adapter().rangeDeletes()!=null)owners.add(generation.adapter().rangeDeletes().owner());return List.copyOf(owners);}catch(IOException failure){throw new CompletionException(failure);}});});}
+
     public CompletableFuture<RemoteMutationToken> preparePointMutation(RemoteMutationOwner expectedOwner,UUID requestId,long requestSequence,long column,List<Keys> keys,List<it.cavallium.buffer.Buf> values,RatisRocksDBDirect.WriteKind kind,RequestType.RequestTypeId type,boolean multi,RequestContext context) {
         return startDiagnosticOwned(context,remaining -> {var actor=generations.column(column).generation().point(expectedOwner);var observer=actor.prepareSequence(expectedOwner,requestId,requestSequence,column,keys,values,kind,type,multi,remaining);return new OwnedDiagnostic<>(observer,actor.actualCompletion(observer),() -> observer.cancel(false));});
     }
