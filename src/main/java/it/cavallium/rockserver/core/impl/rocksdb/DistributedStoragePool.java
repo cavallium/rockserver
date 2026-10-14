@@ -70,6 +70,8 @@ public final class DistributedStoragePool implements AutoCloseable {
     private static final UUID BOOTSTRAP_BIRTH=new UUID(0,0);
     private static final byte[] BIRTHS_KEY="CF-BIRTH".getBytes(StandardCharsets.US_ASCII);
     private static final int MAX_BINDINGS=4096,MAX_BINDING_BYTES=8*1024*1024;
+    private static final RocksDBLoader.ColumnFamilyInventoryLimits INVENTORY_LIMITS =
+            new RocksDBLoader.ColumnFamilyInventoryLimits(MAX_BINDINGS + RESERVED_COLUMNS.size(), 4096, MAX_BINDING_BYTES);
     private enum BirthKind { BOOTSTRAP, CREATE }
     private record Binding(String name,boolean mergeAdmitted,BirthKind birthKind,UUID birthChange) {
         Binding(String name,boolean mergeAdmitted) { this(name,mergeAdmitted,BirthKind.BOOTSTRAP,BOOTSTRAP_BIRTH); }
@@ -401,8 +403,10 @@ public final class DistributedStoragePool implements AutoCloseable {
     /** Reads forced metadata, including WAL, without installing user callbacks or enabling native writes. */
     private static void preflightNativeBindings(Path path,DatabaseConfig config,DistributedOperatorArtifacts artifacts) throws IOException,RocksDBException {
         org.rocksdb.RocksDB.loadLibrary();
-        List<byte[]> names; try(var listing=new org.rocksdb.Options()) { names=org.rocksdb.RocksDB.listColumnFamilies(listing,path.toString()); }
-        if(names.size()>MAX_BINDINGS+RESERVED_COLUMNS.size()) throw new IOException("Native CF count exceeds budget");
+        List<byte[]> names; try(var listing=new org.rocksdb.Options()) {
+            names=org.rocksdb.RocksDB.listColumnFamiliesBounded(listing,path.toString(),
+                    INVENTORY_LIMITS.maximumCount(),INVENTORY_LIMITS.maximumNameBytes(),INVENTORY_LIMITS.maximumTotalNameBytes());
+        }
         boolean hasState=names.stream().anyMatch(name -> Arrays.equals(name,STATE_COLUMN.getBytes(StandardCharsets.US_ASCII)));
         if(!hasState) { if(artifacts.qualified()) throw new IOException("Qualified native pool lacks STATE"); return; }
         try(var refs=new RocksDBObjects(); var dbOptions=RocksDBLoader.readOnlyOptions(path,config)) {
@@ -815,7 +819,7 @@ public final class DistributedStoragePool implements AutoCloseable {
             if(Files.exists(persistentPath.resolve("CURRENT"))) preflightNativeBindings(persistentPath,config,artifacts);
         } catch(IOException|RocksDBException failure) { throw new IllegalStateException("Cannot qualify native operator bindings",failure); }
         RocksDBLoader.OperatorResolver resolver=artifacts.qualified() ? name -> RESERVED_COLUMNS.contains(name) ? null : artifacts.resolve(name) : null;
-        var nativeLoaded=RocksDBLoader.load(persistentPath,config,logger,null,null,INTERNAL_COLUMNS,resolver);
+        var nativeLoaded=RocksDBLoader.load(persistentPath,config,logger,null,null,INTERNAL_COLUMNS,resolver,INVENTORY_LIMITS);
         try { return new DistributedStoragePool(nativeLoaded,globalConfig,logger,artifacts); }
         catch(RuntimeException|Error failure) {
             try { nativeLoaded.db().close(); } catch(Exception cleanup) { failure.addSuppressed(cleanup); }

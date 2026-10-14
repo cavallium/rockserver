@@ -52,6 +52,63 @@ class DistributedStoragePoolTest {
                 List.of(new Mutation(Mutation.Kind.PUT, COLUMN, key, value)));
     }
 
+    @Test void distributedPreflightRejectsOversizedNativeNameBeforeRecoveringFamilies() throws Exception {
+        Path path = directory.resolve("oversized-native-name");
+        org.rocksdb.RocksDB.loadLibrary();
+        try (var options = new org.rocksdb.Options().setCreateIfMissing(true);
+             var db = org.rocksdb.RocksDB.open(options, path.toString());
+             var familyOptions = new org.rocksdb.ColumnFamilyOptions();
+             var family = db.createColumnFamily(new org.rocksdb.ColumnFamilyDescriptor(
+                     "x".repeat(4097).getBytes(java.nio.charset.StandardCharsets.US_ASCII), familyOptions))) {
+            db.put(family, new byte[]{1}, new byte[]{2});
+        }
+        var failure = assertThrows(IllegalStateException.class, () -> open(path, ConfigParser.parseDefault()));
+        assertInstanceOf(org.rocksdb.RocksDBException.class, failure.getCause());
+        assertTrue(failure.getCause().getMessage().contains("maxNameBytes"));
+        // Standalone listing still reads its existing unrestricted native namespace.
+        try (var options = new org.rocksdb.Options()) {
+            assertEquals(2, org.rocksdb.RocksDB.listColumnFamilies(options, path.toString()).size());
+        }
+    }
+
+    @Test void loaderEnforcesExplicitInventoryCountBeforeOpeningDatabase() throws Exception {
+        Path path = directory.resolve("loader-inventory");
+        org.rocksdb.RocksDB.loadLibrary();
+        try (var options = new org.rocksdb.Options().setCreateIfMissing(true);
+             var db = org.rocksdb.RocksDB.open(options, path.toString());
+             var familyOptions = new org.rocksdb.ColumnFamilyOptions();
+             var family = db.createColumnFamily(new org.rocksdb.ColumnFamilyDescriptor(new byte[]{'x'}, familyOptions))) {
+            db.put(family, new byte[]{1}, new byte[]{2});
+        }
+        var failure = assertThrows(RuntimeException.class, () -> RocksDBLoader.load(path,
+                ConfigParser.parseDefault(), LoggerFactory.getLogger(getClass()), null, null, Set.of(), null,
+                new RocksDBLoader.ColumnFamilyInventoryLimits(1, 4096, 8 * 1024 * 1024)));
+        assertTrue(failure.getMessage().contains("maxCount") ||
+                failure.getCause() != null && failure.getCause().getMessage().contains("maxCount"));
+        try (var options = new org.rocksdb.Options()) {
+            assertEquals(2, org.rocksdb.RocksDB.listColumnFamilies(options, path.toString()).size());
+        }
+    }
+
+    @Test void missingCurrentCannotAdoptRetainedNativeFilesAsFreshPool() throws Exception {
+        Path path = directory.resolve("missing-current");
+        var config = ConfigParser.parseDefault();
+        UUID group = UUID.randomUUID();
+        try (var pool = open(path, config)) {
+            range(pool, group, null, null).apply(new ApplyPosition(1, 0),
+                    put(group, new byte[]{1}, new byte[]{2}), new byte[0]);
+        }
+        Path current = path.resolve("CURRENT");
+        Path manifest = path.resolve(Files.readString(current).strip());
+        byte[] retained = Files.readAllBytes(manifest);
+        Files.delete(current);
+        var failure = assertThrows(RuntimeException.class, () -> open(path, config));
+        assertInstanceOf(java.io.IOException.class, failure.getCause());
+        assertTrue(failure.getCause().getMessage().contains("lacks CURRENT"), failure::toString);
+        assertFalse(Files.exists(current));
+        assertArrayEquals(retained, Files.readAllBytes(manifest));
+    }
+
     @Test void disjointRangesShareOneDatabaseAndPhysicalFamiliesAndReopen() throws Exception {
         var config = ConfigParser.parseDefault();
         Path path = directory.resolve("shared");

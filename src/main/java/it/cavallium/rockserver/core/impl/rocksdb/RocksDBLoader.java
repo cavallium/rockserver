@@ -648,11 +648,19 @@ public class RocksDBLoader {
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger,
             @Nullable MeterRegistry meterRegistry, @Nullable String databaseName,
             Set<String> extraInternalColumns) {
-        return load(path,config,logger,meterRegistry,databaseName,extraInternalColumns,null);
+        return load(path,config,logger,meterRegistry,databaseName,extraInternalColumns,null,null);
+    }
+    public record ColumnFamilyInventoryLimits(int maximumCount, int maximumNameBytes, long maximumTotalNameBytes) {
+        public ColumnFamilyInventoryLimits {
+            if (maximumCount <= 0 || maximumNameBytes <= 0 || maximumTotalNameBytes <= 0) {
+                throw new IllegalArgumentException("Column family inventory limits must be positive");
+            }
+        }
     }
     public static LoadedDb load(@Nullable Path path, DatabaseConfig config, Logger logger,
             @Nullable MeterRegistry meterRegistry, @Nullable String databaseName,
-            Set<String> extraInternalColumns, OperatorResolver resolver) {
+            Set<String> extraInternalColumns, OperatorResolver resolver,
+            @Nullable ColumnFamilyInventoryLimits inventoryLimits) {
         extraInternalColumns = Set.copyOf(extraInternalColumns);
         for (String name : extraInternalColumns) {
             if (name.isEmpty() || name.indexOf('\0') >= 0 || !StandardCharsets.US_ASCII.newEncoder().canEncode(name)) {
@@ -674,7 +682,7 @@ public class RocksDBLoader {
             }
             var optionsWithCache = makeRocksDBOptions(path, definitiveDbPath, config, refs, logger);
             return loadDb(path, definitiveDbPath, config, optionsWithCache, refs, logger,
-                    meterRegistry, databaseName, extraInternalColumns, resolver);
+                    meterRegistry, databaseName, extraInternalColumns, resolver, inventoryLimits);
         } catch (RuntimeException | Error failure) {
             try {
                 refs.close();
@@ -1056,7 +1064,8 @@ public class RocksDBLoader {
     private static LoadedDb loadDb(@Nullable Path path,
         @NotNull Path definitiveDbPath,
         DatabaseConfig databaseOptions, OptionsWithCache optionsWithCache, RocksDBObjects refs, Logger logger,
-        @Nullable MeterRegistry meterRegistry, @Nullable String databaseName, Set<String> extraInternalColumns, OperatorResolver resolver) {
+        @Nullable MeterRegistry meterRegistry, @Nullable String databaseName, Set<String> extraInternalColumns, OperatorResolver resolver,
+        @Nullable ColumnFamilyInventoryLimits inventoryLimits) {
         var inMemory = path == null;
         var rocksdbOptions = optionsWithCache.options();
         Map<String, ColumnFamilyOptions> definitiveColumnFamilyOptionsMap = new HashMap<>();
@@ -1102,7 +1111,29 @@ public class RocksDBLoader {
                   }
                 }) {
                     options.setCreateIfMissing(true);
-                    existingColumnFamilies = mapList(RocksDB.listColumnFamilies(options, path.toString()), b -> new String(b, StandardCharsets.UTF_8));
+                    List<byte[]> names;
+                    if (inventoryLimits == null) {
+                        names = RocksDB.listColumnFamilies(options, path.toString());
+                    } else if (Files.exists(path.resolve("CURRENT"))) {
+                        names = RocksDB.listColumnFamiliesBounded(options, path.toString(), inventoryLimits.maximumCount(),
+                                inventoryLimits.maximumNameBytes(), inventoryLimits.maximumTotalNameBytes());
+                    } else {
+                        // Fresh pools have no MANIFEST to inventory. Refuse lost CURRENT
+                        // rather than adopting retained native files as a new database.
+                        try (var entries = Files.walk(path, 33)) {
+                            var iterator = entries.iterator();
+                            int count = 0;
+                            while (iterator.hasNext()) {
+                                var entry = iterator.next();
+                                if (++count > 65536 || path.relativize(entry).getNameCount() > 32
+                                        || !Files.isDirectory(entry, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                                    throw new IOException("Native database lacks CURRENT but is not an empty directory tree");
+                                }
+                            }
+                        }
+                        names = List.of();
+                    }
+                    existingColumnFamilies = mapList(names, b -> new String(b, StandardCharsets.UTF_8));
                 }
                 // Distributed configuration selects options, never the set of existing user CFs.
                 // In particular, a deleted configured CF must not be recreated at restart.

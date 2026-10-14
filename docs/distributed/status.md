@@ -11,10 +11,24 @@ The full target remains [architecture.md](architecture.md), with the identified
 consumer behavior in [consumer-contracts.md](consumer-contracts.md). This checkpoint
 does not establish complete distributed API parity or production acceptance.
 
-## Current acceptance (2026-10-13)
+## Current acceptance (2026-10-14)
 
 Earlier checkpoints below retain the limitations known at their validation time.
 This section and the remaining gates at the end describe the current branch.
+
+- Both distributed startup listings now stream native MANIFEST fragments within
+  4,102 live CFs, 4,096 bytes per name and 8 MiB of names throughout replay.
+  Complete malformed records and CRC errors fail; incomplete trailing records
+  preserve the previous inventory. Fresh pools skip listing only after proving
+  an empty bounded directory tree; retained files without CURRENT cannot be
+  adopted as a new database. The pinned JNI source is `233bc576`, reconstructed
+  exactly by wrapper `522580a`. Its 19 extent, nine inventory and six Java cases
+  pass. Main native consumers passed 103 cases; the subsequent eight-case pool
+  gate also verifies lost-CURRENT refusal without changing the retained MANIFEST.
+  Evidence: `/tmp/rockserver-233-main-native-startup-repair-gate.log` and
+  `/tmp/rockserver-233-main-lost-current-repair-gate.log`.
+  Native Env ownership and ordinary allocation admission are qualified at the
+  JNI boundary; shared node wiring and protected completion remain pending.
 
 - The aggregate common connection routes the complete database domain roster,
   retains schema generations and uses durable point/bulk grants and rotating
