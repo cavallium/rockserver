@@ -1686,22 +1686,62 @@ public final class DistributedStoragePool implements AutoCloseable {
         return localMaintenance(session,column,(db,handle,paths)->{var metadata=it.cavallium.rockserver.core.impl.SelectiveCompaction.boundedMetadata(db,handle,paths,session+"-"+handle.getID(),handle.getID(),request.level(),maxFiles,maxBytes);return it.cavallium.rockserver.core.impl.SelectiveCompaction.compact(db,handle,metadata,request);});
     }
     private static long checkedMaintenanceProperty(long value) throws IOException {if(value<0)throw new IOException("Unsigned physical table property exceeds signed range");return value;}
-    public record LocalTableProperties(long files,long entries,long deletions,long mergeOperands,long rangeDeletions,long dataBytes,long indexBytes,long filterBytes,String comparator) {}
-    // One native inspection graph per pool: caller-bounded inventory plus <=1MiB property-block scratch.
+    /** Caps include retained results for the entire scope and one overlapping inspection workspace. */
+    public record TablePropertyLimits(int files,long inventoryBytes,long blockBytes,long entries,
+                                      long stringBytes,long totalStringBytes,long projectionBytes,
+                                      long workingBytes,long retainedBytes,long scopeBytes) {
+        public TablePropertyLimits {
+            if(files<1 || files>65536 || inventoryBytes<1 || inventoryBytes>256L*1024*1024
+                    || blockBytes<1 || blockBytes>16L*1024*1024 || entries<1 || entries>65536
+                    || stringBytes<1 || stringBytes>blockBytes || totalStringBytes<1 || totalStringBytes>64L*1024*1024
+                    || projectionBytes<1 || projectionBytes>64L*1024*1024 || workingBytes<1 || workingBytes>512L*1024*1024
+                    || retainedBytes<4096+4096L*files+2*totalStringBytes+2*stringBytes
+                    || workingBytes<2*inventoryBytes+3*projectionBytes+8*blockBytes+8*stringBytes+4096
+                    || retainedBytes>scopeBytes
+                    || scopeBytes>it.cavallium.rockserver.core.common.SstMaintenance.MAX_METADATA_RESPONSE_BYTES
+                    || scopeBytes<retainedBytes+workingBytes+4096L*files+projectionBytes+12*stringBytes+4096)
+                throw new IllegalArgumentException("Invalid physical property graph limits");
+        }
+        /** Policy ceilings are partitioned, never enlarged to accommodate a response. */
+        public static TablePropertyLimits forScope(int targets,int maximumFiles,long maximumBytes) {
+            if(targets<1 || targets>65536 || maximumFiles<1 || maximumFiles>65536
+                    || maximumBytes<1 || maximumBytes>it.cavallium.rockserver.core.common.SstMaintenance.MAX_METADATA_RESPONSE_BYTES)
+                throw new IllegalArgumentException("Invalid physical property scope policy");
+            long inventory=maximumBytes/16,block=Math.min(64*1024,maximumBytes/64);
+            long strings=Math.min(block,maximumBytes/(128L*(targets+1)));
+            long totalStrings=Math.min(64L*1024*1024,maximumBytes/(16L*(targets+1)));
+            if(inventory==0 || block==0 || strings==0 || totalStrings==0)
+                throw new IllegalArgumentException("Physical property scope exceeds metadata policy");
+            TablePropertyLimits selected=null;
+            int low=1,high=maximumFiles;
+            while(low<=high) {
+                int files=low+(high-low)/2;
+                long projection=4096+192L*files+totalStrings;
+                // Same preflight as native; includes native/JNI overlap and bounded parser scratch.
+                long working=2*inventory+3*projection+8*block+8*strings+4096;
+                // At most 11 map entries and 6 String objects per SST. 4096/file covers
+                // boxed longs, nodes, tables, immutable copies and object/alignment overhead.
+                // UTF-16 storage is at most twice the bounded native byte-string length.
+                long retained=targets*(4096+4096L*files+2*totalStrings+2*strings);
+                // Packed SDK arrays stay live through decode; mutable aggregation maps and
+                // immutable result maps overlap. Include row decode scratch and response copies.
+                long workspace=4096L*files+projection+12*strings+4096;
+                long scope=retained+working+workspace;
+                if(scope<=maximumBytes && projection<=64L*1024*1024) {
+                    selected=new TablePropertyLimits(files,inventory,block,Math.min(4096,Math.max(1,block/8)),
+                            strings,totalStrings,projection,working,retained,scope);
+                    low=files+1;
+                } else high=files-1;
+            }
+            if(selected==null)throw new IllegalArgumentException("Physical property scope exceeds retained graph policy");
+            return selected;
+        }
+    }
+    // One native inspection graph per pool; cancellation retains the slot until decode exits.
     private final Semaphore tablePropertyInspection=new Semaphore(1);
-    public LocalTableProperties tablePropertiesLocal(UUID session,UUID column,int maxFiles,long maxBytes) throws RocksDBException,IOException {
-        if(maxFiles<1 || maxFiles>it.cavallium.rockserver.core.common.SstMaintenance.MAX_INPUT_FILES
-                || maxBytes<1 || maxBytes>it.cavallium.rockserver.core.common.SstMaintenance.MAX_METADATA_RESPONSE_BYTES)throw new IllegalArgumentException("Invalid table inventory limit");
-        if(!tablePropertyInspection.tryAcquire())throw new IOException("Physical table inspection is already active");
-        try {
-            return localMaintenance(session,column,(db,handle,paths)->{
-                // Native inventory admission precedes selected-file copies; property blocks are scanned serially.
-                var tables=db.getBoundedTableProperties(handle,maxFiles,maxBytes,1024*1024,4096,64*1024);
-                return new LocalTableProperties(checkedMaintenanceProperty(tables.files),checkedMaintenanceProperty(tables.numEntries),
-                        checkedMaintenanceProperty(tables.numDeletions),checkedMaintenanceProperty(tables.numMergeOperands),
-                        checkedMaintenanceProperty(tables.numRangeDeletions),checkedMaintenanceProperty(tables.dataSize),checkedMaintenanceProperty(tables.indexSize),checkedMaintenanceProperty(tables.filterSize),tables.comparatorName);
-            });
-        }finally{tablePropertyInspection.release();}
+    public it.cavallium.rockserver.core.common.ColumnTableProperties tablePropertiesLocal(
+            UUID session,UUID column,int maxFiles,long maxBytes)throws RocksDBException,IOException {
+        return observeQualifiedLocal(session,column,-1,TablePropertyLimits.forScope(1,maxFiles,maxBytes)).tables();
     }
 
     public record LocalColumn(UUID column,long nativeColumnId) {}
@@ -1726,13 +1766,24 @@ public final class DistributedStoragePool implements AutoCloseable {
         if(request.columnId()!=id || !request.session().equals(session+"-"+id))throw new IllegalArgumentException("Stale SST/native CF session");
         return localMaintenance(session,column,id,(db,handle,paths)->{var metadata=it.cavallium.rockserver.core.impl.SelectiveCompaction.boundedMetadata(db,handle,paths,session+"-"+id,id,request.level(),files,bytes);return it.cavallium.rockserver.core.impl.SelectiveCompaction.compact(db,handle,metadata,request);});
     }
-    public record LocalObservation(long estimatedKeys,LocalTableProperties tables) {}
+    public record LocalObservation(long estimatedKeys,String actualCFComparator,
+                                   it.cavallium.rockserver.core.common.ColumnTableProperties tables) {}
     public LocalObservation observeQualifiedLocal(UUID session,UUID column,long id,int files,long bytes)throws RocksDBException,IOException {
-        if(files<1 || files>it.cavallium.rockserver.core.common.SstMaintenance.MAX_INPUT_FILES || bytes<1 || bytes>it.cavallium.rockserver.core.common.SstMaintenance.MAX_METADATA_RESPONSE_BYTES)throw new IllegalArgumentException("Invalid bounded table projection policy");
+        return observeQualifiedLocal(session,column,id,TablePropertyLimits.forScope(1,files,bytes));
+    }
+    public LocalObservation observeQualifiedLocal(UUID session,UUID column,long id,TablePropertyLimits limits)throws RocksDBException,IOException {
+        Objects.requireNonNull(limits);
         if(!tablePropertyInspection.tryAcquire())throw new IOException("Physical table inspection already active");
         try{return localMaintenance(session,column,id,(db,handle,paths)->{
-            long estimate=checkedMaintenanceProperty(db.getLongProperty(handle,"rocksdb.estimate-num-keys"));var t=db.getBoundedTableProperties(handle,files,bytes,1024*1024,4096,64*1024);
-            return new LocalObservation(estimate,new LocalTableProperties(checkedMaintenanceProperty(t.files),checkedMaintenanceProperty(t.numEntries),checkedMaintenanceProperty(t.numDeletions),checkedMaintenanceProperty(t.numMergeOperands),checkedMaintenanceProperty(t.numRangeDeletions),checkedMaintenanceProperty(t.dataSize),checkedMaintenanceProperty(t.indexSize),checkedMaintenanceProperty(t.filterSize),t.comparatorName));
+            long estimate=checkedMaintenanceProperty(db.getLongProperty(handle,"rocksdb.estimate-num-keys"));
+            var packed=db.getBoundedPortableTableProperties(handle,limits.files(),limits.inventoryBytes(),limits.blockBytes(),
+                    limits.entries(),limits.stringBytes(),limits.totalStringBytes(),limits.projectionBytes(),limits.workingBytes());
+            var aggregate=new it.cavallium.rockserver.core.impl.TablePropertiesAccumulator();
+            try {packed.forEach(aggregate::add);}
+            catch(ArithmeticException failure){throw new IOException("Physical table properties overflow",failure);}
+            var tables=aggregate.result();
+            if(tables.tableCount()!=packed.files())throw new IOException("Physical table projection count differs");
+            return new LocalObservation(estimate,Objects.requireNonNull(packed.comparatorName()),tables);
         });}finally{tablePropertyInspection.release();}
     }
 
