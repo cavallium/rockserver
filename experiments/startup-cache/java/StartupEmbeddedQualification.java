@@ -137,18 +137,23 @@ public final class StartupEmbeddedQualification {
         var c = resources.snapshotCaches();
         return c.isEmpty() ? Map.of() : stats(c.getFirst(), c.getLast());
     }
-    private static Map<String, Long> primaryCacheStats(EmbeddedDB internal) throws ReflectiveOperationException {
+    private static Map<String, Long> nativeReadStats(EmbeddedDB internal) throws ReflectiveOperationException {
         var options = (org.rocksdb.DBOptions) field(internal, "dbOptions");
         var result = new LinkedHashMap<String, Long>();
-        // Whole-DB cumulative counters: neither workload-class attribution nor eviction counts.
+        // These tickers and histograms are not reset by the statistics collector.
+        // Whole-DB file timers cover SST data/metadata, not the snapshot cache's POSIX reads.
         try (var statistics = options.statistics()) {
-            if (statistics == null) throw new IllegalStateException("Missing primary cache statistics");
-            for (var ticker : List.of(org.rocksdb.TickerType.BLOCK_CACHE_DATA_HIT,
-                    org.rocksdb.TickerType.BLOCK_CACHE_DATA_MISS,
-                    org.rocksdb.TickerType.BLOCK_CACHE_DATA_ADD,
-                    org.rocksdb.TickerType.BLOCK_CACHE_DATA_BYTES_INSERT,
-                    org.rocksdb.TickerType.BLOCK_CACHE_ADD_FAILURES)) {
+            if (statistics == null) throw new IllegalStateException("Missing native read statistics");
+            for (var ticker : List.of(org.rocksdb.TickerType.NUMBER_KEYS_READ,
+                    org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_READ,
+                    org.rocksdb.TickerType.NUMBER_MULTIGET_KEYS_FOUND)) {
                 result.put(ticker.name(), statistics.getTickerCount(ticker));
+            }
+            for (var type : List.of(org.rocksdb.HistogramType.FILE_READ_GET_MICROS,
+                    org.rocksdb.HistogramType.FILE_READ_MULTIGET_MICROS)) {
+                var histogram = statistics.getHistogramData(type);
+                result.put(type.name() + "_COUNT", histogram.getCount());
+                result.put(type.name() + "_SUM", histogram.getSum());
             }
         }
         return result;
@@ -323,7 +328,10 @@ public final class StartupEmbeddedQualification {
                 long workDeadline = started + TimeUnit.SECONDS.toNanos(workloadSeconds);
                 output.put("scheduler_before", schedulerBefore);
                 output.put("cache_stats_at_foreground_start", cacheStats(resources));
-                if (PublicRead.TYPE.isEnabled()) output.put("primary_cache_stats_at_foreground_start", primaryCacheStats(internal));
+                if (PublicRead.TYPE.isEnabled()) {
+                    output.put("native_read_stats_at_foreground_start", nativeReadStats(internal));
+                    output.put("native_read_stats_scope", "Cumulative whole-DB counters; file histogram COUNT counts read operations/batches and SUM measures microseconds. Includes SST data/metadata, excludes custom snapshot POSIX reads; no cache-hit or eviction attribution.");
+                }
                 if (budget != null) output.put("admission_at_foreground_start", admission(budget));
                 long foregroundEnded;
                 try (var pool = Executors.newFixedThreadPool(4)) {
@@ -428,7 +436,7 @@ public final class StartupEmbeddedQualification {
                         foregroundEnded = System.nanoTime();
                         if (foregroundEvent != null) foregroundEvent.failed = false;
                         output.put("cache_stats_before_final_capture", cacheStats(resources));
-                        if (PublicRead.TYPE.isEnabled()) output.put("primary_cache_stats_at_foreground_end", primaryCacheStats(internal));
+                        if (PublicRead.TYPE.isEnabled()) output.put("native_read_stats_at_foreground_end", nativeReadStats(internal));
                         if (budget != null) output.put("admission_at_foreground_end", admission(budget));
                     }
                     finally {
