@@ -7,6 +7,9 @@ import org.rocksdb.util.SizeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import it.cavallium.rockserver.core.impl.StartupWriteCompletions;
+import org.jetbrains.annotations.Nullable;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -16,11 +19,21 @@ import java.util.List;
 import java.util.UUID;
 
 public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInstance col, Path path, SstFileWriter sstFileWriter, boolean ingestBehind,
-                        RocksDBObjects refs) implements Closeable, DBWriter {
+                        RocksDBObjects refs, @Nullable StartupWriteCompletions writeObserver) implements Closeable, DBWriter {
+
+    public SSTWriter(RocksDB db, ColumnInstance col, Path path, SstFileWriter writer, boolean ingestBehind, RocksDBObjects refs) {
+        this(db, col, path, writer, ingestBehind, refs, null);
+    }
 
     private static final Logger LOG = LoggerFactory.getLogger(SSTWriter.class);
 
     public static SSTWriter open(Path tempSSTsPath, TransactionalDB db, ColumnInstance col, ColumnFamilyOptions columnConifg, boolean forceNoOptions, boolean ingestBehind, RocksDBObjects refs) throws IOException, org.rocksdb.RocksDBException {
+        return open(tempSSTsPath, db, col, columnConifg, forceNoOptions, ingestBehind, refs, null);
+    }
+
+    public static SSTWriter open(Path tempSSTsPath, TransactionalDB db, ColumnInstance col, ColumnFamilyOptions columnConifg,
+            boolean forceNoOptions, boolean ingestBehind, RocksDBObjects refs, @Nullable StartupWriteCompletions observer)
+            throws IOException, org.rocksdb.RocksDBException {
         rejectUnsafeMultiPathIngestion(columnConifg, forceNoOptions);
         if (refs == null) {
             refs = new RocksDBObjects();
@@ -98,7 +111,7 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
 						RocksLeakDetector.register(this, "sst-writer-open-sst-file-writer", owningHandle_);
 					}
         };
-        var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, ingestBehind, refs);
+        var sstWriter = new SSTWriter(db.get(), col, tempFile, sstFileWriter, ingestBehind, refs, observer);
         try {
             sstFileWriter.open(tempFile.toString());
             return sstWriter;
@@ -177,7 +190,15 @@ public record SSTWriter(RocksDB db, it.cavallium.rockserver.core.impl.ColumnInst
                     .setAllowGlobalSeqNo(true)
                     .setWriteGlobalSeqno(false)
                     .setSnapshotConsistency(false);
-            db.ingestExternalFile(col.cfh(), List.of(path.toString()), ingestOptions);
+            var files = List.of(path.toString());
+            long started = writeObserver == null ? 0 : writeObserver.begin();
+            boolean failed = true;
+            try {
+                db.ingestExternalFile(col.cfh(), files, ingestOptions);
+                failed = false;
+            } finally {
+                if (writeObserver != null) writeObserver.complete(started, failed);
+            }
         }
     }
 

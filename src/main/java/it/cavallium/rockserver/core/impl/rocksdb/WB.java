@@ -6,6 +6,9 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
 
+import it.cavallium.rockserver.core.impl.StartupWriteCompletions;
+import org.jetbrains.annotations.Nullable;
+
 import java.io.Closeable;
 
 public final class WB implements Closeable, DBWriter {
@@ -14,8 +17,14 @@ public final class WB implements Closeable, DBWriter {
     private final RocksDB rocksDB;
     private @NotNull WriteBatch wb;
     private final boolean disableWal;
+    private final @Nullable StartupWriteCompletions observer;
 
     public WB(RocksDB rocksDB, @NotNull WriteBatch wb, boolean disableWal) {
+        this(rocksDB, wb, disableWal, null);
+    }
+
+    public WB(RocksDB rocksDB, @NotNull WriteBatch wb, boolean disableWal, @Nullable StartupWriteCompletions observer) {
+        this.observer = observer;
         this.rocksDB = rocksDB;
         this.wb = wb;
         this.disableWal = disableWal;
@@ -35,7 +44,14 @@ public final class WB implements Closeable, DBWriter {
             if (disableWal || MIGRATE) {
                 w.setDisableWAL(true);
             }
-            rocksDB.write(w, wb);
+            long started = observer == null ? 0 : observer.begin();
+            boolean failed = true;
+            try {
+                rocksDB.write(w, wb);
+                failed = false;
+            } finally {
+                if (observer != null) observer.complete(started, failed);
+            }
         } catch (org.rocksdb.RocksDBException e) {
             throw RocksDBException.of(RocksDBException.RocksDBErrorType.WRITE_BATCH_1, e);
         }

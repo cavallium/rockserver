@@ -114,7 +114,12 @@ class StartupReadIntegrationTest {
             assertNotNull(sample);
             assertEquals(8, sample.workers(), "user group must sample its actual READ and WRITE pools");
             assertEquals(1, sample.reads().point().count());
-            assertFalse(samples.containsKey(":shared"));
+            assertEquals(0, sample.writes().calls().count(), "metadata writes must not be attributed to the user group");
+            var shared = samples.get(":shared");
+            assertNotNull(shared, "column creation publishes its actual metadata write in the internal shared group");
+            assertEquals(1, shared.writes().calls().count());
+            assertEquals(0, shared.reads().point().count());
+            assertEquals(1, shared.workers(), "internal shared telemetry must not replace the user scheduler");
         }
     }
 

@@ -72,7 +72,7 @@ def main():
         if path.is_file():
             artifacts.append({"path": str(path), "sha256": sha256(path)})
         else:
-            for name in ("StartupIoPolicy", "StartupReadCompletions"):
+            for name in ("StartupIoPolicy", "StartupReadCompletions", "StartupWriteCompletions"):
                 for file in sorted((path / "it/cavallium/rockserver/core/impl").glob(name + "*.class")):
                     artifacts.append({"path": str(file), "sha256": sha256(file)})
             for pattern in ("NativeStartupBridge*.class", "SnapshotCache*.class", "RocksDBLoader*.class"):
@@ -82,7 +82,7 @@ def main():
                 "source_sha256": sha256(source), "runner_sha256": sha256(Path(__file__)), "support_sha256": sha256(Path(__file__).parent / "experiment_support.py"),
                 "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                 "cache_geometry": "AutoHyperClockCache DATA28MiB METADATA4MiB, estimatedEntryCharge0/shards-1 baseline/candidate matched",
-                "feedback": "Real StartupIoPolicy and StartupReadCompletions, 1second coherent native-call cohorts, 3tracked foreground tasks including writes; 100ms sampled admission-overlap classification",
+                "feedback": "Real StartupIoPolicy with independent native read/write completion cohorts and active-write state, 1second coherent windows, 3tracked foreground tasks; 100ms sampled admission-overlap classification",
                 "service_acceptance": "Requires separate paired EmbeddedDB service gate",
                 "declared_seed_history": {"requested_keys": args.seed_hot_keys, "effective_keys": effective_seed_keys,
                                           "passes": args.seed_passes, "verified_gets": effective_seed_keys * args.seed_passes,

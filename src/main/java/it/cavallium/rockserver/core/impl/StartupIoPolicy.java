@@ -5,7 +5,7 @@ public final class StartupIoPolicy {
     public static final int FOREGROUND = 1, URGENT = 2, UNKNOWN = 4, IDLE_NEUTRAL = 8;
     public static final long MAX_SAMPLE_AGE_NANOS = 2_000_000_000L;
     public static final int CALIBRATION_WINDOWS = 3, RECOVERY_WINDOWS = 3;
-    private final Baseline point = new Baseline(), bulk = new Baseline();
+    private final Baseline point = new Baseline(), bulk = new Baseline(), write = new Baseline();
     private InputSample previous;
     private Decision last;
     private boolean recovering;
@@ -13,11 +13,12 @@ public final class StartupIoPolicy {
 
     /** complete means scheduler and native windows were read successfully for this epoch.
      * accepted/terminal are cumulative scheduler outcomes, including cancellation before execution.
-     * urgentRecovery is shared storage recovery pressure, independent of this group's read demand.
+     * urgentRecovery is shared storage recovery pressure, independent of this group's foreground demand.
+     * writeOutstanding covers queued/executing write tasks; writes separately counts exact native attempts.
      */
     public record InputSample(long epoch, long sampledNanos, boolean telemetryValid, boolean complete,
                               int workers, int active, int queued, long accepted, long terminal,
-                              boolean urgentRecovery, StartupReadCompletions.Snapshot reads) {}
+                              boolean urgentRecovery, boolean writeOutstanding, StartupReadCompletions.Snapshot reads, StartupWriteCompletions.Snapshot writes) {}
     /** A zero mask permits admission growth only when qualifiedHealthy is also true.
      * idleNeutral identifies fresh, valid, conserved idle windows after recovery, never completed-but-uncalibrated work.
      * Capture uses its own pressure flag so idle need not fabricate healthy feedback.
@@ -33,14 +34,18 @@ public final class StartupIoPolicy {
             recovering = true; goodWindows = 0;
             return last = new Decision(UNKNOWN | FOREGROUND | (input.urgentRecovery() ? URGENT : 0), true, false, false);
         }
-        boolean reset = previous != null && (input.epoch() < previous.epoch()
+        boolean reset = previous != null && (previous.reads() == null || previous.writes() == null
+                || input.epoch() < previous.epoch()
                 || input.sampledNanos() <= previous.sampledNanos()
                 || input.accepted() < previous.accepted() || input.terminal() < previous.terminal()
                 || input.reads() != null && previous.reads() != null
                    && (input.reads().generation() != previous.reads().generation()
                    || input.reads().pointCompleted() < previous.reads().pointCompleted()
-                   || input.reads().bulkCompleted() < previous.reads().bulkCompleted()));
-        if (reset) { point.reset(); bulk.reset(); }
+                   || input.reads().bulkCompleted() < previous.reads().bulkCompleted())
+                || input.writes() != null && previous.writes() != null
+                   && (input.writes().generation() != previous.writes().generation()
+                   || input.writes().completed() < previous.writes().completed()));
+        if (reset) { point.reset(); bulk.reset(); write.reset(); }
         boolean valid = !reset && fresh(input, nowNanos) && valid(input) && conserved(input);
         previous = input;
         if (input.urgentRecovery()) {
@@ -49,11 +54,12 @@ public final class StartupIoPolicy {
         }
         if (!valid) { recovering = true; return last = unknown(true); }
         var reads = input.reads();
-        boolean busy = input.active() > 0 || input.queued() > 0 || input.accepted() > input.terminal();
-        boolean completed = reads.point().count() > 0 || reads.bulk().count() > 0;
-        boolean pressure = reads.point().failures() > 0 || reads.bulk().failures() > 0
+        var writes = input.writes().calls();
+        boolean busy = input.writeOutstanding() || input.writes().active() > 0 || input.active() > 0 || input.queued() > 0 || input.accepted() > input.terminal();
+        boolean completed = reads.point().count() > 0 || reads.bulk().count() > 0 || writes.count() > 0;
+        boolean pressure = reads.point().failures() > 0 || reads.bulk().failures() > 0 || writes.failures() > 0
                 || input.queued() > 0
-                || point.slow(reads.point()) || bulk.slow(reads.bulk());
+                || point.slow(reads.point()) || bulk.slow(reads.bulk()) || write.slow(writes.count(), writes.nanos(), writes.tailNanos());
         if (pressure) {
             recovering = true; goodWindows = 0;
             return last = new Decision(FOREGROUND, true, false, false);
@@ -67,9 +73,12 @@ public final class StartupIoPolicy {
             return last = new Decision(UNKNOWN | (busy || recovering ? FOREGROUND : 0),
                     busy || recovering, false, !busy && !recovering);
         }
-        point.observe(reads.point()); bulk.observe(reads.bulk());
+        if (input.writeOutstanding() || input.writes().active() > 0)
+            return last = unknown(true);
+        point.observe(reads.point()); bulk.observe(reads.bulk()); write.observe(writes.count(), writes.nanos(), writes.tailNanos());
         boolean calibrated = (reads.point().count() == 0 || point.ready())
-                && (reads.bulk().count() == 0 || bulk.ready());
+                && (reads.bulk().count() == 0 || bulk.ready())
+                && (writes.count() == 0 || write.ready());
         if (!calibrated) return last = unknown(busy || recovering);
         if (recovering && ++goodWindows < RECOVERY_WINDOWS)
             return last = new Decision(UNKNOWN, true, false, false);
@@ -78,10 +87,12 @@ public final class StartupIoPolicy {
     }
 
     private boolean conserved(InputSample input) {
-        if (previous == null || input.reads() == null || previous.reads() == null) return true;
+        if (previous == null) return true;
+        if (input.reads() == null || previous.reads() == null || input.writes() == null || previous.writes() == null) return false;
         var current = input.reads(); var old = previous.reads();
         return current.pointCompleted() - old.pointCompleted() == current.point().count()
-                && current.bulkCompleted() - old.bulkCompleted() == current.bulk().count();
+                && current.bulkCompleted() - old.bulkCompleted() == current.bulk().count()
+                && input.writes().completed() - previous.writes().completed() == input.writes().calls().count();
     }
 
     private Decision unknown(boolean capturePressure) {
@@ -101,23 +112,28 @@ public final class StartupIoPolicy {
                 && reads.valid() && reads.point() != null && reads.bulk() != null && reads.pointCompleted() >= reads.point().count()
                 && reads.bulkCompleted() >= reads.bulk().count()
                 && reads.point().valid() && reads.bulk().valid()
-                && reads.point().keys() == reads.point().count();
+                && reads.point().keys() == reads.point().count()
+                && input.writes() != null && input.writes().epoch() == input.epoch() && input.writes().generation() >= 0
+                && input.writes().active() >= 0 && input.writes().valid() && input.writes().calls() != null && input.writes().calls().valid()
+                && input.writes().completed() >= input.writes().calls().count();
     }
     private static final class Baseline {
         double mean, tail;
         int windows;
         boolean ready() { return windows >= CALIBRATION_WINDOWS; }
-        boolean slow(StartupReadCompletions.Cohort cohort) {
-            return ready() && cohort.count() > 0
-                    && ((double) cohort.nanos() / cohort.count() > mean * 2
-                    || cohort.tailNanos() > tail * 4);
+        boolean slow(StartupReadCompletions.Cohort cohort) { return slow(cohort.count(), cohort.nanos(), cohort.tailNanos()); }
+        boolean slow(long count, long nanos, long tailNanos) {
+            return ready() && count > 0 && ((double) nanos / count > mean * 2 || tailNanos > tail * 4);
         }
         void observe(StartupReadCompletions.Cohort cohort) {
-            if (cohort.count() == 0 || cohort.nanos() == 0 || ready()) return;
-            double sampleMean = (double) cohort.nanos() / cohort.count();
+            observe(cohort.count(), cohort.nanos(), cohort.tailNanos());
+        }
+        void observe(long count, long nanos, long tailNanos) {
+            if (count == 0 || nanos == 0 || ready()) return;
+            double sampleMean = (double) nanos / count;
             // Freeze the calibrated baseline: sustained overload must not normalize itself.
             mean += (sampleMean - mean) / (windows + 1);
-            tail = Math.max(tail, cohort.tailNanos());
+            tail = Math.max(tail, tailNanos);
             if (windows < CALIBRATION_WINDOWS) windows++;
         }
         void reset() { windows = 0; mean = tail = 0; }

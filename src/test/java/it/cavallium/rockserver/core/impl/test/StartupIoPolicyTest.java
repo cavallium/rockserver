@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.impl.StartupIoPolicy;
 import it.cavallium.rockserver.core.impl.StartupReadCompletions;
+import it.cavallium.rockserver.core.impl.StartupWriteCompletions;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -12,7 +13,7 @@ class StartupIoPolicyTest {
     private StartupIoPolicy.InputSample input(int active, int queued, boolean urgent) {
         epoch++;
         return new StartupIoPolicy.InputSample(epoch, epoch * 100_000_000, true, true,
-                2, active, queued, 100, active + queued == 0 ? 100 : 99, urgent, counters.snapshot(epoch));
+                2, active, queued, 100, active + queued == 0 ? 100 : 99, urgent, false, counters.snapshot(epoch), new StartupWriteCompletions().snapshot(epoch));
     }
     private StartupIoPolicy.Decision sample(int active, int queued, boolean urgent) {
         var input = input(active, queued, urgent);
@@ -53,7 +54,7 @@ class StartupIoPolicyTest {
         counters.reset(); counters.recordPoint(100, false);
         assertFalse(sample(0, 0, false).qualifiedHealthy());
         var bad = new StartupIoPolicy.InputSample(++epoch, epoch * 100_000_000, false, false,
-                -1, 0, 0, 0, 0, false, null);
+                -1, 0, 0, 0, 0, false, false, null, new StartupWriteCompletions().snapshot(epoch));
         assertFalse(policy.sample(bad, bad.sampledNanos()).qualifiedHealthy());
     }
     @Test void malformedAndUnconservedNativeWindowsFailClosed() {
@@ -62,12 +63,12 @@ class StartupIoPolicyTest {
         var b = new StartupReadCompletions.Cohort(0, 0, 0, 0, 0);
         var forged = new StartupReadCompletions.Snapshot(++epoch, 0, 3, 3, p, b, true);
         var input = new StartupIoPolicy.InputSample(epoch, epoch * 100_000_000, true, true,
-                2, 0, 0, 100, 100, false, forged);
+                2, 0, 0, 100, 100, false, false, forged, new StartupWriteCompletions().snapshot(epoch));
         assertEquals(StartupIoPolicy.FOREGROUND | StartupIoPolicy.UNKNOWN,
                 policy.sample(input, input.sampledNanos()).pressureMask());
         var malformed = new StartupReadCompletions.Snapshot(++epoch, 0, 3, 3, null, b, true);
         input = new StartupIoPolicy.InputSample(epoch, epoch * 100_000_000, true, true,
-                2, 0, 0, 100, 100, false, malformed);
+                2, 0, 0, 100, 100, false, false, malformed, new StartupWriteCompletions().snapshot(epoch));
         assertFalse(policy.sample(input, input.sampledNanos()).qualifiedHealthy());
     }
 
@@ -103,7 +104,7 @@ class StartupIoPolicyTest {
         assertTrue(policy.sample(null, healthy.sampledNanos()).capturePressure());
         assertFalse(policy.sample(healthy, healthy.sampledNanos()).qualifiedHealthy());
         var urgent = new StartupIoPolicy.InputSample(healthy.epoch(), healthy.sampledNanos(), true, true,
-                2, 0, 0, 100, 100, true, healthy.reads());
+                2, 0, 0, 100, 100, true, false, healthy.reads(), new StartupWriteCompletions().snapshot(healthy.epoch()));
         assertTrue(policy.sample(urgent, urgent.sampledNanos()).capturePressure());
         assertNotEquals(0, policy.sample(healthy, healthy.sampledNanos()).pressureMask() & StartupIoPolicy.URGENT);
     }
@@ -122,12 +123,12 @@ class StartupIoPolicyTest {
         idle = input(0, 0, false);
         assertFalse(policy.sample(idle, idle.sampledNanos() + StartupIoPolicy.MAX_SAMPLE_AGE_NANOS + 1).idleNeutral());
         var incomplete = new StartupIoPolicy.InputSample(++epoch, epoch * 100_000_000, true, false,
-                2, 0, 0, 100, 100, false, counters.snapshot(epoch));
+                2, 0, 0, 100, 100, false, false, counters.snapshot(epoch), new StartupWriteCompletions().snapshot(epoch));
         assertFalse(policy.sample(incomplete, incomplete.sampledNanos()).idleNeutral());
         var empty = new StartupReadCompletions.Cohort(0, 0, 0, 0, 0);
         var unconserved = new StartupReadCompletions.Snapshot(++epoch, 0, 1, 0, empty, empty, true);
         var forged = new StartupIoPolicy.InputSample(epoch, epoch * 100_000_000, true, true,
-                2, 0, 0, 100, 100, false, unconserved);
+                2, 0, 0, 100, 100, false, false, unconserved, new StartupWriteCompletions().snapshot(epoch));
         assertFalse(policy.sample(forged, forged.sampledNanos()).idleNeutral());
     }
 
@@ -135,7 +136,7 @@ class StartupIoPolicyTest {
         var idle = input(0, 0, false);
         assertTrue(policy.sample(idle, idle.sampledNanos()).idleNeutral());
         var busy = new StartupIoPolicy.InputSample(idle.epoch(), idle.sampledNanos(), true, true,
-                2, 1, 0, 100, 99, false, idle.reads());
+                2, 1, 0, 100, 99, false, false, idle.reads(), new StartupWriteCompletions().snapshot(epoch));
         assertFalse(policy.sample(busy, busy.sampledNanos()).idleNeutral());
         assertFalse(policy.sample(idle, idle.sampledNanos()).idleNeutral());
         assertFalse(policy.sample(null, idle.sampledNanos()).idleNeutral());

@@ -145,6 +145,7 @@ import it.cavallium.rockserver.core.common.cdc.CDCEvent;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import org.rocksdb.TransactionLogIterator;
 import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
 
 public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable {
 
@@ -364,6 +365,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicInteger activeNativeMultiGets = new AtomicInteger();
 	private final PointReadCompletionCounters pointReadCompletions = new PointReadCompletionCounters();
 	private final Map<String, StartupReadCompletions> startupReadGroups = new ConcurrentHashMap<>();
+	private final Map<String, StartupWriteCompletions> startupWriteGroups = new ConcurrentHashMap<>();
+	private final NonBlockingHashMapLong<StartupWriteCompletions> startupWritesByHandle = new NonBlockingHashMapLong<>();
+	private final NonBlockingHashMapLong<String> startupWriteNamesByHandle = new NonBlockingHashMapLong<>();
+	private final Map<org.rocksdb.Transaction, String> startupTransactionWriteGroups = new ConcurrentHashMap<>();
 	private final NonBlockingHashMapLong<StartupReadCompletions> startupReadsByHandle = new NonBlockingHashMapLong<>();
 	private boolean startupReadsEnabled;
 	private final AtomicLong bulkReadTailNanos = new AtomicLong();
@@ -877,6 +882,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			startupReadGroups.put("default", new StartupReadCompletions());
 			for (String group : workloadGroups.keySet()) startupReadGroups.put(group, new StartupReadCompletions());
 			startupReadGroups.put(":shared", new StartupReadCompletions());
+			for (String group : startupReadGroups.keySet()) startupWriteGroups.put(group, new StartupWriteCompletions());
 		}
 		loadExistingColumns(loadedDb.mergeOperators());
         if (tablePropertiesEnabled) {
@@ -1197,8 +1203,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		var column = new ColumnInstance(cfh, schema, mergeOp);
 		String workload = columnWorkloadGroups.getOrDefault(name, fallbackWorkloadGroup);
 		columnWorkloadNames.put(id, workload);
-		if (startupReadsEnabled) startupReadsByHandle.put(cfh.getNativeHandle(),
-				startupReadGroups.computeIfAbsent(workload, _ -> new StartupReadCompletions()));
+		if (startupReadsEnabled) {
+			startupReadsByHandle.put(cfh.getNativeHandle(), startupReadGroups.computeIfAbsent(workload, _ -> new StartupReadCompletions()));
+			startupWritesByHandle.put(cfh.getNativeHandle(), startupWriteGroups.computeIfAbsent(workload, _ -> new StartupWriteCompletions()));
+			startupWriteNamesByHandle.put(cfh.getNativeHandle(), workload);
+		}
 		this.columns.put(id, column);
 		upsertStoragePressureColumn(new StoragePressureColumn(
 				pressureColumn.id(),
@@ -1407,6 +1416,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			var col = this.columns.remove(id);
 			Objects.requireNonNull(col, () -> "Column does not exist: " + id);
 			startupReadsByHandle.remove(col.cfh().getNativeHandle());
+			startupWritesByHandle.remove(col.cfh().getNativeHandle());
+			startupWriteNamesByHandle.remove(col.cfh().getNativeHandle());
 			removeStoragePressureColumn(id);
 
 			if (this.columnNamesIndex.remove(name) == null) {
@@ -2724,15 +2735,25 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		// Owned transactions are deliberately closed again from several finally blocks.
 		// Once the native handle is gone, its resource lease has already been balanced.
 		if (!tx.val().isOwningHandle()) {
+			startupTransactionWriteGroups.remove(tx.val());
 			return true;
 		}
+		boolean retainForRetry = false;
 		// Transaction lifetimes are tracked separately from active operations. This lets
 		// shutdown drain native calls first and then roll back idle client transactions.
 		try {
 			if (commit) {
 				boolean succeeded;
 				try {
-					tx.val().commit();
+					var observer = startupCommitCounter(tx);
+					long nativeStarted = observer == null ? 0 : observer.begin();
+					boolean nativeFailed = true;
+					try {
+						tx.val().commit();
+						nativeFailed = false;
+					} finally {
+						if (observer != null) observer.complete(nativeStarted, nativeFailed);
+					}
 					recordCdcPublishedTail();
 					succeeded = true;
 				} catch (org.rocksdb.RocksDBException ex) {
@@ -2743,8 +2764,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						throw ex;
 					}
 				}
- 			if (!succeeded) {
-					// Keep the resource lease while the transaction remains open.
+				if (!succeeded) {
+					// Keep the resource lease and owner tag while the transaction remains open.
+					retainForRetry = true;
 					return false;
 				}
 			} else {
@@ -2771,6 +2793,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			releaseResourceLease();
 			throw ex;
+		} finally {
+			if (!retainForRetry) startupTransactionWriteGroups.remove(tx.val());
 		}
 	}
 
@@ -2797,7 +2821,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		try {
 			byte[] key = name.getBytes(StandardCharsets.UTF_8);
 			byte[] value = encodeColumnSchema(newSchema);
-			db.get().put(columnSchemasColumnDescriptorHandle, key, value);
+			nativePut(columnSchemasColumnDescriptorHandle, null, key, value);
 			recordCdcPublishedTail();
 		} catch (org.rocksdb.RocksDBException e) {
 			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to persist updated schema for column: " + name, e);
@@ -2885,7 +2909,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							}
 							byte[] key = name.getBytes(StandardCharsets.UTF_8);
 							byte[] value = encodeColumnSchema(schema);
-							db.get().put(columnSchemasColumnDescriptorHandle, key, value);
+							nativePut(columnSchemasColumnDescriptorHandle, null, key, value);
 							recordCdcPublishedTail();
 							return internalRegisterColumn(name, unconfiguredCfh, schema, mergeOp);
 						} catch (org.rocksdb.RocksDBException | GestaltException e) {
@@ -2921,7 +2945,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						byte[] key = name.getBytes(StandardCharsets.UTF_8);
 						var cf = db.get().createColumnFamily(new ColumnFamilyDescriptor(key, options.options()));
 						byte[] value = encodeColumnSchema(schema);
-						db.get().put(columnSchemasColumnDescriptorHandle, key, value);
+						nativePut(columnSchemasColumnDescriptorHandle, null, key, value);
 						recordCdcPublishedTail();
 						return internalRegisterColumn(name, cf, schema, mergeOp);
 					} catch (org.rocksdb.RocksDBException | GestaltException e) {
@@ -3031,7 +3055,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	}
 
 	private void deleteColumnSchemaMetadata(@NotNull String name) throws org.rocksdb.RocksDBException {
-		db.get().delete(columnSchemasColumnDescriptorHandle, name.getBytes(StandardCharsets.UTF_8));
+		nativeDelete(columnSchemasColumnDescriptorHandle, null, name.getBytes(StandardCharsets.UTF_8));
 		recordCdcPublishedTail();
 	}
 
@@ -3207,6 +3231,80 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return startupReadsEnabled ? System.nanoTime() : 0L;
 	}
 
+	private @Nullable StartupWriteCompletions startupWriteCounter(@Nullable ColumnFamilyHandle column) {
+		if (!startupReadsEnabled) {
+			return null;
+		}
+		var counter = column == null ? null : startupWritesByHandle.get(column.getNativeHandle());
+		if (counter != null) {
+			return counter;
+		}
+		startupReadGroups.computeIfAbsent(":shared", _ -> new StartupReadCompletions());
+		return startupWriteGroups.computeIfAbsent(":shared", _ -> new StartupWriteCompletions());
+	}
+	private void rememberStartupTransactionWrite(Tx tx, ColumnFamilyHandle column) {
+		if (!startupReadsEnabled) {
+			return;
+		}
+		String group = startupWriteNamesByHandle.get(column.getNativeHandle());
+		startupTransactionWriteGroups.merge(tx.val(), group == null ? ":shared" : group,
+				(old, next) -> old.equals(next) ? old : ":shared");
+	}
+	private @Nullable StartupWriteCompletions startupCommitCounter(Tx tx) {
+		if (!startupReadsEnabled) {
+			return null;
+		}
+		String group = startupTransactionWriteGroups.getOrDefault(tx.val(), ":shared");
+		startupReadGroups.computeIfAbsent(group, _ -> new StartupReadCompletions());
+		return startupWriteGroups.computeIfAbsent(group, _ -> new StartupWriteCompletions());
+	}
+	private void nativePut(ColumnFamilyHandle column, @Nullable WriteOptions options, byte[] key, byte[] value) throws org.rocksdb.RocksDBException {
+		var observer = startupWriteCounter(column);
+		long started = observer == null ? 0 : observer.begin();
+		boolean failed = true;
+		try {
+			if (options == null) db.get().put(column, key, value);
+			else db.get().put(column, options, key, value);
+			failed = false;
+		} finally {
+			if (observer != null) observer.complete(started, failed);
+		}
+	}
+	private void nativeDelete(ColumnFamilyHandle column, @Nullable WriteOptions options, byte[] key) throws org.rocksdb.RocksDBException {
+		var observer = startupWriteCounter(column);
+		long started = observer == null ? 0 : observer.begin();
+		boolean failed = true;
+		try {
+			if (options == null) db.get().delete(column, key);
+			else db.get().delete(column, options, key);
+			failed = false;
+		} finally {
+			if (observer != null) observer.complete(started, failed);
+		}
+	}
+	private void nativeMerge(ColumnFamilyHandle column, WriteOptions options, byte[] key, byte[] value) throws org.rocksdb.RocksDBException {
+		var observer = startupWriteCounter(column);
+		long started = observer == null ? 0 : observer.begin();
+		boolean failed = true;
+		try {
+			db.get().merge(column, options, key, value);
+			failed = false;
+		} finally {
+			if (observer != null) observer.complete(started, failed);
+		}
+	}
+	private void nativeWriteBatch(org.rocksdb.RocksDB rocks, ColumnFamilyHandle column, WriteOptions options, WriteBatch batch) throws org.rocksdb.RocksDBException {
+		var observer = startupWriteCounter(column);
+		long started = observer == null ? 0 : observer.begin();
+		boolean failed = true;
+		try {
+			rocks.write(options, batch);
+			failed = false;
+		} finally {
+			if (observer != null) observer.complete(started, failed);
+		}
+	}
+
 	private void recordStartupRead(ColumnFamilyHandle column, long started, int keys, boolean failed) {
 		if (!startupReadsEnabled) return;
 		long elapsed = Math.max(0L, System.nanoTime() - started);
@@ -3331,9 +3429,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			for (var entry : startupReadGroups.entrySet()) {
 				String group = entry.getKey();
 				var reads = entry.getValue().snapshot(epoch);
+				var writeCalls = startupWriteGroups.computeIfAbsent(group, _ -> new StartupWriteCompletions()).snapshot(epoch);
 				if (group.equals(":shared")) {
 					samples.put(group, new StartupIoPolicy.InputSample(epoch, sampledNanos, true, true,
-							1, 0, 0, 0, 0, databaseUrgent, reads));
+							1, 0, 0, 0, 0, databaseUrgent, false, reads, writeCalls));
 					continue;
 				}
 				var groupScheduler = workloadGroups.getOrDefault(group, scheduler);
@@ -3344,7 +3443,10 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS], writes[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS])),
 						Math.toIntExact(Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS], writes[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS])),
 						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS], writes[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS]),
-						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES], writes[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]), databaseUrgent || urgentGroups.contains(group), reads));
+						Math.addExact(telemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES], writes[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES]), databaseUrgent || urgentGroups.contains(group),
+						writes[RWScheduler.POOL_TELEMETRY_ACTIVE_TASKS] > 0 || writes[RWScheduler.POOL_TELEMETRY_QUEUED_TASKS] > 0
+							|| writes[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS] > writes[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],
+						reads, writeCalls));
 			}
 			return samples;
 		} catch (org.rocksdb.RocksDBException failure) {
@@ -3978,7 +4080,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 		try (var w = new LeakSafeWriteOptions(null); var wb = new LeakSafeWriteBatch()) {
 			wb.deleteRange(col.cfh(), beginKey, endKey);
-			rocks.write(w, wb);
+			nativeWriteBatch(rocks, col.cfh(), w, wb);
 			recordCdcPublishedTail();
 		}
 	}
@@ -3998,14 +4100,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					wb.delete(col.cfh(), it.key());
 					pendingDeletes++;
 					if (pendingDeletes >= 10_000) {
-						writeDeleteRangeFallbackBatch(wb);
+						writeDeleteRangeFallbackBatch(col, wb);
 						wb.clear();
 						pendingDeletes = 0;
 					}
 					it.next();
 				}
 				if (pendingDeletes > 0) {
-					writeDeleteRangeFallbackBatch(wb);
+					writeDeleteRangeFallbackBatch(col, wb);
 				}
 			} catch (org.rocksdb.RocksDBException e) {
 				throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
@@ -4015,9 +4117,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		}
 	}
 
-	private void writeDeleteRangeFallbackBatch(LeakSafeWriteBatch wb) throws org.rocksdb.RocksDBException {
+	private void writeDeleteRangeFallbackBatch(ColumnInstance col, LeakSafeWriteBatch wb) throws org.rocksdb.RocksDBException {
 		try (var w = new LeakSafeWriteOptions(null)) {
-			db.get().write(w, wb);
+			nativeWriteBatch(db.get(), col.cfh(), w, wb);
 			recordCdcPublishedTail();
 		}
 	}
@@ -4642,7 +4744,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				this.col = columnUse.column();
 				this.writer = switch (mode) {
 					case WRITE_BATCH, WRITE_BATCH_NO_WAL ->
-							new WB(db.get(), new LeakSafeWriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL);
+							new WB(db.get(), new LeakSafeWriteBatch(), mode == PutBatchMode.WRITE_BATCH_NO_WAL, startupWriteCounter(col.cfh()));
 					case SST_INGESTION, SST_INGEST_BEHIND ->
 							getSSTWriter(columnId, null, false, mode == PutBatchMode.SST_INGEST_BEHIND);
 				};
@@ -4733,7 +4835,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							yield openTransactionInternal(120_000, false);
 						}
 						yield new WB(db.get(), new LeakSafeWriteBatch(),
-								mode == MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL);
+								mode == MergeBatchMode.MERGE_WRITE_BATCH_NO_WAL, startupWriteCounter(col.cfh()));
 					}
 					case MERGE_SST_INGESTION -> {
 						pendingSstEntries = new ArrayList<>();
@@ -4944,7 +5046,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					columnConifg != null ? columnConifg.options() : null,
 					forceNoOptions,
 					ingestBehind,
-					refs
+					refs, startupWriteCounter(col.cfh())
 			);
 		} catch (IOException ex) {
 			if (refs != null) {
@@ -5095,6 +5197,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							previousValue = transformResultValue(col, bucket.addElement(bucketElementKeys, value));
 							var v = Utils.toByteArray(bucket.toSegment());
 							((Tx) newTx).val().put(col.cfh(), calculatedKeyArray, v);
+							rememberStartupTransactionWrite((Tx) newTx, col.cfh());
 						} catch (org.rocksdb.RocksDBException e) {
 							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
 						}
@@ -5128,11 +5231,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
 								sstWriter.put(calculatedKeyArray, valueBB);
 							}
-							case Tx t -> t.val().put(col.cfh(), calculatedKeyArray, value.toByteArray());
+							case Tx t -> {
+								t.val().put(col.cfh(), calculatedKeyArray, value.toByteArray());
+								rememberStartupTransactionWrite(t, col.cfh());
+							}
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
 									var valueBB = (col.schema().hasValue() ? value : dummyRocksDBEmptyValue()).toByteArray();
-									db.get().put(col.cfh(), w, calculatedKeyArray, valueBB);
+									nativePut(col.cfh(), w, calculatedKeyArray, valueBB);
 									recordCdcPublishedTail();
 								}
 							}
@@ -5254,6 +5360,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							previousValue = transformResultValue(col, bucket.removeElement(bucketElementKeys));
 							var v = Utils.toByteArray(bucket.toSegment());
 							((Tx) newTx).val().put(col.cfh(), calculatedKeyArray, v);
+							rememberStartupTransactionWrite((Tx) newTx, col.cfh());
 						} catch (org.rocksdb.RocksDBException e) {
 							throw RocksDBException.of(RocksDBErrorType.PUT_1, e);
 						}
@@ -5293,10 +5400,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 								// But we can check if we should support it.
 								throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Delete not supported in SST writer mode");
 							}
-							case Tx t -> t.val().delete(col.cfh(), calculatedKeyArray);
+							case Tx t -> {
+								t.val().delete(col.cfh(), calculatedKeyArray);
+								rememberStartupTransactionWrite(t, col.cfh());
+							}
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
-									db.get().delete(col.cfh(), w, calculatedKeyArray);
+									nativeDelete(col.cfh(), w, calculatedKeyArray);
 									recordCdcPublishedTail();
 								}
 							}
@@ -5416,6 +5526,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							bucket.addElement(bucketElementKeys, mergedValue);
 							var v = Utils.toByteArray(bucket.toSegment());
 							((Tx) newTx).val().put(col.cfh(), calculatedKeyArray, v);
+							rememberStartupTransactionWrite((Tx) newTx, col.cfh());
 							if (callback instanceof RequestType.RequestMerged<?>) {
 								var merged = bucket.getElement(col.getBucketElementKeys(keys.keys()));
 								result = RequestType.safeCast(transformResultValue(col, merged));
@@ -5430,10 +5541,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 							case WB wb -> wb.wb().merge(col.cfh(), calculatedKeyArray, value.toByteArray());
 							case SSTWriter ignored ->
 									throw RocksDBException.of(RocksDBErrorType.PUT_INVALID_REQUEST, "Merge not supported with SST writer");
-							case Tx t -> t.val().merge(col.cfh(), calculatedKeyArray, value.toByteArray());
+							case Tx t -> {
+								t.val().merge(col.cfh(), calculatedKeyArray, value.toByteArray());
+								rememberStartupTransactionWrite(t, col.cfh());
+							}
 							case null -> {
 								try (var w = new LeakSafeWriteOptions(null)) {
-									db.get().merge(col.cfh(), w, calculatedKeyArray, value.toByteArray());
+									nativeMerge(col.cfh(), w, calculatedKeyArray, value.toByteArray());
 									recordCdcPublishedTail();
 								}
 							}
@@ -11553,7 +11667,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			// v2: emitLatestValues flag
 			dos.writeBoolean(meta.emitLatestValues);
 			dos.flush();
-			db.get().put(cdcMetaColumnDescriptorHandle, cdcKeyOf(id), baos.toByteArray());
+			nativePut(cdcMetaColumnDescriptorHandle, null, cdcKeyOf(id), baos.toByteArray());
 			recordCdcPublishedTail();
 		} catch (IOException e) {
 			throw new org.rocksdb.RocksDBException(e.getMessage());
@@ -11813,7 +11927,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		ops.beginOp();
 		try {
 			withCdcMetadataLock("delete", id, () -> {
-				db.get().delete(cdcMetaColumnDescriptorHandle, cdcKeyOf(id));
+				nativeDelete(cdcMetaColumnDescriptorHandle, null, cdcKeyOf(id));
 				cdcSubscriptionProgress.remove(id);
 				recordCdcPublishedTail();
 				return null;

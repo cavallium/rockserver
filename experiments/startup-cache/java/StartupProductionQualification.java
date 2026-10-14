@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.rocksdb.*;
 import it.cavallium.rockserver.core.impl.StartupIoPolicy;
 import it.cavallium.rockserver.core.impl.StartupReadCompletions;
+import it.cavallium.rockserver.core.impl.StartupWriteCompletions;
 
 /** Fresh-JVM production bridge fixture; intentionally excludes service/network acceptance. */
 public final class StartupProductionQualification {
@@ -99,8 +100,9 @@ public final class StartupProductionQualification {
         synchronized void accept() { accepted++; queued++; }
         synchronized void start() { queued--; active++; }
         synchronized void finish() { active--; terminal++; }
-        synchronized StartupIoPolicy.InputSample sample(long epoch, long now, StartupReadCompletions.Snapshot reads) {
-            return new StartupIoPolicy.InputSample(epoch, now, true, true, 3, active, queued, accepted, terminal, false, reads);
+        synchronized StartupIoPolicy.InputSample sample(long epoch, long now, StartupReadCompletions.Snapshot reads, StartupWriteCompletions.Snapshot writes) {
+            return new StartupIoPolicy.InputSample(epoch, now, true, true, 3, active, queued, accepted, terminal,
+                    false, writes.active() > 0, reads, writes);
         }
     }
     static SnapshotCache snapshotCache(Path path, boolean seed, boolean metadata, int sampling, long periodMs) {
@@ -225,6 +227,7 @@ public final class StartupProductionQualification {
                             long started = System.nanoTime();
                             var foreground = new Foreground();
                             var completions = new StartupReadCompletions();
+                            var writeCompletions = new StartupWriteCompletions();
                             var policy = new StartupIoPolicy();
                             var openingSampled = new AtomicBoolean();
                             var readersRemaining = new AtomicInteger(2);
@@ -242,7 +245,7 @@ public final class StartupProductionQualification {
                                         long epoch = 1 + (now - started) / 1_000_000_000L;
                                         if (epoch != lastEpoch) {
                                             var reads = completions.snapshot(epoch);
-                                            var input = foreground.sample(epoch, now, reads);
+                                            var input = foreground.sample(epoch, now, reads, writeCompletions.snapshot(epoch));
                                             var decision = policy.sample(input, System.nanoTime());
                                             sample.put("policy_pressure_mask", decision.pressureMask());
                                             sample.put("policy_capture_pressure", decision.capturePressure());
@@ -330,11 +333,11 @@ public final class StartupProductionQualification {
                                         long cycleStarted = System.nanoTime();
                                         boolean readersActive = readersRemaining.get() > 0;
                                         byte[] nativeKey = writeKey(i), nativeValue = value(~i);
-                                        long before = System.nanoTime(), nativeNanos;
+                                        long before = writeCompletions.begin(), nativeNanos;
                                         boolean writeFailed = true;
                                         try { db.put(writeOptions, nativeKey, nativeValue); writeFailed = false; }
                                         finally {
-                                            nativeNanos = System.nanoTime() - before;
+                                            nativeNanos = writeCompletions.complete(before, writeFailed);
                                             if (before - started < startupWindowMs * 1_000_000L) startupWrites.record(nativeNanos, writeFailed);
                                         }
                                         writes.record(nativeNanos);
@@ -371,8 +374,10 @@ public final class StartupProductionQualification {
                             output.put("point", point.report()); output.put("hot_point", hotPoint.report()); output.put("cold_point", coldPoint.report()); output.put("multi_get", multi.report()); output.put("writes", writes.report());
                             output.put("opening_overlap", overlap.report()); output.put("steady_or_unclassified", steady.report());
                             output.put("overlap_classification", budget == null ? "unclassified: admission disabled" : "approximate: latest100ms admission sample");
-                            var finalForeground = foreground.sample(1 + (System.nanoTime() - started) / 1_000_000_000L,
-                                    System.nanoTime(), null);
+                            long finalSampleNanos = System.nanoTime();
+                            long finalEpoch = 1 + (finalSampleNanos - started) / 1_000_000_000L;
+                            var finalForeground = foreground.sample(finalEpoch, finalSampleNanos, null,
+                                    writeCompletions.snapshot(finalEpoch));
                             output.put("foreground_accepted", finalForeground.accepted()); output.put("foreground_terminal", finalForeground.terminal());
                             if (snapshot != null) {
                                 output.put("cache_stats_before_final_capture", stats(snapshot, metadataSnapshot));

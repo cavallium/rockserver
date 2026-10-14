@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import it.cavallium.rockserver.core.impl.StartupIoPolicy;
 import it.cavallium.rockserver.core.impl.StartupReadCompletions;
+import it.cavallium.rockserver.core.impl.StartupWriteCompletions;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -18,7 +19,7 @@ class StartupIoControllerTest {
         StartupIoPolicy.InputSample input(int active, boolean complete, boolean urgent) {
             epoch++;
             return new StartupIoPolicy.InputSample(epoch, epoch * 100_000_000, true, complete,
-                    2, active, 0, 100, active == 0 ? 100 : 99, urgent, reads.snapshot(epoch));
+                    2, active, 0, 100, active == 0 ? 100 : 99, urgent, false, reads.snapshot(epoch), new StartupWriteCompletions().snapshot(epoch));
         }
         StartupIoPolicy.Decision sample(int active, boolean complete, boolean urgent) {
             var sample = input(active, complete, urgent);
