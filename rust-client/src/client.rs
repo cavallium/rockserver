@@ -3,6 +3,7 @@ use crate::proto::*; // For request/response types
 use crate::types::*;
 use crate::types::{Column, ColumnSchema};
 use futures::{Stream, StreamExt};
+use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::time::Duration;
@@ -324,6 +325,65 @@ impl RockserverClient {
     // ============================================================================================
     // Column Management
     // ============================================================================================
+
+    /// Finds the published revision matching the operator's SHA-256 artifact hash.
+    pub async fn check_merge_operator(
+        &self,
+        operator_name: String,
+        hash: [u8; 32],
+    ) -> Result<Option<i64>> {
+        let req = CheckMergeOperatorRequest {
+            operator_name,
+            hash: hash.to_vec(),
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .call_contextual(req, |mut client, request| async move {
+                client.check_merge_operator(request).await
+            })
+            .await?;
+        Ok(resp.into_inner().version)
+    }
+
+    /// Publishes an operator artifact and returns its revision.
+    pub async fn upload_merge_operator(
+        &self,
+        operator_name: String,
+        class_name: String,
+        jar_payload: Vec<u8>,
+    ) -> Result<i64> {
+        let req = UploadMergeOperatorRequest {
+            operator_name,
+            class_name,
+            jar_payload,
+            context: Some(self.context.clone()),
+        };
+        let resp = self
+            .call_contextual(req, |mut client, request| async move {
+                client.upload_merge_operator(request).await
+            })
+            .await?;
+        Ok(resp.into_inner().version)
+    }
+
+    /// Reuses the matching artifact or uploads it, within one caller deadline.
+    pub async fn ensure_merge_operator(
+        &self,
+        operator_name: String,
+        class_name: String,
+        jar_payload: Vec<u8>,
+    ) -> Result<i64> {
+        let deadline = self.contextual_request(())?.deadline;
+        await_bound_call(deadline, async {
+            let hash = Sha256::digest(&jar_payload).into();
+            if let Some(version) = self.check_merge_operator(operator_name.clone(), hash).await? {
+                return Ok(version);
+            }
+            self.upload_merge_operator(operator_name, class_name, jar_payload)
+                .await
+        })
+        .await
+    }
 
     /// Creates a new column with the given name and schema.
     pub async fn create_column(&self, name: String, schema: ColumnSchema) -> Result<i64> {

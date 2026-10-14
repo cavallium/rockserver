@@ -3,6 +3,13 @@ use rockserver_client::{ColumnHashType, ColumnSchema, RawSstToken, RockserverCli
 
 #[allow(dead_code)]
 async fn ensure_api_compiles(client: &RockserverClient) {
+    let _ = client.check_merge_operator("operator".into(), [0; 32]).await;
+    let _ = client
+        .upload_merge_operator("operator".into(), "example.Operator".into(), vec![])
+        .await;
+    let _ = client
+        .ensure_merge_operator("operator".into(), "example.Operator".into(), vec![])
+        .await;
     client
         .put_ensure(0, 1, vec![vec![1]], vec![2])
         .await
