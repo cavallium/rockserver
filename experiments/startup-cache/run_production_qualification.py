@@ -224,7 +224,8 @@ def main():
             baseline, candidate = by_mode["none"], by_mode[mode]
             gains = [a["foreground_elapsed_ns"] / b["foreground_elapsed_ns"] for a, b in zip(baseline, candidate)]
             tails = [max(b[k]["p99_upper_ns"] / max(1, a[k]["p99_upper_ns"]) for k in ("point", "hot_point", "multi_get", "writes")) for a, b in zip(baseline, candidate)]
-            performance = "PASS" if args.pairs >= 3 and min(gains) >= 1.10 and max(tails) <= 1.20 else "INCONCLUSIVE_OR_REGRESSION"
+            tail_bounds = [max(b[k]["p99_upper_ns"] / max(1, a[k]["p99_lower_ns"]) for k in ("point", "hot_point", "multi_get", "writes")) for a, b in zip(baseline, candidate)]
+            performance = "PASS" if args.pairs >= 3 and min(gains) >= 1.10 and max(tails) <= 1.20 and max(tail_bounds) <= 1.20 else "INCONCLUSIVE_OR_REGRESSION"
             mechanisms = []
             for report in candidate:
                 opening = report.get("admission_before_close", {})
@@ -249,6 +250,7 @@ def main():
                 performance = "INCONCLUSIVE_MECHANISM_NOT_EXERCISED"
             comparisons.append({"disk": disk_index, "mechanism_exercised": mechanism_exercised, "mode": mode, "mechanism_evidence": mechanisms, "paired_throughput_ratios": gains,
                                 "median_throughput_ratio": statistics.median(gains), "protected_p99_ratios": tails,
+                                "protected_actual_p99_ratio_upper_bounds": tail_bounds,
                                 "performance_acceptance": performance})
     write_json(out / "result.json", {"correctness_status": "PASS", "performance_comparisons": comparisons,
                                       "scope": manifest["scope"], "runs": runs})

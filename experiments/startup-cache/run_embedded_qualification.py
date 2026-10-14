@@ -48,6 +48,38 @@ def closed_fixture_bytes(root):
             "allocation_scope": "Sum of per-file st_blocks*512, without inode/extent deduplication; not device consumption"}
 
 
+def flush_task_fixture(root, owner):
+    """Flush only a verified owned clone, before any child opens it."""
+    if owner.is_symlink() or root.parent != owner or (owner / ".task-owned").read_text() != "startup-embedded-qualification-v1\n":
+        raise RuntimeError("Fixture flush lost task-owned path identity")
+    accounting = closed_fixture_bytes(root)  # Reject nonregular entries before opening files.
+    started = time.monotonic()
+    directories = [root, owner]
+    files = 0
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            directories.append(path)
+            continue
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError(f"Nonregular fixture entry during flush: {path}")
+            os.fsync(fd)
+            files += 1
+        finally:
+            os.close(fd)
+    for path in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return {"regular_files_flushed": files, "directories_flushed": len(directories),
+            "logical_regular_file_bytes": accounting["logical_regular_file_bytes"],
+            "wall_seconds": time.monotonic() - started,
+            "scope": "Task-owned clone files and directories, including owned parent; no global sync or cache drop"}
+
+
 def require_data_clone_space(destination, owner, accounting, remaining_bytes):
     if destination.parent != owner or (owner / ".task-owned").read_text() != "startup-embedded-qualification-v1\n":
         raise RuntimeError("Data clone guard lost task-owned path identity")
@@ -157,6 +189,8 @@ def main():
                 "ownership": "New task-owned roots. Sequential exited child JVMs; immutable seed backups restore the same canonical DB/cache paths before every trial. No namespace rebasing.",
                 "feedback": "Actual production loader/controller, native-call completion cohorts and scheduler pools. Observer reads counters every100ms; never publishes feedback.",
                 "bulk_semantics": "Public async eight-key ExistsMulti presence checks; async Get verifies values. One in-flight future per caller lane. Not raw value-returning MultiGet.",
+                "latency_histogram": "128 subdivisions per power of two; below 0.8% bucket width, fixed 64 KiB counters per cohort plus object overhead; p99 lower/upper bounds retained",
+                "fixture_flush": "Task-owned restored files and directories fsynced before child launch; per-clone receipts, no global sync/cache drop",
                 "scheduler_gate": "Accepted/terminal deltas must conserve and cover all verified public request completions; queue/active demand sampled without injection",
                 "timeout_scope": "Single monotonic foreground deadline equals --timeout; whole child also has the same timeout including open/capture/close",
                 "counter_attribution": "Start/end deltas bracket foreground, excluding startup and final capture. SSD hits/FindTable calls in that window can include concurrent native opening; logical bytes are not physical I/O.",
@@ -165,6 +199,7 @@ def main():
                                     "wbm_bytes_charged_within_data_cache": 16 * 1024**2,
                                     "snapshot_budget_bytes": 16 * 1024**2, "snapshot_disk_budget_bytes": 48 * 1024**2},
                 "acceptance_predefined": {"minimum_pairs": 3, "material_gain_ratio": 1.10, "protected_p99_max_ratio": 1.20,
+                    "quantile_guard": "Candidate p99 upper / control p99 lower must also stay within 1.20; reported upper/upper ratios retained",
                     "periodic_capture": "Every cache candidate requires both roles publishing during foreground that spans two capture periods; post-workload manual capture excluded",
                     "admission": "Every admission candidate requires actual owned successful file opens during foreground plus sampled overlap; FindTable cache hits alone do not qualify",
                     "correctness": "All values/presence results verified, all128writer keys survive fresh-JVM restart, zero failures/timeouts/resource violations",
@@ -317,6 +352,9 @@ def main():
                  require_data_clone_space(backup_db, root, seed_bytes, remaining_bytes))
             shutil.copytree(db, backup_db)
             shutil.copytree(cache, backup_cache)
+            save(out / f"disk-{disk_index}-seed-backup-flush.json", {
+                "data": flush_task_fixture(backup_db, root),
+                "cache": flush_task_fixture(backup_cache, cache_root)})
             seed_db_manifest, seed_cache_manifest = tree_manifest(backup_db), tree_manifest(backup_cache)
             save(out / f"disk-{disk_index}-seed-db.files.json", seed_db_manifest)
             save(out / f"disk-{disk_index}-seed-cache.files.json", seed_cache_manifest)
@@ -337,6 +375,8 @@ def main():
                             shutil.copytree(backup, target)
                             if tree_manifest(target) != expected:
                                 raise RuntimeError("Restored same-path fixture differs from immutable seed")
+                            save(out / f"disk-{disk_index}-pair-{pair}-{mode}-{target.name}.flush.json",
+                                 flush_task_fixture(target, target.parent))
                     label = f"disk-{disk_index}-pair-{pair}-{mode}"
                     report = java(label, db, cache, mode)
                     verified = java(label + "-restart", db, cache, "verify")
@@ -352,17 +392,19 @@ def main():
                 baseline, candidate = modes["none"], modes[mode]
                 gains = [x["foreground_elapsed_ns"] / y["foreground_elapsed_ns"] for x, y in zip(baseline, candidate)]
                 tails = [max(y[k]["p99_upper_ns"] / max(1, x[k]["p99_upper_ns"]) for k in ("point", "hot_point", "exists_multi", "writes")) for x, y in zip(baseline, candidate)]
+                tail_bounds = [max(y[k]["p99_upper_ns"] / max(1, x[k]["p99_lower_ns"]) for k in ("point", "hot_point", "exists_multi", "writes")) for x, y in zip(baseline, candidate)]
                 exercised = all(r["writes_during_read_tasks"] >= 128
                     and (mode not in ("cache", "both") or (r["foreground_secondary_hits"] > 0 and r.get("capture_status") == 0
                          and r["foreground_elapsed_ns"] >= 2 * a.capture_period_ms * 1000000
                          and all(r["periodic_published_snapshots_during_foreground"].get(role, 0) > 0 for role in ("data", "metadata"))))
                     and (mode not in ("admission", "both") or (r["opening_overlap"]["operations"] > 0
                          and r["foreground_owned_successful_file_opens"] > 0)) for r in candidate)
-                result = "PASS" if a.pairs >= 3 and min(gains) >= 1.10 and max(tails) <= 1.20 else "INCONCLUSIVE_OR_REGRESSION"
+                result = "PASS" if a.pairs >= 3 and min(gains) >= 1.10 and max(tails) <= 1.20 and max(tail_bounds) <= 1.20 else "INCONCLUSIVE_OR_REGRESSION"
                 if not exercised:
                     result = "INCONCLUSIVE_MECHANISM_NOT_EXERCISED"
                 comparisons.append({"disk": disk_index, "mode": mode, "mechanism_exercised": exercised,
                     "paired_throughput_ratios": gains, "protected_p99_ratios": tails, "median_throughput_ratio": statistics.median(gains),
+                    "protected_actual_p99_ratio_upper_bounds": tail_bounds,
                     "performance_acceptance": result})
         save(out / "result.json", {"correctness_status": "PASS", "scope": manifest["scope"], "performance_comparisons": comparisons, "runs": runs})
     except (Exception, KeyboardInterrupt) as failure:

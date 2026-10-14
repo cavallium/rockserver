@@ -29,13 +29,16 @@ public final class StartupProductionQualification {
         if (!Arrays.equals(actual, value(i))) throw new IllegalStateException("Data mismatch: " + i);
     }
     static final class Histogram {
-        final long[] buckets = new long[512];
+        // Under 0.8% bucket width; fixed 64 KiB counter storage plus object overhead.
+        private static final int SUBDIVISIONS = 128;
+        final long[] buckets = new long[8192];
         long count;
         long failures;
         synchronized void record(long nanos) {
             long duration = Math.max(1, nanos);
-            int shift = Math.max(0, 60 - Long.numberOfLeadingZeros(duration));
-            int bucket = duration < 8 ? (int) duration : shift * 8 + (int) (duration >>> shift);
+            int shift = Math.max(0, 56 - Long.numberOfLeadingZeros(duration));
+            int bucket = duration < SUBDIVISIONS ? (int) duration
+                    : shift * SUBDIVISIONS + (int) (duration >>> shift);
             buckets[bucket]++;
             count++;
         }
@@ -44,21 +47,26 @@ public final class StartupProductionQualification {
             if (failed) failures++;
         }
         synchronized long percentile(int percentile) {
+            return percentileBound(percentile, true);
+        }
+        private long percentileBound(int percentile, boolean upper) {
             if (count == 0) return 0;
             long rank = (count * percentile + 99) / 100, seen = 0;
             for (int i = 0; i < buckets.length; i++) {
                 seen += buckets[i];
                 if (seen >= rank) {
-                    if (i < 8) return i;
-                    int shift = i / 8 - 1;
-                    return ((9L + i % 8) << shift) - 1;
+                    if (i < SUBDIVISIONS) return i;
+                    int shift = i / SUBDIVISIONS - 1;
+                    long lower = (SUBDIVISIONS + (long) i % SUBDIVISIONS) << shift;
+                    return upper ? lower | ((1L << shift) - 1) : lower;
                 }
             }
             throw new AssertionError();
         }
         synchronized Map<String, Object> report() {
             return Map.of("operations", count, "native_failures", failures, "p50_upper_ns", percentile(50),
-                    "p95_upper_ns", percentile(95), "p99_upper_ns", percentile(99));
+                    "p95_upper_ns", percentile(95), "p99_upper_ns", percentile(99),
+                    "p99_lower_ns", percentileBound(99, false));
         }
     }
     static String json(Object value) {
