@@ -582,3 +582,31 @@ service RemoteMutationService {
   rpc appendBatch(RemoteMutationAppendRequest) returns (RemoteMutationObservation);
   rpc finishInput(RemoteMutationTokenRequest) returns (RemoteMutationObservation);
 }
+
+// Explicitly injected node/operator authority, separate from the customer DATA backend.
+// Timeout/disconnect ends observation; it does not prove native work has stopped.
+message ReplicaPhysicalContext { int64 timeoutNanos = 1; }
+message ReplicaPhysicalScope { optional bytes pool = 1; optional bytes column = 2; }
+message ReplicaPhysicalTarget {
+  bytes node = 1; bytes incarnation = 2; bytes process = 3;
+  bytes pool = 4; bytes session = 5; bytes column = 6; int64 nativeColumnId = 7;
+}
+message ReplicaPhysicalScopeRequest { ReplicaPhysicalScope scope = 1; ReplicaPhysicalContext context = 2; }
+message ReplicaPhysicalTargets { repeated ReplicaPhysicalTarget targets = 1; }
+message ReplicaPhysicalObservation {
+  ReplicaPhysicalTarget target = 1; int64 estimatedKeys = 2; string actualCFComparator = 3;
+  ColumnTablePropertiesResponse tables = 4;
+}
+message ReplicaPhysicalObservations { repeated ReplicaPhysicalObservation observations = 1; }
+message ReplicaPhysicalMetadataRequest { ReplicaPhysicalTarget target = 1; int32 level = 2; ReplicaPhysicalContext context = 3; }
+message ReplicaPhysicalMetadata { ReplicaPhysicalTarget target = 1; GetSstMetadataResponse metadata = 2; }
+message ReplicaPhysicalCompactRequest { ReplicaPhysicalTarget target = 1; CompactFilesRequest request = 2; ReplicaPhysicalContext context = 3; }
+message ReplicaPhysicalCompaction { ReplicaPhysicalTarget target = 1; CompactFilesResponse result = 2; }
+service ReplicaPhysicalService {
+  rpc discover(ReplicaPhysicalScopeRequest) returns (ReplicaPhysicalTargets);
+  rpc observe(ReplicaPhysicalScopeRequest) returns (ReplicaPhysicalObservations);
+  rpc flush(ReplicaPhysicalScopeRequest) returns (google.protobuf.Empty);
+  rpc compact(ReplicaPhysicalScopeRequest) returns (google.protobuf.Empty);
+  rpc metadata(ReplicaPhysicalMetadataRequest) returns (ReplicaPhysicalMetadata);
+  rpc compactFiles(ReplicaPhysicalCompactRequest) returns (ReplicaPhysicalCompaction);
+}

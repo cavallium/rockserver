@@ -38,6 +38,7 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.unix.DomainSocketAddress;
 import it.cavallium.rockserver.core.client.RocksDBConnection;
+import it.cavallium.rockserver.core.client.GrpcPortableWire;
 import it.cavallium.rockserver.core.common.*;
 import it.cavallium.rockserver.core.common.cdc.CdcBatch;
 import it.cavallium.rockserver.core.common.ColumnHashType;
@@ -326,12 +327,12 @@ public class GrpcServer extends Server {
 	}
 
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress) throws IOException {
-		this(client, socketAddress, null);
+		this(client, socketAddress, null, null);
 	}
 
-	/** The optional export backend is borrowed and remains owned by the caller. */
+	/** Optional export and physical operator authorities are borrowed and remain caller-owned. */
 	public GrpcServer(RocksDBConnection client, SocketAddress socketAddress,
-			it.cavallium.rockserver.core.common.export.ExportAsyncAPI exports) throws IOException {
+			it.cavallium.rockserver.core.common.export.ExportAsyncAPI exports, ReplicaPhysicalAPI physical) throws IOException {
 		super(client);
 		ExpectedGrpcStreamCloseLogFilter.install();
 		if (client instanceof InternalConnection internalConnection) {
@@ -376,6 +377,7 @@ public class GrpcServer extends Server {
 				.addService(new ExportGrpcService(exports).bindBoundedService())
                 .addService(new DistributedCdcGrpcService(client.getCapabilities().cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null).bindBoundedService())
                 .addService(new RemoteMutationGrpcService(remoteMutationBackend(client)).bindBoundedService())
+                .addService(new ReplicaPhysicalGrpcService(physical).bindBoundedService())
 				.permitKeepAliveWithoutCalls(true)
 				.permitKeepAliveTime(5, TimeUnit.SECONDS)
 				.intercept(new AdaptiveCompressionInterceptor())
@@ -1239,37 +1241,7 @@ public class GrpcServer extends Server {
             return executeSync(request.getContext(), OperationFamily.FULL_SCAN_AGGREGATE,
                     api -> {
                         var p = api.getTableProperties(request.getColumnId());
-                        return ColumnTablePropertiesResponse.newBuilder()
-                                .setTableCount(p.tableCount())
-                                .setDataSize(p.dataSize())
-                                .setIndexSize(p.indexSize())
-                                .setIndexPartitions(p.indexPartitions())
-                                .setTopLevelIndexSize(p.topLevelIndexSize())
-                                .setFilterSize(p.filterSize())
-                                .setRawKeySize(p.rawKeySize())
-                                .setRawValueSize(p.rawValueSize())
-                                .setNumDataBlocks(p.numDataBlocks())
-                                .setNumEntries(p.numEntries())
-                                .setNumDeletions(p.numDeletions())
-                                .setNumMergeOperands(p.numMergeOperands())
-                                .setNumRangeDeletions(p.numRangeDeletions())
-                                .setSlowCompressionEstimatedDataSize(p.slowCompressionEstimatedDataSize())
-                                .setFastCompressionEstimatedDataSize(p.fastCompressionEstimatedDataSize())
-                                .setOldestCreationTime(p.oldestCreationTime())
-                                .setNewestCreationTime(p.newestCreationTime())
-                                .setOldestKeyTime(p.oldestKeyTime())
-                                .putAllFormatVersions(p.formatVersions())
-                                .putAllFixedKeyLengths(p.fixedKeyLengths())
-                                .putAllIndexKeysAreUserKeys(p.indexKeysAreUserKeys())
-                                .putAllIndexValuesAreDeltaEncoded(p.indexValuesAreDeltaEncoded())
-                                .putAllColumnFamilyIds(p.columnFamilyIds())
-                                .putAllFilterPolicies(p.filterPolicies())
-                                .putAllComparators(p.comparators())
-                                .putAllMergeOperators(p.mergeOperators())
-                                .putAllPrefixExtractors(p.prefixExtractors())
-                                .putAllPropertyCollectors(p.propertyCollectors())
-                                .putAllCompressions(p.compressions())
-                                .build();
+                        return GrpcPortableWire.properties(p);
                     })
                     .transform(this.onErrorMapMonoWithRequestInfo("getTableProperties", request));
         }
@@ -2504,17 +2476,7 @@ public class GrpcServer extends Server {
         public Mono<GetSstMetadataResponse> getSstMetadata(GetSstMetadataRequest request) {
             return executeSync(request.getContext(), OperationFamily.METADATA, api -> {
                 var metadata = api.getSstMetadata(request.getColumnId(), request.getLevel());
-                var builder = GetSstMetadataResponse.newBuilder().setSession(metadata.session())
-                        .setColumnId(metadata.columnId()).setColumnName(metadata.columnName())
-                        .setNumLevels(metadata.numLevels()).setBaseLevel(metadata.baseLevel())
-                        .addAllPaths(metadata.paths());
-                for (var file : metadata.files()) {
-                    builder.addFiles(SstFileMetadata.newBuilder().setName(file.name()).setLevel(file.level())
-                            .setPathId(file.pathId()).setSizeBytes(file.sizeBytes())
-                            .setSmallestKeyHex(file.smallestKeyHex()).setLargestKeyHex(file.largestKeyHex())
-                            .setBeingCompacted(file.beingCompacted()));
-                }
-                var response = builder.build();
+                var response = GrpcPortableWire.metadata(metadata);
                 if (response.getSerializedSize() > SstMaintenance.MAX_METADATA_RESPONSE_BYTES) {
                     throw SstMaintenance.invalid("SST metadata exceeds 64 MiB; query one level at a time");
                 }
@@ -2526,16 +2488,10 @@ public class GrpcServer extends Server {
         @Override
         public Mono<CompactFilesResponse> compactFiles(CompactFilesRequest request) {
             return Mono.defer(() -> {
-                var decoded = new SstMaintenance.Request(request.getColumnId(), request.getSession(),
-                        request.getFilesList(), request.getLevel(), request.getOutputPathId(),
-                        request.getOutputFileSizeLimit(), request.getMaxInputBytes(), request.getMaxSubcompactions(),
-                        request.getExecute());
+                var decoded = GrpcPortableWire.request(request);
                 return executeScheduled(() -> {
                     var result = protectedApi().compactFiles(decoded);
-                    return CompactFilesResponse.newBuilder().setExecuted(result.executed())
-                            .addAllInputFiles(result.inputFiles()).addAllOutputFiles(result.outputFiles())
-                            .setValidatedInputBytes(result.validatedInputBytes()).setOutputBytes(result.outputBytes())
-                            .setElapsedNanos(result.elapsedNanos()).build();
+                    return GrpcPortableWire.result(result);
                 },
                         scheduler.scheduler(WorkloadProfile.PHYSICAL_MAINTENANCE, OperationFamily.COMPACTION, Long.MAX_VALUE));
             }).transform(this.onErrorMapMonoWithRequestInfo("compactFiles", request));

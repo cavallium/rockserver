@@ -68,7 +68,7 @@ pub struct RockserverClient {
 type DeadlineClient = RocksDbServiceClient<InterceptedService<Channel, DeadlineInterceptor>>;
 
 #[derive(Clone, Copy, Debug)]
-struct BoundDeadline(tokio::time::Instant);
+pub(crate) struct BoundDeadline(pub(crate) tokio::time::Instant);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DeadlineInterceptor;

@@ -91,3 +91,6 @@ pub use types::*;
 
 pub mod remote_mutation;
 pub use remote_mutation::*;
+
+pub mod replica_physical;
+pub use replica_physical::*;

@@ -74,7 +74,7 @@ public class ThriftServer extends Server {
 			String http2Host,
 			int http2Port,
 			int maxFrameSize) throws IOException {
-        this(client, http2Host, http2Port, maxFrameSize, null);
+        this(client, http2Host, http2Port, maxFrameSize, null, null);
     }
 
     private static it.cavallium.rockserver.core.common.distributed.RemoteMutationAsyncAPI remoteMutationBackend(RocksDBConnection client) {
@@ -88,11 +88,24 @@ public class ThriftServer extends Server {
 
     public ThriftServer(RocksDBConnection client, String host, int port,
             it.cavallium.rockserver.core.common.export.ExportAsyncAPI exportBackend) throws IOException {
-        this(client, host, port, ThriftTransportLimits.configuredServerMaxFrameSize(), exportBackend);
+        this(client, host, port, ThriftTransportLimits.configuredServerMaxFrameSize(), exportBackend, null);
+    }
+
+    public ThriftServer(RocksDBConnection client, String host, int port,
+            it.cavallium.rockserver.core.common.export.ExportAsyncAPI exportBackend,
+            it.cavallium.rockserver.core.common.ReplicaPhysicalAPI physicalBackend) throws IOException {
+        this(client, host, port, ThriftTransportLimits.configuredServerMaxFrameSize(), exportBackend, physicalBackend);
+    }
+
+    private static void registerPhysical(org.apache.thrift.TMultiplexedProcessor processor,
+            it.cavallium.rockserver.core.common.ReplicaPhysicalAPI physicalBackend,int maxFrameSize) {
+        if(physicalBackend!=null)processor.registerProcessor(ReplicaPhysicalThriftService.SERVICE_NAME,
+                new ReplicaPhysicalThriftService(physicalBackend,maxFrameSize).boundedProcessor());
     }
 
     public ThriftServer(RocksDBConnection client, String http2Host, int http2Port, int maxFrameSize,
-            it.cavallium.rockserver.core.common.export.ExportAsyncAPI exportBackend) throws IOException {
+            it.cavallium.rockserver.core.common.export.ExportAsyncAPI exportBackend,
+            it.cavallium.rockserver.core.common.ReplicaPhysicalAPI physicalBackend) throws IOException {
         super(client);
         int validatedMaxFrameSize = ThriftTransportLimits.validateServerMaxFrameSize(maxFrameSize);
 		var handler = new ThriftHandler(this.getClient(),
@@ -110,6 +123,7 @@ public class ThriftServer extends Server {
                 new DistributedCdcThriftService(client.getCapabilities().withTransportLimit(validatedMaxFrameSize).cdcMode()==it.cavallium.rockserver.core.common.RockserverCapabilities.CdcMode.VECTOR_SUBSCRIPTIONS ? client.getDistributedCdcApi() : null,validatedMaxFrameSize).boundedProcessor());
         processor.registerProcessor(RemoteMutationThriftService.SERVICE_NAME,
                 new RemoteMutationThriftService(remoteMutationBackend(client),validatedMaxFrameSize).boundedProcessor());
+        registerPhysical(processor,physicalBackend,validatedMaxFrameSize);
         try {
             var serverTransport = new ConfiguredNonblockingServerSocket(
 					new InetSocketAddress(http2Host, http2Port),
@@ -681,36 +695,7 @@ public class ThriftServer extends Server {
                 it.cavallium.rockserver.core.common.api.RequestContext context) throws RocksDBThriftException {
             try {
                 var p = api(context).getTableProperties(columnId);
-                return new it.cavallium.rockserver.core.common.api.ColumnTablePropertiesData()
-                        .setTableCount(p.tableCount())
-                        .setDataSize(p.dataSize())
-                        .setIndexSize(p.indexSize())
-                        .setIndexPartitions(p.indexPartitions())
-                        .setTopLevelIndexSize(p.topLevelIndexSize())
-                        .setFilterSize(p.filterSize())
-                        .setRawKeySize(p.rawKeySize())
-                        .setRawValueSize(p.rawValueSize())
-                        .setNumDataBlocks(p.numDataBlocks())
-                        .setNumEntries(p.numEntries())
-                        .setNumDeletions(p.numDeletions())
-                        .setNumMergeOperands(p.numMergeOperands())
-                        .setNumRangeDeletions(p.numRangeDeletions())
-                        .setSlowCompressionEstimatedDataSize(p.slowCompressionEstimatedDataSize())
-                        .setFastCompressionEstimatedDataSize(p.fastCompressionEstimatedDataSize())
-                        .setOldestCreationTime(p.oldestCreationTime())
-                        .setNewestCreationTime(p.newestCreationTime())
-                        .setOldestKeyTime(p.oldestKeyTime())
-                        .setFormatVersions(p.formatVersions())
-                        .setFixedKeyLengths(p.fixedKeyLengths())
-                        .setIndexKeysAreUserKeys(p.indexKeysAreUserKeys())
-                        .setIndexValuesAreDeltaEncoded(p.indexValuesAreDeltaEncoded())
-                        .setColumnFamilyIds(p.columnFamilyIds())
-                        .setFilterPolicies(p.filterPolicies())
-                        .setComparators(p.comparators())
-                        .setMergeOperators(p.mergeOperators())
-                        .setPrefixExtractors(p.prefixExtractors())
-                        .setPropertyCollectors(p.propertyCollectors())
-                        .setCompressions(p.compressions());
+                return it.cavallium.rockserver.core.client.ThriftTablePropertiesWire.properties(p);
             } catch (it.cavallium.rockserver.core.common.RocksDBException e) { throw mapException(e); }
         }
 

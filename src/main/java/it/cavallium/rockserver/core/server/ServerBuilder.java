@@ -15,6 +15,7 @@ public class ServerBuilder {
 	private boolean useThrift;
 	private RocksDBConnection client;
 	private it.cavallium.rockserver.core.common.export.ExportAsyncAPI exports;
+	private it.cavallium.rockserver.core.common.ReplicaPhysicalAPI physical;
 
 	public void setUnixSocket(UnixDomainSocketAddress address) {
 		this.unixAddress = address;
@@ -41,15 +42,20 @@ public class ServerBuilder {
 		this.exports = exports;
 	}
 
+	/** Borrow explicitly authorized node/operator scope; never inferred from the DATA connection. */
+	public void setReplicaPhysicalAPI(it.cavallium.rockserver.core.common.ReplicaPhysicalAPI physical) {
+		this.physical = physical;
+	}
+
 	public Server build() throws IOException {
 		if (http2Address != null) {
 			if (useThrift) {
-				return new ThriftServer(client, http2Address.host(), http2Address.port(), exports);
+				return new ThriftServer(client, http2Address.host(), http2Address.port(), exports, physical);
 			} else {
-				return new GrpcServer(client, new InetSocketAddress(http2Address.host(), http2Address.port()), exports);
+				return new GrpcServer(client, new InetSocketAddress(http2Address.host(), http2Address.port()), exports, physical);
 			}
 		} else if (unixAddress != null) {
-			return new GrpcServer(client, new DomainSocketAddress(unixAddress.getPath().toFile()), exports);
+			return new GrpcServer(client, new DomainSocketAddress(unixAddress.getPath().toFile()), exports, physical);
 		} else if (iNetAddress != null) {
 			throw new UnsupportedOperationException("Not implemented: inet address");
 		} else {

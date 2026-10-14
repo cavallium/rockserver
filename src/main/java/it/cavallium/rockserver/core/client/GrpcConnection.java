@@ -1373,36 +1373,7 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
         var request = GetTablePropertiesRequest.newBuilder().setColumnId(columnId)
                 .setContext(currentWireRequestContext()).build();
         return toResponse(futureStubWithRequestDeadline().getTableProperties(request),
-                p -> new ColumnTableProperties(
-                        p.getTableCount(),
-                        p.getDataSize(),
-                        p.getIndexSize(),
-                        p.getIndexPartitions(),
-                        p.getTopLevelIndexSize(),
-                        p.getFilterSize(),
-                        p.getRawKeySize(),
-                        p.getRawValueSize(),
-                        p.getNumDataBlocks(),
-                        p.getNumEntries(),
-                        p.getNumDeletions(),
-                        p.getNumMergeOperands(),
-                        p.getNumRangeDeletions(),
-                        p.getSlowCompressionEstimatedDataSize(),
-                        p.getFastCompressionEstimatedDataSize(),
-                        p.getOldestCreationTime(),
-                        p.getNewestCreationTime(),
-                        p.getOldestKeyTime(),
-                        p.getFormatVersionsMap(),
-                        p.getFixedKeyLengthsMap(),
-                        p.getIndexKeysAreUserKeysMap(),
-                        p.getIndexValuesAreDeltaEncodedMap(),
-                        p.getColumnFamilyIdsMap(),
-                        p.getFilterPoliciesMap(),
-                        p.getComparatorsMap(),
-                        p.getMergeOperatorsMap(),
-                        p.getPrefixExtractorsMap(),
-                        p.getPropertyCollectorsMap(),
-                        p.getCompressionsMap()));
+                GrpcPortableWire::properties);
     }
 
     @Override
@@ -1410,24 +1381,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
         var request = GetSstMetadataRequest.newBuilder().setColumnId(columnId).setLevel(level)
                 .setContext(currentWireRequestContext()).build();
         return toResponse(futureStubWithRequestDeadline().withMaxInboundMessageSize(SstMaintenance.MAX_METADATA_RESPONSE_BYTES)
-                .getSstMetadata(request), m -> new SstMaintenance.Metadata(m.getSession(), m.getColumnId(),
-                        m.getColumnName(), m.getNumLevels(), m.getBaseLevel(), m.getPathsList(),
-                        m.getFilesList().stream().map(f -> new SstMaintenance.File(f.getName(), f.getLevel(),
-                                f.getPathId(), f.getSizeBytes(), f.getSmallestKeyHex(), f.getLargestKeyHex(),
-                                f.getBeingCompacted())).toList()));
+                .getSstMetadata(request), GrpcPortableWire::metadata);
     }
 
     @Override
     public CompletableFuture<SstMaintenance.Result> compactFilesAsync(SstMaintenance.Request request) {
         // Deliberately excluded from the automatic-retry allowlist, like compact().
-        var wireRequest = CompactFilesRequest.newBuilder()
-                .setColumnId(request.columnId()).setSession(request.session()).addAllFiles(request.files())
-                .setLevel(request.level()).setOutputPathId(request.outputPathId())
-                .setOutputFileSizeLimit(request.outputFileSizeLimit()).setMaxInputBytes(request.maxInputBytes())
-                .setMaxSubcompactions(request.maxSubcompactions()).setExecute(request.execute()).build();
-        return toResponse(futureStub.compactFiles(wireRequest), r -> new SstMaintenance.Result(r.getExecuted(),
-                r.getInputFilesList(), r.getOutputFilesList(), r.getValidatedInputBytes(), r.getOutputBytes(),
-                r.getElapsedNanos()));
+        return toResponse(futureStub.compactFiles(GrpcPortableWire.request(request)), GrpcPortableWire::result);
     }
 
 	@Override

@@ -420,36 +420,7 @@ final class ThriftConnectionDelegate extends BaseConnection implements RocksDBAP
     public ColumnTableProperties getTableProperties(long columnId) {
         try {
             var p = client.getTableProperties(columnId, currentWireRequestContext());
-            return new ColumnTableProperties(
-                    p.getTableCount(),
-                    p.getDataSize(),
-                    p.getIndexSize(),
-                    p.getIndexPartitions(),
-                    p.getTopLevelIndexSize(),
-                    p.getFilterSize(),
-                    p.getRawKeySize(),
-                    p.getRawValueSize(),
-                    p.getNumDataBlocks(),
-                    p.getNumEntries(),
-                    p.getNumDeletions(),
-                    p.getNumMergeOperands(),
-                    p.getNumRangeDeletions(),
-                    p.getSlowCompressionEstimatedDataSize(),
-                    p.getFastCompressionEstimatedDataSize(),
-                    p.getOldestCreationTime(),
-                    p.getNewestCreationTime(),
-                    p.getOldestKeyTime(),
-                    p.getFormatVersions(),
-                    p.getFixedKeyLengths(),
-                    p.getIndexKeysAreUserKeys(),
-                    p.getIndexValuesAreDeltaEncoded(),
-                    p.getColumnFamilyIds(),
-                    p.getFilterPolicies(),
-                    p.getComparators(),
-                    p.getMergeOperators(),
-                    p.getPrefixExtractors(),
-                    p.getPropertyCollectors(),
-                    p.getCompressions());
+            return ThriftTablePropertiesWire.properties(p);
         } catch (TException e) { throw wrap(e); }
     }
 
