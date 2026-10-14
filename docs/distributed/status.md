@@ -1669,6 +1669,21 @@ unavailable listener recovery before retirement
 lineage-safe catch-up, physical parent cleanup and its recovery barriers remain
 unfinished.
 
+The recovery prerequisite now retains an exact frozen parent GROUP image before
+native SEED retirement, sharing the existing source artifact quotas. A durable
+receiver-local fence prevents historical sources and intermediate children from
+serving while committed replay proceeds through split and merge to a qualified
+current leaf. Image installation and cold reopen preserve that fence. Fourteen
+controlled anchor/artifact cases pass, including original pending-sidecar recovery,
+conflicting/partial sidecar refusal, scratch-growth refusal and aggregate metadata
+quota enforcement including the reservation marker
+(`topology-anchor-marker-quota-gate.log`). The extended 17-case gate also proves
+exact pending reservation promotion/deduplication after cold quota validation;
+partial/conflicting markers and over-quota inventories remain untouched
+(`topology-reservation-pending-recovery-gate.log`). This does not yet
+implement historical obligation discovery, transport, quorum retirement or physical
+parent reclamation.
+
 - Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold
   artifact quotas against the architecture. Controlled restore quota/unknown-force,
   durable ownership claims and custom proof accounting checks are recorded above;

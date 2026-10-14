@@ -2180,7 +2180,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public long takeSnapshot() throws IOException {
         // A retired parent's shared USER rows may already belong to its children.
-        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending())return -1;
+        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending() || store.topologyRecoveryOnly())return -1;
         var recovery=diskRunway==null?null:diskRunway.reserveRecovery(diskPool,Math.addExact(2*limits.maxImageBytes(),65536));
         try (var pin = snapshotPin()) {
             if (pin.position() == null) return -1;
@@ -2555,6 +2555,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         var transaction = super.startTransaction(request);
         try {
             requireHealthy();
+            if(store.topologyRecoveryOnly())throw new IOException("Topology historical owner is replay-only");
             long generation = admissionGeneration.get();
             Leadership leadership = leadership();
             if (!leadership.ready()) throw new IllegalStateException("Leader is not ready for admission");

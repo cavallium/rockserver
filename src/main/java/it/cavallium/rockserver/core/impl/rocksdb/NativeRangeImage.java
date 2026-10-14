@@ -173,6 +173,7 @@ public final class NativeRangeImage {
                 byte[] originKey=ByteBuffer.allocate(17).putLong(pin.groupId().getMostSignificantBits()).putLong(pin.groupId().getLeastSignificantBits()).put((byte)0x64).array();
                 boolean[] originWritten={false};
                 pin.visitState((key,value) -> {
+                    if(key.length==17 && (key[16]==0x6d || key[16]==0x6e))return; // Recovery fences are local receiver authority, never transferable image state.
                     if(Arrays.equals(key,originKey)) throw new IOException("Image-only topology origin cannot be persisted as native state");
                     if(originBytes!=null && !originWritten[0] && Arrays.compareUnsigned(key,originKey)>0) { append.accept(Section.STATE,null,originKey,originBytes); originWritten[0]=true; }
                     append.accept(Section.STATE,null,key,value);
@@ -303,6 +304,7 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && key[16]==0x78 && (key.length!=17 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.STATE_BYTES))throw new IOException("Invalid catalogue history state length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x79 && (key.length!=49 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.CREDIT_BYTES))throw new IOException("Invalid catalogue history credit length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x15 && (key.length!=17 || valueLength!=8))throw new IOException("Invalid ACK namespace count length");
+                if(section==Section.STATE && key.length>16 && (key[16]==0x6d || key[16]==0x6e))throw new IOException("Receiver-local recovery fence is not portable image authority");
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
@@ -928,9 +930,17 @@ public final class NativeRangeImage {
                 if(learnerAdoption.origin()==null && (topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null))throw new IOException("Ordinary learner image acquired birth provenance");
             } else if(learnerImageReceipt!=null || laterLearnerPermission!=null || laterLearnerReceipt!=null)throw new IOException("Learner image permission/receipt lacks registration");
             if(topologyOrigin!=null || topologyBirth!=null || topologyActivation!=null) {
-                if(topologyOrigin==null || topologyBirth==null || topologyActivation==null || topologyFreeze!=null || importBirth!=null
+                if(topologyOrigin==null || topologyBirth==null || topologyActivation==null || importBirth!=null
                         || !topologyBirth.equals(topologyOrigin.activation().birth()) || !Arrays.equals(topologyActivation.encode(),topologyOrigin.activation().encode())) throw new IOException("Topology image lacks exact complete birth/activation/origin provenance");
                 var seed=topologyOrigin.seed(); var source=seed.definition().sourceDirectory();
+                if(topologyFreeze!=null) {
+                    var original=topologyBirth.resolveDescriptor(seed);var successor=topologyFreeze.header();var parent=successor.participant(it.cavallium.rockserver.core.common.distributed.TopologyChange.Stage.FREEZE,original.groupId());
+                    if(successor.intentId().equals(seed.definition().intentId()) || successor.kind()==it.cavallium.rockserver.core.common.distributed.TopologyChange.Kind.RELOCATE || successor.sourceGeneration()<seed.header().targetGeneration()
+                            || successor.sourceGeneration()==seed.header().targetGeneration() && !Arrays.equals(successor.sourceDirectoryDigest(),seed.header().targetDirectoryDigest())
+                            || !parent.rangeId().equals(original.rangeId()) || parent.rangeEpoch()!=original.rangeEpoch()
+                            || topologyFreeze.position().index()<=topologyActivation.position().index() || topologyFreeze.position().term()<topologyActivation.position().term())throw new IOException("Frozen child image does not follow its original activation/lineage");
+                }
+
                 Map<String,byte[]> adoptedMutable=Map.of();if(topologyOrigin.learnerAdoptionDigest()!=null){if(learnerAdoption==null || learnerAdoption.origin()==null || !Arrays.equals(topologyOrigin.learnerAdoptionDigest(),learnerAdoption.digest()) || !Arrays.equals(seed.encode(),learnerAdoption.origin().seed().encode()) || !Arrays.equals(topologyActivation.encode(),learnerAdoption.origin().activation().encode()))throw new IOException("Topology alias bridge lacks exact original learner adoption");adoptedMutable=learnerAdoption.localSchemaRows();for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] expected=adoptedMutable.get(HexFormat.of().formatHex(key));if(expected!=null && !Arrays.equals(expected,record.encode()))throw new IOException("Learner image changed normalized historical alias evidence");}}
 
                 final Map<String,byte[]> adopted=adoptedMutable;

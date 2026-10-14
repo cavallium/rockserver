@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed.ratis;
 import it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage;
 import java.util.concurrent.TimeUnit;
 import java.io.*;
+import java.nio.ByteBuffer;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -29,6 +30,37 @@ class RatisTopologySourceSnapshotArtifactsTest {
     final NativeRangeImage.Limits limits=new NativeRangeImage.Limits(4*1024*1024,8*1024*1024,16);
     Path artifacts()throws IOException{return Files.createDirectories(root.resolve("artifacts"));}
     RatisTopologySourceSnapshotArtifacts open(Path directory)throws IOException{return new RatisTopologySourceSnapshotArtifacts(directory,limits,64*1024*1024,128*1024*1024,4);}
+    @Test void recoveryReservationPendingPromotesAndMatchingDuplicateUsesOneQuotaSlot()throws Exception {
+        var owned=artifacts();var id=new UUID(0,901);Path canonical=owned.resolve(id+".recovery-reserved"),pending=owned.resolve(id+".recovery-reserved.pending");
+        long maximum=2*limits.maxImageBytes(),metadata=3L*RatisTopologyRecoveryAnchors.MAX_METADATA_BYTES;
+        try(var ledger=new RatisTopologySourceSnapshotArtifacts(owned,limits,maximum,metadata,1)){ledger.reserveTopologyRecovery(id);assertEquals(maximum,ledger.reservedImageBytes());}
+        byte[] original=Files.readAllBytes(canonical);Files.move(canonical,pending);SessionJournalFiles.force(owned);
+        try(var ledger=new RatisTopologySourceSnapshotArtifacts(owned,limits,maximum,metadata,1)){assertEquals(maximum,ledger.reservedImageBytes());assertArrayEquals(original,Files.readAllBytes(canonical));assertFalse(Files.exists(pending));}
+        Files.copy(canonical,pending);SessionJournalFiles.force(pending);SessionJournalFiles.force(owned);
+        try(var ledger=new RatisTopologySourceSnapshotArtifacts(owned,limits,maximum,metadata,1)){assertEquals(maximum,ledger.reservedImageBytes());assertArrayEquals(original,Files.readAllBytes(canonical));assertFalse(Files.exists(pending));}
+        try(var ledger=new RatisTopologySourceSnapshotArtifacts(owned,limits,maximum,metadata,1)){assertEquals(maximum,ledger.reservedImageBytes());}
+    }
+    @Test void partialOrConflictingRecoveryReservationPendingNeverChangesOriginalFiles()throws Exception {
+        for(boolean originalPresent:List.of(false,true))for(boolean partial:List.of(false,true)) {
+            var owned=Files.createDirectory(root.resolve("reservation-"+originalPresent+"-"+partial));var id=new UUID(0,902);
+            Path canonical=owned.resolve(id+".recovery-reserved"),pending=owned.resolve(id+".recovery-reserved.pending");
+            if(originalPresent)SessionJournalFiles.write(canonical,ByteBuffer.allocate(8).putLong(limits.maxImageBytes()).array(),40);
+            byte[] original=originalPresent?Files.readAllBytes(canonical):null;
+            if(partial)Files.write(pending,new byte[]{1,2,3});else SessionJournalFiles.write(pending,ByteBuffer.allocate(8).putLong(limits.maxImageBytes()+1).array(),40);
+            byte[] unsettled=Files.readAllBytes(pending);
+            assertThrows(IOException.class,()->open(owned));assertArrayEquals(unsettled,Files.readAllBytes(pending));
+            if(originalPresent)assertArrayEquals(original,Files.readAllBytes(canonical));else assertFalse(Files.exists(canonical));
+        }
+    }
+    @Test void recoveryReservationPendingCannotPromoteBeforeSlotImageAndMetadataAdmission()throws Exception {
+        var owned=artifacts();var ids=List.of(new UUID(0,903),new UUID(0,904));var originals=new HashMap<UUID,byte[]>();
+        for(var id:ids){var pending=owned.resolve(id+".recovery-reserved.pending");SessionJournalFiles.write(pending,ByteBuffer.allocate(8).putLong(limits.maxImageBytes()).array(),40);originals.put(id,Files.readAllBytes(pending));}
+        long image=limits.maxImageBytes(),metadata=3L*RatisTopologyRecoveryAnchors.MAX_METADATA_BYTES;
+        assertThrows(IOException.class,()->new RatisTopologySourceSnapshotArtifacts(owned,limits,4*image,2*metadata,1));
+        assertThrows(IOException.class,()->new RatisTopologySourceSnapshotArtifacts(owned,limits,2*image,2*metadata,2));
+        assertThrows(IOException.class,()->new RatisTopologySourceSnapshotArtifacts(owned,limits,4*image,metadata,2));
+        for(var id:ids){assertFalse(Files.exists(owned.resolve(id+".recovery-reserved")));assertArrayEquals(originals.get(id),Files.readAllBytes(owned.resolve(id+".recovery-reserved.pending")));}
+    }
     SnapshotInfo managed(RatisTopologySourceSnapshotService.Lease lease,Path directory)throws IOException {
         Files.createDirectories(directory);var cut=lease.prepared().image().position();Path standard=directory.resolve(SimpleStateMachineStorage.getSnapshotFileName(cut.term(),cut.index()));
         Files.createLink(standard,lease.snapshot().getFiles().getFirst().getPath());return new SingleFileSnapshotInfo(new FileInfo(standard,MD5FileUtil.computeMd5ForFile(standard.toFile())),cut.term(),cut.index());

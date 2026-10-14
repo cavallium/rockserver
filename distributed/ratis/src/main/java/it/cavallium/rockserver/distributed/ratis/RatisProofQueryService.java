@@ -16,7 +16,7 @@ public final class RatisProofQueryService implements RatisRangeStateMachine.Proo
     /** Fast, nonblocking admission only: resolve this exact group to its declared pool and shared node lane. */
     @FunctionalInterface public interface ResourceAdmission {ResourceLease reserve(UUID group,long retainedBytes)throws IOException;}
     /** Release only bookkeeping; it must not throw, block on I/O, or invoke user callbacks. */
-    @FunctionalInterface public interface ResourceLease {void close();}
+    @FunctionalInterface public interface ResourceLease extends AutoCloseable {@Override void close();}
     private final ResourceAdmission resourceAdmission;
     private final ThreadPoolExecutor executor;
     private final int maximumJobs;private final long maximumBytes;

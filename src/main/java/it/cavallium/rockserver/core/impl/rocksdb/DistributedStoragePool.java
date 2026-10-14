@@ -159,7 +159,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         return topologySeeds.values().stream().sorted(Comparator.comparingLong(seed->seed.definition().sourceDirectory().generation())).toList();
     }
     public NativeTopologySeed topologySeed(UUID intent) { return topologySeeds.get(Objects.requireNonNull(intent)); }
-    private record PendingTopologySeed(NativeTopologySeed seed,List<ReplicatedRangeStore> parents,List<HistoricalOwner> history,Map<UUID,NativeTopologySeed> seeds,RangeOwnership.TopologyTransfer transfer) {}
+    private record PendingTopologySeed(NativeTopologySeed seed,List<ReplicatedRangeStore> parents,List<HistoricalOwner> history,Map<UUID,NativeTopologySeed> seeds,RangeOwnership.TopologyTransfer transfer,NativeTopologyRecoveryFence fence) {}
     private byte[] encodeTopologySeeds(Map<UUID,NativeTopologySeed> seeds) throws IOException {
         if(seeds.size()>MAX_TOPOLOGY_SEEDS) throw new IllegalStateException("Topology seed count exhausted");
         var bytes=new ByteArrayOutputStream(); var out=new DataOutputStream(bytes); out.writeInt(0x54535247); out.writeInt(seeds.size());
@@ -212,7 +212,12 @@ public final class DistributedStoragePool implements AutoCloseable {
     }
     @FunctionalInterface private interface SeedWork { NativeTopologySeed run() throws RocksDBException; }
     private NativeTopologySeed withTopologyParents(List<ReplicatedRangeStore> parents,int at,SeedWork work) throws RocksDBException { return at==parents.size() ? work.run() : parents.get(at).readSchemaMetadata(() -> withTopologyParents(parents,at+1,work)); }
-    public NativeTopologySeed seedTopology(TopologyChange.Definition definition,TopologyChange.State authority,List<ReplicatedRangeStore> parents,ReplicaDescriptor local) throws RocksDBException {
+    public NativeTopologySeed seedTopology(TopologyChange.Definition definition,TopologyChange.State authority,List<ReplicatedRangeStore> parents,ReplicaDescriptor local) throws RocksDBException {return seedTopology(definition,authority,parents,local,null);}
+    /** Trusted historical replay: the local fence is forced in the same batch as every target birth. */
+    public NativeTopologySeed seedTopologyRecovery(TopologyChange.Definition definition,TopologyChange.State authority,List<ReplicatedRangeStore> parents,ReplicaDescriptor local,NativeTopologyRecoveryFence fence)throws RocksDBException {
+        Objects.requireNonNull(fence);fence.header().requireDefinition(definition);if(!fence.owner().equals(TopologyChange.Owner.of(local)))throw new IllegalArgumentException("Recovery seed owner changed");return seedTopology(definition,authority,parents,local,fence);
+    }
+    private NativeTopologySeed seedTopology(TopologyChange.Definition definition,TopologyChange.State authority,List<ReplicatedRangeStore> parents,ReplicaDescriptor local,NativeTopologyRecoveryFence fence) throws RocksDBException {
         Objects.requireNonNull(definition); Objects.requireNonNull(authority); Objects.requireNonNull(local); parents=List.copyOf(parents);
         if(parents.size()!=definition.parents().size() || new HashSet<>(parents).size()!=parents.size() || parents.stream().anyMatch(parent -> !ranges.contains(parent))) throw new IllegalArgumentException("Topology seed requires exact local pool parents");
         var ordered=parents.stream().sorted(java.util.Comparator.comparing(parent -> parent.ownership().owner().groupId().toString())).toList(); nativeMutation.acquireUninterruptibly();
@@ -227,8 +232,8 @@ public final class DistributedStoragePool implements AutoCloseable {
                     var current=schemaPhysicalNamesUnderMutation(parent); if(names!=null && (!names.equals(current) || !merges.equals(parent.deterministicMergeColumns()))) throw new IllegalArgumentException("Seed parents use different native CFs/operators"); names=current; merges=parent.deterministicMergeColumns(); freezes.put(parent.ownership().owner().groupId(),freeze);
                 }
                 var candidate=new NativeTopologySeed(definition,authority,local,freezes,names,merges); var saved=topologySeeds.get(definition.intentId());
-                if(saved!=null) { requireSeedRetry(saved,candidate); requireTopologySeedRows(saved); return saved; }
-                if(pendingTopologySeed!=null) { requireSeedRetry(pendingTopologySeed.seed(),candidate); return forceTopologySeed(pendingTopologySeed); }
+                if(saved!=null) { requireSeedRetry(saved,candidate); requireTopologySeedRows(saved);requireRecoverySeedFence(saved,fence); return saved; }
+                if(pendingTopologySeed!=null) { requireSeedRetry(pendingTopologySeed.seed(),candidate);if(!Objects.equals(fence,pendingTopologySeed.fence()))throw new IllegalArgumentException("Unknown seed changed original recovery fence");return forceTopologySeed(pendingTopologySeed); }
                 var sources=new HashMap<RangeOwnership.Owner,RangeOwnership.Interval>(); ordered.forEach(parent -> sources.put(parent.ownership().owner(),parent.ownership().interval()));
                 var targets=new HashMap<RangeOwnership.Owner,RangeOwnership.Interval>(); var history=new ArrayList<>(ownershipHistory);
                 for(var target:definition.targets()) {
@@ -239,7 +244,7 @@ public final class DistributedStoragePool implements AutoCloseable {
                 }
                 if(history.size()>MAX_OWNERSHIP_HISTORY) throw new IllegalStateException("Topology ownership history exhausted"); var next=new HashMap<>(topologySeeds); next.put(definition.intentId(),candidate);
                 try { encodeOwnershipHistory(history); encodeTopologySeeds(next); } catch(IOException failure) { throw new IllegalStateException("Topology metadata budget exhausted",failure); }
-                var transfer=ownership.prepareTopologyTransfer(sources,targets); pendingTopologySeed=new PendingTopologySeed(candidate,ordered,List.copyOf(history),Map.copyOf(next),transfer); return forceTopologySeed(pendingTopologySeed);
+                var transfer=ownership.prepareTopologyTransfer(sources,targets); pendingTopologySeed=new PendingTopologySeed(candidate,ordered,List.copyOf(history),Map.copyOf(next),transfer,fence); return forceTopologySeed(pendingTopologySeed);
             });
         } finally { nativeMutation.release(); }
     }
@@ -249,7 +254,7 @@ public final class DistributedStoragePool implements AutoCloseable {
         try(var batch=new org.rocksdb.WriteBatch();var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)) {
             batch.put(state,TOPOLOGY_SEEDS_KEY,encodeTopologySeeds(pending.seeds())); batch.put(state,OWNERSHIP_HISTORY_KEY,encodeOwnershipHistory(pending.history()));
             for(var parent:seed.definition().parents()) batch.put(state,groupSchemaKey(parent.groupId(),0x62),seed.digest());
-            for(var target:seed.definition().targets()) { batch.put(state,groupSchemaKey(target.groupId(),0x61),seed.birth(target.groupId()).encode()); batch.put(state,groupSchemaKey(target.groupId(),0x10),ReplicatedRangeStore.topologyVirginUsage()); }
+            for(var target:seed.definition().targets()) { batch.put(state,groupSchemaKey(target.groupId(),0x61),seed.birth(target.groupId()).encode()); batch.put(state,groupSchemaKey(target.groupId(),0x10),ReplicatedRangeStore.topologyVirginUsage());if(pending.fence()!=null)batch.put(state,groupSchemaKey(target.groupId(),0x6d),pending.fence().forGroup(target.groupId()).encode()); }
             db.flushWal(true); topologySeedForceObserver.boundary(false); db.write(options,batch); topologySeedForceObserver.boundary(true);
             for(var parent:pending.parents()) parent.publishTopologyRetirement(seed);
             pending.transfer().publish(); topologySeeds=pending.seeds(); ownershipHistory=pending.history(); ownershipHistoryDurable=true;
@@ -258,6 +263,28 @@ public final class DistributedStoragePool implements AutoCloseable {
             for(var parent:pending.parents()) { retirements.put(parent.ownership().owner().groupId(),seed); parent.publishTopologyRetirement(seed); }
             topologyBirths=Map.copyOf(births); topologyRetirements=Map.copyOf(retirements); pendingTopologySeed=null; return seed;
         } catch(IOException failure) { throw new IllegalStateException("Cannot encode topology metadata",failure); }
+    }
+    private void requireRecoverySeedFence(NativeTopologySeed seed,NativeTopologyRecoveryFence fence)throws RocksDBException {
+        for(var target:seed.definition().targets()) {
+            byte[] current=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(target.groupId(),0x6d));
+            if(fence==null) {if(current!=null)throw new IllegalArgumentException("Recovery seed cannot lose its original fence");}
+            else {var expected=fence.forGroup(target.groupId()).encode();byte[] completed=loaded.db().get().get(handles.get(STATE_COLUMN),groupSchemaKey(target.groupId(),0x6e));if(!Arrays.equals(current,expected) && !Arrays.equals(completed,expected))throw new IllegalArgumentException("Original recovery birth fence changed");}
+        }
+    }
+    /** Force receiver-local admission exclusion before constructing or exposing a historical source store. */
+    public ReplicatedRangeStore openTopologyRecoveryRange(NativeTopologyRecoveryFence fence,RangeOwnership.Interval interval,byte[] schema,Map<UUID,String> names,Set<UUID> merges)throws RocksDBException {
+        Objects.requireNonNull(fence);var participant=java.util.stream.Stream.concat(fence.header().parents().stream(),fence.header().targets().stream()).filter(p->p.groupId().equals(fence.groupId())).findFirst().orElseThrow();
+        fence.requireGroup(participant.groupId(),participant.rangeEpoch());
+        if(!interval.domainId().equals(fence.header().domainId()) || !Arrays.equals(schema,fence.header().schemaDigest()))throw new IllegalArgumentException("Historical recovery source changed namespace/schema");
+        nativeMutation.acquireUninterruptibly();try {
+            synchronized(admission){if(closing)throw new IllegalStateException("Pool is closing");}
+            for(var existing:ranges)if(existing.ownership().owner().groupId().equals(fence.groupId()))throw new IllegalStateException("Recovery fence must precede opening its native owner");
+            byte[] key=groupSchemaKey(fence.groupId(),0x6d),saved=loaded.db().get().get(handles.get(STATE_COLUMN),key);if(saved!=null && !Arrays.equals(saved,fence.encode()))throw new IllegalArgumentException("Historical recovery changed original fence");
+            try(var options=new org.rocksdb.WriteOptions().setDisableWAL(false).setSync(true)){loaded.db().get().put(handles.get(STATE_COLUMN),options,key,fence.encode());}
+        }finally{nativeMutation.release();}
+        var store=openRange(new RangeOwnership.Owner(participant.groupId(),participant.rangeEpoch()),interval,schema,names,merges);
+        // Image replacement owns the interval fence as well as the independently durable serving fence.
+        store.fence();return store;
     }
     /** Opens only retained parent metadata, independent of historic USER CF availability. */
     public ReplicatedRangeStore openRetiredTopologyRange(UUID group) throws RocksDBException {

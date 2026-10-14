@@ -27,6 +27,8 @@ class RatisTopologyControllerTest {
     }
     static UUID id(int n) { return new UUID(175,n); }
     static Message message(byte[] value) { return Message.valueOf(ByteString.copyFrom(value)); }
+    private Fixture lastFixture;
+    private String seedFailure(){var failure=lastFixture==null?null:lastFixture.localSeedFailure;var parts=new ArrayList<String>();while(failure!=null){parts.add(failure.toString());failure=failure.getCause();}return String.join(" -> ",parts);}
     final class Fixture implements RatisTopologyController.DataPlane,AutoCloseable {
         final RatisNodeRuntimeTest.Env env;
         final RatisNodeRuntimeTest.FakeServer server=new RatisNodeRuntimeTest.FakeServer();
@@ -44,10 +46,11 @@ class RatisTopologyControllerTest {
         it.cavallium.rockserver.core.impl.rocksdb.DistributedStoragePool minorityPool;
         final Map<UUID,ReplicatedRangeStore> minorityStores=new HashMap<>();
         Exception minorityFailure;
+        Throwable localSeedFailure;
         @FunctionalInterface interface Observer { void run() throws IOException; }
         Observer beforeFreeze=()->{};
         Fixture(Path path,boolean merge,boolean listener) throws Exception {
-            var schema=logicalSchema(); env=new RatisNodeRuntimeTest.Env(path,false,schema.digest());
+            lastFixture=this;var schema=logicalSchema(); env=new RatisNodeRuntimeTest.Env(path,false,schema.digest());
             RatisNodeRuntime opened=null; RatisRoutedClient route=null;
             try {
             var original=env.plan.domains().getFirst().directory().ranges().getFirst(); local=original.replicas().stream().filter(r->r.nodeId().equals(env.plan.nodeId())).findFirst().orElseThrow();
@@ -120,7 +123,7 @@ class RatisTopologyControllerTest {
                 try { return seedMinority(request); } catch(Exception error) { minorityFailure=error; throw new IOException(error); }
             }
             try { var seed=node.seedTopology(request); bindReaders(); if(loseSeed) { loseSeed=false; throw new IOException("Lost completed local SEED reply"); } return seed; }
-            catch(IOException error) { throw error; } catch(Exception error) { throw new IOException(error); }
+            catch(IOException error) { localSeedFailure=error;throw error; } catch(Exception error) { localSeedFailure=error;throw new IOException(error); }
         }
         public RatisTopologyOwnerRpc.Evidence proof(TopologyChange.Definition d,TopologyChange.Stage stage,RangeDescriptor range,ReplicaDescriptor owner) throws IOException {
             if(!owner.equals(local)) {
@@ -173,7 +176,7 @@ class RatisTopologyControllerTest {
         public void close() throws Exception { node.close(); if(minorityPool!=null)minorityPool.close(); routed.close(); env.close(); }
     }
     void until(RatisTopologyController controller,RatisTopologyController.Handle handle,Path journal,RatisTopologyController.Phase phase) throws Exception {
-        for(int i=0;i<200 && handle.phase()!=phase;i++) controller.advance(handle,1); assertEquals(phase,handle.phase());
+        for(int i=0;i<200 && handle.phase()!=phase;i++) controller.advance(handle,1); assertEquals(phase,handle.phase(),()->"Last local SEED failure: "+seedFailure());
         if(RatisSchemaClientJournal.read(journal.resolve(handle.intentId()+".topology")).containsKey("pendingAck")) controller.advance(handle,1);
     }
     @Test void executableLocalSplitAndMergeUseActualOwnerArtifactsThroughActivationAndBusinessData() throws Exception {

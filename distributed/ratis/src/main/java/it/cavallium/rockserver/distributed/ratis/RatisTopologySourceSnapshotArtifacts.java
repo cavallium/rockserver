@@ -45,7 +45,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         this.maximumImageBytes=maximumImageBytes;this.maximumMetadataBytes=maximumMetadataBytes;this.maximumArtifacts=maximumArtifacts;
         Path lockPath=root.resolve("artifacts.lock");if(Files.exists(lockPath,LinkOption.NOFOLLOW_LINKS))regular(lockPath,0);
         lockChannel=FileChannel.open(lockPath,StandardOpenOption.CREATE,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS);FileLock acquired=null;
-        try{try{acquired=lockChannel.tryLock();}catch(OverlappingFileLockException busy){throw new IOException("Source artifact directory already owned",busy);}if(acquired==null)throw new IOException("Source artifact directory already owned");recoverPublications();inventory(null,null);}
+        try{try{acquired=lockChannel.tryLock();}catch(OverlappingFileLockException busy){throw new IOException("Source artifact directory already owned",busy);}if(acquired==null)throw new IOException("Source artifact directory already owned");recoverPublications();recoverRecoveryReservations();inventory(null,null);}
         catch(IOException|RuntimeException failure){try{if(acquired!=null)acquired.release();}catch(IOException cleanup){failure.addSuppressed(cleanup);}try{lockChannel.close();}catch(IOException cleanup){failure.addSuppressed(cleanup);}throw failure;}lock=acquired;
     }
     private void recoverPublications()throws IOException {
@@ -56,6 +56,25 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
             if(!complete){removal.delete(file);removal.force(root);continue;}
             var next=decodePublication(body);if(!id.equals(next.request().transferId()))throw new IOException("Pending source publication identity changed");var before=committed.get(id);requirePublicationTransition(before,next);SessionJournalFiles.force(file);Files.move(file,path(id,"publication"),StandardCopyOption.ATOMIC_MOVE,StandardCopyOption.REPLACE_EXISTING);SessionJournalFiles.force(root);committed.put(id,next);
         }
+    }
+    /** Complete checksummed recovery promises are inventoried before any namespace publication. */
+    private void recoverRecoveryReservations()throws IOException {
+        inventory(null,null);
+        try(var files=Files.newDirectoryStream(root,"*.recovery-reserved.pending")){for(var pending:files){
+            var name=pending.getFileName().toString();var canonical=pending.resolveSibling(name.substring(0,name.length()-".pending".length()));
+            byte[] promised=recoveryReservation(pending);
+            if(exists(canonical) && !Arrays.equals(promised,recoveryReservation(canonical)))throw new IOException("Recovery reservation sidecar conflicts with original promise");
+            SessionJournalFiles.force(pending);
+            if(exists(canonical)){SessionJournalFiles.force(canonical);removal.delete(pending);}
+            else Files.move(pending,canonical,StandardCopyOption.ATOMIC_MOVE);
+            SessionJournalFiles.force(canonical);removal.force(root);
+        }}
+        boolean retained=false;try(var files=Files.newDirectoryStream(root,"*.recovery-reserved")){for(var canonical:files){SessionJournalFiles.force(canonical);retained=true;}}
+        if(retained)SessionJournalFiles.force(root);
+    }
+    private byte[] recoveryReservation(Path file)throws IOException {
+        regular(file,40);byte[] value=read(file,40);
+        if(value.length!=8 || ByteBuffer.wrap(value).getLong()!=imageLimits.maxImageBytes())throw new IOException("Recovery image reservation changed");return value;
     }
     private static void requirePublicationTransition(Publication before,Publication next)throws IOException {
         if(before==null){if(next.phase()!=PublicationPhase.CAPTURING)throw new IOException("Terminal source sidecar lacks original capture authority");return;}
@@ -68,11 +87,25 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private byte[] reservationBytes(Request request){byte[] encoded=request(PREPARE,request);return ByteBuffer.allocate(12+encoded.length).putLong(imageLimits.maxImageBytes()).putInt(encoded.length).put(encoded).array();}
     /** Durable inventory admission precedes source pin acquisition and image materialization. */
     public synchronized void reserve(Request request)throws IOException {
-        requireOpen();UUID id=request.transferId();if(exists(path(id,"released")))throw new AdmissionRejected("Source transfer already has durable release authority");
+        requireOpen();UUID id=request.transferId();if(exists(path(id,"recovery-reserved")))throw new AdmissionRejected("Source transfer collides with topology recovery anchor");if(exists(path(id,"released")))throw new AdmissionRejected("Source transfer already has durable release authority");
         var file=path(id,"reserved");if(exists(file)){var prior=reservation(id);if(!Arrays.equals(request(PREPARE,request),request(PREPARE,prior.request())))throw new AdmissionRejected("Original source reservation request changed");SessionJournalFiles.force(file);SessionJournalFiles.force(root);inventory(null,null);return;}
         var usage=inventoryUsage();long imageCharge=Math.multiplyExact(2,imageLimits.maxImageBytes()),metadataCharge=6L*MAX_METADATA_FILE+6L*MAX_PUBLICATION_FILE+256+3L*(reservationBytes(request).length+32);
         if(usage.count()>=maximumArtifacts || publicationCount()>=MAX_RELEASED || imageCharge>maximumImageBytes-usage.imageBytes() || metadataCharge>maximumMetadataBytes-usage.metadataBytes())throw new AdmissionRejected("Durable source image/metadata reservation exhausted");
         writeMetadata(file,reservationBytes(request),MAX_RESERVATION_FILE);inventory(null,null);
+    }
+    /** Shares the existing forced image/scratch/metadata quota with source transfers. */
+    synchronized Path reserveTopologyRecovery(UUID id)throws IOException {
+        requireOpen();var reservation=path(id,"recovery-reserved");
+        if(exists(path(id,"reserved")) || exists(path(id,"released")) || exists(path(id,"publication")))throw new IOException("Recovery anchor collides with source transfer");
+        if(!exists(reservation)) {
+            var usage=inventoryUsage();long imageCharge=Math.multiplyExact(2,imageLimits.maxImageBytes());
+            if(usage.count()>=maximumArtifacts || imageCharge>maximumImageBytes-usage.imageBytes() || 3L*RatisTopologyRecoveryAnchors.MAX_METADATA_BYTES>maximumMetadataBytes-usage.metadataBytes())throw new AdmissionRejected("Topology recovery image/metadata quota exhausted");
+            writeMetadata(reservation,ByteBuffer.allocate(8).putLong(imageLimits.maxImageBytes()).array(),40);
+        }
+        inventory(null,null);var directory=path(id,"recovery");Files.createDirectories(directory);SessionJournalFiles.force(directory);SessionJournalFiles.force(root);return directory;
+    }
+    synchronized Path topologyRecoveryDirectory(UUID id)throws IOException {
+        requireOpen();if(!exists(path(id,"recovery-reserved")) || !Files.isDirectory(path(id,"recovery"),LinkOption.NOFOLLOW_LINKS))throw new IOException("Topology recovery anchor has no forced reservation");inventory(null,null);return path(id,"recovery");
     }
     public synchronized long reservedImageBytes()throws IOException{requireOpen();return inventoryUsage().imageBytes();}
     private record Capture(Request request,byte[] lower,byte[] upper,ApplyPosition cut,DistributedSchema schema,ReplicaDescriptor owner,ReplicatedRangeStore.Configuration configuration,Map<String,byte[]> rows,byte[] origin) {}
@@ -234,9 +267,12 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private Usage inventoryUsage()throws IOException{return inventoryUsage(null,null);}
     private Usage inventoryUsage(Prepared candidate,byte[] candidateBytes)throws IOException {
         publicationCount();
-        var reservations=new HashMap<UUID,Reservation>();var prepared=new HashMap<UUID,Prepared>();var captures=new HashMap<UUID,Capture>();var receipts=new HashMap<UUID,Receipt>();var settled=new HashSet<UUID>();var abandonedSettled=new HashSet<UUID>();var publications=new HashMap<UUID,Publication>();var imageIds=new HashSet<UUID>();var sourceIds=new HashSet<UUID>();long metadata=0;int files=0;
+        var recoveries=new HashSet<UUID>();var recoveryDirectories=new HashSet<UUID>();var reservations=new HashMap<UUID,Reservation>();var prepared=new HashMap<UUID,Prepared>();var captures=new HashMap<UUID,Capture>();var receipts=new HashMap<UUID,Receipt>();var settled=new HashSet<UUID>();var abandonedSettled=new HashSet<UUID>();var publications=new HashMap<UUID,Publication>();var imageIds=new HashSet<UUID>();var sourceIds=new HashSet<UUID>();long metadata=0;int files=0;
         try(var entries=Files.newDirectoryStream(root)){for(var file:entries){if(++files>3*MAX_RELEASED+maximumArtifacts*10+1)throw new IOException("Source artifact directory quota exceeded");String name=file.getFileName().toString();if(name.equals("artifacts.lock")){regular(file,0);continue;}int dot=name.indexOf('.');if(dot!=36)throw new IOException("Foreign source artifact path");UUID id;try{id=UUID.fromString(name.substring(0,dot));}catch(IllegalArgumentException invalid){throw new IOException("Foreign source artifact identity",invalid);}if(!id.toString().equals(name.substring(0,dot)))throw new IOException("Noncanonical source artifact identity");String suffix=name.substring(dot+1);
             switch(suffix){
+                case "recovery-reserved","recovery-reserved.pending"->{recoveryReservation(file);if(recoveries.add(id))metadata=Math.addExact(metadata,3L*RatisTopologyRecoveryAnchors.MAX_METADATA_BYTES);}
+                case "recovery"->{if(!Files.isDirectory(file,LinkOption.NOFOLLOW_LINKS))throw new IOException("Invalid recovery anchor directory");recoveryDirectories.add(id);}
+
                 case "source"->{if(!Files.isDirectory(file,LinkOption.NOFOLLOW_LINKS))throw new IOException("Invalid source original directory");sourceIds.add(id);}
                 case "publication"->{regular(file,MAX_PUBLICATION_FILE);var publication=decodePublication(read(file,MAX_PUBLICATION_FILE));if(!publication.request().transferId().equals(id))throw new IOException("Source publication filename changed");publications.put(id,publication);metadata=Math.addExact(metadata,3L*Files.size(file));}
                 case "abandoned-settled"->{regular(file,64);abandonedSettled.add(id);metadata=Math.addExact(metadata,Files.size(file));}
@@ -276,6 +312,8 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         for(var id:prepared.keySet())if(!reservations.containsKey(id)&&!receipts.containsKey(id))throw new IOException("Source image lacks durable disk reservation");for(var id:captures.keySet())if(!reservations.containsKey(id)&&!receipts.containsKey(id))throw new IOException("Source capture lacks durable disk reservation");for(var id:settled)if(!receipts.containsKey(id))throw new IOException("Source settled marker lacks release authority");
         for(var id:imageIds){var value=prepared.get(id);if(value==null&&!receipts.containsKey(id))throw new IOException("Image lacks forced original source metadata");long expected=value==null?receipts.get(id).imageBytes():value.image().bytes();if(exists(path(id,"image"))&&Files.size(path(id,"image"))!=expected || exists(path(id,"image.pending"))&&Files.size(path(id,"image.pending"))>expected)throw new IOException("Owned source image exceeds bound");}
         for(var id:sourceIds){var value=prepared.get(id);var captured=captures.get(id);var receipt=receipts.get(id);ApplyPosition cut=value!=null?value.image().position():captured!=null?captured.cut():receipt!=null?receipt.cut():publications.containsKey(id)?publications.get(id).cut():null;if(cut==null)throw new IOException("Original source directory lacks forced cut");var expected=sourcePath(id,cut).getFileName().toString();int count=0;try(var filesInSource=Files.newDirectoryStream(sourcePath(id,cut).getParent())){for(var file:filesInSource){if(++count>4)throw new IOException("Source original file count exceeded");var name=file.getFileName().toString();if(!name.equals(expected)&&!name.equals(expected+".pending")&&!name.matches("[.]native-range-building-.*[.]tmp"))throw new IOException("Foreign source original file");regular(file,imageLimits.maxImageBytes());}}}
+        for(var id:recoveryDirectories)if(!recoveries.contains(id))throw new IOException("Recovery image lacks durable reservation");
+        for(var id:recoveries){if(!retained.add(id))throw new IOException("Recovery/source reservation identity overlaps");images=Math.addExact(images,2L*imageLimits.maxImageBytes());if(recoveryDirectories.contains(id))RatisTopologyRecoveryAnchors.validateDirectory(path(id,"recovery"),imageLimits);}
         if(publications.size()>MAX_RELEASED||receipts.size()>MAX_RELEASED||retained.size()>maximumArtifacts||images>maximumImageBytes||metadata>maximumMetadataBytes)throw new IOException("Source durable image/metadata quota exhausted");return new Usage(retained.size(),images,metadata);
     }
     private void publishImage(Path source,Path target,Prepared prepared)throws IOException {
