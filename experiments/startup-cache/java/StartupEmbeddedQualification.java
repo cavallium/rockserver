@@ -29,6 +29,23 @@ public final class StartupEmbeddedQualification {
         public boolean failed = true;
         static final EventType TYPE = EventType.getEventType(PublicWrite.class);
     }
+    @Name("rockserver.QualificationRead") @Enabled(false) @StackTrace(false)
+    static final class PublicRead extends Event {
+        public String workload;
+        public int lane;
+        public long sequence;
+        public boolean failed = true;
+        static final EventType TYPE = EventType.getEventType(PublicRead.class);
+    }
+    private static PublicRead beginRead(String workload, int lane, long sequence) {
+        if (!PublicRead.TYPE.isEnabled()) return null;
+        var event = new PublicRead();
+        event.workload = workload; event.lane = lane; event.sequence = sequence; event.begin();
+        return event;
+    }
+    private static void endRead(PublicRead event) {
+        if (event != null) { event.end(); event.commit(); }
+    }
     @Name("rockserver.QualificationForeground") @Enabled(false) @StackTrace(false)
     static final class Foreground extends Event {
         public String mode;
@@ -119,6 +136,22 @@ public final class StartupEmbeddedQualification {
     private static Map<String, String> cacheStats(RocksDBLoader.StartupResources resources) {
         var c = resources.snapshotCaches();
         return c.isEmpty() ? Map.of() : stats(c.getFirst(), c.getLast());
+    }
+    private static Map<String, Long> primaryCacheStats(EmbeddedDB internal) throws ReflectiveOperationException {
+        var options = (org.rocksdb.DBOptions) field(internal, "dbOptions");
+        var result = new LinkedHashMap<String, Long>();
+        // Whole-DB cumulative counters: neither workload-class attribution nor eviction counts.
+        try (var statistics = options.statistics()) {
+            if (statistics == null) throw new IllegalStateException("Missing primary cache statistics");
+            for (var ticker : List.of(org.rocksdb.TickerType.BLOCK_CACHE_DATA_HIT,
+                    org.rocksdb.TickerType.BLOCK_CACHE_DATA_MISS,
+                    org.rocksdb.TickerType.BLOCK_CACHE_DATA_ADD,
+                    org.rocksdb.TickerType.BLOCK_CACHE_DATA_BYTES_INSERT,
+                    org.rocksdb.TickerType.BLOCK_CACHE_ADD_FAILURES)) {
+                result.put(ticker.name(), statistics.getTickerCount(ticker));
+            }
+        }
+        return result;
     }
     private static void awaitCapturePermission(RocksDBLoader.StartupResources resources) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
@@ -290,6 +323,7 @@ public final class StartupEmbeddedQualification {
                 long workDeadline = started + TimeUnit.SECONDS.toNanos(workloadSeconds);
                 output.put("scheduler_before", schedulerBefore);
                 output.put("cache_stats_at_foreground_start", cacheStats(resources));
+                if (PublicRead.TYPE.isEnabled()) output.put("primary_cache_stats_at_foreground_start", primaryCacheStats(internal));
                 if (budget != null) output.put("admission_at_foreground_start", admission(budget));
                 long foregroundEnded;
                 try (var pool = Executors.newFixedThreadPool(4)) {
@@ -321,14 +355,30 @@ public final class StartupEmbeddedQualification {
                                     if (op % 4 == 0) {
                                         var batch = new ArrayList<Keys>();
                                         for (int i = 0; i < 8; i++) batch.add(keys(key((id + i * 997) % count)));
-                                        long before = System.nanoTime(); var values = awaitRequest(async.existsMultiAsync(0, column, batch), workDeadline);
-                                        long ns = System.nanoTime() - before; bulk.record(ns); (activeOpen ? overlap : steady).record(ns);
+                                        var readEvent = beginRead("bulk", salt, op);
+                                        long before = System.nanoTime();
+                                        List<Boolean> values;
+                                        long ns;
+                                        try {
+                                            values = awaitRequest(async.existsMultiAsync(0, column, batch), workDeadline);
+                                            ns = System.nanoTime() - before;
+                                            if (readEvent != null) readEvent.failed = false;
+                                        } finally { endRead(readEvent); }
+                                        bulk.record(ns); (activeOpen ? overlap : steady).record(ns);
                                         if (before - openedAt < startupWindowMs * 1_000_000L) startupBulk.record(ns);
                                         if (!values.equals(Collections.nCopies(8, true))) throw new IllegalStateException("ExistsMulti mismatch");
                                     } else {
                                         Keys requestKey = keys(key(id));
-                                        long before = System.nanoTime(); Buf value = awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline);
-                                        long ns = System.nanoTime() - before; point.record(ns); (op % 2 == 0 ? hot : cold).record(ns); (activeOpen ? overlap : steady).record(ns);
+                                        var readEvent = beginRead(op % 2 == 0 ? "hot" : "uniform", salt, op);
+                                        long before = System.nanoTime();
+                                        Buf value;
+                                        long ns;
+                                        try {
+                                            value = awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline);
+                                            ns = System.nanoTime() - before;
+                                            if (readEvent != null) readEvent.failed = false;
+                                        } finally { endRead(readEvent); }
+                                        point.record(ns); (op % 2 == 0 ? hot : cold).record(ns); (activeOpen ? overlap : steady).record(ns);
                                         if (before - openedAt < startupWindowMs * 1_000_000L) {
                                             startupPoint.record(ns);
                                             if (op % 2 == 0) startupHot.record(ns);
@@ -359,7 +409,13 @@ public final class StartupEmbeddedQualification {
                                 }
                                 write.record(ns);
                                 if (before - openedAt < startupWindowMs * 1_000_000L) startupWrites.record(ns);
-                                verifyValue(awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline), ~id);
+                                var readEvent = beginRead("writer-verification", 2, sequence);
+                                Buf verified;
+                                try {
+                                    verified = awaitRequest(async.getAsync(0, column, requestKey, RequestType.current()), workDeadline);
+                                    if (readEvent != null) readEvent.failed = false;
+                                } finally { endRead(readEvent); }
+                                verifyValue(verified, ~id);
                                 completedWrites.incrementAndGet(); if (activeReaders) duringReads.incrementAndGet();
                                 long pause = 1_000_000_000L / 128 - (System.nanoTime() - cycle);
                                 if (pause > 0) TimeUnit.NANOSECONDS.sleep(pause);
@@ -372,6 +428,7 @@ public final class StartupEmbeddedQualification {
                         foregroundEnded = System.nanoTime();
                         if (foregroundEvent != null) foregroundEvent.failed = false;
                         output.put("cache_stats_before_final_capture", cacheStats(resources));
+                        if (PublicRead.TYPE.isEnabled()) output.put("primary_cache_stats_at_foreground_end", primaryCacheStats(internal));
                         if (budget != null) output.put("admission_at_foreground_end", admission(budget));
                     }
                     finally {

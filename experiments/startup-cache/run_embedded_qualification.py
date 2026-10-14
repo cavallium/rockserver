@@ -21,7 +21,8 @@ from experiment_support import sha256
 MODES = ("none", "cache", "admission", "both")
 DIAGNOSTIC_EVENTS = ("rockserver.StartupIoPolicy", "rockserver.StartupIoStorageFeedback",
                      "rockserver.ServicePut", "rockserver.NativePut",
-                     "rockserver.QualificationWrite", "rockserver.QualificationForeground")
+                     "rockserver.QualificationWrite", "rockserver.QualificationForeground",
+                     "rockserver.QualificationRead", "rockserver.NativeRead")
 
 
 def diagnostic_settings(path):
@@ -192,7 +193,7 @@ def main():
                 "sources": [{"path": str(s), "sha256": sha256(s)} for s in sources],
                 "diagnostics_jfr": {"enabled": a.diagnostics_jfr, "events": DIAGNOSTIC_EVENTS,
                     "maximum_recording_bytes": 256 * 1024**2,
-                    "scope": "Matched diagnostic timing only; recording overhead and possible data loss preclude performance acceptance"},
+                    "scope": "Diagnostic timings only; public read workload classes and native point/bulk distributions are separate. Concurrent reads cannot be uniquely matched by temporal containment. Recording overhead and possible data loss preclude performance acceptance"},
                 "runner_sha256": sha256(Path(__file__)), "runtime_artifacts": artifacts,
                 "expected_native_artifact": native_artifact, "expected_code_sources": expected_sources,
                 "java_option_environment": {name: os.environ.get(name) for name in
