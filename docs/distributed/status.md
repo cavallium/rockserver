@@ -229,6 +229,12 @@ This section and the remaining gates at the end describe the current branch.
   checkouts were not changed. Allocator-backed state/candidate/validation/registry
   storage, prospective control credit before USER WAL, full node resource bounds
   and final wrapper/source qualification remain unfinished.
+- Native checkpoint `b7644f3` repairs the temporary direct-read capability probe
+  when standalone user reads use mmap and compaction writes use direct I/O.
+  The probe disables mmap only for its direct-read attempt and restores the
+  configured mmap setting for buffered fallback. Three native option checks and
+  31 standalone Java cases pass against the rebuilt private task SDK
+  (`standalone-mmap-native-gate.log`, `standalone-shared-sdk-fixed-gate.log`).
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
@@ -1510,6 +1516,22 @@ owner concurrency is bounded separately from scheduler worker count; this is
 controlled correctness/resource evidence, not measured throughput or quorum density.
 
 ## Remaining architecture gates
+
+The current Thrift service now exposes merge-operator lookup, including optional
+versions and contextual asynchronous client dispatch. Two binary protocol/server
+and shared ensure-policy cases pass (`thrift-operator-gate.log`, commit `1ab5bc1`).
+Concrete socket-bound client execution is not covered by that fixture.
+
+Topology catalogue retirement now requires exact ACTIVE state and fresh committed
+ACTIVATE quorum evidence for every target. The controller retains the original
+retirement command and ACK across lost replies. Seven controlled cases pass,
+including split, lost retirement reply/reopen, then merge in the same catalogue;
+the original parent receipt, read pin and history survive subsequent child writes
+(`topology-retirement-pump-gate.log`). Review found that immediate quorum
+retirement removed the only unfinished-owner driver; its repair must preserve
+that progress before the patch is accepted. Quorum retirement with asynchronous
+lineage-safe catch-up, physical parent cleanup and its recovery barriers remain
+unfinished.
 
 - Reconcile the complete two-pool dynamic/import/schema/backup matrix and cold
   artifact quotas against the architecture. Controlled restore quota/unknown-force,
