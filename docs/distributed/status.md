@@ -189,6 +189,25 @@ This section and the remaining gates at the end describe the current branch.
   exhausting their actual remaining budget; refusal and range limits remain.
   Ledger candidate/validation/encoding storage, post-force authority allocations,
   full node bounds and final private JNI/wrapper integration remain open.
+- Native checkpoints `b4c5dbe` and `6259c51` count the current journal image
+  before allocating it and prepare issuers, proof ownership and qualification
+  nodes before their first durable transition. Allocation refusal preserves the
+  original state/ID; unknown force outcomes retain the proposed debt and recovery
+  fence. Fault tests exposed and repaired two additional cold-recovery defects:
+  empty WALs no longer declare phantom payload debt, and physical identities now
+  include bounded filesystem export handles so a reused inode cannot collide
+  with legitimately retained protected debt. Hardlinks, rename, retained-FD
+  qualification and root witnesses share that identity; LOCK qualification opens
+  no secondary descriptor. Missing generation support refuses qualification.
+  All 108 current Debug cases pass: 42 XFS completion/recovery, 34 filesystem and
+  32 planner (`control-generation-*-gate.log` in the native output directory).
+  These include refusal/retry, exact unknown-force reopen, cold data recovery
+  followed by a fresh flush, hardlink/rename/reopen and actual LOCK ownership.
+  The encoder retains one bounded image, but ledger state/candidate/validation
+  and registry heap still require captured shared admission. Source tracing also
+  confirms that the node's extent Env and pool raw limits do not yet share one
+  native RAM-budget owner. That wiring, full node bounds and final private
+  JNI/wrapper qualification remain unfinished.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
