@@ -71,8 +71,21 @@ final class RatisPointOwnerManager implements AutoCloseable {
     }
     CompletableFuture<List<RemoteMutationOwner>> discover(RequestContext context) {
         final long deadline;try{deadline=scheduler.resolveMonotonicDeadline(context);}catch(RuntimeException invalid){return CompletableFuture.failedFuture(invalid);}synchronized(this){if(closed || fenced || busy)return CompletableFuture.failedFuture(new IOException("Point owner discovery closed, uncertain or already active"));busy=true;}
-        var actual=budget.recover(()->{check(deadline);for(var entry:List.copyOf(entries))if(pending(entry))open(entry);var authority=epochs.read();if(authority==null)throw new IOException("Native owner authority unavailable");for(int slot=0;slot<selected.length;slot++){Entry entry;synchronized(this){entry=entries.get(selected[slot]);}if(entry.actor.renewalRequired(authority)){check(deadline);var current=catalogue.read(schema.domainId());if(current==null)throw new IOException("Authoritative renewal placement unavailable");start(slot,current);}}check(deadline);return available();});
+        var actual=budget.recover(()->{
+            check(deadline);var failures=new ArrayList<Throwable>();
+            for(var entry:List.copyOf(entries))if(pending(entry))try{open(entry);}catch(IOException|RuntimeException failure){retainSlotFailure(deadline,failure,failures);}
+            var authority=epochs.read();if(authority==null)throw new IOException("Native owner authority unavailable");
+            for(int slot=0;slot<selected.length;slot++){
+                Entry entry;boolean retainedIntent;synchronized(this){entry=entries.get(selected[slot]);int selectedSlot=slot;retainedIntent=entries.stream().anyMatch(candidate->candidate.slot==selectedSlot && pending(candidate));}
+                if(retainedIntent)continue;
+                try{if(entry.actor.renewalRequired(authority)){check(deadline);entry.actor.beginRenewal();var current=catalogue.read(schema.domainId());if(current==null)throw new IOException("Authoritative renewal placement unavailable");start(slot,current);}}catch(IOException|RuntimeException failure){retainSlotFailure(deadline,failure,failures);}
+            }
+            check(deadline);var owners=available();if(owners.isEmpty() && !failures.isEmpty()){var failure=new IOException("No usable point owner; original failed slot work remains retained",failures.getFirst());for(int index=1;index<failures.size();index++)failure.addSuppressed(failures.get(index));throw failure;}return owners;
+        });
         actual.whenComplete((value,failure)->{synchronized(this){busy=false;}});return actual.copy();
+    }
+    private void retainSlotFailure(long deadline,Throwable failure,List<Throwable> failures)throws IOException {
+        check(deadline);synchronized(this){if(fenced || closed)throw new IOException("Point manager selector ownership is uncertain",failure);}failures.add(failure);
     }
     private void check(long deadline)throws IOException{if(deadline!=Long.MAX_VALUE && scheduler.isMonotonicDeadlineExpired(deadline))throw new IOException("Point owner discovery deadline expired; original renewal intent retained");}
     synchronized List<RemoteMutationOwner> available(){var result=new ArrayList<RemoteMutationOwner>();if(fenced || closed)return List.of();for(int index:selected)if(index>=0){var actor=entries.get(index).actor;try{if(actor!=null && actor.acceptsPreparation() && actor.activeRequests()==0 && actor.recoveryState()==RatisRocksDBDirect.RecoveryState.NONE)result.add(actor.owner());}catch(IOException unavailable){/* Exact historical authority remains retained. */}}return List.copyOf(result);}

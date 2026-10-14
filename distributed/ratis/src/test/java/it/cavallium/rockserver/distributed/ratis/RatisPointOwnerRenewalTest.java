@@ -19,9 +19,9 @@ class RatisPointOwnerRenewalTest {
         final RatisRequestBudget budget;final RatisRocksDBConnection.SessionFactory sessions;final AtomicInteger opens=new AtomicInteger();
         final AtomicBoolean loseIssue=new AtomicBoolean(),loseBinding=new AtomicBoolean();final AtomicReference<SessionEpochLedger.Grant> lost=new AtomicReference<>();final AtomicReference<RatisSessionBindingPlan> lostPlan=new AtomicReference<>();final AtomicReference<Path> lostBindingRoot=new AtomicReference<>();
         volatile CountDownLatch entered,release;final AtomicLong commands=new AtomicLong(900);final Path ownersRoot;
-        Fixture(Path fixtureRoot,int history)throws Exception {
+        Fixture(Path fixtureRoot,int history,int slots)throws Exception {
             f=new RatisAtomicClientTest.Fixture(fixtureRoot.resolve("native"),true);ownersRoot=fixtureRoot.resolve("owners");
-            budget=new RatisRequestBudget(new RemoteMutationOwnerLimits(1,history,history,128L<<20,16L<<20,8L<<20,1));
+            budget=new RatisRequestBudget(new RemoteMutationOwnerLimits(slots,history,history,128L<<20,16L<<20,8L<<20,1));
             var directories=f.catalogue.epochs.catalogue(f.outer.directoryColumn);assertEquals(CommandResult.Status.SUCCESS,directories.execute(directories.prepare(f.outer.operation(commands.getAndIncrement()),null,f.directory)).status());
             sessions=new RatisRocksDBConnection.SessionFactory(List.of(f.data,f.homeClient),(path,schema,plan)->{
                 opens.incrementAndGet();
@@ -40,7 +40,7 @@ class RatisPointOwnerRenewalTest {
         public void close()throws Exception{budget.close();f.close();}
     }
     @Test void expiredQuiescentGrantRenewsOnceAndOldTokenRemainsAckedAcrossColdReopen()throws Exception {
-        try(var x=new Fixture(root,4)) {
+        try(var x=new Fixture(root,4,1)) {
             RemoteMutationToken oldToken,newToken;RemoteMutationOwner replacement;
             try(var manager=x.open()) {
                 var original=await(manager.discover(RequestContext.batch())).getFirst();oldToken=x.write(manager,original,2,7);int grants=x.f.catalogue.epochs.read().grants().size();assertEquals(original.ownerId(),await(manager.discover(RequestContext.batch())).getFirst().ownerId());assertEquals(grants,x.f.catalogue.epochs.read().grants().size(),"Healthy quiescence must not rotate grants");
@@ -51,20 +51,20 @@ class RatisPointOwnerRenewalTest {
         }
     }
     @Test void preparedAndTerminalUnackedRequestsPreventRenewalAndHistoryQuotaPrecedesIssuance()throws Exception {
-        try(var x=new Fixture(root,1);var manager=x.open()) {
+        try(var x=new Fixture(root,1,1);var manager=x.open()) {
             var owner=manager.available().getFirst();var actor=manager.select(owner);var token=await(actor.prepareSequence(owner,UUID.randomUUID(),0,71,List.of(RatisAtomicClientTest.key(2)),List.of(RatisAtomicClientTest.value(9)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,false,RequestContext.batch()));x.expire(owner);int opens=x.opens.get();assertThrows(ExecutionException.class,()->await(manager.discover(RequestContext.batch())));assertEquals(RemoteMutationStatus.State.PREPARED,actor.status(token).state());assertEquals(opens,x.opens.get());
             try{await(actor.execute(token,RequestContext.batch()));}catch(ExecutionException expired){assertEquals(CommandResult.Status.SESSION_EXPIRED,actor.status(token).outcome());}assertEquals(RemoteMutationStatus.State.TERMINAL,actor.status(token).state());assertThrows(ExecutionException.class,()->await(manager.discover(RequestContext.batch())));assertEquals(opens,x.opens.get());actor.acknowledgeResult(token,actor.status(token).resultDigest());int grants=x.f.catalogue.epochs.read().grants().size();assertThrows(ExecutionException.class,()->await(manager.discover(RequestContext.batch())));assertEquals(opens,x.opens.get());assertEquals(grants,x.f.catalogue.epochs.read().grants().size());assertEquals(1,manager.all().size());assertTrue(manager.available().isEmpty());
         }
     }
     @Test void lostIssueAndBindingRepliesReopenTheSameForcedRenewalIntent()throws Exception {
-        for(boolean binding:List.of(false,true))try(var x=new Fixture(root.resolve("lost-"+binding),4)) {
+        for(boolean binding:List.of(false,true))try(var x=new Fixture(root.resolve("lost-"+binding),4,1)) {
             SessionEpochLedger.Grant issued;
             try(var manager=x.open()){var owner=manager.available().getFirst();x.write(manager,owner,2,1);x.expire(owner);if(binding)x.loseBinding.set(true);else x.loseIssue.set(true);assertThrows(ExecutionException.class,()->await(manager.discover(RequestContext.batch())));issued=x.lost.get();assertNotNull(issued);assertEquals(1,manager.all().size());}
             try(var cold=x.open()){var owner=await(cold.discover(RequestContext.batch())).getFirst();assertEquals(issued.sessionId(),owner.ownerId());assertEquals(issued.epoch(),owner.ownerEpoch());int grants=x.f.catalogue.epochs.read().grants().size();x.write(cold,owner,3,2);assertEquals(grants,x.f.catalogue.epochs.read().grants().size());assertArrayEquals(new byte[]{2},x.f.get(71,RatisAtomicClientTest.key(3)));}
         }
     }
     @Test void canceledRenewalObserverKeepsNewOwnerCreditAndSelectorForceUncertaintyReopensExactly()throws Exception {
-        try(var x=new Fixture(root,4)) {
+        try(var x=new Fixture(root,4,1)) {
             UUID replacement;
             try(var manager=x.open()){var owner=manager.available().getFirst();x.write(manager,owner,2,1);x.expire(owner);x.entered=new CountDownLatch(1);x.release=new CountDownLatch(1);var renewal=manager.discover(RequestContext.batch());assertTrue(x.entered.await(10,TimeUnit.SECONDS));long charged=x.budget.chargedBytes();assertTrue(renewal.cancel(false));assertEquals(charged,x.budget.chargedBytes());assertThrows(IOException.class,manager::close);x.release.countDown();await(x.budget.recover(()->null));replacement=manager.available().getFirst().ownerId();assertNotEquals(owner.ownerId(),replacement);x.entered=null;var current=manager.available().getFirst();x.write(manager,current,3,2);x.expire(current);manager.afterSelectorForce(()->{throw new IllegalStateException("Lost selector force reply");});assertThrows(ExecutionException.class,()->await(manager.discover(RequestContext.batch())));assertTrue(manager.available().isEmpty());}
             try(var cold=x.open()){var owner=await(cold.discover(RequestContext.batch())).getFirst();assertNotEquals(replacement,owner.ownerId());int grants=x.f.catalogue.epochs.read().grants().size();x.write(cold,owner,4,3);assertEquals(grants,x.f.catalogue.epochs.read().grants().size());}
@@ -92,7 +92,7 @@ class RatisPointOwnerRenewalTest {
 
     static RangeDirectory advancePlacement(RangeDirectory directory){return new RangeDirectory(directory.clusterId(),directory.databaseId(),directory.domainId(),directory.schemaEpoch(),directory.schemaDigest(),directory.generation()+1,directory.columns(),directory.routingPrefixBytes(),directory.ranges());}
     @Test void pendingBindingPlanReopensOriginalDataAndHomeDirectoriesDespiteLaterAdvancement()throws Exception {
-        try(var x=new Fixture(root,4)) {
+        try(var x=new Fixture(root,4,1)) {
             var directories=x.f.catalogue.epochs.catalogue(x.f.outer.directoryColumn);var dataFirst=advancePlacement(x.f.directory);var homeFirst=advancePlacement(x.f.homeClient.directory());RemoteMutationToken originalToken;SessionEpochLedger.Grant issued;byte[] planBytes;
             try(var manager=x.open()) {
                 var owner=manager.available().getFirst();originalToken=x.write(manager,owner,2,1);
@@ -124,6 +124,14 @@ class RatisPointOwnerRenewalTest {
                 try(var retained=RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,f.directory)){assertArrayEquals(original,DistributedCommandCodec.encode(retained.pendingCommand()));assertEquals(CommandResult.Status.SUCCESS,retained.execute().status());assertNotNull(retained.propagated());}
                 assertEquals(2,sent.size());assertArrayEquals(original,sent.getFirst());assertArrayEquals(original,sent.getLast());assertThrows(IOException.class,()->RatisSessionMaintenance.frozenBinding(journal,f.catalogue.epochs,routed,group,latest));assertEquals(2,sent.size());
             }
+        }
+    }
+
+    @Test void expiredPreparedSlotCannotPreventAnotherQuiescentSlotFromRenewing()throws Exception {
+        try(var x=new Fixture(root,4,2);var manager=x.open()) {
+            var original=manager.available();assertEquals(2,original.size());var blocked=original.get(0);var reusable=original.get(1);var actor=manager.select(blocked);var token=await(actor.prepareSequence(blocked,UUID.randomUUID(),0,71,List.of(RatisAtomicClientTest.key(2)),List.of(RatisAtomicClientTest.value(9)),RatisRocksDBDirect.WriteKind.PUT,RequestType.RequestTypeId.NOTHING,false,RequestContext.batch()));var acknowledged=x.write(manager,reusable,3,2);x.expire(blocked);assertEquals(1,x.budget.retainedRequests());long bytes=x.budget.chargedBytes();
+            var available=await(manager.discover(RequestContext.batch()));assertEquals(1,available.size());var renewed=available.getFirst();assertNotEquals(reusable.ownerId(),renewed.ownerId());assertNotEquals(blocked.ownerId(),renewed.ownerId());assertSame(actor,manager.select(blocked));var retained=actor.status(token);assertEquals(RemoteMutationStatus.State.PREPARED,retained.state());assertEquals(0,retained.appliedMutations());assertEquals(1,x.budget.retainedRequests());assertTrue(x.budget.chargedBytes()>bytes,"Renewal adds metadata credit while preserving the blocked request");assertNull(x.f.get(71,RatisAtomicClientTest.key(2)));assertEquals(RemoteMutationStatus.State.ACKNOWLEDGED,manager.select(acknowledged).status(acknowledged).state());assertEquals(3,manager.all().size());
+            x.write(manager,renewed,4,3);assertArrayEquals(new byte[]{3},x.f.get(71,RatisAtomicClientTest.key(4)));assertEquals(RemoteMutationStatus.State.PREPARED,actor.status(token).state());assertEquals(1,x.budget.retainedRequests());assertNull(x.f.get(71,RatisAtomicClientTest.key(2)));
         }
     }
 

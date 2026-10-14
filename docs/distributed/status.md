@@ -1598,8 +1598,14 @@ A bounded root-owned directory lease permits its exact business preparation and
 is released when the root closes. All seven renewal cases pass
 (`point-renewal-directory-lease-second-gate.log`); the preceding focused gate also
 passed seven maintenance, three backend-session and three factory cases.
-This does not establish actual HOME relocation. Independent expired-slot discovery
-and shared envelope integration for bulk/range actors remain unfinished.
+This does not establish actual HOME relocation. Discovery now isolates failed
+expired slots: an original prepared/unknown slot retains its token and credit,
+while a separate quiescent expired slot can renew and execute. No replacement
+intent is allocated over an unresolved one. Global selector uncertainty and
+deadlines still stop discovery; if no owner is usable, the original failures are
+reported. Eight renewal and two pipeline cases pass
+(`point-renewal-slot-isolation-fixed-gate.log`). Shared envelope integration for
+bulk/range actors remains unfinished in the separate SDK resource worktree.
 
 Node-owned physical discovery now returns bounded qualified targets and actual
 per-CF scalar/comparator observations, without synthesizing a logical estimate
