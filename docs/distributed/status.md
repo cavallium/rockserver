@@ -49,6 +49,15 @@ This section and the remaining gates at the end describe the current branch.
   The recipe enables RTTI in every release profile; shell and generated flag-matrix
   checks pass. The installed private JNI remains the qualified Debug candidate;
   this recipe repair does not establish a production native build.
+- The separate native candidate at `902f574` combines accepted-prefix MANIFEST
+  recovery, bounded raw writing and prepaid cohort primitives in one current
+  layout. Its Debug build passes, followed by 80 component cases: 28 extent,
+  20 completion, nine inventory, ten blob-builder and 13 raw-writer cases.
+  Evidence is `raw-primitives-merge-qualification.json` in the task-owned
+  `native-completion-integration-output` directory. Actual producer and atomic
+  orchestration, ordered installation, cold raw-cohort resolution and retained
+  source-owner barriers remain pending. This candidate has not replaced the
+  installed private JNI or established protected completion in the node.
 - The core pool owner now borrows one NativeExtentEnv for writable options,
   preflight/read-only opens and both bounded listings. Native Logger callbacks
   remain owned through Options cleanup; qualified paths are canonical and use
