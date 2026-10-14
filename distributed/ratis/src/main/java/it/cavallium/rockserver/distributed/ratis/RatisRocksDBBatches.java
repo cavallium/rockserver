@@ -24,8 +24,8 @@ public final class RatisRocksDBBatches implements AutoCloseable {
     private ScheduledThreadPoolExecutor deadlineTimer;
     private volatile Progress retainedProgress;
     private volatile Runnable beforeAcknowledgementMarker;
-    public RatisRocksDBBatches(DistributedSchema schema,RatisRoutedClient routed,RatisDurableSessionClient dedicatedSession,RWScheduler scheduler,Path path,SessionOwnership ownership) throws IOException {
-        this.schema=Objects.requireNonNull(schema); this.routed=Objects.requireNonNull(routed); session=Objects.requireNonNull(dedicatedSession); this.scheduler=Objects.requireNonNull(scheduler); this.ownership=Objects.requireNonNull(ownership); routed.requireKnownSchema(schema); directory=routed.directory(schema);
+    public RatisRocksDBBatches(DistributedSchema schema,RangeDirectory frozenDirectory,RatisRoutedClient routed,RatisDurableSessionClient dedicatedSession,RWScheduler scheduler,Path path,SessionOwnership ownership) throws IOException {
+        this.schema=Objects.requireNonNull(schema); this.routed=Objects.requireNonNull(routed); session=Objects.requireNonNull(dedicatedSession); this.scheduler=Objects.requireNonNull(scheduler); this.ownership=Objects.requireNonNull(ownership); routed.requireKnownSchema(schema); directory=Objects.requireNonNull(frozenDirectory);schema.requireMatches(directory);
         byte[] binding; var grant=session.grant();
         try { var digest=java.security.MessageDigest.getInstance("SHA-256"); digest.update(schema.digest()); digest.update(routed.sessionIdentityDigest()); digest.update(ByteBuffer.allocate(40).putLong(grant.sessionId().getMostSignificantBits()).putLong(grant.sessionId().getLeastSignificantBits()).putLong(grant.epoch()).putLong(grant.issuedAtMillis()).putLong(grant.expiresAtMillis()).array()); binding=digest.digest(); }
         catch(java.security.NoSuchAlgorithmException impossible) { throw new AssertionError(impossible); }

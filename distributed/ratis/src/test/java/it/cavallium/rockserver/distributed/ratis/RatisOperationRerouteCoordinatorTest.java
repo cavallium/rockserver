@@ -31,8 +31,11 @@ class RatisOperationRerouteCoordinatorTest {
         final UUID homeGroup=new UUID(0,500),homeColumn=new UUID(0,501);final Map<UUID,ReplicatedRangeStore> stores=new HashMap<>();final Map<UUID,RatisRangeStateMachine> machines=new HashMap<>();final List<RaftStorage> storage=new ArrayList<>();
         final RatisDurableLogicalSession logical;final Path logicalRoot=root.resolve("logical");final RatisRoutedClient data,homeClient;final RatisTransactionStatuses homes;final RatisOperationRerouteCoordinator coordinator;final RatisDurableSessionClient window;
         int opens;boolean losePromotion,losePublication,loseAck,loseConsume;volatile boolean promotionUncertain,ackUncertain,consumeUncertain;final List<HomeRecovery> consumes=new ArrayList<>();final List<DistributedCommand> ackCommands=new ArrayList<>();final Path windowPath=root.resolve("window.bin");
-        Fixture()throws Exception {this(false);}
-        Fixture(boolean logicalSession)throws Exception {
+        final boolean logicalSession;
+        Fixture()throws Exception {this(false,false);}
+        Fixture(boolean logicalSession)throws Exception {this(logicalSession,false);}
+        Fixture(boolean logicalSession,boolean deferSplit)throws Exception {
+            this.logicalSession=logicalSession;
             catalogue=outer.new Fixture(root.resolve("catalogue"));source=new RatisTopologyCdcPollTest.Fixture(root.resolve("source"),outer.cluster,outer.database,new UUID(0,510));
             var initial=SessionEpochLedger.initial(outer.cluster,outer.database,10);assertEquals(CommandResult.Status.SUCCESS,catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(0),null,initial)).status());assertEquals(CommandResult.Status.SUCCESS,catalogue.epochs.execute(catalogue.epochs.prepare(outer.operation(1),initial,source.ledger.get())).status());
             var prior=source.ledger.get();var exclusive=prior.issue(new UUID(0,540),SessionEpochLedger.MAX_LIFETIME_MILLIS+10);
@@ -43,14 +46,6 @@ class RatisOperationRerouteCoordinatorTest {
             if(logicalSession) {
                 logical=RatisDurableLogicalSession.create(Files.createDirectory(logicalRoot),source.schema,catalogue.epochs,data,homes,scheduler,catalogue.epochs.catalogue(outer.directoryColumn),header->{var definition=TopologyChange.Definition.decode(point(RatisTopologyCatalogue.definitionKey(header.definitionDigest())));header.requireDefinition(definition);return definition.sourceDirectory();},1000,RatisSessionClient.Limits.defaults());logical.advance();source.ledger.set(catalogue.epochs.read());var logicalGrant=logical.progress().grant();source.apply(DistributedCommand.sessionControl(source.groupId,1,source.schema.digest(),new OperationId(source.admin,1,2),RangeSessionControl.bind(source.ledger.get(),logicalGrant,1024),-1));
             } else logical=null;
-            byte[] state=TopologyChange.State.begin(source.definition.header()).beginFencing().encode();byte[] admission=OperatorUpload.sha256(ByteBuffer.allocate(16+state.length).putLong(outer.catalogue.getMostSignificantBits()).putLong(outer.catalogue.getLeastSignificantBits()).put(state).array());
-            source.freeze=source.store.applyTopologyFreeze(new ApplyPosition(1,++source.index),source.definition,admission);source.machine.notifyTermIndexUpdated(1,source.index);var authority=TopologyChange.State.begin(source.definition.header()).beginFencing().frozen(source.freeze.proof(source.local.replicaId()));source.seed=source.pool.seedTopology(source.definition,authority,List.of(source.store),source.local);
-            for(var route:source.target.ranges())authority=authority.seeded(source.seed.proof(route.groupId()));authority=authority.publish();writeCatalogue(authority);
-            for(var route:source.target.ranges()) {
-                var child=source.pool.reopenTopologyRange(source.seed.birth(route.groupId()),source.schema);child.initializeConfiguration(source.store.configuration().data());child.applyNoop(new ApplyPosition(1,0));var activated=child.applyTopologyActivation(new ApplyPosition(1,1),source.definition,authority.freezeDigest(),outer.catalogue,catalogue.store.applied(),NativeTopologyActivation.publicationCommitment(source.definition,authority.freezeDigest(),outer.catalogue));authority=authority.activated(activated.proof());stores.put(route.groupId(),child);
-            }
-            writeCatalogue(authority);
-            if(!logicalSession)data.refresh(source.target);
             var home=source.pool.openRange(new RangeOwnership.Owner(homeGroup,1),new RangeOwnership.Interval(homeDirectory.domainId(),Set.of(homeColumn),null,null),new byte[32],Map.of(homeColumn,"reroute-home"),Set.of());stores.put(homeGroup,home);
             var proof=new RatisOperationRerouteAdmission(new RatisOperationRerouteAdmission.Authority(){
                 public TopologyChange.State intent(UUID intent)throws IOException{return TopologyChange.State.decode(point(RatisTopologyCatalogue.stateKey(intent)));}
@@ -59,9 +54,6 @@ class RatisOperationRerouteCoordinatorTest {
                 public RatisTopologyOperationOutcomeRpc.Reply outcome(RangeDirectory directory,RangeDescriptor route,DistributedCommand command)throws IOException{return data.operationOutcome(data.restoreSessionCommand(directory,command,route));}
             },outer.catalogue);
             var homeMachine=RatisRangeStateMachine.withSessions(home,group(homeGroup,"home"),new NativeRangeImage.Limits(4<<20,32<<20,2),RatisTransactionStatuses.validator(outer.cluster,outer.database,homeGroup,1,new byte[32],homeColumn),catalogue.epochs,homeDirectory,RatisRangeStateMachine.RetentionLimits.defaults(),()->new RatisRangeStateMachine.Leadership(1,true));homeMachine.role(RatisNodePlan.Role.TRANSACTION_HOME,(key,value)->RatisTransactionStatuses.validateRecord(outer.cluster,outer.database,key,value));homeMachine.homeRecoveryReservations(outer.cluster,outer.database,homeColumn);homeMachine.homeRecoveryData(data);homeMachine.proofQueries(proofs);homeMachine.operationRerouteQueries(reroutes);homeMachine.operationRerouteProofAdmission(proof::validate);initialize(homeGroup,"home",homeMachine);
-            for(var route:source.target.ranges()) {
-                var machine=RatisRangeStateMachine.withSessions(stores.get(route.groupId()),group(route.groupId(),source.peer.getId().toString()),new NativeRangeImage.Limits(4<<20,32<<20,2),command->{},catalogue.epochs,source.target,RatisRangeStateMachine.RetentionLimits.defaults(),()->new RatisRangeStateMachine.Leadership(1,true));machine.proofQueries(proofs);machine.transactionHomes(homes);initialize(route.groupId(),source.peer.getId().toString(),machine);
-            }
             var publication=new RatisSourceOutcomeAdmission(new RatisSourceOutcomeAdmission.Authority(){
                 public TransactionStatus home(HomeIdentity identity)throws IOException{return homes.read(identity.definition().transactionId());}
                 public ParticipantOutcome outcome(RangeDirectory directory,RangeDescriptor route,UUID transaction)throws IOException{try{return stores.get(route.groupId()).finalizedParticipant(transaction);}catch(Exception failure){throw new IOException(failure);}}
@@ -69,6 +61,21 @@ class RatisOperationRerouteCoordinatorTest {
             });
             var originalMachine=RatisRangeStateMachine.withSessions(source.store,source.group,new NativeRangeImage.Limits(4<<20,32<<20,2),command->{},catalogue.epochs,source.directory,RatisRangeStateMachine.RetentionLimits.defaults(),()->new RatisRangeStateMachine.Leadership(1,true));originalMachine.cdcBinding(outer.cluster,outer.database,source.rangeId);originalMachine.proofQueries(proofs);originalMachine.sourceOutcomeQueries(publications);originalMachine.sourceOutcomeAdmission(publication::qualify);stores.put(source.groupId,source.store);initialize(source.groupId,source.peer.getId().toString(),originalMachine);
             var grant=freshBusiness;window=RatisDurableSessionClient.create(windowPath,data,source.ledger.get(),grant,new RatisSessionClient.Limits(16,16L<<20,16L<<20));coordinator=new RatisOperationRerouteCoordinator(root.resolve("reroutes"),source.schema,catalogue.epochs,data,homes,scheduler,grant,window.limits(),catalogue.epochs.catalogue(outer.directoryColumn),header->{var definition=TopologyChange.Definition.decode(point(RatisTopologyCatalogue.definitionKey(header.definitionDigest())));header.requireDefinition(definition);return definition.sourceDirectory();});
+            if(!deferSplit)activateSplit();
+        }
+        void activateSplit()throws Exception {
+            if(source.seed!=null)throw new IllegalStateException("Fixture split already activated");
+            byte[] state=TopologyChange.State.begin(source.definition.header()).beginFencing().encode();byte[] admission=OperatorUpload.sha256(ByteBuffer.allocate(16+state.length).putLong(outer.catalogue.getMostSignificantBits()).putLong(outer.catalogue.getLeastSignificantBits()).put(state).array());
+            source.freeze=source.store.applyTopologyFreeze(new ApplyPosition(1,source.index=source.store.applied().index()+1),source.definition,admission);source.machine.notifyTermIndexUpdated(1,source.index);machines.get(source.groupId).notifyTermIndexUpdated(1,source.index);var authority=TopologyChange.State.begin(source.definition.header()).beginFencing().frozen(source.freeze.proof(source.local.replicaId()));source.seed=source.pool.seedTopology(source.definition,authority,List.of(source.store),source.local);
+            for(var route:source.target.ranges())authority=authority.seeded(source.seed.proof(route.groupId()));authority=authority.publish();writeCatalogue(authority);
+            for(var route:source.target.ranges()) {
+                var child=source.pool.reopenTopologyRange(source.seed.birth(route.groupId()),source.schema);child.initializeConfiguration(source.store.configuration().data());child.applyNoop(new ApplyPosition(1,0));var activated=child.applyTopologyActivation(new ApplyPosition(1,1),source.definition,authority.freezeDigest(),outer.catalogue,catalogue.store.applied(),NativeTopologyActivation.publicationCommitment(source.definition,authority.freezeDigest(),outer.catalogue));authority=authority.activated(activated.proof());stores.put(route.groupId(),child);
+            }
+            writeCatalogue(authority);
+            if(!logicalSession)data.refresh(source.target);
+            for(var route:source.target.ranges()) {
+                var machine=RatisRangeStateMachine.withSessions(stores.get(route.groupId()),group(route.groupId(),source.peer.getId().toString()),new NativeRangeImage.Limits(4<<20,32<<20,2),command->{},catalogue.epochs,source.target,RatisRangeStateMachine.RetentionLimits.defaults(),()->new RatisRangeStateMachine.Leadership(1,true));machine.proofQueries(proofs);machine.transactionHomes(homes);initialize(route.groupId(),source.peer.getId().toString(),machine);
+            }
         }
         byte[] point(byte[] key)throws IOException{try{return catalogue.store.readCurrentPoint(outer.directoryColumn,key);}catch(org.rocksdb.RocksDBException failure){throw new IOException(failure);}}
         byte[] key(UUID id){return ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();}
