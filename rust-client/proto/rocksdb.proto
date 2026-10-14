@@ -528,3 +528,57 @@ message ColumnTablePropertiesResponse {
   map<string, int64> propertyCollectors = 28;
   map<string, int64> compressions = 29;
 }
+
+// Explicit durable caller-owned mutations. Tokens are the canonical 193-byte encoding.
+message RemoteMutationAuthority {
+  bytes clusterId = 1; bytes databaseId = 2; bytes domainId = 3; bytes ownerId = 4;
+  int64 ownerEpoch = 5; int64 nextRequestSequence = 6; string kind = 7;
+  bytes schemaDigest = 8; bytes directoryDigest = 9;
+}
+message RemoteMutationOwnersRequest { int64 column = 1; RequestContext context = 2; }
+message RemoteMutationOwnersResponse { repeated RemoteMutationAuthority owners = 1; }
+message RemoteMutationEntry { KeyTuple key = 1; optional bytes value = 2; }
+message RemoteMutationPreparePointRequest {
+  RemoteMutationAuthority owner = 1; bytes requestId = 2; int64 requestSequence = 3;
+  int64 column = 4; repeated RemoteMutationEntry entries = 5; string kind = 6;
+  string callback = 7; bool multi = 8; bool valuesPresent = 9; RequestContext context = 10;
+}
+message RemoteMutationPrepareRangeRequest {
+  RemoteMutationAuthority owner = 1; bytes requestId = 2; int64 requestSequence = 3;
+  int64 column = 4; KeyTuple lower = 5; KeyTuple upper = 6; RequestContext context = 7;
+}
+message RemoteMutationPrepareBulkRequest {
+  RemoteMutationAuthority owner = 1; bytes requestId = 2; int64 requestSequence = 3;
+  int64 column = 4; bool merge = 5; RequestContext context = 6;
+}
+message RemoteMutationTokenResponse { bytes token = 1; }
+message RemoteMutationTokenRequest { bytes token = 1; RequestContext context = 2; }
+message RemoteMutationObservation {
+  bytes token = 1; string state = 2; int64 appliedMutations = 3; int64 copiedBatches = 4;
+  int32 retainedResults = 5; optional string outcome = 6; optional bytes resultDigest = 7;
+}
+message RemoteMutationResultsRequest {
+  bytes token = 1; int32 offset = 2; int32 maximumItems = 3; int32 maximumBytes = 4; RequestContext context = 5;
+}
+message RemoteMutationPage {
+  RemoteMutationObservation status = 1; int32 offset = 2; int32 nextOffset = 3;
+  repeated bytes rows = 4; bool hasMore = 5;
+}
+message RemoteMutationAcknowledgeRequest { bytes token = 1; bytes resultDigest = 2; RequestContext context = 3; }
+message RemoteMutationAppendRequest {
+  bytes token = 1; int64 ordinal = 2; repeated RemoteMutationEntry entries = 3;
+  bytes inputDigest = 4; RequestContext context = 5;
+}
+service RemoteMutationService {
+  rpc owners(RemoteMutationOwnersRequest) returns (RemoteMutationOwnersResponse);
+  rpc preparePoint(RemoteMutationPreparePointRequest) returns (RemoteMutationTokenResponse);
+  rpc prepareRange(RemoteMutationPrepareRangeRequest) returns (RemoteMutationTokenResponse);
+  rpc prepareBulk(RemoteMutationPrepareBulkRequest) returns (RemoteMutationTokenResponse);
+  rpc execute(RemoteMutationTokenRequest) returns (RemoteMutationObservation);
+  rpc resume(RemoteMutationTokenRequest) returns (RemoteMutationObservation);
+  rpc status(RemoteMutationTokenRequest) returns (RemoteMutationObservation);
+  rpc results(RemoteMutationResultsRequest) returns (RemoteMutationPage);
+  rpc acknowledge(RemoteMutationAcknowledgeRequest) returns (RemoteMutationObservation);
+  rpc appendBatch(RemoteMutationAppendRequest) returns (RemoteMutationObservation);
+  rpc finishInput(RemoteMutationTokenRequest) returns (RemoteMutationObservation);
+}

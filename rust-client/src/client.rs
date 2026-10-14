@@ -60,7 +60,8 @@ impl std::error::Error for RockserverConnectError {
 #[derive(Clone, Debug)]
 pub struct RockserverClient {
     client: DeadlineClient,
-    context: RequestContext,
+    channel: Channel,
+    pub(crate) context: RequestContext,
     capabilities: Capabilities,
 }
 
@@ -70,7 +71,7 @@ type DeadlineClient = RocksDbServiceClient<InterceptedService<Channel, DeadlineI
 struct BoundDeadline(tokio::time::Instant);
 
 #[derive(Clone, Copy, Debug, Default)]
-struct DeadlineInterceptor;
+pub(crate) struct DeadlineInterceptor;
 
 impl Interceptor for DeadlineInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>> {
@@ -89,12 +90,12 @@ impl Interceptor for DeadlineInterceptor {
     }
 }
 
-struct PreparedRequest<T> {
-    request: Request<T>,
-    deadline: Option<tokio::time::Instant>,
+pub(crate) struct PreparedRequest<T> {
+    pub(crate) request: Request<T>,
+    pub(crate) deadline: Option<tokio::time::Instant>,
 }
 
-async fn await_bound_call<F, R>(deadline: Option<tokio::time::Instant>, future: F) -> Result<R>
+pub(crate) async fn await_bound_call<F, R>(deadline: Option<tokio::time::Instant>, future: F) -> Result<R>
 where
     F: Future<Output = Result<R>>,
 {
@@ -137,6 +138,7 @@ impl RockserverClient {
             .await
             .map_err(RockserverConnectError::Capabilities)?;
         Ok(Self {
+            channel: channel.clone(),
             client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
                 .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES),
             context,
@@ -151,6 +153,7 @@ impl RockserverClient {
             .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES);
         let capabilities = Self::require_capabilities(&mut handshake_client).await?;
         Ok(Self {
+            channel: channel.clone(),
             client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
                 .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES),
             context,
@@ -159,8 +162,9 @@ impl RockserverClient {
     }
 
     #[cfg(test)]
-    fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
+    pub(crate) fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
         Self {
+            channel: channel.clone(),
             client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
                 .max_decoding_message_size(MAX_DECODING_MESSAGE_BYTES),
             context,
@@ -203,9 +207,18 @@ impl RockserverClient {
     pub fn with_context(&self, context: RequestContext) -> Self {
         Self {
             client: self.client.clone(),
+            channel: self.channel.clone(),
             context,
             capabilities: self.capabilities,
         }
+    }
+
+    /// Explicit caller-owned mutations, supported only by distributed backends.
+    pub fn remote_mutations(&self) -> Result<crate::RemoteMutationClient> {
+        if self.capabilities.backend_mode != BackendMode::Distributed {
+            return Err(Status::unimplemented("explicit remote mutations require a distributed backend"));
+        }
+        Ok(crate::RemoteMutationClient::from_client(self.clone(), self.channel.clone()))
     }
 
     fn validated_timeout(&self) -> Result<Option<Duration>> {
@@ -243,7 +256,7 @@ impl RockserverClient {
         })
     }
 
-    fn contextual_request<T>(&self, message: T) -> Result<PreparedRequest<T>> {
+    pub(crate) fn contextual_request<T>(&self, message: T) -> Result<PreparedRequest<T>> {
         let timeout = self.validated_timeout()?;
         let deadline =
             timeout.and_then(|duration| tokio::time::Instant::now().checked_add(duration));

@@ -88,3 +88,6 @@ mod types;
 
 pub use client::*;
 pub use types::*;
+
+pub mod remote_mutation;
+pub use remote_mutation::*;
