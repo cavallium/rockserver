@@ -1561,8 +1561,25 @@ or independent endpoint acceptance is established. Existing tokenless distribute
 mutation paths refuse before effects; obsolete actor entry points are removed.
 All 36 focused direct/bulk/range/native-MERGE/reroute consumer cases pass using
 prepared identities and explicit ACK (`consumer-physical-first-gate.log`,
-`4201d3a`). Native grant renewal, bulk ordinal reclamation and disjoint request
-pipelining remain unfinished.
+`4201d3a`). Bulk input receipts now retain 256 completed digests plus one unresolved input,
+with a forced contiguous retirement floor. Eleven bulk cases pass, including
+4,100 native MERGE inputs, expired-input rejection and cold exact retry without
+reapplying operands (`bulk-ordinal-window-first-gate.log`, `3b402ed`). The three
+journal cases pass on the current source. Bulk resume now checks the full token
+under its owned lock; a changed UUID cannot drain the original request. The
+converted connection workflows and three focused bulk recovery cases pass
+(`physical-wire-and-exact-bulk-third-gate.log`, `d1bd4f4`).
+
+POINT owners now share a bounded backend envelope across generations. Two real
+RPC futures can remain unresolved with one WRITE worker; cancellation retains
+credit until actual completion and explicit ACK. Cold exact lookup, unavailable
+slot discovery and recovery quota denial preserve the original identity. The
+pipeline and genuine native reroute checks pass after fixing synchronous async
+submission errors to enter original-outcome resolution
+(`point-physical-refined-gate.log`, `b5ba3a5`). Future topology geometry can still
+require recovery admission after preparation; refusal retains PENDING ownership.
+Genuine native grant renewal and shared envelope integration for bulk/range
+actors remain unfinished.
 
 Node-owned physical discovery now returns bounded qualified targets and actual
 per-CF scalar/comparator observations, without synthesizing a logical estimate
@@ -1570,9 +1587,24 @@ from shared CFs. Process/pool-session/native-CF checks and actual native lifetim
 leases qualify metadata, selected-file compaction and deduplicated local
 flush/compact work. Queued pressure-denied jobs can retire during shutdown while
 running JNI remains owned until return. Nineteen physical/multi-domain/service
-cases pass (`physical-queued-stop-gate.log`, `0d33e7f`). This is an explicit local
-operator API; physical wire consumers and bounded full portable table properties
-remain unfinished.
+cases pass (`physical-queued-stop-gate.log`, `0d33e7f`). Full portable properties now use one pinned native file-set version and a
+bounded 21-number/six-string projection. Scope-owned admission covers all retained
+results plus one inspection/decode workspace; the actual CF comparator remains
+available for empty CFs. The native reader passes eight cases and the SDK passes
+39 cases, including optimistic wrappers and non-ASCII names (`095377f`). The
+current native completion and filesystem checks pass 57 and 34 cases respectively.
+The aggregation, physical and maintenance checks pass, including full-field parity
+and unchanged USER receipts (`point-physical-current-first-gate.log`,
+`point-physical-refined-gate.log`, `d894847`).
+
+Java gRPC/Thrift and Rust now provide explicit qualified operator clients. The
+Java servers register physical authority only when an embedding supplies it;
+ordinary frontend defaults do not expose node-wide maintenance. Twelve Java and
+six Rust controlled contract cases pass (`physical-wire-and-exact-bulk-third-gate.log`,
+`rust-physical-first-gate.log`, `9f2eb22`). These are no-socket checks, not independent
+endpoint or operator-listener authentication acceptance. The current qualified JNI
+is installed only in the task's private Maven repository; final wrapper/source-pin
+integration remains unfinished.
 
 Topology catalogue retirement now requires exact ACTIVE state and fresh committed
 ACTIVATE quorum evidence for every target. The controller retains the original
