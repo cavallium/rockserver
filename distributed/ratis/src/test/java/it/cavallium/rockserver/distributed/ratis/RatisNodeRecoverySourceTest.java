@@ -46,7 +46,19 @@ class RatisNodeRecoverySourceTest {
                 assertArrayEquals(prepared.image().sha256(),service.prepare(request).image().sha256());assertArrayEquals(prepared.image().sha256(),service.transfer(request).get(10,TimeUnit.SECONDS).image().sha256());assertArrayEquals(prepared.image().sha256(),OperatorUpload.sha256(received.toByteArray()));
                 var freshId=new RatisTopologySourceSnapshotRpc.Request(new UUID(0,9411),null,request.catalogue(),receiver,request.purpose(),range.groupId(),directory);assertThrows(java.io.IOException.class,()->service.prepare(freshId),"A new capture cannot reuse stale placement");
             }
-            try(var cold=new RatisTopologySourceSnapshotService(transport,limits,fixture.scheduler(),admission)){assertArrayEquals(prepared.image().sha256(),cold.prepare(request).image().sha256());}
+            try(var cold=new RatisTopologySourceSnapshotService(transport,limits,fixture.scheduler(),admission)){
+                assertArrayEquals(prepared.image().sha256(),cold.prepare(request).image().sha256());cold.transfer(request).get(10,TimeUnit.SECONDS);
+                fixture.server.leader=false;
+                var machine=fixture.server.machines.get(RaftGroupId.valueOf(range.groupId()));var sourceField=RatisRangeStateMachine.class.getDeclaredField("sourceSnapshots");sourceField.setAccessible(true);var prior=sourceField.get(machine);sourceField.set(machine,cold);
+                try {
+                    assertThrows(ExecutionException.class,()->head(fixture,new RatisSourceHeadRpc.Request(request,prepared.image().position())));
+                    byte[] release=RatisTopologySourceSnapshotRpc.request(RatisTopologySourceSnapshotRpc.RELEASE,request);var message=Message.valueOf(ByteString.copyFrom(release));
+                    assertThrows(ExecutionException.class,()->machine.queryStale(message,1).get(10,TimeUnit.SECONDS));
+                    assertArrayEquals(release,machine.queryStale(message,0).get(10,TimeUnit.SECONDS).getContent().toByteArray());
+                    assertArrayEquals(release,machine.queryStale(message,0).get(10,TimeUnit.SECONDS).getContent().toByteArray());
+                    assertEquals(0,cold.stats().leases());assertEquals(0,cold.stats().reservedImageBytes());assertEquals(0,fixture.store(range.groupId()).activeSnapshotPins());
+                }finally{sourceField.set(machine,prior);fixture.server.leader=true;}
+            }
         }
     }
     @Test void splitExportsCurrentLeafAndOriginalMetadataThroughActualHostAndColdArtifacts()throws Exception {

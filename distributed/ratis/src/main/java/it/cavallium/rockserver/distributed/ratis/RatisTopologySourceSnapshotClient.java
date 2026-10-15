@@ -7,7 +7,7 @@ import org.apache.ratis.protocol.*;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnapshotRpc.*;
 
-/** Borrowed leader transport. Unknown replies must retry the same UUID and immutable request. */
+/** Borrowed transport. Unknown replies retry the same UUID and immutable request at its actual owner. */
 public final class RatisTopologySourceSnapshotClient {
     private final RaftClient client;
     public RatisTopologySourceSnapshotClient(RaftClient client){this.client=Objects.requireNonNull(client);}
@@ -17,7 +17,12 @@ public final class RatisTopologySourceSnapshotClient {
     }
     public Prepared prepare(Request request)throws IOException{return prepared(PREPARE,request);}
     public Prepared transfer(Request request)throws IOException{return prepared(TRANSFER,request);}
-    public void release(Request request)throws IOException{byte[] input=request(RELEASE,request),reply=call(input,request,MAX_REQUEST_BYTES).getMessage().getContent().toByteArray();if(!Arrays.equals(input,reply))throw new IOException("Source release acknowledgement changed exact request");}
+    public void release(Request request,it.cavallium.rockserver.core.common.distributed.ReplicaDescriptor owner)throws IOException{
+        if(!request.sourceOwner(owner) || !client.getGroupId().equals(RaftGroupId.valueOf(request.sourceGroup())))throw new IOException("Source release owner/group differs from immutable transfer");
+        byte[] input=request(RELEASE,request);var peer=RaftPeerId.valueOf(owner.peerId());
+        var reply=RatisRoutedClient.rpc(()->client.io().sendStaleRead(Message.valueOf(ByteString.copyFrom(input)),0,peer));
+        if(reply==null || !reply.isSuccess() || reply.getMessage()==null || !client.getGroupId().equals(reply.getRaftGroupId()) || !peer.equals(reply.getServerId()) || reply.getMessage().getContent().size()>MAX_REQUEST_BYTES || !Arrays.equals(input,reply.getMessage().getContent().toByteArray()))throw new IOException("Source release did not acknowledge exact request at its original owner",reply==null?null:reply.getException());
+    }
     public RatisRecoveryImageRpc.Evidence imageInstalled(RatisRecoveryImageRpc.Request request)throws IOException {
         if(!client.getGroupId().equals(RaftGroupId.valueOf(request.source().sourceGroup())))throw new IOException("Image probe client belongs to another group");
         var receiver=RaftPeerId.valueOf(request.source().receiver().peerId());

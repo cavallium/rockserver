@@ -32,6 +32,18 @@ class RatisRelocationDataClientTest {
             }
         }
     }
+    @Test void releaseRetriesForcedReceiptAtOriginalOwnerWithoutLeaderLookup()throws Exception {
+        try(var fixture=new RatisTopologySourceSnapshotFixture(root);var service=new RatisTopologySourceSnapshotService(fixture,RatisTopologySourceSnapshotService.Limits.defaults(8*1024*1024),fixture.scheduler,fixture.transferAdmission())){
+            var request=fixture.request(50);var prepared=service.prepare(request);service.transfer(request).get(5,java.util.concurrent.TimeUnit.SECONDS);
+            var raft=mock(RaftClient.class);var io=mock(BlockingApi.class);when(raft.getGroupId()).thenReturn(RaftGroupId.valueOf(fixture.group));when(raft.io()).thenReturn(io);var calls=new AtomicInteger();
+            when(io.sendStaleRead(any(),eq(0L),eq(RaftPeerId.valueOf(fixture.donor.peerId())))).thenAnswer(call->{byte[] input=((Message)call.getArgument(0)).getContent().toByteArray();service.release(RatisTopologySourceSnapshotRpc.request(input));if(calls.incrementAndGet()==1)throw new IOException("Lost forced release reply");return reply(fixture.group,input);});
+            try(var data=new RatisRelocationDataClient(fixture.schema.clusterId(),fixture.schema.databaseId(),request.catalogue(),range->{throw new AssertionError("Cleanup must not rediscover a leader");},(range,owner)->{assertEquals(prepared.sourceOwner(),owner);return raft;})){
+                assertThrows(IOException.class,()->data.release(request,fixture.definition,prepared.sourceOwner()));
+                data.release(request,fixture.definition,prepared.sourceOwner());assertEquals(2,calls.get());assertEquals(1,fixture.durableReleases.get());assertEquals(1,fixture.pinCloses.get());assertEquals(0,service.stats().leases());
+                verify(io,never()).sendReadOnly(any());
+            }
+        }
+    }
     @Test void targetConfigurationUsesExactDescriptorAddressesAndRecordCodecBindsBothSets()throws Exception {
         try(var fixture=new RatisTopologySourceSnapshotFixture(root)){
             byte[] source=fixture.store.configuration().data();var stale=RaftConfigurationProto.parseFrom(source).toBuilder();stale.setPeers(0,stale.getPeers(0).toBuilder().setAddress("127.0.0.1:9999").build());byte[] target=RatisRelocationDataClient.targetConfiguration(fixture.definition.targets().getFirst(),stale.build().toByteArray());assertEquals(fixture.donor.address(),RaftConfigurationProto.parseFrom(target).getPeers(0).getAddress());

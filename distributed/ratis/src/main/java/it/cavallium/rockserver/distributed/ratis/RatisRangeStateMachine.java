@@ -4650,7 +4650,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 if (minIndex!=0) throw new IOException("Pinned reads do not accept current-index constraints");
                 return query(request);
             }
-            if(kind==RatisRecoveryImageRpc.KIND || ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
+            if(kind==RatisTopologySourceSnapshotRpc.RELEASE || kind==RatisRecoveryImageRpc.KIND || ScopedTransactionRpc.schemaReplica(kind) || kind==ScopedTransactionRpc.TOPOLOGY_OWNER || kind==ScopedTransactionRpc.TOPOLOGY_SEED || kind==RatisRangeImportStatusRpc.KIND){if(minIndex!=0)throw new IOException("Owner-local requests have no requested index override");return query(request);}
             if (kind>=ScopedTransactionRpc.OPEN) throw new IOException("Stale reads cannot access transaction handles");
             synchronized (gate) {
                 requireHealthy();
@@ -4804,7 +4804,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 });
             }
             if(RatisTopologySourceSnapshotRpc.kind(kind)){
-                requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source snapshot dispatcher unavailable");var sourceRequest=RatisTopologySourceSnapshotRpc.request(encoded);if(!sourceRequest.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source snapshot crossed group");
+                requireDataRole();if((kind!=RatisTopologySourceSnapshotRpc.RELEASE && !freshBarrier) || sourceSnapshots==null || topologyImageQueries==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Source snapshot dispatcher unavailable");var sourceRequest=RatisTopologySourceSnapshotRpc.request(encoded);if(!sourceRequest.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source snapshot crossed group");
                 if(kind==RatisTopologySourceSnapshotRpc.PREPARE)return sourceSnapshots.prepareAsync(sourceRequest).handle((prepared,failed)->{
                     Throwable problem=failed;while(problem instanceof java.util.concurrent.CompletionException && problem.getCause()!=null)problem=problem.getCause();
                     if(problem instanceof RatisTopologySourceSnapshotRpc.AbandonedException terminal)return Message.valueOf(ByteString.copyFrom(RatisTopologySourceSnapshotRpc.reply(kind,terminal.receipt())));
