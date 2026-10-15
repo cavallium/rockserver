@@ -21,7 +21,7 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     private static final int MAX_METADATA_FILE=MAX_REPLY_BYTES+32,MAX_PUBLICATION_FILE=MAX_REQUEST_BYTES+MAX_OWNER_BYTES+177;
     public record Saved(Prepared prepared,Path image,SnapshotInfo snapshot) {}
     private record Receipt(UUID id,byte[] requestDigest,byte[] metadataDigest,byte[] imageDigest,long imageBytes,long reservedImageBytes,ApplyPosition cut,boolean metadataOnly) {}
-    private final Path root;private final NativeRangeImage.Limits imageLimits;
+    private final Path root;private final NativeRangeImage.Limits imageLimits;private final NativeRangeImage.IoAdmission metadataAdmission;
     private final long maximumImageBytes,maximumMetadataBytes;private final int maximumArtifacts;
     private final FileChannel lockChannel;private final FileLock lock;private SessionJournalFiles.Removal removal;
     @FunctionalInterface interface CaptureForceObserver{void forced(Path path)throws IOException;}
@@ -39,7 +39,14 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
     public RatisTopologySourceSnapshotArtifacts(Path root,NativeRangeImage.Limits imageLimits,long maximumImageBytes,long maximumMetadataBytes,int maximumArtifacts)throws IOException {
         this(root,imageLimits,maximumImageBytes,maximumMetadataBytes,maximumArtifacts,SessionJournalFiles.FILESYSTEM);
     }
-    RatisTopologySourceSnapshotArtifacts(Path ownedRoot,NativeRangeImage.Limits imageLimits,long maximumImageBytes,long maximumMetadataBytes,int maximumArtifacts,SessionJournalFiles.Removal removal)throws IOException {
+    public RatisTopologySourceSnapshotArtifacts(Path root,NativeRangeImage.Limits imageLimits,long maximumImageBytes,long maximumMetadataBytes,int maximumArtifacts,NativeRangeImage.IoAdmission metadataAdmission)throws IOException {
+        this(root,imageLimits,maximumImageBytes,maximumMetadataBytes,maximumArtifacts,SessionJournalFiles.FILESYSTEM,metadataAdmission);
+    }
+    RatisTopologySourceSnapshotArtifacts(Path root,NativeRangeImage.Limits imageLimits,long maximumImageBytes,long maximumMetadataBytes,int maximumArtifacts,SessionJournalFiles.Removal removal)throws IOException {
+        this(root,imageLimits,maximumImageBytes,maximumMetadataBytes,maximumArtifacts,removal,NativeRangeImage.IoAdmission.UNLIMITED);
+    }
+    private RatisTopologySourceSnapshotArtifacts(Path ownedRoot,NativeRangeImage.Limits imageLimits,long maximumImageBytes,long maximumMetadataBytes,int maximumArtifacts,SessionJournalFiles.Removal removal,NativeRangeImage.IoAdmission metadataAdmission)throws IOException {
+        this.metadataAdmission=Objects.requireNonNull(metadataAdmission);
         this.root=ownedRoot.toAbsolutePath().normalize();directory(root);this.imageLimits=Objects.requireNonNull(imageLimits);this.removal=Objects.requireNonNull(removal);
         if(maximumImageBytes<1 || maximumMetadataBytes<1 || maximumArtifacts<1 || maximumArtifacts>4)throw new IllegalArgumentException("Invalid source artifact quota");
         this.maximumImageBytes=maximumImageBytes;this.maximumMetadataBytes=maximumMetadataBytes;this.maximumArtifacts=maximumArtifacts;
@@ -335,7 +342,11 @@ public final class RatisTopologySourceSnapshotArtifacts implements AutoCloseable
         validateImage(prepared,pending);SessionJournalFiles.force(pending);Files.move(pending,target,StandardCopyOption.ATOMIC_MOVE);SessionJournalFiles.force(target.getParent());
     }
     private NativeRangeImage.Manifest inspect(Path file,boolean metadataOnly)throws IOException {
-        return metadataOnly?NativeRangeImage.visitMetadataAdmitted(file,imageLimits,(kind,column,key,value)->{},imageAdmission.get()):NativeRangeImage.inspectAdmitted(file,imageLimits,imageAdmission.get());
+        var admitted=new NativeRangeImage.IoAdmission() {
+            public void beforeBytes(int bytes)throws IOException{imageAdmission.get().beforeBytes(bytes);}
+            public AutoCloseable reserveMetadata(int bytes)throws IOException{return metadataAdmission.reserveMetadata(bytes);}
+        };
+        return metadataOnly?NativeRangeImage.visitMetadataAdmitted(file,imageLimits,(kind,column,key,value)->{},admitted):NativeRangeImage.inspectAdmitted(file,imageLimits,admitted);
     }
     private void validateImage(Prepared prepared,Path file)throws IOException {
         regular(file,prepared.image().bytes());if(Files.size(file)!=prepared.image().bytes())throw new IOException("Source image length changed");var actual=inspect(file,prepared.request().metadataOnly());var expected=prepared.image();

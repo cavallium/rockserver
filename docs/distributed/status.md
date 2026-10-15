@@ -1762,11 +1762,30 @@ own-group registration/permission keys; USER rows and total image limits stay
 unchanged. A forty-change history passes interrupted install, cold retry and
 successive re-export/install, and malformed/foreign/ordinary oversized rows are
 rejected before value allocation. All 28 current/metadata/image cases pass in both
-configured executions (`current-typed-registration-image-gate.log`). Row-aware heap
-admission for retained decoded metadata and nested image passes is still in progress;
-this gate does not prove the final resource envelope.
+configured executions (`current-typed-registration-image-gate.log`). Native image operations now admit the actual encoded recovery-registration workspace
+before value allocation/decoding and retain a shared high-water envelope across
+nested install scans. All 30 selected native cases pass in both executions
+(`current-typed-metadata-memory-gate.log`), including denial/release, multi-pass
+reuse and an ordinary USER image acquiring no metadata lease. The node applies a
+conservative decoded-graph policy to measured encoded bytes; this is not an
+allocator-byte measurement. Runtime source capture, cold artifact scans and adapter lifecycle operations now
+bind that workspace to the shared protected node/pool budget. The integrated gate
+passes seven core eligibility cases and 27 adapter/source/resource cases
+(`recovery-image-eligibility-memory-adapter-second-gate.log`), including missing-image
+CURRENT and META cold reload, actual configuration-tail evidence refresh while USER
+access stays fenced, and original retired-source metadata snapshots at a later real
+cut. The final resource envelope is unproven.
 
-Initial-image adapter reload, voting/apply/append eligibility, durable metadata-DAG
+The Ratis core now separates initial native-image eligibility from final USER
+readiness. Seven controlled real-division tests pass for vote/pre-vote/forced
+leadership refusal, image-gated append/apply, revocation versus vote persistence,
+and initial snapshot installation with a retained newer committed configuration/tail
+(`ratis-initial-image-voting-shutdown-fixed-gate.log`). Transport start is forbidden
+by the fixture. This is not multi-node quorum or network evidence. Adapter lifecycle and native configuration-tail publication pass the integrated
+checks described above; later completed-member checkpoint qualification and the
+full catch-up/retirement driver remain unfinished.
+
+Completed-member checkpoint qualification, durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,
 Raft commitment alone must not report an absent native image as installed, replay

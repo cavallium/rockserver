@@ -21,6 +21,18 @@ public final class RatisNodeResourceBudget {
         this.limits=Objects.requireNonNull(limits);if(declaredPools.isEmpty() || declaredPools.size()>MAX_POOLS)throw new IllegalArgumentException("Node resource pools must be declared and bounded");var values=new LinkedHashMap<UUID,Pool>();declaredPools.forEach((id,value)->values.put(Objects.requireNonNull(id),new Pool(Objects.requireNonNull(value))));pools=Collections.unmodifiableMap(values);
     }
     public Set<UUID> poolIds(){return pools.keySet();}
+    /** Raw registration buffers plus decoded schema histories, normalized aliases and canonical copies. */
+    public it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission imageMetadataAdmission(UUID poolId,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission io) {
+        if(!pools.containsKey(poolId))throw new IllegalArgumentException("Undeclared native resource pool");Objects.requireNonNull(io);
+        return new it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission() {
+            public void beforeBytes(int bytes)throws IOException{io.beforeBytes(bytes);}
+            public AutoCloseable reserveMetadata(int rawBytes)throws IOException {
+                if(rawBytes<1)throw new IllegalArgumentException("Positive metadata workspace required");
+                return reserve(poolId,Kind.PROTECTED,Math.addExact(4096L,Math.multiplyExact(16L,rawBytes)),1);
+            }
+        };
+    }
+
     public synchronized Lease reserve(UUID poolId,Kind kind,long bytes,int owners)throws IOException {
         Objects.requireNonNull(kind);if(bytes<0 || bytes>MAX_BYTES || owners<1 || owners>MAX_OWNERS)throw new IllegalArgumentException("Invalid node resource reservation");var pool=pools.get(Objects.requireNonNull(poolId));if(pool==null)throw new IllegalArgumentException("Undeclared native resource pool");var global=counter(kind);var local=counter(pool,kind);var nodeLimit=lane(limits,kind);var poolLimit=lane(pool.limits,kind);
         if(bytes>nodeLimit.bytes-global.bytes || owners>nodeLimit.owners-global.owners || bytes>poolLimit.bytes-local.bytes || owners>poolLimit.owners-local.owners)throw new IOException("Shared node/pool "+kind+" resource admission exhausted");global.bytes+=bytes;global.owners+=owners;local.bytes+=bytes;local.owners+=owners;return new Lease(pool,kind,bytes,owners);

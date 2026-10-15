@@ -11,6 +11,17 @@ class RatisNodeResourceBudgetTest {
     private static RatisNodeResourceBudget.Limits limits(long bytes,int owners) {
         return new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(bytes,owners),new RatisNodeResourceBudget.Lane(8192,2));
     }
+    @Test void imageMetadataUsesActualSharedProtectedWorkspaceWithoutChargingUserIo()throws Exception {
+        var pool=UUID.randomUUID();var budget=new RatisNodeResourceBudget(limits(100,2),Map.of(pool,limits(100,2)));
+        var bytes=new java.util.concurrent.atomic.AtomicLong();var admission=budget.imageMetadataAdmission(pool,bytes::addAndGet);
+        admission.beforeBytes(1024*1024);assertEquals(1024*1024,bytes.get());assertEquals(0,budget.stats().protectedLane().bytes());
+        try(var workspace=admission.reserveMetadata(128)) {
+            assertEquals(6144,budget.stats().protectedLane().bytes());assertEquals(6144,budget.stats(pool).protectedLane().bytes());
+            assertThrows(IOException.class,()->admission.reserveMetadata(1));
+        }
+        assertEquals(new RatisNodeResourceBudget.Usage(0,0),budget.stats().protectedLane());
+        assertThrows(IOException.class,()->admission.reserveMetadata(1<<20));assertEquals(0,budget.stats().protectedLane().owners());
+    }
     @Test void groupsAndPoolsShareNodeCapsWhileProtectedProgressRemainsAdmissible() throws Exception {
         var a=UUID.randomUUID(); var b=UUID.randomUUID();
         var budget=new RatisNodeResourceBudget(limits(100,2),Map.of(a,limits(80,2),b,limits(80,2)));

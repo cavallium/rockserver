@@ -92,7 +92,7 @@ import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 
 /** Initial synchronous apply adapter; the pool owner drains Ratis before closing native handles. */
-public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.leader.MigrationLogStateMachine,org.apache.ratis.server.impl.LinearizableQueryStateMachine, org.apache.ratis.server.impl.CommittedApplyStateMachine,org.apache.ratis.server.impl.LogResourceStateMachine {
+public final class RatisRangeStateMachine extends BaseStateMachine implements org.apache.ratis.server.leader.MigrationLogStateMachine,org.apache.ratis.server.impl.LinearizableQueryStateMachine, org.apache.ratis.server.impl.CommittedApplyStateMachine,org.apache.ratis.server.impl.LogResourceStateMachine,org.apache.ratis.server.impl.RecoveryEligibilityStateMachine {
     private RatisReferencedFiles referencedFiles;
     private static final org.apache.ratis.statemachine.StateMachine.DataApi NO_REFERENCED_DATA=new org.apache.ratis.statemachine.StateMachine.DataApi() {
         @Override public CompletableFuture<?> write(org.apache.ratis.proto.RaftProtos.LogEntryProto entry) {
@@ -385,8 +385,36 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         }
         rangeImportApply=adapter;rangeImportPublication=reader;
     }
+    private final org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate recoveryEligibility=new org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate();
+    private volatile boolean recoveryReplacement=true;
+    @Override public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate recoveryEligibilityGate(){return recoveryEligibility;}
+    /** Caller must revoke outside division/native/apply locks before starting a live replacement. */
+    void prepareRecoveryReplacement(){recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());}
+    /** Native reads finish before the immutable Gate assignment; no division callback runs under Gate. */
+    void refreshRecoveryEligibility()throws IOException {
+        long revision=recoveryEligibility.revision(),generation=admissionGeneration.get();
+        if(recoveryReplacement || getLifeCycleState()!=LifeCycle.State.RUNNING)return;
+        org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence evidence;
+        try {
+            var current=store.currentRangeRecoveryRegistration();var metadata=store.metadataRecoveryRegistration();
+            if(current!=null && store.currentRangeRecoveryReady() && store.admissionOpen()) {
+                store.enableScopedHistory(RangeMutationHistory.Limits.defaults());if(enableSessionControls)store.enableSessionControls();
+            }
+            if(current==null && metadata==null)evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.normal();
+            else {
+                var image=current==null?metadata.imageCut():current.imageCut();boolean installed=current==null?store.metadataRecoveryImageInstalled():store.currentRangeRecoveryImageInstalled();
+                var cut=store.applied();var cfg=store.configuration();var snapshot=durableSnapshot;
+                if(!installed || store.pendingInstallation() || cut==null || cfg==null || snapshot==null || !RatisRelocationOwnerRpc.covers(new ApplyPosition(snapshot.getTerm(),snapshot.getIndex()),image))evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing();
+                else evidence=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.recovered(TermIndex.valueOf(image.term(),image.index()),TermIndex.valueOf(cut.term(),cut.index()),snapshot.getTermIndex(),cfg.term(),cfg.index(),RaftConfigurationProto.parseFrom(cfg.data()));
+            }
+        }catch(Exception failure){recoveryEligibility.publish(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing());throw new IOException("Cannot qualify native/Ratis recovery baseline",failure);}
+        if(!recoveryReplacement && generation==admissionGeneration.get() && getLifeCycleState()==LifeCycle.State.RUNNING)recoveryEligibility.publishIfCurrent(revision,evidence);
+    }
+    private void refreshRecoveryAfterNativeCompletion()throws IOException {
+        if(store.currentRangeRecoveryRegistration()!=null || store.metadataRecoveryRegistration()!=null)refreshRecoveryEligibility();
+    }
     private void activateRecoveredOwner()throws IOException{
-        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending()){validateRoleNativeState();return;}
+        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending() || store.topologyRecoveryOnly()){validateRoleNativeState();return;}
         if(store.importPending()){if(rangeImportApply==null)throw new IOException("Unpublished native import lacks configured adapter");rangeImportApply.requireGroup(store.ownership().owner().groupId());store.fence();return;}
         else store.activate();
         validateRoleNativeState();
@@ -1541,7 +1569,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (getLifeCycleState()!=LifeCycle.State.NEW || nodeResourceBudget!=null) throw new IllegalStateException("Node resources are fixed before initialization");
         java.util.Objects.requireNonNull(budget); java.util.Objects.requireNonNull(pool);
         if (!budget.poolIds().contains(pool)) throw new IllegalArgumentException("Undeclared native resource pool");
-        nodeResourcePool=pool; nodeResourceBudget=budget;
+        nodeResourcePool=pool; nodeResourceBudget=budget;snapshotMetadataAdmission=budget.imageMetadataAdmission(pool,NativeRangeImage.IoAdmission.UNLIMITED);
     }
     RatisNodeResourceBudget.Lease reserveNodeResources(RatisNodeResourceBudget.Kind kind,long bytes,int owners) throws IOException {
         if(kind==RatisNodeResourceBudget.Kind.ORDINARY && diskRunway!=null)diskRunway.requireOrdinary();
@@ -2118,12 +2146,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public SimpleStateMachineStorage getStateMachineStorage() { return snapshots; }
-    @Override public SnapshotInfo getLatestSnapshot() { return durableSnapshot; }
+    @Override public SnapshotInfo getLatestSnapshot() { return recoveryReplacement?null:durableSnapshot; }
 
     @Override public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage storage) throws IOException {
         super.initialize(server, groupId, storage);
         getLifeCycle().transition(LifeCycle.State.STARTING);
-        try {
+        try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
             if (!initialGroup.getGroupId().equals(groupId)
                     || !groupId.getUuid().equals(store.ownership().owner().groupId())) {
                 throw new IOException("Raft group differs from native ownership");
@@ -2136,10 +2164,10 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             snapshots.init(storage);
             recover(false);
             activateRecoveredOwner();
-            if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+            if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && !store.topologyRecoveryOnly() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
             else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
             if (enableSessionControls && !store.importPending() && !store.topologyBirthPending()) store.enableSessionControls();
-            getLifeCycle().transition(LifeCycle.State.RUNNING);
+            getLifeCycle().transition(LifeCycle.State.RUNNING);recoveryReplacement=false;refreshRecoveryEligibility();
         } catch (Exception failure) { throw failRecovery(failure); }
     }
 
@@ -2165,7 +2193,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var a = store.applied();
             if (installing || store.pendingInstallation() || a == null || a.index() < manifest.position().index()) {
                 store.fence();
-                store.installSnapshot(image, limits);
+                if(metadataSnapshotOwner())store.installMetadataSnapshotAdmitted(image,limits,batches->{},snapshotMetadataAdmission);else store.installSnapshotAdmitted(image,limits,batches->{},snapshotMetadataAdmission);
             } else if (a.index() == manifest.position().index() && a.term() != manifest.position().term()) {
                 throw new IOException("Native marker conflicts with durable snapshot");
             }
@@ -2196,8 +2224,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if (RaftConfigurationProto.parseFrom(bytes).getPeersCount() == 0) throw new IOException("Configuration has no voters");
     }
 
+    private NativeRangeImage.IoAdmission snapshotMetadataAdmission=NativeRangeImage.IoAdmission.UNLIMITED;
+    private boolean metadataSnapshotOwner() {
+        return role==RatisNodePlan.Role.DATA && (store.metadataRecoveryRegistration()!=null || store.topologyRetired() && store.topologyFreeze()!=null);
+    }
     private NativeRangeImage.Manifest validateImage(Path image, TermIndex position) throws IOException {
+        try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
+        final NativeTopologyFreeze[] cutFreeze={null};
+        boolean metadata=metadataSnapshotOwner();
         NativeRangeImage.RowVisitor visitor = (section, column, key, value) -> {
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x27 && ((key[16]&255)<=0x2b || (key[16]&255)==0x60)) throw new IllegalArgumentException("Non-DATA image contains schema transition state");
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x20 && (key[16]&255)<=0x24) throw new IllegalArgumentException("Non-DATA image contains participant/snapshot state");
@@ -2212,20 +2247,31 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 homeValues.validate(homeKey,credit.initial().encode()); homeValues.validate(homeKey,credit.current().encode());
             }
             if (homeValues!=null && section==NativeRangeImage.Section.USER) homeValues.validate(key,value);
+            if(section==NativeRangeImage.Section.STATE && key.length==17 && key[16]==0x60)cutFreeze[0]=NativeTopologyFreeze.decode(value);
             if (section == NativeRangeImage.Section.STATE && key.length == 17 && key[16] == 1) {
                 try { cutConfiguration[0] = ReplicatedRangeStore.Configuration.decode(value); }
                 catch (IllegalArgumentException invalid) { throw new IOException("Invalid image configuration", invalid); }
             }
         };
-        var manifest=homeReservations ? NativeRangeImage.visitHomeRecoveryReservations(image,limits,homeCluster,homeDatabase,homeColumn,visitor) : NativeRangeImage.visit(image,limits,visitor);
+        var manifest=metadata?NativeRangeImage.visitMetadata(image,limits,visitor):homeReservations ? NativeRangeImage.visitHomeRecoveryReservations(image,limits,homeCluster,homeDatabase,homeColumn,visitor) : NativeRangeImage.visit(image,limits,visitor);
         if(manifest.topologyOrigin()!=null && role!=RatisNodePlan.Role.DATA)throw new IOException("Non-DATA image contains topology provenance");
+        var current=store.currentRangeRecoveryRegistration();
+        if(metadata) {
+            var registration=store.metadataRecoveryRegistration();var freeze=registration==null?store.topologyFreeze():registration.freeze();
+            if(freeze==null || !freeze.equals(cutFreeze[0]))throw new IOException("Metadata snapshot changed qualified original source FREEZE");
+            if(registration!=null && (!manifest.position().equals(registration.imageCut()) || !Arrays.equals(manifest.sha256(),registration.imageHash()) || cutConfiguration[0]==null || cutConfiguration[0].term()!=registration.configurationTerm() || cutConfiguration[0].index()!=registration.configurationIndex() || !Arrays.equals(cutConfiguration[0].data(),registration.sourceConfiguration())))throw new IOException("Metadata snapshot lacks exact forced recovery image permission");
+        } else if(current!=null) {
+            var server=getServer().getNow(null);
+            if(topologyLocalReplica==null || !sameReplicaIdentity(current.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(current.receiver().peerId()) || !manifest.position().equals(current.imageCut()) || !Arrays.equals(manifest.sha256(),current.imageHash()) || cutConfiguration[0]==null || cutConfiguration[0].term()!=current.configurationTerm() || cutConfiguration[0].index()!=current.configurationIndex() || !Arrays.equals(cutConfiguration[0].data(),current.sourceConfiguration()))throw new IOException("CURRENT snapshot lacks exact forced receiver image permission");
+            try{store.validateTopologyImageOrigin(manifest.topologyOrigin());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify CURRENT image provenance",invalid);}
+        }
         var learner=store.topologyLearnerRegistration();
-        if(learner!=null){
+        if(!metadata && current==null && learner!=null){
             var server=getServer().getNow(null);if(topologyStorage==null || topologyLocalReplica==null || !sameReplicaIdentity(learner.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(learner.receiver().peerId()))throw new IOException("Learner image target identity changed");
             var permission=store.topologyLearnerImagePermission();boolean initial=manifest.position().equals(learner.imageCut()) && Arrays.equals(manifest.sha256(),learner.imageHash()) && cutConfiguration[0]!=null && Arrays.equals(cutConfiguration[0].data(),learner.sourceConfiguration());boolean authorized=permission!=null && manifest.position().equals(permission.imageCut()) && Arrays.equals(manifest.sha256(),permission.imageHash()) && cutConfiguration[0]!=null && Arrays.equals(cutConfiguration[0].data(),permission.sourceConfiguration());
             if(!initial && !authorized)throw new IOException("Learner image lacks exact forced registration/recovery permission");
             try{store.validateTopologyImageOrigin(manifest.topologyOrigin());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify admitted learner provenance",invalid);}
-        }else if(manifest.topologyOrigin()!=null || store.topologyBirth()!=null) {
+        }else if(!metadata && current==null && (manifest.topologyOrigin()!=null || store.topologyBirth()!=null)) {
             var birth=store.topologyBirth();
             if(birth==null || topologyStorage==null || topologyLocalReplica==null)throw new IOException("Topology snapshot target has no configured local birth");
             var seed=topologyStorage.topologySeed(birth.intentId());
@@ -2242,7 +2288,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         boolean currentSchema=manifest.interval().equals(store.ownership().interval())
                 && Arrays.equals(manifest.schemaDigest(),store.schemaDigest())
                 && manifest.deterministicMergeColumns().equals(store.deterministicMergeColumns());
-        boolean precedingSchema=store.qualifiedHistoricalImage(manifest);
+        boolean precedingSchema=!currentSchema && !metadata && store.qualifiedHistoricalImage(manifest);
         if (!manifest.owner().equals(store.ownership().owner())
                 || !currentSchema && !precedingSchema
                 || manifest.position().term() != position.getTerm() || manifest.position().index() != position.getIndex()) {
@@ -2253,6 +2299,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             throw new IOException("Snapshot MD5 mismatch");
         }
         return manifest;
+        }
     }
 
     private static void force(Path path) throws IOException {
@@ -2263,13 +2310,15 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public long takeSnapshot() throws IOException {
         // A retired parent's shared USER rows may already belong to its children.
-        if(store.ownership().state()==it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED || store.topologyBirthPending() || store.topologyRecoveryOnly())return -1;
+        boolean metadata=metadataSnapshotOwner();
+        if(store.topologyBirthPending() || store.topologyRecoveryOnly() || store.metadataRecoveryPending() || !metadata && store.currentRangeRecoveryRegistration()!=null || store.metadataRecoveryRegistration()!=null)return -1;
+        if(metadata){var freeze=store.topologyFreeze();var cut=store.applied();if(freeze==null || cut==null || cut.index()<=freeze.position().index())return -1;}
         var recovery=diskRunway==null?null:diskRunway.reserveRecovery(diskPool,Math.addExact(2*limits.maxImageBytes(),65536));
-        try (var pin = snapshotPin()) {
+        try (var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission);var pin = metadata?store.captureMetadataForRecovery():snapshotPin()) {
             if (pin.position() == null) return -1;
             var position = TermIndex.valueOf(pin.position().term(), pin.position().index());
             Path file = snapshots.getSnapshotFile(position.getTerm(), position.getIndex()).toPath();
-            if (!Files.exists(file)) NativeRangeImage.write(file, pin, pin.interval(), limits);
+            if (!Files.exists(file)){if(metadata)NativeRangeImage.writeMetadataAdmitted(file,pin,pin.interval(),limits,NativeRangeImage.IoAdmission.UNLIMITED);else NativeRangeImage.write(file, pin, pin.interval(), limits);}
             validateImage(file, position);
             var md5 = MD5FileUtil.computeMd5ForFile(file.toFile());
             MD5FileUtil.saveMD5File(file.toFile(), md5);
@@ -2297,8 +2346,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public void pause() {
+        recoveryReplacement=true;
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
-        try {
+        try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
             synchronized (gate) {
                 getLifeCycle().transition(LifeCycle.State.PAUSING);
                 store.fence();
@@ -2318,6 +2368,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     /** Must run before RaftServer.close(), whose updater waits for outstanding apply futures. */
     public void beginShutdown() {
+        prepareRecoveryReplacement();recoveryReplacement=true;
         if(committedGroup!=null)committedGroup.stop();
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates();
         try { scopedTransactions.close(); } catch (Exception failure) { storageFailure=failure; }
@@ -2484,6 +2535,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         catch(java.util.concurrent.ExecutionException|java.util.concurrent.TimeoutException failure){throw new IOException("Topology replacement preparation did not drain",failure);}
     }
     @Override public void reinitialize() throws IOException {
+        try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
+        if(recoveryEligibility.snapshot().mode()!=org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.MISSING)prepareRecoveryReplacement();
+        recoveryReplacement=true;
         admissionGeneration.incrementAndGet(); invalidateProposalCandidates(); store.invalidateScopedSnapshots();
         quiesceTopologyReplacement();
         var completions = new java.util.ArrayList<Completion>();
@@ -2521,7 +2575,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 pendingNoops.headMap(a.index(), true).clear();
                 configurations.headMap(a.index(), true).clear(); schemaConfigurationPending=!configurations.isEmpty();
                 activateRecoveredOwner();
-                if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
+                if (role==RatisNodePlan.Role.DATA && !store.importPending() && !store.topologyBirthPending() && !store.topologyRecoveryOnly() && store.ownership().state()!=it.cavallium.rockserver.core.impl.rocksdb.RangeOwnership.State.RETIRED) store.enableScopedHistory(it.cavallium.rockserver.core.common.distributed.RangeMutationHistory.Limits.defaults());
                 else if (role==RatisNodePlan.Role.CATALOGUE) store.enableCatalogueScopeCompaction();
                 if (enableSessionControls && !store.importPending() && !store.topologyBirthPending()) store.enableSessionControls();
                 var verifiedAdmissions=verifiedNativeAdmissionOutcomes();
@@ -2554,11 +2608,13 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             for (var completion : completions) completion.future().completeExceptionally(failure);
             throw failure;
         }
+        recoveryReplacement=false;refreshRecoveryEligibility();
         for (var completion : completions) completion.future().complete(completion.result());
         NativeApply resume;
         synchronized (gate) { resume=nativeApply; }
         if (covered!=null && closeCovered) covered.close();
         if (resume!=null && resume.suspended) scheduleNativeApply(resume,resume.stageReady);
+        }
     }
 
     private IOException failRecovery(Exception failure) {
@@ -3177,7 +3233,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             return new AppliedRecord(preparation.operation(),RatisParticipantRecord.result(record));
         }
         var command=DistributedCommandCodec.decode(encoded); commandValidator.accept(command);
-        return new AppliedRecord(command.operationId(),store.topologyLearnerRegistration()==null ? store.apply(positionArg,command) : store.applyTopologyLearnerTail(positionArg,command));
+        return new AppliedRecord(command.operationId(),store.currentRangeRecoveryRegistration()!=null ? store.applyCurrentRangeRecoveryTail(positionArg,command) : store.topologyLearnerRegistration()==null ? store.apply(positionArg,command) : store.applyTopologyLearnerTail(positionArg,command));
     }
     private AppliedRecord recoveredRecord(byte[] encoded) throws Exception {
         if(RatisTopologyRelocationRecord.isRecord(encoded))return new AppliedRecord(null,new CommandResult(CommandResult.Status.SUCCESS,List.of()).encode());
@@ -3288,6 +3344,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             failDeferred(failure);
             return CompletableFuture.failedFuture(failure);
         }
+        try{refreshRecoveryAfterNativeCompletion();}catch(IOException problem){synchronized(gate){storageFailure=problem;}failDeferred(problem);return CompletableFuture.failedFuture(problem);}
         publishSchemaActivation(appliedRecord);
         if (completion != null) completion.future().complete(result);
         return CompletableFuture.completedFuture(result);
@@ -3432,7 +3489,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 completions.add(new Completion(pending.future(),Message.valueOf(ByteString.copyFrom(applied.result()))));
             }
         }
-        work.close(); activations.forEach(this::publishSchemaActivation); for (var completion:completions) completion.future().complete(completion.result());
+        work.close();refreshRecoveryAfterNativeCompletion(); activations.forEach(this::publishSchemaActivation); for (var completion:completions) completion.future().complete(completion.result());
         if (next!=null) scheduleNativeApply(next,false); return result;
         } catch (Exception failure) {
             synchronized (gate) { storageFailure=failure; }
@@ -4563,6 +4620,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             failDeferred(failure);
             throw new IllegalStateException("Range failed completed apply", failure);
         }
+        try{refreshRecoveryAfterNativeCompletion();}catch(IOException problem){synchronized(gate){storageFailure=problem;}failDeferred(problem);throw new IllegalStateException("Recovery evidence did not follow completed native metadata",problem);}
     }
 
     @Override public CompletableFuture<Message> queryStale(Message request, long minIndex) {
