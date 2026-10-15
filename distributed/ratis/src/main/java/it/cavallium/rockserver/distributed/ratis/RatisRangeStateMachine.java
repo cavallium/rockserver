@@ -5671,6 +5671,57 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public CompletableFuture<Message> query(Message request) {
         return query(request,false);
     }
+    @Override public boolean requiresLeaderForLinearizableQuery(Message request) {
+        if(request==null || request.getContent()==null)return false;
+        try {
+            var bytes=request.getContent();
+            int kind=ScopedTransactionRpc.kind(bytes,Math.max(RatisSnapshotCohortRpc.MAX_REQUEST_BYTES,
+                    Math.max(RatisOperationRerouteAdmissionRpc.MAX_BYTES,RatisSourceOutcomeRpc.MAX_REQUEST_BYTES)));
+            // STATE is also the leader-discovery barrier preceding a single, non-retried metadata WRITE.
+            if(kind==ScopedTransactionRpc.STATE)return true;
+            return switch(role) {
+                case CATALOGUE -> switch(kind) {
+                    case RatisCatalogueViewRpc.KIND,RatisRecoveryLineageRpc.KIND,RatisTopologyAuthority.KIND,
+                            RatisTopologyJoinAuthority.KIND,RatisRangeImportAuthority.KIND,ScopedTransactionRpc.SCHEMA_AUTHORITY,
+                            ScopedTransactionRpc.SCHEMA_FENCING_PREPARE,ScopedTransactionRpc.IMPORT_PUBLICATION_PREPARE,
+                            ScopedTransactionRpc.TOPOLOGY_EXECUTION_PREPARE,RatisCdcDeliveryRpc.PREPARE -> true;
+                    default -> false;
+                };
+                case DATA -> switch(kind) {
+                    case RatisTopologySourceSnapshotRpc.PREPARE,RatisTopologySourceSnapshotRpc.TRANSFER,RatisSourceHeadRpc.KIND,
+                            RatisSourceOutcomeRpc.PREPARE,RatisSourceOutcomeRpc.CANCEL,RatisTopologyOperationOutcomeRpc.KIND,
+                            RatisCdcPollRpc.KIND,RatisRangeImportFileResultRpc.KIND,ScopedTransactionRpc.IMPORT_APPLY_PREPARE,
+                            RatisRelocationAdmissionRpc.PREPARE,ScopedTransactionRpc.TOPOLOGY_FREEZE_PREPARE,
+                            ScopedTransactionRpc.TOPOLOGY_ACTIVATE_PREPARE,RatisSnapshotCohortRpc.OWNER,
+                            ScopedTransactionRpc.SCHEMA_FENCE_PREPARE,ScopedTransactionRpc.SCHEMA_FENCE_CANCEL,ScopedTransactionRpc.SCHEMA_FENCE_STATE,
+                            ScopedTransactionRpc.SCHEMA_INSTALL_PREPARE,ScopedTransactionRpc.SCHEMA_INSTALL_CANCEL,ScopedTransactionRpc.SCHEMA_INSTALL_STATE,
+                            ScopedTransactionRpc.SCHEMA_ACTIVATE_PREPARE,ScopedTransactionRpc.SCHEMA_ACTIVATE_CANCEL,ScopedTransactionRpc.SCHEMA_ACTIVATE_STATE,
+                            ScopedTransactionRpc.OPEN,ScopedTransactionRpc.GET,ScopedTransactionRpc.PAGE,ScopedTransactionRpc.PLAN,ScopedTransactionRpc.STAGE,
+                            ScopedTransactionRpc.PARTICIPANT_AUTHORIZE,ScopedTransactionRpc.PARTICIPANT_STATE,ScopedTransactionRpc.PARTICIPANT_OUTCOME,
+                            ScopedTransactionRpc.FINALIZATION_PREPARE,ScopedTransactionRpc.FINALIZATION_CANCEL,ScopedTransactionRpc.PARTICIPANT_FENCE,
+                            ScopedTransactionRpc.PARTICIPANT_RETIRE_PREPARE,ScopedTransactionRpc.PARTICIPANT_RETIRE_CANCEL,
+                            ScopedTransactionRpc.SNAPSHOT_GATE_STATE,ScopedTransactionRpc.SNAPSHOT_OWNER,ScopedTransactionRpc.SNAPSHOT_READY,
+                            ScopedTransactionRpc.SNAPSHOT_BLOCKERS,ScopedTransactionRpc.SNAPSHOT_HELP,ScopedTransactionRpc.SNAPSHOT_GATE_PREPARE,
+                            ScopedTransactionRpc.SNAPSHOT_GATE_CANCEL,ScopedTransactionRpc.SNAPSHOT_FENCE,ScopedTransactionRpc.SNAPSHOT_RETIRE_PREPARE,
+                            ScopedTransactionRpc.SNAPSHOT_RETIRE_CANCEL -> true;
+                    case RatisRelocationOwnerRpc.KIND -> bytes.size()>=ScopedTransactionRpc.HEADER_BYTES+72
+                            && ScopedTransactionRpc.headerInt(bytes,ScopedTransactionRpc.HEADER_BYTES)==bytes.size()-ScopedTransactionRpc.HEADER_BYTES-72
+                            && bytes.byteAt(bytes.size()-68)==0
+                            && ((bytes.byteAt(bytes.size()-51)&255)==RatisRelocationOwnerRpc.Expected.SOURCE.ordinal()
+                                || (bytes.byteAt(bytes.size()-51)&255)==RatisRelocationOwnerRpc.Expected.TARGET.ordinal());
+                    default -> false;
+                };
+                case TRANSACTION_HOME -> switch(kind) {
+                    case ScopedTransactionRpc.HOME_RECOVERY_PREPARE,ScopedTransactionRpc.HOME_RECOVERY_RESULT,ScopedTransactionRpc.HOME_RECOVERY_CANCEL,
+                            ScopedTransactionRpc.HOME_FENCE,ScopedTransactionRpc.HOME_RETIRE_PREPARE,ScopedTransactionRpc.HOME_RETIRE_CANCEL,
+                            RatisOperationRerouteAdmissionRpc.PREPARE -> true;
+                    default -> false;
+                };
+                case SNAPSHOT_HOME -> kind==ScopedTransactionRpc.SNAPSHOT_HOME_FENCE
+                        || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_PREPARE || kind==ScopedTransactionRpc.SNAPSHOT_HOME_RETIRE_CANCEL;
+            };
+        }catch(IllegalArgumentException malformed){return false;}
+    }
     @Override public CompletableFuture<Message> queryLinearizable(Message request) { return query(request,true); }
     private CompletableFuture<Message> query(Message request,boolean freshBarrier) {
         try {

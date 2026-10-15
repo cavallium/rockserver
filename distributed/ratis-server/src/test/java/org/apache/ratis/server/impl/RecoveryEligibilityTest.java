@@ -162,8 +162,12 @@ public class RecoveryEligibilityTest {
       this(path, stateMachine, true);
     }
     Fixture(Path path, BaseStateMachine stateMachine, boolean installSnapshotEnabled) throws Exception {
+      this(path,stateMachine,installSnapshotEnabled,RaftServerConfigKeys.Read.Option.DEFAULT);
+    }
+    Fixture(Path path, BaseStateMachine stateMachine, boolean installSnapshotEnabled,RaftServerConfigKeys.Read.Option readOption) throws Exception {
       this.machine = stateMachine instanceof Machine ? (Machine)stateMachine : null;
       var properties = new RaftProperties();
+      RaftServerConfigKeys.Read.setOption(properties,readOption);
       RaftConfigKeys.Rpc.setType(properties, new InProcessRpcType());
       RaftConfigKeys.DataStream.setType(properties, SupportedDataStreamType.DISABLED);
       RaftServerConfigKeys.setStorageDir(properties, List.of(path.toFile()));
@@ -212,6 +216,44 @@ public class RecoveryEligibilityTest {
   }
   static void append(RaftServerImpl server, List<LogEntryProto> entries) throws Exception {
     for (var future : server.getRaftLog().append(entries)) { future.get(5, TimeUnit.SECONDS); }
+  }
+
+  static class ReadQueries extends BaseStateMachine implements LinearizableQueryStateMachine {
+    final AtomicInteger classified=new AtomicInteger(),queried=new AtomicInteger();
+    @Override public CompletableFuture<Message> queryLinearizable(Message request){queried.incrementAndGet();return CompletableFuture.completedFuture(Message.EMPTY);}
+  }
+  static final class LeaderReadQueries extends ReadQueries {
+    @Override public boolean requiresLeaderForLinearizableQuery(Message request){classified.incrementAndGet();return true;}
+  }
+  private static RaftClientRequest readRequest(RaftClientRequest.Type type) {
+    return RaftClientRequest.newBuilder().setClientId(ClientId.randomId()).setServerId(SELF).setGroupId(GROUP)
+        .setCallId(1).setType(type).setMessage(Message.valueOf("leader-qualified proof")).build();
+  }
+  @Test void leaderQualifiedReadRedirectsActualFollowerBeforeAnyBarrierOrQuery()throws Exception {
+    var machine=new LeaderReadQueries();
+    try(var fixture=new Fixture(root.resolve("leader-read"),machine,true,RaftServerConfigKeys.Read.Option.LINEARIZABLE)) {
+      assertEquals(RaftPeerRole.FOLLOWER,fixture.server.getInfo().getCurrentRole());
+      var reply=fixture.server.submitClientRequestAsync(readRequest(RaftClientRequest.readRequestType())).get(5,TimeUnit.SECONDS);
+      assertInstanceOf(org.apache.ratis.protocol.exceptions.NotLeaderException.class,reply.getException());
+      assertEquals(1,machine.classified.get());assertEquals(0,machine.queried.get());
+    }
+  }
+  @Test void defaultReadHookStillUsesFollowerReadIndex()throws Exception {
+    var machine=new ReadQueries();
+    try(var fixture=new Fixture(root.resolve("ordinary-read"),machine,true,RaftServerConfigKeys.Read.Option.LINEARIZABLE)) {
+      var reply=fixture.server.submitClientRequestAsync(readRequest(RaftClientRequest.readRequestType())).get(5,TimeUnit.SECONDS);
+      assertInstanceOf(org.apache.ratis.protocol.exceptions.ReadIndexException.class,reply.getException());
+      assertEquals(0,machine.classified.get());assertEquals(0,machine.queried.get());
+    }
+  }
+  @Test void explicitStaleReadBypassesLeaderClassification()throws Exception {
+    var machine=new LeaderReadQueries();
+    try(var fixture=new Fixture(root.resolve("stale-owner-read"),machine,true,RaftServerConfigKeys.Read.Option.LINEARIZABLE)) {
+      var reply=fixture.server.submitClientRequestAsync(readRequest(RaftClientRequest.staleReadRequestType(0))).get(5,TimeUnit.SECONDS);
+      var failure=assertInstanceOf(org.apache.ratis.protocol.exceptions.StateMachineException.class,reply.getException());
+      assertInstanceOf(org.apache.ratis.protocol.exceptions.StaleReadException.class,failure.getCause());
+      assertEquals(0,machine.classified.get());assertEquals(0,machine.queried.get());
+    }
   }
 
   @Test void missingConfiguredVoterRejectsBothVotesTimeoutsAndForcedTransferWithoutPersistingGrant() throws Exception {

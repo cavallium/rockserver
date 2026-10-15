@@ -23,6 +23,13 @@ import org.apache.ratis.statemachine.StateMachine;
 
 /** Optional query hook invoked by the pinned server after its linearizable read barrier completes. */
 public interface LinearizableQueryStateMachine extends StateMachine {
+  /**
+   * Whether this query requires execution on the actual ready leader, rather than a follower
+   * that forwards ReadIndex. Called before the barrier; inspect only bounded cached/header state,
+   * without IO, payload decoding or retaining request data. Owner-specific stale reads do not use it.
+   */
+  default boolean requiresLeaderForLinearizableQuery(Message request) { return false; }
+
   /** The server has obtained a fresh read index and waited for that index to be applied. */
   CompletableFuture<Message> queryLinearizable(Message request);
 }

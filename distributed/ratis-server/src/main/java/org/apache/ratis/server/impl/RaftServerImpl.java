@@ -1232,6 +1232,13 @@ class RaftServerImpl implements RaftServer.Division,
       return isDummyRead(request) ? CompletableFuture.completedFuture(newSuccessReply(request))
           : queryStateMachine(request);
     } else if (readOption == RaftServerConfigKeys.Read.Option.LINEARIZABLE) {
+      if (stateMachine instanceof LinearizableQueryStateMachine
+          && ((LinearizableQueryStateMachine) stateMachine).requiresLeaderForLinearizableQuery(request.getMessage())) {
+        final CompletableFuture<RaftClientReply> reply = checkLeaderState(request);
+        if (reply != null) {
+          return reply;
+        }
+      }
       final LeaderStateImpl leader = role.getLeaderState().orElse(null);
       final CompletableFuture<Long> replyFuture;
       if (leader != null) {

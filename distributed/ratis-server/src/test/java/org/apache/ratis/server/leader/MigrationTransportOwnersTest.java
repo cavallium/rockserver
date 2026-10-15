@@ -10,23 +10,29 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class MigrationTransportOwnersTest {
     MigrationLogStateMachine.Lease lease(AtomicInteger closed){return new MigrationLogStateMachine.Lease(){public void materialized(long bytes){}public void close(){closed.incrementAndGet();}};}
+    @Test void terminalTransportRejectsNewFramesNormallyAndStillRejectsDuplicateLiveIds() {
+        var closed=new AtomicInteger();var owners=new MigrationTransportOwners(new Object(),()->{},()->{});
+        assertTrue(owners.begin(1,lease(closed)));assertThrows(IllegalStateException.class,()->owners.begin(1,lease(closed)));assertEquals(1,closed.get());
+        owners.terminal();assertEquals(1,closed.get(),"Terminal callback cannot retire a frame still inside its local send");owners.sent(1);assertEquals(2,closed.get());
+        assertFalse(owners.begin(2,lease(closed)));assertFalse(owners.begin(3,null));assertEquals(3,closed.get());assertEquals(0,owners.size());assertTrue(owners.drained().isDone());
+    }
     @Test void acknowledgementAndDrainRetainActualSendUntilItReturns(){
-        var closed=new AtomicInteger();var owners=new MigrationTransportOwners(new Object(),()->{},()->{});owners.begin(1,lease(closed));
+        var closed=new AtomicInteger();var owners=new MigrationTransportOwners(new Object(),()->{},()->{});assertTrue(owners.begin(1,lease(closed)));
         owners.acknowledged(1);assertEquals(0,closed.get());owners.terminal();assertFalse(owners.drained().isDone());
         owners.sent(1);assertEquals(1,closed.get());assertTrue(owners.drained().isDone());owners.terminal();assertEquals(1,closed.get());
     }
     @Test void sentOwnerWaitsForAcknowledgementOrActualTerminal(){
-        var closed=new AtomicInteger();var owners=new MigrationTransportOwners(new Object(),()->{},()->{});owners.begin(1,lease(closed));owners.sent(1);
+        var closed=new AtomicInteger();var owners=new MigrationTransportOwners(new Object(),()->{},()->{});assertTrue(owners.begin(1,lease(closed)));owners.sent(1);
         assertEquals(1,owners.size());assertEquals(0,closed.get());owners.terminal();assertEquals(1,closed.get());assertTrue(owners.drained().isDone());
     }
     @Test void oldAcknowledgementCannotRemoveANewOwnerFromResetStopDrain()throws Exception {
         var lock=new Object();var registry=new HashSet<MigrationTransportOwners>();var ref=new java.util.concurrent.atomic.AtomicReference<MigrationTransportOwners>();var closed=new AtomicInteger();
         var pruning=new java.util.concurrent.CountDownLatch(1);var unblock=new java.util.concurrent.CountDownLatch(1);
         var owners=new MigrationTransportOwners(lock,()->{pruning.countDown();try{assertTrue(unblock.await(5,java.util.concurrent.TimeUnit.SECONDS));}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}registry.remove(ref.get());},()->registry.add(ref.get()));ref.set(owners);
-        owners.begin(1,lease(closed));owners.sent(1);
+        assertTrue(owners.begin(1,lease(closed)));owners.sent(1);
         try(var threads=java.util.concurrent.Executors.newFixedThreadPool(2)){
             var old=threads.submit(()->owners.acknowledged(1));assertTrue(pruning.await(5,java.util.concurrent.TimeUnit.SECONDS));var began=new java.util.concurrent.CountDownLatch(1);
-            var next=threads.submit(()->{began.countDown();owners.begin(2,lease(closed));});assertTrue(began.await(5,java.util.concurrent.TimeUnit.SECONDS));assertFalse(next.isDone());
+            var next=threads.submit(()->{began.countDown();assertTrue(owners.begin(2,lease(closed)));});assertTrue(began.await(5,java.util.concurrent.TimeUnit.SECONDS));assertFalse(next.isDone());
             unblock.countDown();old.get(5,java.util.concurrent.TimeUnit.SECONDS);next.get(5,java.util.concurrent.TimeUnit.SECONDS);
             java.util.concurrent.CompletableFuture<?> stop;synchronized(lock){assertTrue(registry.contains(owners));stop=java.util.concurrent.CompletableFuture.allOf(registry.stream().map(MigrationTransportOwners::drained).toArray(java.util.concurrent.CompletableFuture[]::new));}
             owners.terminal();assertFalse(stop.isDone());owners.sent(2);stop.get(5,java.util.concurrent.TimeUnit.SECONDS);assertEquals(2,closed.get());synchronized(lock){assertTrue(registry.isEmpty());}

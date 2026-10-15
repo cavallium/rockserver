@@ -356,16 +356,16 @@ public class GrpcLogAppender extends LogAppenderBase {
     private final AppendLogResponseHandler appendHandler,heartbeatHandler;
     private volatile boolean running = true;
 
-    StreamObservers(GrpcServerProtocolClient client, AppendLogResponseHandler handler, AppendLogResponseHandler heartbeatHandler, boolean separateHeartbeat,
+    StreamObservers(java.util.function.BiFunction<StreamObserver<AppendEntriesReplyProto>,Boolean,CallStreamObserver<AppendEntriesRequestProto>> open, AppendLogResponseHandler handler, AppendLogResponseHandler heartbeatHandler, boolean separateHeartbeat,
         TimeDuration waitTimeMin) {
       this.appendHandler=handler;this.heartbeatHandler=heartbeatHandler;
       CallStreamObserver<AppendEntriesRequestProto> append=null;
-      try {append=client.appendEntries(handler,false);this.heartbeat=separateHeartbeat?client.appendEntries(heartbeatHandler,true):null;this.appendLog=append;}
+      try {append=open.apply(handler,false);this.heartbeat=separateHeartbeat?open.apply(heartbeatHandler,true):null;this.appendLog=append;}
       catch(RuntimeException failure){if(append==null)handler.migration.terminal();else append.onError(failure);if(heartbeatHandler!=null)heartbeatHandler.migration.terminal();throw failure;}
       this.waitForReady = waitTimeMin.isPositive()? waitTimeMin: TimeDuration.ONE_MILLISECOND;
     }
 
-    void onNext(AppendEntriesRequestProto proto,org.apache.ratis.server.leader.MigrationLogStateMachine.Lease owner)
+    boolean onNext(AppendEntriesRequestProto proto,org.apache.ratis.server.leader.MigrationLogStateMachine.Lease owner)
         throws InterruptedIOException {
       CallStreamObserver<AppendEntriesRequestProto> stream;
       boolean isHeartBeat = heartbeat != null && proto.getEntriesCount() == 0;
@@ -375,15 +375,15 @@ public class GrpcLogAppender extends LogAppenderBase {
         stream = appendLog;
       }
       var handler=isHeartBeat?heartbeatHandler:appendHandler;var migration=handler.migration;
-      long id=proto.getServerRequest().getCallId();migration.begin(id,owner);
+      long id=proto.getServerRequest().getCallId();if(!migration.begin(id,owner))return false;
       boolean attempted=false;
       try {
       // stall for stream to be ready.
       while (!stream.isReady() && running) {
         sleep(waitForReady, isHeartBeat);
       }
-      if(!running) { migration.acknowledged(id);throw new InterruptedIOException("Migration transport stopped before send"); }
-      attempted=true;stream.onNext(proto);
+      if(!running)return false;
+      attempted=true;stream.onNext(proto);return true;
       } finally {if(!attempted)migration.acknowledged(id);migration.sent(id);}
     }
 
@@ -409,6 +409,11 @@ public class GrpcLogAppender extends LogAppenderBase {
     return CALL_ID_COMPARATOR;
   }
 
+  StreamObservers newStreamObservers() throws IOException {
+    return new StreamObservers(getClient()::appendEntries,new AppendLogResponseHandler(),
+        useSeparateHBChannel?new AppendLogResponseHandler():null,useSeparateHBChannel,getWaitTimeMin());
+  }
+
   private void appendLog(boolean heartbeat) throws IOException {
     final AppendEntriesRequestProto pending;
     final AppendEntriesRequest request;
@@ -423,8 +428,7 @@ public class GrpcLogAppender extends LogAppenderBase {
       pendingRequests.put(request);
       increaseNextIndex(pending);
       if (appendLogRequestObserver == null) {
-        appendLogRequestObserver = new StreamObservers(
-            getClient(), new AppendLogResponseHandler(), useSeparateHBChannel?new AppendLogResponseHandler():null, useSeparateHBChannel, getWaitTimeMin());
+        appendLogRequestObserver = newStreamObservers();
       }
     } catch(IOException|RuntimeException failure){releaseUnsentMigrationOwners();throw failure;}
 
@@ -457,15 +461,46 @@ public class GrpcLogAppender extends LogAppenderBase {
     resetHeartbeatTrigger();
 
     StreamObservers observers = appendLogRequestObserver;
-    if (observers != null) {
-      request.startRequestTimer();
-      var owner=takeMigrationOwner(proto.getServerRequest().getCallId());
-      observers.onNext(proto,owner);
-      getFollower().updateLastRpcSendTime(request.isHeartbeat());
-      scheduler.onTimeout(requestTimeoutDuration,
-          () -> timeoutAppendRequest(request.getCallId(), request.isHeartbeat()),
-          LOG, () -> "Timeout check failed for append entry request: " + request);
+    if (observers == null) {
+      discardUnsentRequest(request, false, null);
+      return;
     }
+    request.startRequestTimer();
+    var owner=takeMigrationOwner(proto.getServerRequest().getCallId());
+    final boolean sent;
+    try {
+      sent=observers.onNext(proto,owner);
+    } catch (InterruptedIOException interrupted) {
+      discardUnsentRequest(request, true, null);
+      throw interrupted;
+    }
+    if (!sent) {
+      discardUnsentRequest(request, true, observers);
+      return;
+    }
+    getFollower().updateLastRpcSendTime(request.isHeartbeat());
+    scheduler.onTimeout(requestTimeoutDuration,
+        () -> timeoutAppendRequest(request.getCallId(), request.isHeartbeat()),
+        LOG, () -> "Timeout check failed for append entry request: " + request);
+  }
+
+  private void discardUnsentRequest(AppendEntriesRequest request,boolean timerStarted,StreamObservers rejected) {
+    try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
+      pendingRequests.remove(request.getCallId(), request.isHeartbeat());
+      if (rejected!=null && appendLogRequestObserver==rejected) {
+        // An early terminal callback can precede publication and miss resetClient.
+        // Remove only this failed stream and retain this appender's retry backoff.
+        appendLogRequestObserver=null;
+        replyState.process(Event.ERROR);
+      }
+      if (!request.isHeartbeat()) {
+        // Optimistic advancement happened before entering the transport. Preserve
+        // confirmed matchIndex while making this unsent first entry eligible again.
+        getFollower().computeNextIndex(getNextIndexForError(request.getFirstIndex()));
+      }
+    }
+    try {if(rejected!=null)rejected.stop();}
+    finally {if (timerStarted)request.stopRequestTimer();}
   }
 
   private void timeoutAppendRequest(long cid, boolean heartbeat) {

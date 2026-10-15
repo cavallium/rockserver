@@ -4,6 +4,7 @@ import it.cavallium.rockserver.core.common.distributed.ApplyPosition;
 import it.cavallium.rockserver.core.common.distributed.PhysicalRangePage;
 import it.cavallium.rockserver.core.common.distributed.TransactionScope;
 import java.nio.ByteBuffer;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -86,6 +87,20 @@ public final class ScopedTransactionRpc {
         if(maxBytes<HEADER_BYTES || size>maxBytes)throw invalid("Invalid frame budget");require(input,HEADER_BYTES);
         if(input.getInt()!=MAGIC)throw invalid("Unsupported read frame");int kind=input.getInt(),length=input.getInt();requireKind(kind);
         if(size>frameLimit(kind))throw invalid("Frame kind exceeds budget");if(length<0 || length!=input.remaining())throw invalid("Invalid frame body length");return kind;
+    }
+    /** Header-only inspection of segmented transport bytes; never flatten an unadmitted body. */
+    static int kind(ByteString encoded,int maxBytes) {
+        int size=Objects.requireNonNull(encoded).size();
+        if(maxBytes<HEADER_BYTES || size<HEADER_BYTES || size>maxBytes)throw invalid("Invalid frame budget");
+        if(headerInt(encoded,0)!=MAGIC)throw invalid("Unsupported read frame");
+        int kind=headerInt(encoded,4),length=headerInt(encoded,8);requireKind(kind);
+        if(size>frameLimit(kind))throw invalid("Frame kind exceeds budget");
+        if(length<0 || length!=size-HEADER_BYTES)throw invalid("Invalid frame body length");
+        return kind;
+    }
+    static int headerInt(ByteString bytes,int offset) {
+        return (bytes.byteAt(offset)&255)<<24 | (bytes.byteAt(offset+1)&255)<<16
+                | (bytes.byteAt(offset+2)&255)<<8 | bytes.byteAt(offset+3)&255;
     }
     public static Packet parse(byte[] encoded,int maxBytes) {
         int kind=kind(encoded,maxBytes); byte[] body=Arrays.copyOfRange(encoded,HEADER_BYTES,encoded.length); return new Packet(kind,body);

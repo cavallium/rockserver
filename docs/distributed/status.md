@@ -29,8 +29,24 @@ This section and the remaining gates at the end describe the current branch.
   passes this workflow in 67.62 seconds. Recovery phase timers are caller-driven;
   Raft timers, transport, catalogue and native work are real. This is one-host
   correctness evidence, with separate failure domains and representative resource/
-  performance acceptance still pending. Earlier runs also exposed sticky leader
-  routing of proof reads; the passing run does not resolve that remaining defect.
+  performance acceptance still pending. The final coupled
+  `runtime-terminal-stream-reconnect50.log` passes the same workflow in 57.73
+  seconds with the routing/transport fixes below, and checks the returning voter's
+  original fence/provenance, resource release and actual updater catch-up again.
+- Normal linearizable requests that require the actual leader now receive a real
+  NotLeader/LeaderNotReady reply before the read barrier when sent to a follower.
+  CAT/source/CDC and scoped/HOME proof handlers keep their fresh quorum barrier;
+  explicit stale and captured-owner snapshot/export controls keep their routes.
+  Classification reads only fixed ByteString header/tail bytes without flattening
+  an unadmitted body, including legal control frames above the ordinary RPC bound.
+- Replaced gRPC streams now return a normal unsent outcome, retaining migration
+  leases until the active call retires. Pending requests/timers are removed, the
+  original first index remains retryable and no send time/timeout is fabricated.
+  Early terminal callbacks before stream publication also invalidate the captured
+  stream and record backoff once, so the same appender reconnects. Actual thread
+  interruption still propagates. `runtime-terminal-stream-reconnect50.log` passes
+  28 actual server/barrier/transport-owner cases, 16 gRPC admission/lifecycle cases,
+  two adapter routing cases, the durability check and the three-process workflow.
 
 - Configured CURRENT recovery now durably selects META in the same driver journal,
   fences the actual receiver, and settles every retained request alias at every
