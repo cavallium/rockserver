@@ -35,6 +35,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         @Override public void close()throws Exception{retained.close();}
     }
     public interface Host {
+        default RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request request)throws Exception{throw new IOException("Source head owner unavailable");}
         Lease capture(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission admission)throws Exception;
         default boolean chunkReady(Request request,long bytes)throws IOException{return true;}
         default void transferFinished(Request request){}
@@ -104,6 +105,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
             try{Thread.sleep(10);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException("Source image admission interrupted",interrupted);}
         }
     }
+    public RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request request)throws Exception{synchronized(this){if(stopping)throw new IOException("Source service stopped");}return host.head(request);}
     Prepared prepare(Request request)throws IOException {return prepareOwned(request,bytes->awaitImageBytes(request,bytes));}
     private Prepared prepareOwned(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission imageAdmission)throws IOException {
         Objects.requireNonNull(request);Entry entry;boolean capture;
@@ -159,8 +161,8 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 if(lookup){var abandoned=host.abandoned(request);if(abandoned!=null)throw new AbandonedException(abandoned);
                     synchronized(RatisTopologySourceSnapshotService.this){entry=entries.get(request.transferId());if(entry==null || entry.lease==null || entry.unusable)throw new IOException("Prepare the exact source image first");requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;releaseLookups.remove(request.transferId());metadataBytes-=publicationLookupBytes(request);lookup=false;}
                 }
-                if(entry.installed)return RWScheduler.CooperativeResult.COMPLETE;
                 host.requireOwner(entry.lease);
+                if(entry.installed)return RWScheduler.CooperativeResult.COMPLETE;
                 if(chunks==null)chunks=RockserverSnapshotRequests.openSource(entry.lease.source(),RaftPeerId.valueOf(request.receiver().peerId()),request.transferId().toString(),entry.lease.snapshot(),CHUNK_BYTES);
                 if(!chunks.hasNext())throw new IOException("Snapshot producer did not yield a final receiver response");
                 if(!host.chunkReady(request,CHUNK_BYTES)){rateWakeup.schedule(this::resumeRate,10,TimeUnit.MILLISECONDS);return RWScheduler.CooperativeResult.PARK;}

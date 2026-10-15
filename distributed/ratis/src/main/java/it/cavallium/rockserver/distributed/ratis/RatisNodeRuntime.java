@@ -733,7 +733,8 @@ public final class RatisNodeRuntime implements AutoCloseable {
         if(!view.catalogue().equals(plan.catalogue().groupId()) || !view.catalogue().equals(request.catalogue()) || view.state().phase()!=TopologyChange.Phase.JOINING)throw new IOException("Source image requires exact irreversible JOINING");return view;
     }
     private record SourceAuthority(TopologyChange.Definition relocation,RangeDirectory directory,DistributedSchema schema) {}
-    private SourceAuthority sourceView(RatisTopologySourceSnapshotRpc.Request request)throws IOException {
+    private SourceAuthority sourceView(RatisTopologySourceSnapshotRpc.Request request)throws IOException {return sourceView(request,false);}
+    private SourceAuthority sourceView(RatisTopologySourceSnapshotRpc.Request request,boolean continuity)throws IOException {
         if(!request.catalogue().equals(plan.catalogue().groupId()) || !request.clusterId().equals(plan.clusterId()) || !request.databaseId().equals(plan.databaseId()))throw new IOException("Source image authority namespace differs");
         RangeDirectory directory;TopologyChange.Definition relocation=null;
         if(request.relocation()) {
@@ -745,9 +746,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if(!Arrays.equals(directory.payloadDigest(),request.sourceDirectory().payloadDigest()) || definition.parents().stream().noneMatch(range->range.groupId().equals(request.sourceGroup())))throw new IOException("Ancestor metadata changed original source directory/group");
         }else {
             directory=epochs.catalogue(plan.catalogue().directoryColumn()).read(request.domainId());
-            if(directory==null || !Arrays.equals(directory.payloadDigest(),request.sourceDirectory().payloadDigest()))throw new IOException("Current source image placement changed; qualify a current leaf again");
+            if(directory==null)throw new IOException("Current source group retired; rediscover placement");
+            if(continuity){try{RatisSourceHeadRpc.requireContinuity(request,directory);}catch(IllegalArgumentException invalid){throw new IOException("Source continuity requires rediscovery",invalid);}}
+            else if(!Arrays.equals(directory.payloadDigest(),request.sourceDirectory().payloadDigest()))throw new IOException("Current source image placement changed; qualify a current leaf again");
         }
-        var store=stores.get(request.sourceGroup());if(store==null)throw new IOException("Source image has no actual native owner");var schema=store.installedSchema();if(schema==null)schema=logicalSchemas.get(directory.domainId());
+        var store=stores.get(request.sourceGroup());if(store==null)throw new IOException("Source image has no actual native owner");var schema=request.metadataOnly()?epochs.schemaCatalogue(plan.catalogue().directoryColumn()).read(directory.schemaDigest()):store.installedSchema();
+        if(schema==null){var bootstrap=logicalSchemas.get(directory.domainId());if(bootstrap!=null && bootstrap.clusterId().equals(directory.clusterId()) && bootstrap.databaseId().equals(directory.databaseId()) && Arrays.equals(bootstrap.digest(),directory.schemaDigest()))schema=bootstrap;}
         if(schema==null)throw new IOException("Source image has no qualified native logical schema");try{schema.requireMatches(directory);}catch(IllegalArgumentException invalid){throw new IOException("Source image native schema differs from qualified directory",invalid);}
         if(!request.relocation() && !request.metadataOnly())requireSourcePublication(request.sourceGroup(),directory,store);
         return new SourceAuthority(relocation,directory,schema);
@@ -780,10 +784,19 @@ public final class RatisNodeRuntime implements AutoCloseable {
             final RatisNodeResourceBudget.Lease reservation;try{reservation=resources.reserve(owner.spec.id(),RatisNodeResourceBudget.Kind.PROTECTED,65536L+6L*RatisTopologySourceSnapshotRpc.maximumPreparedBytes(request),1);}catch(IOException exhausted){throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Source metadata graph admission exhausted");}
             RatisTopologySourceSnapshotService.Lease captured=null;boolean returned=false;
             try{
-                var view=sourceView(request);var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Source snapshot has no local source division");sourceArtifacts.reserve(request);
+                var retained=sourceArtifacts.lookupAdmitted(request,admission);var view=sourceView(request,retained!=null);var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null)throw new RatisTopologySourceSnapshotArtifacts.AdmissionRejected("Source snapshot has no local source division");sourceArtifacts.reserve(request);
                 captured=machine.captureSourceSnapshot(request,view.relocation(),view.directory(),view.schema(),sourceArtifacts,resources.imageMetadataAdmission(owner.spec.id(),admission));reservation.shrinkTo(Math.addExact(65536L,6L*RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,captured.prepared()).length),1);
                 var actual=captured;var lease=new RatisTopologySourceSnapshotService.Lease(actual.prepared(),actual.source(),actual.snapshot(),()->{actual.close();reservation.close();});returned=true;return lease;
             }finally{if(!returned){if(captured==null){var sourceMachine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));AutoCloseable cleanup=()->{if(sourceMachine!=null)sourceMachine.drainSourceCapture(request.transferId());reservation.close();};try{cleanup.close();}catch(Exception failed){owner.sourceCleanup.put(request.transferId(),cleanup);throw failed;}}else{var actual=captured;AutoCloseable cleanup=()->{actual.close();reservation.close();};try{cleanup.close();}catch(Exception failure){owner.sourceCleanup.put(request.transferId(),cleanup);throw failure;}}}}
+        }
+        public RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request query)throws Exception {
+            var request=query.source();if(!owner.spec.id().equals(groupPools.get(request.sourceGroup())))throw new IOException("Source head crossed physical pool");
+            var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null)throw new IOException("Source head has no actual source division");
+            var before=sourceView(request,true);var first=machine.sourceSnapshotEvidence(request,before.relocation(),before.directory(),true);
+            var catalogue=epochs.catalogue(plan.catalogue().directoryColumn()).readView(request.domainId());if(catalogue.directory()==null)throw new IOException("Source domain missing; rediscover placement");
+            var after=sourceView(request,true);var last=machine.sourceSnapshotEvidence(request,after.relocation(),after.directory(),true);
+            if(!Arrays.equals(before.directory().payloadDigest(),after.directory().payloadDigest()) || !first.owner().equals(last.owner()) || !first.completedCut().equals(last.completedCut()) || first.configuration().term()!=last.configuration().term() || first.configuration().index()!=last.configuration().index() || !Arrays.equals(first.configuration().data(),last.configuration().data()) || !request.metadataOnly() && !request.relocation() && !Arrays.equals(after.directory().payloadDigest(),catalogue.directory().payloadDigest()))throw new IOException("Source head changed during catalogue/native proof");
+            return new RatisSourceHeadRpc.Head(query,catalogue.cut(),catalogue.directory(),last.owner(),last.completedCut(),last.configuration());
         }
         public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return sourceArtifacts.abandoned(request);}
         public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{
@@ -791,11 +804,11 @@ public final class RatisNodeRuntime implements AutoCloseable {
             var evidence=machine.sourceSnapshotEvidence(request,view.relocation(),view.directory());return sourceArtifacts.abandon(request,evidence.configuration(),evidence.completedCut());
         }
         public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{
-            sourceArtifacts.requireReady(lease.prepared());var request=lease.prepared().request();var view=sourceView(request);var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null || lease.source().getStateMachine()!=machine)throw new IOException("Source snapshot division changed");var evidence=machine.sourceSnapshotEvidence(request,view.relocation(),view.directory());
-            if(!evidence.owner().equals(lease.prepared().sourceOwner()) || !RatisRelocationOwnerRpc.covers(evidence.completedCut(),lease.prepared().image().position()) || !Arrays.equals(evidence.configuration().data(),lease.prepared().sourceCfg().data()))throw new IOException("Retained source image lost actual native owner/configuration");
+            sourceArtifacts.requireReady(lease.prepared());var request=lease.prepared().request();var view=sourceView(request,true);var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null || lease.source().getStateMachine()!=machine)throw new IOException("Source snapshot division changed");var evidence=machine.sourceSnapshotEvidence(request,view.relocation(),view.directory(),true,true);
+            if(!evidence.owner().equals(lease.prepared().sourceOwner()) || !RatisRelocationOwnerRpc.covers(evidence.completedCut(),lease.prepared().image().position()))throw new IOException("Retained source image lost actual native owner/configuration");
         }
         public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{
-            var request=lease.prepared().request();var view=sourceView(request);var image=lease.prepared().image();
+            var request=lease.prepared().request();var view=sourceView(request,true);var image=lease.prepared().image();
             if(request.relocation()){var evidence=relocationClients.read(new RatisRelocationOwnerRpc.Request(view.relocation(),request.receiver().replicaId(),RatisRelocationOwnerRpc.Expected.IMAGE,image.position(),image.sha256()));if(!evidence.imageInstalled())throw new IOException("Receiver has not forced the exact native image");}
             else if(!relocationClients.imageInstalled(new RatisRecoveryImageRpc.Request(request,image.position(),image.sha256())).imageInstalled())throw new IOException("Receiver has not forced the exact registered current/metadata image");
         }

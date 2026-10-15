@@ -56,6 +56,12 @@ public final class RatisCatalogue {
         } catch (IllegalArgumentException malformed) { throw new IOException("Invalid catalogue directory", malformed); }
     }
 
+    public RatisCatalogueViewRpc.View readView(UUID domainId)throws IOException {
+        var request=new RatisCatalogueViewRpc.Request(clusterId,databaseId,groupId,columnId,domainId);
+        try{return RatisCatalogueViewRpc.reply(content(RatisRoutedClient.rpc(()->client.io().sendReadOnly(message(RatisCatalogueViewRpc.request(request)))),RatisCatalogueViewRpc.MAX_REPLY_BYTES),request);}
+        catch(IllegalArgumentException malformed){throw new IOException("Invalid completed catalogue directory view",malformed);}
+    }
+
     /** Prepare once; retry this exact command/operation identity after an uncertain reply. */
     public DistributedCommand prepare(OperationId operationId, RangeDirectory expected, RangeDirectory next) {
         return prepare(operationId,expected,next,null);

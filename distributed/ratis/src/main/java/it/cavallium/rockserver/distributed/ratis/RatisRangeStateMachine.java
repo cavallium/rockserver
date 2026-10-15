@@ -828,6 +828,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     Path sourceSnapshotDirectory(){return snapshots.getSnapshotFile(0,0).toPath().getParent();}
     record SourceSnapshotEvidence(ReplicaDescriptor owner,ApplyPosition completedCut,ReplicatedRangeStore.Configuration configuration) {}
     SourceSnapshotEvidence sourceSnapshotEvidence(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory)throws Exception {
+        return sourceSnapshotEvidence(request,definition,qualifiedDirectory,false);
+    }
+    SourceSnapshotEvidence sourceSnapshotEvidence(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory,boolean continuity)throws Exception {
+        return sourceSnapshotEvidence(request,definition,qualifiedDirectory,continuity,false);
+    }
+    SourceSnapshotEvidence sourceSnapshotEvidence(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory,boolean continuity,boolean retained)throws Exception {
         java.util.Objects.requireNonNull(qualifiedDirectory);
         if(request.relocation()) {
             if(definition==null)throw new IOException("Relocation export requires immutable definition");
@@ -838,9 +844,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             return new SourceSnapshotEvidence(owner,evidence.completedCut(),evidence.configuration());
         }
         requireDataRole();requireHealthy();
-        if(definition!=null || request.sourceDirectory()==null || !java.util.Arrays.equals(request.sourceDirectory().payloadDigest(),qualifiedDirectory.payloadDigest()) || topologyLocalReplica==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Recovery export lacks exact qualified source directory");
-        var expected=request.range();var local=expected.replicas().stream().filter(replica->sameReplicaIdentity(replica,topologyLocalReplica)).findFirst().orElseThrow(()->new IOException("Recovery export has no configured local source"));
-        if(!request.sourceOwner(local) || !request.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Recovery export crossed actual source group/owner");
+        if(definition!=null || request.sourceDirectory()==null || (!continuity || request.metadataOnly()) && !java.util.Arrays.equals(request.sourceDirectory().payloadDigest(),qualifiedDirectory.payloadDigest()) || topologyLocalReplica==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Recovery export lacks exact qualified source directory");
+        var expected=continuity && !request.metadataOnly()?RatisSourceHeadRpc.requireContinuity(request,qualifiedDirectory):request.range();var local=expected.replicas().stream().filter(replica->sameReplicaIdentity(replica,topologyLocalReplica)).findFirst().orElseThrow(()->new IOException("Recovery export has no configured local source"));
+        if(local.role()!=ReplicaDescriptor.Role.VOTER || (!continuity || request.metadataOnly()) && !request.sourceOwner(local) || !request.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Recovery export crossed actual source group/owner");
         var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(local.peerId()))throw new IOException("Recovery export server identity differs");
         var division=server.getDivision(getGroupId());var info=division.getInfo();long term=info.getCurrentTerm();
         if(division.getStateMachine()!=this || !info.isAlive() || info.getLifeCycleState()!=LifeCycle.State.RUNNING || term<1 || !info.isLeader() || !info.isLeaderReady())throw new IOException("Recovery export requires actual live ready leader");
@@ -853,18 +859,22 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var freeze=store.topologyFreeze();if(freeze==null || !java.util.Arrays.equals(freeze.header().encode(),request.header().encode()))throw new IOException("Metadata export lacks original sealed source");
             freeze.requireParent(expected.groupId(),expected.rangeEpoch(),qualifiedDirectory.domainId(),qualifiedDirectory.schemaDigest(),expected.lowerInclusive(),expected.upperExclusive());freeze.requireCut(cut);
             var metadata=store.metadataOutcomeState();if(!java.util.Objects.equals(metadata.applied(),cut))throw new IOException("Metadata export is not ready at native cut");
-        } else if(store.topologyRetired() || store.topologyFreeze()!=null || !store.admissionOpen())throw new IOException("Current leaf export lacks active USER authority");
+        } else {
+            var fence=store.schemaFence();boolean schemaFenced=retained && fence!=null && fence.clusterId().equals(qualifiedDirectory.clusterId()) && fence.databaseId().equals(qualifiedDirectory.databaseId()) && fence.domainId().equals(qualifiedDirectory.domainId()) && fence.participant().groupId().equals(expected.groupId()) && fence.participant().rangeEpoch()==expected.rangeEpoch() && java.util.Arrays.equals(fence.sourceDirectoryDigest(),qualifiedDirectory.payloadDigest());
+            if(schemaFenced)fence.requireCut(cut);
+            if(store.topologyRetired() || store.topologyFreeze()!=null || (!store.admissionOpen() || fence!=null) && !schemaFenced)throw new IOException("Current leaf export lacks suitable native source authority");
+        }
         requireSchemaMembership(expected,cfg.data());var actual=division.getRaftConf();requireActualMembership(actual,expected);
         if(actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("Recovery export actual/native configuration positions differ");
-        synchronized(admissions){if(generation!=admissionGeneration.get() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || getLifeCycleState()!=LifeCycle.State.RUNNING || info.getCurrentTerm()!=term || !java.util.Objects.equals(cut,store.applied()))throw new IOException("Recovery export owner/configuration changed during proof");}
+        synchronized(admissions){if(generation!=admissionGeneration.get() || schemaConfigurationPending || stamp!=schemaConfigurationStamp || getLifeCycleState()!=LifeCycle.State.RUNNING || info.getCurrentTerm()!=term || !info.isAlive() || !info.isLeader() || !info.isLeaderReady() || !java.util.Objects.equals(cut,store.applied()))throw new IOException("Recovery export owner/configuration changed during proof");}
         return new SourceSnapshotEvidence(local,cut,cfg);
     }
     RatisTopologySourceSnapshotService.Lease captureSourceSnapshot(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory,DistributedSchema qualifiedSchema,RatisTopologySourceSnapshotArtifacts artifacts,NativeRangeImage.IoAdmission imageAdmission)throws Exception{
         imageAdmission.beforeBytes(1);qualifiedSchema.requireMatches(qualifiedDirectory);
-        var evidence=sourceSnapshotEvidence(request,definition,qualifiedDirectory);var division=getServer().getNow(null).getDivision(getGroupId());var saved=artifacts.lookupAdmitted(request,imageAdmission);
+        var saved=artifacts.lookupAdmitted(request,imageAdmission);var evidence=sourceSnapshotEvidence(request,definition,qualifiedDirectory,saved!=null,saved!=null);var division=getServer().getNow(null).getDivision(getGroupId());
+        if(saved!=null){var prepared=saved.prepared();var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory,true,true);if(!RatisRelocationOwnerRpc.covers(after.completedCut(),prepared.image().position()) || !prepared.sourceOwner().equals(after.owner()) || !after.owner().equals(evidence.owner()))throw new IOException("Cold source image lacks its original actual owner/prefix");return new RatisTopologySourceSnapshotService.Lease(prepared,division,saved.snapshot(),()->{});}
         ReplicatedRangeStore.SnapshotPin pin=request.metadataOnly()?store.captureMetadataForRecovery():request.relocation()?store.captureForRecovery():store.capture();boolean returned=false;
         try {
-            if(saved!=null){var prepared=saved.prepared();var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory);if(!RatisRelocationOwnerRpc.covers(after.completedCut(),prepared.image().position()) || !prepared.sourceOwner().equals(after.owner()) || !after.owner().equals(evidence.owner()))throw new IOException("Cold source image lacks its original actual owner/prefix");var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,saved.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;}
             var position=pin.position();if(position==null || position.term()<1 || !java.util.Arrays.equals(qualifiedSchema.digest(),pin.schemaDigest()))throw new IOException("Source image lacks qualified committed schema/prefix");
             var rows=new java.util.HashMap<String,byte[]>();pin.visitState((key,value)->{if(it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerSchema.row(key))rows.put(java.util.HexFormat.of().formatHex(key),value.clone());});
             if(request.relocation())artifacts.capture(request,definition,pin,qualifiedSchema,evidence.owner());else artifacts.capture(request,pin,qualifiedSchema,evidence.owner());
@@ -4775,6 +4785,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(kind>=RatisSnapshotCohortRpc.OWNER && kind<=RatisSnapshotCohortRpc.CANCEL){requireDataRole();if(snapshotCohorts==null)throw new IOException("Cohort capture is not configured");if(kind==RatisSnapshotCohortRpc.OWNER && !freshBarrier)throw new IOException("Cohort owner qualification requires fresh barrier");var packet=ScopedTransactionRpc.parse(encoded,RatisSnapshotCohortRpc.MAX_REQUEST_BYTES);return snapshotCohorts.query(store.ownership().owner().groupId(),kind,packet.body()).thenApply(bytes->Message.valueOf(ByteString.copyFrom(ScopedTransactionRpc.frame(kind,bytes))));}
             if(kind==RatisTopologyLearnerRecoveryRpc.KIND){if(topologyImageQueries==null || learnerRecoveryInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Learner recovery dispatcher unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerRecoveryRpc.MAX_REPLY_BYTES,false,owned->{try{return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerRecoveryRpc.reply(learnerRecoveryInstaller.prepare(RatisTopologyLearnerRecoveryRpc.decode(owned)))));}catch(RatisTopologySourceSnapshotRpc.AbandonedException terminal){return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerRecoveryRpc.reply(terminal.receipt())));}});}
             if(kind==RatisTopologyLearnerJoinRpc.KIND){if(topologyImageQueries==null || learnerInstaller==null || getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("Node learner bootstrap unavailable");return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*RatisTopologyLearnerJoinRpc.MAX_REPLY_BYTES,false,owned->{var join=RatisTopologyLearnerJoinRpc.decode(owned);var registration=learnerInstaller.install(join);return Message.valueOf(ByteString.copyFrom(RatisTopologyLearnerJoinRpc.reply(join,registration)));});}
+            if(kind==RatisSourceHeadRpc.KIND){
+                requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source head requires fresh DATA dispatcher");var head=RatisSourceHeadRpc.request(encoded);if(!head.source().sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source head crossed group");
+                return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*(encoded.length+RatisSourceHeadRpc.MAX_REPLY_BYTES),false,owned->Message.valueOf(ByteString.copyFrom(RatisSourceHeadRpc.reply(sourceSnapshots.head(RatisSourceHeadRpc.request(owned))))));
+            }
+            if(kind==RatisCatalogueViewRpc.KIND){
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Catalogue view requires fresh catalogue dispatcher");checkCatalogueOwner();long generation=admissionGeneration.get();var leader=leadership();
+                return schemaAuthorityQueries.submit(store.ownership().owner().groupId(),encoded,4L*RatisCatalogueViewRpc.MAX_REPLY_BYTES,false,owned->{
+                    var query=RatisCatalogueViewRpc.request(owned);if(!query.cluster().equals(schemaCluster) || !query.database().equals(schemaDatabase) || !query.catalogue().equals(store.ownership().owner().groupId()) || !query.column().equals(schemaColumn))throw new IOException("Catalogue view crossed namespace");
+                    checkCatalogueOwner();var point=new ReplicatedRangeStore.PhysicalPoint(schemaColumn,ByteBuffer.allocate(16).putLong(query.domain().getMostSignificantBits()).putLong(query.domain().getLeastSignificantBits()).array());var read=store.readSchemaAuthorityPoints(List.of(point),new int[]{RatisCatalogue.MAX_DIRECTORY_BYTES});var bytes=read.values().getFirst();var directory=bytes==null?null:RangeDirectoryCodec.decode(bytes);
+                    checkCatalogueOwner();synchronized(admissions){if(generation!=admissionGeneration.get() || schemaConfigurationPending || leadership().term()!=leader.term() || read.position().term()!=leader.term() || !read.position().equals(store.applied()))throw new IOException("Catalogue view lost completed barrier owner");}
+                    return Message.valueOf(ByteString.copyFrom(RatisCatalogueViewRpc.reply(new RatisCatalogueViewRpc.View(query,read.position(),directory))));
+                });
+            }
             if(RatisTopologySourceSnapshotRpc.kind(kind)){
                 requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source snapshot dispatcher unavailable");var sourceRequest=RatisTopologySourceSnapshotRpc.request(encoded);if(!sourceRequest.sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source snapshot crossed group");
                 if(kind==RatisTopologySourceSnapshotRpc.PREPARE)return sourceSnapshots.prepareAsync(sourceRequest).handle((prepared,failed)->{

@@ -11,6 +11,10 @@ import static it.cavallium.rockserver.distributed.ratis.RatisTopologySourceSnaps
 public final class RatisTopologySourceSnapshotClient {
     private final RaftClient client;
     public RatisTopologySourceSnapshotClient(RaftClient client){this.client=Objects.requireNonNull(client);}
+    public RatisSourceHeadRpc.Head head(RatisSourceHeadRpc.Request request)throws IOException{
+        var reply=call(RatisSourceHeadRpc.request(request),request.source(),RatisSourceHeadRpc.MAX_REPLY_BYTES);
+        try{var head=RatisSourceHeadRpc.reply(reply.getMessage().getContent().toByteArray(),request);if(!RaftPeerId.valueOf(head.sourceOwner().peerId()).equals(reply.getServerId()))throw new IOException("Source head crossed actual source owner");return head;}catch(IllegalArgumentException malformed){throw new IOException("Malformed source head reply",malformed);}
+    }
     public Prepared prepare(Request request)throws IOException{return prepared(PREPARE,request);}
     public Prepared transfer(Request request)throws IOException{return prepared(TRANSFER,request);}
     public void release(Request request)throws IOException{byte[] input=request(RELEASE,request),reply=call(input,request,MAX_REQUEST_BYTES).getMessage().getContent().toByteArray();if(!Arrays.equals(input,reply))throw new IOException("Source release acknowledgement changed exact request");}

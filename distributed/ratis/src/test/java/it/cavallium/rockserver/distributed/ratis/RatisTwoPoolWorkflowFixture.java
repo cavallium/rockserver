@@ -77,6 +77,7 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
         service=RatisNodeService.recover(manifest,env.nodeRoot,ConfigParser.parseDefault(),resources,server::create,this::admitOperator,this::homeClient);node=field(service,"node",RatisNodeRuntime.class);service.start();field(node,"poolPressure",RatisPoolPressureService.class).refresh().get(10,TimeUnit.SECONDS);if(!pendingImport)service.verifyCatalogue();
         }catch(Exception|Error failure){try{close();}catch(Exception cleanup){failure.addSuppressed(cleanup);}throw failure;}
     }
+    it.cavallium.rockserver.core.impl.RWScheduler scheduler(){return env.scheduler;}
     private static RangeDirectory directory(DistributedSchema schema,UUID group,ReplicaDescriptor owner,RangeDescriptor.TopologyState state){return new RangeDirectory(schema.clusterId(),schema.databaseId(),schema.domainId(),schema.schemaEpoch(),schema.digest(),1,schema.columnIds(),schema.routingPrefixBytes(),List.of(new RangeDescriptor(group,group,1,0,null,null,state,List.of(owner))));}
     private OperationId operation(){return new OperationId(new UUID(962,2),0,sequence++);}
     private void publish()throws Exception {
@@ -100,7 +101,7 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
     });}
     private RaftClient catalogue(){
         var borrowed=env.catalogue.client;var binding=plan.catalogue();var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
-            if(method.getName().equals("sendReadOnly")){byte[] bytes=((Message)args[0]).getContent().toByteArray();var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(ScopedTransactionRpc.importPublication(packet.kind()) || RatisTopologyExecutionRpc.kind(packet.kind()) || packet.kind()==RatisTopologyAuthority.KIND || packet.kind()==RatisRangeImportAuthority.KIND || packet.kind()==ScopedTransactionRpc.SCHEMA_AUTHORITY || packet.kind()==ScopedTransactionRpc.SCHEMA_FENCING_PREPARE){assertNotNull(catalogueMachine);return reply(catalogueMachine.queryLinearizable((Message)args[0]).get(10,TimeUnit.SECONDS).getContent().toByteArray());}}
+            if(method.getName().equals("sendReadOnly")){byte[] bytes=((Message)args[0]).getContent().toByteArray();var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()==RatisCatalogueViewRpc.KIND || ScopedTransactionRpc.importPublication(packet.kind()) || RatisTopologyExecutionRpc.kind(packet.kind()) || packet.kind()==RatisTopologyAuthority.KIND || packet.kind()==RatisRangeImportAuthority.KIND || packet.kind()==ScopedTransactionRpc.SCHEMA_AUTHORITY || packet.kind()==ScopedTransactionRpc.SCHEMA_FENCING_PREPARE){assertNotNull(catalogueMachine);return reply(catalogueMachine.queryLinearizable((Message)args[0]).get(10,TimeUnit.SECONDS).getContent().toByteArray());}}
             if(method.getName().equals("send")){var command=DistributedCommandCodec.decode(((Message)args[0]).getContent().toByteArray());return reply(applyCatalogue(command).getContent().toByteArray());}
             return invoke(method,borrowed.io(),args);
         });
@@ -202,6 +203,18 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
             return new RaftClientReply.Builder().setClientId(ClientId.randomId()).setServerId(RaftPeerId.valueOf(owner.peerId())).setGroupId(RaftGroupId.valueOf(descriptor.groupId())).setCallId(1).setSuccess(true).setMessage(Message.valueOf(ByteString.copyFrom(bytes))).build();
         });
         return (RaftClient)Proxy.newProxyInstance(RaftClient.class.getClassLoader(),new Class<?>[]{RaftClient.class},(proxy,method,args)->switch(method.getName()){case "io"->io;case "close"->null;default->throw new AssertionError(method);});
+    }
+    void createColumn(UUID domain,String name)throws Exception {createColumn(domain,name,null);}
+    void createColumn(UUID domain,String name,Callable<Void> whileFenced)throws Exception {
+        var route=routes.get(domain);var binding=plan.catalogue();boolean checked=false;
+        try(var client=new RatisSchemaClient(Files.createDirectory(root.resolve("schema-"+name)),first.clusterId(),first.databaseId(),domain,binding,catalogue,route,schemaReplicas,null);
+            var create=client.prepareCreate(name,ColumnSchema.of(IntArrayList.of(1),new ObjectArrayList<>(),true))){
+            for(int visits=0;visits<256 && create.phase()!=RatisSchemaClient.Phase.DONE;visits++){
+                var progress=client.advance(create,1);assertNotEquals(RatisSchemaClient.Phase.CONFLICT,progress.phase());assertNotEquals(RatisSchemaClient.Phase.ABORTED,progress.phase());
+                var nativeStore=store(route.directory().ranges().getFirst().groupId());if(whileFenced!=null && !checked && nativeStore.schemaFence()!=null){whileFenced.call();checked=true;}
+            }
+            assertEquals(RatisSchemaClient.Phase.DONE,create.phase());assertTrue(client.completed(create).changed());if(whileFenced!=null)assertTrue(checked,"Actual native FENCE stage exercised");
+        }
     }
     record SchemaMerge(UUID column,long api,UUID request,SessionEpochLedger.Grant grant,DistributedCommand last,RangeDirectory directory){}
     SchemaMerge createOperatorAndMerge()throws Exception {
