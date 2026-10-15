@@ -69,6 +69,26 @@ public final class RatisCatalogue {
         catch(IllegalArgumentException malformed){throw new IOException("Invalid recovery birth provenance reply",malformed);}
     }
 
+    /** Borrows this catalogue client; reply graphs are admitted before their first local copy/decode. */
+    RatisConfiguredRecoveryDiscovery.Source recoveryDiscoverySource() {
+        return new RatisConfiguredRecoveryDiscovery.Source(){
+            public RatisCatalogueViewRpc.View view(RatisCatalogueViewRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException {
+                requireScope(request.cluster(),request.database(),request.catalogue(),request.column());
+                try{return RatisCatalogueViewRpc.reply(discoveryContent(RatisCatalogueViewRpc.request(request),RatisCatalogueViewRpc.MAX_REPLY_BYTES,admission),request);}catch(IllegalArgumentException malformed){throw new IOException("Invalid discovery directory reply",malformed);}
+            }
+            public RatisRecoveryLineageRpc.Reply birth(RatisRecoveryLineageRpc.Request request,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException {
+                requireScope(request.cluster(),request.database(),request.catalogue(),request.column());
+                try{return RatisRecoveryLineageRpc.reply(discoveryContent(RatisRecoveryLineageRpc.request(request),RatisRecoveryLineageRpc.MAX_REPLY_BYTES,admission),request);}catch(IllegalArgumentException malformed){throw new IOException("Invalid discovery lineage reply",malformed);}
+            }
+            private void requireScope(UUID cluster,UUID database,UUID group,UUID column)throws IOException {if(!clusterId.equals(cluster) || !databaseId.equals(database) || !groupId.equals(group) || !columnId.equals(column))throw new IOException("Discovery request escaped catalogue binding");}
+        };
+    }
+    private byte[] discoveryContent(byte[] request,int maximum,RatisConfiguredRecoveryDiscovery.ReplyAdmission admission)throws IOException {
+        Objects.requireNonNull(admission);var reply=RatisRoutedClient.rpc(()->client.io().sendReadOnly(message(request)));
+        if(reply==null || !reply.isSuccess() || reply.getMessage()==null)throw new IOException("Discovery catalogue request failed",reply==null?null:reply.getException());
+        var bytes=reply.getMessage().getContent();if(bytes.size()<1 || bytes.size()>maximum)throw new IOException("Discovery catalogue reply exceeds operation budget");admission.beforeReply(bytes.size());return bytes.toByteArray();
+    }
+
     /** Prepare once; retry this exact command/operation identity after an uncertain reply. */
     public DistributedCommand prepare(OperationId operationId, RangeDirectory expected, RangeDirectory next) {
         return prepare(operationId,expected,next,null);

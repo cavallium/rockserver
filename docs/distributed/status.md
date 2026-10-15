@@ -2038,10 +2038,36 @@ The separate `current-to-meta-native-current-regression.log` passes the unchange
 16 native CURRENT cases in both core executions. Logs are in the task-owned native
 output directory; delivery and Ratis log floors remain controlled fixtures.
 
-Automatic CAT/DAG discovery and durable obligation retention remain unfinished.
-Discovery must fence obsolete roles before Raft replay or new PREPARE work and
-safely supersede unfinished CURRENT attempts after sealing. Catch-up from a stale
-pre-relocation membership and leader-change source transfer also remain open.
+Bounded CAT lineage planning now scans every current root, including nonlocal
+leaves, and follows both split/merge parents. Local ancestor obligations use the
+consuming definition's final source cohort/schema. Geometry conflicts, cycles,
+changed final views and absent birth without an ACTIVE immutable bootstrap witness
+are rejected. Roots and unique definitions share a 64 MiB bound with at most 128
+definitions; duplicate replies consume temporary workspace rather than accumulating
+retained credit. The production borrowed-client adapter admits exact bounded reply
+lengths before local copy/decode. The first final view supplies the historical
+common cut across domains; later final checks still enforce monotonic cuts.
+
+The planner/client gate passes 28 cases across seven classes in
+`configured-discovery-final-regression-gate.log`, including committed native CAT
+split/merge resolution through the production client adapter, nonlocal roots,
+cohort changes, two-domain cut ordering, FENCED-import provenance refusal, byte/count
+limits and existing lineage/source consumers. This establishes planning only.
+
+Automatic Runtime discovery and durable graph/attempt ownership remain unfinished.
+An unresolved role fence must be installed before server construction: Ratis also
+initializes persisted DATA divisions. Preserve their real log floor while deferring
+GROUP import, replay, voting, export and incoming snapshot installation until CAT
+classification is durable. Ordinary MISSING alone permits snapshot installation.
+All-node cold restart additionally needs qualification of genuine local META
+sources so fenced sources do not all wait for another source. Explicit true-genesis
+authority must remain distinct from a returning empty configured member.
+
+Discovery must safely supersede unfinished CURRENT attempts after sealing, including
+terminal cleanup of their obsolete source captures without claiming GROUP install.
+Catch-up from a stale pre-relocation membership and leader-change source transfer
+also remain open. FENCED import roots require genuine import provenance rather than
+ordinary-bootstrap permission.
 Canonical journal promises and runway accounting do not establish the complete
 physical allocation envelope.
 
