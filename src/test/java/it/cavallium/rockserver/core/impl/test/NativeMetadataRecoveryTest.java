@@ -5,6 +5,7 @@ import it.cavallium.rockserver.core.impl.rocksdb.*;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.RocksDBException;
@@ -169,7 +170,6 @@ class NativeMetadataRecoveryTest {
                 var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
                 metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1201),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
                 metadata.requireTransitionOf(current);
-                assertThrows(IllegalStateException.class,()->pool.openMetadataRecovery(metadata),"Image alone cannot retire unfinished CURRENT recovery");
                 assertTrue(pool.metadataRecoveries().isEmpty());assertEquals(current,target.currentRangeRecoveryRegistration());
                 target.completeCurrentRangeRecovery(current,image.position(),target.configuration());
                 var freeze=target.applyTopologyFreeze(new ApplyPosition(1,2),definition,nativeTest.admission(definition));assertEquals(source.freeze,freeze);
@@ -193,6 +193,133 @@ class NativeMetadataRecoveryTest {
                 assertTrue(pool.currentRangeRecoveries().isEmpty());assertEquals(List.of(metadata),pool.metadataRecoveries());var target=pool.openMetadataRecovery(metadata);configure(target,definition);assertTrue(target.metadataRecoveryImageInstalled());assertFalse(target.metadataRecoveryPending());assertEquals(tail,target.applied());assertFalse(target.admissionOpen());assertNull(target.currentRangeRecoveryRegistration());
                 var child=pool.reopenTopologyRange(descendants.birth(definition.targets().getFirst().groupId()),helper.outer.schema());assertArrayEquals(helper.helper.key(7),child.readCurrentPoint(helper.outer.fixed,helper.helper.key(1)));assertEquals(new ApplyPosition(3,2),child.applied());
             }
+        }
+    }
+
+    @Test void unfinishedCurrentSupersessionColdReopensWithoutCompletingOrRestoringItsGroupImage()throws Exception {
+        var currentHelper=new NativeCurrentRangeRecoveryTest();
+        for(int stage=0;stage<3;stage++)for(boolean after:List.of(false,true)) {
+            String id=stage+"-"+after;Path path=root.resolve("unfinished-"+id),groupImage=root.resolve("unfinished-group-"+id),metaImage=root.resolve("unfinished-meta-"+id);
+            NativeCurrentRangeRecovery current;NativeMetadataRecoveryRegistration metadata;TopologyChange.Definition definition;ApplyPosition actual;
+            try(var source=nativeTest.new Fixture(root.resolve("unfinished-source-"+id));var pool=helper.pool(path)) {
+                source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));definition=source.definition;
+                var image=NativeRangeImage.write(groupImage,source.parent,nativeTest.limits);var cfg=source.parent.configuration();
+                current=new NativeCurrentRangeRecovery(new UUID(0,1250),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"unfinished-"),Set.of(),currentHelper.schemaRows(source.parent));
+                var target=pool.openCurrentRangeRecovery(current);configure(target,definition);
+                if(stage==1)target.installSnapshot(groupImage,nativeTest.limits);
+                if(stage==2)assertThrows(IOException.class,()->target.installSnapshot(groupImage,nativeTest.limits,batch->{throw new IOException("Interrupted GROUP restore");}));
+                actual=target.applied();assertFalse(target.currentRangeRecoveryReady());assertEquals(stage==2,target.pendingInstallation());
+                source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
+                metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1251),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+                pool.metadataRecoveryForceObserver(boundary->{if(boundary==after)throw new RocksDBException("Lost sealed supersession acknowledgement");});
+                assertThrows(RocksDBException.class,()->pool.openMetadataRecovery(metadata));
+                assertEquals(actual,target.applied());assertNull(target.currentRangeRecoveryRegistration());assertFalse(target.pendingInstallation());assertTrue(target.userHandlesDetached());assertTrue(target.metadataRecoveryPending());assertFalse(target.metadataRecoveryImageInstalled());assertFalse(target.admissionOpen());
+                assertThrows(IllegalStateException.class,target::capture);assertThrows(IllegalStateException.class,target::metadataOutcomeState);
+                assertThrows(IllegalStateException.class,()->helper.open(pool,definition.targets().getFirst()),"Uncertain role force must not expose the newly freed descendant interval");
+            }
+            try(var pool=helper.pool(path)) {
+                ReplicatedRangeStore target;
+                if(after){assertTrue(pool.currentRangeRecoveries().isEmpty());target=pool.openMetadataRecovery(metadata);}
+                else {assertEquals(List.of(current),pool.currentRangeRecoveries());target=pool.openCurrentRangeRecovery(current);assertEquals(stage==2,target.pendingInstallation());assertSame(target,pool.openMetadataRecovery(metadata));}
+                configure(target,definition);assertEquals(actual,target.applied());assertTrue(target.userHandlesDetached());assertFalse(target.pendingInstallation());assertFalse(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());
+                target.installMetadataSnapshot(metaImage,nativeTest.limits);target.completeMetadataRecovery(metadata,target.applied(),target.configuration());
+                assertTrue(target.metadataRecoveryImageInstalled());assertFalse(target.metadataRecoveryPending());assertFalse(target.admissionOpen());assertTrue(pool.currentRangeRecoveries().isEmpty());
+            }
+        }
+    }
+
+    @Test void supersessionPreservesFinalForcedCurrentMarkerDespiteLostInstallAcknowledgement()throws Exception {
+        var currentHelper=new NativeCurrentRangeRecoveryTest();Path groupImage=root.resolve("forced-current-group"),metaImage=root.resolve("forced-current-meta");
+        try(var source=nativeTest.new Fixture(root.resolve("forced-current-source"));var pool=helper.pool(root.resolve("forced-current-receiver"))) {
+            source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));var image=NativeRangeImage.write(groupImage,source.parent,nativeTest.limits);var cfg=source.parent.configuration();var definition=source.definition;
+            var current=new NativeCurrentRangeRecovery(new UUID(0,1260),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"forced-current-"),Set.of(),currentHelper.schemaRows(source.parent));
+            var target=pool.openCurrentRangeRecovery(current);configure(target,definition);
+            assertThrows(IOException.class,()->target.installSnapshot(groupImage,nativeTest.limits,new ReplicatedRangeStore.InstallationObserver(){public void afterBatch(int count){}public void afterCompletionForce()throws IOException{throw new IOException("Lost final image force acknowledgement");}}));
+            assertNull(target.applied());assertTrue(target.pendingInstallation());
+            source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
+            var metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1261),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            assertSame(target,pool.openMetadataRecovery(metadata));assertEquals(image.position(),target.applied());assertFalse(target.pendingInstallation());assertFalse(target.metadataRecoveryImageInstalled());
+            target.installMetadataSnapshot(metaImage,nativeTest.limits);target.completeMetadataRecovery(metadata,target.applied(),target.configuration());assertFalse(target.metadataRecoveryPending());
+        }
+    }
+
+    @Test void bornCurrentWithInterruptedLaterCheckpointColdReopensMetadataBeforeItsImageArrives()throws Exception {
+        var currentHelper=new NativeCurrentRangeRecoveryTest();var images=currentHelper.helper;
+        Path path=root.resolve("born-superseded"),initial=root.resolve("born-initial"),later=root.resolve("born-later"),meta=root.resolve("born-meta");
+        NativeMetadataRecoveryRegistration metadata;
+        try(var source=images.new Fixture(root.resolve("born-source"),images.first,"born-source-");var pool=helper.pool(path)) {
+            source.cdc();source.child.enableSessionControls();source.child.apply(new ApplyPosition(1,2),source.write(9));
+            var image=NativeRangeImage.write(initial,source.child,images.limits);
+            var current=currentHelper.registration(source.child,source.definition.targetDirectory(),image,images.first,images.first,"born-target-");
+            var target=pool.openCurrentRangeRecovery(current);target.enableSessionControls();target.enableCdc(current.range().rangeId());target.installSnapshot(initial,images.limits);target.completeCurrentRangeRecovery(current,image.position(),target.configuration());
+            source.child.applyNoop(new ApplyPosition(1,3));target.applyNoop(new ApplyPosition(1,3));NativeRangeImage.write(later,target,images.limits);target.fence();
+            assertEquals("Interrupt born CURRENT checkpoint",assertThrows(IOException.class,()->target.installSnapshot(later,images.limits,batch->{throw new IOException("Interrupt born CURRENT checkpoint");})).getMessage());
+            assertNull(target.applied());assertTrue(target.pendingInstallation());assertNotNull(target.topologyActivation());
+            var directory=source.definition.targetDirectory();var merged=new RangeDescriptor(new UUID(0,1270),new UUID(0,1271),2,directory.ranges().getFirst().configurationVersion(),null,null,RangeDescriptor.TopologyState.ACTIVE,directory.ranges().getFirst().replicas());
+            var definition=new TopologyChange.Definition(new UUID(0,1272),directory,helper.topology.directory(helper.outer.schema(),directory.generation()+1,List.of(merged)));
+            var authority=TopologyChange.State.begin(definition.header()).beginFencing();NativeTopologyFreeze freeze=null;
+            for(var child:source.children){var f=child.applyTopologyFreeze(new ApplyPosition(1,child.applied().index()+1),definition,images.admission(definition));authority=authority.frozen(f.proof(images.first.replicaId())).frozen(f.proof(images.second.replicaId()));if(child==source.child)freeze=f;}
+            source.pool.seedTopology(definition,authority,source.children,images.first);
+            var sealed=NativeRangeImage.writeMetadata(meta,source.child,images.limits);var cfg=source.child.configuration();
+            metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1273),current.catalogue(),new ApplyPosition(1,50),directory,freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            assertSame(target,pool.openMetadataRecovery(metadata));assertNull(target.applied());assertFalse(target.pendingInstallation());assertTrue(target.userHandlesDetached());assertFalse(target.metadataRecoveryImageInstalled());
+        }
+        try(var pool=helper.pool(path)) {
+            var target=pool.openMetadataRecovery(metadata);assertNull(target.applied());assertFalse(target.pendingInstallation());assertFalse(target.metadataRecoveryImageInstalled());assertTrue(target.metadataRecoveryPending());assertFalse(target.admissionOpen());
+            target.enableSessionControls();target.enableCdc(metadata.range().rangeId());target.installMetadataSnapshot(meta,images.limits);target.completeMetadataRecovery(metadata,target.applied(),target.configuration());assertFalse(target.metadataRecoveryPending());assertFalse(target.admissionOpen());
+        }
+    }
+
+    @Test void supersessionWaitsForActualInstallerAndExactForceRetryPreservesNewMetadataInstall()throws Exception {
+        var currentHelper=new NativeCurrentRangeRecoveryTest();Path path=root.resolve("drained-receiver"),group=root.resolve("drained-group"),meta=root.resolve("drained-meta");
+        NativeMetadataRecoveryRegistration metadata;
+        try(var source=nativeTest.new Fixture(root.resolve("drained-source"));var pool=helper.pool(path);var workers=Executors.newVirtualThreadPerTaskExecutor()) {
+            source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));var image=NativeRangeImage.write(group,source.parent,nativeTest.limits);var cfg=source.parent.configuration();var definition=source.definition;
+            var current=new NativeCurrentRangeRecovery(new UUID(0,1280),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"drained-current-"),Set.of(),currentHelper.schemaRows(source.parent));
+            var target=pool.openCurrentRangeRecovery(current);configure(target,definition);
+            source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(meta,source.parent,nativeTest.limits);cfg=source.parent.configuration();
+            metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1281),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+            var installer=workers.submit(()->target.installSnapshot(group,nativeTest.limits,batch->{entered.countDown();try{if(!release.await(10,TimeUnit.SECONDS))throw new IOException("Installer barrier timeout");}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new IOException(interrupted);}throw new IOException("Interrupted original install");}));
+            try {
+                assertTrue(entered.await(5,TimeUnit.SECONDS));assertThrows(IllegalStateException.class,()->pool.openMetadataRecovery(metadata));
+                assertTrue(pool.metadataRecoveries().isEmpty());assertEquals(current,target.currentRangeRecoveryRegistration());assertTrue(target.pendingInstallation());
+            }finally{release.countDown();}
+            assertInstanceOf(IOException.class,assertThrows(ExecutionException.class,()->installer.get(5,TimeUnit.SECONDS)).getCause());
+            pool.metadataRecoveryForceObserver(after->{if(after)throw new RocksDBException("Lost supersession force acknowledgement");});
+            assertThrows(RocksDBException.class,()->pool.openMetadataRecovery(metadata));assertTrue(target.metadataRecoveryRegistrationForced(metadata));
+            assertThrows(IOException.class,()->target.installMetadataSnapshot(meta,nativeTest.limits,batch->{throw new IOException("Interrupted new META install");}));assertTrue(target.pendingInstallation());
+            byte[] key=java.nio.ByteBuffer.allocate(17).putLong(metadata.groupId().getMostSignificantBits()).putLong(metadata.groupId().getLeastSignificantBits()).put((byte)0x7f).array();
+            byte[] pending=helper.db(pool).get(helper.handles(pool).get(DistributedStoragePool.STATE_COLUMN),key);assertNotNull(pending);
+            pool.metadataRecoveryForceObserver(after->{});assertSame(target,pool.openMetadataRecovery(metadata));
+            assertTrue(target.pendingInstallation());assertArrayEquals(pending,helper.db(pool).get(helper.handles(pool).get(DistributedStoragePool.STATE_COLUMN),key));assertNull(target.applied());
+        }
+        try(var pool=helper.pool(path)) {
+            var target=pool.openMetadataRecovery(metadata);assertTrue(target.pendingInstallation());assertNull(target.applied());assertFalse(target.admissionOpen());
+            target.enableSessionControls();target.enableCdc(metadata.range().rangeId());target.installMetadataSnapshot(meta,nativeTest.limits);target.completeMetadataRecovery(metadata,target.applied(),target.configuration());assertFalse(target.metadataRecoveryPending());assertTrue(pool.currentRangeRecoveries().isEmpty());
+        }
+    }
+
+    @Test void supersessionRejectsMetadataBehindPendingOrFinallyForcedOwnCheckpoint()throws Exception {
+        var currentHelper=new NativeCurrentRangeRecoveryTest();
+        for(boolean forced:List.of(false,true))try(var source=nativeTest.new Fixture(root.resolve("floor-source-"+forced));var pool=helper.pool(root.resolve("floor-receiver-"+forced))) {
+            Path group=root.resolve("floor-group-"+forced),own=root.resolve("floor-own-"+forced),meta=root.resolve("floor-meta-"+forced),latest=root.resolve("floor-latest-"+forced);
+            source.parent.apply(new ApplyPosition(1,1),source.write(source.parent,0,9));var image=NativeRangeImage.write(group,source.parent,nativeTest.limits);var cfg=source.parent.configuration();var definition=source.definition;
+            var current=new NativeCurrentRangeRecovery(new UUID(0,1290),nativeTest.catalogue,new ApplyPosition(1,10),definition.sourceDirectory(),helper.outer.schema(),source.parent.ownership().owner().groupId(),helper.topology.replica,helper.topology.replica,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),currentHelper.names(helper.outer.schema(),"floor-current-"),Set.of(),currentHelper.schemaRows(source.parent));
+            var target=pool.openCurrentRangeRecovery(current);configure(target,definition);target.installSnapshot(group,nativeTest.limits);target.completeCurrentRangeRecovery(current,image.position(),target.configuration());
+            source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(meta,source.parent,nativeTest.limits);cfg=source.parent.configuration();
+            var stale=new NativeMetadataRecoveryRegistration(new UUID(0,1291),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of());
+            target.applyTopologyFreeze(new ApplyPosition(1,2),definition,nativeTest.admission(definition));target.applyNoop(new ApplyPosition(1,3));NativeRangeImage.write(own,target,nativeTest.limits);target.fence();
+            assertThrows(IOException.class,()->target.installSnapshot(own,nativeTest.limits,new ReplicatedRangeStore.InstallationObserver(){
+                public void afterBatch(int count)throws IOException{if(!forced)throw new IOException("Interrupted own checkpoint");}
+                public void afterCompletionForce()throws IOException{throw new IOException("Lost own checkpoint completion acknowledgement");}
+            }));
+            assertNull(target.applied());assertTrue(target.pendingInstallation());assertThrows(IllegalArgumentException.class,()->pool.openMetadataRecovery(stale));
+            assertEquals(current,target.currentRangeRecoveryRegistration());assertTrue(pool.metadataRecoveries().isEmpty());assertTrue(target.pendingInstallation());
+            source.parent.applyNoop(new ApplyPosition(1,3));var nextImage=NativeRangeImage.writeMetadata(latest,source.parent,nativeTest.limits);cfg=source.parent.configuration();
+            var next=new NativeMetadataRecoveryRegistration(new UUID(0,1292),current.catalogue(),new ApplyPosition(1,21),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),nextImage.position(),nextImage.sha256(),Set.of());
+            assertSame(target,pool.openMetadataRecovery(next));assertEquals(forced?new ApplyPosition(1,3):null,target.applied());assertFalse(target.pendingInstallation());
+            target.installMetadataSnapshot(latest,nativeTest.limits);target.completeMetadataRecovery(next,target.applied(),target.configuration());assertFalse(target.metadataRecoveryPending());
         }
     }
 

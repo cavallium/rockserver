@@ -1036,7 +1036,7 @@ public final class ReplicatedRangeStore {
         if(birth!=null) { topologyBirth=NativeTopologyBirth.decode(birth); if(!topologyBirth.groupId().equals(groupId)) throw new IllegalArgumentException("Topology birth group differs from store"); }
         if(retirement!=null && retirement.length!=32) throw new IllegalArgumentException("Invalid topology retirement pointer"); topologyRetirement=retirement;
         byte[] activation=db.get(state,topologyOwnershipKey(0x63));
-        if(activation!=null) { topologyActivation=NativeTopologyActivation.decode(activation); if(topologyBirth==null || !topologyBirth.equals(topologyActivation.birth())) throw new IllegalArgumentException("Topology activation lacks matching live birth"); topologyActivation.requireCut(topologyRecoveryCut()); }
+        if(activation!=null) { topologyActivation=NativeTopologyActivation.decode(activation); if(topologyBirth==null || !topologyBirth.equals(topologyActivation.birth())) throw new IllegalArgumentException("Topology activation lacks matching live birth");if(metadataRecoveryRegistration==null || applied!=null)topologyActivation.requireCut(topologyRecoveryCut()); }
     }
     private ApplyPosition topologyRecoveryCut() {
         if(applied!=null || pendingInstallation==null)return applied;
@@ -1147,22 +1147,28 @@ public final class ReplicatedRangeStore {
             if(closing || snapshotPins.get()!=0)throw new IllegalStateException("Actual original native snapshots have not drained");
             var previous=metadataRecoveryRegistration;if(previous!=null)registration.requireSuccessorOf(previous);
             if(retiredMetadataOnly && registration.equals(previous) && Arrays.equals(registration.digest(),db.get(state,topologyOwnershipKey(0x6f)))){force.force();metadataCurrentPredecessor=null;return;}
+            ApplyPosition retainedCut=applied;
             if(predecessor!=null){
-                registration.requireTransitionOf(predecessor);if(pendingInstallation!=null || pendingCurrentCompletion!=null)throw new IllegalStateException("Unsettled CURRENT image/completion cannot change native role");
-                if(currentRangeRecovery!=null){if(!predecessor.equals(currentRangeRecovery) || !currentRangeRecoveryReady || !currentImageInstalledUnderLane())throw new IllegalStateException("META transition requires genuinely completed CURRENT image");}
-                else if(!predecessor.equals(metadataCurrentPredecessor) || !registration.equals(previous))throw new IllegalStateException("META transition lost its original completed CURRENT predecessor");
-                byte[] recipe=db.get(state,topologyOwnershipKey(0x72));if(recipe==null || !Arrays.equals(recipe,predecessor.encode()) || !Arrays.equals(db.get(state,topologyOwnershipKey(0x74)),ByteBuffer.allocate(48).putLong(predecessor.imageCut().term()).putLong(predecessor.imageCut().index()).put(predecessor.imageHash()).array()))throw new IllegalStateException("META transition lost actual CURRENT registration/image receipt");
-                NativeCurrentRangeRecovery.requireCompletion(predecessor,db.get(state,topologyOwnershipKey(0x73)),applied);
+                registration.requireTransitionOf(predecessor);
+                if(currentRangeRecovery!=null){if(!predecessor.equals(currentRangeRecovery))throw new IllegalStateException("META transition changed original CURRENT registration");}
+                else if(!predecessor.equals(metadataCurrentPredecessor) || !registration.equals(previous))throw new IllegalStateException("META transition lost its original CURRENT predecessor");
+                byte[] recipe=db.get(state,topologyOwnershipKey(0x72));if(recipe==null || !Arrays.equals(recipe,predecessor.encode()))throw new IllegalStateException("META transition lost actual CURRENT registration");
+                // A final install force can succeed before its acknowledgement updates the cache.
+                byte[] marker=db.get(state,markerKey);retainedCut=marker==null?null:decodePosition(marker);
+                var pendingCut=snapshotInstallationCut(db.get(state,installingKey));
+                if(pendingCut!=null && !NativeMetadataRecoveryRegistration.covers(registration.imageCut(),pendingCut))throw new IllegalArgumentException("META image regresses retained CURRENT installation floor");
                 if(activeTopologyFreeze!=null && !activeTopologyFreeze.equals(registration.freeze()))throw new IllegalArgumentException("META transition changed the actual sealed source FREEZE");
             }
-            if(pendingInstallation!=null && !registration.equals(previous))throw new IllegalStateException("Uncertain metadata install requires original image retry");
-            if(applied!=null && !NativeMetadataRecoveryRegistration.covers(registration.imageCut(),applied))throw new IllegalArgumentException("Metadata image regresses completed native prefix");
+            if(predecessor==null && pendingInstallation!=null && !registration.equals(previous))throw new IllegalStateException("Uncertain metadata install requires original image retry");
+            if(retainedCut!=null && !NativeMetadataRecoveryRegistration.covers(registration.imageCut(),retainedCut))throw new IllegalArgumentException("Metadata image regresses completed native prefix");
             var descriptor=registration.range();var target=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),descriptor.lowerInclusive(),descriptor.upperExclusive());
             if(!groupId.equals(registration.groupId()) || rangeEpoch!=descriptor.rangeEpoch())throw new IllegalArgumentException("Metadata registration changed source owner");
             ownership.validateMetadataRecovery(owner,target);byte[] digest=registration.sourceDirectory().schemaDigest();
             // Fence first. A failed/unknown force must never reopen the previous USER owner.
             metadataRecoveryRegistration=registration;metadataRecoveryReady=false;pendingMetadataCompletion=null;
-            if(predecessor!=null){metadataCurrentPredecessor=predecessor;currentRangeRecovery=null;currentRangeRecoveryReady=false;pendingCurrentCompletion=null;}
+            // The exclusive native lifecycle/apply lanes have drained the obsolete install.
+            // Supersession abandons its recipe, never fabricates its completed marker or image receipt.
+            if(predecessor!=null){metadataCurrentPredecessor=predecessor;currentRangeRecovery=null;currentRangeRecoveryReady=false;pendingCurrentCompletion=null;pendingInstallation=null;applied=retainedCut;}
             ownership.recoverMetadata(owner,target);interval=target;schemaDigest=digest;columns=Map.of();deterministicMergeColumns=registration.mergeColumns();topologyRecoveryFence=null;
             retiredMetadataOnly=true;installedGeneration=null;logicalSchema=null;retiredRoutingPrefix=registration.sourceDirectory().routingPrefixBytes();
             force.force();metadataCurrentPredecessor=null;
@@ -4340,6 +4346,7 @@ public final class ReplicatedRangeStore {
                         if(topologyLearner!=null)batch.delete(state,topologyOwnershipKey(0x6c));
                         db.write(options, batch);
                     }
+                    observer.afterCompletionForce();
                     publishScoped(expected.position(),prepareScopedWrites(false,List.of(),Map.of()),false); applied = expected.position();
                     recoverImportMetadata();recoverTopologyOwnership();recoverRelocationCompletions();validateTopologyActivationRecovery();
                     installationGeneration++;
@@ -4357,6 +4364,8 @@ public final class ReplicatedRangeStore {
     public interface InstallationObserver {
         /** Fault/measurement hook; the interval remains exclusively leased and unservable. */
         void afterBatch(int completedBatches) throws IOException;
+        /** Final native marker/image receipt is forced, before volatile completion publication. */
+        default void afterCompletionForce() throws IOException { }
     }
 
     private final class InstallWriter implements AutoCloseable {

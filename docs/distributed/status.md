@@ -2022,6 +2022,22 @@ old CURRENT authority or the new pending META authority, never mixed receipts.
 Immutable group/range/epoch/bounds and receiver identity stay fixed while source
 schema, configuration and receiver role may progress under fresh authority.
 
+Native supersession also accepts an unfinished CURRENT registration after actual
+installers/readers drain. The same atomic role force removes its obsolete install
+intent without claiming that GROUP data was installed. It reconciles the durable
+native marker after a lost final-install acknowledgement and requires META to cover
+both that marker and any pending checkpoint target. Missing native progress stays
+missing; a genuine META image is required before replay or authoritative outcomes.
+Cold born-CURRENT recovery defers activation cut qualification while its META image
+is absent. Unknown role forces block new structural ownership and schema claims;
+exact force retry preserves newer META installation and completion state.
+
+`unfinished-current-native-regression-gate.log` passes 90 distinct cases across nine
+classes in both core executions, including missing/unfinished/interrupted CURRENT,
+pre/post-force cold roles, blocked actual installers, lost final-install ACKs,
+checkpoint floor refusal, born-owner cold reopen, descendant ownership exclusion,
+learner/schema consumers and standalone codec/async behavior.
+
 The node replaces the old graph credit once and reuses its exposure identity.
 A DONE CURRENT journal may start the fresh META attempt; unfinished attempts stay
 fixed. Renewal rejects both the initial UUID and an effective UUID reached after
