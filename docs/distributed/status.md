@@ -84,6 +84,13 @@ This section and the remaining gates at the end describe the current branch.
   durability check and three independent Runtime JVM starts pass in
   `runtime-quorum-transport-envelope32.log`; that run then fails at a separate
   genesis fixture ordering error. Full cold-quorum acceptance is still pending.
+- Idle gRPC appenders no longer take a zero-wait retry path solely because their
+  stream is absent after reset. An unconstructible idle request waits for its
+  heartbeat deadline; new data and explicit heartbeats remain prompt. Failure
+  backoff and resource bounds are unchanged. The actual-appender scheduling check
+  and nine admitted-observer cases pass in `runtime-quorum-appender-metrics42.log`.
+  Large call IDs in earlier logs count attempted request construction, not RPCs;
+  this check does not establish a measured production CPU improvement.
 - Redundant format-version words are removed from the current command, schema,
   directory, acceptance, session journals, native image and internal state rows.
   Java and Rust readers, command admission offsets and receipt budgets use the

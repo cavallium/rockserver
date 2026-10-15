@@ -275,7 +275,9 @@ public class GrpcLogAppender extends LogAppenderBase {
     if(isMigrationWaiting())return Math.max(0,Math.min(10,getHeartbeatWaitTimeMs()));
     if (haveTooManyPendingRequests()) {
       return getHeartbeatWaitTimeMs(); // Should wait for a short time
-    } else if (shouldSendAppendEntries() && !isSlowFollower()) {
+    } else if (super.shouldSendAppendEntries() && !isSlowFollower()) {
+      // An absent stream requests a reconnect attempt, but an idle attempt can
+      // produce no request. Wait for its heartbeat deadline instead of spinning.
       // For normal nodes, new entries should be sent ASAP
       // however for slow followers (especially when the follower is down),
       // keep sending without any wait time only ends up in high CPU load
