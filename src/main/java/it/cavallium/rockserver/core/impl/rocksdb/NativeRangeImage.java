@@ -83,7 +83,53 @@ public final class NativeRangeImage {
     @FunctionalInterface public interface IoAdmission {
         /** Before the actual read/write; the caller owns cancellation and any waiting. Maximum quantum is 1 MiB. */
         void beforeBytes(int bytes)throws IOException;
+        /** Reserve actual encoded registration bytes before allocation; implementations must cover decoded/copy graphs too. */
+        default AutoCloseable reserveMetadata(int rawBytes)throws IOException{return ()->{};}
         IoAdmission UNLIMITED=bytes->{};
+    }
+    private static final ThreadLocal<MetadataAdmissionScope> METADATA_ADMISSION=new ThreadLocal<>();
+
+    /** Synchronous operation ownership: nested scans reuse one retained high-water envelope. */
+    public static MetadataAdmissionScope openMetadataAdmission(IoAdmission admission) {
+        Objects.requireNonNull(admission);
+        var current=METADATA_ADMISSION.get();
+        return new MetadataAdmissionScope(current==null?admission:current.admission,current);
+    }
+    public static final class MetadataAdmissionScope implements AutoCloseable {
+        private final Thread owner=Thread.currentThread();
+        private final IoAdmission admission;
+        private final MetadataAdmissionScope root,parent;
+        private final List<AutoCloseable> leases=new ArrayList<>();
+        private int active,highWater;
+        private boolean closed;
+        private MetadataAdmissionScope(IoAdmission admission,MetadataAdmissionScope parent) {
+            this.admission=admission;this.parent=parent;root=parent==null?this:parent.root;
+            METADATA_ADMISSION.set(this);
+        }
+        private void requireOwner(){if(Thread.currentThread()!=owner || closed)throw new IllegalStateException("Image metadata admission scope is closed or belongs to another thread");}
+        MetadataPass pass(){requireOwner();return new MetadataPass(root);}
+        @Override public void close()throws IOException {
+            requireOwner();
+            if(METADATA_ADMISSION.get()!=this)throw new IllegalStateException("Image metadata admission scopes must close in nesting order");
+            closed=true;
+            if(parent!=null){METADATA_ADMISSION.set(parent);return;}
+            METADATA_ADMISSION.remove();
+            IOException failure=null;
+            for(int i=leases.size()-1;i>=0;i--)try{leases.get(i).close();}catch(Exception invalid){if(failure==null)failure=new IOException("Image metadata reservation release failed",invalid);else failure.addSuppressed(invalid);}
+            if(failure!=null)throw failure;
+        }
+    }
+    static final class MetadataPass implements AutoCloseable {
+        private final MetadataAdmissionScope scope;
+        private int bytes;
+        private MetadataPass(MetadataAdmissionScope scope){this.scope=scope;}
+        void reserve(int rawBytes)throws IOException {
+            scope.requireOwner();
+            int next=Math.addExact(scope.active,rawBytes);
+            if(next>scope.highWater){var lease=Objects.requireNonNull(scope.admission.reserveMetadata(next-scope.highWater),"Metadata admission lease");scope.leases.add(lease);scope.highWater=next;}
+            scope.active=next;bytes=Math.addExact(bytes,rawBytes);
+        }
+        @Override public void close(){scope.active-=bytes;}
     }
     private static final int IO_QUANTUM=1024*1024;
     private static OutputStream admittedOutput(OutputStream output,IoAdmission admission){return new FilterOutputStream(output){
@@ -141,6 +187,8 @@ public final class NativeRangeImage {
         if (!pin.interval().equals(interval) || !pin.columns().equals(interval.columns()) || pin.position() == null) {
             throw new IllegalArgumentException("Image requires exact pin interval/columns and a completed position");
         }
+        try(var metadataScope=openMetadataAdmission(admission);var metadataPass=metadataScope.pass()) {
+        metadataPass.reserve(pin.recoveryRegistrationBytes(limits));
         NativeTopologyImageOrigin origin=pin.topologyImageOrigin();
         byte[] originBytes=origin==null ? null : origin.encode();
         if(originBytes!=null && ((long)originBytes.length+17>limits.maxRowBytes() || (long)originBytes.length+17>limits.maxImageBytes())) throw new IOException("Topology image origin exceeds configured byte limit");
@@ -212,6 +260,7 @@ public final class NativeRangeImage {
             return manifest(header, rows, bytes, whole.digest(),origin);
         } finally {
             Files.deleteIfExists(temporary);
+        }
         }
     }
 
@@ -301,7 +350,8 @@ public final class NativeRangeImage {
         if (size <= HASH_BYTES || size > limits.maxImageBytes()) throw new IOException("Invalid image byte size");
         MessageDigest whole = digest();
         MessageDigest body = digest();
-        try (var source = new BufferedInputStream(admittedInput(Files.newInputStream(image),admission))) {
+        try (var metadataScope=openMetadataAdmission(admission);var metadataPass=metadataScope.pass();
+             var source = new BufferedInputStream(admittedInput(Files.newInputStream(image),admission))) {
             var counted = new BoundedInput(new DigestInputStream(source, whole), size);
             var bodyInput = new DigestInputStream(counted, body);
             var input = new DataInputStream(bodyInput);
@@ -325,6 +375,7 @@ public final class NativeRangeImage {
                 byte[] key = new byte[keyLength];
                 input.readFully(key);
                 if(rowBytes>rowByteLimit(header,section,key,limits))throw new IOException("Image row exceeds byte limit");
+                if(section==Section.STATE && key.length>16 && key[16]==0x67 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.MAX_BYTES))throw new IOException("Learner registration exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x72 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.MAX_BYTES))throw new IOException("CURRENT registration exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x73 && (key.length!=17 || valueLength>65620))throw new IOException("CURRENT completion exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x74 && (key.length!=17 || valueLength!=48))throw new IOException("CURRENT image receipt exceeds bound");
@@ -336,6 +387,7 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length>16 && key[16]==0x79 && (key.length!=49 || valueLength!=it.cavallium.rockserver.core.common.distributed.CatalogueHistory.CREDIT_BYTES))throw new IOException("Invalid catalogue history credit length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x15 && (key.length!=17 || valueLength!=8))throw new IOException("Invalid ACK namespace count length");
                 if(section==Section.STATE && key.length>16 && key[16]>=0x6d && key[16]<=0x71)throw new IOException("Receiver-local recovery fence is not portable image authority");
+                if(recoveryRegistration(header,section,key))metadataPass.reserve(valueLength);
                 byte[] value = new byte[valueLength];
                 input.readFully(value);
                 tracker.accept(section, column, key, value);
@@ -480,6 +532,12 @@ public final class NativeRangeImage {
         try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
             channel.force(true);
         }
+    }
+
+    private static boolean recoveryRegistration(Header header,Section section,byte[] key) {
+        if(header.metadata() || section!=Section.STATE || key.length!=17 || key[16]!=0x67 && key[16]!=0x6a && key[16]!=0x72)return false;
+        var group=ByteBuffer.wrap(key);
+        return group.getLong()==header.owner().groupId().getMostSignificantBits() && group.getLong()==header.owner().groupId().getLeastSignificantBits();
     }
 
     private static long rowByteLimit(Header header,Section section,byte[] key,Limits limits) {

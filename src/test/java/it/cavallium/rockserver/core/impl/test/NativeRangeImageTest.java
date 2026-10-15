@@ -49,7 +49,10 @@ class NativeRangeImageTest {
         try(var pool=new Pool(directory.resolve("admitted-pool"))){
             pool.store.applyNoop(new ApplyPosition(1,0));pool.db.put(pool.handles.get(1),key(0x80),new byte[3*1024*1024]);
             var limits=new Limits(4*1024*1024,8*1024*1024,4);var calls=new java.util.concurrent.atomic.AtomicInteger();var charged=new java.util.concurrent.atomic.AtomicLong();
-            IoAdmission gate=bytes->{assertTrue(bytes>0 && bytes<=1024*1024);calls.incrementAndGet();charged.addAndGet(bytes);};
+            IoAdmission gate=new IoAdmission(){
+                public void beforeBytes(int bytes){assertTrue(bytes>0 && bytes<=1024*1024);calls.incrementAndGet();charged.addAndGet(bytes);}
+                public AutoCloseable reserveMetadata(int rawBytes){throw new AssertionError("USER image must not reserve typed metadata");}
+            };
             try(var pin=pool.store.capture()){
                 var path=directory.resolve("admitted.image");var written=NativeRangeImage.writeAdmitted(path,pin,interval(),limits,gate);
                 assertTrue(written.bytes()>3*1024*1024);assertTrue(calls.get()>3);assertTrue(charged.get()>=written.bytes());
@@ -66,6 +69,35 @@ class NativeRangeImageTest {
                 var written=NativeRangeImage.writeAdmitted(path,pin,interval(),LIMITS,IoAdmission.UNLIMITED);assertArrayEquals(written.sha256(),NativeRangeImage.inspect(path,LIMITS).sha256());
             }
         }
+    }
+
+    @Test void typedMetadataDenialPrecedesWriterDecodeAndReaderValueAllocation()throws Exception {
+        int registrationBytes=1024*1024;
+        byte[] registrationKey=ByteBuffer.allocate(17).putLong(GROUP.getMostSignificantBits()).putLong(GROUP.getLeastSignificantBits()).put((byte)0x72).array();
+        var requests=new java.util.concurrent.atomic.AtomicInteger();
+        IoAdmission deny=new IoAdmission(){
+            public void beforeBytes(int bytes){}
+            public AutoCloseable reserveMetadata(int rawBytes)throws IOException {
+                assertEquals(registrationBytes,rawBytes);requests.incrementAndGet();throw new IOException("metadata denied before decode");
+            }
+        };
+        try(var pool=new Pool(directory.resolve("metadata-denied-pool"))){
+            pool.store.applyNoop(new ApplyPosition(1,0));
+            pool.db.put(pool.handles.get(3),registrationKey,new byte[registrationBytes]);
+            try(var pin=pool.store.capture()){
+                var path=directory.resolve("metadata-denied.image");
+                assertEquals("metadata denied before decode",assertThrows(IOException.class,()->NativeRangeImage.writeAdmitted(path,pin,interval(),new Limits(4096,4*1024*1024,4),deny)).getMessage());
+                assertFalse(Files.exists(path));
+            }
+        }
+        // An otherwise valid header followed by a registration payload whose contents must never be decoded.
+        byte[] original=imageWithOneUserRow();int end=original.length-41;
+        var bytes=new java.io.ByteArrayOutputStream();bytes.write(original,0,end);
+        var output=new java.io.DataOutputStream(bytes);output.writeByte(Section.STATE.ordinal()+1);output.writeInt(17);output.writeInt(registrationBytes);output.write(registrationKey);output.write(new byte[registrationBytes]);output.write(original,end,41);
+        byte[] forged=bytes.toByteArray();byte[] checksum=MessageDigest.getInstance("SHA-256").digest(Arrays.copyOf(forged,forged.length-32));System.arraycopy(checksum,0,forged,forged.length-32,32);
+        var path=directory.resolve("metadata-reader-denied.image");Files.write(path,forged);
+        assertEquals("metadata denied before decode",assertThrows(IOException.class,()->NativeRangeImage.inspectAdmitted(path,new Limits(4096,4*1024*1024,4),deny)).getMessage());
+        assertEquals(2,requests.get());
     }
 
     @Test

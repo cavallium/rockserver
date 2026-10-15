@@ -27,6 +27,47 @@ class NativeCurrentRangeRecoveryTest {
     NativeCurrentRangeRecovery registration(ReplicatedRangeStore source,RangeDirectory directory,NativeRangeImage.Manifest image,ReplicaDescriptor receiver,ReplicaDescriptor owner,String prefix)throws Exception {
         var cfg=source.configuration();return new NativeCurrentRangeRecovery(UUID.randomUUID(),helper.catalogue,new ApplyPosition(1,40),directory,source.installedSchema(),source.ownership().owner().groupId(),receiver,owner,image.position(),image.sha256(),cfg.term(),cfg.index(),cfg.data(),image.topologyOrigin(),names(source.installedSchema(),prefix),source.deterministicMergeColumns(),schemaRows(source));
     }
+    @Test void typedMetadataChargesActualBytesReusesInstallAndScanEnvelopeAndReleasesOnFailure()throws Exception {
+        Path original=root.resolve("metadata-source-image"),exported=root.resolve("metadata-reexport");
+        try(var source=helper.new Fixture(root.resolve("metadata-source"),helper.first,"source-")) {
+            source.child.apply(new ApplyPosition(1,2),source.write(8));
+            var image=NativeRangeImage.write(original,source.child,helper.limits);
+            var registration=registration(source.child,source.definition.targetDirectory(),image,helper.second,helper.first,"metadata-current-");
+            var held=new java.util.concurrent.atomic.AtomicInteger();var reservations=new java.util.concurrent.atomic.AtomicInteger();
+            NativeRangeImage.IoAdmission gate=new NativeRangeImage.IoAdmission(){
+                public void beforeBytes(int bytes){}
+                public AutoCloseable reserveMetadata(int rawBytes){
+                    assertEquals(registration.encodedSize(),rawBytes);assertEquals(0,held.get());
+                    held.addAndGet(rawBytes);reservations.incrementAndGet();return ()->assertEquals(rawBytes,held.getAndAdd(-rawBytes));
+                }
+            };
+            try(var pool=helper.helper.pool(root.resolve("metadata-receiver"))){
+                var receiver=pool.openCurrentRangeRecovery(registration);
+                NativeRangeImage.IoAdmission denied=new NativeRangeImage.IoAdmission(){
+                    public void beforeBytes(int bytes){}
+                    public AutoCloseable reserveMetadata(int rawBytes)throws java.io.IOException{assertEquals(registration.encodedSize(),rawBytes);throw new java.io.IOException("controlled metadata denial");}
+                };
+                assertThrows(java.io.IOException.class,()->receiver.installSnapshotAdmitted(original,helper.limits,batch->fail("Denied metadata must precede installation"),denied));
+                assertFalse(receiver.pendingInstallation());assertNull(receiver.applied());
+                receiver.installSnapshotAdmitted(original,helper.limits,batch->assertEquals(registration.encodedSize(),held.get()),gate);
+                assertEquals(0,held.get());assertEquals(1,reservations.get());
+                receiver.completeCurrentRangeRecovery(registration,image.position(),receiver.configuration());
+                try(var pin=receiver.captureForRecovery()){NativeRangeImage.writeAdmitted(exported,pin,pin.interval(),helper.limits,gate);}
+                assertEquals(0,held.get());assertEquals(2,reservations.get());
+            }
+            try(var scope=NativeRangeImage.openMetadataAdmission(gate)){
+                NativeRangeImage.inspect(exported,helper.limits);NativeRangeImage.inspectAdmitted(exported,helper.limits,NativeRangeImage.IoAdmission.UNLIMITED);
+                assertEquals(registration.encodedSize(),held.get());assertEquals(3,reservations.get());
+            }
+            assertEquals(0,held.get());
+            byte[] damaged=java.nio.file.Files.readAllBytes(exported);damaged[damaged.length-1]^=1;Path invalid=root.resolve("metadata-invalid");java.nio.file.Files.write(invalid,damaged);
+            assertThrows(java.io.IOException.class,()->NativeRangeImage.inspectAdmitted(invalid,helper.limits,gate));
+            assertEquals(0,held.get());assertEquals(4,reservations.get());
+            NativeRangeImage.inspectAdmitted(exported,helper.limits,gate);
+            assertEquals(0,held.get());assertEquals(5,reservations.get());
+        }
+    }
+
     @Test void absentBornCurrentMemberInstallsActualEvolvedImageReplaysOwnTailCompletesColdReopensAndReexports()throws Exception {
         Path imagePath=root.resolve("current-image"),receiverPath=root.resolve("current-receiver"),exportPath=root.resolve("current-export"),secondPath=root.resolve("second-receiver");NativeCurrentRangeRecovery registration,secondRegistration;
         try(var source=helper.new Fixture(root.resolve("current-source"),helper.first,"source-")) {

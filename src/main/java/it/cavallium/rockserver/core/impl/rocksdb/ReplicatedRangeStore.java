@@ -3916,15 +3916,37 @@ public final class ReplicatedRangeStore {
 
     public NativeRangeImage.Manifest installSnapshot(Path image, NativeRangeImage.Limits limits,
             InstallationObserver observer) throws IOException, RocksDBException {
+        return installSnapshotAdmitted(image,limits,observer,NativeRangeImage.IoAdmission.UNLIMITED);
+    }
+    public NativeRangeImage.Manifest installSnapshotAdmitted(Path image,NativeRangeImage.Limits limits,
+            InstallationObserver observer,NativeRangeImage.IoAdmission admission)throws IOException,RocksDBException {
         enterNative();
-        try { return installUnderAdmission(image, limits, observer,false); }
+        try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission);var metadataPass=metadataScope.pass()) { metadataPass.reserve(recoveryRegistrationBytes(null,limits));return installUnderAdmission(image, limits, observer,false); }
         finally { try { drainScopedReleases(); } finally { leaveNative(); } }
     }
     public NativeRangeImage.Manifest installMetadataSnapshot(Path image,NativeRangeImage.Limits limits)throws IOException,RocksDBException{return installMetadataSnapshot(image,limits,batches->{});}
     /** Trusted sealed-source snapshot replacement. Descendant USER CFs and intervals are never visited. */
     public NativeRangeImage.Manifest installMetadataSnapshot(Path image,NativeRangeImage.Limits limits,InstallationObserver observer)throws IOException,RocksDBException {
-        enterNative();try{if(!topologyRetired())throw new IllegalStateException("Metadata install requires durable source retirement/recovery registration");return installUnderAdmission(image,limits,observer,true);}
+        return installMetadataSnapshotAdmitted(image,limits,observer,NativeRangeImage.IoAdmission.UNLIMITED);
+    }
+    public NativeRangeImage.Manifest installMetadataSnapshotAdmitted(Path image,NativeRangeImage.Limits limits,
+            InstallationObserver observer,NativeRangeImage.IoAdmission admission)throws IOException,RocksDBException {
+        enterNative();try(var metadataScope=NativeRangeImage.openMetadataAdmission(admission)){if(!topologyRetired())throw new IllegalStateException("Metadata install requires durable source retirement/recovery registration");return installUnderAdmission(image,limits,observer,true);}
         finally{try{drainScopedReleases();}finally{leaveNative();}}
+    }
+
+    private int recoveryRegistrationBytes(ReadOptions options,NativeRangeImage.Limits limits)throws RocksDBException,IOException {
+        int total=0;
+        int[] tags={0x67,0x6a,0x72};
+        int[] bounds={NativeTopologyLearnerRegistration.MAX_BYTES,NativeTopologyLearnerImagePermission.MAX_BYTES,NativeCurrentRangeRecovery.MAX_BYTES};
+        for(int i=0;i<tags.length;i++) {
+            byte[] key=topologyOwnershipKey(tags[i]);
+            int size=options==null?db.get(state,key,new byte[0]):db.get(state,options,key,new byte[0]);
+            if(size==RocksDB.NOT_FOUND)continue;
+            if(size<0 || size>bounds[i] || (long)size+17>limits.maxImageBytes())throw new IOException("Recovery registration exceeds image metadata bound");
+            total=Math.addExact(total,size);
+        }
+        return total;
     }
 
     private static boolean topologySchemaRow(byte[] key) { return key.length>16 && (key[16]==0x27 || key[16]==0x28 || key[16]==0x2a || key[16]==0x2b || key[16]==0x2c); }
@@ -4703,6 +4725,13 @@ public final class ReplicatedRangeStore {
             try (var options=new ReadOptions().setSnapshot(snapshot)) {
                 return new RangeStateView(groupId,rangeEpoch,capturedInterval.domainId(),capturedSchemaDigest,capturedColumns,capturedInterval.lowerInclusive(),capturedInterval.upperExclusive(),position,minimumSessionEpoch(options),sessionAuthority(options));
             } finally { releaseUse(); }
+        }
+        /** Size-only native reads precede every registration allocation in image export. */
+        int recoveryRegistrationBytes(NativeRangeImage.Limits limits)throws RocksDBException,IOException {
+            if(metadataOnly)return 0;
+            acquireUse();
+            try(var options=new ReadOptions().setSnapshot(snapshot)) { return ReplicatedRangeStore.this.recoveryRegistrationBytes(options,limits); }
+            finally { releaseUse(); }
         }
         /** Local topology evidence is read from this owned native cut, never the live store cache. */
         public NativeTopologyImageOrigin topologyImageOrigin() throws RocksDBException {
