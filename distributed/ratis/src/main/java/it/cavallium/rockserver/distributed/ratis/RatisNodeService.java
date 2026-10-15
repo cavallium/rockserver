@@ -68,7 +68,7 @@ public final class RatisNodeService implements AutoCloseable {
     /** Trusted node-local operator admission; manifest budgets persist independently of this borrowed policy. */
     public static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,RatisSchemaReplicaService.OperatorPolicy policy) throws IOException {
         Objects.requireNonNull(manifest); Objects.requireNonNull(config); Objects.requireNonNull(policy); preflight(root,manifest.plan());
-        return recover(manifest,root,config,connectResources(manifest,config),null,policy);
+        return recover(manifest,root,config,connectResources(manifest,config),null,policy,RatisRoutedClient::connect);
     }
     static Resources connectResources(RatisNodeManifest manifest,DatabaseConfig config)throws IOException {
         final WorkloadSettings workload;
@@ -94,10 +94,10 @@ public final class RatisNodeService implements AutoCloseable {
     }
 
     static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory) throws IOException {
-        return recover(manifest,root,config,resources,factory,RatisNodeRuntime.SchemaReplicaConfig.defaults().policy());
+        return recover(manifest,root,config,resources,factory,RatisNodeRuntime.SchemaReplicaConfig.defaults().policy(),RatisRoutedClient::connect);
     }
-    static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy) throws IOException {
-        return open(manifest,root,config,resources,factory,policy,RatisNodeRuntime.Startup.RECOVER,RatisRoutedClient::connect,false,null);
+    static RatisNodeService recover(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy,RatisNodeRuntime.HomeClientFactory homes) throws IOException {
+        return open(manifest,root,config,resources,factory,policy,RatisNodeRuntime.Startup.RECOVER,Objects.requireNonNull(homes),false,null);
     }
     static RatisNodeService openRestore(RatisNodeManifest manifest,Path root,DatabaseConfig config,Resources resources,
             RatisNodeRuntime.ServerFactory factory,RatisSchemaReplicaService.OperatorPolicy policy,RatisNodeRuntime.HomeClientFactory homes,RatisNodeRuntime.RestoreNativeInitialization staging)throws IOException {

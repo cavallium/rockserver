@@ -809,7 +809,16 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     var replica=range.replicas().stream().filter(r->r.nodeId().equals(plan.nodeId())).findFirst().orElse(null);if(replica==null)continue;
                     if(!replica.nodeIncarnation().equals(plan.nodeIncarnation()) || !replica.peerId().equals(plan.peerId()) || !replica.address().equals(plan.address()))throw new IOException("Current placement changed local node incarnation/endpoint");
                     local.add(range.groupId());var entry=groups.require(range.groupId());var store=stores.get(range.groupId());
-                    if(entry.role()!=RatisNodePlan.Role.DATA || entry.retired() || store==null || !entry.descriptor().equals(range) || !entry.directory().domainId().equals(domain))throw new IOException("Current range lacks exact recovered native registration");
+                    if(entry.role()!=RatisNodePlan.Role.DATA || entry.retired() || store==null || !entry.directory().domainId().equals(domain))throw new IOException("Current range lacks exact recovered native registration");
+                    var imported=store.importActivation();var importDefinition=imported==null?null:plan.importDefinition(range.groupId());
+                    if(imported!=null) {
+                        if(importDefinition==null || !imported.catalogueGroup().equals(plan.catalogue().groupId()))throw new IOException("Current import lacks original configured publication");
+                        imported.receipt().requireManifest(importDefinition.manifest(range.groupId()));imported.requireCut(store.applied());
+                    }
+                    if(!entry.descriptor().equals(range) && !(imported!=null
+                            && Arrays.equals(entry.directory().payloadDigest(),importDefinition.sourceDirectory().payloadDigest())
+                            && importDefinition.sourceDirectory().ranges().stream().anyMatch(entry.descriptor()::equals)
+                            && importDefinition.targetDirectory().ranges().stream().anyMatch(range::equals)))throw new IOException("Current range lacks exact recovered native registration");
                     boolean original=bootstrap.ranges().stream().anyMatch(range::equals) && Arrays.equals(bootstrap.schemaDigest(),candidate.schemaDigest());
                     boolean plannedFenced=original && range.topologyState()==RangeDescriptor.TopologyState.FENCED;
                     if(store.pendingInstallation() || store.topologyBirthPending() || store.topologyRecoveryOnly() || store.topologyRetired() || !plannedFenced && (store.importPending() || store.topologyFreeze()!=null))throw new IOException("Current range retains pending/recovery/retired ownership");
@@ -833,10 +842,9 @@ public final class RatisNodeRuntime implements AutoCloseable {
                         activation.requireHeader(installation.definition().header());activation.requireCut(store.applied());installation.definition().targetSchema().requireMatches(candidate);qualified=true;
                         if(Arrays.equals(installation.definition().targetDirectory().payloadDigest(),candidate.payloadDigest()))directoryQualified=true;
                     }
-                    var imported=store.importActivation();if(imported!=null) {
-                        var definition=plan.importDefinition(range.groupId());if(definition==null || !imported.catalogueGroup().equals(plan.catalogue().groupId()))throw new IOException("Current import lacks original configured publication");
-                        imported.receipt().requireManifest(definition.manifest(range.groupId()));imported.requireCut(store.applied());qualified=true;
-                        if(Arrays.equals(definition.targetDirectory().payloadDigest(),candidate.payloadDigest()))directoryQualified=true;
+                    if(imported!=null) {
+                        qualified=true;
+                        if(Arrays.equals(importDefinition.targetDirectory().payloadDigest(),candidate.payloadDigest()))directoryQualified=true;
                     }
                     if(entry.relocation()!=null) {
                         var record=entry.relocation();var cfg=store.configuration();

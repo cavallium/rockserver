@@ -40,7 +40,7 @@ class RatisNodeServiceTest {
                 public void close() { closes++; }
             }
             var policy=new Policy(); var fake=new RatisNodeRuntimeTest.FakeServer();
-            try (var service=RatisNodeService.recover(configured,env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create,policy)) {
+            try (var service=RatisNodeService.recover(configured,env.nodeRoot,ConfigParser.parseDefault(),resources(env),fake::create,policy,RatisRoutedClient::connect)) {
                 var nodeField=RatisNodeService.class.getDeclaredField("node"); nodeField.setAccessible(true); var node=nodeField.get(service);
                 var replicas=RatisPoolFixtures.schemaService((RatisNodeRuntime)node); assertNotNull(replicas);
                 var limitsField=RatisSchemaReplicaService.class.getDeclaredField("limits"); limitsField.setAccessible(true); assertEquals(RatisPoolFixtures.pools().getFirst().replicas(),limitsField.get(replicas));var admissionField=RatisSchemaReplicaService.class.getDeclaredField("admission");admissionField.setAccessible(true);var nodeAdmission=admissionField.get(replicas);var nodeLimitsField=RatisSchemaReplicaAdmission.class.getDeclaredField("limits");nodeLimitsField.setAccessible(true);assertEquals(limits,nodeLimitsField.get(nodeAdmission));
