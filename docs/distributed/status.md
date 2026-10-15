@@ -1853,6 +1853,17 @@ remain caller responsibilities. The combined focused gate passes 15 cases
 (`owner-release-lineage-second-gate.log`), including actual native split/merge,
 leadership-loss cleanup and relocation recovery with controlled transports.
 
+Recovery birth lookup is now available through a bounded fresh catalogue RPC and
+`RatisCatalogue.readRecoveryBirth`. The dispatcher checks actual ready catalogue
+leadership, namespace, configuration/admission generation and the unchanged native
+cut around the bounded lookup. It reserves protected proof workspace before native
+scanning. Replies bind the exact request/minimum cut and original definition digest;
+an absent birth remains evidence only, with no implicit bootstrap authority. Six
+cases pass (`fresh-recovery-lineage-first-gate.log`), including the actual native
+split/schema workflow through the production client and dispatcher, stale/nonleader/
+namespace/ahead-cut rejection, quota denial, and original split/merge definitions.
+Node recovery actor dispatch and obligation retention are still unfinished.
+
 Durable metadata-DAG
 obligation discovery, asynchronous configured-member catch-up, quorum retirement,
 source quiescence and physical parent reclamation remain unfinished. In particular,

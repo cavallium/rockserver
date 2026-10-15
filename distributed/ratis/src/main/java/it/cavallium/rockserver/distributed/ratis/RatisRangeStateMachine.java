@@ -4794,6 +4794,20 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 requireDataRole();if(!freshBarrier || sourceSnapshots==null || topologyImageQueries==null)throw new IOException("Source head requires fresh DATA dispatcher");var head=RatisSourceHeadRpc.request(encoded);if(!head.source().sourceGroup().equals(store.ownership().owner().groupId()))throw new IOException("Source head crossed group");
                 return topologyImageQueries.submit(store.ownership().owner().groupId(),encoded,8L*(encoded.length+RatisSourceHeadRpc.MAX_REPLY_BYTES),false,owned->Message.valueOf(ByteString.copyFrom(RatisSourceHeadRpc.reply(sourceSnapshots.head(RatisSourceHeadRpc.request(owned))))));
             }
+            if(kind==RatisRecoveryLineageRpc.KIND){
+                if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Recovery lineage requires fresh catalogue dispatcher");
+                checkCatalogueOwner();long generation=admissionGeneration.get();var owner=leadership();final long configurationStamp;
+                synchronized(admissions){if(schemaConfigurationPending)throw new IOException("Recovery lineage waits for configuration apply");configurationStamp=schemaConfigurationStamp;}
+                return schemaAuthorityQueries.submit(store.ownership().owner().groupId(),encoded,RatisProofQueryService.MAX_BYTES,false,owned->{
+                    var query=RatisRecoveryLineageRpc.request(owned);
+                    if(!query.cluster().equals(schemaCluster) || !query.database().equals(schemaDatabase) || !query.catalogue().equals(store.ownership().owner().groupId()) || !query.column().equals(schemaColumn))throw new IOException("Recovery lineage crossed catalogue namespace");
+                    checkCatalogueOwner();if(generation!=admissionGeneration.get() || leadership().term()!=owner.term())throw new IOException("Recovery lineage lost read-barrier owner");
+                    var lookup=new RatisRecoveryLineage(schemaCluster,schemaDatabase,query.catalogue(),store,schemaColumn).lookup(new RatisRecoveryLineage.Request(query.domain(),query.range(),query.group(),query.epoch()),query.minimumCatalogueCut());
+                    checkCatalogueOwner();var current=leadership();
+                    synchronized(admissions){if(generation!=admissionGeneration.get() || current.term()!=owner.term() || lookup.catalogueCut().term()!=current.term() || getLifeCycleState()!=LifeCycle.State.RUNNING || schemaConfigurationPending || configurationStamp!=schemaConfigurationStamp || !lookup.catalogueCut().equals(store.applied()))throw new IOException("Recovery lineage lost completed cut/configuration");}
+                    return Message.valueOf(ByteString.copyFrom(RatisRecoveryLineageRpc.reply(new RatisRecoveryLineageRpc.Reply(query,lookup.catalogueCut(),lookup.birth()==null?null:lookup.birth().definition()))));
+                });
+            }
             if(kind==RatisCatalogueViewRpc.KIND){
                 if(!freshBarrier || role!=RatisNodePlan.Role.CATALOGUE || schemaColumn==null || schemaAuthorityQueries==null)throw new IOException("Catalogue view requires fresh catalogue dispatcher");checkCatalogueOwner();long generation=admissionGeneration.get();var leader=leadership();
                 return schemaAuthorityQueries.submit(store.ownership().owner().groupId(),encoded,4L*RatisCatalogueViewRpc.MAX_REPLY_BYTES,false,owned->{

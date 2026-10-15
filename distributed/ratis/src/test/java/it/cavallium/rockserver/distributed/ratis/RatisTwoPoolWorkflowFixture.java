@@ -43,6 +43,7 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
     RatisNodeRuntime node;
     long sequence;
     RatisRangeStateMachine catalogueMachine;
+    volatile RatisRangeStateMachine.Leadership catalogueLeadership=new RatisRangeStateMachine.Leadership(1,true);
     org.apache.ratis.server.storage.RaftStorage catalogueStorage;
     RatisProofQueryService importQueries,authorityQueries,catalogueProofQueries;
     RatisCommittedApplyDispatcher catalogueDispatcher;
@@ -101,7 +102,7 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
     });}
     private RaftClient catalogue(){
         var borrowed=env.catalogue.client;var binding=plan.catalogue();var io=(BlockingApi)Proxy.newProxyInstance(BlockingApi.class.getClassLoader(),new Class<?>[]{BlockingApi.class},(proxy,method,args)->{
-            if(method.getName().equals("sendReadOnly")){byte[] bytes=((Message)args[0]).getContent().toByteArray();var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()==RatisCatalogueViewRpc.KIND || ScopedTransactionRpc.importPublication(packet.kind()) || RatisTopologyExecutionRpc.kind(packet.kind()) || packet.kind()==RatisTopologyAuthority.KIND || packet.kind()==RatisRangeImportAuthority.KIND || packet.kind()==ScopedTransactionRpc.SCHEMA_AUTHORITY || packet.kind()==ScopedTransactionRpc.SCHEMA_FENCING_PREPARE){assertNotNull(catalogueMachine);return reply(catalogueMachine.queryLinearizable((Message)args[0]).get(10,TimeUnit.SECONDS).getContent().toByteArray());}}
+            if(method.getName().equals("sendReadOnly")){byte[] bytes=((Message)args[0]).getContent().toByteArray();var packet=ScopedTransactionRpc.parse(bytes,ScopedTransactionRpc.MAX_REQUEST_BYTES);if(packet.kind()==RatisRecoveryLineageRpc.KIND || packet.kind()==RatisCatalogueViewRpc.KIND || ScopedTransactionRpc.importPublication(packet.kind()) || RatisTopologyExecutionRpc.kind(packet.kind()) || packet.kind()==RatisTopologyAuthority.KIND || packet.kind()==RatisRangeImportAuthority.KIND || packet.kind()==ScopedTransactionRpc.SCHEMA_AUTHORITY || packet.kind()==ScopedTransactionRpc.SCHEMA_FENCING_PREPARE){assertNotNull(catalogueMachine);return reply(catalogueMachine.queryLinearizable((Message)args[0]).get(10,TimeUnit.SECONDS).getContent().toByteArray());}}
             if(method.getName().equals("send")){var command=DistributedCommandCodec.decode(((Message)args[0]).getContent().toByteArray());return reply(applyCatalogue(command).getContent().toByteArray());}
             return invoke(method,borrowed.io(),args);
         });
@@ -165,7 +166,7 @@ final class RatisTwoPoolWorkflowFixture implements AutoCloseable,RatisRangeImpor
         var validator=RatisCatalogue.validator(first.clusterId(),first.databaseId(),binding.groupId(),binding.epoch(),binding.schemaDigest(),binding.directoryColumn(),binding.sessionsColumn(),operatorValidator,this::committedValue);
         var peer=RaftPeer.newBuilder().setId("two-pool-catalogue").build();var group=RaftGroup.valueOf(RaftGroupId.valueOf(binding.groupId()),peer);
         catalogueStorage=org.apache.ratis.server.storage.RaftStorage.newBuilder().setDirectory(root.resolve("remote-catalogue-raft").toFile()).setOption(org.apache.ratis.server.storage.RaftStorage.StartupOption.FORMAT).setStorageFreeSpaceMin(org.apache.ratis.util.SizeInBytes.ONE_MB).build();catalogueStorage.initialize();
-        catalogueMachine=new RatisRangeStateMachine(env.catalogue.store,group,manifest.settings().images(),validator,command->{},()->new RatisRangeStateMachine.Leadership(1,true));
+        catalogueMachine=new RatisRangeStateMachine(env.catalogue.store,group,manifest.settings().images(),validator,command->{},()->catalogueLeadership);
         var resourcePolicy=manifest.settings().resources();
         remoteResources=new RatisNodeResourceBudget(resourcePolicy.node(),Map.of(remotePool,resourcePolicy.pool()));
         var dispatchPolicy=resourcePolicy.committedApply();catalogueDispatcher=new RatisCommittedApplyDispatcher(dispatchPolicy.node(),Map.of(remotePool,dispatchPolicy.pool()));

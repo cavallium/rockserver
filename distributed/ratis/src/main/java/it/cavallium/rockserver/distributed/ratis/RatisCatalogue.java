@@ -62,6 +62,13 @@ public final class RatisCatalogue {
         catch(IllegalArgumentException malformed){throw new IOException("Invalid completed catalogue directory view",malformed);}
     }
 
+    /** Fresh committed birth provenance. An absent birth grants no bootstrap or USER authority. */
+    public RatisRecoveryLineageRpc.Reply readRecoveryBirth(UUID domain,UUID range,UUID group,long epoch,ApplyPosition minimumCatalogueCut)throws IOException {
+        var request=new RatisRecoveryLineageRpc.Request(clusterId,databaseId,groupId,columnId,domain,range,group,epoch,minimumCatalogueCut);
+        try{return RatisRecoveryLineageRpc.reply(content(RatisRoutedClient.rpc(()->client.io().sendReadOnly(message(RatisRecoveryLineageRpc.request(request)))),RatisRecoveryLineageRpc.MAX_REPLY_BYTES),request);}
+        catch(IllegalArgumentException malformed){throw new IOException("Invalid recovery birth provenance reply",malformed);}
+    }
+
     /** Prepare once; retry this exact command/operation identity after an uncertain reply. */
     public DistributedCommand prepare(OperationId operationId, RangeDirectory expected, RangeDirectory next) {
         return prepare(operationId,expected,next,null);
