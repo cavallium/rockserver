@@ -222,7 +222,7 @@ public final class NativeRangeImage {
     public static Manifest inspectMetadata(Path image,Limits limits)throws IOException{return visitMetadata(image,limits,(section,column,key,value)->{});}
     public static Manifest visitMetadata(Path image,Limits limits,RowVisitor visitor)throws IOException{return visit(image,limits,visitor,true,null,null,IoAdmission.UNLIMITED,true);}
     public static Manifest visitMetadataAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission),true);}
-    static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x71) || key.length==33 && tag==0x68;}
+    static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x74) || key.length==33 && tag==0x68;}
 
     public static Manifest inspectAdmitted(Path image,Limits limits,IoAdmission admission)throws IOException{return visit(image,limits,(section,column,key,value)->{},true,null,null,Objects.requireNonNull(admission));}
 
@@ -323,6 +323,9 @@ public final class NativeRangeImage {
                 }
                 byte[] key = new byte[keyLength];
                 input.readFully(key);
+                if(section==Section.STATE && key.length>16 && key[16]==0x72 && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.MAX_BYTES))throw new IOException("CURRENT registration exceeds bound");
+                if(section==Section.STATE && key.length>16 && key[16]==0x73 && (key.length!=17 || valueLength>65620))throw new IOException("CURRENT completion exceeds bound");
+                if(section==Section.STATE && key.length>16 && key[16]==0x74 && (key.length!=17 || valueLength!=48))throw new IOException("CURRENT image receipt exceeds bound");
                 if(section==Section.STATE && key.length>16 && key[16]==0x64 && valueLength>NativeTopologyImageOrigin.MAX_BYTES) throw new IOException("Topology image origin exceeds canonical bound");
                 if(section==Section.STATE && key.length>16 && (key[16]==0x69 || key[16]==0x6b) && (key.length!=17 || valueLength!=48))throw new IOException("Invalid learner image receipt length");
                 if(section==Section.STATE && key.length>16 && key[16]==0x6a && (key.length!=17 || valueLength>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerImagePermission.MAX_BYTES))throw new IOException("Later image permission exceeds canonical bound");
@@ -521,6 +524,8 @@ public final class NativeRangeImage {
         private it.cavallium.rockserver.core.common.distributed.NativeSstImportManifest.Receipt importReceipt;
         private it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration learnerAdoption;
         private byte[] learnerImageReceipt;
+        private it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery currentAdoption;
+        private byte[] currentImageReceipt,currentCompletion;
         private byte[] laterLearnerPermission,laterLearnerReceipt;
         private NativeRangeSstImport.Activation importActivation;
         private int importFileReceipts;
@@ -650,6 +655,9 @@ public final class NativeRangeImage {
                 if(section==Section.STATE && key.length==17 && key[16]==0x6a){if(value.length>it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerImagePermission.MAX_BYTES)throw new IOException("Later learner permission exceeds bound");laterLearnerPermission=value.clone();}
                 if(section==Section.STATE && key.length==17 && key[16]==0x6b){if(value.length!=48)throw new IOException("Invalid later learner image receipt");laterLearnerReceipt=value.clone();}
                 if(section==Section.STATE && key.length==17 && key[16]==0x69){if(value.length!=48)throw new IOException("Invalid learner image receipt");learnerImageReceipt=value.clone();}
+                if(section==Section.STATE && key.length==17 && key[16]==0x72){try{currentAdoption=it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.decode(value);}catch(IllegalArgumentException invalid){throw new IOException("Invalid CURRENT source adoption evidence",invalid);}}
+                if(section==Section.STATE && key.length==17 && key[16]==0x73)currentCompletion=value.clone();
+                if(section==Section.STATE && key.length==17 && key[16]==0x74)currentImageReceipt=value.clone();
                 if(section==Section.STATE && key.length==17 && key[16]==0x67){try{learnerAdoption=it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerRegistration.decode(value);}catch(IllegalArgumentException invalid){throw new IOException("Invalid learner adoption evidence",invalid);}}
                 if(section==Section.STATE && key.length>16 && (key[16]==0x65 || key[16]==0x66)) {
                     try {
@@ -947,6 +955,16 @@ public final class NativeRangeImage {
                     if(old==null || prepared.preparation().scope().spans().stream().anyMatch(span -> !old.columnIds().contains(span.columnId()))) throw new IOException("Historical preparation columns differ");
                 }
             }
+            if(currentAdoption!=null){try{var range=currentAdoption.range();var cut=currentAdoption.imageCut();byte[] expected=ByteBuffer.allocate(48).putLong(cut.term()).putLong(cut.index()).put(currentAdoption.imageHash()).array();
+                if(learnerAdoption!=null || !range.groupId().equals(header.owner().groupId()) || range.rangeEpoch()!=header.owner().epoch() || !currentAdoption.schema().domainId().equals(header.interval().domainId()) || !Arrays.equals(range.lowerInclusive(),header.interval().lowerInclusive()) || !Arrays.equals(range.upperExclusive(),header.interval().upperExclusive()) || !Arrays.equals(expected,currentImageReceipt))throw new IllegalArgumentException("CURRENT image changed original owner/image receipt");
+                it.cavallium.rockserver.core.common.distributed.NativeCurrentRangeRecovery.requireCompletion(currentAdoption,currentCompletion,header.position());
+                for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] known=currentAdoption.localSchemaRows().get(HexFormat.of().formatHex(key));if(known!=null && !Arrays.equals(known,record.encode()))throw new IllegalArgumentException("CURRENT image changed normalized schema history");}
+                boolean currentSchema=Arrays.equals(header.schema(),currentAdoption.schema().digest()) && header.interval().columns().equals(currentAdoption.schema().columnIds());
+                if(!currentSchema && (schemaInstallation==null || currentSchemaActivation==null || schemaInstallations.stream().noneMatch(record->Arrays.equals(record.definition().sourceSchema().digest(),currentAdoption.schema().digest()) && record.sourceNames().equals(currentAdoption.physicalNames()) && record.sourceMerges().equals(currentAdoption.mergeColumns()))))throw new IllegalArgumentException("CURRENT image lacks activated schema evolution from admitted image");
+                for(var row:currentAdoption.localSchemaRows().entrySet()){byte[] key=HexFormat.of().parseHex(row.getKey());if(key[16]!=0x2a && key[16]!=0x2b)continue;var id=new UUID(ByteBuffer.wrap(key,17,16).getLong(),ByteBuffer.wrap(key,25,8).getLong());byte[] known=key[16]==0x2a?schemaInstallations.stream().filter(record->record.definition().changeId().equals(id)).findFirst().map(it.cavallium.rockserver.core.common.distributed.NativeSchemaInstallation::encode).orElse(null):schemaActivations.containsKey(id)?schemaActivations.get(id).encode():null;if(!Arrays.equals(known,row.getValue()))throw new IllegalArgumentException("CURRENT image discarded immutable admitted schema history");}
+                if((currentAdoption.origin()==null)!=(topologyOrigin==null) || currentAdoption.origin()==null && (topologyBirth!=null || topologyActivation!=null))throw new IllegalArgumentException("CURRENT image changed original birth provenance presence");
+            }catch(IllegalArgumentException invalid){throw new IOException("Invalid CURRENT completed source adoption",invalid);}}
+            else if(currentImageReceipt!=null || currentCompletion!=null)throw new IOException("CURRENT receipt lacks original registration");
             if(learnerAdoption!=null) {
                 var descriptor=learnerAdoption.definition().targets().getFirst();
                 byte[] expected=ByteBuffer.allocate(48).putLong(learnerAdoption.imageCut().term()).putLong(learnerAdoption.imageCut().index()).put(learnerAdoption.imageHash()).array();
@@ -974,7 +992,19 @@ public final class NativeRangeImage {
                             || topologyFreeze.position().index()<=topologyActivation.position().index() || topologyFreeze.position().term()<topologyActivation.position().term())throw new IOException("Frozen child image does not follow its original activation/lineage");
                 }
 
-                Map<String,byte[]> adoptedMutable=Map.of();if(topologyOrigin.learnerAdoptionDigest()!=null){if(learnerAdoption==null || learnerAdoption.origin()==null || !Arrays.equals(topologyOrigin.learnerAdoptionDigest(),learnerAdoption.digest()) || !Arrays.equals(seed.encode(),learnerAdoption.origin().seed().encode()) || !Arrays.equals(topologyActivation.encode(),learnerAdoption.origin().activation().encode()))throw new IOException("Topology alias bridge lacks exact original learner adoption");adoptedMutable=learnerAdoption.localSchemaRows();for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] expected=adoptedMutable.get(HexFormat.of().formatHex(key));if(expected!=null && !Arrays.equals(expected,record.encode()))throw new IOException("Learner image changed normalized historical alias evidence");}}
+                Map<String,byte[]> adoptedMutable=Map.of();if(topologyOrigin.learnerAdoptionDigest()!=null){
+                    var adoptedOrigin=currentAdoption!=null?currentAdoption.origin():learnerAdoption==null?null:learnerAdoption.origin();byte[] adoptionDigest=currentAdoption!=null?currentAdoption.digest():learnerAdoption==null?null:learnerAdoption.digest();
+                    if(adoptedOrigin==null || !Arrays.equals(topologyOrigin.learnerAdoptionDigest(),adoptionDigest) || !Arrays.equals(seed.encode(),adoptedOrigin.seed().encode()) || !Arrays.equals(topologyActivation.encode(),adoptedOrigin.activation().encode()))throw new IOException("Topology alias bridge lacks exact completed source adoption");
+                    adoptedMutable=currentAdoption!=null?currentAdoption.localSchemaRows():learnerAdoption.localSchemaRows();
+                    var first=schemaInstallations.stream().min(Comparator.comparingLong(record->record.position().index())).orElse(null);byte[] actualAnchor=first==null?null:it.cavallium.rockserver.core.common.distributed.RangeImportAdmission.sha256(first.encode());
+                    if(!Arrays.equals(actualAnchor,topologyOrigin.adoptedSchemaAnchorDigest()))throw new IOException("Topology alias bridge changed actual first snapshot INSTALL");
+                    byte[] admittedAnchor=it.cavallium.rockserver.core.common.distributed.NativeTopologyLearnerSchema.adoptionAnchorDigest(adoptedMutable);
+                    if(admittedAnchor!=null){if(!Arrays.equals(admittedAnchor,actualAnchor))throw new IOException("Topology alias bridge discarded original normalized INSTALL");}
+                    else if(first!=null){var admittedSchema=currentAdoption!=null?currentAdoption.schema():learnerAdoption.schema();var admittedNames=currentAdoption!=null?currentAdoption.physicalNames():learnerAdoption.physicalNames();var admittedMerges=currentAdoption!=null?currentAdoption.mergeColumns():learnerAdoption.mergeColumns();var admittedCut=currentAdoption!=null?currentAdoption.imageCut():learnerAdoption.imageCut();
+                        if(schemaInstallation==null || currentSchemaActivation==null || !Arrays.equals(first.definition().sourceSchema().digest(),admittedSchema.digest()) || !first.sourceNames().equals(admittedNames) || !first.sourceMerges().equals(admittedMerges) || first.fence().position().index()<=admittedCut.index() || first.fence().position().term()<admittedCut.term())throw new IOException("First post-adoption schema lacks qualified receiver aliases and activated lifecycle");
+                        byte[] anchorKey=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(first.definition().changeId().getMostSignificantBits()).putLong(first.definition().changeId().getLeastSignificantBits()).array();adoptedMutable=Map.of(HexFormat.of().formatHex(anchorKey),first.encode());
+                    }
+                    for(var record:schemaInstallations){byte[] key=ByteBuffer.allocate(33).put(groupPrefix).put((byte)0x2a).putLong(record.definition().changeId().getMostSignificantBits()).putLong(record.definition().changeId().getLeastSignificantBits()).array();byte[] expected=adoptedMutable.get(HexFormat.of().formatHex(key));if(expected!=null && !Arrays.equals(expected,record.encode()))throw new IOException("Learner image changed normalized historical alias evidence");}}
 
                 final Map<String,byte[]> adopted=adoptedMutable;
                 boolean original=Arrays.equals(source.schemaDigest(),header.schema()) && source.columns().equals(header.interval().columns()) && seed.mergeColumns().equals(header.mergeColumns());
