@@ -25,16 +25,20 @@ class RatisPendingCurrentMetadataRegistrationTest {
     @TempDir(factory=RatisDiskTestDirectory.class) Path root;
     @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"false,false","true,false","false,true","true,true"})
     void interruptedCurrentIsSupersededOnlyByExactGraphMetaAndRealImage(boolean coldRetry,boolean importedConfiguration)throws Exception {
-        exercise(coldRetry,importedConfiguration,false,false);
+        exercise(coldRetry,importedConfiguration,false,false,false);
     }
     @org.junit.jupiter.api.Test void unknownCurrentForceCanSettleAfterSourceSealsWithoutOldReceiveAuthority()throws Exception {
-        exercise(false,false,true,false);
+        exercise(false,false,true,false,false);
     }
     @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"false,false","true,false","false,true","true,true"})
     void interruptedOwnCheckpointBeyondOriginalCfgUsesActualPublishedFloor(boolean coldRetry,boolean importedConfiguration)throws Exception {
-        exercise(coldRetry,importedConfiguration,false,true);
+        exercise(coldRetry,importedConfiguration,false,true,false);
     }
-    private void exercise(boolean coldRetry,boolean importedConfiguration,boolean lostCurrentForce,boolean laterOwnCheckpoint)throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void finalCurrentImageForceLostAckIsSupersededWithoutColdCacheRefresh(boolean laterOwnCheckpoint)throws Exception {
+        exercise(false,true,false,laterOwnCheckpoint,true);
+    }
+    private void exercise(boolean coldRetry,boolean importedConfiguration,boolean lostCurrentForce,boolean laterOwnCheckpoint,boolean finalImageForceLost)throws Exception {
         try(var source=new RatisTwoPoolWorkflowFixture(root.resolve("source"),false);
             var env=new RatisNodeRuntimeTest.Env(root.resolve("receiver"),false,source.first.digest())) {
             var directory=source.firstDirectory;var parent=directory.ranges().getFirst();var id=RaftGroupId.valueOf(parent.groupId());
@@ -135,8 +139,27 @@ class RatisPendingCurrentMetadataRegistrationTest {
                     if(importedConfiguration || laterOwnCheckpoint){assertNotNull(pending.configuration());assertEquals(restoreConfiguration,pending.configuration().index());}
                     else assertNull(pending.configuration());
                 }
-                    source.split();
-                    node=open(env,source,plan,route,epochs,settings,machines,receiver,RatisNodeRuntime.Startup.RECOVER);
+                    if(finalImageForceLost) {
+                        node=open(env,source,plan,route,epochs,settings,machines,receiver,RatisNodeRuntime.Startup.RECOVER);
+                        try {
+                            var warm=field(machines.get(id),"store",ReplicatedRangeStore.class);var forced=new AtomicBoolean();
+                            Path finalImage=laterOwnCheckpoint?machines.get(id).getLatestSnapshot().getFiles().getFirst().getPath():oldImage;
+                            assertThrows(IOException.class,()->warm.installSnapshot(finalImage,settings.images(),new ReplicatedRangeStore.InstallationObserver(){
+                                public void afterBatch(int batch){}
+                                public void afterCompletionForce()throws IOException{forced.set(true);throw new IOException("Lost final CURRENT image force acknowledgement");}
+                            }));
+                            assertTrue(forced.get(),"Actual final image force must be reached");
+                            assertNull(warm.applied(),"Keep the warm pre-publication cache unresolved");assertTrue(warm.pendingInstallation());
+                            assertNull(warm.pendingInstallationCut(),"The durable 7f was deleted by the real final force");
+                            var db=field(warm,"db",org.rocksdb.RocksDB.class);var state=field(warm,"state",org.rocksdb.ColumnFamilyHandle.class);
+                            assertArrayEquals(java.nio.ByteBuffer.allocate(16).putLong(restoreTarget.term()).putLong(restoreTarget.index()).array(),db.get(state,field(warm,"markerKey",byte[].class)));
+                            assertFalse(warm.admissionOpen());assertTrue(machines.get(id).recoveryEligibilityGate().discoveryPending());
+                            source.split();
+                        }catch(Exception|Error failed){try{node.close();}catch(Exception|Error close){failed.addSuppressed(close);}throw failed;}
+                    }else {
+                        source.split();
+                        node=open(env,source,plan,route,epochs,settings,machines,receiver,RatisNodeRuntime.Startup.RECOVER);
+                    }
                 }else {
                     node=open(env,source,plan,route,epochs,settings,machines,receiver,RatisNodeRuntime.Startup.AUTHORIZED_INITIAL_PLACEMENT);
                     var currentLost=new AtomicBoolean(true);node.nativePool(pool).currentRecoveryForceObserver(after->{if(after && currentLost.getAndSet(false))throw new org.rocksdb.RocksDBException("Lost original CURRENT force acknowledgement");});
@@ -182,7 +205,7 @@ class RatisPendingCurrentMetadataRegistrationTest {
                             }else assertTrue(actualCfg.getLogEntryIndex()<=0,"Actual receiver core still has bootstrap CFG");
                         }else assertNull(pending.configuration(),"First real clear batch interrupted before importing native CFG");
                         assertEquals(predecessor,pending.currentRangeRecoveryRegistration());
-                        assertEquals(restoreTarget,pending.pendingInstallationCut());
+                        if(finalImageForceLost)assertNull(pending.pendingInstallationCut());else assertEquals(restoreTarget,pending.pendingInstallationCut());
                         assertEquals(retainedFloor,receiver.get().getDivision(id).getRaftLog().getSnapshotIndex());
                         if(laterOwnCheckpoint){assertNotNull(machine.getLatestSnapshot());assertEquals(retainedFloor,machine.getLatestSnapshot().getIndex());}
                         var once=new AtomicBoolean(true);node.nativePool(pool).metadataRecoveryForceObserver(after->{if(after && once.getAndSet(false))throw new org.rocksdb.RocksDBException("Lost real META force acknowledgement");});
@@ -223,7 +246,8 @@ class RatisPendingCurrentMetadataRegistrationTest {
                         }
                         assertFalse(pending.pendingInstallation());assertFalse(machine.recoveryEligibilityGate().discoveryPending());
                         assertEquals(org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Mode.MISSING,machine.recoveryEligibilityGate().snapshot().mode());
-                        assertFalse(pending.metadataRecoveryImageInstalled());assertFalse(pending.admissionOpen());assertNull(pending.applied());
+                        assertFalse(pending.metadataRecoveryImageInstalled());assertFalse(pending.admissionOpen());
+                        if(finalImageForceLost)assertEquals(restoreTarget,pending.applied());else assertNull(pending.applied());
                         assertEquals(NativeMetadataRecoveryRegistration.CurrentPredecessor.of(predecessor),pending.metadataRecoveryRegistration().currentPredecessor());
                         assertThrows(IllegalStateException.class,machine.recoveryEligibilityGate()::snapshotPermit);
                         var exactNode=node;var actualRegistration=pending.metadataRecoveryRegistration();

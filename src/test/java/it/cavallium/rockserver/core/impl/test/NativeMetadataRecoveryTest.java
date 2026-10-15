@@ -274,6 +274,14 @@ class NativeMetadataRecoveryTest {
             var target=pool.openCurrentRangeRecovery(current);configure(target,definition);
             assertThrows(IOException.class,()->target.installSnapshot(groupImage,nativeTest.limits,new ReplicatedRangeStore.InstallationObserver(){public void afterBatch(int count){}public void afterCompletionForce()throws IOException{throw new IOException("Lost final image force acknowledgement");}}));
             assertNull(target.applied());assertTrue(target.pendingInstallation());
+            var completedReference=target.completedCurrentInstallationReference();assertNotNull(completedReference);assertEquals(image.position(),completedReference.cut());
+            assertEquals(cfg.term(),completedReference.configuration().term());assertEquals(cfg.index(),completedReference.configuration().index());assertArrayEquals(cfg.data(),completedReference.configuration().data());
+            assertNull(target.applied());assertTrue(target.pendingInstallation());assertFalse(target.currentRangeRecoveryReady());assertFalse(target.currentRangeRecoveryImageInstalled());assertNull(target.pendingInstallationCut());
+            var admitted=new java.util.concurrent.atomic.AtomicInteger();
+            try(var admission=NativeRangeImage.openMetadataAdmission(new NativeRangeImage.IoAdmission(){public void beforeBytes(int bytes){}public AutoCloseable reserveMetadata(int bytes)throws IOException{admitted.addAndGet(bytes);if(bytes>128)throw new IOException("No CURRENT metadata workspace");return ()->{};}})) {
+                assertThrows(IOException.class,target::completedCurrentInstallationReference);
+            }
+            assertTrue(admitted.get()>=current.encodedSize());assertNull(target.applied());assertTrue(target.pendingInstallation());
             source.freeze();source.seed();var sealed=NativeRangeImage.writeMetadata(metaImage,source.parent,nativeTest.limits);cfg=source.parent.configuration();
             var metadata=new NativeMetadataRecoveryRegistration(new UUID(0,1261),current.catalogue(),new ApplyPosition(1,20),definition.sourceDirectory(),source.freeze,current.receiver(),current.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),sealed.position(),sealed.sha256(),Set.of(),NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current));
             assertSame(target,pool.openMetadataRecovery(metadata));assertEquals(image.position(),target.applied());assertFalse(target.pendingInstallation());assertFalse(target.metadataRecoveryImageInstalled());

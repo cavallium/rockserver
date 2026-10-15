@@ -2609,6 +2609,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public SimpleStateMachineStorage getStateMachineStorage() { return snapshots; }
     private it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration metadataFloorPreparation;
+    private ReplicatedRangeStore.CurrentInstallationReference completedCurrentInstallationReference()throws IOException,org.rocksdb.RocksDBException {
+        try(var metadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)){return store.completedCurrentInstallationReference();}
+    }
     /** Only a genuine CURRENT predecessor may abandon its drained, persisted incomplete image target. */
     void requireMetadataRecoveryCoverage(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
         try {
@@ -2618,6 +2621,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
                 var current=store.currentRangeRecoveryRegistration();
                 if(current==null || proposed.currentPredecessor()==null || !proposed.currentPredecessor().equals(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current)))throw new IOException("Pending installation lacks exact CURRENT supersession authority");
                 proposed.requireTransitionOf(current);
+                if(pending==null){var completed=completedCurrentInstallationReference();if(completed!=null)pending=completed.cut();}
                 if(pending==null || !RatisRelocationOwnerRpc.covers(proposed.imageCut(),pending))throw new IOException("META image does not cover persisted incomplete CURRENT target");
             }
         }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("Cannot qualify CURRENT installation supersession",invalid);}
@@ -2647,17 +2651,27 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             if(!recoveryEligibility.settleDiscovery(revision,org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Evidence.missing()))throw new IOException("Registered receiver discovery settlement revoked");
         }});
     }
-    private record MetadataFloorConfiguration(ReplicatedRangeStore.Configuration value,boolean referenceOnly) {}
+    private record MetadataFloorConfiguration(ReplicatedRangeStore.Configuration value,boolean referenceOnly,ApplyPosition cut) {}
     /** Partial CURRENT CFG rows are references until their final native A is published. */
     private MetadataFloorConfiguration metadataFloorConfiguration(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException,org.rocksdb.RocksDBException {
         var cfg=store.configuration();var applied=store.applied();
         if(applied!=null) {
             if(cfg==null)throw new IOException("Completed native prefix has no CFG");
-            return new MetadataFloorConfiguration(cfg,false);
+            return new MetadataFloorConfiguration(cfg,false,applied);
         }
         var current=store.currentRangeRecoveryRegistration();var pending=store.pendingInstallationCut();
+        if(current!=null && pending==null) {
+            var completed=completedCurrentInstallationReference();
+            if(completed!=null) {
+                if(!java.util.Objects.equals(proposed.currentPredecessor(),it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration.CurrentPredecessor.of(current)))throw new IOException("Completed CURRENT reference changed predecessor");
+                proposed.requireTransitionOf(current);
+                if(!RatisRelocationOwnerRpc.covers(proposed.imageCut(),completed.cut()))throw new IOException("META image does not cover final-forced CURRENT reference");
+                validateConfiguration(completed.configuration().data());requireSchemaMembership(proposed.range(),completed.configuration().data());
+                return new MetadataFloorConfiguration(completed.configuration(),true,completed.cut());
+            }
+        }
         if(current==null || pending==null) {
-            if(cfg!=null)return new MetadataFloorConfiguration(cfg,false);
+            if(cfg!=null)return new MetadataFloorConfiguration(cfg,false,proposed.currentPredecessor()==null?null:proposed.currentPredecessor().imageCut());
             throw new IOException("Missing native CFG has no incomplete CURRENT reference");
         }
         if(proposed.currentPredecessor()==null
@@ -2675,7 +2689,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(reference.index()>pending.index() || reference.term()>pending.term())throw new IOException("CURRENT reference CFG exceeds its genuine image cut");
         if(cfg!=null && !sameConfiguration(cfg,reference))throw new IOException("Partially imported CFG differs from exact CURRENT image reference");
         validateConfiguration(reference.data());requireSchemaMembership(proposed.range(),reference.data());
-        return new MetadataFloorConfiguration(reference,true);
+        return new MetadataFloorConfiguration(reference,true,pending);
     }
     /** Read-only qualification before forcing a META recipe over an existing quiescent owner. */
     void qualifyMetadataRecoveryFloor(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
@@ -2683,12 +2697,12 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var snapshot=durableSnapshot;if(snapshot!=null)validateCoveredMetadataFloor(snapshot.getFile().getPath(),snapshot.getTermIndex(),proposed);
             var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(proposed.receiver().peerId()) || topologyLocalReplica==null || !sameReplicaIdentity(proposed.receiver(),topologyLocalReplica))throw new IOException("META floor receiver identity differs");
             var division=server.getDivision(getGroupId());if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("META floor has no actual running division");var actual=division.getRaftConf();requireActualMembership(actual,proposed.range());
-            try{var qualified=metadataFloorConfiguration(proposed);var cfg=qualified.value();var nativeCut=store.applied();var ceiling=nativeCut!=null?nativeCut:store.pendingInstallationCut();if(ceiling==null && proposed.currentPredecessor()!=null)ceiling=proposed.currentPredecessor().imageCut();if(cfg==null || ceiling==null && (cfg.term()!=0 || cfg.index()!=-1) || ceiling!=null && (!RatisRelocationOwnerRpc.covers(proposed.imageCut(),ceiling) || cfg.index()>ceiling.index() || cfg.term()>ceiling.term()) || !qualified.referenceOnly() && actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("META floor actual/native configuration or image coverage differs");requireSchemaMembership(proposed.range(),cfg.data());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify existing META floor configuration",invalid);}metadataFloorPreparation=proposed;
+            try{var qualified=metadataFloorConfiguration(proposed);var cfg=qualified.value();var ceiling=qualified.cut();if(cfg==null || ceiling==null && (cfg.term()!=0 || cfg.index()!=-1) || ceiling!=null && (!RatisRelocationOwnerRpc.covers(proposed.imageCut(),ceiling) || cfg.index()>ceiling.index() || cfg.term()>ceiling.term()) || !qualified.referenceOnly() && actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("META floor actual/native configuration or image coverage differs");requireSchemaMembership(proposed.range(),cfg.data());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify existing META floor configuration",invalid);}metadataFloorPreparation=proposed;
         }
     }
     private NativeRangeImage.Manifest validateCoveredMetadataFloor(Path image,TermIndex position,it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
         try(var metadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)){
-            requireMetadataRecoveryCoverage(proposed);var nativeCut=store.applied();
+            requireMetadataRecoveryCoverage(proposed);var nativeCut=store.applied();if(nativeCut==null){var completed=completedCurrentInstallationReference();if(completed!=null)nativeCut=completed.cut();}
             var kind=NativeRangeImage.kind(image,snapshotMetadataAdmission);var cfg=new ReplicatedRangeStore.Configuration[1];var freeze=new NativeTopologyFreeze[1];NativeRangeImage.RowVisitor visitor=(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && key.length==17){if(key[16]==1){if(cfg[0]!=null)throw new IOException("Duplicate floor configuration");cfg[0]=ReplicatedRangeStore.Configuration.decode(value);}if(key[16]==0x60)freeze[0]=NativeTopologyFreeze.decode(value);}};
             var manifest=kind==NativeRangeImage.Kind.GROUP?NativeRangeImage.visitAdmitted(image,limits,visitor,snapshotMetadataAdmission):NativeRangeImage.visitMetadataAdmitted(image,limits,visitor,snapshotMetadataAdmission);var range=proposed.range();
             boolean completedFloor=nativeCut!=null && RatisRelocationOwnerRpc.covers(nativeCut,manifest.position());

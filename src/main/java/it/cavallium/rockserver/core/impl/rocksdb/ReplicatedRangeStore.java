@@ -3566,6 +3566,36 @@ public final class ReplicatedRangeStore {
     private void requireCurrentSchemaTail()throws RocksDBException {if(currentRangeRecovery==null || pendingCurrentCompletion!=null)throw new IllegalStateException("CURRENT own-tail control lacks settled registration");requireTopologyLearnerImage();}
     public NativeCurrentRangeRecovery currentRangeRecoveryRegistration(){return currentRangeRecovery;}
     public boolean currentRangeRecoveryReady(){return currentRangeRecovery!=null && currentRangeRecoveryReady;}
+    public record CurrentInstallationReference(ApplyPosition cut,Configuration configuration) {}
+    /** Durable completed prefix after an uncertain install ACK; never publishes cached A or serving permission. */
+    public CurrentInstallationReference completedCurrentInstallationReference()throws IOException,RocksDBException {
+        enterNative();
+        try(var scope=NativeRangeImage.openMetadataAdmission(NativeRangeImage.IoAdmission.UNLIMITED);var metadata=scope.pass()) {
+            applyLane.lock();try {
+                var registration=currentRangeRecovery;var pending=pendingInstallation;
+                if(registration==null || pending==null || applied!=null)return null;
+                if(pending.length!=48)throw new IllegalArgumentException("Invalid cached CURRENT installation intent");
+                metadata.reserve(128);if(db.get(state,installingKey)!=null)return null;
+                metadata.reserve(Math.toIntExact(4096L+2L*registration.encodedSize()+8L*65536));
+                byte[] marker=db.get(state,markerKey);if(marker==null)return null;var cut=decodePosition(marker);
+                if(!cut.equals(snapshotInstallationCut(pending)) || !NativeMetadataRecoveryRegistration.covers(cut,registration.imageCut())
+                        || !Arrays.equals(db.get(state,topologyOwnershipKey(0x72)),registration.encode())
+                        || !Arrays.equals(db.get(state,topologyOwnershipKey(0x74)),currentImageReceipt()))throw new IllegalArgumentException("Completed CURRENT installation changed its native authority");
+                var cfg=configurationUnderAdmission();
+                if(cfg==null || cfg.index()>cut.index() || cfg.term()>cut.term() || cfg.index()==cut.index() && cfg.term()!=cut.term())throw new IllegalArgumentException("Completed CURRENT installation lacks bounded CFG");
+                if(Arrays.equals(pending,currentImageReceipt())) {
+                    if(cfg.term()!=registration.configurationTerm() || cfg.index()!=registration.configurationIndex() || !Arrays.equals(cfg.data(),registration.sourceConfiguration()))throw new IllegalArgumentException("Completed initial CURRENT image changed CFG");
+                }else {
+                    var receipt=db.get(state,topologyOwnershipKey(0x73));NativeCurrentRangeRecovery.requireCompletion(registration,receipt,cut);requireCurrentCompletionConfiguration(receipt,cfg);
+                }
+                return new CurrentInstallationReference(cut,cfg);
+            }finally{applyLane.unlock();}
+        }finally{leaveNative();}
+    }
+    private static void requireCurrentCompletionConfiguration(byte[] completion,Configuration cfg) {
+        var receipt=ByteBuffer.wrap(completion);receipt.position(48);long term=receipt.getLong(),index=receipt.getLong();int length=receipt.getInt();byte[] data=new byte[length];receipt.get(data);
+        if(cfg.index()<index || cfg.term()<term || cfg.index()==index && (cfg.term()!=term || !Arrays.equals(cfg.data(),data)))throw new IllegalArgumentException("CURRENT checkpoint regressed completed configuration");
+    }
     private byte[] currentImageReceipt(){return ByteBuffer.allocate(48).putLong(currentRangeRecovery.imageCut().term()).putLong(currentRangeRecovery.imageCut().index()).put(currentRangeRecovery.imageHash()).array();}
     private boolean currentImageInstalledUnderLane()throws RocksDBException {
         if(currentRangeRecovery==null || pendingInstallation!=null || applied==null)return false;byte[] receipt=db.get(state,topologyOwnershipKey(0x74));if(receipt==null)return false;if(!Arrays.equals(receipt,currentImageReceipt()))throw new IllegalArgumentException("CURRENT receipt changed registered image");return NativeMetadataRecoveryRegistration.covers(applied,currentRangeRecovery.imageCut());
@@ -4283,8 +4313,7 @@ public final class ReplicatedRangeStore {
                     if(NativeMetadataRecoveryRegistration.covers(actual.position(),cut) && !Arrays.equals(rows.get(row.getKey()),row.getValue()))throw new IOException("CURRENT checkpoint discarded retained schema history at its cut");
                 }
             }
-            var receipt=ByteBuffer.wrap(trustedCompletion);receipt.position(48);long term=receipt.getLong(),index=receipt.getLong();int length=receipt.getInt();byte[] data=new byte[length];receipt.get(data);
-            if(cfg.index()<index || cfg.term()<term || cfg.index()==index && (cfg.term()!=term || !Arrays.equals(cfg.data(),data)))throw new IOException("CURRENT checkpoint regressed completed configuration");
+            requireCurrentCompletionConfiguration(trustedCompletion,cfg);
             localRows=Map.copyOf(rows);activation=origin==null?null:origin.activation();
         }
         var retainedConfiguration=configurationUnderAdmission();
