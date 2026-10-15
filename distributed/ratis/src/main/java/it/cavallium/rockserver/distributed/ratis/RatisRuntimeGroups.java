@@ -74,7 +74,7 @@ final class RatisRuntimeGroups {
         var directory=registration.sourceDirectory();var descriptor=registration.range();recoveryIdentity(registration.catalogue(),directory,registration.receiver(),descriptor,registration.sourceConfiguration());
         var old=groups.get(registration.groupId());
         if(old!=null){
-            if(old.metadata()!=null){if(old.metadata().equals(registration))return;throw new IllegalArgumentException("META recovery changed original local registration");}
+            if(old.metadata()!=null){if(!old.metadata().equals(registration))registration.requireSuccessorOf(old.metadata());return;}
             if(old.role()!=RatisNodePlan.Role.DATA || old.current()!=null || old.learner()!=null || old.descriptor().rangeEpoch()!=descriptor.rangeEpoch() || !old.descriptor().rangeId().equals(descriptor.rangeId())
                     || !Arrays.equals(old.descriptor().lowerInclusive(),descriptor.lowerInclusive()) || !Arrays.equals(old.descriptor().upperExclusive(),descriptor.upperExclusive()) || !old.directory().domainId().equals(directory.domainId()))throw new IllegalArgumentException("META recovery conflicts with an existing local registration");
         }

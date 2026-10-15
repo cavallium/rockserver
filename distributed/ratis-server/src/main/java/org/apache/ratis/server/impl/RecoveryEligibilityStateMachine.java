@@ -54,13 +54,39 @@ public interface RecoveryEligibilityStateMachine extends StateMachine {
    * callbacks, native IO and apply-lane acquisition remain outside Gate.
    */
   final class Gate {
-    private record Publication(long revision, Evidence evidence) { }
+    private record Publication(long revision, long revocationGeneration, Evidence evidence) { }
     record Revocation(long revision, Evidence previous) { }
-    private volatile Publication publication = new Publication(0, Evidence.missing());
+    private volatile Publication publication = new Publication(0, 0, Evidence.missing());
+    /** Captured before artifact qualification; an intervening MISSING publication permanently revokes it. */
+    public static final class SnapshotPermit {
+      private final Gate owner;
+      private final long generation;
+      private SnapshotPermit(Gate owner, long generation) { this.owner = owner; this.generation = generation; }
+      public void requireCurrent() {
+        final Publication current = owner.publication;
+        if (current.evidence().mode() == Mode.MISSING || current.revocationGeneration() != generation) {
+          throw new IllegalStateException("Snapshot source eligibility was revoked");
+        }
+      }
+      public void requireOwner(Gate expected) {
+        if (owner != expected) { throw new IllegalStateException("Snapshot permit belongs to another recovery Gate"); }
+        requireCurrent();
+      }
+    }
+    public SnapshotPermit snapshotPermit() {
+      final Publication current = publication;
+      if (current.evidence().mode() == Mode.MISSING) {
+        throw new IllegalStateException("Missing native recovery state cannot produce a snapshot");
+      }
+      return new SnapshotPermit(this, current.revocationGeneration());
+    }
     public Evidence snapshot() { return publication.evidence(); }
     public long revision() { return publication.revision(); }
     public synchronized void publish(Evidence next) {
-      publication = new Publication(Math.incrementExact(publication.revision()), Objects.requireNonNull(next));
+      Objects.requireNonNull(next);
+      final long generation = next.mode() == Mode.MISSING
+          ? Math.incrementExact(publication.revocationGeneration()) : publication.revocationGeneration();
+      publication = new Publication(Math.incrementExact(publication.revision()), generation, next);
     }
     /** Capture revision before native/file reads; stale completions cannot undo pause/replacement revocation. */
     public synchronized boolean publishIfCurrent(long expectedRevision, Evidence next) {

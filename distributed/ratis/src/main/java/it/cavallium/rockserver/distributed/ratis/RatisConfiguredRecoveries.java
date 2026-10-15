@@ -141,6 +141,7 @@ final class RatisConfiguredRecoveries {
     private Slot select(){for(int checked=0;checked<slots.size();checked++){var slot=slots.get(cursor);if(slot.phase!=RatisConfiguredRecovery.Phase.DONE)return slot;cursor=(cursor+1)%slots.size();}return null;}
     private void open(Slot slot,Request request,Metadata metadata)throws IOException {
         try {
+            synchronized(this){slot.phase=null;} // A lost constructor-force ACK must be rediscovered, even after cached DONE.
             validateFiles(slot.directory);
             var driver=new RatisConfiguredRecovery(slot.directory,binding,request,hosts.create(metadata),io,slot.files,metadata,initial->{if(!initial.sourceGroup().equals(slot.group) || !owner.pool(initial).equals(slot.pool))throw new IOException("Configured recovery journal escaped its pool/group");});
             active=driver;activeSlot=slot;visits=0;synchronized(this){slot.phase=driver.phase();}
@@ -150,7 +151,7 @@ final class RatisConfiguredRecoveries {
     private void post(Runnable action){try{io.execute(action);}catch(RuntimeException failure){lastFailure=failure;stopped.completeExceptionally(failure);}}
     private boolean isStopping(){synchronized(this){return stopping;}}
     private void finish(CompletableFuture<Void> pending,Throwable failure) {
-        synchronized(this){if(actual!=pending)return;actual=null;enqueued=null;waiters=0;if(failure!=null)lastFailure=failure;}
+        synchronized(this){if(actual!=pending)return;actual=null;enqueued=null;waiters=0;lastFailure=failure;}
         if(failure==null)pending.complete(null);else pending.completeExceptionally(failure);if(isStopping())maybeFinishStop();
     }
     synchronized RatisConfiguredRecovery.Phase phase(UUID group){var slot=groups.get(group);return slot==null?null:slot.phase;}

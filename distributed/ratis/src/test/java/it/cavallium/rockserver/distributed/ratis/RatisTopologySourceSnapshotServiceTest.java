@@ -56,7 +56,7 @@ class RatisTopologySourceSnapshotServiceTest {
                 public RatisTopologySourceSnapshotService.Lease capture(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission admission)throws Exception{return fixture.capture(request,admission);}
                 public Abandoned abandoned(Request request)throws Exception{if(request.transferId().equals(old.transferId())){entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return terminal;}return null;}
                 public Abandoned abandon(Request request)throws Exception{return fixture.abandon(request);}
-                public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
+                public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate.SnapshotPermit requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{return fixture.requireOwner(lease);}
                 public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                 public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);}
                 public boolean isReleased(Request request)throws Exception{return fixture.isReleased(request);}
@@ -110,7 +110,7 @@ class RatisTopologySourceSnapshotServiceTest {
                     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
                     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
                 public RatisTopologySourceSnapshotService.Lease capture(Request request,it.cavallium.rockserver.core.impl.rocksdb.NativeRangeImage.IoAdmission admission)throws Exception{entered.countDown();assertTrue(unblock.await(5,TimeUnit.SECONDS));return fixture.capture(request,admission);}
-                public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
+                public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate.SnapshotPermit requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{return fixture.requireOwner(lease);}
                 public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                 public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);}
                 public boolean isReleased(Request request)throws Exception{return fixture.isReleased(request);}

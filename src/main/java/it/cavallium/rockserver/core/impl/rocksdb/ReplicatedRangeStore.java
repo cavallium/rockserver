@@ -1133,6 +1133,10 @@ public final class ReplicatedRangeStore {
         var registration=metadataRecoveryRegistration;return registration!=null && pendingInstallation==null && applied!=null && NativeMetadataRecoveryRegistration.covers(applied,registration.imageCut())
                 && Arrays.equals(db.get(state,topologyOwnershipKey(0x71)),metadataImageReceipt(registration));
     }
+    /** Exact forced registration, already in the detached META role; acknowledges registration without resetting later image/tail work. */
+    public boolean metadataRecoveryRegistrationForced(NativeMetadataRecoveryRegistration registration)throws RocksDBException {
+        return readSchemaMetadata(()->retiredMetadataOnly && registration.equals(metadataRecoveryRegistration) && Arrays.equals(registration.digest(),db.get(state,topologyOwnershipKey(0x6f))));
+    }
     @FunctionalInterface interface MetadataRecoveryForce {void force()throws RocksDBException;}
     /** Pool mutation ownership supplies the one durable registry/registration force before local publication. */
     void prepareMetadataRecovery(NativeMetadataRecoveryRegistration registration,MetadataRecoveryForce force)throws RocksDBException {
@@ -1141,6 +1145,7 @@ public final class ReplicatedRangeStore {
         applyLane.lock();try {
             if(closing || snapshotPins.get()!=0)throw new IllegalStateException("Actual original native snapshots have not drained");
             var previous=metadataRecoveryRegistration;if(previous!=null)registration.requireSuccessorOf(previous);
+            if(retiredMetadataOnly && registration.equals(previous) && Arrays.equals(registration.digest(),db.get(state,topologyOwnershipKey(0x6f)))){force.force();return;}
             if(pendingInstallation!=null && !registration.equals(previous))throw new IllegalStateException("Uncertain metadata install requires original image retry");
             if(applied!=null && !NativeMetadataRecoveryRegistration.covers(registration.imageCut(),applied))throw new IllegalArgumentException("Metadata image regresses completed native prefix");
             var descriptor=registration.range();var target=new RangeOwnership.Interval(registration.sourceDirectory().domainId(),registration.sourceDirectory().columns(),descriptor.lowerInclusive(),descriptor.upperExclusive());

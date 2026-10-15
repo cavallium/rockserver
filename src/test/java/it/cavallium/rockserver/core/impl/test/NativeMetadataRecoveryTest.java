@@ -170,6 +170,30 @@ class NativeMetadataRecoveryTest {
             try(var pool=helper.pool(path)) {var target=pool.openMetadataRecovery(registration);configure(target,definition);assertTrue(target.metadataRecoveryPending());assertThrows(IllegalStateException.class,target::retiredOutcomeState);target.installMetadataSnapshot(image,nativeTest.limits);target.completeMetadataRecovery(registration,registration.imageCut(),target.configuration());assertFalse(target.metadataRecoveryPending());}
         }
     }
+    @Test void unknownSuccessorForceRetriesDurabilityWithoutResettingInstalledImageOrOwnTail()throws Exception {
+        for(boolean after:List.of(false,true)) {
+            Path path=root.resolve("progressed-receiver-"+after),first=root.resolve("first-"+after),latest=root.resolve("latest-"+after);
+            NativeMetadataRecoveryRegistration next;ApplyPosition tail;
+            try(var source=nativeTest.new Fixture(root.resolve("progressed-source-"+after));var pool=helper.pool(path)) {
+                source.freeze();source.seed();var original=registration(source,NativeRangeImage.writeMetadata(first,source.parent,nativeTest.limits));
+                var target=pool.openMetadataRecovery(original);configure(target,source.definition);target.installMetadataSnapshot(first,nativeTest.limits);target.completeMetadataRecovery(original,original.imageCut(),target.configuration());
+                source.parent.applyNoop(new ApplyPosition(1,source.parent.applied().index()+1));var image=NativeRangeImage.writeMetadata(latest,source.parent,nativeTest.limits);var cfg=source.parent.configuration();
+                var changed=new NativeMetadataRecoveryRegistration(original.transferId(),original.catalogue(),new ApplyPosition(1,21),original.sourceDirectory(),original.freeze(),original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+                assertThrows(IllegalArgumentException.class,()->pool.openMetadataRecovery(changed),"An attempt identity cannot acquire another image recipe");
+                next=new NativeMetadataRecoveryRegistration(new UUID(0,1104),original.catalogue(),new ApplyPosition(1,21),original.sourceDirectory(),original.freeze(),original.receiver(),original.sourceOwner(),cfg.term(),cfg.index(),cfg.data(),image.position(),image.sha256(),Set.of());
+                pool.metadataRecoveryForceObserver(boundary->{if(boundary==after)throw new RocksDBException("Lost successor registration force acknowledgement");});
+                assertThrows(RocksDBException.class,()->pool.openMetadataRecovery(next));assertEquals(List.of(original),pool.metadataRecoveries());assertTrue(target.metadataRecoveryPending());
+                if(after){assertTrue(target.metadataRecoveryRegistrationForced(next));target.installMetadataSnapshot(latest,nativeTest.limits);tail=new ApplyPosition(1,image.position().index()+1);target.applyNoop(tail,new byte[]{2});target.completeMetadataRecovery(next,tail,target.configuration());}
+                else {assertFalse(target.metadataRecoveryRegistrationForced(next));tail=new ApplyPosition(1,image.position().index()+1);}
+                var barriers=new java.util.concurrent.atomic.AtomicInteger();pool.metadataRecoveryForceObserver(boundary->{if(boundary)barriers.incrementAndGet();});
+                assertSame(target,pool.openMetadataRecovery(next));assertEquals(1,barriers.get(),"Retry must establish a sync barrier even when the registration is readable");assertEquals(List.of(next),pool.metadataRecoveries());
+                if(!after){assertFalse(target.metadataRecoveryImageInstalled());target.installMetadataSnapshot(latest,nativeTest.limits);target.applyNoop(tail,new byte[]{2});target.completeMetadataRecovery(next,tail,target.configuration());}
+                assertEquals(tail,target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertFalse(target.metadataRecoveryPending());assertArrayEquals(new byte[]{2},target.configuration().data());assertTrue(target.recoveryCompletionRecorded(tail,target.configuration()));assertTrue(target.userHandlesDetached());assertFalse(target.admissionOpen());
+            }
+            try(var pool=helper.pool(path)){var target=pool.openMetadataRecovery(next);assertEquals(tail,target.applied());assertTrue(target.metadataRecoveryImageInstalled());assertFalse(target.metadataRecoveryPending());assertArrayEquals(new byte[]{2},target.configuration().data());assertTrue(target.recoveryCompletionRecorded(tail,target.configuration()));assertTrue(target.userHandlesDetached());assertFalse(target.admissionOpen());}
+        }
+    }
+
     @Test void sourceCreditPublicationAndAckTailStayAuthoritativeAcrossNewMetadataImage()throws Exception {
         var promises=new NativeSourceOutcomePublicationTest();Path first=root.resolve("credit-image"),latest=root.resolve("ack-image"),path=root.resolve("receiver");NativeMetadataRecoveryRegistration next;NativeSourceOutcomeCredit.Request request;
         try(var source=nativeTest.new Fixture(root.resolve("source"));var home=promises.home.new Fixture(root.resolve("home"));var pool=helper.pool(path)) {

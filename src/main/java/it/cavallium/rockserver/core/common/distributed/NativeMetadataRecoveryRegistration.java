@@ -41,7 +41,7 @@ public final class NativeMetadataRecoveryRegistration {
     public long configurationTerm(){return configurationTerm;}public long configurationIndex(){return configurationIndex;}public byte[] sourceConfiguration(){return configuration.clone();}
     public byte[] imageHash(){return imageHash.clone();}public Set<UUID> mergeColumns(){return merges;}public int encodedSize(){return encoded.length;}public byte[] encode(){return encoded.clone();}public byte[] digest(){return digest.clone();}
     public void requireSuccessorOf(NativeMetadataRecoveryRegistration previous) {
-        if(!catalogue.equals(previous.catalogue) || !receiver.equals(previous.receiver) || !Arrays.equals(directory.payloadDigest(),previous.directory.payloadDigest()) || !freeze.equals(previous.freeze) || !merges.equals(previous.merges)
+        if(transfer.equals(previous.transfer) && !equals(previous) || !catalogue.equals(previous.catalogue) || !receiver.equals(previous.receiver) || !Arrays.equals(directory.payloadDigest(),previous.directory.payloadDigest()) || !freeze.equals(previous.freeze) || !merges.equals(previous.merges)
                 || !covers(catalogueCut,previous.catalogueCut) || !covers(imageCut,previous.imageCut) || configurationIndex<previous.configurationIndex || configurationTerm<previous.configurationTerm
                 || configurationIndex==previous.configurationIndex && (configurationTerm!=previous.configurationTerm || !Arrays.equals(configuration,previous.configuration))
                 || imageCut.equals(previous.imageCut) && source.equals(previous.source) && !Arrays.equals(imageHash,previous.imageHash))throw new IllegalArgumentException("Metadata recovery changed or regressed original source authority");

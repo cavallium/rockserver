@@ -72,6 +72,11 @@ public final class NativeRangeImage {
         @Override public byte[] sha256() { return sha256.clone(); }
     }
 
+    public enum Kind { GROUP, METADATA }
+    /** Selects the semantic kind of the single current format; callers must still validate the full file. */
+    public static Kind kind(Path image,IoAdmission admission)throws IOException {
+        try(var input=new DataInputStream(admittedInput(Files.newInputStream(image),Objects.requireNonNull(admission)))){int magic=input.readInt();if(magic==MAGIC)return Kind.GROUP;if(magic==METADATA_MAGIC)return Kind.METADATA;throw new IOException("Unknown native image kind");}
+    }
     public enum Section { USER, STATE, RECEIPTS }
 
     @FunctionalInterface
@@ -270,6 +275,7 @@ public final class NativeRangeImage {
     }
     public static Manifest inspectMetadata(Path image,Limits limits)throws IOException{return visitMetadata(image,limits,(section,column,key,value)->{});}
     public static Manifest visitMetadata(Path image,Limits limits,RowVisitor visitor)throws IOException{return visit(image,limits,visitor,true,null,null,IoAdmission.UNLIMITED,true);}
+    public static Manifest visitAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission));}
     public static Manifest visitMetadataAdmitted(Path image,Limits limits,RowVisitor visitor,IoAdmission admission)throws IOException{return visit(image,limits,visitor,true,null,null,Objects.requireNonNull(admission),true);}
     static boolean metadataLocalPointer(byte[] key){if(key.length<17)return false;int tag=key[16]&255;return key.length==17 && (tag>=0x61 && tag<=0x64 || tag>=0x67 && tag<=0x74) || key.length==33 && tag==0x68;}
 

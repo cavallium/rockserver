@@ -118,7 +118,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     }
     private LearnerSourceReader learnerSource=this::loadLearnerSource;
     private NativeTopologyLearnerRegistration learnerAttempt;private UUID learnerAttemptPool;
-    private record RecoveryAttempt(UUID pool,UUID group,byte[] preparedDigest,NativeCurrentRangeRecovery current,NativeMetadataRecoveryRegistration metadata) {}
+    private record RecoveryAttempt(UUID pool,UUID group,byte[] preparedDigest,NativeCurrentRangeRecovery current,NativeMetadataRecoveryRegistration metadata,int previousBytes) {}
     private RecoveryAttempt recoveryAttempt;
     private final Map<UUID,byte[]> recoveryCompletionAttempts=new HashMap<>();
     private RatisConfiguredRecoveries configuredRecoveries;private RatisTransactionRecoveryService configuredRecoveryService;private boolean configuredRecoveryServiceStarted;
@@ -137,7 +137,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private final Map<UUID,PoolOwner> pools=new LinkedHashMap<>();private final Map<UUID,UUID> groupPools=new ConcurrentHashMap<>(); private RaftServer server; private RatisCatalogueClock clock;
     static RatisNodeResourceBudget.Limits poolResources(RatisNodeResourceBudget.Limits spec,RatisNodeResourceBudget.Limits ceiling){return new RatisNodeResourceBudget.Limits(new RatisNodeResourceBudget.Lane(Math.min(spec.ordinary().bytes(),ceiling.ordinary().bytes()),Math.min(spec.ordinary().owners(),ceiling.ordinary().owners())),new RatisNodeResourceBudget.Lane(Math.min(spec.protectedLane().bytes(),ceiling.protectedLane().bytes()),Math.min(spec.protectedLane().owners(),ceiling.protectedLane().owners())));}
     private RatisMetadataClaims metadataClaims;
-    private final class PoolOwner{final RatisNativePoolSpec spec;final DistributedStoragePool pool;RatisSchemaReplicaService schemas;RatisSnapshotCohortService cohorts;RatisTopologySourceSnapshotArtifacts artifacts;RatisTopologyRecoveryAnchors anchors;RatisTopologySourceSnapshotService sources;final java.util.concurrent.ConcurrentHashMap<UUID,AutoCloseable> sourceCleanup=new java.util.concurrent.ConcurrentHashMap<>();boolean closed;final List<AutoCloseable> recoveryMetadata=new ArrayList<>();long recoveryExposureBytes;PoolOwner(RatisNativePoolSpec spec,DistributedStoragePool pool){this.spec=spec;this.pool=pool;}NativeRangeImage.Limits images(){var value=spec.images();return new NativeRangeImage.Limits(Math.min(value.maxRowBytes(),settings.images().maxRowBytes()),Math.min(value.maxImageBytes(),settings.images().maxImageBytes()),Math.min(value.maxColumns(),settings.images().maxColumns()));}RatisRangeStateMachine.RetentionLimits retention(){var value=spec.retention();var node=settings.retention();return new RatisRangeStateMachine.RetentionLimits(Math.min(value.dataCount(),node.dataCount()),Math.min(value.dataBytes(),node.dataBytes()),Math.min(value.maintenanceCount(),node.maintenanceCount()),Math.min(value.maintenanceBytes(),node.maintenanceBytes()));}PoolSnapshotAdmission.Limits pins(){var value=spec.pins();var node=settings.exports().pins();return new PoolSnapshotAdmission.Limits(Math.min(value.maximumPins(),node.maximumPins()),Math.min(value.maximumEstimatedBytes(),node.maximumEstimatedBytes()),value.maximumAge().compareTo(node.maximumAge())<0?value.maximumAge():node.maximumAge(),Math.max(value.minimumFreeBytes(),node.minimumFreeBytes()));}}
+    private final class PoolOwner{final RatisNativePoolSpec spec;final DistributedStoragePool pool;RatisSchemaReplicaService schemas;RatisSnapshotCohortService cohorts;RatisTopologySourceSnapshotArtifacts artifacts;RatisTopologyRecoveryAnchors anchors;RatisTopologySourceSnapshotService sources;final java.util.concurrent.ConcurrentHashMap<UUID,AutoCloseable> sourceCleanup=new java.util.concurrent.ConcurrentHashMap<>();boolean closed;RatisNodeResourceBudget.Lease recoveryMetadata;long recoveryEncodedBytes,recoveryExposureBytes;PoolOwner(RatisNativePoolSpec spec,DistributedStoragePool pool){this.spec=spec;this.pool=pool;}NativeRangeImage.Limits images(){var value=spec.images();return new NativeRangeImage.Limits(Math.min(value.maxRowBytes(),settings.images().maxRowBytes()),Math.min(value.maxImageBytes(),settings.images().maxImageBytes()),Math.min(value.maxColumns(),settings.images().maxColumns()));}RatisRangeStateMachine.RetentionLimits retention(){var value=spec.retention();var node=settings.retention();return new RatisRangeStateMachine.RetentionLimits(Math.min(value.dataCount(),node.dataCount()),Math.min(value.dataBytes(),node.dataBytes()),Math.min(value.maintenanceCount(),node.maintenanceCount()),Math.min(value.maintenanceBytes(),node.maintenanceBytes()));}PoolSnapshotAdmission.Limits pins(){var value=spec.pins();var node=settings.exports().pins();return new PoolSnapshotAdmission.Limits(Math.min(value.maximumPins(),node.maximumPins()),Math.min(value.maximumEstimatedBytes(),node.maximumEstimatedBytes()),value.maximumAge().compareTo(node.maximumAge())<0?value.maximumAge():node.maximumAge(),Math.max(value.minimumFreeBytes(),node.minimumFreeBytes()));}}
     public UUID poolId(UUID group){return owner(group).spec.id();}DistributedStoragePool nativePool(UUID poolId){var owner=pools.get(poolId);if(owner==null)throw new IllegalArgumentException("Undeclared pool");return owner.pool;}
     private PoolOwner owner(UUID group){var id=groupPools.get(group);var owner=id==null?null:pools.get(id);if(owner==null)throw new IllegalArgumentException("Group has no opened native pool: "+group);return owner;}
     private void requirePoolCapacity(UUID pool,Collection<UUID> requested){requireGroupCapacity(requested);var proposed=new HashSet<UUID>();groupPools.forEach((group,id)->{if(id.equals(pool))proposed.add(group);});proposed.addAll(requested);if(seedAttempt!=null && pool.equals(groupPools.get(seedAttempt.definition().parents().getFirst().groupId())))seedAttempt.definition().targets().forEach(target->proposed.add(target.groupId()));if(learnerAttempt!=null && pool.equals(learnerAttemptPool))proposed.add(learnerAttempt.definition().targets().getFirst().groupId());if(recoveryAttempt!=null && recoveryAttempt.pool().equals(pool))proposed.add(recoveryAttempt.group());if(proposed.size()>Math.min(plan.pools().get(pool).maximumGroups(),settings.resources().committedApply().pool().groups()))throw new IllegalArgumentException("Physical pool group ceiling exhausted");}
@@ -484,7 +484,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             // POOL_BYTES already reserves the native shared 64 MiB registry, including per-group
             // registration/digest/image/completion rows. Count that promise once, not once per DTO.
             if(registry>64L*1024*1024)throw new IOException("Native recovery registry exceeds covered metadata reservation");
-            if(encoded!=0)owner.recoveryMetadata.add(resources.imageMetadataAdmission(owner.spec.id(),NativeRangeImage.IoAdmission.UNLIMITED).reserveMetadata(Math.toIntExact(encoded)));
+            if(encoded!=0)owner.recoveryMetadata=resources.reserve(owner.spec.id(),RatisNodeResourceBudget.Kind.PROTECTED,4096L+16L*encoded,1);owner.recoveryEncodedBytes=encoded;
             owner.recoveryExposureBytes=Math.multiplyExact(224L,current.size()+metadata.size()); // 80-byte identity + checksum; main and pending.
             for(var registration:metadata){requireRecoveryPool(owner,registration.sourceDirectory());assignPool(registration.groupId(),owner.spec.id());groups.register(registration);}
         }
@@ -817,9 +817,10 @@ public final class RatisNodeRuntime implements AutoCloseable {
             var view=sourceView(request);var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null)throw new IOException("Original source capture owner unavailable");var cleanup=owner.sourceCleanup.get(request.transferId());if(cleanup!=null){cleanup.close();owner.sourceCleanup.remove(request.transferId(),cleanup);}machine.drainSourceCapture(request.transferId());
             var evidence=machine.sourceSnapshotEvidence(request,view.relocation(),view.directory());return sourceArtifacts.abandon(request,evidence.configuration(),evidence.completedCut());
         }
-        public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{
-            sourceArtifacts.requireReady(lease.prepared());var request=lease.prepared().request();var view=sourceView(request,true);var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null || lease.source().getStateMachine()!=machine)throw new IOException("Source snapshot division changed");var evidence=machine.sourceSnapshotEvidence(request,view.relocation(),view.directory(),true,true);
-            if(!evidence.owner().equals(lease.prepared().sourceOwner()) || !RatisRelocationOwnerRpc.covers(evidence.completedCut(),lease.prepared().image().position()))throw new IOException("Retained source image lost actual native owner/configuration");
+        public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate.SnapshotPermit requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{
+            var request=lease.prepared().request();var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));if(machine==null || lease.source().getStateMachine()!=machine)throw new IOException("Source snapshot division changed");var permit=machine.recoveryEligibilityGate().snapshotPermit();
+            sourceArtifacts.requireReady(lease.prepared());var view=sourceView(request,true);var evidence=machine.sourceSnapshotEvidence(request,view.relocation(),view.directory(),true,true);
+            if(!evidence.owner().equals(lease.prepared().sourceOwner()) || !RatisRelocationOwnerRpc.covers(evidence.completedCut(),lease.prepared().image().position()))throw new IOException("Retained source image lost actual native owner/configuration");permit.requireCurrent();return permit;
         }
         public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{
             var request=lease.prepared().request();var view=sourceView(request,true);var image=lease.prepared().image();
@@ -876,7 +877,12 @@ public final class RatisNodeRuntime implements AutoCloseable {
     private byte[] seedExposureBytes(RatisRuntimeGroups.Entry entry){return ByteBuffer.allocate(80).putLong(entry.group().getGroupId().getUuid().getMostSignificantBits()).putLong(entry.group().getGroupId().getUuid().getLeastSignificantBits()).put((entry.learner()!=null ? entry.learner().digest() : entry.seed().digest())).put(plan.identityDigest()).array();}
     private static boolean registeredRecovery(RatisRuntimeGroups.Entry entry){return entry.current()!=null || entry.metadata()!=null;}
     private Path registeredExposure(UUID group){return root.resolve("topology-exposure/registered").resolve(group.toString());}
-    private byte[] registeredExposureBytes(RatisRuntimeGroups.Entry entry){return ByteBuffer.allocate(80).putLong(entry.group().getGroupId().getUuid().getMostSignificantBits()).putLong(entry.group().getGroupId().getUuid().getLeastSignificantBits()).put(entry.current()!=null?entry.current().digest():entry.metadata().digest()).put(plan.identityDigest()).array();}
+    private byte[] registeredExposureBytes(RatisRuntimeGroups.Entry entry){
+        var range=entry.descriptor();var receiver=entry.current()!=null?entry.current().receiver():entry.metadata().receiver();var identity=ByteBuffer.allocate(88);
+        for(var id:List.of(range.groupId(),range.rangeId(),entry.directory().domainId(),plan.catalogue().groupId(),receiver.replicaId()))identity.putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits());identity.putLong(range.rangeEpoch());
+        // Exposure belongs to this native group/receiver. Exact image permissions live in the forced native registry.
+        return ByteBuffer.allocate(80).putLong(range.groupId().getMostSignificantBits()).putLong(range.groupId().getLeastSignificantBits()).put(OperatorUpload.sha256(identity.array())).put(plan.identityDigest()).array();
+    }
     private void validateSeedExposures()throws IOException{
         var directory=root.resolve("topology-exposure");if(!Files.exists(directory))return;
         try(var files=Files.newDirectoryStream(directory)){int count=0;for(var path:files){if(path.getFileName().toString().equals("registered")){if(!Files.isDirectory(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Invalid registered recovery exposure directory");continue;}if(++count>RatisNodePlan.MAX_LOCAL_GROUPS)throw new IOException("Topology exposure count exceeds group bound");validateExposure(path,false);}}
@@ -1046,12 +1052,13 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 byte[] digest=OperatorUpload.sha256(RatisTopologySourceSnapshotRpc.reply(RatisTopologySourceSnapshotRpc.PREPARE,prepared));
                 if(recoveryAttempt!=null && (!recoveryAttempt.group().equals(request.sourceGroup()) || !recoveryAttempt.pool().equals(owner.spec.id()) || !Arrays.equals(recoveryAttempt.preparedDigest(),digest)))throw new IOException("Unknown recovery force requires exact original Prepared retry");
                 var authority=qualifyRecovery(prepared,bytes->workspace.growTo(4096L+16L*Math.addExact(prepared.encodedSize(),bytes)));var current=owner.pool.currentRangeRecoveries().stream().filter(r->r.groupId().equals(request.sourceGroup())).findFirst().orElse(null);var metadata=owner.pool.metadataRecoveries().stream().filter(r->r.groupId().equals(request.sourceGroup())).findFirst().orElse(null);
-                var frozen=recoveryAttempt;ApplyPosition cut=frozen!=null?(frozen.current()!=null?frozen.current().catalogueCut():frozen.metadata().catalogueCut()):current!=null?current.catalogueCut():metadata!=null?metadata.catalogueCut():authority;
+                var frozen=recoveryAttempt;ApplyPosition cut=frozen!=null?(frozen.current()!=null?frozen.current().catalogueCut():frozen.metadata().catalogueCut()):current!=null?current.catalogueCut():metadata!=null && metadata.transferId().equals(request.transferId())?metadata.catalogueCut():authority;
+                int previousGraphBytes=frozen!=null?frozen.previousBytes():metadata==null?0:metadata.encodedSize();workspace.growTo(Math.max(workspace.bytes(),4096L+16L*Math.addExact(prepared.encodedSize(),previousGraphBytes)));
                 NativeCurrentRangeRecovery proposedCurrent=null;NativeMetadataRecoveryRegistration proposedMetadata=null;
                 if(request.metadataOnly()) {
                     if(current!=null)throw new IOException("CURRENT-to-META recovery conversion is not supported");
                     proposedMetadata=new NativeMetadataRecoveryRegistration(request.transferId(),request.catalogue(),cut,request.sourceDirectory(),prepared.metadataFreeze(),receiver,prepared.sourceOwner(),prepared.sourceCfg().term(),prepared.sourceCfg().index(),prepared.sourceCfg().data(),prepared.image().position(),prepared.image().sha256(),prepared.image().deterministicMergeColumns());
-                    groups.preflight(proposedMetadata);if(metadata!=null && !metadata.equals(proposedMetadata))throw new IOException("META registration changed original installed recipe");
+                    groups.preflight(proposedMetadata);if(metadata!=null && !metadata.equals(proposedMetadata)){if(metadata.transferId().equals(request.transferId()))throw new IOException("META retry changed its original image recipe");if(recoveryCompletionAttempts.containsKey(request.sourceGroup()))throw new IOException("META successor waits for original completion settlement");proposedMetadata.requireSuccessorOf(metadata);}
                 } else {
                     if(metadata!=null)throw new IOException("Sealed META group cannot adopt CURRENT image");
                     var names=new HashMap<UUID,String>();var configured=plan.domain(request.domainId()).columns();for(var column:prepared.schema().columnIds())names.put(column,configured.getOrDefault(column,"recovery-"+column));
@@ -1061,25 +1068,29 @@ public final class RatisNodeRuntime implements AutoCloseable {
                 }
                 if(frozen!=null && (!Objects.equals(frozen.current(),proposedCurrent) || !Objects.equals(frozen.metadata(),proposedMetadata)))throw new IOException("Recovery retry changed frozen native recipe");
                 var existing=stores.get(request.sourceGroup());var machine=machines.get(RaftGroupId.valueOf(request.sourceGroup()));
-                if(request.metadataOnly() && metadata==null && existing!=null){
+                boolean registeredMetadata=request.metadataOnly() && existing!=null && existing.metadataRecoveryRegistrationForced(proposedMetadata);
+                if(request.metadataOnly() && metadata==null && existing!=null && !registeredMetadata){
                     if(existing.currentRangeRecoveryRegistration()!=null || existing.pendingInstallation() || existing.activeSnapshotPins()!=0 || existing.applied()!=null && !RatisRelocationOwnerRpc.covers(prepared.image().position(),existing.applied()))throw new IOException("Existing META source has busy or newer native prefix; recapture first");
-                    if(machine!=null){machine.requireRecoveryRegistrationDrained();if(machine.hasRetainedSnapshot())throw new IOException("Existing source snapshot must be qualified before META replacement");}
+                    if(machine!=null)machine.requireRecoveryRegistrationDrained();
                 }
-                if(frozen==null && current==null && metadata==null) {
-                    int bytes=proposedCurrent!=null?proposedCurrent.encodedSize():proposedMetadata.encodedSize();var retained=resources.imageMetadataAdmission(owner.spec.id(),NativeRangeImage.IoAdmission.UNLIMITED).reserveMetadata(bytes);boolean saved=false;
+                boolean changedMetadata=proposedMetadata!=null && !proposedMetadata.equals(metadata);
+                if(request.metadataOnly() && machine!=null && !registeredMetadata && (changedMetadata || frozen!=null)){machine.requireRecoveryRegistrationDrained();machine.qualifyMetadataRecoveryFloor(proposedMetadata);}
+                if(frozen==null && current==null && (metadata==null || changedMetadata)) {
+                    int bytes=proposedCurrent!=null?proposedCurrent.encodedSize():proposedMetadata.encodedSize(),previousBytes=metadata==null?0:metadata.encodedSize();long originalCredit=owner.recoveryMetadata==null?0:owner.recoveryMetadata.bytes();boolean saved=false;
                     try {
-                        long claim=groups.entries().stream().anyMatch(e->e.group().getGroupId().getUuid().equals(request.sourceGroup()))?0:metadataClaim(owner.spec,request.sourceGroup(),RatisNodePlan.Role.DATA).bytes();
-                        long total=metadataClaims.bytes()+claim+224;for(var pool:pools.values())total=Math.addExact(total,pool.recoveryExposureBytes);
-                        if(total>settings.resources().maximumDurableMetadataBytes() || metadataClaims.bytes(owner.spec.id())+claim+owner.recoveryExposureBytes+224>owner.spec.maximumDurableMetadataBytes())throw new IOException("Recovery registration durable metadata/exposure ceiling exhausted");
+                        long retained=4096L+16L*Math.addExact(owner.recoveryEncodedBytes,bytes);if(owner.recoveryMetadata==null)owner.recoveryMetadata=resources.reserve(owner.spec.id(),RatisNodeResourceBudget.Kind.PROTECTED,retained,1);else owner.recoveryMetadata.growTo(Math.max(owner.recoveryMetadata.bytes(),retained));
+                        metadataClaims.reserve(List.of());long claim=metadataClaims.contains(request.sourceGroup())?0:metadataClaim(owner.spec,request.sourceGroup(),RatisNodePlan.Role.DATA).bytes();
+                        long exposure=previousBytes==0?224:0;long total=metadataClaims.bytes()+claim+exposure;for(var pool:pools.values())total=Math.addExact(total,pool.recoveryExposureBytes);
+                        if(total>settings.resources().maximumDurableMetadataBytes() || metadataClaims.bytes(owner.spec.id())+claim+owner.recoveryExposureBytes+exposure>owner.spec.maximumDurableMetadataBytes())throw new IOException("Recovery registration durable metadata/exposure ceiling exhausted");
                         reserveDataMetadata(owner,List.of(request.sourceGroup()));
-                        if(machine!=null && request.metadataOnly()){
+                        if(machine!=null && request.metadataOnly() && !registeredMetadata){
                             machine.pauseRecoveryRegistration(prepared.image().position());machine.awaitNativeReaders(settings.shutdownTimeout());
                             if(existing.pendingInstallation() || existing.activeSnapshotPins()!=0 || existing.applied()!=null && !RatisRelocationOwnerRpc.covers(prepared.image().position(),existing.applied()))throw new IOException("Drained META source requires a newer image or original native owner release");
                         }
-                        owner.recoveryExposureBytes+=224;owner.recoveryMetadata.add(retained);recoveryAttempt=new RecoveryAttempt(owner.spec.id(),request.sourceGroup(),digest,proposedCurrent,proposedMetadata);saved=true;
-                    }finally{if(!saved)try{retained.close();}catch(Exception failed){throw new IOException("Recovery registration graph release failed",failed);}}
+                        owner.recoveryExposureBytes+=exposure;recoveryAttempt=new RecoveryAttempt(owner.spec.id(),request.sourceGroup(),digest,proposedCurrent,proposedMetadata,previousBytes);saved=true;
+                    }finally{if(!saved){if(originalCredit==0){if(owner.recoveryMetadata!=null)owner.recoveryMetadata.close();owner.recoveryMetadata=null;}else owner.recoveryMetadata.shrinkTo(originalCredit,1);}}
                 }
-                if(machine!=null && request.metadataOnly() && (metadata==null || recoveryAttempt!=null)) {machine.requireRecoveryRegistrationDrained();machine.pauseRecoveryRegistration(prepared.image().position());machine.awaitNativeReaders(settings.shutdownTimeout());machine.requireRecoveryRegistrationDrained();}
+                if(machine!=null && request.metadataOnly() && !registeredMetadata && (changedMetadata || recoveryAttempt!=null)) {machine.requireRecoveryRegistrationDrained();machine.pauseRecoveryRegistration(prepared.image().position());machine.awaitNativeReaders(settings.shutdownTimeout());machine.requireRecoveryRegistrationDrained();}
                 var store=proposedCurrent!=null?owner.pool.openCurrentRangeRecovery(proposedCurrent):owner.pool.openMetadataRecovery(proposedMetadata);
                 assignPool(request.sourceGroup(),owner.spec.id());if(proposedCurrent!=null)groups.register(proposedCurrent);else groups.register(proposedMetadata);
                 var entry=groups.require(request.sourceGroup());var id=entry.group().getGroupId();
@@ -1087,7 +1098,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
                     machine=RatisRangeStateMachine.withSessions(store,entry.group(),owner.images(),command->{},epochs,entry.directory(),owner.retention());machine.nodeResources(resources,owner.spec.id());machine.logResources(logBudget(request.sourceGroup(),owner.spec.id()));machine.diskRunway(diskRunway,owner.spec.id());machine.committedApply(committedDispatcher,owner.spec.id(),MAX_COMMITTED_ENTRY_BYTES);configureDataMachine(machine,entry.directory(),entry.descriptor());machine.learnerInstaller(topologyImageQueries,this::joinTopologyLearner);machine.learnerRecoveryInstaller(this::prepareLearnerRecovery);machine.proofQueries(proofQueries);machine.exportSources(exportSources);stores.put(request.sourceGroup(),store);machines.put(id,machine);
                 }
                 if(recoveryAttempt!=null)virginSeedAdds.add(request.sourceGroup());requireSeedStorage(entry);markSeedExposure(entry);var actual=new HashSet<RaftGroupId>();server.getGroupIds().forEach(actual::add);if(!actual.contains(id))addGroup(entry.group());else {if(machine.getLifeCycleState()==org.apache.ratis.util.LifeCycle.State.PAUSED)machine.resumeRecoveryRegistration();verify(entry.group());}
-                virginSeedAdds.remove(request.sourceGroup());recoveryAttempt=null;return store;
+                virginSeedAdds.remove(request.sourceGroup());if(recoveryAttempt!=null){owner.recoveryEncodedBytes=Math.addExact(owner.recoveryEncodedBytes-recoveryAttempt.previousBytes(),proposedCurrent!=null?proposedCurrent.encodedSize():proposedMetadata.encodedSize());owner.recoveryMetadata.shrinkTo(4096L+16L*owner.recoveryEncodedBytes,1);}recoveryAttempt=null;return store;
             }
         }catch(IOException failure){throw failure;}catch(Exception failure){throw new IOException("Configured native recovery registration failed",failure);}finally{endSeedLifecycle();}
     }
@@ -1546,7 +1557,7 @@ public final class RatisNodeRuntime implements AutoCloseable {
             if (importOwners!=null && !importOwnersClosed) { importOwners.close(); importOwnersClosed=true; }
             for(var owner:pools.values()){
                 if(!owner.closed){owner.pool.close();owner.closed=true;}
-                while(!owner.recoveryMetadata.isEmpty()){try{owner.recoveryMetadata.getFirst().close();}catch(Exception failed){throw new IOException("Recovered native metadata ownership release failed",failed);}owner.recoveryMetadata.removeFirst();}
+                if(owner.recoveryMetadata!=null){owner.recoveryMetadata.close();owner.recoveryMetadata=null;owner.recoveryEncodedBytes=0;}
             }poolClosed=true;
             for (var client:homeClients.values()) client.close();
             if(nativeExtentEnv!=null){nativeExtentEnv.close();nativeExtentEnv=null;}

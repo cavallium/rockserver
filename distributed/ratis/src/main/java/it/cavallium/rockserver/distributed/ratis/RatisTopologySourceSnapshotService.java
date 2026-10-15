@@ -41,7 +41,7 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
         default void transferFinished(Request request){}
         Abandoned abandoned(Request request)throws Exception;
         Abandoned abandon(Request request)throws Exception;
-        void requireOwner(Lease lease)throws Exception;
+        org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate.SnapshotPermit requireOwner(Lease lease)throws Exception;
         void requireReceiverInstalled(Lease lease)throws Exception;
         void released(Lease lease)throws Exception;
         boolean isReleased(Request request)throws Exception;
@@ -161,9 +161,9 @@ public final class RatisTopologySourceSnapshotService implements AutoCloseable {
                 if(lookup){var abandoned=host.abandoned(request);if(abandoned!=null)throw new AbandonedException(abandoned);
                     synchronized(RatisTopologySourceSnapshotService.this){entry=entries.get(request.transferId());if(entry==null || entry.lease==null || entry.unusable)throw new IOException("Prepare the exact source image first");requireSame(entry,request);if(entry.busy)throw new IOException("Source transfer owner is active");entry.busy=true;releaseLookups.remove(request.transferId());metadataBytes-=publicationLookupBytes(request);lookup=false;}
                 }
-                host.requireOwner(entry.lease);
+                var sourcePermit=host.requireOwner(entry.lease);
                 if(entry.installed)return RWScheduler.CooperativeResult.COMPLETE;
-                if(chunks==null)chunks=RockserverSnapshotRequests.openSource(entry.lease.source(),RaftPeerId.valueOf(request.receiver().peerId()),request.transferId().toString(),entry.lease.snapshot(),CHUNK_BYTES);
+                if(chunks==null)chunks=RockserverSnapshotRequests.openSource(entry.lease.source(),RaftPeerId.valueOf(request.receiver().peerId()),request.transferId().toString(),entry.lease.snapshot(),CHUNK_BYTES,sourcePermit);
                 if(!chunks.hasNext())throw new IOException("Snapshot producer did not yield a final receiver response");
                 if(!host.chunkReady(request,CHUNK_BYTES)){rateWakeup.schedule(this::resumeRate,10,TimeUnit.MILLISECONDS);return RWScheduler.CooperativeResult.PARK;}
                 var chunk=chunks.next();var reply=host.send(request,chunk);requireReply(chunk,reply);host.requireOwner(entry.lease);

@@ -1975,12 +1975,46 @@ when their index credit is unavailable. Evidence is
 output directory. Earlier passing unchanged selections are reused alongside the
 final ten-case manager/Runtime/client gate.
 
-These are controlled Raft wire delivery and log-floor fixtures. Automatic CAT/DAG
-obligation discovery, CURRENT-to-META conversion, META registration successors,
-and conversion of an existing source with a retained GROUP snapshot still need
-dedicated Runtime transitions; first-time META conversion conservatively refuses
-any retained snapshot before native force. DAG obligation retention and
-leader-change source transfer also remain unfinished. Canonical journal promises
+Settled META recovery now admits a fresh capture attempt without changing its
+source identity. Unknown registration forces retry the original recipe and sync
+barrier, preserving a subsequently installed image, own tail and completion.
+Changed recipes cannot reuse an attempt UUID. Renewal replaces one pool-level
+retained graph credit and reuses the stable group/receiver exposure promise;
+unfinished registration or completion still owns its original attempt. A lost
+renewal journal acknowledgement clears cached DONE so CONTROL rediscovers the
+forced request without another enqueue.
+
+Existing covered GROUP snapshots can remain Ratis log floors during META
+registration. They grant neither image-installation authority nor native readiness.
+Exact META promotion supports an equal cut with a different semantic image hash,
+retains the old floor through publication, and cold recovery checks the actual
+registered META image receipt before skipping installation. Older META floors
+remain valid inventory while a newer registered image is missing. These are
+semantic GROUP/META roles in the single current format, not format releases or
+compatibility readers.
+
+Snapshot producers capture a Gate permit before qualifying their artifact and
+check it for every chunk. Any intervening MISSING state permanently revokes that
+permit, including restoration before the next chunk. Default transfers also bind
+the cached latest file identity; explicit source transfers receive their permit
+from fresh source/CAT/native qualification. Ordinary checkpoint and tail progress
+do not revoke an otherwise valid transfer.
+
+The broader controlled regression gate passes 129 distinct cases across 18
+classes, including 24 native cases, source artifacts/transfers, all 33 node-runtime
+cases and retained GROUP-to-META transitions. Evidence is
+`metadata-transition-final-regression-gate.log` in the task-owned native output
+directory. The final 37-case `metadata-equal-cut-cold-final-gate.log` validates
+the subsequent cold-recovery fixes, including publication before native install,
+older META floors during renewal, genuine successor installation/completion and
+another cold reopen. The other 92 cases cover unchanged paths from the broader
+gate. Both cold defects were reproduced before repair. Earlier fixture failures
+were repaired by fencing the initial native install and providing the bounded
+native apply dispatcher.
+
+These remain controlled Raft wire delivery and log-floor fixtures. Automatic
+CAT/DAG obligation discovery, CURRENT-to-META conversion, DAG obligation retention
+and leader-change source transfer remain unfinished. Canonical journal promises
 and runway accounting do not establish the complete physical allocation envelope.
 
 Durable metadata-DAG

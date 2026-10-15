@@ -135,7 +135,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                         var held=fixture.capture(input,admission);boolean adopted=false;
                         try{var saved=helper.retain(held.prepared(),managed(held,fixture.image.getParent()));var result=new RatisTopologySourceSnapshotService.Lease(saved.prepared(),held.source(),saved.snapshot(),held.retained());adopted=true;return result;}finally{if(!adopted)held.close();}
                     }
-                    public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
+                    public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate.SnapshotPermit requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{return fixture.requireOwner(lease);}
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                     public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);helper.released(lease.prepared().request());}
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
@@ -158,7 +158,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                         var held=fixture.capture(input,admission);boolean adopted=false;
                         try{var saved=helper.retain(held.prepared(),managed(held,fixture.image.getParent()));var result=new RatisTopologySourceSnapshotService.Lease(saved.prepared(),held.source(),saved.snapshot(),held.retained());adopted=true;return result;}finally{if(!adopted)held.close();}
                     }
-                    public void requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireOwner(lease);}
+                    public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate.SnapshotPermit requireOwner(RatisTopologySourceSnapshotService.Lease lease)throws Exception{return fixture.requireOwner(lease);}
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.requireReceiverInstalled(lease);}
                     public void released(RatisTopologySourceSnapshotService.Lease lease)throws Exception{fixture.released(lease);helper.released(lease.prepared().request());}
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}
@@ -171,7 +171,7 @@ class RatisTopologySourceSnapshotArtifactsTest {
                     public RatisTopologySourceSnapshotRpc.Abandoned abandoned(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandoned(request);}
                     public RatisTopologySourceSnapshotRpc.Abandoned abandon(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return fixture.abandon(request);}
                     public RatisTopologySourceSnapshotService.Lease capture(RatisTopologySourceSnapshotRpc.Request request,NativeRangeImage.IoAdmission admission){throw new AssertionError("Cold release cannot recapture");}
-                    public void requireOwner(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot acquire owner permission");}
+                    public org.apache.ratis.server.impl.RecoveryEligibilityStateMachine.Gate.SnapshotPermit requireOwner(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot acquire owner permission");}
                     public void requireReceiverInstalled(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot create a new installation proof");}
                     public void released(RatisTopologySourceSnapshotService.Lease lease){throw new AssertionError("Cold release cannot create a receipt");}
                     public boolean isReleased(RatisTopologySourceSnapshotRpc.Request request)throws Exception{return helper.isReleased(request);}

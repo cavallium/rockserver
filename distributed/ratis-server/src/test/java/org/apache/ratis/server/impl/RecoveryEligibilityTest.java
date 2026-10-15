@@ -360,4 +360,20 @@ public class RecoveryEligibilityTest {
       machine.publish(); assertTrue(timeout(follower));
     }
   }
+  @Test void restoredVotingEvidenceDoesNotRestoreRevokedSnapshotPermits() {
+    var gate = new RecoveryEligibilityStateMachine.Gate();
+    gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
+    var old = gate.snapshotPermit();
+    var revoked = gate.revoke();
+    gate.restoreUnchanged(revoked);
+    assertEquals(RecoveryEligibilityStateMachine.Mode.NORMAL, gate.snapshot().mode());
+    assertThrows(IllegalStateException.class, old::requireCurrent);
+    var fresh = gate.snapshotPermit();
+    gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
+    fresh.requireCurrent();
+    gate.publish(RecoveryEligibilityStateMachine.Evidence.missing());
+    gate.publish(RecoveryEligibilityStateMachine.Evidence.normal());
+    assertThrows(IllegalStateException.class, fresh::requireCurrent);
+  }
+
 }

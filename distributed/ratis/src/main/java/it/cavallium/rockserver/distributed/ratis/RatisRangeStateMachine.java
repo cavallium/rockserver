@@ -903,9 +903,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         return new SourceSnapshotEvidence(local,cut,cfg);
     }
     RatisTopologySourceSnapshotService.Lease captureSourceSnapshot(RatisTopologySourceSnapshotRpc.Request request,TopologyChange.Definition definition,RangeDirectory qualifiedDirectory,DistributedSchema qualifiedSchema,RatisTopologySourceSnapshotArtifacts artifacts,NativeRangeImage.IoAdmission imageAdmission)throws Exception{
-        imageAdmission.beforeBytes(1);qualifiedSchema.requireMatches(qualifiedDirectory);
+        var snapshotPermit=recoveryEligibility.snapshotPermit();imageAdmission.beforeBytes(1);qualifiedSchema.requireMatches(qualifiedDirectory);
         var saved=artifacts.lookupAdmitted(request,imageAdmission);var evidence=sourceSnapshotEvidence(request,definition,qualifiedDirectory,saved!=null,saved!=null);var division=getServer().getNow(null).getDivision(getGroupId());
-        if(saved!=null){var prepared=saved.prepared();var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory,true,true);if(!RatisRelocationOwnerRpc.covers(after.completedCut(),prepared.image().position()) || !prepared.sourceOwner().equals(after.owner()) || !after.owner().equals(evidence.owner()))throw new IOException("Cold source image lacks its original actual owner/prefix");return new RatisTopologySourceSnapshotService.Lease(prepared,division,saved.snapshot(),()->{});}
+        if(saved!=null){var prepared=saved.prepared();var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory,true,true);if(!RatisRelocationOwnerRpc.covers(after.completedCut(),prepared.image().position()) || !prepared.sourceOwner().equals(after.owner()) || !after.owner().equals(evidence.owner()))throw new IOException("Cold source image lacks its original actual owner/prefix");snapshotPermit.requireCurrent();return new RatisTopologySourceSnapshotService.Lease(prepared,division,saved.snapshot(),()->{});}
         ReplicatedRangeStore.SnapshotPin pin=request.metadataOnly()?store.captureMetadataForRecovery():request.relocation()?store.captureForRecovery():store.capture();boolean returned=false;
         try {
             var position=pin.position();if(position==null || position.term()<1 || !java.util.Arrays.equals(qualifiedSchema.digest(),pin.schemaDigest()))throw new IOException("Source image lacks qualified committed schema/prefix");
@@ -919,7 +919,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var md5=org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(file,imageAdmission));var snapshot=new SingleFileSnapshotInfo(new FileInfo(file,md5),TermIndex.valueOf(position.term(),position.index()));
             var prepared=new RatisTopologySourceSnapshotRpc.Prepared(request,image,qualifiedSchema,evidence.owner(),pin.configuration(),rows,metadataFreeze[0]);var retained=artifacts.retainAdmitted(prepared,snapshot,imageAdmission);
             var after=sourceSnapshotEvidence(request,definition,qualifiedDirectory);if(!after.owner().equals(evidence.owner()) || !RatisRelocationOwnerRpc.covers(after.completedCut(),position))throw new IOException("Source lost completed image owner");
-            var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,retained.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;
+            snapshotPermit.requireCurrent();var lease=new RatisTopologySourceSnapshotService.Lease(prepared,division,retained.snapshot(),()->closeSourceCapture(request.transferId(),pin));returned=true;return lease;
         }finally{if(!returned)closeSourceCapture(request.transferId(),pin);}
     }
     RatisRecoveryImageRpc.Evidence recoveryImageEvidence(RatisRecoveryImageRpc.Request request)throws Exception {
@@ -2190,7 +2190,30 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     }
 
     @Override public SimpleStateMachineStorage getStateMachineStorage() { return snapshots; }
-    boolean hasRetainedSnapshot(){return durableSnapshot!=null;}
+    private it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration metadataFloorPreparation;
+    /** Read-only qualification before forcing a META recipe over an existing quiescent owner. */
+    void qualifyMetadataRecoveryFloor(it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
+        synchronized(gate){requireRecoveryRegistrationDrained();if(store.pendingInstallation() || store.activeSnapshotPins()!=0)throw new IOException("META floor has active native installation/readers");
+            var snapshot=durableSnapshot;if(snapshot!=null)validateCoveredMetadataFloor(snapshot.getFile().getPath(),snapshot.getTermIndex(),proposed);
+            var server=getServer().getNow(null);if(server==null || !server.getId().toString().equals(proposed.receiver().peerId()) || topologyLocalReplica==null || !sameReplicaIdentity(proposed.receiver(),topologyLocalReplica))throw new IOException("META floor receiver identity differs");
+            var division=server.getDivision(getGroupId());if(division.getStateMachine()!=this || !division.getInfo().isAlive() || division.getInfo().getLifeCycleState()!=LifeCycle.State.RUNNING)throw new IOException("META floor has no actual running division");var actual=division.getRaftConf();requireActualMembership(actual,proposed.range());
+            try{var cfg=store.configuration();var nativeCut=store.applied();if(cfg==null || nativeCut==null && (snapshot!=null || cfg.term()!=0 || cfg.index()!=-1) || nativeCut!=null && (!RatisRelocationOwnerRpc.covers(proposed.imageCut(),nativeCut) || cfg.index()>nativeCut.index() || cfg.term()>nativeCut.term()) || actual.getLogEntryIndex()!=cfg.index() && !(cfg.term()==0 && cfg.index()==-1 && actual.getLogEntryIndex()<=0))throw new IOException("META floor actual/native configuration or image coverage differs");requireSchemaMembership(proposed.range(),cfg.data());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify existing META floor configuration",invalid);}metadataFloorPreparation=proposed;
+        }
+    }
+    private NativeRangeImage.Manifest validateCoveredMetadataFloor(Path image,TermIndex position,it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration proposed)throws IOException {
+        try(var metadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)){
+            if(store.pendingInstallation())throw new IOException("Pending native install cannot use a preceding log floor");var nativeCut=store.applied();if(nativeCut==null || !RatisRelocationOwnerRpc.covers(proposed.imageCut(),nativeCut))throw new IOException("META image does not cover existing native prefix");
+            var kind=NativeRangeImage.kind(image,snapshotMetadataAdmission);var cfg=new ReplicatedRangeStore.Configuration[1];var freeze=new NativeTopologyFreeze[1];NativeRangeImage.RowVisitor visitor=(section,column,key,value)->{if(section==NativeRangeImage.Section.STATE && key.length==17){if(key[16]==1){if(cfg[0]!=null)throw new IOException("Duplicate floor configuration");cfg[0]=ReplicatedRangeStore.Configuration.decode(value);}if(key[16]==0x60)freeze[0]=NativeTopologyFreeze.decode(value);}};
+            var manifest=kind==NativeRangeImage.Kind.GROUP?NativeRangeImage.visitAdmitted(image,limits,visitor,snapshotMetadataAdmission):NativeRangeImage.visitMetadataAdmitted(image,limits,visitor,snapshotMetadataAdmission);var range=proposed.range();
+            if(!manifest.owner().equals(new RangeOwnership.Owner(proposed.groupId(),range.rangeEpoch())) || !manifest.interval().domainId().equals(proposed.sourceDirectory().domainId()) || !Arrays.equals(manifest.interval().lowerInclusive(),range.lowerInclusive()) || !Arrays.equals(manifest.interval().upperExclusive(),range.upperExclusive()) || manifest.position().term()!=position.getTerm() || manifest.position().index()!=position.getIndex() || !RatisRelocationOwnerRpc.covers(nativeCut,manifest.position()) || !RatisRelocationOwnerRpc.covers(proposed.imageCut(),manifest.position()))throw new IOException("Retained floor owner/geometry/cut differs from covered META source");
+            if(kind==NativeRangeImage.Kind.METADATA && !proposed.freeze().equals(freeze[0]))throw new IOException("Retained META floor changed original FREEZE");
+            var historical=cfg[0];var current=store.configuration();if(historical==null || current==null || historical.index()>manifest.position().index() || historical.term()>manifest.position().term() || current.index()>nativeCut.index() || current.term()>nativeCut.term() || current.index()<historical.index() || current.term()<historical.term() || current.index()==historical.index() && (current.term()!=historical.term() || !Arrays.equals(current.data(),historical.data())))throw new IOException("Retained floor configuration is not covered by native prefix");
+            validateConfiguration(historical.data());requireSchemaMembership(range,current.data());var saved=MD5FileUtil.readStoredMd5ForFile(image.toFile());if(saved!=null && !saved.equals(org.apache.ratis.io.MD5Hash.newInstance(NativeRangeImage.md5Admitted(image,snapshotMetadataAdmission))))throw new IOException("Retained GROUP floor MD5 changed");return manifest;
+        }catch(org.rocksdb.RocksDBException|IllegalArgumentException invalid){throw new IOException("Retained META log floor qualification failed",invalid);}
+    }
+    private it.cavallium.rockserver.core.common.distributed.NativeMetadataRecoveryRegistration groupFloorRegistration(){var registration=store.metadataRecoveryRegistration();return registration==null?metadataFloorPreparation:registration;}
+    private boolean precedingGroupFloorAllowed()throws IOException{try{return !store.pendingInstallation() && (store.metadataRecoveryRegistration()==null?metadataFloorPreparation!=null && recoveryReplacement:store.metadataRecoveryPending() && !store.metadataRecoveryImageInstalled());}catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify pending META image receipt",invalid);}}
+
     @Override public SnapshotInfo getLatestSnapshot() { return recoveryReplacement?null:durableSnapshot; }
 
     @Override public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage storage) throws IOException {
@@ -2236,7 +2259,9 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             force(image.getParent());
             force(raftRoot);
             var a = store.applied();
-            if (installing || store.pendingInstallation() || a == null || a.index() < manifest.position().index()) {
+            var registration=store.metadataRecoveryRegistration();
+            boolean missingRegisteredMetadataImage=registration!=null && metadataSnapshotOwner() && manifest.position().equals(registration.imageCut()) && Arrays.equals(manifest.sha256(),registration.imageHash()) && NativeRangeImage.kind(image,snapshotMetadataAdmission)==NativeRangeImage.Kind.METADATA && !store.metadataRecoveryImageInstalled();
+            if (installing || store.pendingInstallation() || missingRegisteredMetadataImage || a == null || a.index() < manifest.position().index()) {
                 store.fence();
                 if(metadataSnapshotOwner())store.installMetadataSnapshotAdmitted(image,limits,batches->{},snapshotMetadataAdmission);else store.installSnapshotAdmitted(image,limits,batches->{},snapshotMetadataAdmission);
             } else if (a.index() == manifest.position().index() && a.term() != manifest.position().term()) {
@@ -2281,6 +2306,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         final NativeTopologyFreeze[] cutFreeze={null};
         boolean metadata=metadataSnapshotOwner();
+        if(NativeRangeImage.kind(image,snapshotMetadataAdmission)==NativeRangeImage.Kind.GROUP && (metadata || precedingGroupFloorAllowed())){if(use!=SnapshotImageUse.RETAINED_INVENTORY || !precedingGroupFloorAllowed())throw new IOException("GROUP file is only a covered pending META log floor");return validateCoveredMetadataFloor(image,position,groupFloorRegistration());}
         NativeRangeImage.RowVisitor visitor = (section, column, key, value) -> {
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x27 && ((key[16]&255)<=0x2b || (key[16]&255)==0x60)) throw new IllegalArgumentException("Non-DATA image contains schema transition state");
             if (role!=RatisNodePlan.Role.DATA && section==NativeRangeImage.Section.STATE && key.length>=17 && (key[16]&255)>=0x20 && (key[16]&255)<=0x24) throw new IllegalArgumentException("Non-DATA image contains participant/snapshot state");
@@ -2481,16 +2507,16 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
 
     @Override public void close() { beginShutdown(); }
 
-    private record Image(Path file, TermIndex position, NativeRangeImage.Manifest manifest) {}
+    private record Image(Path file, TermIndex position, NativeRangeImage.Manifest manifest,NativeRangeImage.Kind kind) {}
 
     private Image image(Path file) throws IOException {
         var position = SimpleStateMachineStorage.getTermIndexFromSnapshotFile(file.toFile());
-        return new Image(file, position, validateImage(file, position));
+        return new Image(file, position, validateImage(file, position),NativeRangeImage.kind(file,snapshotMetadataAdmission));
     }
 
     private Image retainedImage(Path file)throws IOException {
         var position=SimpleStateMachineStorage.getTermIndexFromSnapshotFile(file.toFile());
-        return new Image(file,position,validateImage(file,position,null,SnapshotImageUse.RETAINED_INVENTORY));
+        return new Image(file,position,validateImage(file,position,null,SnapshotImageUse.RETAINED_INVENTORY),NativeRangeImage.kind(file,snapshotMetadataAdmission));
     }
 
     private void syncImage(Image image) throws IOException {
@@ -2501,16 +2527,19 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         force(image.file().getParent());
     }
 
+    private boolean metadataReplacesGroupFloor(Image metadata,Image floor){
+        var registration=store.metadataRecoveryRegistration();if(registration==null || metadata.kind()!=NativeRangeImage.Kind.METADATA || floor.kind()!=NativeRangeImage.Kind.GROUP || !metadata.position().equals(floor.position()))return false;
+        // Both files were qualified as retained inventory; older META preference grants no install authority.
+        var cut=metadata.manifest().position();return cut.equals(registration.imageCut()) && Arrays.equals(metadata.manifest().sha256(),registration.imageHash()) || cut.index()<registration.imageCut().index() && RatisRelocationOwnerRpc.covers(registration.imageCut(),cut);
+    }
+    private Path groupFloorDirectory(){return recoveryDir.resolve("group-floor");}
     private void retainImage(Image image) throws IOException {
-        Files.createDirectories(recoveryDir);
-        Path target = recoveryDir.resolve(image.file().getFileName());
-        if (!Files.exists(target)) Files.createLink(target, image.file());
-        else if (!Arrays.equals(retainedImage(target).manifest().sha256(), image.manifest().sha256())) {
-            throw new IOException("Conflicting snapshot recovery image at " + image.position());
+        Files.createDirectories(recoveryDir);boolean floor=image.kind()==NativeRangeImage.Kind.GROUP && precedingGroupFloorAllowed();Path directory=floor?groupFloorDirectory():recoveryDir;Files.createDirectories(directory);Path target=directory.resolve(image.file().getFileName());
+        if(Files.exists(target) && !Arrays.equals(retainedImage(target).manifest().sha256(),image.manifest().sha256())){
+            var previous=retainedImage(target);if(!metadataReplacesGroupFloor(image,previous))throw new IOException("Conflicting snapshot recovery image at "+image.position());
+            retainImage(previous);Files.deleteIfExists(MD5FileUtil.getDigestFileForFile(target.toFile()).toPath());Files.delete(target);force(directory);
         }
-        syncImage(retainedImage(target));
-        force(recoveryDir);
-        force(raftRoot);
+        if(!Files.exists(target))Files.createLink(target,image.file());syncImage(retainedImage(target));force(directory);force(recoveryDir);force(raftRoot);
     }
 
     private java.util.List<Image> images(Path directory, boolean staging) throws IOException {
@@ -2560,21 +2589,29 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private void recoverStagingImages() throws IOException {
         synchronized (durabilityGate) {
             Path published = snapshots.getSnapshotFile(0, 0).toPath().getParent();
+            // A pending semantic META transition keeps covered GROUP floors separately, so an
+            // equal-cut META file can own the canonical snapshot filename without deleting its floor.
+            if(precedingGroupFloorAllowed())for(var floor:images(recoveryDir,false))if(floor.kind()==NativeRangeImage.Kind.GROUP){retainImage(floor);Files.deleteIfExists(MD5FileUtil.getDigestFileForFile(floor.file().toFile()).toPath());Files.delete(floor.file());force(recoveryDir);}
             // Corrupt published snapshots are repair failures, never skipped for an older image.
             var candidates = new java.util.ArrayList<>(images(published, false));
-            candidates.addAll(images(recoveryDir, false));
+            candidates.addAll(images(recoveryDir, false));if(precedingGroupFloorAllowed())candidates.addAll(images(groupFloorDirectory(),false));
             for (var staged : stagedImages()) { syncImage(staged); retainImage(staged); candidates.add(staged); }
             Image latest = null;
             for (var candidate : candidates) {
                 if (latest == null || candidate.position().getIndex() > latest.position().getIndex()) latest = candidate;
                 else if (candidate.position().getIndex() == latest.position().getIndex()
                         && !Arrays.equals(candidate.manifest().sha256(), latest.manifest().sha256())) {
-                    throw new IOException("Snapshot recovery cuts disagree");
+                    if(metadataReplacesGroupFloor(candidate,latest))latest=candidate;else if(!metadataReplacesGroupFloor(latest,candidate))throw new IOException("Snapshot recovery cuts disagree");
                 }
             }
             Files.createDirectories(published);
             if (latest != null) {
+                if(latest.kind()==NativeRangeImage.Kind.METADATA && precedingGroupFloorAllowed()){
+                    syncImage(latest);retainImage(latest);
+                    for(var floor:images(published,false))if(floor.kind()==NativeRangeImage.Kind.GROUP){retainImage(floor);Files.deleteIfExists(MD5FileUtil.getDigestFileForFile(floor.file().toFile()).toPath());Files.delete(floor.file());force(published);}
+                }
                 Path target = published.resolve(latest.file().getFileName());
+                if(Files.exists(target) && !Arrays.equals(retainedImage(target).manifest().sha256(),latest.manifest().sha256())){var previous=retainedImage(target);if(!metadataReplacesGroupFloor(latest,previous))throw new IOException("Published snapshot conflicts with selected recovery image");retainImage(previous);Files.deleteIfExists(MD5FileUtil.getDigestFileForFile(target.toFile()).toPath());Files.delete(target);force(published);}
                 if (!Files.exists(target)) Files.createLink(target, latest.file());
                 syncImage(retainedImage(target));
             }

@@ -22,6 +22,7 @@ import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
 import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto.SnapshotChunkProto;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.impl.RecoveryEligibilityStateMachine;
 import org.apache.ratis.server.storage.FileChunkReader;
 import org.apache.ratis.server.storage.FileInfo;
 import org.apache.ratis.server.storage.RaftStorageDirectory;
@@ -35,6 +36,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.function.Function;
 
 /**
@@ -49,6 +51,7 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
   private final RaftServer.Division server;
   private final RaftPeerId followerId;
   private final Function<FileInfo, Path> getRelativePath;
+  private final RecoveryEligibilityStateMachine.Gate.SnapshotPermit snapshotPermit;
 
   /** The snapshot to be sent. */
   private final SnapshotInfo snapshot;
@@ -65,23 +68,41 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
 
   InstallSnapshotRequests(RaftServer.Division server, RaftPeerId followerId,
       String requestId, SnapshotInfo snapshot, int snapshotChunkMaxSize) {
-    this(server, followerId, requestId, snapshot, snapshotChunkMaxSize, null);
+    this(server, followerId, requestId, snapshot, snapshotChunkMaxSize, null, null);
   }
 
   static InstallSnapshotRequests source(RaftServer.Division server, RaftPeerId receiver,
-      String requestId, SnapshotInfo snapshot, int chunkBytes) {
+      String requestId, SnapshotInfo snapshot, int chunkBytes, RecoveryEligibilityStateMachine.Gate.SnapshotPermit permit) {
     if (snapshot.getFiles().size() != 1 || snapshot.getTerm() < 1 || snapshot.getIndex() < 0) {
       throw new IllegalArgumentException("Source transfer requires one committed image");
     }
     final Path wirePath = new File(RaftStorageDirectory.STATE_MACHINE_DIR_NAME,
         org.apache.ratis.statemachine.impl.SimpleStateMachineStorage.getSnapshotFileName(
             snapshot.getTerm(), snapshot.getIndex())).toPath();
-    return new InstallSnapshotRequests(server, receiver, requestId, snapshot, chunkBytes, ignored -> wirePath);
+    return new InstallSnapshotRequests(server, receiver, requestId, snapshot, chunkBytes, ignored -> wirePath, permit);
   }
 
   private InstallSnapshotRequests(RaftServer.Division server, RaftPeerId followerId,
-      String requestId, SnapshotInfo snapshot, int snapshotChunkMaxSize, Function<FileInfo, Path> sourcePath) {
+      String requestId, SnapshotInfo snapshot, int snapshotChunkMaxSize, Function<FileInfo, Path> sourcePath,
+      RecoveryEligibilityStateMachine.Gate.SnapshotPermit suppliedPermit) {
     this.server = server;
+    final var machine = server.getStateMachine();
+    final var gate = machine instanceof RecoveryEligibilityStateMachine recovery
+        ? Objects.requireNonNull(recovery.recoveryEligibilityGate()) : null;
+    if (sourcePath != null) {
+      if (gate == null && suppliedPermit != null) {
+        throw new IllegalStateException("Nonparticipating snapshot source cannot use a recovery permit");
+      }
+      this.snapshotPermit = gate == null ? null : Objects.requireNonNull(suppliedPermit,
+          "Qualified source artifact requires its recovery permit");
+      if (snapshotPermit != null) { snapshotPermit.requireOwner(gate); }
+    } else {
+      this.snapshotPermit = gate == null ? null : gate.snapshotPermit();
+      if (snapshotPermit != null) {
+        requireLatestSnapshot(snapshot, machine.getLatestSnapshot());
+        snapshotPermit.requireCurrent();
+      }
+    }
     this.followerId = followerId;
     this.requestId = requestId;
     this.snapshot = snapshot;
@@ -91,7 +112,11 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
             () -> new IllegalStateException("Failed to compute total size for snapshot " + snapshot));
     this.numFiles = files.size();
 
-    if (sourcePath != null) { this.getRelativePath = sourcePath; return; }
+    if (sourcePath != null) {
+      this.getRelativePath = sourcePath;
+      if (snapshotPermit != null) { snapshotPermit.requireCurrent(); }
+      return;
+    }
 
     final File snapshotDir = server.getStateMachine().getStateMachineStorage().getSnapshotDir();
     final Function<Path, Path> relativize;
@@ -106,11 +131,32 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
         .filter(Path::isAbsolute)
         .map(relativize)
         .orElseGet(info::getPath);
+    if (snapshotPermit != null) { snapshotPermit.requireCurrent(); }
   }
 
   @Override
   public RockserverSnapshotRequests.Requests iterator() {
     return new Iter();
+  }
+
+  private static void requireLatestSnapshot(SnapshotInfo supplied, SnapshotInfo latest) {
+    if (latest == null || supplied.getTerm() != latest.getTerm() || supplied.getIndex() != latest.getIndex()) {
+      throw new IllegalStateException("Snapshot source artifact differs from its cached latest snapshot");
+    }
+    final var expected = latest.getFiles();
+    final var actual = supplied.getFiles();
+    if (actual.size() != expected.size()) {
+      throw new IllegalStateException("Snapshot source artifact file count changed");
+    }
+    for (int index = 0; index < actual.size(); index++) {
+      final var file = actual.get(index);
+      final var cached = expected.get(index);
+      if (!file.getPath().equals(cached.getPath()) || file.getFileSize() != cached.getFileSize()
+          || file.getFileDigest() == null || cached.getFileDigest() == null
+          || !file.getFileDigest().equals(cached.getFileDigest())) {
+        throw new IllegalStateException("Snapshot source artifact identity changed");
+      }
+    }
   }
 
   private class Iter implements RockserverSnapshotRequests.Requests {
@@ -122,6 +168,7 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
     /** The current file. */
     private FileChunkReader current;
     private boolean closed;
+    private boolean revoked;
 
     @Override public void close() throws IOException {
       if (closed) return;
@@ -131,7 +178,7 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
 
     @Override
     public boolean hasNext() {
-      return !closed && fileIndex < numFiles;
+      return !closed && !revoked && fileIndex < numFiles;
     }
 
     @Override
@@ -142,6 +189,7 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
 
       final FileInfo info = snapshot.getFiles().get(fileIndex);
       try {
+        requireSnapshotPermit();
         if (current == null) {
           current = FileChunkReader.newInstance(info, getRelativePath.apply(info));
         }
@@ -166,8 +214,18 @@ class InstallSnapshotRequests implements Iterable<InstallSnapshotRequestProto> {
       }
     }
 
-    private InstallSnapshotRequestProto newInstallSnapshotRequest(FileChunkProto chunk, boolean done) {
+    private void requireSnapshotPermit() throws IOException {
+      try {
+        if (snapshotPermit != null) { snapshotPermit.requireCurrent(); }
+      } catch (IllegalStateException stale) {
+        revoked = true;
+        throw new IOException("Native recovery state was revoked before snapshot production", stale);
+      }
+    }
+
+    private InstallSnapshotRequestProto newInstallSnapshotRequest(FileChunkProto chunk, boolean done) throws IOException {
       synchronized (server) {
+        requireSnapshotPermit();
         final SnapshotChunkProto.Builder b = LeaderProtoUtils.toSnapshotChunkProtoBuilder(
             requestId, requestIndex++, snapshot.getTermIndex(), chunk, totalSize, done);
         return LeaderProtoUtils.toInstallSnapshotRequestProto(server, followerId, b);
