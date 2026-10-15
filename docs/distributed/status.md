@@ -91,6 +91,10 @@ This section and the remaining gates at the end describe the current branch.
   The remaining Ratis receipt minimum is now 88 bytes; an existing native capacity
   workflow reproduced the old rejection, and all twelve retention/admission cases
   pass at the corrected limits in `/tmp/rockserver-oct14-retention-minimum-fixed.log`.
+  The catalogue clock and grant issuer journals also use their current layouts
+  directly, without redundant format-version words. Cold reopening, forged pending
+  commands and downstream session consumers pass 24 cases in
+  `current-journal-clock-issuer28.log`. No compatibility reader is retained.
 - Both distributed startup listings now stream native MANIFEST fragments within
   4,102 live CFs, 4,096 bytes per name and 8 MiB of names throughout replay.
   Complete malformed records and CRC errors fail; incomplete trailing records

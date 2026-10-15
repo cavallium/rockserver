@@ -54,7 +54,7 @@ public final class RatisGrantIssuer implements AutoCloseable {
                 state=new State(user,issuer,0,-1,Phase.IDLE,null,null); persist(state);
             } else {
                 var input=new DataInputStream(new ByteArrayInputStream(access.read(this.path,MAX_BYTES)));
-                if (input.readInt()!=MAGIC || input.readInt()!=1 || !Arrays.equals(input.readNBytes(32),identity)) throw new IOException("Wrong grant issuer journal identity/version");
+                if (input.readInt()!=MAGIC || !Arrays.equals(input.readNBytes(32),identity)) throw new IOException("Wrong grant issuer journal identity");
                 expiresAtMillis=input.readLong(); if (expiresAtMillis<=0) throw new IOException("Invalid journaled grant expiry");
                 state=decode(input); if (input.available()!=0) throw new IOException("Trailing grant issuer journal bytes");
                 SessionJournalFiles.force(this.path); SessionJournalFiles.force(this.path.getParent());
@@ -113,7 +113,7 @@ public final class RatisGrantIssuer implements AutoCloseable {
     private void persist(State next) throws IOException {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
-            output.writeInt(MAGIC); output.writeInt(1); output.write(identity); output.writeLong(expiresAtMillis);
+            output.writeInt(MAGIC); output.write(identity); output.writeLong(expiresAtMillis);
             uuid(output,next.user()); uuid(output,next.issuer()); output.writeLong(next.sequence()); output.writeLong(next.acknowledged()); output.writeByte(wire(next.phase()));
             blob(output,next.pending()==null ? null : DistributedCommandCodec.encode(next.pending()));
             blob(output,next.issued()==null ? null : next.issued().issuance().encode()); output.flush();

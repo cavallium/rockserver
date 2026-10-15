@@ -99,7 +99,7 @@ class RatisGrantIssuerTest {
             byte[] body=SessionJournalFiles.read(path,2*SessionEpochLedger.MAX_BYTES+4096);
             var expected=SessionEpochLedger.decode(first.predicates().getFirst().expectedValue());
             var last=f.epochs.prepare(new OperationId(first.operationId().sessionId(),0,Long.MAX_VALUE),expected,replacement(first),Long.MAX_VALUE-1);
-            var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes); output.write(body,0,80);
+            var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes); output.write(body,0,76);
             output.writeLong(Long.MAX_VALUE); output.writeLong(Long.MAX_VALUE-1); output.writeByte(1);
             byte[] command=DistributedCommandCodec.encode(last); output.writeInt(command.length); output.write(command); output.writeInt(-1); output.flush();
             SessionJournalFiles.write(path,bytes.toByteArray(),2*SessionEpochLedger.MAX_BYTES+4096);

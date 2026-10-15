@@ -34,8 +34,8 @@ public final class RatisCatalogueClock implements AutoCloseable {
             lock=acquired;
             if (Files.exists(this.journal)) {
                 var input=new DataInputStream(new ByteArrayInputStream(SessionJournalFiles.read(this.journal,MAX_JOURNAL)));
-                if (input.readInt()!=MAGIC || input.readInt()!=1 || !Arrays.equals(input.readNBytes(32),identity)) {
-                    throw new IOException("Wrong catalogue clock journal identity/version");
+                if (input.readInt()!=MAGIC || !Arrays.equals(input.readNBytes(32),identity)) {
+                    throw new IOException("Wrong catalogue clock journal identity");
                 }
                 state=decode(input);
                 if (input.available()!=0) throw new IOException("Trailing catalogue clock journal data");
@@ -110,7 +110,7 @@ public final class RatisCatalogueClock implements AutoCloseable {
     private void persist(State next) throws IOException {
         try {
             var bytes=new ByteArrayOutputStream(); var output=new DataOutputStream(bytes);
-            output.writeInt(MAGIC); output.writeInt(1); output.write(identity);
+            output.writeInt(MAGIC); output.write(identity);
             uuid(output,next.session()); output.writeLong(next.sequence()); output.writeLong(next.acknowledged());
             blob(output,next.observed()==null ? null : new RangeSessionControl(next.observed(),null,0).encode());
             blob(output,next.pending()==null ? null : DistributedCommandCodec.encode(next.pending()));

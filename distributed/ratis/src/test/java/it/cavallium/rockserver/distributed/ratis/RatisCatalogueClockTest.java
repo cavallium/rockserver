@@ -146,7 +146,7 @@ class RatisCatalogueClockTest {
             byte[] valid=Files.readAllBytes(journal), body=SessionJournalFiles.read(journal,2*SessionEpochLedger.MAX_BYTES+4096);
             var expected=SessionEpochLedger.decode(pending.predicates().getFirst().expectedValue());
             var issuance=f.epochs.prepare(pending.operationId(),expected,expected.issue(outer.a,100));
-            var input=java.nio.ByteBuffer.wrap(body); input.position(72); int observedBytes=input.getInt();
+            var input=java.nio.ByteBuffer.wrap(body); input.position(68); int observedBytes=input.getInt();
             input.position(input.position()+observedBytes); int pendingOffset=input.position();
             var replacement=new java.io.ByteArrayOutputStream(); var output=new java.io.DataOutputStream(replacement);
             output.write(body,0,pendingOffset); byte[] wrong=DistributedCommandCodec.encode(issuance);
