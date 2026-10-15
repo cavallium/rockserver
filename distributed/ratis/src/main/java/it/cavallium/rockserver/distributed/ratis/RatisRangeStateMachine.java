@@ -2238,7 +2238,8 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     private boolean metadataSnapshotOwner() {
         return role==RatisNodePlan.Role.DATA && (store.metadataRecoveryRegistration()!=null || store.topologyRetired() && store.topologyFreeze()!=null);
     }
-    private NativeRangeImage.Manifest validateImage(Path image, TermIndex position) throws IOException {
+    private NativeRangeImage.Manifest validateImage(Path image,TermIndex position)throws IOException{return validateImage(image,position,null);}
+    private NativeRangeImage.Manifest validateImage(Path image,TermIndex position,ReplicatedRangeStore.SnapshotPin pin)throws IOException {
         try(var imageMetadata=NativeRangeImage.openMetadataAdmission(snapshotMetadataAdmission)) {
         final ReplicatedRangeStore.Configuration[] cutConfiguration = {null};
         final NativeTopologyFreeze[] cutFreeze={null};
@@ -2269,7 +2270,11 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
         if(metadata) {
             var registration=store.metadataRecoveryRegistration();var freeze=registration==null?store.topologyFreeze():registration.freeze();
             if(freeze==null || !freeze.equals(cutFreeze[0]))throw new IOException("Metadata snapshot changed qualified original source FREEZE");
-            if(registration!=null && (!manifest.position().equals(registration.imageCut()) || !Arrays.equals(manifest.sha256(),registration.imageHash()) || cutConfiguration[0]==null || cutConfiguration[0].term()!=registration.configurationTerm() || cutConfiguration[0].index()!=registration.configurationIndex() || !Arrays.equals(cutConfiguration[0].data(),registration.sourceConfiguration())))throw new IOException("Metadata snapshot lacks exact forced recovery image permission");
+            if(registration!=null) {
+                var server=getServer().getNow(null);if(topologyLocalReplica==null || !sameReplicaIdentity(registration.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(registration.receiver().peerId()))throw new IOException("META snapshot receiver identity differs");
+                try{var qualified=pin==null?store.validateMetadataRecoveryImage(image,limits):pin.validateMetadataRecoveryImage(image,limits);if(!qualified.position().equals(manifest.position()) || !Arrays.equals(qualified.sha256(),manifest.sha256()))throw new IOException("META image changed during native qualification");}
+                catch(org.rocksdb.RocksDBException invalid){throw new IOException("Cannot qualify META image provenance",invalid);}
+            }
         } else if(current!=null) {
             var server=getServer().getNow(null);
             if(topologyLocalReplica==null || !sameReplicaIdentity(current.receiver(),topologyLocalReplica) || server==null || !server.getId().toString().equals(current.receiver().peerId()))throw new IOException("CURRENT snapshot receiver identity differs");
@@ -2324,7 +2329,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
     @Override public long takeSnapshot() throws IOException {
         // A retired parent's shared USER rows may already belong to its children.
         boolean metadata=metadataSnapshotOwner();
-        if(store.topologyBirthPending() || store.topologyRecoveryOnly() || store.metadataRecoveryPending() || store.metadataRecoveryRegistration()!=null)return -1;
+        if(store.topologyBirthPending() || store.topologyRecoveryOnly() || store.metadataRecoveryPending())return -1;
         if(metadata){var freeze=store.topologyFreeze();var cut=store.applied();if(freeze==null || cut==null || cut.index()<=freeze.position().index())return -1;}
         var recovery=diskRunway==null?null:diskRunway.reserveRecovery(diskPool,Math.addExact(2*limits.maxImageBytes(),65536));
         long published;
@@ -2333,7 +2338,7 @@ public final class RatisRangeStateMachine extends BaseStateMachine implements or
             var position = TermIndex.valueOf(pin.position().term(), pin.position().index());
             Path file = snapshots.getSnapshotFile(position.getTerm(), position.getIndex()).toPath();
             if (!Files.exists(file)){if(metadata)NativeRangeImage.writeMetadataAdmitted(file,pin,pin.interval(),limits,NativeRangeImage.IoAdmission.UNLIMITED);else NativeRangeImage.write(file, pin, pin.interval(), limits);}
-            validateImage(file, position);
+            validateImage(file,position,pin);
             var md5 = MD5FileUtil.computeMd5ForFile(file.toFile());
             MD5FileUtil.saveMD5File(file.toFile(), md5);
             force(file);
